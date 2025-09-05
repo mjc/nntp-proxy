@@ -1,10 +1,11 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -18,6 +19,10 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,7 +36,7 @@ impl NntpProxy {
         if config.servers.is_empty() {
             anyhow::bail!("No servers configured");
         }
-        
+
         Ok(Self {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
@@ -61,12 +66,19 @@ impl NntpProxy {
         &self.servers
     }
 
-    pub async fn handle_client(&self, mut client_stream: TcpStream, client_addr: SocketAddr) -> Result<()> {
+    pub async fn handle_client(
+        &self,
+        mut client_stream: TcpStream,
+        client_addr: SocketAddr,
+    ) -> Result<()> {
         info!("New client connection from {}", client_addr);
 
         // Get the next backend server
         let server = self.next_server();
-        info!("Routing client {} to server {}:{}", client_addr, server.host, server.port);
+        info!(
+            "Routing client {} to server {}:{}",
+            client_addr, server.host, server.port
+        );
 
         // Connect to backend server
         let backend_addr = format!("{}:{}", server.host, server.port);
@@ -74,12 +86,57 @@ impl NntpProxy {
             Ok(stream) => stream,
             Err(e) => {
                 error!("Failed to connect to backend {}: {}", backend_addr, e);
-                let _ = client_stream.write_all(b"400 Backend server unavailable\r\n").await;
+                let _ = client_stream
+                    .write_all(b"400 Backend server unavailable\r\n")
+                    .await;
                 return Err(e.into());
             }
         };
 
         info!("Connected to backend server {}", backend_addr);
+
+        // Perform authentication if credentials are provided
+        if let (Some(username), Some(password)) = (&server.username, &server.password) {
+            info!("Performing NNTP authentication for {}", server.name);
+
+            if let Err(e) = self
+                .authenticate_backend(&mut backend_stream, username, password)
+                .await
+            {
+                error!("Authentication failed for {}: {}", server.name, e);
+                let _ = client_stream
+                    .write_all(b"502 Authentication failed\r\n")
+                    .await;
+                return Err(e);
+            }
+
+            info!("Successfully authenticated to {}", server.name);
+
+            // Send greeting to client after successful authentication
+            if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
+                error!("Failed to send greeting to client: {}", e);
+                return Err(e);
+            }
+
+            // Handle any client authentication attempts by responding with success
+            // since we've already authenticated with the backend
+            if let Err(e) = self
+                .handle_client_auth_requests(&mut client_stream, &mut backend_stream)
+                .await
+            {
+                error!("Error handling client authentication: {}", e);
+                // Don't return error here, continue with normal proxying
+            }
+        } else {
+            // For non-authenticated servers, we still need to consume and forward the greeting
+            if let Err(e) = self
+                .forward_greeting(&mut backend_stream, &mut client_stream)
+                .await
+            {
+                error!("Failed to forward server greeting: {}", e);
+                return Err(e);
+            }
+        }
 
         // Split streams for bidirectional proxying
         let (client_read, client_write) = client_stream.split();
@@ -107,11 +164,179 @@ impl NntpProxy {
         Ok(())
     }
 
-    pub async fn proxy_data<R, W>(
-        mut reader: R,
-        mut writer: W,
-        direction: &str,
-    ) -> Result<()>
+    /// Forward the server greeting to the client for non-authenticated connections
+    async fn forward_greeting(
+        &self,
+        backend_stream: &mut TcpStream,
+        client_stream: &mut TcpStream,
+    ) -> Result<()> {
+        let mut buffer = [0u8; 1024];
+
+        // Read the server greeting
+        let n = backend_stream.read(&mut buffer).await?;
+        let greeting = &buffer[..n];
+
+        // Forward it to the client
+        client_stream.write_all(greeting).await?;
+
+        Ok(())
+    }
+
+    /// Perform NNTP authentication using AUTHINFO USER/PASS commands
+    async fn authenticate_backend(
+        &self,
+        stream: &mut TcpStream,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        let mut buffer = [0u8; 1024];
+
+        // Read the server greeting first
+        let n = stream.read(&mut buffer).await?;
+        let greeting = &buffer[..n];
+        info!(
+            "Server greeting: {}",
+            String::from_utf8_lossy(greeting).trim()
+        );
+
+        // Check if greeting indicates successful connection (200)
+        let greeting_str = String::from_utf8_lossy(greeting);
+        if !greeting_str.starts_with("200") && !greeting_str.starts_with("201") {
+            return Err(anyhow::anyhow!(
+                "Server returned non-success greeting: {}",
+                greeting_str.trim()
+            ));
+        }
+
+        // Send AUTHINFO USER command
+        let user_command = format!("AUTHINFO USER {}\r\n", username);
+        stream.write_all(user_command.as_bytes()).await?;
+
+        // Read response
+        let n = stream.read(&mut buffer).await?;
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        info!("AUTHINFO USER response: {}", response.trim());
+
+        // Should get 381 (password required) or 281 (authenticated)
+        if response.starts_with("281") {
+            // Already authenticated with just username
+            return Ok(());
+        } else if !response.starts_with("381") {
+            return Err(anyhow::anyhow!(
+                "Unexpected response to AUTHINFO USER: {}",
+                response.trim()
+            ));
+        }
+
+        // Send AUTHINFO PASS command
+        let pass_command = format!("AUTHINFO PASS {}\r\n", password);
+        stream.write_all(pass_command.as_bytes()).await?;
+
+        // Read final response
+        let n = stream.read(&mut buffer).await?;
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        info!("AUTHINFO PASS response: {}", response.trim());
+
+        // Should get 281 (authenticated)
+        if response.starts_with("281") {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Authentication failed: {}",
+                response.trim()
+            ))
+        }
+    }
+
+    /// Send a synthetic server greeting to the client after authentication
+    async fn send_greeting_to_client(&self, client_stream: &mut TcpStream) -> Result<()> {
+        // Send a standard NNTP greeting to the client
+        let greeting = b"200 NNTP Proxy Server Ready\r\n";
+        client_stream.write_all(greeting).await?;
+        Ok(())
+    }
+
+    /// Handle any authentication requests from the client
+    /// Since we've already authenticated with the backend, we respond with success
+    async fn handle_client_auth_requests(
+        &self,
+        client_stream: &mut TcpStream,
+        backend_stream: &mut TcpStream,
+    ) -> Result<()> {
+        let mut buffer = vec![0; 4096];
+
+        // Use a timeout to avoid blocking forever
+        let timeout_duration = Duration::from_secs(5);
+
+        loop {
+            // Try to read from client with timeout
+            let bytes_read =
+                match tokio::time::timeout(timeout_duration, client_stream.read(&mut buffer)).await
+                {
+                    Ok(Ok(0)) => {
+                        // Client disconnected
+                        info!("Client disconnected during auth handling");
+                        return Ok(());
+                    }
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        error!("Error reading from client during auth: {}", e);
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        // Timeout - assume no more auth commands coming
+                        info!(
+                            "No auth commands received from client, proceeding with normal proxy"
+                        );
+                        return Ok(());
+                    }
+                };
+
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+            info!("Received from client: {}", request.trim());
+
+            // Check if this is an AUTHINFO command
+            if request
+                .trim_start()
+                .to_uppercase()
+                .starts_with("AUTHINFO USER")
+            {
+                info!("Client sent AUTHINFO USER, responding with success");
+                let response = "281 Authentication accepted\r\n";
+                client_stream.write_all(response.as_bytes()).await?;
+                client_stream.flush().await?;
+            } else if request
+                .trim_start()
+                .to_uppercase()
+                .starts_with("AUTHINFO PASS")
+            {
+                info!("Client sent AUTHINFO PASS, responding with success");
+                let response = "281 Authentication accepted\r\n";
+                client_stream.write_all(response.as_bytes()).await?;
+                client_stream.flush().await?;
+            } else {
+                // Not an auth command, forward it to backend and start normal proxying
+                info!(
+                    "Non-auth command received: {}, starting normal proxy mode",
+                    request.trim()
+                );
+                backend_stream.write_all(&buffer[..bytes_read]).await?;
+                backend_stream.flush().await?;
+
+                // Forward the response back to client
+                let mut response_buffer = vec![0; 4096];
+                let response_bytes = backend_stream.read(&mut response_buffer).await?;
+                client_stream
+                    .write_all(&response_buffer[..response_bytes])
+                    .await?;
+                client_stream.flush().await?;
+
+                return Ok(());
+            }
+        }
+    }
+
+    pub async fn proxy_data<R, W>(mut reader: R, mut writer: W, direction: &str) -> Result<()>
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
@@ -121,7 +346,9 @@ impl NntpProxy {
             match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await {
+                    if let Err(e) =
+                        tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await
+                    {
                         error!("Write error in {}: {}", direction, e);
                         return Err(e.into());
                     }
@@ -143,22 +370,22 @@ impl NntpProxy {
 pub fn load_config(config_path: &str) -> Result<Config> {
     let config_content = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", config_path, e))?;
-    
+
     let config: Config = toml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", config_path, e))?;
-    
+
     Ok(config)
 }
 
 pub fn create_default_config() -> Config {
     Config {
-        servers: vec![
-            ServerConfig {
-                host: "news.example.com".to_string(),
-                port: 119,
-                name: "Example News Server".to_string(),
-            },
-        ],
+        servers: vec![ServerConfig {
+            host: "news.example.com".to_string(),
+            port: 119,
+            name: "Example News Server".to_string(),
+            username: None,
+            password: None,
+        }],
     }
 }
 
@@ -176,16 +403,22 @@ mod tests {
                     host: "server1.example.com".to_string(),
                     port: 119,
                     name: "Test Server 1".to_string(),
+                    username: None,
+                    password: None,
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
                     port: 119,
                     name: "Test Server 2".to_string(),
+                    username: None,
+                    password: None,
                 },
                 ServerConfig {
                     host: "server3.example.com".to_string(),
                     port: 119,
                     name: "Test Server 3".to_string(),
+                    username: None,
+                    password: None,
                 },
             ],
         }
@@ -197,6 +430,8 @@ mod tests {
             host: "news.example.com".to_string(),
             port: 119,
             name: "Example Server".to_string(),
+            username: None,
+            password: None,
         };
 
         assert_eq!(config.host, "news.example.com");
@@ -217,7 +452,7 @@ mod tests {
     fn test_proxy_creation_with_servers() {
         let config = create_test_config();
         let proxy = NntpProxy::new(config).expect("Failed to create proxy");
-        
+
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.servers()[0].name, "Test Server 1");
     }
@@ -226,23 +461,28 @@ mod tests {
     fn test_proxy_creation_with_empty_servers() {
         let config = Config { servers: vec![] };
         let result = NntpProxy::new(config);
-        
+
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No servers configured"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No servers configured")
+        );
     }
 
     #[test]
     fn test_round_robin_server_selection() {
         let config = create_test_config();
         let proxy = NntpProxy::new(config).expect("Failed to create proxy");
-        
+
         proxy.reset_index();
-        
+
         // Test first round
         assert_eq!(proxy.next_server().name, "Test Server 1");
         assert_eq!(proxy.next_server().name, "Test Server 2");
         assert_eq!(proxy.next_server().name, "Test Server 3");
-        
+
         // Test wraparound
         assert_eq!(proxy.next_server().name, "Test Server 1");
         assert_eq!(proxy.next_server().name, "Test Server 2");
@@ -251,18 +491,18 @@ mod tests {
     #[test]
     fn test_round_robin_with_single_server() {
         let config = Config {
-            servers: vec![
-                ServerConfig {
-                    host: "single.example.com".to_string(),
-                    port: 119,
-                    name: "Single Server".to_string(),
-                },
-            ],
+            servers: vec![ServerConfig {
+                host: "single.example.com".to_string(),
+                port: 119,
+                name: "Single Server".to_string(),
+                username: None,
+                password: None,
+            }],
         };
-        
+
         let proxy = NntpProxy::new(config).expect("Failed to create proxy");
         proxy.reset_index();
-        
+
         // All requests should go to the same server
         assert_eq!(proxy.next_server().name, "Single Server");
         assert_eq!(proxy.next_server().name, "Single Server");
@@ -274,35 +514,35 @@ mod tests {
         let config = create_test_config();
         let proxy = Arc::new(NntpProxy::new(config).expect("Failed to create proxy"));
         proxy.reset_index();
-        
+
         let mut handles = vec![];
         let servers_selected = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         // Spawn multiple tasks to test concurrent access
         for _ in 0..9 {
             let proxy_clone = Arc::clone(&proxy);
             let servers_clone = Arc::clone(&servers_selected);
-            
+
             let handle = std::thread::spawn(move || {
                 let server = proxy_clone.next_server();
                 servers_clone.lock().unwrap().push(server.name.clone());
             });
             handles.push(handle);
         }
-        
+
         // Wait for all tasks to complete
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         let servers = servers_selected.lock().unwrap();
         assert_eq!(servers.len(), 9);
-        
+
         // Count occurrences of each server (should be balanced)
         let server1_count = servers.iter().filter(|&s| s == "Test Server 1").count();
         let server2_count = servers.iter().filter(|&s| s == "Test Server 2").count();
         let server3_count = servers.iter().filter(|&s| s == "Test Server 3").count();
-        
+
         // Each server should be selected 3 times
         assert_eq!(server1_count, 3);
         assert_eq!(server2_count, 3);
@@ -313,19 +553,19 @@ mod tests {
     fn test_load_config_from_file() -> Result<()> {
         let config = create_test_config();
         let config_toml = toml::to_string_pretty(&config)?;
-        
+
         // Create a temporary file
         let mut temp_file = NamedTempFile::new()?;
         write!(temp_file, "{}", config_toml)?;
-        
+
         // Load config from file
         let loaded_config = load_config(temp_file.path().to_str().unwrap())?;
-        
+
         assert_eq!(loaded_config.servers.len(), 3);
         assert_eq!(loaded_config.servers[0].name, "Test Server 1");
         assert_eq!(loaded_config.servers[0].host, "server1.example.com");
         assert_eq!(loaded_config.servers[0].port, 119);
-        
+
         Ok(())
     }
 
@@ -333,28 +573,38 @@ mod tests {
     fn test_load_config_nonexistent_file() {
         let result = load_config("/nonexistent/path/config.toml");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Failed to read config file"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to read config file")
+        );
     }
 
     #[test]
     fn test_load_config_invalid_toml() -> Result<()> {
         let invalid_toml = "invalid toml content [[[";
-        
+
         // Create a temporary file with invalid TOML
         let mut temp_file = NamedTempFile::new()?;
         write!(temp_file, "{}", invalid_toml)?;
-        
+
         let result = load_config(temp_file.path().to_str().unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Failed to parse config file"));
-        
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to parse config file")
+        );
+
         Ok(())
     }
 
     #[test]
     fn test_create_default_config() {
         let config = create_default_config();
-        
+
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].host, "news.example.com");
         assert_eq!(config.servers[0].port, 119);
@@ -364,64 +614,65 @@ mod tests {
     #[test]
     fn test_config_serialization() -> Result<()> {
         let config = create_test_config();
-        
+
         // Serialize to TOML
         let toml_string = toml::to_string_pretty(&config)?;
         assert!(toml_string.contains("server1.example.com"));
         assert!(toml_string.contains("Test Server 1"));
-        
+
         // Deserialize back
         let deserialized: Config = toml::from_str(&toml_string)?;
         assert_eq!(deserialized, config);
-        
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_proxy_data_empty_stream() -> Result<()> {
         use tokio::io::{empty, sink};
-        
+
         let result = NntpProxy::proxy_data(empty(), sink(), "test").await;
         assert!(result.is_ok());
-        
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_proxy_data_with_data() -> Result<()> {
-        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
-        
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
         let (mut client, server) = duplex(64);
         let (server_read, server_write) = tokio::io::split(server);
-        
+
         // Send data in the background
         tokio::spawn(async move {
             let _ = client.write_all(b"Hello, world!").await;
             let _ = client.shutdown().await;
         });
-        
+
         // Capture the proxied data
         let (mut output_reader, output_writer) = duplex(64);
-        
+
         // Start proxying
-        let proxy_task = tokio::spawn(async move {
-            NntpProxy::proxy_data(server_read, output_writer, "test").await
-        });
-        
+        let proxy_task =
+            tokio::spawn(
+                async move { NntpProxy::proxy_data(server_read, output_writer, "test").await },
+            );
+
         // Close the write side so the proxy task can complete
         drop(server_write);
-        
+
         // Read the proxied data
         let mut buffer = Vec::new();
         let _ = output_reader.read_to_end(&mut buffer).await;
-        
+
         // Wait for proxy to finish
         let result = proxy_task.await.unwrap();
         assert!(result.is_ok());
-        
+
         // Verify data was proxied correctly
         assert_eq!(buffer, b"Hello, world!");
-        
+
         Ok(())
     }
 }
