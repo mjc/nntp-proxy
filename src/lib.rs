@@ -419,6 +419,14 @@ impl NntpProxy {
                                 client_write.write_all(response).await?;
                                 backend_to_client_bytes += response.len() as u64;
                                 debug!("Intercepted AUTHINFO PASS, authenticated client");
+                            } else if trimmed.eq_ignore_ascii_case("QUIT") {
+                                // Client wants to disconnect - handle locally without forwarding to backend
+                                let response = b"205 Closing connection - goodbye!\r\n";
+                                client_write.write_all(response).await?;
+                                backend_to_client_bytes += response.len() as u64;
+                                debug!("Intercepted QUIT command, closing client connection");
+                                self.buffer_pool.return_buffer(buffer).await;
+                                break; // Close client connection, keep backend for pool reuse
                             } else if trimmed.starts_with("ARTICLE") || trimmed.starts_with("BODY") ||
                                      trimmed.starts_with("HEAD") || trimmed.starts_with("STAT") {
                                 // Forward data command to backend
@@ -508,9 +516,21 @@ impl NntpProxy {
                             break;
                         }
                         Ok(_) => {
-                            // Forward command to backend
-                            backend_write.write_all(line.as_bytes()).await?;
-                            client_to_backend_bytes += line.len() as u64;
+                            let trimmed = line.trim();
+                            
+                            // Intercept QUIT command even in high-throughput mode
+                            if trimmed.eq_ignore_ascii_case("QUIT") {
+                                let response = b"205 Closing connection - goodbye!\r\n";
+                                client_write.write_all(response).await?;
+                                backend_to_client_bytes += response.len() as u64;
+                                debug!("Intercepted QUIT command in high-throughput mode");
+                                self.buffer_pool.return_buffer(buffer).await;
+                                break; // Close client connection, keep backend for pool reuse
+                            } else {
+                                // Forward other commands to backend
+                                backend_write.write_all(line.as_bytes()).await?;
+                                client_to_backend_bytes += line.len() as u64;
+                            }
                         }
                         Err(e) => {
                             warn!("Error reading client command: {}", e);
