@@ -2,6 +2,15 @@
 name = "nntp-proxy"
 version = "0.1.0"
 edition = "2024"
+description = "High-performance NNTP proxy server with connection pooling and authentication"
+license = "MIT"
+repository = "https://github.com/mjc/nntp-proxy"
+documentation = "https://docs.rs/nntp-proxy"
+homepage = "https://github.com/mjc/nntp-proxy"
+keywords = ["nntp", "proxy", "server", "networking", "usenet"]
+categories = ["network-programming", "web-programming"]
+authors = ["Mika Cohen <mjc@kernel.org>"]
+readme = "README.md"
 
 [[bin]]
 name = "nntp-proxy"
