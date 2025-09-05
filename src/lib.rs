@@ -80,7 +80,7 @@ impl NntpProxy {
     /// Prewarm all connection pools by forcing pool to create max_connections
     /// Called on first client connection after idle period
     async fn prewarm_all_pools(&self) -> Result<()> {
-        // Use compare_and_swap to ensure only one thread prewarmes the pools
+        // Use compare_and_swap to ensure only one thread prewarms the pools
         if self.pools_prewarmed.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             // Another thread is already prewarming or has already prewarmed
             return Ok(());
