@@ -31,7 +31,7 @@ impl BufferPool {
     fn create_aligned_buffer(size: usize) -> Vec<u8> {
         // Align to page boundaries (4KB) for better memory performance
         let page_size = 4096;
-        let aligned_size = ((size + page_size - 1) / page_size) * page_size;
+        let aligned_size = size.div_ceil(page_size) * page_size;
 
         // Use aligned allocation for better cache performance
         let mut buffer = Vec::with_capacity(aligned_size);
@@ -433,7 +433,6 @@ impl ConnectionPool {
                     conn.server_name
                 );
                 self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                return;
             }
             Ok(_) => {
                 // Got unexpected data, connection might be in use
@@ -442,7 +441,6 @@ impl ConnectionPool {
                     conn.server_name
                 );
                 self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                return;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Connection is alive and ready
@@ -457,7 +455,6 @@ impl ConnectionPool {
                     conn.server_name
                 );
                 self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                return;
             }
         }
     }
@@ -588,7 +585,7 @@ impl NntpProxy {
 
         // Try to get a pooled connection first
         let (mut backend_stream, is_pooled, server_name, pooled_authenticated) =
-            match self.connection_pool.get_connection(&server, self).await {
+            match self.connection_pool.get_connection(server, self).await {
                 Ok(pooled) => {
                     info!(
                         "Using pooled connection to {} (authenticated: {})",
