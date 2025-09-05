@@ -325,8 +325,8 @@ impl ConnectionPool {
             use std::os::unix::io::AsRawFd;
             let fd = socket.as_raw_fd();
 
-            // Set larger socket buffers (512KB each for high throughput)
-            let buffer_size = 512 * 1024i32;
+            // Set much larger socket buffers for high-throughput large file transfers (2MB each)
+            let buffer_size = 2 * 1024 * 1024i32; // 2MB instead of 512KB
             unsafe {
                 libc::setsockopt(
                     fd,
@@ -387,6 +387,39 @@ impl ConnectionPool {
                     libc::IPPROTO_TCP,
                     libc::TCP_CORK,
                     &cork_flag as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+
+                // Advanced TCP congestion control optimizations for large file transfers
+                // Set TCP congestion control algorithm to BBR if available (best for high BDP)
+                let bbr_name = b"bbr\0";
+                let bbr_result = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CONGESTION,
+                    bbr_name.as_ptr() as *const libc::c_void,
+                    bbr_name.len() as u32 - 1,
+                );
+
+                // If BBR fails, try cubic which is also excellent for large transfers
+                if bbr_result != 0 {
+                    let cubic_name = b"cubic\0";
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_TCP,
+                        libc::TCP_CONGESTION,
+                        cubic_name.as_ptr() as *const libc::c_void,
+                        cubic_name.len() as u32 - 1,
+                    );
+                }
+
+                // Enable TCP Fast Open for faster connection establishment
+                let tcp_fastopen = 1i32; // Enable client-side Fast Open
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_FASTOPEN,
+                    &tcp_fastopen as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
 
