@@ -94,31 +94,11 @@ impl managed::Manager for TcpManager {
         self.create_optimized_tcp_stream().await
     }
 
-    async fn recycle(&self, conn: &mut TcpStream, _: &managed::Metrics) -> managed::RecycleResult<anyhow::Error> {
-        // For TCP connections, do a simple health check
-        let mut test_buf = [0u8; 1];
-        match conn.try_read(&mut test_buf) {
-            Ok(0) => {
-                // Connection was closed by server
-                warn!("Connection to {} was closed by server during recycle check", self.name);
-                Err(managed::RecycleError::message("Connection closed by server"))
-            }
-            Ok(_) => {
-                // Got data, which might be normal for NNTP (server messages)
-                debug!("Connection to {} appears healthy (has buffered data)", self.name);
-                Ok(())
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available, connection appears healthy
-                debug!("Connection to {} appears healthy", self.name);
-                Ok(())
-            }
-            Err(e) => {
-                // Connection error
-                warn!("Connection to {} failed health check: {}", self.name, e);
-                Err(managed::RecycleError::message("Connection health check failed"))
-            }
-        }
+    async fn recycle(&self, _conn: &mut TcpStream, _: &managed::Metrics) -> managed::RecycleResult<anyhow::Error> {
+        // For NNTP connections, we don't do invasive health checks that might consume data
+        // The connection will be tested when actually used for communication
+        debug!("Connection to {} recycled successfully", self.name);
+        Ok(())
     }
 
     fn detach(&self, _conn: &mut TcpStream) {
