@@ -21,9 +21,8 @@ struct Args {
     threads: Option<usize>,
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
-    // Initialize tracing
+fn main() -> Result<()> {
+    // Initialize tracing first
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
@@ -34,8 +33,25 @@ async fn main() -> Result<()> {
         .unwrap_or(1);
     let worker_threads = args.threads.unwrap_or(num_cpus);
     
-    info!("Starting NNTP proxy with {} worker threads (detected {} CPUs)", 
-          worker_threads, num_cpus);
+    // Use different runtime based on thread count for optimal performance
+    if worker_threads == 1 {
+        info!("Starting NNTP proxy with single-threaded runtime for optimal performance");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(run_proxy(args))
+    } else {
+        info!("Starting NNTP proxy with {} worker threads (detected {} CPUs)", 
+              worker_threads, num_cpus);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()?;
+        rt.block_on(run_proxy(args))
+    }
+}
+
+async fn run_proxy(args: Args) -> Result<()> {
 
     // Load configuration
     let config = if std::path::Path::new(&args.config).exists() {
