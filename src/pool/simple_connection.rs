@@ -19,13 +19,13 @@ impl SimpleConnectionProvider {
     /// Create a new optimized TCP connection
     pub async fn get_connection(&self) -> Result<TcpStream> {
         info!("Creating connection to {}", self.name);
-        
+
         let addr = format!("{}:{}", self.host, self.port);
         let stream = TcpStream::connect(&addr).await?;
-        
+
         // Apply basic optimization
         let _ = stream.set_nodelay(true);
-        
+
         Ok(stream)
     }
 }

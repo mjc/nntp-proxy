@@ -52,15 +52,12 @@ impl NntpProxy {
         }
 
         // Create simple connection providers for each server
-        let connection_providers: Vec<SimpleConnectionProvider> = config.servers
+        let connection_providers: Vec<SimpleConnectionProvider> = config
+            .servers
             .iter()
             .map(|server| {
                 info!("Configuring connection provider for '{}'", server.name);
-                SimpleConnectionProvider::new(
-                    server.host.clone(),
-                    server.port,
-                    server.name.clone(),
-                )
+                SimpleConnectionProvider::new(server.host.clone(), server.port, server.name.clone())
             })
             .collect();
 
@@ -136,9 +133,7 @@ impl NntpProxy {
         }
 
         // Get the connection manager for this server and create connection
-        let mut backend_stream = match self.connection_providers[server_idx]
-            .get_connection()
-            .await
+        let mut backend_stream = match self.connection_providers[server_idx].get_connection().await
         {
             Ok(stream) => {
                 info!("Created new connection to {}", server.name);
@@ -158,8 +153,8 @@ impl NntpProxy {
         info!("Connected to backend server {}", backend_addr);
 
         // Authenticate proxy to backend using configured credentials
-        if let (Some(username), Some(password)) = (&server.username, &server.password) {
-            if let Err(e) = self
+        if let (Some(username), Some(password)) = (&server.username, &server.password)
+            && let Err(e) = self
                 .authenticate_backend(&mut backend_stream, username, password)
                 .await
             {
@@ -169,11 +164,12 @@ impl NntpProxy {
                     .await;
                 return Err(e);
             }
-        }
 
         // Now implement intelligent proxying that handles client authentication
         // without passing it to the already-authenticated backend
-        let copy_result = self.handle_client_with_auth_interception(client_stream, backend_stream).await;
+        let copy_result = self
+            .handle_client_with_auth_interception(client_stream, backend_stream)
+            .await;
 
         // Connection will be automatically closed when backend_stream goes out of scope
         info!("Connection to {} will be closed", server.name);
@@ -274,20 +270,20 @@ impl NntpProxy {
         mut backend_stream: TcpStream,
     ) -> Result<(u64, u64), anyhow::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-        
+
         // Split streams for independent read/write
         let (client_read, mut client_write) = client_stream.split();
         let (mut backend_read, mut backend_write) = backend_stream.split();
         let mut client_reader = BufReader::new(client_read);
-        
+
         let mut client_to_backend_bytes = 0u64;
         let mut backend_to_client_bytes = 0u64;
-        
+
         // Handle the initial command/response phase where we intercept auth
         loop {
             let mut line = String::new();
             let mut buffer = self.buffer_pool.get_buffer().await;
-            
+
             tokio::select! {
                 // Read command from client
                 result = client_reader.read_line(&mut line) => {
@@ -299,7 +295,7 @@ impl NntpProxy {
                         Ok(_) => {
                             let trimmed = line.trim();
                             debug!("Client command: {}", trimmed);
-                            
+
                             // Intercept authentication commands
                             if trimmed.starts_with("AUTHINFO USER") {
                                 // Client is trying to authenticate - respond positively
@@ -313,16 +309,16 @@ impl NntpProxy {
                                 client_write.write_all(response).await?;
                                 backend_to_client_bytes += response.len() as u64;
                                 debug!("Intercepted AUTHINFO PASS, authenticated client");
-                            } else if trimmed.starts_with("ARTICLE") || trimmed.starts_with("BODY") || 
+                            } else if trimmed.starts_with("ARTICLE") || trimmed.starts_with("BODY") ||
                                      trimmed.starts_with("HEAD") || trimmed.starts_with("STAT") {
                                 // Forward data command to backend
                                 backend_write.write_all(line.as_bytes()).await?;
                                 client_to_backend_bytes += line.len() as u64;
                                 debug!("Forwarding data command, switching to high-throughput mode");
-                                
+
                                 // Return the buffer before transitioning
                                 self.buffer_pool.return_buffer(buffer).await;
-                                
+
                                 // For high-throughput data transfer, use our optimized copy
                                 // We need to carefully handle this transition...
                                 // For now, let's continue with the select loop but optimize for large transfers
@@ -345,7 +341,7 @@ impl NntpProxy {
                         }
                     }
                 }
-                
+
                 // Read response from backend and forward to client (for non-auth commands)
                 result = backend_read.read(&mut buffer) => {
                     match result {
@@ -365,13 +361,13 @@ impl NntpProxy {
                     }
                 }
             }
-            
+
             self.buffer_pool.return_buffer(buffer).await;
         }
-        
+
         Ok((client_to_backend_bytes, backend_to_client_bytes))
     }
-    
+
     /// Handle high-throughput data transfer after authentication is complete
     async fn handle_high_throughput_transfer(
         &self,
@@ -383,12 +379,12 @@ impl NntpProxy {
         mut backend_to_client_bytes: u64,
     ) -> Result<(u64, u64), anyhow::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-        
+
         // Continue handling commands and large data responses
         loop {
             let mut line = String::new();
             let mut buffer = self.buffer_pool.get_buffer().await;
-            
+
             tokio::select! {
                 // Continue reading client commands
                 result = client_reader.read_line(&mut line) => {
@@ -409,7 +405,7 @@ impl NntpProxy {
                         }
                     }
                 }
-                
+
                 // Read large responses from backend with optimized buffer size
                 result = backend_read.read(&mut buffer) => {
                     match result {
@@ -420,7 +416,7 @@ impl NntpProxy {
                         Ok(n) => {
                             client_write.write_all(&buffer[..n]).await?;
                             backend_to_client_bytes += n as u64;
-                            
+
                             // For very large transfers, ensure we keep reading efficiently
                             if n == buffer.len() {
                                 // Buffer was full, likely more data coming
@@ -435,10 +431,10 @@ impl NntpProxy {
                     }
                 }
             }
-            
+
             self.buffer_pool.return_buffer(buffer).await;
         }
-        
+
         Ok((client_to_backend_bytes, backend_to_client_bytes))
     }
 }

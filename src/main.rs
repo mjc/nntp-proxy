@@ -8,7 +8,7 @@ use nntp_proxy::{NntpProxy, create_default_config, load_config};
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
 fn pin_to_cpu_cores() -> Result<()> {
-    use nix::sched::{sched_setaffinity, CpuSet};
+    use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
 
     // Pin to CPU cores 0-1 for optimal performance
@@ -22,10 +22,13 @@ fn pin_to_cpu_cores() -> Result<()> {
             info!("Successfully pinned process to CPU cores 0-1 for optimal performance");
         }
         Err(e) => {
-            warn!("Failed to set CPU affinity: {}, continuing without pinning", e);
+            warn!(
+                "Failed to set CPU affinity: {}, continuing without pinning",
+                e
+            );
         }
     }
-    
+
     Ok(())
 }
 
