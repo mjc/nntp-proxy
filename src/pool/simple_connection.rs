@@ -1,42 +1,34 @@
 use anyhow::Result;
-use std::sync::Arc;
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::ServerConfig;
-
-/// Simple connection manager - no pooling, just creates connections on demand
+/// Simple connection provider - creates optimized connections on demand
+/// Can be easily replaced with a pooled implementation later
 #[derive(Debug, Clone)]
-pub struct ConnectionManager {
-    server_config: Arc<ServerConfig>,
+pub struct SimpleConnectionProvider {
+    host: String,
+    port: u16,
+    name: String,
 }
 
-impl ConnectionManager {
-    pub fn new(server_config: Arc<ServerConfig>) -> Self {
-        Self { server_config }
+impl SimpleConnectionProvider {
+    pub fn new(host: String, port: u16, name: String) -> Self {
+        Self { host, port, name }
     }
 
     /// Create a new optimized TCP connection
-    pub async fn create_connection(&self) -> Result<TcpStream> {
-        let addr = format!("{}:{}", self.server_config.host, self.server_config.port);
-        info!("Creating new connection to {}", self.server_config.name);
+    pub async fn get_connection(&self) -> Result<TcpStream> {
+        info!("Creating connection to {}", self.name);
         
-        // Use tokio's built-in connect which handles hostname resolution and async connection properly
+        let addr = format!("{}:{}", self.host, self.port);
         let stream = TcpStream::connect(&addr).await?;
         
-        // Apply optimizations after connection is established
-        Self::optimize_tcp_stream(&stream).await?;
+        // Apply basic optimization
+        let _ = stream.set_nodelay(true);
         
         Ok(stream)
     }
-
-    /// Apply TCP optimizations to an existing stream
-    async fn optimize_tcp_stream(stream: &TcpStream) -> Result<()> {
-        // Set TCP_NODELAY for lower latency
-        if let Err(e) = stream.set_nodelay(true) {
-            warn!("Failed to set TCP_NODELAY: {}", e);
-        }
-
-        Ok(())
-    }
 }
+
+/// Legacy alias for backward compatibility
+pub type ConnectionManager = SimpleConnectionProvider;

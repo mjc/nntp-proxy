@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,7 +8,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 mod pool;
-use pool::{BufferPool, ConnectionManager};
+use pool::{BufferPool, SimpleConnectionProvider};
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
@@ -40,8 +39,8 @@ pub struct ServerConfig {
 pub struct NntpProxy {
     servers: Vec<ServerConfig>,
     current_index: Arc<AtomicUsize>,
-    /// Connection managers per server (server_name -> manager)
-    connection_managers: Arc<HashMap<String, ConnectionManager>>,
+    /// Connection providers per server - easily swappable implementation
+    connection_providers: Vec<SimpleConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
 }
@@ -52,32 +51,34 @@ impl NntpProxy {
             anyhow::bail!("No servers configured");
         }
 
-        // Create connection managers for each server
-        let mut connection_managers = HashMap::new();
-        for server in &config.servers {
-            let manager = ConnectionManager::new(Arc::new(server.clone()));
-            connection_managers.insert(server.name.clone(), manager);
-            info!(
-                "Server '{}' configured with simple connections",
-                server.name
-            );
-        }
+        // Create simple connection providers for each server
+        let connection_providers: Vec<SimpleConnectionProvider> = config.servers
+            .iter()
+            .map(|server| {
+                info!("Configuring connection provider for '{}'", server.name);
+                SimpleConnectionProvider::new(
+                    server.host.clone(),
+                    server.port,
+                    server.name.clone(),
+                )
+            })
+            .collect();
 
         Ok(Self {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
-            connection_managers: Arc::new(connection_managers),
-            buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers better for 100MB files with more available
+            connection_providers,
+            buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers for high throughput
         })
     }
 
-    /// Pre-warm connections to all servers (simplified - no pooling)
+    /// Test connections to all servers (simplified)
     pub async fn prewarm_connections(&self) -> Result<()> {
         info!("Testing connections to all backend servers...");
-        for server in &self.servers {
-            let manager = self.connection_managers.get(&server.name).unwrap();
+        for (i, server) in self.servers.iter().enumerate() {
+            let provider = &self.connection_providers[i];
             // Test connection to ensure servers are reachable
-            match manager.create_connection().await {
+            match provider.get_connection().await {
                 Ok(_) => {
                     info!("Successfully tested connection to {}", server.name);
                 }
@@ -121,7 +122,8 @@ impl NntpProxy {
         info!("New client connection from {}", client_addr);
 
         // Get the next backend server
-        let server = self.next_server();
+        let server_idx = self.current_index.fetch_add(1, Ordering::Relaxed) % self.servers.len();
+        let server = &self.servers[server_idx];
         info!(
             "Routing client {} to server {}:{}",
             client_addr, server.host, server.port
@@ -133,12 +135,11 @@ impl NntpProxy {
             return Err(e.into());
         }
 
-        // Get the connection manager for this server
-        let manager = self.connection_managers.get(&server.name)
-            .ok_or_else(|| anyhow::anyhow!("No connection manager found for server {}", server.name))?;
-
-        // Create a new connection for this request
-        let mut backend_stream = match manager.create_connection().await {
+        // Get the connection manager for this server and create connection
+        let mut backend_stream = match self.connection_providers[server_idx]
+            .get_connection()
+            .await
+        {
             Ok(stream) => {
                 info!("Created new connection to {}", server.name);
                 stream
