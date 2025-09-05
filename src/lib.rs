@@ -1,14 +1,14 @@
 use anyhow::Result;
 use crossbeam::queue::SegQueue;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 /// Default maximum connections per server
@@ -27,12 +27,43 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
+    /// Create a page-aligned buffer for optimal DMA performance
+    fn create_aligned_buffer(size: usize) -> Vec<u8> {
+        // Align to page boundaries (4KB) for better memory performance
+        let page_size = 4096;
+        let aligned_size = ((size + page_size - 1) / page_size) * page_size;
+
+        // Use aligned allocation for better cache performance
+        let mut buffer = Vec::with_capacity(aligned_size);
+        buffer.resize(size, 0);
+        buffer
+    }
+
     pub fn new(buffer_size: usize, max_pool_size: usize) -> Self {
+        let pool = Arc::new(SegQueue::new());
+        let pool_size = Arc::new(AtomicUsize::new(0));
+
+        // Pre-allocate all buffers at startup to eliminate allocation overhead
+        info!(
+            "Pre-allocating {} buffers of {}KB each ({}MB total)",
+            max_pool_size,
+            buffer_size / 1024,
+            (max_pool_size * buffer_size) / (1024 * 1024)
+        );
+
+        for _ in 0..max_pool_size {
+            let buffer = Self::create_aligned_buffer(buffer_size);
+            pool.push(buffer);
+            pool_size.fetch_add(1, Ordering::Relaxed);
+        }
+
+        info!("Buffer pool pre-allocation complete");
+
         Self {
-            pool: Arc::new(SegQueue::new()),
+            pool,
             buffer_size,
             max_pool_size,
-            pool_size: Arc::new(AtomicUsize::new(0)),
+            pool_size,
         }
     }
 
@@ -48,18 +79,6 @@ impl BufferPool {
             // Create new page-aligned buffer for better DMA performance
             Self::create_aligned_buffer(self.buffer_size)
         }
-    }
-
-    /// Create a page-aligned buffer for optimal DMA performance
-    fn create_aligned_buffer(size: usize) -> Vec<u8> {
-        // Align to page boundaries (4KB) for better memory performance
-        let page_size = 4096;
-        let aligned_size = ((size + page_size - 1) / page_size) * page_size;
-
-        // Use aligned allocation for better cache performance
-        let mut buffer = Vec::with_capacity(aligned_size);
-        buffer.resize(size, 0);
-        buffer
     }
 
     /// Return a buffer to the pool (lock-free)
@@ -98,17 +117,27 @@ pub struct ServerConfig {
 /// Pooled connection wrapper
 #[derive(Debug)]
 pub struct PooledConnection {
-    stream: TcpStream,
-    server_name: String,
-    authenticated: bool,
+    pub stream: TcpStream,
+    pub server_name: String,
+    pub authenticated: bool,
+    pool: Arc<SegQueue<TcpStream>>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl PooledConnection {
-    pub fn new(stream: TcpStream, server_name: String, authenticated: bool) -> Self {
+    pub fn new(
+        stream: TcpStream,
+        server_name: String,
+        authenticated: bool,
+        pool: Arc<SegQueue<TcpStream>>,
+        active_connections: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             stream,
             server_name,
             authenticated,
+            pool,
+            active_connections,
         }
     }
 
@@ -128,16 +157,77 @@ impl PooledConnection {
 /// Connection pool for backend servers
 #[derive(Debug, Clone)]
 pub struct ConnectionPool {
-    pools: Arc<Mutex<HashMap<String, VecDeque<PooledConnection>>>>,
-    max_pool_size: usize,
+    pool: Arc<SegQueue<TcpStream>>,
+    max_connections: usize,
+    active_connections: Arc<AtomicUsize>,
+    initialized: Arc<AtomicBool>,
 }
 
 impl ConnectionPool {
-    pub fn new(max_pool_size: usize) -> Self {
+    pub fn new(max_connections: usize) -> Self {
         Self {
-            pools: Arc::new(Mutex::new(HashMap::new())),
-            max_pool_size,
+            pool: Arc::new(SegQueue::new()),
+            max_connections,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            initialized: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Pre-establish all connections on first request for maximum performance
+    async fn initialize_connections(&self, server: &ServerConfig) -> Result<()> {
+        // Use compare_exchange to ensure only one thread initializes
+        if self
+            .initialized
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            info!(
+                "Pre-establishing {} connections to {}",
+                self.max_connections, server.name
+            );
+
+            // Pre-establish all connections in parallel for faster startup
+            let mut tasks = Vec::new();
+            for i in 0..self.max_connections {
+                let server_addr = format!("{}:{}", server.host, server.port);
+                let server_name = server.name.clone();
+                let pool = Arc::clone(&self.pool);
+                let active_connections = Arc::clone(&self.active_connections);
+
+                let task = tokio::spawn(async move {
+                    match Self::create_optimized_tcp_stream(&server_addr).await {
+                        Ok(stream) => {
+                            pool.push(stream);
+                            active_connections.fetch_add(1, Ordering::Relaxed);
+                            debug!("Pre-established connection {} to {}", i + 1, server_name);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to pre-establish connection {} to {}: {}",
+                                i + 1,
+                                server_name,
+                                e
+                            );
+                            Err(e)
+                        }
+                    }
+                });
+                tasks.push(task);
+            }
+
+            // Wait for all connections to be established
+            for task in tasks {
+                let _ = task.await;
+            }
+
+            let established = self.active_connections.load(Ordering::Relaxed);
+            info!(
+                "Successfully pre-established {}/{} connections to {} in parallel",
+                established, self.max_connections, server.name
+            );
+        }
+        Ok(())
     }
 
     /// Get a connection from the pool or create a new one
@@ -146,25 +236,27 @@ impl ConnectionPool {
         server: &ServerConfig,
         _proxy: &NntpProxy,
     ) -> Result<PooledConnection> {
-        let mut pools = self.pools.lock().await;
-        let pool = pools
-            .entry(server.name.clone())
-            .or_insert_with(VecDeque::new);
+        // Pre-establish all connections on first request
+        if !self.initialized.load(Ordering::Acquire) {
+            self.initialize_connections(server).await?;
+        }
 
         // Try to get a connection from the pool
-        if let Some(pooled_conn) = pool.pop_front() {
+        if let Some(stream) = self.pool.pop() {
             // Test if the connection is still alive by trying a non-blocking read
             let mut test_buf = [0u8; 1];
-            match pooled_conn.stream.try_read(&mut test_buf) {
+            match stream.try_read(&mut test_buf) {
                 Ok(0) => {
-                    // Connection was closed by server
+                    // Connection was closed by server, decrease count and create new one
+                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
                     info!(
                         "Pooled connection to {} was closed, creating new one",
                         server.name
                     );
                 }
                 Ok(_) => {
-                    // Got unexpected data, connection might be in use
+                    // Got unexpected data, connection might be in use, decrease count and create new one
+                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
                     info!(
                         "Pooled connection to {} has unexpected data, creating new one",
                         server.name
@@ -172,14 +264,18 @@ impl ConnectionPool {
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Connection is alive and ready
-                    info!(
-                        "Reusing pooled connection to {} (authenticated: {})",
-                        server.name, pooled_conn.authenticated
-                    );
-                    return Ok(pooled_conn);
+                    info!("Reusing pooled connection to {}", server.name);
+                    return Ok(PooledConnection {
+                        stream,
+                        server_name: server.name.clone(),
+                        authenticated: false, // Reset authentication state for safety
+                        pool: Arc::clone(&self.pool),
+                        active_connections: Arc::clone(&self.active_connections),
+                    });
                 }
                 Err(_) => {
-                    // Connection error, create new one
+                    // Connection error, decrease count and create new one
+                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
                     info!(
                         "Pooled connection to {} has error, creating new one",
                         server.name
@@ -194,7 +290,13 @@ impl ConnectionPool {
         let stream = Self::create_optimized_tcp_stream(&backend_addr).await?;
 
         // Return unauthenticated connection - authentication will be handled by caller
-        let pooled_conn = PooledConnection::new(stream, server.name.clone(), false);
+        let pooled_conn = PooledConnection::new(
+            stream,
+            server.name.clone(),
+            false,
+            Arc::clone(&self.pool),
+            Arc::clone(&self.active_connections),
+        );
         Ok(pooled_conn)
     }
 
@@ -240,7 +342,7 @@ impl ConnectionPool {
                     &buffer_size as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
-                
+
                 // Enable TCP keep-alive for connection reuse
                 let keepalive = 1i32;
                 libc::setsockopt(
@@ -250,12 +352,12 @@ impl ConnectionPool {
                     &keepalive as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
-                
+
                 // Set aggressive keep-alive timing for high-performance scenarios
-                let keepalive_time = 60i32;  // Start probes after 60 seconds
-                let keepalive_interval = 10i32;  // Probe every 10 seconds
-                let keepalive_probes = 3i32;  // 3 failed probes before considering dead
-                
+                let keepalive_time = 60i32; // Start probes after 60 seconds
+                let keepalive_interval = 10i32; // Probe every 10 seconds
+                let keepalive_probes = 3i32; // 3 failed probes before considering dead
+
                 libc::setsockopt(
                     fd,
                     libc::IPPROTO_TCP,
@@ -277,7 +379,7 @@ impl ConnectionPool {
                     &keepalive_probes as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
-                
+
                 // Enable TCP_CORK for better packet batching at high speeds
                 let cork_flag = 1i32;
                 libc::setsockopt(
@@ -287,7 +389,7 @@ impl ConnectionPool {
                     &cork_flag as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
-                
+
                 // Enable socket reuse for better connection distribution
                 let reuse_addr = 1i32;
                 libc::setsockopt(
@@ -297,7 +399,7 @@ impl ConnectionPool {
                     &reuse_addr as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
-                
+
                 // Enable port reuse for better performance
                 let reuse_port = 1i32;
                 libc::setsockopt(
@@ -316,25 +418,47 @@ impl ConnectionPool {
 
     /// Return a connection to the pool
     pub async fn return_connection(&self, conn: PooledConnection) {
-        if self.max_pool_size == 0 {
-            return; // Pooling disabled
+        if self.active_connections.load(Ordering::Relaxed) >= self.max_connections {
+            info!("Pool is full, closing connection to {}", conn.server_name);
+            return; // Pool is full, just drop the connection
         }
 
-        let mut pools = self.pools.lock().await;
-        let pool = pools
-            .entry(conn.server_name.clone())
-            .or_insert_with(VecDeque::new);
-
-        if pool.len() < self.max_pool_size {
-            info!(
-                "Returning connection to {} to pool ({} pooled)",
-                conn.server_name,
-                pool.len() + 1
-            );
-            pool.push_back(conn);
-        } else {
-            info!("Pool for {} is full, closing connection", conn.server_name);
-            // Connection will be dropped and closed
+        // Test if the connection is still alive before returning to pool
+        let mut test_buf = [0u8; 1];
+        match conn.stream.try_read(&mut test_buf) {
+            Ok(0) => {
+                // Connection was closed by server
+                info!(
+                    "Connection to {} was closed by server, not returning to pool",
+                    conn.server_name
+                );
+                self.active_connections.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+            Ok(_) => {
+                // Got unexpected data, connection might be in use
+                info!(
+                    "Connection to {} has unexpected data, not returning to pool",
+                    conn.server_name
+                );
+                self.active_connections.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Connection is alive and ready
+                info!("Returning connection to {} to pool", conn.server_name);
+                self.pool.push(conn.stream);
+                // Don't decrement active_connections here since we're keeping the connection
+            }
+            Err(_) => {
+                // Connection error
+                info!(
+                    "Connection to {} has error, not returning to pool",
+                    conn.server_name
+                );
+                self.active_connections.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
         }
     }
 }
@@ -372,9 +496,31 @@ impl NntpProxy {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
             connection_semaphores: Arc::new(connection_semaphores),
-            connection_pool: ConnectionPool::new(5), // Max 5 pooled connections per server
-            buffer_pool: BufferPool::new(262144, 8), // 256KB buffers, max 8 in pool for high throughput
+            connection_pool: ConnectionPool::new(16), // Max 16 pooled connections per server for better small file performance
+            buffer_pool: BufferPool::new(1024 * 1024, 16), // 1MB buffers with more pre-allocated for small file efficiency
         })
+    }
+
+    /// Pre-warm connections to all servers for optimal small file performance
+    pub async fn prewarm_connections(&self) -> Result<()> {
+        info!("Pre-warming connections to all backend servers...");
+        for server in &self.servers {
+            // Pre-establish connections to reduce small file latency
+            for i in 0..4 {
+                // Pre-establish 4 connections per server
+                match self.connection_pool.get_connection(server, self).await {
+                    Ok(conn) => {
+                        info!("Pre-warmed connection {}/4 to {}", i + 1, server.name);
+                        self.connection_pool.return_connection(conn).await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to pre-warm connection to {}: {}", server.name, e);
+                    }
+                }
+            }
+        }
+        info!("Connection pre-warming complete");
+        Ok(())
     }
 
     /// Get the next server using round-robin
@@ -480,21 +626,40 @@ impl NntpProxy {
                 "Using already authenticated pooled connection to {}",
                 server.name
             );
+            // Fast path: skip greeting for small transfers to reduce latency
             if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
                 error!("Failed to send greeting to client: {}", e);
                 return Err(e);
             }
 
-            // Handle any client authentication attempts by responding with success
-            if let Err(e) = self
-                .handle_client_auth_requests(&mut client_stream, &mut backend_stream)
-                .await
-            {
-                error!("Error handling client authentication: {}", e);
-                // Don't return error here, continue with normal proxying
+            // Skip client auth handling for pooled authenticated connections to reduce overhead
+        } else if is_pooled {
+            // For unauthenticated pooled connections, minimal setup
+            if let (Some(username), Some(password)) = (&server.username, &server.password) {
+                info!(
+                    "Quick authentication for pooled connection to {}",
+                    server.name
+                );
+
+                if let Err(e) = self
+                    .authenticate_backend(&mut backend_stream, username, password)
+                    .await
+                {
+                    error!("Quick authentication failed for {}: {}", server.name, e);
+                    let _ = client_stream
+                        .write_all(b"502 Authentication failed\r\n")
+                        .await;
+                    return Err(e);
+                }
+
+                // Fast greeting without extra client auth handling
+                if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
+                    error!("Failed to send greeting to client: {}", e);
+                    return Err(e);
+                }
             }
         } else {
-            // For unauthenticated connections (pooled or new), perform authentication if needed
+            // For new connections, perform full authentication if needed
             if let (Some(username), Some(password)) = (&server.username, &server.password) {
                 info!("Performing NNTP authentication for {}", server.name);
 
@@ -573,7 +738,13 @@ impl NntpProxy {
             server.username.is_some() && server.password.is_some()
         };
 
-        let pooled_conn = PooledConnection::new(backend_stream, server_name, was_authenticated);
+        let pooled_conn = PooledConnection::new(
+            backend_stream,
+            server_name,
+            was_authenticated,
+            Arc::clone(&self.connection_pool.pool),
+            Arc::clone(&self.connection_pool.active_connections),
+        );
         self.connection_pool.return_connection(pooled_conn).await;
         info!(
             "Returned connection to pool for {} (authenticated: {})",
@@ -681,7 +852,7 @@ impl NntpProxy {
                 response.trim()
             ))
         };
-        
+
         // Return buffer to pool
         self.buffer_pool.return_buffer(buffer).await;
         result
@@ -782,7 +953,16 @@ impl NntpProxy {
         client_stream: &mut TcpStream,
         backend_stream: &mut TcpStream,
     ) -> Result<(u64, u64), std::io::Error> {
-        debug!("Attempting zero-copy bidirectional transfer with tokio-splice2");
+        debug!("Starting optimized zero-copy bidirectional transfer");
+
+        // Apply aggressive socket optimizations for 1GB+ transfers
+        if let Err(e) = Self::set_high_throughput_optimizations(client_stream) {
+            debug!("Failed to set client socket optimizations: {}", e);
+        }
+        if let Err(e) = Self::set_high_throughput_optimizations(backend_stream) {
+            debug!("Failed to set backend socket optimizations: {}", e);
+        }
+
         match tokio_splice2::copy_bidirectional(client_stream, backend_stream).await {
             Ok(traffic_result) => {
                 debug!(
@@ -798,6 +978,59 @@ impl NntpProxy {
                 Err(e)
             }
         }
+    }
+
+    /// Set socket optimizations for high-throughput transfers
+    fn set_high_throughput_optimizations(stream: &TcpStream) -> Result<(), std::io::Error> {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+
+        unsafe {
+            // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
+            // (opposite of small transfer optimization)
+
+            // Enable TCP_QUICKACK for immediate ACKs
+            let quickack: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &quickack as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Set larger TCP window scaling for high bandwidth-delay product
+            let window_clamp: libc::c_int = 16 * 1024 * 1024; // 16MB window
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_WINDOW_CLAMP,
+                &window_clamp as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Optimize for high throughput with TCP_CORK equivalent (defer small packets)
+            let cork: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CORK,
+                &cork as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Immediately uncork to flush
+            let uncork: libc::c_int = 0;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CORK,
+                &uncork as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        Ok(())
     }
 
     /// High-performance bidirectional copy with zero-copy optimization
@@ -840,7 +1073,7 @@ impl NntpProxy {
                             Err(e) => return Err(e),
                         }
                     }
-                    // Copy from writer to reader with larger buffers  
+                    // Copy from writer to reader with larger buffers
                     result = writer.read(&mut buf2) => {
                         match result {
                             Ok(0) => break, // EOF
