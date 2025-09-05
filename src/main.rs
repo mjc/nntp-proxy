@@ -25,19 +25,24 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load configuration
-    let config = match load_config(&args.config).or_else(|_| {
-        warn!("Config file not found, creating default config");
+    let config = if std::path::Path::new(&args.config).exists() {
+        // File exists, try to load it
+        match load_config(&args.config) {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Failed to load existing config file '{}': {}", args.config, e);
+                error!("Please check your config file syntax and try again");
+                return Err(e);
+            }
+        }
+    } else {
+        // File doesn't exist, create default
+        warn!("Config file '{}' not found, creating default config", args.config);
         let default_config = create_default_config();
         let config_toml = toml::to_string_pretty(&default_config)?;
         std::fs::write(&args.config, &config_toml)?;
         info!("Created default config file: {}", args.config);
-        Ok(default_config)
-    }) {
-        Ok(config) => config,
-        Err(e) => {
-            error!("Failed to load or create config: {}", e);
-            return Err(e);
-        }
+        default_config
     };
     
     info!("Loaded {} backend servers:", config.servers.len());
