@@ -8,27 +8,24 @@ use nntp_proxy::{NntpProxy, create_default_config, load_config};
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
 fn pin_to_cpu_cores() -> Result<()> {
-    // Pin to CPU cores 0-3 for optimal performance
+    use nix::sched::{sched_setaffinity, CpuSet};
+    use nix::unistd::Pid;
+
+    // Pin to CPU cores 0-1 for optimal performance
     // This reduces context switching and improves cache locality
-    unsafe {
-        let mut cpu_set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut cpu_set);
-        libc::CPU_SET(0, &mut cpu_set);
-        libc::CPU_SET(1, &mut cpu_set);
+    let mut cpu_set = CpuSet::new();
+    cpu_set.set(0)?; // CPU 0
+    cpu_set.set(1)?; // CPU 1
 
-        let result = libc::sched_setaffinity(
-            0, // current process
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &cpu_set,
-        );
-
-        if result != 0 {
-            warn!("Failed to set CPU affinity, continuing without pinning");
-        } else {
+    match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+        Ok(_) => {
             info!("Successfully pinned process to CPU cores 0-1 for optimal performance");
         }
+        Err(e) => {
+            warn!("Failed to set CPU affinity: {}, continuing without pinning", e);
+        }
     }
-
+    
     Ok(())
 }
 
