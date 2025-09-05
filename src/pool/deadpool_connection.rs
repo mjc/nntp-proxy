@@ -4,7 +4,7 @@ use deadpool::managed;
 use tokio::net::TcpStream;
 use tracing::{info, debug, warn};
 
-use crate::pool::connection_trait::{ConnectionProvider, PoolStatus, ConnectionType};
+use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
@@ -202,31 +202,6 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
             Err(e) => {
                 warn!("Failed to get connection from pool for {}: {}", self.name, e);
                 Err(anyhow::anyhow!("Pool connection failed: {}", e))
-            }
-        }
-    }
-    
-    /// Get a typed connection that indicates whether authentication is needed
-    async fn get_typed_connection(&self) -> Result<ConnectionType> {
-        use deadpool::managed::{Object, Manager};
-        
-        // Try to get a connection from the pool first
-        match self.pool.get().await {
-            Ok(obj) => {
-                debug!("Retrieved pooled connection (pre-authenticated) for {}", self.name);
-                let stream = Object::take(obj);
-                Ok(ConnectionType::Pooled(stream))
-            }
-            Err(e) => {
-                warn!("Failed to get pooled connection for {}, creating fresh: {}", self.name, e);
-                // Fall back to creating a fresh connection using the same manager logic
-                let manager = TcpManager {
-                    host: self.pool.manager().host().to_string(),
-                    port: self.pool.manager().port(),
-                    name: self.name.clone(),
-                };
-                let stream = manager.create().await?;
-                Ok(ConnectionType::Fresh(stream))
             }
         }
     }
