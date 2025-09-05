@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tracing::{error, info, warn};
 
 use nntp_proxy::{NntpProxy, create_default_config, load_config};
@@ -130,6 +131,16 @@ async fn run_proxy(args: Args) -> Result<()> {
     let listener = TcpListener::bind(&listen_addr).await?;
     info!("NNTP proxy listening on {}", listen_addr);
 
+    // Set up graceful shutdown
+    let proxy_for_shutdown = proxy.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Shutdown signal received, closing idle connections...");
+        proxy_for_shutdown.graceful_shutdown().await;
+        info!("Graceful shutdown complete");
+        std::process::exit(0);
+    });
+
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
@@ -144,5 +155,30 @@ async fn run_proxy(args: Args) -> Result<()> {
                 error!("Failed to accept connection: {}", e);
             }
         }
+    }
+}
+
+/// Wait for shutdown signal
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }
