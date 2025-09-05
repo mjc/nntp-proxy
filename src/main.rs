@@ -5,6 +5,39 @@ use tracing::{error, info, warn};
 
 use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
+/// Pin current process to specific CPU cores for optimal performance
+#[cfg(target_os = "linux")]
+fn pin_to_cpu_cores() -> Result<()> {
+    // Pin to CPU cores 0-3 for optimal performance
+    // This reduces context switching and improves cache locality
+    unsafe {
+        let mut cpu_set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut cpu_set);
+        libc::CPU_SET(0, &mut cpu_set);
+        libc::CPU_SET(1, &mut cpu_set);
+
+        let result = libc::sched_setaffinity(
+            0, // current process
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &cpu_set,
+        );
+
+        if result != 0 {
+            warn!("Failed to set CPU affinity, continuing without pinning");
+        } else {
+            info!("Successfully pinned process to CPU cores 0-1 for optimal performance");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_to_cpu_cores() -> Result<()> {
+    info!("CPU pinning not available on this platform");
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -26,6 +59,9 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // Pin to specific CPU cores for optimal performance
+    pin_to_cpu_cores()?;
 
     // Log threading info
     let num_cpus = std::thread::available_parallelism()
