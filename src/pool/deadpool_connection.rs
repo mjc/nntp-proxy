@@ -38,8 +38,26 @@ impl TcpManager {
         let domain = if socket_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         
-        // Enable keepalive
+        // Set socket buffer sizes for high throughput (2MB each)
+        socket.set_recv_buffer_size(2 * 1024 * 1024)?;
+        socket.set_send_buffer_size(2 * 1024 * 1024)?;
+
+        // Enable keepalive for connection reuse
+        socket.set_keepalive(true)?;
+
+        // Set aggressive keepalive timing for high-performance scenarios
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
+            // Start probes after 60 seconds, probe every 10 seconds
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(10));
+            socket.set_tcp_keepalive(&keepalive)?;
+        }
+        
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // Fallback for non-Linux platforms
             let keepalive = socket2::TcpKeepalive::new()
                 .with_time(std::time::Duration::from_secs(60))
                 .with_interval(std::time::Duration::from_secs(10));
@@ -51,6 +69,9 @@ impl TcpManager {
 
         // Set reuse address for quick restart
         socket.set_reuse_address(true)?;
+
+        // Note: set_reuse_port is not available in socket2 0.5 on all platforms
+        // It's primarily a Linux feature anyway
 
         // Connect to the target
         socket.connect(&socket_addr.into())?;
