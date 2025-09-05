@@ -1,4 +1,4 @@
-//! Connectiuse deadpool_connection::DeadpoolConnectionProvider; and buffer pooling modules
+//! Connection deadpool_connection::DeadpoolConnectionProvider; and buffer pooling modules
 //!
 //! This module provides connection management and buffer pooling for the NNTP proxy.
 //! Uses simple connection providers that can be easily swapped out.
