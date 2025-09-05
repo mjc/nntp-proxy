@@ -9,7 +9,6 @@ use tracing::{debug, error, info, warn};
 
 mod pool;
 use pool::{BufferPool, DeadpoolConnectionProvider, ConnectionProvider};
-use pool::connection_trait::ConnectionType;
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
@@ -241,15 +240,11 @@ impl NntpProxy {
         }
 
         // Get the connection manager for this server and create connection
-        // Use typed connection to optimize authentication
-        let backend_connection = match self.connection_providers[server_idx].get_typed_connection().await
+        let mut backend_stream = match self.connection_providers[server_idx].get_connection().await
         {
-            Ok(connection) => {
-                match &connection {
-                    ConnectionType::Fresh(_) => debug!("Created fresh connection to {} (requires auth)", server.name),
-                    ConnectionType::Pooled(_) => debug!("Retrieved pooled connection to {} (pre-authenticated)", server.name),
-                }
-                connection
+            Ok(stream) => {
+                debug!("Retrieved connection from pool for {}", server.name);
+                stream
             }
             Err(e) => {
                 error!("Failed to connect to {}: {}", server.name, e);
@@ -263,29 +258,19 @@ impl NntpProxy {
         let backend_addr = format!("{}:{}", server.host, server.port);
         debug!("Connected to backend server {}", backend_addr);
 
-        // Extract the stream and determine if authentication is needed
-        let (mut backend_stream, needs_auth) = match backend_connection {
-            ConnectionType::Fresh(stream) => (stream, true),
-            ConnectionType::Pooled(stream) => (stream, false),
-        };
-
-        // Only authenticate if this is a fresh connection that needs it
-        if needs_auth {
-            if let (Some(username), Some(password)) = (&server.username, &server.password) {
-                if let Err(e) = self
-                    .authenticate_backend(&mut backend_stream, username, password)
-                    .await
-                {
-                    error!("Authentication failed for {}: {}", server.name, e);
-                    let _ = client_stream
-                        .write_all(b"502 Authentication failed\r\n")
-                        .await;
-                    return Err(e);
-                }
-                debug!("Successfully authenticated fresh connection to {}", server.name);
+        // All connections need authentication since Object::take() gives us fresh connections
+        if let (Some(username), Some(password)) = (&server.username, &server.password) {
+            if let Err(e) = self
+                .authenticate_backend(&mut backend_stream, username, password)
+                .await
+            {
+                error!("Authentication failed for {}: {}", server.name, e);
+                let _ = client_stream
+                    .write_all(b"502 Authentication failed\r\n")
+                    .await;
+                return Err(e);
             }
-        } else {
-            debug!("Skipping authentication for pre-authenticated pooled connection to {}", server.name);
+            debug!("Successfully authenticated connection to {}", server.name);
         }
 
         // Now implement intelligent proxying that handles client authentication
@@ -435,14 +420,6 @@ impl NntpProxy {
                                 client_write.write_all(response).await?;
                                 backend_to_client_bytes += response.len() as u64;
                                 debug!("Intercepted AUTHINFO PASS, authenticated client");
-                            } else if trimmed.eq_ignore_ascii_case("QUIT") {
-                                // Client wants to disconnect - handle locally without forwarding to backend
-                                let response = b"205 Closing connection - goodbye!\r\n";
-                                client_write.write_all(response).await?;
-                                backend_to_client_bytes += response.len() as u64;
-                                debug!("Intercepted QUIT command, closing client connection");
-                                self.buffer_pool.return_buffer(buffer).await;
-                                break; // Close client connection, keep backend for pool reuse
                             } else if trimmed.starts_with("ARTICLE") || trimmed.starts_with("BODY") ||
                                      trimmed.starts_with("HEAD") || trimmed.starts_with("STAT") {
                                 // Forward data command to backend
@@ -532,20 +509,10 @@ impl NntpProxy {
                     match result {
                         Ok(0) => break,
                         Ok(_) => {
-                            let trimmed = line.trim();
-                            
-                            // Intercept QUIT command even in high-throughput mode
-                            if trimmed.eq_ignore_ascii_case("QUIT") {
-                                let response = b"205 Closing connection - goodbye!\r\n";
-                                client_write.write_all(response).await?;
-                                backend_to_client_bytes += response.len() as u64;
-                                debug!("Intercepted QUIT command in high-throughput mode");
-                                break; // Close client connection, keep backend for pool reuse
-                            } else {
-                                // Forward other commands to backend
-                                backend_write.write_all(line.as_bytes()).await?;
-                                client_to_backend_bytes += line.len() as u64;
-                            }
+                            // Forward all commands including QUIT to backend
+                            // This maintains proper NNTP protocol flow
+                            backend_write.write_all(line.as_bytes()).await?;
+                            client_to_backend_bytes += line.len() as u64;
                         }
                         Err(e) => {
                             warn!("Error reading client command: {}", e);
