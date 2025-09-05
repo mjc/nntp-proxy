@@ -561,6 +561,7 @@ dependencies = [
  "clap",
  "rek2_nntp",
  "serde",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
