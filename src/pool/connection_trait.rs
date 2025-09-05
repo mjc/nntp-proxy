@@ -4,6 +4,7 @@ use tokio::net::TcpStream;
 
 /// Generic connection pool status information
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Used in greetings and monitoring
 pub struct PoolStatus {
     pub available: usize,
     pub max_size: usize,
@@ -17,5 +18,6 @@ pub trait ConnectionProvider: Send + Sync + Clone + std::fmt::Debug {
     async fn get_connection(&self) -> Result<TcpStream>;
     
     /// Get current pool status for monitoring
+    #[allow(dead_code)] // Used for client greetings
     fn status(&self) -> PoolStatus;
 }
