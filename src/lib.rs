@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
@@ -174,11 +174,60 @@ impl ConnectionPool {
         // Create new connection - don't authenticate here, let the caller handle it
         info!("Creating new connection to {} for pooling", server.name);
         let backend_addr = format!("{}:{}", server.host, server.port);
-        let stream = TcpStream::connect(&backend_addr).await?;
+        let stream = Self::create_optimized_tcp_stream(&backend_addr).await?;
 
         // Return unauthenticated connection - authentication will be handled by caller
         let pooled_conn = PooledConnection::new(stream, server.name.clone(), false);
         Ok(pooled_conn)
+    }
+
+    /// Create an optimized TCP stream with performance tuning
+    async fn create_optimized_tcp_stream(addr: &str) -> Result<TcpStream, std::io::Error> {
+        use std::net::{SocketAddr, ToSocketAddrs};
+
+        // Parse the address
+        let socket_addr: SocketAddr = addr.to_socket_addrs()?.next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address")
+        })?;
+
+        // Create socket with optimizations
+        let socket = if socket_addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+
+        // Apply TCP optimizations
+        socket.set_nodelay(true)?; // Disable Nagle's algorithm for low latency
+
+        // Set socket buffer sizes for high throughput
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+
+            // Set larger socket buffers (256KB each)
+            let buffer_size = 256 * 1024i32;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buffer_size as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buffer_size as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
+
+        // Connect with the optimized socket
+        socket.connect(socket_addr).await
     }
 
     /// Return a connection to the pool
@@ -325,7 +374,7 @@ impl NntpProxy {
                 Err(_) => {
                     // If no pooled connection available, create a new one
                     info!("Creating new connection to {}", backend_addr);
-                    match TcpStream::connect(&backend_addr).await {
+                    match ConnectionPool::create_optimized_tcp_stream(&backend_addr).await {
                         Ok(stream) => (stream, false, server.name.clone(), false),
                         Err(e) => {
                             error!("Failed to connect to backend {}: {}", backend_addr, e);
@@ -404,10 +453,31 @@ impl NntpProxy {
             }
         }
 
-        // Use custom high-performance bidirectional copying with pooled buffers
-        let copy_result = self
-            .copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
-            .await;
+        // Try zero-copy first (Linux only), then fall back to high-performance buffered copying
+        let copy_result = {
+            #[cfg(target_os = "linux")]
+            {
+                match self
+                    .copy_bidirectional_zero_copy(&mut client_stream, &mut backend_stream)
+                    .await
+                {
+                    Ok(result) => {
+                        debug!("Zero-copy successful");
+                        Ok(result)
+                    }
+                    Err(_) => {
+                        debug!("Zero-copy failed, falling back to buffered copy");
+                        self.copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
+                            .await
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
+                    .await
+            }
+        };
 
         // Always try to return the connection to the pool (whether it was originally pooled or newly created)
         // Determine if authentication was performed in this session
@@ -617,8 +687,33 @@ impl NntpProxy {
         }
     }
 
-    /// High-performance bidirectional copy with pooled buffers
-    /// Uses reusable 64KB buffers from the buffer pool for better performance
+    /// Zero-copy bidirectional copy specifically for TcpStream pairs (Linux only)
+    #[cfg(target_os = "linux")]
+    async fn copy_bidirectional_zero_copy(
+        &self,
+        client_stream: &mut TcpStream,
+        backend_stream: &mut TcpStream,
+    ) -> Result<(u64, u64), std::io::Error> {
+        debug!("Attempting zero-copy bidirectional transfer with tokio-splice2");
+        match tokio_splice2::copy_bidirectional(client_stream, backend_stream).await {
+            Ok(traffic_result) => {
+                debug!(
+                    "Zero-copy transfer successful: {} bytes (client->server: {}, server->client: {})",
+                    traffic_result.tx + traffic_result.rx,
+                    traffic_result.tx,
+                    traffic_result.rx
+                );
+                Ok((traffic_result.tx as u64, traffic_result.rx as u64))
+            }
+            Err(e) => {
+                debug!("Zero-copy failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// High-performance bidirectional copy with zero-copy optimization
+    /// Attempts zero-copy transfer on Linux, falls back to pooled buffers
     async fn copy_bidirectional_buffered<R, W>(
         &self,
         mut reader: R,
@@ -628,6 +723,8 @@ impl NntpProxy {
         R: AsyncRead + AsyncWrite + Unpin,
         W: AsyncRead + AsyncWrite + Unpin,
     {
+        // Use buffered copy with pooled buffers for generic streams
+        // Zero-copy is handled by the specialized copy_bidirectional_zero_copy method
         use std::io::ErrorKind;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
