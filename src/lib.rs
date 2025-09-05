@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
@@ -440,122 +440,6 @@ impl NntpProxy {
         }
         
         Ok((client_to_backend_bytes, backend_to_client_bytes))
-    }
-
-    /// Zero-copy bidirectional copy specifically for TcpStream pairs (Linux only)
-    #[cfg(target_os = "linux")]
-    async fn copy_bidirectional_zero_copy(
-        &self,
-        client_stream: &mut TcpStream,
-        backend_stream: &mut TcpStream,
-    ) -> Result<(u64, u64), std::io::Error> {
-        debug!("Starting optimized zero-copy bidirectional transfer");
-
-        // Apply aggressive socket optimizations for 1GB+ transfers
-        if let Err(e) = Self::set_high_throughput_optimizations(client_stream) {
-            debug!("Failed to set client socket optimizations: {}", e);
-        }
-        if let Err(e) = Self::set_high_throughput_optimizations(backend_stream) {
-            debug!("Failed to set backend socket optimizations: {}", e);
-        }
-
-        match tokio_splice2::copy_bidirectional(client_stream, backend_stream).await {
-            Ok(traffic_result) => {
-                debug!(
-                    "Zero-copy transfer successful: {} bytes (client->server: {}, server->client: {})",
-                    traffic_result.tx + traffic_result.rx,
-                    traffic_result.tx,
-                    traffic_result.rx
-                );
-                Ok((traffic_result.tx as u64, traffic_result.rx as u64))
-            }
-            Err(e) => {
-                debug!("Zero-copy failed: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Set socket optimizations for high-throughput transfers using socket2
-    fn set_high_throughput_optimizations(stream: &TcpStream) -> Result<(), std::io::Error> {
-        use socket2::SockRef;
-
-        let sock_ref = SockRef::from(stream);
-
-        // Set larger buffer sizes for high throughput
-        sock_ref.set_recv_buffer_size(16 * 1024 * 1024)?; // 16MB
-        sock_ref.set_send_buffer_size(16 * 1024 * 1024)?; // 16MB
-
-        // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
-        // (socket2 doesn't expose some advanced TCP options like TCP_QUICKACK, TCP_CORK)
-        // but the basic optimizations are sufficient for most use cases
-
-        Ok(())
-    }
-
-    /// High-performance bidirectional copy with zero-copy optimization
-    /// Attempts zero-copy transfer on Linux, falls back to pooled buffers
-    async fn copy_bidirectional_buffered<R, W>(
-        &self,
-        mut reader: R,
-        mut writer: W,
-    ) -> Result<(u64, u64), std::io::Error>
-    where
-        R: AsyncRead + AsyncWrite + Unpin,
-        W: AsyncRead + AsyncWrite + Unpin,
-    {
-        // Use high-throughput buffered copy with pooled buffers for generic streams
-        // Zero-copy is handled by the specialized copy_bidirectional_zero_copy method
-        // Optimized for sustained high-throughput transfers
-        use std::io::ErrorKind;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // Get larger buffers from the pool (256KB for high throughput)
-        let mut buf1 = self.buffer_pool.get_buffer().await;
-        let mut buf2 = self.buffer_pool.get_buffer().await;
-
-        let mut transferred_a_to_b = 0u64;
-        let mut transferred_b_to_a = 0u64;
-
-        // High-throughput copy with 256KB buffers reduces syscall overhead
-        let copy_result = async {
-            loop {
-                tokio::select! {
-                    // Copy from reader to writer with larger buffers
-                    result = reader.read(&mut buf1) => {
-                        match result {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                writer.write_all(&buf1[..n]).await?;
-                                transferred_a_to_b += n as u64;
-                            }
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    // Copy from writer to reader with larger buffers
-                    result = writer.read(&mut buf2) => {
-                        match result {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                reader.write_all(&buf2[..n]).await?;
-                                transferred_b_to_a += n as u64;
-                            }
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-            }
-            Ok((transferred_a_to_b, transferred_b_to_a))
-        }
-        .await;
-
-        // Return buffers to the pool
-        self.buffer_pool.return_buffer(buf1).await;
-        self.buffer_pool.return_buffer(buf2).await;
-
-        copy_result
     }
 }
 

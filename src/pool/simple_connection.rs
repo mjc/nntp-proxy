@@ -29,6 +29,3 @@ impl SimpleConnectionProvider {
         Ok(stream)
     }
 }
-
-/// Legacy alias for backward compatibility
-pub type ConnectionManager = SimpleConnectionProvider;
