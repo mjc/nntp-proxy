@@ -6,11 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 mod pool;
-use pool::{BufferPool, ConnectionPool, PooledConnection};
+use pool::{BufferPool, ConnectionManager};
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
@@ -41,10 +40,8 @@ pub struct ServerConfig {
 pub struct NntpProxy {
     servers: Vec<ServerConfig>,
     current_index: Arc<AtomicUsize>,
-    /// Connection semaphores per server (server_name -> semaphore)
-    connection_semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
-    /// Connection pool for backend connections
-    connection_pool: ConnectionPool,
+    /// Connection managers per server (server_name -> manager)
+    connection_managers: Arc<HashMap<String, ConnectionManager>>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
 }
@@ -55,45 +52,41 @@ impl NntpProxy {
             anyhow::bail!("No servers configured");
         }
 
-        // Create connection semaphores for each server
-        let mut connection_semaphores = HashMap::new();
+        // Create connection managers for each server
+        let mut connection_managers = HashMap::new();
         for server in &config.servers {
-            let semaphore = Arc::new(Semaphore::new(server.max_connections as usize));
-            connection_semaphores.insert(server.name.clone(), semaphore);
+            let manager = ConnectionManager::new(Arc::new(server.clone()));
+            connection_managers.insert(server.name.clone(), manager);
             info!(
-                "Server '{}' configured with max {} connections",
-                server.name, server.max_connections
+                "Server '{}' configured with simple connections",
+                server.name
             );
         }
 
         Ok(Self {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
-            connection_semaphores: Arc::new(connection_semaphores),
-            connection_pool: ConnectionPool::new(32), // Increased to 32 for better small file concurrency
+            connection_managers: Arc::new(connection_managers),
             buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers better for 100MB files with more available
         })
     }
 
-    /// Pre-warm connections to all servers for optimal small file performance
+    /// Pre-warm connections to all servers (simplified - no pooling)
     pub async fn prewarm_connections(&self) -> Result<()> {
-        info!("Pre-warming connections to all backend servers...");
+        info!("Testing connections to all backend servers...");
         for server in &self.servers {
-            // Pre-establish connections without authentication to avoid complexity
-            for i in 0..4 {
-                // Back to 4 connections per server for stability
-                match self.connection_pool.get_connection(server).await {
-                    Ok(conn) => {
-                        info!("Pre-warmed connection {}/4 to {}", i + 1, server.name);
-                        self.connection_pool.return_connection(conn).await;
-                    }
-                    Err(e) => {
-                        warn!("Failed to pre-warm connection to {}: {}", server.name, e);
-                    }
+            let manager = self.connection_managers.get(&server.name).unwrap();
+            // Test connection to ensure servers are reachable
+            match manager.create_connection().await {
+                Ok(_) => {
+                    info!("Successfully tested connection to {}", server.name);
+                }
+                Err(e) => {
+                    warn!("Failed to test connection to {}: {}", server.name, e);
                 }
             }
         }
-        info!("Connection pre-warming complete");
+        info!("Connection testing complete");
         Ok(())
     }
 
@@ -134,136 +127,55 @@ impl NntpProxy {
             client_addr, server.host, server.port
         );
 
-        // Acquire connection permit for this server
-        let semaphore = self.connection_semaphores.get(&server.name).unwrap();
-        let _permit = match semaphore.try_acquire() {
-            Ok(permit) => {
-                info!(
-                    "Acquired connection permit for server '{}' ({} remaining)",
-                    server.name,
-                    semaphore.available_permits()
-                );
-                permit
-            }
-            Err(_) => {
-                warn!(
-                    "Server '{}' has reached max connections ({}), rejecting client",
-                    server.name, server.max_connections
-                );
-                let _ = client_stream
-                    .write_all(b"400 Server temporarily unavailable - too many connections\r\n")
-                    .await;
-                return Err(anyhow::anyhow!("Server {} at max connections", server.name));
-            }
-        };
-
-        // Try to get a pooled connection or create a new one
-        let backend_addr = format!("{}:{}", server.host, server.port);
-
-        // Try to get a pooled connection first
-        let (mut backend_stream, is_pooled, server_name, pooled_authenticated) =
-            match self.connection_pool.get_connection(server).await {
-                Ok(pooled) => {
-                    let server_name = pooled.server_name().to_string();
-                    let authenticated = pooled.is_authenticated();
-                    info!(
-                        "Using pooled connection to {} (authenticated: {})",
-                        server_name, authenticated
-                    );
-                    (
-                        pooled.into_stream(),
-                        true,
-                        server_name,
-                        authenticated,
-                    )
-                }
-                Err(_) => {
-                    // If no pooled connection available, create a new one
-                    info!("Creating new connection to {}", backend_addr);
-                    match pool::connection::ConnectionPool::create_optimized_tcp_stream(&backend_addr).await {
-                        Ok(stream) => (stream, false, server.name.clone(), false),
-                        Err(e) => {
-                            error!("Failed to connect to backend {}: {}", backend_addr, e);
-                            let _ = client_stream
-                                .write_all(b"400 Backend server unavailable\r\n")
-                                .await;
-                            return Err(e.into());
-                        }
-                    }
-                }
-            };
-
-        info!("Connected to backend server {}", backend_addr);
-
-        // Simplified authentication - focus on speed over complexity
-        if !is_pooled || !pooled_authenticated {
-            // Only authenticate if not already authenticated
-            if let (Some(username), Some(password)) = (&server.username, &server.password) {
-                if let Err(e) = self
-                    .authenticate_backend(&mut backend_stream, username, password)
-                    .await
-                {
-                    error!("Authentication failed for {}: {}", server.name, e);
-                    let _ = client_stream
-                        .write_all(b"502 Authentication failed\r\n")
-                        .await;
-                    return Err(e);
-                }
-            }
-        }
-
-        // Simple greeting for protocol compliance
+        // Send greeting to client immediately (NNTP protocol requirement)
         if let Err(e) = client_stream.write_all(b"200 NNTP Service Ready\r\n").await {
             error!("Failed to send greeting to client: {}", e);
             return Err(e.into());
         }
 
-        // Try zero-copy first (Linux only), then fall back to high-performance buffered copying
-        let copy_result = {
-            #[cfg(target_os = "linux")]
-            {
-                match self
-                    .copy_bidirectional_zero_copy(&mut client_stream, &mut backend_stream)
-                    .await
-                {
-                    Ok(result) => {
-                        debug!("Zero-copy successful");
-                        Ok(result)
-                    }
-                    Err(_) => {
-                        debug!("Zero-copy failed, falling back to buffered copy");
-                        self.copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
-                            .await
-                    }
-                }
+        // Get the connection manager for this server
+        let manager = self.connection_managers.get(&server.name)
+            .ok_or_else(|| anyhow::anyhow!("No connection manager found for server {}", server.name))?;
+
+        // Create a new connection for this request
+        let mut backend_stream = match manager.create_connection().await {
+            Ok(stream) => {
+                info!("Created new connection to {}", server.name);
+                stream
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                self.copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
-                    .await
+            Err(e) => {
+                error!("Failed to connect to {}: {}", server.name, e);
+                let _ = client_stream
+                    .write_all(b"400 Backend server unavailable\r\n")
+                    .await;
+                return Err(e);
             }
         };
 
-        // Always try to return the connection to the pool (whether it was originally pooled or newly created)
-        // Determine if authentication was performed in this session
-        let was_authenticated = if is_pooled {
-            // If it was pooled, it might already be authenticated OR we just authenticated it
-            pooled_authenticated || (server.username.is_some() && server.password.is_some())
-        } else {
-            // If it was a new connection, it's authenticated if we have credentials
-            server.username.is_some() && server.password.is_some()
-        };
+        let backend_addr = format!("{}:{}", server.host, server.port);
 
-        let pooled_conn = PooledConnection::new(
-            backend_stream,
-            server_name,
-            was_authenticated,
-        );
-        self.connection_pool.return_connection(pooled_conn).await;
-        info!(
-            "Returned connection to pool for {} (authenticated: {})",
-            server.name, was_authenticated
-        );
+        info!("Connected to backend server {}", backend_addr);
+
+        // Authenticate proxy to backend using configured credentials
+        if let (Some(username), Some(password)) = (&server.username, &server.password) {
+            if let Err(e) = self
+                .authenticate_backend(&mut backend_stream, username, password)
+                .await
+            {
+                error!("Authentication failed for {}: {}", server.name, e);
+                let _ = client_stream
+                    .write_all(b"502 Authentication failed\r\n")
+                    .await;
+                return Err(e);
+            }
+        }
+
+        // Now implement intelligent proxying that handles client authentication
+        // without passing it to the already-authenticated backend
+        let copy_result = self.handle_client_with_auth_interception(client_stream, backend_stream).await;
+
+        // Connection will be automatically closed when backend_stream goes out of scope
+        info!("Connection to {} will be closed", server.name);
 
         match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
@@ -351,6 +263,182 @@ impl NntpProxy {
         // Return buffer to pool
         self.buffer_pool.return_buffer(buffer).await;
         result
+    }
+
+    /// Handle client connection with authentication interception
+    /// Client authenticates to proxy, proxy uses backend connection already authenticated
+    async fn handle_client_with_auth_interception(
+        &self,
+        mut client_stream: TcpStream,
+        mut backend_stream: TcpStream,
+    ) -> Result<(u64, u64), anyhow::Error> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        
+        // Split streams for independent read/write
+        let (client_read, mut client_write) = client_stream.split();
+        let (mut backend_read, mut backend_write) = backend_stream.split();
+        let mut client_reader = BufReader::new(client_read);
+        
+        let mut client_to_backend_bytes = 0u64;
+        let mut backend_to_client_bytes = 0u64;
+        
+        // Handle the initial command/response phase where we intercept auth
+        loop {
+            let mut line = String::new();
+            let mut buffer = self.buffer_pool.get_buffer().await;
+            
+            tokio::select! {
+                // Read command from client
+                result = client_reader.read_line(&mut line) => {
+                    match result {
+                        Ok(0) => {
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break; // Client disconnected
+                        }
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            debug!("Client command: {}", trimmed);
+                            
+                            // Intercept authentication commands
+                            if trimmed.starts_with("AUTHINFO USER") {
+                                // Client is trying to authenticate - respond positively
+                                let response = b"381 Password required\r\n";
+                                client_write.write_all(response).await?;
+                                backend_to_client_bytes += response.len() as u64;
+                                debug!("Intercepted AUTHINFO USER, sent password request");
+                            } else if trimmed.starts_with("AUTHINFO PASS") {
+                                // Client is providing password - accept it
+                                let response = b"281 Authentication accepted\r\n";
+                                client_write.write_all(response).await?;
+                                backend_to_client_bytes += response.len() as u64;
+                                debug!("Intercepted AUTHINFO PASS, authenticated client");
+                            } else if trimmed.starts_with("ARTICLE") || trimmed.starts_with("BODY") || 
+                                     trimmed.starts_with("HEAD") || trimmed.starts_with("STAT") {
+                                // Forward data command to backend
+                                backend_write.write_all(line.as_bytes()).await?;
+                                client_to_backend_bytes += line.len() as u64;
+                                debug!("Forwarding data command, switching to high-throughput mode");
+                                
+                                // Return the buffer before transitioning
+                                self.buffer_pool.return_buffer(buffer).await;
+                                
+                                // For high-throughput data transfer, use our optimized copy
+                                // We need to carefully handle this transition...
+                                // For now, let's continue with the select loop but optimize for large transfers
+                                return self.handle_high_throughput_transfer(
+                                    client_reader, client_write,
+                                    backend_read, backend_write,
+                                    client_to_backend_bytes,
+                                    backend_to_client_bytes
+                                ).await;
+                            } else {
+                                // Forward other commands to backend
+                                backend_write.write_all(line.as_bytes()).await?;
+                                client_to_backend_bytes += line.len() as u64;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error reading from client: {}", e);
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                    }
+                }
+                
+                // Read response from backend and forward to client (for non-auth commands)
+                result = backend_read.read(&mut buffer) => {
+                    match result {
+                        Ok(0) => {
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break; // Backend disconnected
+                        }
+                        Ok(n) => {
+                            client_write.write_all(&buffer[..n]).await?;
+                            backend_to_client_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            warn!("Error reading from backend: {}", e);
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            self.buffer_pool.return_buffer(buffer).await;
+        }
+        
+        Ok((client_to_backend_bytes, backend_to_client_bytes))
+    }
+    
+    /// Handle high-throughput data transfer after authentication is complete
+    async fn handle_high_throughput_transfer(
+        &self,
+        mut client_reader: tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
+        mut client_write: tokio::net::tcp::WriteHalf<'_>,
+        mut backend_read: tokio::net::tcp::ReadHalf<'_>,
+        mut backend_write: tokio::net::tcp::WriteHalf<'_>,
+        mut client_to_backend_bytes: u64,
+        mut backend_to_client_bytes: u64,
+    ) -> Result<(u64, u64), anyhow::Error> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        
+        // Continue handling commands and large data responses
+        loop {
+            let mut line = String::new();
+            let mut buffer = self.buffer_pool.get_buffer().await;
+            
+            tokio::select! {
+                // Continue reading client commands
+                result = client_reader.read_line(&mut line) => {
+                    match result {
+                        Ok(0) => {
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                        Ok(_) => {
+                            // Forward command to backend
+                            backend_write.write_all(line.as_bytes()).await?;
+                            client_to_backend_bytes += line.len() as u64;
+                        }
+                        Err(e) => {
+                            warn!("Error reading client command: {}", e);
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                    }
+                }
+                
+                // Read large responses from backend with optimized buffer size
+                result = backend_read.read(&mut buffer) => {
+                    match result {
+                        Ok(0) => {
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            client_write.write_all(&buffer[..n]).await?;
+                            backend_to_client_bytes += n as u64;
+                            
+                            // For very large transfers, ensure we keep reading efficiently
+                            if n == buffer.len() {
+                                // Buffer was full, likely more data coming
+                                // Continue optimized reading...
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error reading backend response: {}", e);
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            self.buffer_pool.return_buffer(buffer).await;
+        }
+        
+        Ok((client_to_backend_bytes, backend_to_client_bytes))
     }
 
     /// Zero-copy bidirectional copy specifically for TcpStream pairs (Linux only)

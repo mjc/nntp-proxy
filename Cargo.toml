@@ -33,7 +33,7 @@ tokio-splice2 = "0.3"  # Zero-copy networking with splice/sendfile
 socket2 = "0.5"  # Safe cross-platform socket operations
 crossbeam = "0.8"  # Lock-free data structures for high performance
 nix = { version = "0.30", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
-async-trait = "0.1.89"
+tokio-postgres = "0.7.13"
 
 [dev-dependencies]
 tempfile = "3.8"
