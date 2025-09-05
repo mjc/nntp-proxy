@@ -1,0 +1,29 @@
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Example News Server 1"
+# Optional authentication - uncomment if needed
+# username = "your_username"
+# password = "your_password"
+
+[[servers]]
+host = "nntp.example.org"
+port = 119
+name = "Example News Server 2"
+# This server requires authentication
+username = "testuser"
+password = "testpass"
+
+[[servers]]
+host = "secure-news.example.com"
+port = 563
+name = "Secure News Server"
+# Example with SSL port and authentication
+username = "premium_user"
+password = "secure_password"
+
+[[servers]]
+host = "localhost"
+port = 1119
+name = "Local Test Server"
+# No authentication needed for local server
