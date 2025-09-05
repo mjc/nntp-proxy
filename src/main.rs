@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tracing::{error, info, warn};
 
 use nntp_proxy::{NntpProxy, create_default_config, load_config};
@@ -8,24 +9,24 @@ use nntp_proxy::{NntpProxy, create_default_config, load_config};
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
 fn pin_to_cpu_cores() -> Result<()> {
-    // Pin to CPU cores 0-3 for optimal performance
+    use nix::sched::{CpuSet, sched_setaffinity};
+    use nix::unistd::Pid;
+
+    // Pin to CPU cores 0-1 for optimal performance
     // This reduces context switching and improves cache locality
-    unsafe {
-        let mut cpu_set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut cpu_set);
-        libc::CPU_SET(0, &mut cpu_set);
-        libc::CPU_SET(1, &mut cpu_set);
+    let mut cpu_set = CpuSet::new();
+    cpu_set.set(0)?; // CPU 0
+    cpu_set.set(1)?; // CPU 1
 
-        let result = libc::sched_setaffinity(
-            0, // current process
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &cpu_set,
-        );
-
-        if result != 0 {
-            warn!("Failed to set CPU affinity, continuing without pinning");
-        } else {
+    match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+        Ok(_) => {
             info!("Successfully pinned process to CPU cores 0-1 for optimal performance");
+        }
+        Err(e) => {
+            warn!(
+                "Failed to set CPU affinity: {}, continuing without pinning",
+                e
+            );
         }
     }
 
@@ -130,6 +131,16 @@ async fn run_proxy(args: Args) -> Result<()> {
     let listener = TcpListener::bind(&listen_addr).await?;
     info!("NNTP proxy listening on {}", listen_addr);
 
+    // Set up graceful shutdown
+    let proxy_for_shutdown = proxy.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Shutdown signal received, closing idle connections...");
+        proxy_for_shutdown.graceful_shutdown().await;
+        info!("Graceful shutdown complete");
+        std::process::exit(0);
+    });
+
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
@@ -144,5 +155,30 @@ async fn run_proxy(args: Args) -> Result<()> {
                 error!("Failed to accept connection: {}", e);
             }
         }
+    }
+}
+
+/// Wait for shutdown signal
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }

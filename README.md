@@ -128,6 +128,15 @@ The proxy is built with:
 - **Serde + TOML**: Configuration file handling
 - **Anyhow**: Error handling
 
+## TODO
+
+- **SSL/TLS Support**: Add support for secure NNTP connections (NNTPS) for both client-facing and backend connections
+- **Connection Persistence**: Implement longer-lived connections with proper connection reuse to reduce authentication overhead and improve performance
+- **Health Checks**: Add periodic health checks for backend servers
+- **Metrics**: Expose Prometheus metrics for monitoring
+- **Configuration Hot-Reload**: Support reloading configuration without restart
+- **IPv6 Support**: Full IPv6 support for client and backend connections
+
 ## Building for Production
 
 ```bash

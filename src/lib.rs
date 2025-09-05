@@ -1,96 +1,18 @@
 use anyhow::Result;
-use crossbeam::queue::SegQueue;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
-use tokio::sync::Semaphore;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
+
+mod pool;
+use pool::{BufferPool, DeadpoolConnectionProvider, ConnectionProvider};
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
     10
-}
-
-/// Lock-free buffer pool for reusing large I/O buffers
-/// Uses crossbeam's SegQueue for lock-free operations
-#[derive(Debug, Clone)]
-pub struct BufferPool {
-    pool: Arc<SegQueue<Vec<u8>>>,
-    buffer_size: usize,
-    max_pool_size: usize,
-    pool_size: Arc<AtomicUsize>,
-}
-
-impl BufferPool {
-    /// Create a page-aligned buffer for optimal DMA performance
-    fn create_aligned_buffer(size: usize) -> Vec<u8> {
-        // Align to page boundaries (4KB) for better memory performance
-        let page_size = 4096;
-        let aligned_size = size.div_ceil(page_size) * page_size;
-
-        // Use aligned allocation for better cache performance
-        let mut buffer = Vec::with_capacity(aligned_size);
-        buffer.resize(size, 0);
-        buffer
-    }
-
-    pub fn new(buffer_size: usize, max_pool_size: usize) -> Self {
-        let pool = Arc::new(SegQueue::new());
-        let pool_size = Arc::new(AtomicUsize::new(0));
-
-        // Pre-allocate all buffers at startup to eliminate allocation overhead
-        info!(
-            "Pre-allocating {} buffers of {}KB each ({}MB total)",
-            max_pool_size,
-            buffer_size / 1024,
-            (max_pool_size * buffer_size) / (1024 * 1024)
-        );
-
-        for _ in 0..max_pool_size {
-            let buffer = Self::create_aligned_buffer(buffer_size);
-            pool.push(buffer);
-            pool_size.fetch_add(1, Ordering::Relaxed);
-        }
-
-        info!("Buffer pool pre-allocation complete");
-
-        Self {
-            pool,
-            buffer_size,
-            max_pool_size,
-            pool_size,
-        }
-    }
-
-    /// Get a buffer from the pool or create a new one (lock-free)
-    pub async fn get_buffer(&self) -> Vec<u8> {
-        if let Some(mut buffer) = self.pool.pop() {
-            self.pool_size.fetch_sub(1, Ordering::Relaxed);
-            // Reuse existing buffer, clear it first
-            buffer.clear();
-            buffer.resize(self.buffer_size, 0);
-            buffer
-        } else {
-            // Create new page-aligned buffer for better DMA performance
-            Self::create_aligned_buffer(self.buffer_size)
-        }
-    }
-
-    /// Return a buffer to the pool (lock-free)
-    pub async fn return_buffer(&self, buffer: Vec<u8>) {
-        if buffer.len() == self.buffer_size {
-            let current_size = self.pool_size.load(Ordering::Relaxed);
-            if current_size < self.max_pool_size {
-                self.pool.push(buffer);
-                self.pool_size.fetch_add(1, Ordering::Relaxed);
-            }
-            // If pool is full, just drop the buffer
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -113,385 +35,16 @@ pub struct ServerConfig {
     pub max_connections: u32,
 }
 
-/// Pooled connection wrapper
-#[derive(Debug)]
-pub struct PooledConnection {
-    pub stream: TcpStream,
-    pub server_name: String,
-    pub authenticated: bool,
-}
-
-impl PooledConnection {
-    pub fn new(
-        stream: TcpStream,
-        server_name: String,
-        authenticated: bool,
-    ) -> Self {
-        Self {
-            stream,
-            server_name,
-            authenticated,
-        }
-    }
-
-    pub fn into_stream(self) -> TcpStream {
-        self.stream
-    }
-
-    pub fn is_authenticated(&self) -> bool {
-        self.authenticated
-    }
-
-    pub fn server_name(&self) -> &str {
-        &self.server_name
-    }
-}
-
-/// Connection pool for backend servers
-#[derive(Debug, Clone)]
-pub struct ConnectionPool {
-    pool: Arc<SegQueue<TcpStream>>,
-    max_connections: usize,
-    active_connections: Arc<AtomicUsize>,
-    initialized: Arc<AtomicBool>,
-}
-
-impl ConnectionPool {
-    pub fn new(max_connections: usize) -> Self {
-        Self {
-            pool: Arc::new(SegQueue::new()),
-            max_connections,
-            active_connections: Arc::new(AtomicUsize::new(0)),
-            initialized: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Pre-establish all connections on first request for maximum performance
-    async fn initialize_connections(&self, server: &ServerConfig) -> Result<()> {
-        // Use compare_exchange to ensure only one thread initializes
-        if self
-            .initialized
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            info!(
-                "Pre-establishing {} connections to {}",
-                self.max_connections, server.name
-            );
-
-            // Pre-establish all connections in parallel for faster startup
-            let mut tasks = Vec::new();
-            for i in 0..self.max_connections {
-                let server_addr = format!("{}:{}", server.host, server.port);
-                let server_name = server.name.clone();
-                let pool = Arc::clone(&self.pool);
-                let active_connections = Arc::clone(&self.active_connections);
-
-                let task = tokio::spawn(async move {
-                    match Self::create_optimized_tcp_stream(&server_addr).await {
-                        Ok(stream) => {
-                            pool.push(stream);
-                            active_connections.fetch_add(1, Ordering::Relaxed);
-                            debug!("Pre-established connection {} to {}", i + 1, server_name);
-                            Ok(())
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to pre-establish connection {} to {}: {}",
-                                i + 1,
-                                server_name,
-                                e
-                            );
-                            Err(e)
-                        }
-                    }
-                });
-                tasks.push(task);
-            }
-
-            // Wait for all connections to be established
-            for task in tasks {
-                let _ = task.await;
-            }
-
-            let established = self.active_connections.load(Ordering::Relaxed);
-            info!(
-                "Successfully pre-established {}/{} connections to {} in parallel",
-                established, self.max_connections, server.name
-            );
-        }
-        Ok(())
-    }
-
-    /// Get a connection from the pool or create a new one
-    pub async fn get_connection(
-        &self,
-        server: &ServerConfig,
-        _proxy: &NntpProxy,
-    ) -> Result<PooledConnection> {
-        // Pre-establish all connections on first request
-        if !self.initialized.load(Ordering::Acquire) {
-            self.initialize_connections(server).await?;
-        }
-
-        // Try to get a connection from the pool
-        if let Some(stream) = self.pool.pop() {
-            // Test if the connection is still alive by trying a non-blocking read
-            let mut test_buf = [0u8; 1];
-            match stream.try_read(&mut test_buf) {
-                Ok(0) => {
-                    // Connection was closed by server, decrease count and create new one
-                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    info!(
-                        "Pooled connection to {} was closed, creating new one",
-                        server.name
-                    );
-                }
-                Ok(_) => {
-                    // Got unexpected data, connection might be in use, decrease count and create new one
-                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    info!(
-                        "Pooled connection to {} has unexpected data, creating new one",
-                        server.name
-                    );
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Connection is alive and ready
-                    info!("Reusing pooled connection to {}", server.name);
-                    return Ok(PooledConnection {
-                        stream,
-                        server_name: server.name.clone(),
-                        authenticated: false, // Reset authentication state for safety
-                    });
-                }
-                Err(_) => {
-                    // Connection error, decrease count and create new one
-                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    info!(
-                        "Pooled connection to {} has error, creating new one",
-                        server.name
-                    );
-                }
-            }
-        }
-
-        // Create new connection - don't authenticate here, let the caller handle it
-        info!("Creating new connection to {} for pooling", server.name);
-        let backend_addr = format!("{}:{}", server.host, server.port);
-        let stream = Self::create_optimized_tcp_stream(&backend_addr).await?;
-
-        // Return unauthenticated connection - authentication will be handled by caller
-        let pooled_conn = PooledConnection::new(
-            stream,
-            server.name.clone(),
-            false,
-        );
-        Ok(pooled_conn)
-    }
-
-    /// Create an optimized TCP stream with performance tuning
-    async fn create_optimized_tcp_stream(addr: &str) -> Result<TcpStream, std::io::Error> {
-        use std::net::{SocketAddr, ToSocketAddrs};
-
-        // Parse the address
-        let socket_addr: SocketAddr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address")
-        })?;
-
-        // Create socket with optimizations
-        let socket = if socket_addr.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
-        };
-
-        // Apply TCP optimizations
-        socket.set_nodelay(true)?; // Disable Nagle's algorithm for low latency
-
-        // Set socket buffer sizes for high throughput
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-
-            // Set much larger socket buffers for high-throughput large file transfers (2MB each)
-            let buffer_size = 2 * 1024 * 1024i32; // 2MB instead of 512KB
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    &buffer_size as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    &buffer_size as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable TCP keep-alive for connection reuse
-                let keepalive = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_KEEPALIVE,
-                    &keepalive as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Set aggressive keep-alive timing for high-performance scenarios
-                let keepalive_time = 60i32; // Start probes after 60 seconds
-                let keepalive_interval = 10i32; // Probe every 10 seconds
-                let keepalive_probes = 3i32; // 3 failed probes before considering dead
-
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPIDLE,
-                    &keepalive_time as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPINTVL,
-                    &keepalive_interval as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPCNT,
-                    &keepalive_probes as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable TCP_CORK for better packet batching at high speeds
-                let cork_flag = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_CORK,
-                    &cork_flag as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Advanced TCP congestion control optimizations for large file transfers
-                // Set TCP congestion control algorithm to BBR if available (best for high BDP)
-                let bbr_name = b"bbr\0";
-                let bbr_result = libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_CONGESTION,
-                    bbr_name.as_ptr() as *const libc::c_void,
-                    bbr_name.len() as u32 - 1,
-                );
-
-                // If BBR fails, try cubic which is also excellent for large transfers
-                if bbr_result != 0 {
-                    let cubic_name = b"cubic\0";
-                    libc::setsockopt(
-                        fd,
-                        libc::IPPROTO_TCP,
-                        libc::TCP_CONGESTION,
-                        cubic_name.as_ptr() as *const libc::c_void,
-                        cubic_name.len() as u32 - 1,
-                    );
-                }
-
-                // Enable TCP Fast Open for faster connection establishment
-                let tcp_fastopen = 1i32; // Enable client-side Fast Open
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_FASTOPEN,
-                    &tcp_fastopen as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable socket reuse for better connection distribution
-                let reuse_addr = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_REUSEADDR,
-                    &reuse_addr as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable port reuse for better performance
-                let reuse_port = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_REUSEPORT,
-                    &reuse_port as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-            }
-        }
-
-        // Connect with the optimized socket
-        socket.connect(socket_addr).await
-    }
-
-    /// Return a connection to the pool
-    pub async fn return_connection(&self, conn: PooledConnection) {
-        if self.active_connections.load(Ordering::Relaxed) >= self.max_connections {
-            info!("Pool is full, closing connection to {}", conn.server_name);
-            return; // Pool is full, just drop the connection
-        }
-
-        // Test if the connection is still alive before returning to pool
-        let mut test_buf = [0u8; 1];
-        match conn.stream.try_read(&mut test_buf) {
-            Ok(0) => {
-                // Connection was closed by server
-                info!(
-                    "Connection to {} was closed by server, not returning to pool",
-                    conn.server_name
-                );
-                self.active_connections.fetch_sub(1, Ordering::Relaxed);
-            }
-            Ok(_) => {
-                // Got unexpected data, connection might be in use
-                info!(
-                    "Connection to {} has unexpected data, not returning to pool",
-                    conn.server_name
-                );
-                self.active_connections.fetch_sub(1, Ordering::Relaxed);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Connection is alive and ready
-                info!("Returning connection to {} to pool", conn.server_name);
-                self.pool.push(conn.stream);
-                // Don't decrement active_connections here since we're keeping the connection
-            }
-            Err(_) => {
-                // Connection error
-                info!(
-                    "Connection to {} has error, not returning to pool",
-                    conn.server_name
-                );
-                self.active_connections.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct NntpProxy {
     servers: Vec<ServerConfig>,
     current_index: Arc<AtomicUsize>,
-    /// Connection semaphores per server (server_name -> semaphore)
-    connection_semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
-    /// Connection pool for backend connections
-    connection_pool: ConnectionPool,
+    /// Connection providers per server - easily swappable implementation
+    connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
+    /// Track if pools have been prewarmed to avoid redundant prewarming
+    pools_prewarmed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NntpProxy {
@@ -500,45 +53,119 @@ impl NntpProxy {
             anyhow::bail!("No servers configured");
         }
 
-        // Create connection semaphores for each server
-        let mut connection_semaphores = HashMap::new();
-        for server in &config.servers {
-            let semaphore = Arc::new(Semaphore::new(server.max_connections as usize));
-            connection_semaphores.insert(server.name.clone(), semaphore);
-            info!(
-                "Server '{}' configured with max {} connections",
-                server.name, server.max_connections
-            );
-        }
+        // Create deadpool connection providers for each server
+        let connection_providers: Vec<DeadpoolConnectionProvider> = config
+            .servers
+            .iter()
+            .map(|server| {
+                info!("Configuring deadpool connection provider for '{}'", server.name);
+                DeadpoolConnectionProvider::new(
+                    server.host.clone(),
+                    server.port,
+                    server.name.clone(),
+                    server.max_connections as usize,
+                )
+            })
+            .collect();
 
         Ok(Self {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
-            connection_semaphores: Arc::new(connection_semaphores),
-            connection_pool: ConnectionPool::new(32), // Increased to 32 for better small file concurrency
-            buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers better for 100MB files with more available
+            connection_providers,
+            buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers for high throughput
+            pools_prewarmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
-    /// Pre-warm connections to all servers for optimal small file performance
+    /// Prewarm all connection pools by forcing pool to create max_connections
+    /// Called on first client connection after idle period
+    async fn prewarm_all_pools(&self) -> Result<()> {
+        // Use compare_and_swap to ensure only one thread prewarms the pools
+        if self.pools_prewarmed.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            // Another thread is already prewarming or has already prewarmed
+            return Ok(());
+        }
+
+        info!("Prewarming all connection pools on first client connection...");
+        
+        // Spawn tasks to prewarm each pool concurrently
+        let mut handles = Vec::new();
+        
+        for (i, server) in self.servers.iter().enumerate() {
+            let provider = self.connection_providers[i].clone();
+            let server_name = server.name.clone();
+            let max_connections = server.max_connections as usize;
+            
+            let handle = tokio::spawn(async move {
+                info!("Prewarming pool for '{}' with {} connections", server_name, max_connections);
+                
+                // Limit concurrent prewarming to avoid overwhelming the server
+                let batch_size = 5; // Create connections in batches of 5
+                let mut total_created = 0;
+                
+                for batch_start in (0..max_connections).step_by(batch_size) {
+                    let batch_end = std::cmp::min(batch_start + batch_size, max_connections);
+                    let mut batch_connections = Vec::new();
+                    
+                    // Create batch connections concurrently
+                    for i in batch_start..batch_end {
+                        match provider.get_pooled_connection().await {
+                            Ok(conn) => {
+                                debug!("Created prewarmed connection {}/{} for '{}'", i+1, max_connections, server_name);
+                                batch_connections.push(conn);
+                                total_created += 1;
+                            }
+                            Err(e) => {
+                                warn!("Failed to prewarm connection {}/{} for '{}': {}", i+1, max_connections, server_name, e);
+                                // Continue with remaining connections in batch
+                            }
+                        }
+                    }
+                    
+                    // Drop batch connections (return to pool)
+                    drop(batch_connections);
+                    
+                    // Wait between batches to avoid overwhelming server
+                    if batch_end < max_connections {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+                
+                info!("Pool prewarming completed for '{}' - {}/{} connections ready", server_name, total_created, max_connections);
+                Ok::<(), anyhow::Error>(())
+            });
+            
+            handles.push(handle);
+        }
+        
+        // Wait for all prewarming tasks to complete
+        for handle in handles {
+            if let Err(e) = handle.await {
+                warn!("Pool prewarming task failed: {}", e);
+            }
+        }
+        
+        // Mark pools as prewarmed
+        self.pools_prewarmed.store(true, Ordering::Relaxed);
+        info!("All connection pools have been prewarmed and are ready for use");
+        
+        Ok(())
+    }
     pub async fn prewarm_connections(&self) -> Result<()> {
-        info!("Pre-warming connections to all backend servers...");
-        for server in &self.servers {
-            // Pre-establish connections without authentication to avoid complexity
-            for i in 0..4 {
-                // Back to 4 connections per server for stability
-                match self.connection_pool.get_connection(server, self).await {
-                    Ok(conn) => {
-                        info!("Pre-warmed connection {}/4 to {}", i + 1, server.name);
-                        self.connection_pool.return_connection(conn).await;
-                    }
-                    Err(e) => {
-                        warn!("Failed to pre-warm connection to {}: {}", server.name, e);
-                    }
+        info!("Testing connections to all backend servers...");
+        for (i, server) in self.servers.iter().enumerate() {
+            let provider = &self.connection_providers[i];
+            // Test connection to ensure servers are reachable
+            match provider.get_connection().await {
+                Ok(_) => {
+                    debug!("Successfully tested connection to {}", server.name);
+                }
+                Err(e) => {
+                    warn!("Failed to test connection to {}: {}", server.name, e);
                 }
             }
         }
-        info!("Connection pre-warming complete");
+        info!("Connection testing complete");
         Ok(())
     }
 
@@ -546,6 +173,17 @@ impl NntpProxy {
     pub fn next_server(&self) -> &ServerConfig {
         let index = self.current_index.fetch_add(1, Ordering::Relaxed);
         &self.servers[index % self.servers.len()]
+    }
+
+    /// Gracefully shutdown all connection pools
+    pub async fn graceful_shutdown(&self) {
+        info!("Initiating graceful shutdown of all connection pools...");
+        
+        for provider in &self.connection_providers {
+            provider.graceful_shutdown().await;
+        }
+        
+        info!("All connection pools have been shut down gracefully");
     }
 
     /// Get the current server index (for testing)
@@ -570,143 +208,79 @@ impl NntpProxy {
         mut client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        info!("New client connection from {}", client_addr);
+        debug!("New client connection from {}", client_addr);
 
         // Get the next backend server
-        let server = self.next_server();
+        let server_idx = self.current_index.fetch_add(1, Ordering::Relaxed) % self.servers.len();
+        let server = &self.servers[server_idx];
         info!(
             "Routing client {} to server {}:{}",
             client_addr, server.host, server.port
         );
 
-        // Acquire connection permit for this server
-        let semaphore = self.connection_semaphores.get(&server.name).unwrap();
-        let _permit = match semaphore.try_acquire() {
-            Ok(permit) => {
-                info!(
-                    "Acquired connection permit for server '{}' ({} remaining)",
-                    server.name,
-                    semaphore.available_permits()
-                );
-                permit
-            }
-            Err(_) => {
-                warn!(
-                    "Server '{}' has reached max connections ({}), rejecting client",
-                    server.name, server.max_connections
-                );
-                let _ = client_stream
-                    .write_all(b"400 Server temporarily unavailable - too many connections\r\n")
-                    .await;
-                return Err(anyhow::anyhow!("Server {} at max connections", server.name));
-            }
-        };
-
-        // Try to get a pooled connection or create a new one
-        let backend_addr = format!("{}:{}", server.host, server.port);
-
-        // Try to get a pooled connection first
-        let (mut backend_stream, is_pooled, server_name, pooled_authenticated) =
-            match self.connection_pool.get_connection(server, self).await {
-                Ok(pooled) => {
-                    info!(
-                        "Using pooled connection to {} (authenticated: {})",
-                        pooled.server_name, pooled.authenticated
-                    );
-                    (
-                        pooled.stream,
-                        true,
-                        pooled.server_name.clone(),
-                        pooled.authenticated,
-                    )
-                }
-                Err(_) => {
-                    // If no pooled connection available, create a new one
-                    info!("Creating new connection to {}", backend_addr);
-                    match ConnectionPool::create_optimized_tcp_stream(&backend_addr).await {
-                        Ok(stream) => (stream, false, server.name.clone(), false),
-                        Err(e) => {
-                            error!("Failed to connect to backend {}: {}", backend_addr, e);
-                            let _ = client_stream
-                                .write_all(b"400 Backend server unavailable\r\n")
-                                .await;
-                            return Err(e.into());
-                        }
-                    }
-                }
-            };
-
-        info!("Connected to backend server {}", backend_addr);
-
-        // Simplified authentication - focus on speed over complexity
-        if !is_pooled || !pooled_authenticated {
-            // Only authenticate if not already authenticated
-            if let (Some(username), Some(password)) = (&server.username, &server.password) {
-                if let Err(e) = self
-                    .authenticate_backend(&mut backend_stream, username, password)
-                    .await
-                {
-                    error!("Authentication failed for {}: {}", server.name, e);
-                    let _ = client_stream
-                        .write_all(b"502 Authentication failed\r\n")
-                        .await;
-                    return Err(e);
-                }
-            }
-        }
-
-        // Simple greeting for protocol compliance
-        if let Err(e) = client_stream.write_all(b"200 NNTP Service Ready\r\n").await {
+        // Send greeting to client immediately (NNTP protocol requirement)
+        // Include server name and pool status in greeting for operational visibility  
+        let pool_status = self.connection_providers[server_idx].status();
+        let greeting = format!(
+            "200 NNTP Service Ready - Proxying to {} ({}/{} connections available)\r\n",
+            server.name, 
+            pool_status.available,
+            pool_status.max_size
+        );
+        if let Err(e) = client_stream.write_all(greeting.as_bytes()).await {
             error!("Failed to send greeting to client: {}", e);
             return Err(e.into());
         }
 
-        // Try zero-copy first (Linux only), then fall back to high-performance buffered copying
-        let copy_result = {
-            #[cfg(target_os = "linux")]
-            {
-                match self
-                    .copy_bidirectional_zero_copy(&mut client_stream, &mut backend_stream)
-                    .await
-                {
-                    Ok(result) => {
-                        debug!("Zero-copy successful");
-                        Ok(result)
-                    }
-                    Err(_) => {
-                        debug!("Zero-copy failed, falling back to buffered copy");
-                        self.copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
-                            .await
-                    }
-                }
+        // Prewarm all connection pools on first connection after idle
+        // This ensures subsequent requests can immediately use pooled connections
+        if let Err(e) = self.prewarm_all_pools().await {
+            warn!("Failed to prewarm connection pools: {}", e);
+            // Continue anyway - this is an optimization, not a requirement
+        }
+
+        // Get the connection manager for this server and create connection
+        let mut backend_stream = match self.connection_providers[server_idx].get_connection().await
+        {
+            Ok(stream) => {
+                debug!("Retrieved connection from pool for {}", server.name);
+                stream
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                self.copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
-                    .await
+            Err(e) => {
+                error!("Failed to connect to {}: {}", server.name, e);
+                let _ = client_stream
+                    .write_all(b"400 Backend server unavailable\r\n")
+                    .await;
+                return Err(e);
             }
         };
 
-        // Always try to return the connection to the pool (whether it was originally pooled or newly created)
-        // Determine if authentication was performed in this session
-        let was_authenticated = if is_pooled {
-            // If it was pooled, it might already be authenticated OR we just authenticated it
-            pooled_authenticated || (server.username.is_some() && server.password.is_some())
-        } else {
-            // If it was a new connection, it's authenticated if we have credentials
-            server.username.is_some() && server.password.is_some()
-        };
+        let backend_addr = format!("{}:{}", server.host, server.port);
+        debug!("Connected to backend server {}", backend_addr);
 
-        let pooled_conn = PooledConnection::new(
-            backend_stream,
-            server_name,
-            was_authenticated,
-        );
-        self.connection_pool.return_connection(pooled_conn).await;
-        info!(
-            "Returned connection to pool for {} (authenticated: {})",
-            server.name, was_authenticated
-        );
+        // All connections need authentication since Object::take() gives us fresh connections
+        if let (Some(username), Some(password)) = (&server.username, &server.password) {
+            if let Err(e) = self
+                .authenticate_backend(&mut backend_stream, username, password)
+                .await
+            {
+                error!("Authentication failed for {}: {}", server.name, e);
+                let _ = client_stream
+                    .write_all(b"502 Authentication failed\r\n")
+                    .await;
+                return Err(e);
+            }
+            debug!("Successfully authenticated connection to {}", server.name);
+        }
+
+        // Now implement intelligent proxying that handles client authentication
+        // without passing it to the already-authenticated backend
+        let copy_result = self
+            .handle_client_with_auth_interception(client_stream, backend_stream)
+            .await;
+
+        // Connection will be automatically closed when backend_stream goes out of scope
+        debug!("Connection to {} will be closed", server.name);
 
         match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
@@ -721,7 +295,7 @@ impl NntpProxy {
         }
 
         // The permit will be automatically dropped here when _permit goes out of scope
-        info!("Connection closed for client {}", client_addr);
+        debug!("Connection closed for client {}", client_addr);
         Ok(())
     }
 
@@ -738,13 +312,11 @@ impl NntpProxy {
         // Read the server greeting first
         let n = stream.read(&mut buffer).await?;
         let greeting = &buffer[..n];
-        info!(
-            "Server greeting: {}",
-            String::from_utf8_lossy(greeting).trim()
-        );
-
-        // Check if greeting indicates successful connection (200)
         let greeting_str = String::from_utf8_lossy(greeting);
+        debug!(
+            "Server greeting: {}",
+            greeting_str.trim()
+        );
         if !greeting_str.starts_with("200") && !greeting_str.starts_with("201") {
             return Err(anyhow::anyhow!(
                 "Server returned non-success greeting: {}",
@@ -759,7 +331,7 @@ impl NntpProxy {
         // Read response
         let n = stream.read(&mut buffer).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
-        info!("AUTHINFO USER response: {}", response.trim());
+        debug!("AUTHINFO USER response: {}", response.trim());
 
         // Should get 381 (password required) or 281 (authenticated)
         if response.starts_with("281") {
@@ -779,7 +351,7 @@ impl NntpProxy {
         // Read final response
         let n = stream.read(&mut buffer).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
-        info!("AUTHINFO PASS response: {}", response.trim());
+        debug!("AUTHINFO PASS response: {}", response.trim());
 
         // Should get 281 (authenticated)
         let result = if response.starts_with("281") {
@@ -796,16 +368,211 @@ impl NntpProxy {
         result
     }
 
-    /// Zero-copy bidirectional copy specifically for TcpStream pairs (Linux only)
-    #[cfg(target_os = "linux")]
-    async fn copy_bidirectional_zero_copy(
+    /// Handle client connection with authentication interception
+    /// Client authenticates to proxy, proxy uses backend connection already authenticated
+    async fn handle_client_with_auth_interception(
         &self,
-        client_stream: &mut TcpStream,
-        backend_stream: &mut TcpStream,
-    ) -> Result<(u64, u64), std::io::Error> {
-        debug!("Starting optimized zero-copy bidirectional transfer");
+        mut client_stream: TcpStream,
+        mut backend_stream: TcpStream,
+    ) -> Result<(u64, u64), anyhow::Error> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-        // Apply aggressive socket optimizations for 1GB+ transfers
+        // Apply high-throughput socket optimizations for large transfers
+        if let Err(e) = Self::apply_high_throughput_optimizations(&client_stream, &backend_stream) {
+            debug!("Failed to apply high-throughput optimizations: {}", e);
+        }
+
+        // Split streams for independent read/write
+        let (client_read, mut client_write) = client_stream.split();
+        let (mut backend_read, mut backend_write) = backend_stream.split();
+        let mut client_reader = BufReader::new(client_read);
+
+        let mut client_to_backend_bytes = 0u64;
+        let mut backend_to_client_bytes = 0u64;
+
+        // Handle the initial command/response phase where we intercept auth
+        loop {
+            let mut line = String::new();
+            let mut buffer = self.buffer_pool.get_buffer().await;
+
+            tokio::select! {
+                // Read command from client
+                result = client_reader.read_line(&mut line) => {
+                    match result {
+                        Ok(0) => {
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break; // Client disconnected
+                        }
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            debug!("Client command: {}", trimmed);
+
+                            // Intercept authentication commands
+                            if trimmed.starts_with("AUTHINFO USER") {
+                                // Client is trying to authenticate - respond positively
+                                let response = b"381 Password required\r\n";
+                                client_write.write_all(response).await?;
+                                backend_to_client_bytes += response.len() as u64;
+                                debug!("Intercepted AUTHINFO USER, sent password request");
+                            } else if trimmed.starts_with("AUTHINFO PASS") {
+                                // Client is providing password - accept it
+                                let response = b"281 Authentication accepted\r\n";
+                                client_write.write_all(response).await?;
+                                backend_to_client_bytes += response.len() as u64;
+                                debug!("Intercepted AUTHINFO PASS, authenticated client");
+                            } else if trimmed.starts_with("ARTICLE") || trimmed.starts_with("BODY") ||
+                                     trimmed.starts_with("HEAD") || trimmed.starts_with("STAT") {
+                                // Forward data command to backend
+                                backend_write.write_all(line.as_bytes()).await?;
+                                client_to_backend_bytes += line.len() as u64;
+                                debug!("Forwarding data command, switching to high-throughput mode");
+
+                                // Return the buffer before transitioning
+                                self.buffer_pool.return_buffer(buffer).await;
+
+                                // For high-throughput data transfer, use our optimized copy
+                                // We need to carefully handle this transition...
+                                // For now, let's continue with the select loop but optimize for large transfers
+                                return self.handle_high_throughput_transfer(
+                                    client_reader, client_write,
+                                    backend_read, backend_write,
+                                    client_to_backend_bytes,
+                                    backend_to_client_bytes
+                                ).await;
+                            } else {
+                                // Forward other commands to backend
+                                backend_write.write_all(line.as_bytes()).await?;
+                                client_to_backend_bytes += line.len() as u64;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error reading from client: {}", e);
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                    }
+                }
+
+                // Read response from backend and forward to client (for non-auth commands)
+                result = backend_read.read(&mut buffer) => {
+                    match result {
+                        Ok(0) => {
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break; // Backend disconnected
+                        }
+                        Ok(n) => {
+                            client_write.write_all(&buffer[..n]).await?;
+                            backend_to_client_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            warn!("Error reading from backend: {}", e);
+                            self.buffer_pool.return_buffer(buffer).await;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            self.buffer_pool.return_buffer(buffer).await;
+        }
+
+        Ok((client_to_backend_bytes, backend_to_client_bytes))
+    }
+
+    /// Handle high-throughput data transfer after authentication is complete
+    async fn handle_high_throughput_transfer(
+        &self,
+        mut client_reader: tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
+        mut client_write: tokio::net::tcp::WriteHalf<'_>,
+        mut backend_read: tokio::net::tcp::ReadHalf<'_>,
+        mut backend_write: tokio::net::tcp::WriteHalf<'_>,
+        mut client_to_backend_bytes: u64,
+        mut backend_to_client_bytes: u64,
+    ) -> Result<(u64, u64), anyhow::Error> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        // Note: We would apply high-throughput optimizations here, but we need the original streams
+        // The optimizations are best applied during connection creation in the deadpool manager
+        debug!("Starting high-throughput data transfer");
+
+        // Use direct buffer allocation for high-throughput to avoid pool overhead
+        const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB
+        let mut direct_buffer = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
+
+        // Continue handling commands and large data responses
+        loop {
+            let mut line = String::new();
+
+            tokio::select! {
+                // Continue reading client commands
+                result = client_reader.read_line(&mut line) => {
+                    match result {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            // Forward all commands including QUIT to backend
+                            // This maintains proper NNTP protocol flow
+                            backend_write.write_all(line.as_bytes()).await?;
+                            client_to_backend_bytes += line.len() as u64;
+                        }
+                        Err(e) => {
+                            warn!("Error reading client command: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Read large responses from backend with direct buffer (no pool overhead)
+                result = backend_read.read(&mut direct_buffer) => {
+                    match result {
+                        Ok(0) => {
+                            break;
+                        }
+                        Ok(n) => {
+                            client_write.write_all(&direct_buffer[..n]).await?;
+                            backend_to_client_bytes += n as u64;
+
+                            // For very large transfers, ensure we keep reading efficiently
+                            if n == direct_buffer.len() {
+                                // Buffer was full, likely more data coming
+                                // Continue optimized reading...
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error reading backend response: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((client_to_backend_bytes, backend_to_client_bytes))
+    }
+
+    /// Set socket optimizations for high-throughput transfers using socket2
+    fn set_high_throughput_optimizations(stream: &TcpStream) -> Result<(), std::io::Error> {
+        use socket2::SockRef;
+
+        let sock_ref = SockRef::from(stream);
+
+        // Set larger buffer sizes for high throughput
+        sock_ref.set_recv_buffer_size(16 * 1024 * 1024)?; // 16MB
+        sock_ref.set_send_buffer_size(16 * 1024 * 1024)?; // 16MB
+
+        // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
+        // (socket2 doesn't expose some advanced TCP options like TCP_QUICKACK, TCP_CORK)
+        // but the basic optimizations are sufficient for most use cases
+
+        Ok(())
+    }
+
+    /// Apply aggressive socket optimizations for 1GB+ transfers
+    pub fn apply_high_throughput_optimizations(
+        client_stream: &TcpStream,
+        backend_stream: &TcpStream,
+    ) -> Result<(), std::io::Error> {
+        debug!("Applying high-throughput socket optimizations");
+
         if let Err(e) = Self::set_high_throughput_optimizations(client_stream) {
             debug!("Failed to set client socket optimizations: {}", e);
         }
@@ -813,139 +580,7 @@ impl NntpProxy {
             debug!("Failed to set backend socket optimizations: {}", e);
         }
 
-        match tokio_splice2::copy_bidirectional(client_stream, backend_stream).await {
-            Ok(traffic_result) => {
-                debug!(
-                    "Zero-copy transfer successful: {} bytes (client->server: {}, server->client: {})",
-                    traffic_result.tx + traffic_result.rx,
-                    traffic_result.tx,
-                    traffic_result.rx
-                );
-                Ok((traffic_result.tx as u64, traffic_result.rx as u64))
-            }
-            Err(e) => {
-                debug!("Zero-copy failed: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Set socket optimizations for high-throughput transfers
-    fn set_high_throughput_optimizations(stream: &TcpStream) -> Result<(), std::io::Error> {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
-
-        unsafe {
-            // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
-            // (opposite of small transfer optimization)
-
-            // Enable TCP_QUICKACK for immediate ACKs
-            let quickack: libc::c_int = 1;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_QUICKACK,
-                &quickack as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // Set larger TCP window scaling for high bandwidth-delay product
-            let window_clamp: libc::c_int = 16 * 1024 * 1024; // 16MB window
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_WINDOW_CLAMP,
-                &window_clamp as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // Optimize for high throughput with TCP_CORK equivalent (defer small packets)
-            let cork: libc::c_int = 1;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_CORK,
-                &cork as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // Immediately uncork to flush
-            let uncork: libc::c_int = 0;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_CORK,
-                &uncork as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-
         Ok(())
-    }
-
-    /// High-performance bidirectional copy with zero-copy optimization
-    /// Attempts zero-copy transfer on Linux, falls back to pooled buffers
-    async fn copy_bidirectional_buffered<R, W>(
-        &self,
-        mut reader: R,
-        mut writer: W,
-    ) -> Result<(u64, u64), std::io::Error>
-    where
-        R: AsyncRead + AsyncWrite + Unpin,
-        W: AsyncRead + AsyncWrite + Unpin,
-    {
-        // Use high-throughput buffered copy with pooled buffers for generic streams
-        // Zero-copy is handled by the specialized copy_bidirectional_zero_copy method
-        // Optimized for sustained high-throughput transfers
-        use std::io::ErrorKind;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // Get larger buffers from the pool (256KB for high throughput)
-        let mut buf1 = self.buffer_pool.get_buffer().await;
-        let mut buf2 = self.buffer_pool.get_buffer().await;
-
-        let mut transferred_a_to_b = 0u64;
-        let mut transferred_b_to_a = 0u64;
-
-        // High-throughput copy with 256KB buffers reduces syscall overhead
-        let copy_result = async {
-            loop {
-                tokio::select! {
-                    // Copy from reader to writer with larger buffers
-                    result = reader.read(&mut buf1) => {
-                        match result {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                writer.write_all(&buf1[..n]).await?;
-                                transferred_a_to_b += n as u64;
-                            }
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    // Copy from writer to reader with larger buffers
-                    result = writer.read(&mut buf2) => {
-                        match result {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                reader.write_all(&buf2[..n]).await?;
-                                transferred_b_to_a += n as u64;
-                            }
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-            }
-            Ok((transferred_a_to_b, transferred_b_to_a))
-        }
-        .await;
-
-        // Return buffers to the pool
-        self.buffer_pool.return_buffer(buf1).await;
-        self.buffer_pool.return_buffer(buf2).await;
-
-        copy_result
     }
 }
 
