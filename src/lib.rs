@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -177,70 +177,18 @@ impl NntpProxy {
             }
         }
 
-        // Use a more CPU-friendly approach with tokio::select and proper yielding
-        let (mut client_read, mut client_write) = client_stream.into_split();
-        let (mut backend_read, mut backend_write) = backend_stream.into_split();
-        
-        let mut client_buf = vec![0u8; 8192];
-        let mut backend_buf = vec![0u8; 8192];
-        
-        let mut client_to_backend_bytes = 0u64;
-        let mut backend_to_client_bytes = 0u64;
-        
-        loop {
-            tokio::select! {
-                // Read from client, write to backend
-                result = client_read.read(&mut client_buf) => {
-                    match result {
-                        Ok(0) => {
-                            info!("Client closed connection");
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = backend_write.write_all(&client_buf[..n]).await {
-                                warn!("Error writing to backend: {}", e);
-                                break;
-                            }
-                            client_to_backend_bytes += n as u64;
-                        }
-                        Err(e) => {
-                            warn!("Error reading from client: {}", e);
-                            break;
-                        }
-                    }
-                }
-                // Read from backend, write to client
-                result = backend_read.read(&mut backend_buf) => {
-                    match result {
-                        Ok(0) => {
-                            info!("Backend closed connection");
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = client_write.write_all(&backend_buf[..n]).await {
-                                warn!("Error writing to client: {}", e);
-                                break;
-                            }
-                            backend_to_client_bytes += n as u64;
-                        }
-                        Err(e) => {
-                            warn!("Error reading from backend: {}", e);
-                            break;
-                        }
-                    }
-                }
-                // Add a small delay to prevent busy-waiting
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                    // This ensures we yield to the runtime regularly
-                    continue;
-                }
+        // Use custom high-performance bidirectional copying with larger buffers
+        match Self::copy_bidirectional_buffered(&mut client_stream, &mut backend_stream).await {
+            Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
+                info!(
+                    "Connection closed for client {}: {} bytes client->backend, {} bytes backend->client",
+                    client_addr, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+            Err(e) => {
+                warn!("Bidirectional copy error for client {}: {}", client_addr, e);
             }
         }
-
-        info!(
-            "Connection closed for client {}: {} bytes client->backend, {} bytes backend->client",
-            client_addr, client_to_backend_bytes, backend_to_client_bytes
-        );
 
         // The permit will be automatically dropped here when _permit goes out of scope
         info!("Connection closed for client {}", client_addr);
@@ -417,6 +365,60 @@ impl NntpProxy {
                 return Ok(());
             }
         }
+    }
+
+    /// High-performance bidirectional copy with larger buffers
+    /// Uses 64KB buffers instead of tokio's default 8KB for better throughput
+    async fn copy_bidirectional_buffered<R, W>(
+        mut reader: R,
+        mut writer: W,
+    ) -> Result<(u64, u64), std::io::Error>
+    where
+        R: AsyncRead + AsyncWrite + Unpin,
+        W: AsyncRead + AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::io::ErrorKind;
+
+        // Use larger buffers (64KB each) for better performance
+        const BUFFER_SIZE: usize = 65536;
+        
+        let mut buf1 = vec![0u8; BUFFER_SIZE];
+        let mut buf2 = vec![0u8; BUFFER_SIZE];
+        
+        let mut transferred_a_to_b = 0u64;
+        let mut transferred_b_to_a = 0u64;
+
+        loop {
+            tokio::select! {
+                // Copy from reader to writer
+                result = reader.read(&mut buf1) => {
+                    match result {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            writer.write_all(&buf1[..n]).await?;
+                            transferred_a_to_b += n as u64;
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Copy from writer to reader
+                result = writer.read(&mut buf2) => {
+                    match result {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            reader.write_all(&buf2[..n]).await?;
+                            transferred_b_to_a += n as u64;
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+
+        Ok((transferred_a_to_b, transferred_b_to_a))
     }
 
 }
