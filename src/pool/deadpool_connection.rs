@@ -1,84 +1,45 @@
 use anyhow::Result;
-use deadpool::managed::{Manager, Pool, PoolError};
-use std::sync::Arc;
+use async_trait::async_trait;
+use deadpool::managed;
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::{info, debug, warn};
 
-use crate::ServerConfig;
+use crate::pool::connection_trait::ConnectionProvider;
 
-/// Pooled connection wrapper for deadpool compatibility
-#[derive(Debug)]
-pub struct PooledConnection {
-    pub(crate) stream: TcpStream,
-    pub(crate) server_name: String,
-    pub(crate) authenticated: bool,
-}
-
-impl PooledConnection {
-    pub fn new(
-        stream: TcpStream,
-        server_name: String,
-        authenticated: bool,
-    ) -> Self {
-        Self {
-            stream,
-            server_name,
-            authenticated,
-        }
-    }
-
-    pub fn into_stream(self) -> TcpStream {
-        self.stream
-    }
-
-    pub fn is_authenticated(&self) -> bool {
-        self.authenticated
-    }
-
-    pub fn server_name(&self) -> &str {
-        &self.server_name
-    }
-}
-
-/// Custom deadpool manager for TCP connections
+/// TCP connection manager for deadpool
 #[derive(Debug)]
 pub struct TcpManager {
-    server_config: Arc<ServerConfig>,
+    host: String,
+    port: u16,
+    name: String,
 }
 
 impl TcpManager {
-    pub fn new(server_config: Arc<ServerConfig>) -> Self {
-        Self { server_config }
+    pub fn new(host: String, port: u16, name: String) -> Self {
+        Self { host, port, name }
     }
 
-    /// Create an optimized TCP stream with performance tuning using socket2
-    async fn create_optimized_tcp_stream(addr: &str) -> Result<TcpStream, std::io::Error> {
+    /// Create an optimized TCP connection
+    async fn create_optimized_tcp_stream(&self) -> Result<TcpStream, anyhow::Error> {
         use socket2::{Domain, Protocol, Socket, Type};
-        use std::net::{SocketAddr, ToSocketAddrs};
+        use std::net::SocketAddr;
 
-        // Parse the address
-        let socket_addr: SocketAddr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address")
-        })?;
-
-        // Create socket with socket2 for better control
-        let socket = Socket::new(
-            if socket_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 },
-            Type::STREAM,
-            Some(Protocol::TCP),
-        )?;
-
-        // Set socket buffer sizes for high throughput (2MB each)
-        socket.set_recv_buffer_size(2 * 1024 * 1024)?;
-        socket.set_send_buffer_size(2 * 1024 * 1024)?;
-
-        // Enable keepalive for connection reuse
-        socket.set_keepalive(true)?;
-
-        // Set aggressive keepalive timing for high-performance scenarios
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // First try to resolve the hostname to an IP address
+        let addr = format!("{}:{}", self.host, self.port);
+        let socket_addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr).await?.collect();
+        
+        if socket_addrs.is_empty() {
+            return Err(anyhow::anyhow!("No addresses found for {}", addr));
+        }
+        
+        let socket_addr = socket_addrs[0]; // Use the first resolved address
+        
+        // Create socket with optimizations
+        let domain = if socket_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        
+        // Enable keepalive
         {
-            // Start probes after 60 seconds, probe every 10 seconds
             let keepalive = socket2::TcpKeepalive::new()
                 .with_time(std::time::Duration::from_secs(60))
                 .with_interval(std::time::Duration::from_secs(10));
@@ -103,114 +64,89 @@ impl TcpManager {
     }
 }
 
-impl Manager for TcpManager {
+impl managed::Manager for TcpManager {
     type Type = TcpStream;
     type Error = anyhow::Error;
 
-    fn create(&self) -> impl std::future::Future<Output = Result<Self::Type, Self::Error>> + Send + '_ {
-        async move {
-            let addr = format!("{}:{}", self.server_config.host, self.server_config.port);
-            info!("Creating new connection to {} for deadpool", self.server_config.name);
-            Self::create_optimized_tcp_stream(&addr).await
-                .map_err(|e| anyhow::anyhow!("Failed to create connection: {}", e))
-        }
+    async fn create(&self) -> Result<TcpStream, anyhow::Error> {
+        debug!("Creating new TCP connection to {} for deadpool", self.name);
+        self.create_optimized_tcp_stream().await
     }
 
-    fn recycle(
-        &self,
-        conn: &mut Self::Type,
-        _metrics: &deadpool::managed::Metrics,
-    ) -> impl std::future::Future<Output = deadpool::managed::RecycleResult<Self::Error>> + Send + '_ {
-        async move {
-            // For TCP connections, we'll do a simple health check
-            // Try a non-blocking read to see if the connection is still alive
-            let mut test_buf = [0u8; 1];
-            match conn.try_read(&mut test_buf) {
-                Ok(0) => {
-                    // Connection was closed by server
-                    warn!("Connection to {} was closed by server during recycle check", self.server_config.name);
-                    Err(deadpool::managed::RecycleError::message("Connection closed by server"))
-                }
-                Ok(_) => {
-                    // Got data, which might be normal for NNTP (server messages)
-                    // We'll consider this OK for now and let the application handle it
-                    info!("Connection to {} appears healthy (has buffered data)", self.server_config.name);
-                    Ok(())
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No data available, connection appears healthy
-                    info!("Connection to {} appears healthy", self.server_config.name);
-                    Ok(())
-                }
-                Err(e) => {
-                    // Connection error
-                    warn!("Connection to {} failed health check: {}", self.server_config.name, e);
-                    Err(deadpool::managed::RecycleError::message("Connection health check failed"))
-                }
+    async fn recycle(&self, conn: &mut TcpStream, _: &managed::Metrics) -> managed::RecycleResult<anyhow::Error> {
+        // For TCP connections, do a simple health check
+        let mut test_buf = [0u8; 1];
+        match conn.try_read(&mut test_buf) {
+            Ok(0) => {
+                // Connection was closed by server
+                warn!("Connection to {} was closed by server during recycle check", self.name);
+                Err(managed::RecycleError::message("Connection closed by server"))
+            }
+            Ok(_) => {
+                // Got data, which might be normal for NNTP (server messages)
+                debug!("Connection to {} appears healthy (has buffered data)", self.name);
+                Ok(())
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data available, connection appears healthy
+                debug!("Connection to {} appears healthy", self.name);
+                Ok(())
+            }
+            Err(e) => {
+                // Connection error
+                warn!("Connection to {} failed health check: {}", self.name, e);
+                Err(managed::RecycleError::message("Connection health check failed"))
             }
         }
     }
 }
 
-/// Deadpool-based connection pool wrapper
+type Pool = managed::Pool<TcpManager>;
+
+/// Deadpool-based connection provider with connection pooling
 #[derive(Debug, Clone)]
-pub struct ConnectionPool {
-    pool: Pool<TcpManager>,
-    server_config: Arc<ServerConfig>,
+pub struct DeadpoolConnectionProvider {
+    pool: Pool,
+    name: String,
 }
 
-impl ConnectionPool {
-    pub fn new(server_config: Arc<ServerConfig>) -> Result<Self, anyhow::Error> {
-        let manager = TcpManager::new(server_config.clone());
-        
+impl DeadpoolConnectionProvider {
+    pub fn new(host: String, port: u16, name: String, max_size: usize) -> Self {
+        let manager = TcpManager::new(host, port, name.clone());
         let pool = Pool::builder(manager)
-            .max_size(server_config.max_connections as usize)
+            .max_size(max_size)
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create connection pool: {}", e))?;
+            .expect("Failed to create connection pool");
         
-        info!("Created deadpool connection pool for {} with max {} connections", 
-              server_config.name, server_config.max_connections);
+        info!("Created deadpool connection provider for '{}' with max {} connections", name, max_size);
         
-        Ok(Self {
-            pool,
-            server_config,
-        })
+        Self { pool, name }
     }
 
-    /// Get a connection from the pool
-    pub async fn get(&self) -> Result<deadpool::managed::Object<TcpManager>, PoolError<anyhow::Error>> {
-        self.pool.get().await
-    }
-
-    /// Get pool status for monitoring
-    pub fn status(&self) -> deadpool::Status {
+    /// Get current pool status for monitoring
+    pub fn status(&self) -> managed::Status {
         self.pool.status()
     }
+}
 
-    /// Prewarm connections
-    pub async fn prewarm(&self, count: usize) -> Result<(), anyhow::Error> {
-        let mut connections = Vec::new();
-        let actual_count = count.min(self.server_config.max_connections as usize);
+#[async_trait]
+impl ConnectionProvider for DeadpoolConnectionProvider {
+    async fn get_connection(&self) -> Result<TcpStream> {
+        debug!("Getting connection from pool for {}", self.name);
         
-        info!("Prewarming {} connections for server {}", actual_count, self.server_config.name);
-        
-        for _ in 0..actual_count {
-            match self.get().await {
-                Ok(conn) => {
-                    connections.push(conn);
-                }
-                Err(e) => {
-                    warn!("Failed to prewarm connection for server {}: {}", self.server_config.name, e);
-                    break;
-                }
+        match self.pool.get().await {
+            Ok(conn) => {
+                debug!("Retrieved connection from pool for {}", self.name);
+                // Use Object::take() to permanently remove the connection from the pool
+                // This is appropriate for a proxy where connections aren't reused
+                use deadpool::managed::Object;
+                let stream = Object::take(conn);
+                Ok(stream)
+            }
+            Err(e) => {
+                warn!("Failed to get connection from pool for {}: {}", self.name, e);
+                Err(anyhow::anyhow!("Pool connection failed: {}", e))
             }
         }
-        
-        let prewarmed = connections.len();
-        drop(connections);
-        info!("Completed prewarming for server {} with {} connections", 
-              self.server_config.name, prewarmed);
-        
-        Ok(())
     }
 }

@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 mod pool;
-use pool::{BufferPool, SimpleConnectionProvider};
+use pool::{BufferPool, DeadpoolConnectionProvider, ConnectionProvider};
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
@@ -40,7 +40,7 @@ pub struct NntpProxy {
     servers: Vec<ServerConfig>,
     current_index: Arc<AtomicUsize>,
     /// Connection providers per server - easily swappable implementation
-    connection_providers: Vec<SimpleConnectionProvider>,
+    connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
 }
@@ -51,13 +51,18 @@ impl NntpProxy {
             anyhow::bail!("No servers configured");
         }
 
-        // Create simple connection providers for each server
-        let connection_providers: Vec<SimpleConnectionProvider> = config
+        // Create deadpool connection providers for each server
+        let connection_providers: Vec<DeadpoolConnectionProvider> = config
             .servers
             .iter()
             .map(|server| {
-                info!("Configuring connection provider for '{}'", server.name);
-                SimpleConnectionProvider::new(server.host.clone(), server.port, server.name.clone())
+                info!("Configuring deadpool connection provider for '{}'", server.name);
+                DeadpoolConnectionProvider::new(
+                    server.host.clone(),
+                    server.port,
+                    server.name.clone(),
+                    server.max_connections as usize,
+                )
             })
             .collect();
 

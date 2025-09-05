@@ -1,6 +1,9 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use tokio::net::TcpStream;
 use tracing::info;
+
+use crate::pool::connection_trait::ConnectionProvider;
 
 /// Simple connection provider - creates optimized connections on demand
 /// Can be easily replaced with a pooled implementation later
@@ -15,9 +18,11 @@ impl SimpleConnectionProvider {
     pub fn new(host: String, port: u16, name: String) -> Self {
         Self { host, port, name }
     }
+}
 
-    /// Create a new optimized TCP connection
-    pub async fn get_connection(&self) -> Result<TcpStream> {
+#[async_trait]
+impl ConnectionProvider for SimpleConnectionProvider {
+    async fn get_connection(&self) -> Result<TcpStream> {
         info!("Creating connection to {}", self.name);
 
         let addr = format!("{}:{}", self.host, self.port);
