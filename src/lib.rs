@@ -223,8 +223,8 @@ impl ConnectionPool {
             use std::os::unix::io::AsRawFd;
             let fd = socket.as_raw_fd();
 
-            // Set larger socket buffers (256KB each)
-            let buffer_size = 256 * 1024i32;
+            // Set larger socket buffers (512KB each for high throughput)
+            let buffer_size = 512 * 1024i32;
             unsafe {
                 libc::setsockopt(
                     fd,
@@ -238,6 +238,16 @@ impl ConnectionPool {
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
                     &buffer_size as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                
+                // Enable TCP_CORK for better packet batching at high speeds
+                let cork_flag = 1i32;
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CORK,
+                    &cork_flag as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
             }
@@ -306,7 +316,7 @@ impl NntpProxy {
             current_index: Arc::new(AtomicUsize::new(0)),
             connection_semaphores: Arc::new(connection_semaphores),
             connection_pool: ConnectionPool::new(5), // Max 5 pooled connections per server
-            buffer_pool: BufferPool::new(65536, 10), // 64KB buffers, max 10 in pool
+            buffer_pool: BufferPool::new(262144, 8), // 256KB buffers, max 8 in pool for high throughput
         })
     }
 
@@ -740,22 +750,24 @@ impl NntpProxy {
         R: AsyncRead + AsyncWrite + Unpin,
         W: AsyncRead + AsyncWrite + Unpin,
     {
-        // Use buffered copy with pooled buffers for generic streams
+        // Use high-throughput buffered copy with pooled buffers for generic streams
         // Zero-copy is handled by the specialized copy_bidirectional_zero_copy method
+        // Optimized for sustained high-throughput transfers
         use std::io::ErrorKind;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Get buffers from the pool
+        // Get larger buffers from the pool (256KB for high throughput)
         let mut buf1 = self.buffer_pool.get_buffer().await;
         let mut buf2 = self.buffer_pool.get_buffer().await;
 
         let mut transferred_a_to_b = 0u64;
         let mut transferred_b_to_a = 0u64;
 
+        // High-throughput copy with 256KB buffers reduces syscall overhead
         let copy_result = async {
             loop {
                 tokio::select! {
-                    // Copy from reader to writer
+                    // Copy from reader to writer with larger buffers
                     result = reader.read(&mut buf1) => {
                         match result {
                             Ok(0) => break, // EOF
@@ -767,7 +779,7 @@ impl NntpProxy {
                             Err(e) => return Err(e),
                         }
                     }
-                    // Copy from writer to reader
+                    // Copy from writer to reader with larger buffers  
                     result = writer.read(&mut buf2) => {
                         match result {
                             Ok(0) => break, // EOF
