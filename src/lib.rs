@@ -15,6 +15,49 @@ fn default_max_connections() -> u32 {
     10
 }
 
+/// Buffer pool for reusing large I/O buffers
+#[derive(Debug, Clone)]
+pub struct BufferPool {
+    pool: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    buffer_size: usize,
+    max_pool_size: usize,
+}
+
+impl BufferPool {
+    pub fn new(buffer_size: usize, max_pool_size: usize) -> Self {
+        Self {
+            pool: Arc::new(Mutex::new(VecDeque::new())),
+            buffer_size,
+            max_pool_size,
+        }
+    }
+
+    /// Get a buffer from the pool or create a new one
+    pub async fn get_buffer(&self) -> Vec<u8> {
+        let mut pool = self.pool.lock().await;
+        if let Some(mut buffer) = pool.pop_front() {
+            // Reuse existing buffer, clear it first
+            buffer.clear();
+            buffer.resize(self.buffer_size, 0);
+            buffer
+        } else {
+            // Create new buffer
+            vec![0u8; self.buffer_size]
+        }
+    }
+
+    /// Return a buffer to the pool
+    pub async fn return_buffer(&self, buffer: Vec<u8>) {
+        if buffer.len() == self.buffer_size {
+            let mut pool = self.pool.lock().await;
+            if pool.len() < self.max_pool_size {
+                pool.push_back(buffer);
+            }
+            // If pool is full, just drop the buffer
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config {
     /// List of backend NNTP servers
@@ -87,7 +130,9 @@ impl ConnectionPool {
         _proxy: &NntpProxy,
     ) -> Result<PooledConnection> {
         let mut pools = self.pools.lock().await;
-        let pool = pools.entry(server.name.clone()).or_insert_with(VecDeque::new);
+        let pool = pools
+            .entry(server.name.clone())
+            .or_insert_with(VecDeque::new);
 
         // Try to get a connection from the pool
         if let Some(pooled_conn) = pool.pop_front() {
@@ -96,20 +141,32 @@ impl ConnectionPool {
             match pooled_conn.stream.try_read(&mut test_buf) {
                 Ok(0) => {
                     // Connection was closed by server
-                    info!("Pooled connection to {} was closed, creating new one", server.name);
+                    info!(
+                        "Pooled connection to {} was closed, creating new one",
+                        server.name
+                    );
                 }
                 Ok(_) => {
                     // Got unexpected data, connection might be in use
-                    info!("Pooled connection to {} has unexpected data, creating new one", server.name);
+                    info!(
+                        "Pooled connection to {} has unexpected data, creating new one",
+                        server.name
+                    );
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Connection is alive and ready
-                    info!("Reusing pooled connection to {} (authenticated: {})", server.name, pooled_conn.authenticated);
+                    info!(
+                        "Reusing pooled connection to {} (authenticated: {})",
+                        server.name, pooled_conn.authenticated
+                    );
                     return Ok(pooled_conn);
                 }
                 Err(_) => {
                     // Connection error, create new one
-                    info!("Pooled connection to {} has error, creating new one", server.name);
+                    info!(
+                        "Pooled connection to {} has error, creating new one",
+                        server.name
+                    );
                 }
             }
         }
@@ -118,7 +175,7 @@ impl ConnectionPool {
         info!("Creating new connection to {} for pooling", server.name);
         let backend_addr = format!("{}:{}", server.host, server.port);
         let stream = TcpStream::connect(&backend_addr).await?;
-        
+
         // Return unauthenticated connection - authentication will be handled by caller
         let pooled_conn = PooledConnection::new(stream, server.name.clone(), false);
         Ok(pooled_conn)
@@ -131,11 +188,16 @@ impl ConnectionPool {
         }
 
         let mut pools = self.pools.lock().await;
-        let pool = pools.entry(conn.server_name.clone()).or_insert_with(VecDeque::new);
+        let pool = pools
+            .entry(conn.server_name.clone())
+            .or_insert_with(VecDeque::new);
 
         if pool.len() < self.max_pool_size {
-            info!("Returning connection to {} to pool ({} pooled)", 
-                  conn.server_name, pool.len() + 1);
+            info!(
+                "Returning connection to {} to pool ({} pooled)",
+                conn.server_name,
+                pool.len() + 1
+            );
             pool.push_back(conn);
         } else {
             info!("Pool for {} is full, closing connection", conn.server_name);
@@ -152,6 +214,8 @@ pub struct NntpProxy {
     connection_semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
     /// Connection pool for backend connections
     connection_pool: ConnectionPool,
+    /// Buffer pool for I/O operations
+    buffer_pool: BufferPool,
 }
 
 impl NntpProxy {
@@ -165,7 +229,10 @@ impl NntpProxy {
         for server in &config.servers {
             let semaphore = Arc::new(Semaphore::new(server.max_connections as usize));
             connection_semaphores.insert(server.name.clone(), semaphore);
-            info!("Server '{}' configured with max {} connections", server.name, server.max_connections);
+            info!(
+                "Server '{}' configured with max {} connections",
+                server.name, server.max_connections
+            );
         }
 
         Ok(Self {
@@ -173,6 +240,7 @@ impl NntpProxy {
             current_index: Arc::new(AtomicUsize::new(0)),
             connection_semaphores: Arc::new(connection_semaphores),
             connection_pool: ConnectionPool::new(5), // Max 5 pooled connections per server
+            buffer_pool: BufferPool::new(65536, 10), // 64KB buffers, max 10 in pool
         })
     }
 
@@ -217,13 +285,18 @@ impl NntpProxy {
         let semaphore = self.connection_semaphores.get(&server.name).unwrap();
         let _permit = match semaphore.try_acquire() {
             Ok(permit) => {
-                info!("Acquired connection permit for server '{}' ({} remaining)", 
-                     server.name, semaphore.available_permits());
+                info!(
+                    "Acquired connection permit for server '{}' ({} remaining)",
+                    server.name,
+                    semaphore.available_permits()
+                );
                 permit
             }
             Err(_) => {
-                warn!("Server '{}' has reached max connections ({}), rejecting client", 
-                     server.name, server.max_connections);
+                warn!(
+                    "Server '{}' has reached max connections ({}), rejecting client",
+                    server.name, server.max_connections
+                );
                 let _ = client_stream
                     .write_all(b"400 Server temporarily unavailable - too many connections\r\n")
                     .await;
@@ -231,42 +304,54 @@ impl NntpProxy {
             }
         };
 
-        // Try to get a pooled connection or create a new one  
+        // Try to get a pooled connection or create a new one
         let backend_addr = format!("{}:{}", server.host, server.port);
-        
+
         // Try to get a pooled connection first
-        let (mut backend_stream, is_pooled, server_name, pooled_authenticated) = match self.connection_pool.get_connection(&server, self).await {
-            Ok(pooled) => {
-                info!("Using pooled connection to {} (authenticated: {})", pooled.server_name, pooled.authenticated);
-                (pooled.stream, true, pooled.server_name.clone(), pooled.authenticated)
-            }
-            Err(_) => {
-                // If no pooled connection available, create a new one
-                info!("Creating new connection to {}", backend_addr);
-                match TcpStream::connect(&backend_addr).await {
-                    Ok(stream) => (stream, false, server.name.clone(), false),
-                    Err(e) => {
-                        error!("Failed to connect to backend {}: {}", backend_addr, e);
-                        let _ = client_stream
-                            .write_all(b"400 Backend server unavailable\r\n")
-                            .await;
-                        return Err(e.into());
+        let (mut backend_stream, is_pooled, server_name, pooled_authenticated) =
+            match self.connection_pool.get_connection(&server, self).await {
+                Ok(pooled) => {
+                    info!(
+                        "Using pooled connection to {} (authenticated: {})",
+                        pooled.server_name, pooled.authenticated
+                    );
+                    (
+                        pooled.stream,
+                        true,
+                        pooled.server_name.clone(),
+                        pooled.authenticated,
+                    )
+                }
+                Err(_) => {
+                    // If no pooled connection available, create a new one
+                    info!("Creating new connection to {}", backend_addr);
+                    match TcpStream::connect(&backend_addr).await {
+                        Ok(stream) => (stream, false, server.name.clone(), false),
+                        Err(e) => {
+                            error!("Failed to connect to backend {}: {}", backend_addr, e);
+                            let _ = client_stream
+                                .write_all(b"400 Backend server unavailable\r\n")
+                                .await;
+                            return Err(e.into());
+                        }
                     }
                 }
-            }
-        };
+            };
 
         info!("Connected to backend server {}", backend_addr);
 
         // Handle authentication and greeting based on whether this is a pooled connection
         if is_pooled && pooled_authenticated {
             // For authenticated pooled connections, send greeting to client immediately
-            info!("Using already authenticated pooled connection to {}", server.name);
+            info!(
+                "Using already authenticated pooled connection to {}",
+                server.name
+            );
             if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
                 error!("Failed to send greeting to client: {}", e);
                 return Err(e);
             }
-            
+
             // Handle any client authentication attempts by responding with success
             if let Err(e) = self
                 .handle_client_auth_requests(&mut client_stream, &mut backend_stream)
@@ -319,9 +404,11 @@ impl NntpProxy {
             }
         }
 
-        // Use custom high-performance bidirectional copying with larger buffers
-        let copy_result = Self::copy_bidirectional_buffered(&mut client_stream, &mut backend_stream).await;
-        
+        // Use custom high-performance bidirectional copying with pooled buffers
+        let copy_result = self
+            .copy_bidirectional_buffered(&mut client_stream, &mut backend_stream)
+            .await;
+
         // Always try to return the connection to the pool (whether it was originally pooled or newly created)
         // Determine if authentication was performed in this session
         let was_authenticated = if is_pooled {
@@ -331,11 +418,14 @@ impl NntpProxy {
             // If it was a new connection, it's authenticated if we have credentials
             server.username.is_some() && server.password.is_some()
         };
-        
+
         let pooled_conn = PooledConnection::new(backend_stream, server_name, was_authenticated);
         self.connection_pool.return_connection(pooled_conn).await;
-        info!("Returned connection to pool for {} (authenticated: {})", server.name, was_authenticated);
-        
+        info!(
+            "Returned connection to pool for {} (authenticated: {})",
+            server.name, was_authenticated
+        );
+
         match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
                 info!(
@@ -359,7 +449,8 @@ impl NntpProxy {
         backend_stream: &mut TcpStream,
         client_stream: &mut TcpStream,
     ) -> Result<()> {
-        let mut buffer = [0u8; 1024];
+        // Use a smaller buffer for greeting (1KB should be enough)
+        let mut buffer = vec![0u8; 1024];
 
         // Read the server greeting
         let n = backend_stream.read(&mut buffer).await?;
@@ -378,7 +469,8 @@ impl NntpProxy {
         username: &str,
         password: &str,
     ) -> Result<()> {
-        let mut buffer = [0u8; 1024];
+        // Use a smaller buffer from the pool for authentication (1KB should be enough)
+        let mut buffer = vec![0u8; 1024];
 
         // Read the server greeting first
         let n = stream.read(&mut buffer).await?;
@@ -525,9 +617,10 @@ impl NntpProxy {
         }
     }
 
-    /// High-performance bidirectional copy with larger buffers
-    /// Uses 64KB buffers instead of tokio's default 8KB for better throughput
+    /// High-performance bidirectional copy with pooled buffers
+    /// Uses reusable 64KB buffers from the buffer pool for better performance
     async fn copy_bidirectional_buffered<R, W>(
+        &self,
         mut reader: R,
         mut writer: W,
     ) -> Result<(u64, u64), std::io::Error>
@@ -535,50 +628,55 @@ impl NntpProxy {
         R: AsyncRead + AsyncWrite + Unpin,
         W: AsyncRead + AsyncWrite + Unpin,
     {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use std::io::ErrorKind;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Use larger buffers (64KB each) for better performance
-        const BUFFER_SIZE: usize = 65536;
-        
-        let mut buf1 = vec![0u8; BUFFER_SIZE];
-        let mut buf2 = vec![0u8; BUFFER_SIZE];
-        
+        // Get buffers from the pool
+        let mut buf1 = self.buffer_pool.get_buffer().await;
+        let mut buf2 = self.buffer_pool.get_buffer().await;
+
         let mut transferred_a_to_b = 0u64;
         let mut transferred_b_to_a = 0u64;
 
-        loop {
-            tokio::select! {
-                // Copy from reader to writer
-                result = reader.read(&mut buf1) => {
-                    match result {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            writer.write_all(&buf1[..n]).await?;
-                            transferred_a_to_b += n as u64;
+        let copy_result = async {
+            loop {
+                tokio::select! {
+                    // Copy from reader to writer
+                    result = reader.read(&mut buf1) => {
+                        match result {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                writer.write_all(&buf1[..n]).await?;
+                                transferred_a_to_b += n as u64;
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                            Err(e) => return Err(e),
                         }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                        Err(e) => return Err(e),
                     }
-                }
-                // Copy from writer to reader
-                result = writer.read(&mut buf2) => {
-                    match result {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            reader.write_all(&buf2[..n]).await?;
-                            transferred_b_to_a += n as u64;
+                    // Copy from writer to reader
+                    result = writer.read(&mut buf2) => {
+                        match result {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                reader.write_all(&buf2[..n]).await?;
+                                transferred_b_to_a += n as u64;
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                            Err(e) => return Err(e),
                         }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                        Err(e) => return Err(e),
                     }
                 }
             }
+            Ok((transferred_a_to_b, transferred_b_to_a))
         }
+        .await;
 
-        Ok((transferred_a_to_b, transferred_b_to_a))
+        // Return buffers to the pool
+        self.buffer_pool.return_buffer(buf1).await;
+        self.buffer_pool.return_buffer(buf2).await;
+
+        copy_result
     }
-
 }
 
 pub fn load_config(config_path: &str) -> Result<Config> {
@@ -847,5 +945,4 @@ mod tests {
 
         Ok(())
     }
-
 }

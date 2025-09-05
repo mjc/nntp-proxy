@@ -3,7 +3,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use nntp_proxy::{NntpProxy, load_config, create_default_config};
+use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
         .map(|p| p.get())
         .unwrap_or(1);
     let worker_threads = args.threads.unwrap_or(num_cpus);
-    
+
     // Use different runtime based on thread count for optimal performance
     if worker_threads == 1 {
         info!("Starting NNTP proxy with single-threaded runtime for optimal performance");
@@ -41,8 +41,10 @@ fn main() -> Result<()> {
             .build()?;
         rt.block_on(run_proxy(args))
     } else {
-        info!("Starting NNTP proxy with {} worker threads (detected {} CPUs)", 
-              worker_threads, num_cpus);
+        info!(
+            "Starting NNTP proxy with {} worker threads (detected {} CPUs)",
+            worker_threads, num_cpus
+        );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .enable_all()
@@ -52,28 +54,33 @@ fn main() -> Result<()> {
 }
 
 async fn run_proxy(args: Args) -> Result<()> {
-
     // Load configuration
     let config = if std::path::Path::new(&args.config).exists() {
         // File exists, try to load it
         match load_config(&args.config) {
             Ok(config) => config,
             Err(e) => {
-                error!("Failed to load existing config file '{}': {}", args.config, e);
+                error!(
+                    "Failed to load existing config file '{}': {}",
+                    args.config, e
+                );
                 error!("Please check your config file syntax and try again");
                 return Err(e);
             }
         }
     } else {
         // File doesn't exist, create default
-        warn!("Config file '{}' not found, creating default config", args.config);
+        warn!(
+            "Config file '{}' not found, creating default config",
+            args.config
+        );
         let default_config = create_default_config();
         let config_toml = toml::to_string_pretty(&default_config)?;
         std::fs::write(&args.config, &config_toml)?;
         info!("Created default config file: {}", args.config);
         default_config
     };
-    
+
     info!("Loaded {} backend servers:", config.servers.len());
     for server in &config.servers {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
