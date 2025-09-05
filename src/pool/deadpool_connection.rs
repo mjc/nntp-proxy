@@ -221,8 +221,8 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
                 warn!("Failed to get pooled connection for {}, creating fresh: {}", self.name, e);
                 // Fall back to creating a fresh connection using the same manager logic
                 let manager = TcpManager {
-                    host: self.pool.manager().host.clone(),
-                    port: self.pool.manager().port,
+                    host: self.pool.manager().host().to_string(),
+                    port: self.pool.manager().port(),
                     name: self.name.clone(),
                 };
                 let stream = manager.create().await?;
