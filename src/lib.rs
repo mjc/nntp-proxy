@@ -99,27 +99,39 @@ impl NntpProxy {
             let handle = tokio::spawn(async move {
                 info!("Prewarming pool for '{}' with {} connections", server_name, max_connections);
                 
-                // Get connections from pool and immediately drop them to force pool creation
-                // Since deadpool manages the lifecycle, connections will be returned to pool on drop
-                let mut connections = Vec::new();
+                // Limit concurrent prewarming to avoid overwhelming the server
+                let batch_size = 5; // Create connections in batches of 5
+                let mut total_created = 0;
                 
-                for _ in 0..max_connections {
-                    match provider.get_pooled_connection().await {
-                        Ok(conn) => {
-                            debug!("Created prewarmed connection for '{}'", server_name);
-                            connections.push(conn); // Keep alive temporarily
+                for batch_start in (0..max_connections).step_by(batch_size) {
+                    let batch_end = std::cmp::min(batch_start + batch_size, max_connections);
+                    let mut batch_connections = Vec::new();
+                    
+                    // Create batch connections concurrently
+                    for i in batch_start..batch_end {
+                        match provider.get_pooled_connection().await {
+                            Ok(conn) => {
+                                debug!("Created prewarmed connection {}/{} for '{}'", i+1, max_connections, server_name);
+                                batch_connections.push(conn);
+                                total_created += 1;
+                            }
+                            Err(e) => {
+                                warn!("Failed to prewarm connection {}/{} for '{}': {}", i+1, max_connections, server_name, e);
+                                // Continue with remaining connections in batch
+                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to prewarm connection for '{}': {}", server_name, e);
-                            break; // Stop prewarming this pool on first error
-                        }
+                    }
+                    
+                    // Drop batch connections (return to pool)
+                    drop(batch_connections);
+                    
+                    // Wait between batches to avoid overwhelming server
+                    if batch_end < max_connections {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
                 
-                // Drop all connections at once - they return to the pool
-                drop(connections);
-                
-                info!("Pool prewarming completed for '{}' - {} connections ready", server_name, max_connections);
+                info!("Pool prewarming completed for '{}' - {}/{} connections ready", server_name, total_created, max_connections);
                 Ok::<(), anyhow::Error>(())
             });
             
@@ -146,7 +158,7 @@ impl NntpProxy {
             // Test connection to ensure servers are reachable
             match provider.get_connection().await {
                 Ok(_) => {
-                    info!("Successfully tested connection to {}", server.name);
+                    debug!("Successfully tested connection to {}", server.name);
                 }
                 Err(e) => {
                     warn!("Failed to test connection to {}: {}", server.name, e);
@@ -196,7 +208,7 @@ impl NntpProxy {
         mut client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        info!("New client connection from {}", client_addr);
+        debug!("New client connection from {}", client_addr);
 
         // Get the next backend server
         let server_idx = self.current_index.fetch_add(1, Ordering::Relaxed) % self.servers.len();
@@ -207,7 +219,15 @@ impl NntpProxy {
         );
 
         // Send greeting to client immediately (NNTP protocol requirement)
-        if let Err(e) = client_stream.write_all(b"200 NNTP Service Ready\r\n").await {
+        // Include server name and pool status in greeting for operational visibility  
+        let pool_status = self.connection_providers[server_idx].status();
+        let greeting = format!(
+            "200 NNTP Service Ready - Proxying to {} ({}/{} connections available)\r\n",
+            server.name, 
+            pool_status.available,
+            pool_status.max_size
+        );
+        if let Err(e) = client_stream.write_all(greeting.as_bytes()).await {
             error!("Failed to send greeting to client: {}", e);
             return Err(e.into());
         }
@@ -223,7 +243,7 @@ impl NntpProxy {
         let mut backend_stream = match self.connection_providers[server_idx].get_connection().await
         {
             Ok(stream) => {
-                info!("Created new connection to {}", server.name);
+                debug!("Created new connection to {}", server.name);
                 stream
             }
             Err(e) => {
@@ -237,7 +257,7 @@ impl NntpProxy {
 
         let backend_addr = format!("{}:{}", server.host, server.port);
 
-        info!("Connected to backend server {}", backend_addr);
+        debug!("Connected to backend server {}", backend_addr);
 
         // Authenticate proxy to backend using configured credentials
         if let (Some(username), Some(password)) = (&server.username, &server.password)
@@ -259,7 +279,7 @@ impl NntpProxy {
             .await;
 
         // Connection will be automatically closed when backend_stream goes out of scope
-        info!("Connection to {} will be closed", server.name);
+        debug!("Connection to {} will be closed", server.name);
 
         match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
@@ -274,7 +294,7 @@ impl NntpProxy {
         }
 
         // The permit will be automatically dropped here when _permit goes out of scope
-        info!("Connection closed for client {}", client_addr);
+        debug!("Connection closed for client {}", client_addr);
         Ok(())
     }
 
@@ -291,13 +311,11 @@ impl NntpProxy {
         // Read the server greeting first
         let n = stream.read(&mut buffer).await?;
         let greeting = &buffer[..n];
-        info!(
-            "Server greeting: {}",
-            String::from_utf8_lossy(greeting).trim()
-        );
-
-        // Check if greeting indicates successful connection (200)
         let greeting_str = String::from_utf8_lossy(greeting);
+        debug!(
+            "Server greeting: {}",
+            greeting_str.trim()
+        );
         if !greeting_str.starts_with("200") && !greeting_str.starts_with("201") {
             return Err(anyhow::anyhow!(
                 "Server returned non-success greeting: {}",
@@ -312,7 +330,7 @@ impl NntpProxy {
         // Read response
         let n = stream.read(&mut buffer).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
-        info!("AUTHINFO USER response: {}", response.trim());
+        debug!("AUTHINFO USER response: {}", response.trim());
 
         // Should get 381 (password required) or 281 (authenticated)
         if response.starts_with("281") {
@@ -332,7 +350,7 @@ impl NntpProxy {
         // Read final response
         let n = stream.read(&mut buffer).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
-        info!("AUTHINFO PASS response: {}", response.trim());
+        debug!("AUTHINFO PASS response: {}", response.trim());
 
         // Should get 281 (authenticated)
         let result = if response.starts_with("281") {
