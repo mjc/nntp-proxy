@@ -493,8 +493,8 @@ impl NntpProxy {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
             connection_semaphores: Arc::new(connection_semaphores),
-            connection_pool: ConnectionPool::new(16), // Max 16 pooled connections per server for better small file performance
-            buffer_pool: BufferPool::new(1024 * 1024, 16), // 1MB buffers with more pre-allocated for small file efficiency
+            connection_pool: ConnectionPool::new(32), // Increased to 32 for better small file concurrency
+            buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers better for 100MB files with more available
         })
     }
 
@@ -502,9 +502,9 @@ impl NntpProxy {
     pub async fn prewarm_connections(&self) -> Result<()> {
         info!("Pre-warming connections to all backend servers...");
         for server in &self.servers {
-            // Pre-establish connections to reduce small file latency
+            // Pre-establish connections without authentication to avoid complexity
             for i in 0..4 {
-                // Pre-establish 4 connections per server
+                // Back to 4 connections per server for stability
                 match self.connection_pool.get_connection(server, self).await {
                     Ok(conn) => {
                         info!("Pre-warmed connection {}/4 to {}", i + 1, server.name);
@@ -616,50 +616,10 @@ impl NntpProxy {
 
         info!("Connected to backend server {}", backend_addr);
 
-        // Handle authentication and greeting based on whether this is a pooled connection
-        if is_pooled && pooled_authenticated {
-            // For authenticated pooled connections, send greeting to client immediately
-            info!(
-                "Using already authenticated pooled connection to {}",
-                server.name
-            );
-            // Fast path: skip greeting for small transfers to reduce latency
-            if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
-                error!("Failed to send greeting to client: {}", e);
-                return Err(e);
-            }
-
-            // Skip client auth handling for pooled authenticated connections to reduce overhead
-        } else if is_pooled {
-            // For unauthenticated pooled connections, minimal setup
+        // Simplified authentication - focus on speed over complexity
+        if !is_pooled || !pooled_authenticated {
+            // Only authenticate if not already authenticated
             if let (Some(username), Some(password)) = (&server.username, &server.password) {
-                info!(
-                    "Quick authentication for pooled connection to {}",
-                    server.name
-                );
-
-                if let Err(e) = self
-                    .authenticate_backend(&mut backend_stream, username, password)
-                    .await
-                {
-                    error!("Quick authentication failed for {}: {}", server.name, e);
-                    let _ = client_stream
-                        .write_all(b"502 Authentication failed\r\n")
-                        .await;
-                    return Err(e);
-                }
-
-                // Fast greeting without extra client auth handling
-                if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
-                    error!("Failed to send greeting to client: {}", e);
-                    return Err(e);
-                }
-            }
-        } else {
-            // For new connections, perform full authentication if needed
-            if let (Some(username), Some(password)) = (&server.username, &server.password) {
-                info!("Performing NNTP authentication for {}", server.name);
-
                 if let Err(e) = self
                     .authenticate_backend(&mut backend_stream, username, password)
                     .await
@@ -670,33 +630,13 @@ impl NntpProxy {
                         .await;
                     return Err(e);
                 }
-
-                info!("Successfully authenticated to {}", server.name);
-
-                // Send greeting to client after successful authentication
-                if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
-                    error!("Failed to send greeting to client: {}", e);
-                    return Err(e);
-                }
-
-                // Handle any client authentication attempts by responding with success
-                if let Err(e) = self
-                    .handle_client_auth_requests(&mut client_stream, &mut backend_stream)
-                    .await
-                {
-                    error!("Error handling client authentication: {}", e);
-                    // Don't return error here, continue with normal proxying
-                }
-            } else {
-                // For non-authenticated servers, forward the greeting
-                if let Err(e) = self
-                    .forward_greeting(&mut backend_stream, &mut client_stream)
-                    .await
-                {
-                    error!("Failed to forward server greeting: {}", e);
-                    return Err(e);
-                }
             }
+        }
+
+        // Simple greeting for protocol compliance
+        if let Err(e) = client_stream.write_all(b"200 NNTP Service Ready\r\n").await {
+            error!("Failed to send greeting to client: {}", e);
+            return Err(e.into());
         }
 
         // Try zero-copy first (Linux only), then fall back to high-performance buffered copying
