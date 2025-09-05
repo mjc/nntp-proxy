@@ -1,13 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, info, warn};
 
 /// Default maximum connections per server
@@ -35,12 +35,123 @@ pub struct ServerConfig {
     pub max_connections: u32,
 }
 
+/// Pooled connection wrapper
+#[derive(Debug)]
+pub struct PooledConnection {
+    stream: TcpStream,
+    server_name: String,
+    authenticated: bool,
+}
+
+impl PooledConnection {
+    pub fn new(stream: TcpStream, server_name: String, authenticated: bool) -> Self {
+        Self {
+            stream,
+            server_name,
+            authenticated,
+        }
+    }
+
+    pub fn into_stream(self) -> TcpStream {
+        self.stream
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
+    }
+
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+}
+
+/// Connection pool for backend servers
+#[derive(Debug, Clone)]
+pub struct ConnectionPool {
+    pools: Arc<Mutex<HashMap<String, VecDeque<PooledConnection>>>>,
+    max_pool_size: usize,
+}
+
+impl ConnectionPool {
+    pub fn new(max_pool_size: usize) -> Self {
+        Self {
+            pools: Arc::new(Mutex::new(HashMap::new())),
+            max_pool_size,
+        }
+    }
+
+    /// Get a connection from the pool or create a new one
+    pub async fn get_connection(
+        &self,
+        server: &ServerConfig,
+        _proxy: &NntpProxy,
+    ) -> Result<PooledConnection> {
+        let mut pools = self.pools.lock().await;
+        let pool = pools.entry(server.name.clone()).or_insert_with(VecDeque::new);
+
+        // Try to get a connection from the pool
+        if let Some(pooled_conn) = pool.pop_front() {
+            // Test if the connection is still alive by trying a non-blocking read
+            let mut test_buf = [0u8; 1];
+            match pooled_conn.stream.try_read(&mut test_buf) {
+                Ok(0) => {
+                    // Connection was closed by server
+                    info!("Pooled connection to {} was closed, creating new one", server.name);
+                }
+                Ok(_) => {
+                    // Got unexpected data, connection might be in use
+                    info!("Pooled connection to {} has unexpected data, creating new one", server.name);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Connection is alive and ready
+                    info!("Reusing pooled connection to {} (authenticated: {})", server.name, pooled_conn.authenticated);
+                    return Ok(pooled_conn);
+                }
+                Err(_) => {
+                    // Connection error, create new one
+                    info!("Pooled connection to {} has error, creating new one", server.name);
+                }
+            }
+        }
+
+        // Create new connection - don't authenticate here, let the caller handle it
+        info!("Creating new connection to {} for pooling", server.name);
+        let backend_addr = format!("{}:{}", server.host, server.port);
+        let stream = TcpStream::connect(&backend_addr).await?;
+        
+        // Return unauthenticated connection - authentication will be handled by caller
+        let pooled_conn = PooledConnection::new(stream, server.name.clone(), false);
+        Ok(pooled_conn)
+    }
+
+    /// Return a connection to the pool
+    pub async fn return_connection(&self, conn: PooledConnection) {
+        if self.max_pool_size == 0 {
+            return; // Pooling disabled
+        }
+
+        let mut pools = self.pools.lock().await;
+        let pool = pools.entry(conn.server_name.clone()).or_insert_with(VecDeque::new);
+
+        if pool.len() < self.max_pool_size {
+            info!("Returning connection to {} to pool ({} pooled)", 
+                  conn.server_name, pool.len() + 1);
+            pool.push_back(conn);
+        } else {
+            info!("Pool for {} is full, closing connection", conn.server_name);
+            // Connection will be dropped and closed
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NntpProxy {
     servers: Vec<ServerConfig>,
     current_index: Arc<AtomicUsize>,
     /// Connection semaphores per server (server_name -> semaphore)
     connection_semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
+    /// Connection pool for backend connections
+    connection_pool: ConnectionPool,
 }
 
 impl NntpProxy {
@@ -61,6 +172,7 @@ impl NntpProxy {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
             connection_semaphores: Arc::new(connection_semaphores),
+            connection_pool: ConnectionPool::new(5), // Max 5 pooled connections per server
         })
     }
 
@@ -119,46 +231,43 @@ impl NntpProxy {
             }
         };
 
-        // Connect to backend server
+        // Try to get a pooled connection or create a new one  
         let backend_addr = format!("{}:{}", server.host, server.port);
-        let mut backend_stream = match TcpStream::connect(&backend_addr).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("Failed to connect to backend {}: {}", backend_addr, e);
-                let _ = client_stream
-                    .write_all(b"400 Backend server unavailable\r\n")
-                    .await;
-                return Err(e.into());
+        
+        // Try to get a pooled connection first
+        let (mut backend_stream, is_pooled, server_name, pooled_authenticated) = match self.connection_pool.get_connection(&server, self).await {
+            Ok(pooled) => {
+                info!("Using pooled connection to {} (authenticated: {})", pooled.server_name, pooled.authenticated);
+                (pooled.stream, true, pooled.server_name.clone(), pooled.authenticated)
+            }
+            Err(_) => {
+                // If no pooled connection available, create a new one
+                info!("Creating new connection to {}", backend_addr);
+                match TcpStream::connect(&backend_addr).await {
+                    Ok(stream) => (stream, false, server.name.clone(), false),
+                    Err(e) => {
+                        error!("Failed to connect to backend {}: {}", backend_addr, e);
+                        let _ = client_stream
+                            .write_all(b"400 Backend server unavailable\r\n")
+                            .await;
+                        return Err(e.into());
+                    }
+                }
             }
         };
 
         info!("Connected to backend server {}", backend_addr);
 
-        // Perform authentication if credentials are provided
-        if let (Some(username), Some(password)) = (&server.username, &server.password) {
-            info!("Performing NNTP authentication for {}", server.name);
-
-            if let Err(e) = self
-                .authenticate_backend(&mut backend_stream, username, password)
-                .await
-            {
-                error!("Authentication failed for {}: {}", server.name, e);
-                let _ = client_stream
-                    .write_all(b"502 Authentication failed\r\n")
-                    .await;
-                return Err(e);
-            }
-
-            info!("Successfully authenticated to {}", server.name);
-
-            // Send greeting to client after successful authentication
+        // Handle authentication and greeting based on whether this is a pooled connection
+        if is_pooled && pooled_authenticated {
+            // For authenticated pooled connections, send greeting to client immediately
+            info!("Using already authenticated pooled connection to {}", server.name);
             if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
                 error!("Failed to send greeting to client: {}", e);
                 return Err(e);
             }
-
+            
             // Handle any client authentication attempts by responding with success
-            // since we've already authenticated with the backend
             if let Err(e) = self
                 .handle_client_auth_requests(&mut client_stream, &mut backend_stream)
                 .await
@@ -167,18 +276,67 @@ impl NntpProxy {
                 // Don't return error here, continue with normal proxying
             }
         } else {
-            // For non-authenticated servers, we still need to consume and forward the greeting
-            if let Err(e) = self
-                .forward_greeting(&mut backend_stream, &mut client_stream)
-                .await
-            {
-                error!("Failed to forward server greeting: {}", e);
-                return Err(e);
+            // For unauthenticated connections (pooled or new), perform authentication if needed
+            if let (Some(username), Some(password)) = (&server.username, &server.password) {
+                info!("Performing NNTP authentication for {}", server.name);
+
+                if let Err(e) = self
+                    .authenticate_backend(&mut backend_stream, username, password)
+                    .await
+                {
+                    error!("Authentication failed for {}: {}", server.name, e);
+                    let _ = client_stream
+                        .write_all(b"502 Authentication failed\r\n")
+                        .await;
+                    return Err(e);
+                }
+
+                info!("Successfully authenticated to {}", server.name);
+
+                // Send greeting to client after successful authentication
+                if let Err(e) = self.send_greeting_to_client(&mut client_stream).await {
+                    error!("Failed to send greeting to client: {}", e);
+                    return Err(e);
+                }
+
+                // Handle any client authentication attempts by responding with success
+                if let Err(e) = self
+                    .handle_client_auth_requests(&mut client_stream, &mut backend_stream)
+                    .await
+                {
+                    error!("Error handling client authentication: {}", e);
+                    // Don't return error here, continue with normal proxying
+                }
+            } else {
+                // For non-authenticated servers, forward the greeting
+                if let Err(e) = self
+                    .forward_greeting(&mut backend_stream, &mut client_stream)
+                    .await
+                {
+                    error!("Failed to forward server greeting: {}", e);
+                    return Err(e);
+                }
             }
         }
 
         // Use custom high-performance bidirectional copying with larger buffers
-        match Self::copy_bidirectional_buffered(&mut client_stream, &mut backend_stream).await {
+        let copy_result = Self::copy_bidirectional_buffered(&mut client_stream, &mut backend_stream).await;
+        
+        // Always try to return the connection to the pool (whether it was originally pooled or newly created)
+        // Determine if authentication was performed in this session
+        let was_authenticated = if is_pooled {
+            // If it was pooled, it might already be authenticated OR we just authenticated it
+            pooled_authenticated || (server.username.is_some() && server.password.is_some())
+        } else {
+            // If it was a new connection, it's authenticated if we have credentials
+            server.username.is_some() && server.password.is_some()
+        };
+        
+        let pooled_conn = PooledConnection::new(backend_stream, server_name, was_authenticated);
+        self.connection_pool.return_connection(pooled_conn).await;
+        info!("Returned connection to pool for {} (authenticated: {})", server.name, was_authenticated);
+        
+        match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
                 info!(
                     "Connection closed for client {}: {} bytes client->backend, {} bytes backend->client",
