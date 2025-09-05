@@ -99,6 +99,17 @@ impl NntpProxy {
         &self.servers[index % self.servers.len()]
     }
 
+    /// Gracefully shutdown all connection pools
+    pub async fn graceful_shutdown(&self) {
+        info!("Initiating graceful shutdown of all connection pools...");
+        
+        for provider in &self.connection_providers {
+            provider.graceful_shutdown().await;
+        }
+        
+        info!("All connection pools have been shut down gracefully");
+    }
+
     /// Get the current server index (for testing)
     #[cfg(test)]
     pub fn current_index(&self) -> usize {
