@@ -1,12 +1,19 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
+
+/// Default maximum connections per server
+fn default_max_connections() -> u32 {
+    10
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config {
@@ -23,12 +30,17 @@ pub struct ServerConfig {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Maximum number of concurrent connections to this server
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NntpProxy {
     servers: Vec<ServerConfig>,
     current_index: Arc<AtomicUsize>,
+    /// Connection semaphores per server (server_name -> semaphore)
+    connection_semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl NntpProxy {
@@ -37,9 +49,18 @@ impl NntpProxy {
             anyhow::bail!("No servers configured");
         }
 
+        // Create connection semaphores for each server
+        let mut connection_semaphores = HashMap::new();
+        for server in &config.servers {
+            let semaphore = Arc::new(Semaphore::new(server.max_connections as usize));
+            connection_semaphores.insert(server.name.clone(), semaphore);
+            info!("Server '{}' configured with max {} connections", server.name, server.max_connections);
+        }
+
         Ok(Self {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
+            connection_semaphores: Arc::new(connection_semaphores),
         })
     }
 
@@ -79,6 +100,24 @@ impl NntpProxy {
             "Routing client {} to server {}:{}",
             client_addr, server.host, server.port
         );
+
+        // Acquire connection permit for this server
+        let semaphore = self.connection_semaphores.get(&server.name).unwrap();
+        let _permit = match semaphore.try_acquire() {
+            Ok(permit) => {
+                info!("Acquired connection permit for server '{}' ({} remaining)", 
+                     server.name, semaphore.available_permits());
+                permit
+            }
+            Err(_) => {
+                warn!("Server '{}' has reached max connections ({}), rejecting client", 
+                     server.name, server.max_connections);
+                let _ = client_stream
+                    .write_all(b"400 Server temporarily unavailable - too many connections\r\n")
+                    .await;
+                return Err(anyhow::anyhow!("Server {} at max connections", server.name));
+            }
+        };
 
         // Connect to backend server
         let backend_addr = format!("{}:{}", server.host, server.port);
@@ -385,6 +424,7 @@ pub fn create_default_config() -> Config {
             name: "Example News Server".to_string(),
             username: None,
             password: None,
+            max_connections: default_max_connections(),
         }],
     }
 }
@@ -405,6 +445,7 @@ mod tests {
                     name: "Test Server 1".to_string(),
                     username: None,
                     password: None,
+                    max_connections: 5,
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -412,6 +453,7 @@ mod tests {
                     name: "Test Server 2".to_string(),
                     username: None,
                     password: None,
+                    max_connections: 8,
                 },
                 ServerConfig {
                     host: "server3.example.com".to_string(),
@@ -419,6 +461,7 @@ mod tests {
                     name: "Test Server 3".to_string(),
                     username: None,
                     password: None,
+                    max_connections: 12,
                 },
             ],
         }
@@ -432,11 +475,13 @@ mod tests {
             name: "Example Server".to_string(),
             username: None,
             password: None,
+            max_connections: 15,
         };
 
         assert_eq!(config.host, "news.example.com");
         assert_eq!(config.port, 119);
         assert_eq!(config.name, "Example Server");
+        assert_eq!(config.max_connections, 15);
     }
 
     #[test]
@@ -497,6 +542,7 @@ mod tests {
                 name: "Single Server".to_string(),
                 username: None,
                 password: None,
+                max_connections: 3,
             }],
         };
 

@@ -50,17 +50,33 @@ The proxy uses a TOML configuration file (`config.toml` by default):
 host = "news.example.com"
 port = 119
 name = "Example News Server 1"
+# Optional authentication
+username = "your_username"
+password = "your_password"
+# Connection limit (defaults to 10 if not specified)
+max_connections = 20
 
 [[servers]]
 host = "nntp.example.org"
 port = 119
 name = "Example News Server 2"
+max_connections = 10
 
 [[servers]]
 host = "localhost"
 port = 1119
 name = "Local Test Server"
+max_connections = 5
 ```
+
+### Configuration Fields
+
+- `host` - Backend server hostname
+- `port` - Backend server port (default: 119)  
+- `name` - Friendly name for the server
+- `username` - Optional authentication username
+- `password` - Optional authentication password
+- `max_connections` - Maximum concurrent connections to this server (default: 10)
 
 ## Usage
 

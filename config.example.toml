@@ -5,6 +5,8 @@ name = "Example News Server 1"
 # Optional authentication - uncomment if needed
 # username = "your_username"
 # password = "your_password"
+# High-capacity server allows many connections
+max_connections = 20
 
 [[servers]]
 host = "nntp.example.org"
@@ -13,6 +15,8 @@ name = "Example News Server 2"
 # This server requires authentication
 username = "testuser"
 password = "testpass"
+# Standard connection limit
+max_connections = 10
 
 [[servers]]
 host = "secure-news.example.com"
@@ -21,9 +25,16 @@ name = "Secure News Server"
 # Example with SSL port and authentication
 username = "premium_user"
 password = "secure_password"
+# Premium server allows more connections
+max_connections = 15
 
 [[servers]]
 host = "localhost"
 port = 1119
 name = "Local Test Server"
 # No authentication needed for local server
+# Limited connections for test server
+max_connections = 5
+
+# Note: max_connections defaults to 10 if not specified
+# Each server can have different limits based on your provider's restrictions
