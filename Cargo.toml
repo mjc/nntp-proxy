@@ -20,6 +20,8 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1.0"
+tokio-splice2 = "0.3"  # Zero-copy networking with splice/sendfile
+libc = "0.2"  # For low-level socket optimizations
 
 [dev-dependencies]
 tempfile = "3.8"
