@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
@@ -120,8 +119,6 @@ pub struct PooledConnection {
     pub stream: TcpStream,
     pub server_name: String,
     pub authenticated: bool,
-    pool: Arc<SegQueue<TcpStream>>,
-    active_connections: Arc<AtomicUsize>,
 }
 
 impl PooledConnection {
@@ -129,15 +126,11 @@ impl PooledConnection {
         stream: TcpStream,
         server_name: String,
         authenticated: bool,
-        pool: Arc<SegQueue<TcpStream>>,
-        active_connections: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             stream,
             server_name,
             authenticated,
-            pool,
-            active_connections,
         }
     }
 
@@ -269,8 +262,6 @@ impl ConnectionPool {
                         stream,
                         server_name: server.name.clone(),
                         authenticated: false, // Reset authentication state for safety
-                        pool: Arc::clone(&self.pool),
-                        active_connections: Arc::clone(&self.active_connections),
                     });
                 }
                 Err(_) => {
@@ -294,8 +285,6 @@ impl ConnectionPool {
             stream,
             server.name.clone(),
             false,
-            Arc::clone(&self.pool),
-            Arc::clone(&self.active_connections),
         );
         Ok(pooled_conn)
     }
@@ -712,8 +701,6 @@ impl NntpProxy {
             backend_stream,
             server_name,
             was_authenticated,
-            Arc::clone(&self.connection_pool.pool),
-            Arc::clone(&self.connection_pool.active_connections),
         );
         self.connection_pool.return_connection(pooled_conn).await;
         info!(
@@ -735,25 +722,6 @@ impl NntpProxy {
 
         // The permit will be automatically dropped here when _permit goes out of scope
         info!("Connection closed for client {}", client_addr);
-        Ok(())
-    }
-
-    /// Forward the server greeting to the client for non-authenticated connections
-    async fn forward_greeting(
-        &self,
-        backend_stream: &mut TcpStream,
-        client_stream: &mut TcpStream,
-    ) -> Result<()> {
-        // Use a smaller buffer for greeting (1KB should be enough)
-        let mut buffer = vec![0u8; 1024];
-
-        // Read the server greeting
-        let n = backend_stream.read(&mut buffer).await?;
-        let greeting = &buffer[..n];
-
-        // Forward it to the client
-        client_stream.write_all(greeting).await?;
-
         Ok(())
     }
 
@@ -826,94 +794,6 @@ impl NntpProxy {
         // Return buffer to pool
         self.buffer_pool.return_buffer(buffer).await;
         result
-    }
-
-    /// Send a synthetic server greeting to the client after authentication
-    async fn send_greeting_to_client(&self, client_stream: &mut TcpStream) -> Result<()> {
-        // Send a standard NNTP greeting to the client
-        let greeting = b"200 NNTP Proxy Server Ready\r\n";
-        client_stream.write_all(greeting).await?;
-        Ok(())
-    }
-
-    /// Handle any authentication requests from the client
-    /// Since we've already authenticated with the backend, we respond with success
-    async fn handle_client_auth_requests(
-        &self,
-        client_stream: &mut TcpStream,
-        backend_stream: &mut TcpStream,
-    ) -> Result<()> {
-        let mut buffer = vec![0; 4096];
-
-        // Use a timeout to avoid blocking forever
-        let timeout_duration = Duration::from_secs(5);
-
-        loop {
-            // Try to read from client with timeout
-            let bytes_read =
-                match tokio::time::timeout(timeout_duration, client_stream.read(&mut buffer)).await
-                {
-                    Ok(Ok(0)) => {
-                        // Client disconnected
-                        info!("Client disconnected during auth handling");
-                        return Ok(());
-                    }
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => {
-                        error!("Error reading from client during auth: {}", e);
-                        return Err(e.into());
-                    }
-                    Err(_) => {
-                        // Timeout - assume no more auth commands coming
-                        info!(
-                            "No auth commands received from client, proceeding with normal proxy"
-                        );
-                        return Ok(());
-                    }
-                };
-
-            let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-            info!("Received from client: {}", request.trim());
-
-            // Check if this is an AUTHINFO command
-            if request
-                .trim_start()
-                .to_uppercase()
-                .starts_with("AUTHINFO USER")
-            {
-                info!("Client sent AUTHINFO USER, responding with success");
-                let response = "281 Authentication accepted\r\n";
-                client_stream.write_all(response.as_bytes()).await?;
-                client_stream.flush().await?;
-            } else if request
-                .trim_start()
-                .to_uppercase()
-                .starts_with("AUTHINFO PASS")
-            {
-                info!("Client sent AUTHINFO PASS, responding with success");
-                let response = "281 Authentication accepted\r\n";
-                client_stream.write_all(response.as_bytes()).await?;
-                client_stream.flush().await?;
-            } else {
-                // Not an auth command, forward it to backend and start normal proxying
-                info!(
-                    "Non-auth command received: {}, starting normal proxy mode",
-                    request.trim()
-                );
-                backend_stream.write_all(&buffer[..bytes_read]).await?;
-                backend_stream.flush().await?;
-
-                // Forward the response back to client
-                let mut response_buffer = vec![0; 4096];
-                let response_bytes = backend_stream.read(&mut response_buffer).await?;
-                client_stream
-                    .write_all(&response_buffer[..response_bytes])
-                    .await?;
-                client_stream.flush().await?;
-
-                return Ok(());
-            }
-        }
     }
 
     /// Zero-copy bidirectional copy specifically for TcpStream pairs (Linux only)
