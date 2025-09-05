@@ -29,6 +29,8 @@
       nativeBuildInputs = with pkgs; [
         rustToolchain
         pkg-config
+        cargo-flamegraph
+        linuxPackages.perf
       ];
 
       buildInputs = with pkgs;
@@ -54,10 +56,12 @@
           echo "   OpenSSL version: ${pkgs.openssl.version}"
           echo ""
           echo "📦 Available commands:"
-          echo "   cargo build    - Build the project"
-          echo "   cargo run      - Run the NNTP proxy"
-          echo "   cargo test     - Run tests"
-          echo "   cargo clippy   - Run linter"
+          echo "   cargo build       - Build the project"
+          echo "   cargo run         - Run the NNTP proxy"
+          echo "   cargo test        - Run tests"
+          echo "   cargo clippy      - Run linter"
+          echo "   cargo flamegraph  - Generate performance flamegraph"
+          echo "   perf              - Linux performance analysis tools"
           echo ""
         '';
 
