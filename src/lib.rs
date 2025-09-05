@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 
 mod pool;
 use pool::{BufferPool, DeadpoolConnectionProvider, ConnectionProvider};
+use pool::connection_trait::ConnectionType;
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
@@ -240,11 +241,15 @@ impl NntpProxy {
         }
 
         // Get the connection manager for this server and create connection
-        let mut backend_stream = match self.connection_providers[server_idx].get_connection().await
+        // Use typed connection to optimize authentication
+        let backend_connection = match self.connection_providers[server_idx].get_typed_connection().await
         {
-            Ok(stream) => {
-                debug!("Created new connection to {}", server.name);
-                stream
+            Ok(connection) => {
+                match &connection {
+                    ConnectionType::Fresh(_) => debug!("Created fresh connection to {} (requires auth)", server.name),
+                    ConnectionType::Pooled(_) => debug!("Retrieved pooled connection to {} (pre-authenticated)", server.name),
+                }
+                connection
             }
             Err(e) => {
                 error!("Failed to connect to {}: {}", server.name, e);
@@ -256,21 +261,32 @@ impl NntpProxy {
         };
 
         let backend_addr = format!("{}:{}", server.host, server.port);
-
         debug!("Connected to backend server {}", backend_addr);
 
-        // Authenticate proxy to backend using configured credentials
-        if let (Some(username), Some(password)) = (&server.username, &server.password)
-            && let Err(e) = self
-                .authenticate_backend(&mut backend_stream, username, password)
-                .await
-            {
-                error!("Authentication failed for {}: {}", server.name, e);
-                let _ = client_stream
-                    .write_all(b"502 Authentication failed\r\n")
-                    .await;
-                return Err(e);
+        // Extract the stream and determine if authentication is needed
+        let (mut backend_stream, needs_auth) = match backend_connection {
+            ConnectionType::Fresh(stream) => (stream, true),
+            ConnectionType::Pooled(stream) => (stream, false),
+        };
+
+        // Only authenticate if this is a fresh connection that needs it
+        if needs_auth {
+            if let (Some(username), Some(password)) = (&server.username, &server.password) {
+                if let Err(e) = self
+                    .authenticate_backend(&mut backend_stream, username, password)
+                    .await
+                {
+                    error!("Authentication failed for {}: {}", server.name, e);
+                    let _ = client_stream
+                        .write_all(b"502 Authentication failed\r\n")
+                        .await;
+                    return Err(e);
+                }
+                debug!("Successfully authenticated fresh connection to {}", server.name);
             }
+        } else {
+            debug!("Skipping authentication for pre-authenticated pooled connection to {}", server.name);
+        }
 
         // Now implement intelligent proxying that handles client authentication
         // without passing it to the already-authenticated backend
@@ -502,19 +518,19 @@ impl NntpProxy {
         // The optimizations are best applied during connection creation in the deadpool manager
         debug!("Starting high-throughput data transfer");
 
+        // Use direct buffer allocation for high-throughput to avoid pool overhead
+        const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB
+        let mut direct_buffer = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
+
         // Continue handling commands and large data responses
         loop {
             let mut line = String::new();
-            let mut buffer = self.buffer_pool.get_buffer().await;
 
             tokio::select! {
                 // Continue reading client commands
                 result = client_reader.read_line(&mut line) => {
                     match result {
-                        Ok(0) => {
-                            self.buffer_pool.return_buffer(buffer).await;
-                            break;
-                        }
+                        Ok(0) => break,
                         Ok(_) => {
                             let trimmed = line.trim();
                             
@@ -524,7 +540,6 @@ impl NntpProxy {
                                 client_write.write_all(response).await?;
                                 backend_to_client_bytes += response.len() as u64;
                                 debug!("Intercepted QUIT command in high-throughput mode");
-                                self.buffer_pool.return_buffer(buffer).await;
                                 break; // Close client connection, keep backend for pool reuse
                             } else {
                                 // Forward other commands to backend
@@ -534,39 +549,34 @@ impl NntpProxy {
                         }
                         Err(e) => {
                             warn!("Error reading client command: {}", e);
-                            self.buffer_pool.return_buffer(buffer).await;
                             break;
                         }
                     }
                 }
 
-                // Read large responses from backend with optimized buffer size
-                result = backend_read.read(&mut buffer) => {
+                // Read large responses from backend with direct buffer (no pool overhead)
+                result = backend_read.read(&mut direct_buffer) => {
                     match result {
                         Ok(0) => {
-                            self.buffer_pool.return_buffer(buffer).await;
                             break;
                         }
                         Ok(n) => {
-                            client_write.write_all(&buffer[..n]).await?;
+                            client_write.write_all(&direct_buffer[..n]).await?;
                             backend_to_client_bytes += n as u64;
 
                             // For very large transfers, ensure we keep reading efficiently
-                            if n == buffer.len() {
+                            if n == direct_buffer.len() {
                                 // Buffer was full, likely more data coming
                                 // Continue optimized reading...
                             }
                         }
                         Err(e) => {
                             warn!("Error reading backend response: {}", e);
-                            self.buffer_pool.return_buffer(buffer).await;
                             break;
                         }
                     }
                 }
             }
-
-            self.buffer_pool.return_buffer(buffer).await;
         }
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
