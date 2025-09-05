@@ -99,6 +99,13 @@ impl managed::Manager for TcpManager {
             }
         }
     }
+
+    fn detach(&self, _conn: &mut TcpStream) {
+        // Connection is being removed from the pool
+        // For simplicity, we'll let the connection drop naturally
+        // The main graceful shutdown will handle QUIT commands
+        debug!("Connection detached from pool for {}", self.name);
+    }
 }
 
 type Pool = managed::Pool<TcpManager>;
@@ -126,6 +133,47 @@ impl DeadpoolConnectionProvider {
     /// Get current pool status for monitoring
     pub fn status(&self) -> managed::Status {
         self.pool.status()
+    }
+
+    /// Gracefully shutdown the pool by sending QUIT to all idle connections
+    pub async fn graceful_shutdown(&self) {
+        info!("Gracefully shutting down connection pool for '{}'", self.name);
+        
+        let status = self.pool.status();
+        let idle_connections = status.available;
+        
+        info!("Sending QUIT to {} idle connections for '{}'", idle_connections, self.name);
+        
+        // Try to get and send QUIT to idle connections with a short timeout
+        for _ in 0..idle_connections {
+            // Use a very short timeout to only get immediately available connections
+            let timeout = std::time::Duration::from_millis(1);
+            let mut timeouts = managed::Timeouts::new();
+            timeouts.wait = Some(timeout);
+            
+            if let Ok(conn_obj) = self.pool.timeout_get(&timeouts).await {
+                use deadpool::managed::Object;
+                use tokio::io::AsyncWriteExt;
+                
+                // Take the connection from the pool permanently
+                let mut conn = Object::take(conn_obj);
+                
+                // Send QUIT command
+                if let Err(e) = conn.write_all(b"QUIT\r\n").await {
+                    debug!("Failed to send QUIT to connection for '{}': {}", self.name, e);
+                } else {
+                    debug!("Sent QUIT to connection for '{}'", self.name);
+                }
+                // Connection will be dropped here, closing it
+            } else {
+                break; // No more idle connections available
+            }
+        }
+        
+        // Close the pool to prevent new connections
+        self.pool.close();
+        
+        info!("Connection pool closed for '{}'", self.name);
     }
 }
 
