@@ -287,6 +287,11 @@ impl NntpProxy {
     ) -> Result<(u64, u64), anyhow::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+        // Apply high-throughput socket optimizations for large transfers
+        if let Err(e) = Self::apply_high_throughput_optimizations(&client_stream, &backend_stream) {
+            debug!("Failed to apply high-throughput optimizations: {}", e);
+        }
+
         // Split streams for independent read/write
         let (client_read, mut client_write) = client_stream.split();
         let (mut backend_read, mut backend_write) = backend_stream.split();
@@ -396,6 +401,10 @@ impl NntpProxy {
     ) -> Result<(u64, u64), anyhow::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+        // Note: We would apply high-throughput optimizations here, but we need the original streams
+        // The optimizations are best applied during connection creation in the deadpool manager
+        debug!("Starting high-throughput data transfer");
+
         // Continue handling commands and large data responses
         loop {
             let mut line = String::new();
@@ -452,6 +461,40 @@ impl NntpProxy {
         }
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
+    }
+
+    /// Set socket optimizations for high-throughput transfers using socket2
+    fn set_high_throughput_optimizations(stream: &TcpStream) -> Result<(), std::io::Error> {
+        use socket2::SockRef;
+
+        let sock_ref = SockRef::from(stream);
+
+        // Set larger buffer sizes for high throughput
+        sock_ref.set_recv_buffer_size(16 * 1024 * 1024)?; // 16MB
+        sock_ref.set_send_buffer_size(16 * 1024 * 1024)?; // 16MB
+
+        // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
+        // (socket2 doesn't expose some advanced TCP options like TCP_QUICKACK, TCP_CORK)
+        // but the basic optimizations are sufficient for most use cases
+
+        Ok(())
+    }
+
+    /// Apply aggressive socket optimizations for 1GB+ transfers
+    pub fn apply_high_throughput_optimizations(
+        client_stream: &TcpStream,
+        backend_stream: &TcpStream,
+    ) -> Result<(), std::io::Error> {
+        debug!("Applying high-throughput socket optimizations");
+
+        if let Err(e) = Self::set_high_throughput_optimizations(client_stream) {
+            debug!("Failed to set client socket optimizations: {}", e);
+        }
+        if let Err(e) = Self::set_high_throughput_optimizations(backend_stream) {
+            debug!("Failed to set backend socket optimizations: {}", e);
+        }
+
+        Ok(())
     }
 }
 
