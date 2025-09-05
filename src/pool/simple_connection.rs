@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use tokio::net::TcpStream;
 use tracing::info;
 
-use crate::pool::connection_trait::ConnectionProvider;
+use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 
 /// Simple connection provider - creates optimized connections on demand
 /// Can be easily replaced with a pooled implementation later
@@ -32,5 +32,14 @@ impl ConnectionProvider for SimpleConnectionProvider {
         let _ = stream.set_nodelay(true);
 
         Ok(stream)
+    }
+    
+    fn status(&self) -> PoolStatus {
+        // Simple provider doesn't pool connections, so always shows max available
+        PoolStatus {
+            available: 1, // Always "available" since it creates on demand
+            max_size: 1,  // No pooling limit
+            created: 0,   // No persistent connections
+        }
     }
 }

@@ -4,7 +4,7 @@ use deadpool::managed;
 use tokio::net::TcpStream;
 use tracing::{info, debug, warn};
 
-use crate::pool::connection_trait::ConnectionProvider;
+use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
@@ -223,6 +223,15 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
                 warn!("Failed to get connection from pool for {}: {}", self.name, e);
                 Err(anyhow::anyhow!("Pool connection failed: {}", e))
             }
+        }
+    }
+    
+    fn status(&self) -> PoolStatus {
+        let status = self.pool.status();
+        PoolStatus {
+            available: status.available,
+            max_size: status.max_size,
+            created: status.size,
         }
     }
 }
