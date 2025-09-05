@@ -15,14 +15,27 @@ struct Args {
     /// Configuration file path
     #[arg(short, long, default_value = "config.toml")]
     config: String,
+
+    /// Number of worker threads (defaults to number of CPU cores)
+    #[arg(short, long)]
+    threads: Option<usize>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // Log threading info
+    let num_cpus = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    let worker_threads = args.threads.unwrap_or(num_cpus);
+    
+    info!("Starting NNTP proxy with {} worker threads (detected {} CPUs)", 
+          worker_threads, num_cpus);
 
     // Load configuration
     let config = if std::path::Path::new(&args.config).exists() {

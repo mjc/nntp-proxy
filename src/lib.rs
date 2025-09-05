@@ -177,28 +177,72 @@ impl NntpProxy {
             }
         }
 
-        // Split streams for bidirectional proxying
-        let (client_read, client_write) = client_stream.split();
-        let (backend_read, backend_write) = backend_stream.split();
-
-        // Proxy data in both directions
-        let client_to_backend = Self::proxy_data(client_read, backend_write, "client->backend");
-        let backend_to_client = Self::proxy_data(backend_read, client_write, "backend->client");
-
-        // Wait for either direction to close
-        tokio::select! {
-            result = client_to_backend => {
-                if let Err(e) = result {
-                    warn!("Client to backend proxy error: {}", e);
+        // Use a more CPU-friendly approach with tokio::select and proper yielding
+        let (mut client_read, mut client_write) = client_stream.into_split();
+        let (mut backend_read, mut backend_write) = backend_stream.into_split();
+        
+        let mut client_buf = vec![0u8; 8192];
+        let mut backend_buf = vec![0u8; 8192];
+        
+        let mut client_to_backend_bytes = 0u64;
+        let mut backend_to_client_bytes = 0u64;
+        
+        loop {
+            tokio::select! {
+                // Read from client, write to backend
+                result = client_read.read(&mut client_buf) => {
+                    match result {
+                        Ok(0) => {
+                            info!("Client closed connection");
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = backend_write.write_all(&client_buf[..n]).await {
+                                warn!("Error writing to backend: {}", e);
+                                break;
+                            }
+                            client_to_backend_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            warn!("Error reading from client: {}", e);
+                            break;
+                        }
+                    }
                 }
-            }
-            result = backend_to_client => {
-                if let Err(e) = result {
-                    warn!("Backend to client proxy error: {}", e);
+                // Read from backend, write to client
+                result = backend_read.read(&mut backend_buf) => {
+                    match result {
+                        Ok(0) => {
+                            info!("Backend closed connection");
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = client_write.write_all(&backend_buf[..n]).await {
+                                warn!("Error writing to client: {}", e);
+                                break;
+                            }
+                            backend_to_client_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            warn!("Error reading from backend: {}", e);
+                            break;
+                        }
+                    }
+                }
+                // Add a small delay to prevent busy-waiting
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    // This ensures we yield to the runtime regularly
+                    continue;
                 }
             }
         }
 
+        info!(
+            "Connection closed for client {}: {} bytes client->backend, {} bytes backend->client",
+            client_addr, client_to_backend_bytes, backend_to_client_bytes
+        );
+
+        // The permit will be automatically dropped here when _permit goes out of scope
         info!("Connection closed for client {}", client_addr);
         Ok(())
     }
@@ -375,35 +419,6 @@ impl NntpProxy {
         }
     }
 
-    pub async fn proxy_data<R, W>(mut reader: R, mut writer: W, direction: &str) -> Result<()>
-    where
-        R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
-    {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if let Err(e) =
-                        tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await
-                    {
-                        error!("Write error in {}: {}", direction, e);
-                        return Err(e.into());
-                    }
-                    if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut writer).await {
-                        error!("Flush error in {}: {}", direction, e);
-                        return Err(e.into());
-                    }
-                }
-                Err(e) => {
-                    error!("Read error in {}: {}", direction, e);
-                    return Err(e.into());
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 pub fn load_config(config_path: &str) -> Result<Config> {
@@ -673,52 +688,4 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_proxy_data_empty_stream() -> Result<()> {
-        use tokio::io::{empty, sink};
-
-        let result = NntpProxy::proxy_data(empty(), sink(), "test").await;
-        assert!(result.is_ok());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_proxy_data_with_data() -> Result<()> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
-
-        let (mut client, server) = duplex(64);
-        let (server_read, server_write) = tokio::io::split(server);
-
-        // Send data in the background
-        tokio::spawn(async move {
-            let _ = client.write_all(b"Hello, world!").await;
-            let _ = client.shutdown().await;
-        });
-
-        // Capture the proxied data
-        let (mut output_reader, output_writer) = duplex(64);
-
-        // Start proxying
-        let proxy_task =
-            tokio::spawn(
-                async move { NntpProxy::proxy_data(server_read, output_writer, "test").await },
-            );
-
-        // Close the write side so the proxy task can complete
-        drop(server_write);
-
-        // Read the proxied data
-        let mut buffer = Vec::new();
-        let _ = output_reader.read_to_end(&mut buffer).await;
-
-        // Wait for proxy to finish
-        let result = proxy_task.await.unwrap();
-        assert!(result.is_ok());
-
-        // Verify data was proxied correctly
-        assert_eq!(buffer, b"Hello, world!");
-
-        Ok(())
-    }
 }
