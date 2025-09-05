@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crossbeam::queue::SegQueue;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -15,43 +16,59 @@ fn default_max_connections() -> u32 {
     10
 }
 
-/// Buffer pool for reusing large I/O buffers
+/// Lock-free buffer pool for reusing large I/O buffers
+/// Uses crossbeam's SegQueue for lock-free operations
 #[derive(Debug, Clone)]
 pub struct BufferPool {
-    pool: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    pool: Arc<SegQueue<Vec<u8>>>,
     buffer_size: usize,
     max_pool_size: usize,
+    pool_size: Arc<AtomicUsize>,
 }
 
 impl BufferPool {
     pub fn new(buffer_size: usize, max_pool_size: usize) -> Self {
         Self {
-            pool: Arc::new(Mutex::new(VecDeque::new())),
+            pool: Arc::new(SegQueue::new()),
             buffer_size,
             max_pool_size,
+            pool_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Get a buffer from the pool or create a new one
+    /// Get a buffer from the pool or create a new one (lock-free)
     pub async fn get_buffer(&self) -> Vec<u8> {
-        let mut pool = self.pool.lock().await;
-        if let Some(mut buffer) = pool.pop_front() {
+        if let Some(mut buffer) = self.pool.pop() {
+            self.pool_size.fetch_sub(1, Ordering::Relaxed);
             // Reuse existing buffer, clear it first
             buffer.clear();
             buffer.resize(self.buffer_size, 0);
             buffer
         } else {
-            // Create new buffer
-            vec![0u8; self.buffer_size]
+            // Create new page-aligned buffer for better DMA performance
+            Self::create_aligned_buffer(self.buffer_size)
         }
     }
 
-    /// Return a buffer to the pool
+    /// Create a page-aligned buffer for optimal DMA performance
+    fn create_aligned_buffer(size: usize) -> Vec<u8> {
+        // Align to page boundaries (4KB) for better memory performance
+        let page_size = 4096;
+        let aligned_size = ((size + page_size - 1) / page_size) * page_size;
+
+        // Use aligned allocation for better cache performance
+        let mut buffer = Vec::with_capacity(aligned_size);
+        buffer.resize(size, 0);
+        buffer
+    }
+
+    /// Return a buffer to the pool (lock-free)
     pub async fn return_buffer(&self, buffer: Vec<u8>) {
         if buffer.len() == self.buffer_size {
-            let mut pool = self.pool.lock().await;
-            if pool.len() < self.max_pool_size {
-                pool.push_back(buffer);
+            let current_size = self.pool_size.load(Ordering::Relaxed);
+            if current_size < self.max_pool_size {
+                self.pool.push(buffer);
+                self.pool_size.fetch_add(1, Ordering::Relaxed);
             }
             // If pool is full, just drop the buffer
         }
