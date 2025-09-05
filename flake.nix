@@ -31,6 +31,7 @@
         pkg-config
         cargo-flamegraph
         linuxPackages.perf
+        gh
       ];
 
       buildInputs = with pkgs;
