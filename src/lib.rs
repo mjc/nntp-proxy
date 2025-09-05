@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
@@ -289,8 +289,9 @@ impl ConnectionPool {
         Ok(pooled_conn)
     }
 
-    /// Create an optimized TCP stream with performance tuning
+    /// Create an optimized TCP stream with performance tuning using socket2
     async fn create_optimized_tcp_stream(addr: &str) -> Result<TcpStream, std::io::Error> {
+        use socket2::{Domain, Protocol, Socket, Type};
         use std::net::{SocketAddr, ToSocketAddrs};
 
         // Parse the address
@@ -298,144 +299,48 @@ impl ConnectionPool {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address")
         })?;
 
-        // Create socket with optimizations
-        let socket = if socket_addr.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
-        };
+        // Create socket with socket2 for better control
+        let socket = Socket::new(
+            if socket_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 },
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )?;
 
-        // Apply TCP optimizations
-        socket.set_nodelay(true)?; // Disable Nagle's algorithm for low latency
+        // Set socket buffer sizes for high throughput (2MB each)
+        socket.set_recv_buffer_size(2 * 1024 * 1024)?;
+        socket.set_send_buffer_size(2 * 1024 * 1024)?;
 
-        // Set socket buffer sizes for high throughput
-        #[cfg(target_os = "linux")]
+        // Enable keepalive for connection reuse
+        socket.set_keepalive(true)?;
+
+        // Set aggressive keepalive timing for high-performance scenarios
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-
-            // Set much larger socket buffers for high-throughput large file transfers (2MB each)
-            let buffer_size = 2 * 1024 * 1024i32; // 2MB instead of 512KB
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    &buffer_size as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    &buffer_size as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable TCP keep-alive for connection reuse
-                let keepalive = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_KEEPALIVE,
-                    &keepalive as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Set aggressive keep-alive timing for high-performance scenarios
-                let keepalive_time = 60i32; // Start probes after 60 seconds
-                let keepalive_interval = 10i32; // Probe every 10 seconds
-                let keepalive_probes = 3i32; // 3 failed probes before considering dead
-
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPIDLE,
-                    &keepalive_time as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPINTVL,
-                    &keepalive_interval as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPCNT,
-                    &keepalive_probes as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable TCP_CORK for better packet batching at high speeds
-                let cork_flag = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_CORK,
-                    &cork_flag as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Advanced TCP congestion control optimizations for large file transfers
-                // Set TCP congestion control algorithm to BBR if available (best for high BDP)
-                let bbr_name = b"bbr\0";
-                let bbr_result = libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_CONGESTION,
-                    bbr_name.as_ptr() as *const libc::c_void,
-                    bbr_name.len() as u32 - 1,
-                );
-
-                // If BBR fails, try cubic which is also excellent for large transfers
-                if bbr_result != 0 {
-                    let cubic_name = b"cubic\0";
-                    libc::setsockopt(
-                        fd,
-                        libc::IPPROTO_TCP,
-                        libc::TCP_CONGESTION,
-                        cubic_name.as_ptr() as *const libc::c_void,
-                        cubic_name.len() as u32 - 1,
-                    );
-                }
-
-                // Enable TCP Fast Open for faster connection establishment
-                let tcp_fastopen = 1i32; // Enable client-side Fast Open
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_FASTOPEN,
-                    &tcp_fastopen as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable socket reuse for better connection distribution
-                let reuse_addr = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_REUSEADDR,
-                    &reuse_addr as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-
-                // Enable port reuse for better performance
-                let reuse_port = 1i32;
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_REUSEPORT,
-                    &reuse_port as *const i32 as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-            }
+            // Start probes after 60 seconds, probe every 10 seconds
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(10));
+            socket.set_tcp_keepalive(&keepalive)?;
         }
 
-        // Connect with the optimized socket
-        socket.connect(socket_addr).await
+        // Disable Nagle's algorithm for low latency
+        socket.set_nodelay(true)?;
+
+        // Set reuse address for quick restart
+        socket.set_reuse_address(true)?;
+
+        // Note: set_reuse_port is not available in socket2 0.5 on all platforms
+        // It's primarily a Linux feature anyway
+
+        // Connect to the target
+        socket.connect(&socket_addr.into())?;
+
+        // Convert socket2::Socket to tokio TcpStream
+        let std_stream: std::net::TcpStream = socket.into();
+        std_stream.set_nonblocking(true)?;
+        let stream = TcpStream::from_std(std_stream)?;
+
+        Ok(stream)
     }
 
     /// Return a connection to the pool
@@ -830,55 +735,19 @@ impl NntpProxy {
         }
     }
 
-    /// Set socket optimizations for high-throughput transfers
+    /// Set socket optimizations for high-throughput transfers using socket2
     fn set_high_throughput_optimizations(stream: &TcpStream) -> Result<(), std::io::Error> {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
+        use socket2::SockRef;
 
-        unsafe {
-            // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
-            // (opposite of small transfer optimization)
+        let sock_ref = SockRef::from(stream);
 
-            // Enable TCP_QUICKACK for immediate ACKs
-            let quickack: libc::c_int = 1;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_QUICKACK,
-                &quickack as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+        // Set larger buffer sizes for high throughput
+        sock_ref.set_recv_buffer_size(16 * 1024 * 1024)?; // 16MB
+        sock_ref.set_send_buffer_size(16 * 1024 * 1024)?; // 16MB
 
-            // Set larger TCP window scaling for high bandwidth-delay product
-            let window_clamp: libc::c_int = 16 * 1024 * 1024; // 16MB window
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_WINDOW_CLAMP,
-                &window_clamp as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // Optimize for high throughput with TCP_CORK equivalent (defer small packets)
-            let cork: libc::c_int = 1;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_CORK,
-                &cork as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // Immediately uncork to flush
-            let uncork: libc::c_int = 0;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_CORK,
-                &uncork as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+        // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
+        // (socket2 doesn't expose some advanced TCP options like TCP_QUICKACK, TCP_CORK)
+        // but the basic optimizations are sufficient for most use cases
 
         Ok(())
     }
