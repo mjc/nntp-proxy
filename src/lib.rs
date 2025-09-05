@@ -241,6 +241,43 @@ impl ConnectionPool {
                     std::mem::size_of::<i32>() as u32,
                 );
                 
+                // Enable TCP keep-alive for connection reuse
+                let keepalive = 1i32;
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_KEEPALIVE,
+                    &keepalive as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                
+                // Set aggressive keep-alive timing for high-performance scenarios
+                let keepalive_time = 60i32;  // Start probes after 60 seconds
+                let keepalive_interval = 10i32;  // Probe every 10 seconds
+                let keepalive_probes = 3i32;  // 3 failed probes before considering dead
+                
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPIDLE,
+                    &keepalive_time as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPINTVL,
+                    &keepalive_interval as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPCNT,
+                    &keepalive_probes as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                
                 // Enable TCP_CORK for better packet batching at high speeds
                 let cork_flag = 1i32;
                 libc::setsockopt(
@@ -248,6 +285,26 @@ impl ConnectionPool {
                     libc::IPPROTO_TCP,
                     libc::TCP_CORK,
                     &cork_flag as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                
+                // Enable socket reuse for better connection distribution
+                let reuse_addr = 1i32;
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &reuse_addr as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                
+                // Enable port reuse for better performance
+                let reuse_port = 1i32;
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    &reuse_port as *const i32 as *const libc::c_void,
                     std::mem::size_of::<i32>() as u32,
                 );
             }
@@ -566,8 +623,8 @@ impl NntpProxy {
         username: &str,
         password: &str,
     ) -> Result<()> {
-        // Use a smaller buffer from the pool for authentication (1KB should be enough)
-        let mut buffer = vec![0u8; 1024];
+        // Use a buffer from our optimized pool instead of small allocations
+        let mut buffer = self.buffer_pool.get_buffer().await;
 
         // Read the server greeting first
         let n = stream.read(&mut buffer).await?;
@@ -616,14 +673,18 @@ impl NntpProxy {
         info!("AUTHINFO PASS response: {}", response.trim());
 
         // Should get 281 (authenticated)
-        if response.starts_with("281") {
+        let result = if response.starts_with("281") {
             Ok(())
         } else {
             Err(anyhow::anyhow!(
                 "Authentication failed: {}",
                 response.trim()
             ))
-        }
+        };
+        
+        // Return buffer to pool
+        self.buffer_pool.return_buffer(buffer).await;
+        result
     }
 
     /// Send a synthetic server greeting to the client after authentication
