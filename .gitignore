@@ -21,3 +21,6 @@ config.toml
 # Logs
 *.log
 .direnv
+
+flamegraph.svg
+perf.data*
