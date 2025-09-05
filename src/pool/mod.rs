@@ -5,8 +5,8 @@
 
 pub mod buffer;
 pub mod connection_trait;
-pub mod simple_connection;
 pub mod deadpool_connection;
+pub mod simple_connection;
 
 pub use buffer::BufferPool;
 pub use connection_trait::ConnectionProvider;

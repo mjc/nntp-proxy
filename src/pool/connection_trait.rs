@@ -16,7 +16,7 @@ pub struct PoolStatus {
 pub trait ConnectionProvider: Send + Sync + Clone + std::fmt::Debug {
     /// Get a connection to the backend server
     async fn get_connection(&self) -> Result<TcpStream>;
-    
+
     /// Get current pool status for monitoring
     #[allow(dead_code)] // Used for client greetings
     fn status(&self) -> PoolStatus;

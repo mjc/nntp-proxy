@@ -35,7 +35,7 @@ impl ConnectionProvider for SimpleConnectionProvider {
 
         Ok(stream)
     }
-    
+
     fn status(&self) -> PoolStatus {
         // Simple provider doesn't pool connections, so always shows max available
         PoolStatus {

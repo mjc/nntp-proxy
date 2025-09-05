@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use tokio::net::TcpStream;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 
@@ -27,17 +27,21 @@ impl TcpManager {
         // First try to resolve the hostname to an IP address
         let addr = format!("{}:{}", self.host, self.port);
         let socket_addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr).await?.collect();
-        
+
         if socket_addrs.is_empty() {
             return Err(anyhow::anyhow!("No addresses found for {}", addr));
         }
-        
+
         let socket_addr = socket_addrs[0]; // Use the first resolved address
-        
+
         // Create socket with optimizations
-        let domain = if socket_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let domain = if socket_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        
+
         // Set socket buffer sizes for high throughput (2MB each)
         socket.set_recv_buffer_size(2 * 1024 * 1024)?;
         socket.set_send_buffer_size(2 * 1024 * 1024)?;
@@ -54,7 +58,7 @@ impl TcpManager {
                 .with_interval(std::time::Duration::from_secs(10));
             socket.set_tcp_keepalive(&keepalive)?;
         }
-        
+
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             // Fallback for non-Linux platforms
@@ -94,7 +98,11 @@ impl managed::Manager for TcpManager {
         self.create_optimized_tcp_stream().await
     }
 
-    async fn recycle(&self, _conn: &mut TcpStream, _: &managed::Metrics) -> managed::RecycleResult<anyhow::Error> {
+    async fn recycle(
+        &self,
+        _conn: &mut TcpStream,
+        _: &managed::Metrics,
+    ) -> managed::RecycleResult<anyhow::Error> {
         // For NNTP connections, we don't do invasive health checks that might consume data
         // The connection will be tested when actually used for communication
         debug!("Connection to {} recycled successfully", self.name);
@@ -125,50 +133,63 @@ impl DeadpoolConnectionProvider {
             .max_size(max_size)
             .build()
             .expect("Failed to create connection pool");
-        
-        info!("Created deadpool connection provider for '{}' with max {} connections", name, max_size);
-        
-        Self { pool, name }
-    }
 
-    /// Get current pool status for monitoring
-    pub fn status(&self) -> managed::Status {
-        self.pool.status()
+        info!(
+            "Created deadpool connection provider for '{}' with max {} connections",
+            name, max_size
+        );
+
+        Self { pool, name }
     }
 
     /// Get a connection from the pool that can be returned (for prewarming)
     /// Unlike get_connection(), this doesn't use Object::take() so the connection can return to pool
     pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
-        debug!("Getting pooled connection for prewarming from {}", self.name);
-        self.pool.get().await.map_err(|e| anyhow::anyhow!("Failed to get pooled connection: {}", e))
+        debug!(
+            "Getting pooled connection for prewarming from {}",
+            self.name
+        );
+        self.pool
+            .get()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get pooled connection: {}", e))
     }
 
     /// Gracefully shutdown the pool by sending QUIT to all idle connections
     pub async fn graceful_shutdown(&self) {
-        info!("Gracefully shutting down connection pool for '{}'", self.name);
-        
+        info!(
+            "Gracefully shutting down connection pool for '{}'",
+            self.name
+        );
+
         let status = self.pool.status();
         let idle_connections = status.available;
-        
-        info!("Sending QUIT to {} idle connections for '{}'", idle_connections, self.name);
-        
+
+        info!(
+            "Sending QUIT to {} idle connections for '{}'",
+            idle_connections, self.name
+        );
+
         // Try to get and send QUIT to idle connections with a short timeout
         for _ in 0..idle_connections {
             // Use a very short timeout to only get immediately available connections
             let timeout = std::time::Duration::from_millis(1);
             let mut timeouts = managed::Timeouts::new();
             timeouts.wait = Some(timeout);
-            
+
             if let Ok(conn_obj) = self.pool.timeout_get(&timeouts).await {
                 use deadpool::managed::Object;
                 use tokio::io::AsyncWriteExt;
-                
+
                 // Take the connection from the pool permanently
                 let mut conn = Object::take(conn_obj);
-                
+
                 // Send QUIT command
                 if let Err(e) = conn.write_all(b"QUIT\r\n").await {
-                    debug!("Failed to send QUIT to connection for '{}': {}", self.name, e);
+                    debug!(
+                        "Failed to send QUIT to connection for '{}': {}",
+                        self.name, e
+                    );
                 } else {
                     debug!("Sent QUIT to connection for '{}'", self.name);
                 }
@@ -177,10 +198,10 @@ impl DeadpoolConnectionProvider {
                 break; // No more idle connections available
             }
         }
-        
+
         // Close the pool to prevent new connections
         self.pool.close();
-        
+
         info!("Connection pool closed for '{}'", self.name);
     }
 }
@@ -189,7 +210,7 @@ impl DeadpoolConnectionProvider {
 impl ConnectionProvider for DeadpoolConnectionProvider {
     async fn get_connection(&self) -> Result<TcpStream> {
         debug!("Getting connection from pool for {}", self.name);
-        
+
         match self.pool.get().await {
             Ok(conn) => {
                 debug!("Retrieved connection from pool for {}", self.name);
@@ -200,7 +221,10 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
                 Ok(stream)
             }
             Err(e) => {
-                warn!("Failed to get connection from pool for {}: {}", self.name, e);
+                warn!(
+                    "Failed to get connection from pool for {}: {}",
+                    self.name, e
+                );
                 Err(anyhow::anyhow!("Pool connection failed: {}", e))
             }
         }

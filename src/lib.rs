@@ -8,7 +8,59 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 mod pool;
-use pool::{BufferPool, DeadpoolConnectionProvider, ConnectionProvider};
+use pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider};
+
+/// Buffer configuration constants
+const BUFFER_SIZE: usize = 256 * 1024; // 256KB buffers for high throughput
+const BUFFER_POOL_SIZE: usize = 32; // Number of buffers in pool
+const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB for direct allocation
+
+/// Connection pool configuration constants
+const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5
+const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
+
+/// TCP socket buffer sizes for high-throughput transfers
+const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024; // 16MB
+const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024; // 16MB
+
+/// NNTP response constants
+const NNTP_PASSWORD_REQUIRED: &[u8] = b"381 Password required\r\n";
+const NNTP_AUTH_ACCEPTED: &[u8] = b"281 Authentication accepted\r\n";
+const NNTP_BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
+const NNTP_AUTH_FAILED: &[u8] = b"502 Authentication failed\r\n";
+
+/// NNTP command classification for different handling strategies
+#[derive(Debug, PartialEq)]
+enum NntpCommand {
+    /// Authentication commands (AUTHINFO USER/PASS) - intercepted locally
+    AuthUser,
+    AuthPass,
+    /// Data retrieval commands that may trigger high-throughput mode
+    DataRetrieval,
+    /// Other commands that are forwarded normally
+    Other,
+}
+
+impl NntpCommand {
+    /// Classify an NNTP command based on its content
+    fn classify(command: &str) -> Self {
+        let trimmed = command.trim();
+
+        if trimmed.starts_with("AUTHINFO USER") {
+            Self::AuthUser
+        } else if trimmed.starts_with("AUTHINFO PASS") {
+            Self::AuthPass
+        } else if trimmed.starts_with("ARTICLE")
+            || trimmed.starts_with("BODY")
+            || trimmed.starts_with("HEAD")
+            || trimmed.starts_with("STAT")
+        {
+            Self::DataRetrieval
+        } else {
+            Self::Other
+        }
+    }
+}
 
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
@@ -58,7 +110,10 @@ impl NntpProxy {
             .servers
             .iter()
             .map(|server| {
-                info!("Configuring deadpool connection provider for '{}'", server.name);
+                info!(
+                    "Configuring deadpool connection provider for '{}'",
+                    server.name
+                );
                 DeadpoolConnectionProvider::new(
                     server.host.clone(),
                     server.port,
@@ -72,7 +127,7 @@ impl NntpProxy {
             servers: config.servers,
             current_index: Arc::new(AtomicUsize::new(0)),
             connection_providers,
-            buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers for high throughput
+            buffer_pool: BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE),
             pools_prewarmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -81,74 +136,95 @@ impl NntpProxy {
     /// Called on first client connection after idle period
     async fn prewarm_all_pools(&self) -> Result<()> {
         // Use compare_and_swap to ensure only one thread prewarms the pools
-        if self.pools_prewarmed.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if self
+            .pools_prewarmed
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             // Another thread is already prewarming or has already prewarmed
             return Ok(());
         }
 
         info!("Prewarming all connection pools on first client connection...");
-        
+
         // Spawn tasks to prewarm each pool concurrently
         let mut handles = Vec::new();
-        
+
         for (i, server) in self.servers.iter().enumerate() {
             let provider = self.connection_providers[i].clone();
             let server_name = server.name.clone();
             let max_connections = server.max_connections as usize;
-            
+
             let handle = tokio::spawn(async move {
-                info!("Prewarming pool for '{}' with {} connections", server_name, max_connections);
-                
+                info!(
+                    "Prewarming pool for '{}' with {} connections",
+                    server_name, max_connections
+                );
+
                 // Limit concurrent prewarming to avoid overwhelming the server
-                let batch_size = 5; // Create connections in batches of 5
                 let mut total_created = 0;
-                
-                for batch_start in (0..max_connections).step_by(batch_size) {
-                    let batch_end = std::cmp::min(batch_start + batch_size, max_connections);
+
+                for batch_start in (0..max_connections).step_by(PREWARMING_BATCH_SIZE) {
+                    let batch_end =
+                        std::cmp::min(batch_start + PREWARMING_BATCH_SIZE, max_connections);
                     let mut batch_connections = Vec::new();
-                    
+
                     // Create batch connections concurrently
                     for i in batch_start..batch_end {
                         match provider.get_pooled_connection().await {
                             Ok(conn) => {
-                                debug!("Created prewarmed connection {}/{} for '{}'", i+1, max_connections, server_name);
+                                debug!(
+                                    "Created prewarmed connection {}/{} for '{}'",
+                                    i + 1,
+                                    max_connections,
+                                    server_name
+                                );
                                 batch_connections.push(conn);
                                 total_created += 1;
                             }
                             Err(e) => {
-                                warn!("Failed to prewarm connection {}/{} for '{}': {}", i+1, max_connections, server_name, e);
+                                warn!(
+                                    "Failed to prewarm connection {}/{} for '{}': {}",
+                                    i + 1,
+                                    max_connections,
+                                    server_name,
+                                    e
+                                );
                                 // Continue with remaining connections in batch
                             }
                         }
                     }
-                    
+
                     // Drop batch connections (return to pool)
                     drop(batch_connections);
-                    
+
                     // Wait between batches to avoid overwhelming server
                     if batch_end < max_connections {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(BATCH_DELAY_MS)).await;
                     }
                 }
-                
-                info!("Pool prewarming completed for '{}' - {}/{} connections ready", server_name, total_created, max_connections);
+
+                info!(
+                    "Pool prewarming completed for '{}' - {}/{} connections ready",
+                    server_name, total_created, max_connections
+                );
                 Ok::<(), anyhow::Error>(())
             });
-            
+
             handles.push(handle);
         }
-        
+
         // Wait for all prewarming tasks to complete
         for handle in handles {
             if let Err(e) = handle.await {
                 warn!("Pool prewarming task failed: {}", e);
             }
         }
-        
+
         // Mark pools as prewarmed
         self.pools_prewarmed.store(true, Ordering::Relaxed);
         info!("All connection pools have been prewarmed and are ready for use");
-        
+
         Ok(())
     }
     pub async fn prewarm_connections(&self) -> Result<()> {
@@ -178,11 +254,11 @@ impl NntpProxy {
     /// Gracefully shutdown all connection pools
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown of all connection pools...");
-        
+
         for provider in &self.connection_providers {
             provider.graceful_shutdown().await;
         }
-        
+
         info!("All connection pools have been shut down gracefully");
     }
 
@@ -218,20 +294,6 @@ impl NntpProxy {
             client_addr, server.host, server.port
         );
 
-        // Send greeting to client immediately (NNTP protocol requirement)
-        // Include server name and pool status in greeting for operational visibility  
-        let pool_status = self.connection_providers[server_idx].status();
-        let greeting = format!(
-            "200 NNTP Service Ready - Proxying to {} ({}/{} connections available)\r\n",
-            server.name, 
-            pool_status.available,
-            pool_status.max_size
-        );
-        if let Err(e) = client_stream.write_all(greeting.as_bytes()).await {
-            error!("Failed to send greeting to client: {}", e);
-            return Err(e.into());
-        }
-
         // Prewarm all connection pools on first connection after idle
         // This ensures subsequent requests can immediately use pooled connections
         if let Err(e) = self.prewarm_all_pools().await {
@@ -248,9 +310,8 @@ impl NntpProxy {
             }
             Err(e) => {
                 error!("Failed to connect to {}: {}", server.name, e);
-                let _ = client_stream
-                    .write_all(b"400 Backend server unavailable\r\n")
-                    .await;
+                // Don't send greeting on connection failure - send error directly
+                let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
                 return Err(e);
             }
         };
@@ -258,19 +319,32 @@ impl NntpProxy {
         let backend_addr = format!("{}:{}", server.host, server.port);
         debug!("Connected to backend server {}", backend_addr);
 
-        // All connections need authentication since Object::take() gives us fresh connections
+        // Handle authentication and greeting forwarding
         if let (Some(username), Some(password)) = (&server.username, &server.password) {
             if let Err(e) = self
-                .authenticate_backend(&mut backend_stream, username, password)
+                .authenticate_backend_and_forward_greeting(
+                    &mut backend_stream,
+                    &mut client_stream,
+                    username,
+                    password,
+                )
                 .await
             {
                 error!("Authentication failed for {}: {}", server.name, e);
-                let _ = client_stream
-                    .write_all(b"502 Authentication failed\r\n")
-                    .await;
+                let _ = client_stream.write_all(NNTP_AUTH_FAILED).await;
                 return Err(e);
             }
             debug!("Successfully authenticated connection to {}", server.name);
+        } else {
+            // No authentication needed, just read and forward the greeting
+            if let Err(e) = self
+                .forward_backend_greeting(&mut backend_stream, &mut client_stream)
+                .await
+            {
+                error!("Failed to forward greeting from {}: {}", server.name, e);
+                let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
+                return Err(e);
+            }
         }
 
         // Now implement intelligent proxying that handles client authentication
@@ -299,57 +373,95 @@ impl NntpProxy {
         Ok(())
     }
 
-    /// Perform NNTP authentication using AUTHINFO USER/PASS commands
-    async fn authenticate_backend(
+    /// Forward the backend server's greeting to the client
+    async fn forward_backend_greeting(
         &self,
-        stream: &mut TcpStream,
+        backend_stream: &mut TcpStream,
+        client_stream: &mut TcpStream,
+    ) -> Result<()> {
+        let mut buffer = self.buffer_pool.get_buffer().await;
+
+        // Read the server greeting
+        let n = backend_stream.read(&mut buffer).await?;
+        let greeting = &buffer[..n];
+        let greeting_str = String::from_utf8_lossy(greeting);
+        debug!("Backend greeting: {}", greeting_str.trim());
+
+        if !greeting_str.starts_with("200") && !greeting_str.starts_with("201") {
+            let error_msg = greeting_str.trim().to_string();
+            self.buffer_pool.return_buffer(buffer).await;
+            return Err(anyhow::anyhow!(
+                "Server returned non-success greeting: {}",
+                error_msg
+            ));
+        }
+
+        // Forward greeting to client
+        client_stream.write_all(greeting).await?;
+
+        self.buffer_pool.return_buffer(buffer).await;
+        Ok(())
+    }
+
+    /// Perform NNTP authentication and forward the final greeting to client
+    async fn authenticate_backend_and_forward_greeting(
+        &self,
+        backend_stream: &mut TcpStream,
+        client_stream: &mut TcpStream,
         username: &str,
         password: &str,
     ) -> Result<()> {
         // Use a buffer from our optimized pool instead of small allocations
         let mut buffer = self.buffer_pool.get_buffer().await;
 
-        // Read the server greeting first
-        let n = stream.read(&mut buffer).await?;
+        // Read the server greeting first and forward it
+        let n = backend_stream.read(&mut buffer).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
-        debug!(
-            "Server greeting: {}",
-            greeting_str.trim()
-        );
+        debug!("Backend greeting: {}", greeting_str.trim());
+
         if !greeting_str.starts_with("200") && !greeting_str.starts_with("201") {
+            let error_msg = greeting_str.trim().to_string();
+            self.buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(
                 "Server returned non-success greeting: {}",
-                greeting_str.trim()
+                error_msg
             ));
         }
 
+        // Forward greeting to client immediately
+        client_stream.write_all(greeting).await?;
+
+        // Now perform authentication on backend
         // Send AUTHINFO USER command
         let user_command = format!("AUTHINFO USER {}\r\n", username);
-        stream.write_all(user_command.as_bytes()).await?;
+        backend_stream.write_all(user_command.as_bytes()).await?;
 
         // Read response
-        let n = stream.read(&mut buffer).await?;
+        let n = backend_stream.read(&mut buffer).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
         debug!("AUTHINFO USER response: {}", response.trim());
 
         // Should get 381 (password required) or 281 (authenticated)
         if response.starts_with("281") {
             // Already authenticated with just username
+            self.buffer_pool.return_buffer(buffer).await;
             return Ok(());
         } else if !response.starts_with("381") {
+            let error_msg = response.trim().to_string();
+            self.buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(
                 "Unexpected response to AUTHINFO USER: {}",
-                response.trim()
+                error_msg
             ));
         }
 
         // Send AUTHINFO PASS command
         let pass_command = format!("AUTHINFO PASS {}\r\n", password);
-        stream.write_all(pass_command.as_bytes()).await?;
+        backend_stream.write_all(pass_command.as_bytes()).await?;
 
         // Read final response
-        let n = stream.read(&mut buffer).await?;
+        let n = backend_stream.read(&mut buffer).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
         debug!("AUTHINFO PASS response: {}", response.trim());
 
@@ -357,10 +469,8 @@ impl NntpProxy {
         let result = if response.starts_with("281") {
             Ok(())
         } else {
-            Err(anyhow::anyhow!(
-                "Authentication failed: {}",
-                response.trim()
-            ))
+            let error_msg = response.trim().to_string();
+            Err(anyhow::anyhow!("Authentication failed: {}", error_msg))
         };
 
         // Return buffer to pool
@@ -407,42 +517,42 @@ impl NntpProxy {
                             let trimmed = line.trim();
                             debug!("Client command: {}", trimmed);
 
-                            // Intercept authentication commands
-                            if trimmed.starts_with("AUTHINFO USER") {
-                                // Client is trying to authenticate - respond positively
-                                let response = b"381 Password required\r\n";
-                                client_write.write_all(response).await?;
-                                backend_to_client_bytes += response.len() as u64;
-                                debug!("Intercepted AUTHINFO USER, sent password request");
-                            } else if trimmed.starts_with("AUTHINFO PASS") {
-                                // Client is providing password - accept it
-                                let response = b"281 Authentication accepted\r\n";
-                                client_write.write_all(response).await?;
-                                backend_to_client_bytes += response.len() as u64;
-                                debug!("Intercepted AUTHINFO PASS, authenticated client");
-                            } else if trimmed.starts_with("ARTICLE") || trimmed.starts_with("BODY") ||
-                                     trimmed.starts_with("HEAD") || trimmed.starts_with("STAT") {
-                                // Forward data command to backend
-                                backend_write.write_all(line.as_bytes()).await?;
-                                client_to_backend_bytes += line.len() as u64;
-                                debug!("Forwarding data command, switching to high-throughput mode");
+                            // Classify and handle command based on type
+                            match NntpCommand::classify(&line) {
+                                NntpCommand::AuthUser => {
+                                    // Client is trying to authenticate - respond positively
+                                    client_write.write_all(NNTP_PASSWORD_REQUIRED).await?;
+                                    backend_to_client_bytes += NNTP_PASSWORD_REQUIRED.len() as u64;
+                                    debug!("Intercepted AUTHINFO USER, sent password request");
+                                }
+                                NntpCommand::AuthPass => {
+                                    // Client is providing password - accept it
+                                    client_write.write_all(NNTP_AUTH_ACCEPTED).await?;
+                                    backend_to_client_bytes += NNTP_AUTH_ACCEPTED.len() as u64;
+                                    debug!("Intercepted AUTHINFO PASS, authenticated client");
+                                }
+                                NntpCommand::DataRetrieval => {
+                                    // Forward data command to backend
+                                    backend_write.write_all(line.as_bytes()).await?;
+                                    client_to_backend_bytes += line.len() as u64;
+                                    debug!("Forwarding data command, switching to high-throughput mode");
 
-                                // Return the buffer before transitioning
-                                self.buffer_pool.return_buffer(buffer).await;
+                                    // Return the buffer before transitioning
+                                    self.buffer_pool.return_buffer(buffer).await;
 
-                                // For high-throughput data transfer, use our optimized copy
-                                // We need to carefully handle this transition...
-                                // For now, let's continue with the select loop but optimize for large transfers
-                                return self.handle_high_throughput_transfer(
-                                    client_reader, client_write,
-                                    backend_read, backend_write,
-                                    client_to_backend_bytes,
-                                    backend_to_client_bytes
-                                ).await;
-                            } else {
-                                // Forward other commands to backend
-                                backend_write.write_all(line.as_bytes()).await?;
-                                client_to_backend_bytes += line.len() as u64;
+                                    // For high-throughput data transfer, use our optimized copy
+                                    return self.handle_high_throughput_transfer(
+                                        client_reader, client_write,
+                                        backend_read, backend_write,
+                                        client_to_backend_bytes,
+                                        backend_to_client_bytes
+                                    ).await;
+                                }
+                                NntpCommand::Other => {
+                                    // Forward other commands to backend
+                                    backend_write.write_all(line.as_bytes()).await?;
+                                    client_to_backend_bytes += line.len() as u64;
+                                }
                             }
                         }
                         Err(e) => {
@@ -496,7 +606,6 @@ impl NntpProxy {
         debug!("Starting high-throughput data transfer");
 
         // Use direct buffer allocation for high-throughput to avoid pool overhead
-        const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB
         let mut direct_buffer = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
 
         // Continue handling commands and large data responses
@@ -556,8 +665,8 @@ impl NntpProxy {
         let sock_ref = SockRef::from(stream);
 
         // Set larger buffer sizes for high throughput
-        sock_ref.set_recv_buffer_size(16 * 1024 * 1024)?; // 16MB
-        sock_ref.set_send_buffer_size(16 * 1024 * 1024)?; // 16MB
+        sock_ref.set_recv_buffer_size(HIGH_THROUGHPUT_RECV_BUFFER)?;
+        sock_ref.set_send_buffer_size(HIGH_THROUGHPUT_SEND_BUFFER)?;
 
         // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
         // (socket2 doesn't expose some advanced TCP options like TCP_QUICKACK, TCP_CORK)
@@ -849,5 +958,49 @@ mod tests {
         assert_eq!(deserialized, config);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn test_nntp_command_classification() {
+        // Test authentication commands
+        assert_eq!(
+            NntpCommand::classify("AUTHINFO USER testuser"),
+            NntpCommand::AuthUser
+        );
+        assert_eq!(
+            NntpCommand::classify("AUTHINFO PASS testpass"),
+            NntpCommand::AuthPass
+        );
+        assert_eq!(
+            NntpCommand::classify("  AUTHINFO USER  whitespace  "),
+            NntpCommand::AuthUser
+        );
+
+        // Test data retrieval commands
+        assert_eq!(
+            NntpCommand::classify("ARTICLE 12345"),
+            NntpCommand::DataRetrieval
+        );
+        assert_eq!(
+            NntpCommand::classify("BODY <message@example.com>"),
+            NntpCommand::DataRetrieval
+        );
+        assert_eq!(
+            NntpCommand::classify("HEAD 67890"),
+            NntpCommand::DataRetrieval
+        );
+        assert_eq!(NntpCommand::classify("STAT"), NntpCommand::DataRetrieval);
+
+        // Test other commands
+        assert_eq!(NntpCommand::classify("HELP"), NntpCommand::Other);
+        assert_eq!(NntpCommand::classify("LIST"), NntpCommand::Other);
+        assert_eq!(NntpCommand::classify("GROUP alt.test"), NntpCommand::Other);
+        assert_eq!(NntpCommand::classify("QUIT"), NntpCommand::Other);
+        assert_eq!(NntpCommand::classify("UNKNOWN COMMAND"), NntpCommand::Other);
     }
 }
