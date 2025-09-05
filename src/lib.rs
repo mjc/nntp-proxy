@@ -43,6 +43,8 @@ pub struct NntpProxy {
     connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
+    /// Track if pools have been prewarmed to avoid redundant prewarming
+    pools_prewarmed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NntpProxy {
@@ -71,10 +73,72 @@ impl NntpProxy {
             current_index: Arc::new(AtomicUsize::new(0)),
             connection_providers,
             buffer_pool: BufferPool::new(256 * 1024, 32), // 256KB buffers for high throughput
+            pools_prewarmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
-    /// Test connections to all servers (simplified)
+    /// Prewarm all connection pools by forcing pool to create max_connections
+    /// Called on first client connection after idle period
+    async fn prewarm_all_pools(&self) -> Result<()> {
+        // Use compare_and_swap to ensure only one thread prewarmes the pools
+        if self.pools_prewarmed.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            // Another thread is already prewarming or has already prewarmed
+            return Ok(());
+        }
+
+        info!("Prewarming all connection pools on first client connection...");
+        
+        // Spawn tasks to prewarm each pool concurrently
+        let mut handles = Vec::new();
+        
+        for (i, server) in self.servers.iter().enumerate() {
+            let provider = self.connection_providers[i].clone();
+            let server_name = server.name.clone();
+            let max_connections = server.max_connections as usize;
+            
+            let handle = tokio::spawn(async move {
+                info!("Prewarming pool for '{}' with {} connections", server_name, max_connections);
+                
+                // Get connections from pool and immediately drop them to force pool creation
+                // Since deadpool manages the lifecycle, connections will be returned to pool on drop
+                let mut connections = Vec::new();
+                
+                for _ in 0..max_connections {
+                    match provider.get_pooled_connection().await {
+                        Ok(conn) => {
+                            debug!("Created prewarmed connection for '{}'", server_name);
+                            connections.push(conn); // Keep alive temporarily
+                        }
+                        Err(e) => {
+                            warn!("Failed to prewarm connection for '{}': {}", server_name, e);
+                            break; // Stop prewarming this pool on first error
+                        }
+                    }
+                }
+                
+                // Drop all connections at once - they return to the pool
+                drop(connections);
+                
+                info!("Pool prewarming completed for '{}' - {} connections ready", server_name, max_connections);
+                Ok::<(), anyhow::Error>(())
+            });
+            
+            handles.push(handle);
+        }
+        
+        // Wait for all prewarming tasks to complete
+        for handle in handles {
+            if let Err(e) = handle.await {
+                warn!("Pool prewarming task failed: {}", e);
+            }
+        }
+        
+        // Mark pools as prewarmed
+        self.pools_prewarmed.store(true, Ordering::Relaxed);
+        info!("All connection pools have been prewarmed and are ready for use");
+        
+        Ok(())
+    }
     pub async fn prewarm_connections(&self) -> Result<()> {
         info!("Testing connections to all backend servers...");
         for (i, server) in self.servers.iter().enumerate() {
@@ -146,6 +210,13 @@ impl NntpProxy {
         if let Err(e) = client_stream.write_all(b"200 NNTP Service Ready\r\n").await {
             error!("Failed to send greeting to client: {}", e);
             return Err(e.into());
+        }
+
+        // Prewarm all connection pools on first connection after idle
+        // This ensures subsequent requests can immediately use pooled connections
+        if let Err(e) = self.prewarm_all_pools().await {
+            warn!("Failed to prewarm connection pools: {}", e);
+            // Continue anyway - this is an optimization, not a requirement
         }
 
         // Get the connection manager for this server and create connection

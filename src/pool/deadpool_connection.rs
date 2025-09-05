@@ -156,6 +156,13 @@ impl DeadpoolConnectionProvider {
         self.pool.status()
     }
 
+    /// Get a connection from the pool that can be returned (for prewarming)
+    /// Unlike get_connection(), this doesn't use Object::take() so the connection can return to pool
+    pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
+        debug!("Getting pooled connection for prewarming from {}", self.name);
+        self.pool.get().await.map_err(|e| anyhow::anyhow!("Failed to get pooled connection: {}", e))
+    }
+
     /// Gracefully shutdown the pool by sending QUIT to all idle connections
     pub async fn graceful_shutdown(&self) {
         info!("Gracefully shutting down connection pool for '{}'", self.name);
