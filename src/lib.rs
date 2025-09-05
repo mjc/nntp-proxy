@@ -1,96 +1,20 @@
 use anyhow::Result;
-use crossbeam::queue::SegQueue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
+mod pool;
+use pool::{BufferPool, ConnectionPool, PooledConnection};
+
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
     10
-}
-
-/// Lock-free buffer pool for reusing large I/O buffers
-/// Uses crossbeam's SegQueue for lock-free operations
-#[derive(Debug, Clone)]
-pub struct BufferPool {
-    pool: Arc<SegQueue<Vec<u8>>>,
-    buffer_size: usize,
-    max_pool_size: usize,
-    pool_size: Arc<AtomicUsize>,
-}
-
-impl BufferPool {
-    /// Create a page-aligned buffer for optimal DMA performance
-    fn create_aligned_buffer(size: usize) -> Vec<u8> {
-        // Align to page boundaries (4KB) for better memory performance
-        let page_size = 4096;
-        let aligned_size = size.div_ceil(page_size) * page_size;
-
-        // Use aligned allocation for better cache performance
-        let mut buffer = Vec::with_capacity(aligned_size);
-        buffer.resize(size, 0);
-        buffer
-    }
-
-    pub fn new(buffer_size: usize, max_pool_size: usize) -> Self {
-        let pool = Arc::new(SegQueue::new());
-        let pool_size = Arc::new(AtomicUsize::new(0));
-
-        // Pre-allocate all buffers at startup to eliminate allocation overhead
-        info!(
-            "Pre-allocating {} buffers of {}KB each ({}MB total)",
-            max_pool_size,
-            buffer_size / 1024,
-            (max_pool_size * buffer_size) / (1024 * 1024)
-        );
-
-        for _ in 0..max_pool_size {
-            let buffer = Self::create_aligned_buffer(buffer_size);
-            pool.push(buffer);
-            pool_size.fetch_add(1, Ordering::Relaxed);
-        }
-
-        info!("Buffer pool pre-allocation complete");
-
-        Self {
-            pool,
-            buffer_size,
-            max_pool_size,
-            pool_size,
-        }
-    }
-
-    /// Get a buffer from the pool or create a new one (lock-free)
-    pub async fn get_buffer(&self) -> Vec<u8> {
-        if let Some(mut buffer) = self.pool.pop() {
-            self.pool_size.fetch_sub(1, Ordering::Relaxed);
-            // Reuse existing buffer, clear it first
-            buffer.clear();
-            buffer.resize(self.buffer_size, 0);
-            buffer
-        } else {
-            // Create new page-aligned buffer for better DMA performance
-            Self::create_aligned_buffer(self.buffer_size)
-        }
-    }
-
-    /// Return a buffer to the pool (lock-free)
-    pub async fn return_buffer(&self, buffer: Vec<u8>) {
-        if buffer.len() == self.buffer_size {
-            let current_size = self.pool_size.load(Ordering::Relaxed);
-            if current_size < self.max_pool_size {
-                self.pool.push(buffer);
-                self.pool_size.fetch_add(1, Ordering::Relaxed);
-            }
-            // If pool is full, just drop the buffer
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -111,280 +35,6 @@ pub struct ServerConfig {
     /// Maximum number of concurrent connections to this server
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
-}
-
-/// Pooled connection wrapper
-#[derive(Debug)]
-pub struct PooledConnection {
-    pub stream: TcpStream,
-    pub server_name: String,
-    pub authenticated: bool,
-}
-
-impl PooledConnection {
-    pub fn new(
-        stream: TcpStream,
-        server_name: String,
-        authenticated: bool,
-    ) -> Self {
-        Self {
-            stream,
-            server_name,
-            authenticated,
-        }
-    }
-
-    pub fn into_stream(self) -> TcpStream {
-        self.stream
-    }
-
-    pub fn is_authenticated(&self) -> bool {
-        self.authenticated
-    }
-
-    pub fn server_name(&self) -> &str {
-        &self.server_name
-    }
-}
-
-/// Connection pool for backend servers
-#[derive(Debug, Clone)]
-pub struct ConnectionPool {
-    pool: Arc<SegQueue<TcpStream>>,
-    max_connections: usize,
-    active_connections: Arc<AtomicUsize>,
-    initialized: Arc<AtomicBool>,
-}
-
-impl ConnectionPool {
-    pub fn new(max_connections: usize) -> Self {
-        Self {
-            pool: Arc::new(SegQueue::new()),
-            max_connections,
-            active_connections: Arc::new(AtomicUsize::new(0)),
-            initialized: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Pre-establish all connections on first request for maximum performance
-    async fn initialize_connections(&self, server: &ServerConfig) -> Result<()> {
-        // Use compare_exchange to ensure only one thread initializes
-        if self
-            .initialized
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            info!(
-                "Pre-establishing {} connections to {}",
-                self.max_connections, server.name
-            );
-
-            // Pre-establish all connections in parallel for faster startup
-            let mut tasks = Vec::new();
-            for i in 0..self.max_connections {
-                let server_addr = format!("{}:{}", server.host, server.port);
-                let server_name = server.name.clone();
-                let pool = Arc::clone(&self.pool);
-                let active_connections = Arc::clone(&self.active_connections);
-
-                let task = tokio::spawn(async move {
-                    match Self::create_optimized_tcp_stream(&server_addr).await {
-                        Ok(stream) => {
-                            pool.push(stream);
-                            active_connections.fetch_add(1, Ordering::Relaxed);
-                            debug!("Pre-established connection {} to {}", i + 1, server_name);
-                            Ok(())
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to pre-establish connection {} to {}: {}",
-                                i + 1,
-                                server_name,
-                                e
-                            );
-                            Err(e)
-                        }
-                    }
-                });
-                tasks.push(task);
-            }
-
-            // Wait for all connections to be established
-            for task in tasks {
-                let _ = task.await;
-            }
-
-            let established = self.active_connections.load(Ordering::Relaxed);
-            info!(
-                "Successfully pre-established {}/{} connections to {} in parallel",
-                established, self.max_connections, server.name
-            );
-        }
-        Ok(())
-    }
-
-    /// Get a connection from the pool or create a new one
-    pub async fn get_connection(
-        &self,
-        server: &ServerConfig,
-        _proxy: &NntpProxy,
-    ) -> Result<PooledConnection> {
-        // Pre-establish all connections on first request
-        if !self.initialized.load(Ordering::Acquire) {
-            self.initialize_connections(server).await?;
-        }
-
-        // Try to get a connection from the pool
-        if let Some(stream) = self.pool.pop() {
-            // Test if the connection is still alive by trying a non-blocking read
-            let mut test_buf = [0u8; 1];
-            match stream.try_read(&mut test_buf) {
-                Ok(0) => {
-                    // Connection was closed by server, decrease count and create new one
-                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    info!(
-                        "Pooled connection to {} was closed, creating new one",
-                        server.name
-                    );
-                }
-                Ok(_) => {
-                    // Got unexpected data, connection might be in use, decrease count and create new one
-                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    info!(
-                        "Pooled connection to {} has unexpected data, creating new one",
-                        server.name
-                    );
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Connection is alive and ready
-                    info!("Reusing pooled connection to {}", server.name);
-                    return Ok(PooledConnection {
-                        stream,
-                        server_name: server.name.clone(),
-                        authenticated: false, // Reset authentication state for safety
-                    });
-                }
-                Err(_) => {
-                    // Connection error, decrease count and create new one
-                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    info!(
-                        "Pooled connection to {} has error, creating new one",
-                        server.name
-                    );
-                }
-            }
-        }
-
-        // Create new connection - don't authenticate here, let the caller handle it
-        info!("Creating new connection to {} for pooling", server.name);
-        let backend_addr = format!("{}:{}", server.host, server.port);
-        let stream = Self::create_optimized_tcp_stream(&backend_addr).await?;
-
-        // Return unauthenticated connection - authentication will be handled by caller
-        let pooled_conn = PooledConnection::new(
-            stream,
-            server.name.clone(),
-            false,
-        );
-        Ok(pooled_conn)
-    }
-
-    /// Create an optimized TCP stream with performance tuning using socket2
-    async fn create_optimized_tcp_stream(addr: &str) -> Result<TcpStream, std::io::Error> {
-        use socket2::{Domain, Protocol, Socket, Type};
-        use std::net::{SocketAddr, ToSocketAddrs};
-
-        // Parse the address
-        let socket_addr: SocketAddr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address")
-        })?;
-
-        // Create socket with socket2 for better control
-        let socket = Socket::new(
-            if socket_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 },
-            Type::STREAM,
-            Some(Protocol::TCP),
-        )?;
-
-        // Set socket buffer sizes for high throughput (2MB each)
-        socket.set_recv_buffer_size(2 * 1024 * 1024)?;
-        socket.set_send_buffer_size(2 * 1024 * 1024)?;
-
-        // Enable keepalive for connection reuse
-        socket.set_keepalive(true)?;
-
-        // Set aggressive keepalive timing for high-performance scenarios
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            // Start probes after 60 seconds, probe every 10 seconds
-            let keepalive = socket2::TcpKeepalive::new()
-                .with_time(std::time::Duration::from_secs(60))
-                .with_interval(std::time::Duration::from_secs(10));
-            socket.set_tcp_keepalive(&keepalive)?;
-        }
-
-        // Disable Nagle's algorithm for low latency
-        socket.set_nodelay(true)?;
-
-        // Set reuse address for quick restart
-        socket.set_reuse_address(true)?;
-
-        // Note: set_reuse_port is not available in socket2 0.5 on all platforms
-        // It's primarily a Linux feature anyway
-
-        // Connect to the target
-        socket.connect(&socket_addr.into())?;
-
-        // Convert socket2::Socket to tokio TcpStream
-        let std_stream: std::net::TcpStream = socket.into();
-        std_stream.set_nonblocking(true)?;
-        let stream = TcpStream::from_std(std_stream)?;
-
-        Ok(stream)
-    }
-
-    /// Return a connection to the pool
-    pub async fn return_connection(&self, conn: PooledConnection) {
-        if self.active_connections.load(Ordering::Relaxed) >= self.max_connections {
-            info!("Pool is full, closing connection to {}", conn.server_name);
-            return; // Pool is full, just drop the connection
-        }
-
-        // Test if the connection is still alive before returning to pool
-        let mut test_buf = [0u8; 1];
-        match conn.stream.try_read(&mut test_buf) {
-            Ok(0) => {
-                // Connection was closed by server
-                info!(
-                    "Connection to {} was closed by server, not returning to pool",
-                    conn.server_name
-                );
-                self.active_connections.fetch_sub(1, Ordering::Relaxed);
-            }
-            Ok(_) => {
-                // Got unexpected data, connection might be in use
-                info!(
-                    "Connection to {} has unexpected data, not returning to pool",
-                    conn.server_name
-                );
-                self.active_connections.fetch_sub(1, Ordering::Relaxed);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Connection is alive and ready
-                info!("Returning connection to {} to pool", conn.server_name);
-                self.pool.push(conn.stream);
-                // Don't decrement active_connections here since we're keeping the connection
-            }
-            Err(_) => {
-                // Connection error
-                info!(
-                    "Connection to {} has error, not returning to pool",
-                    conn.server_name
-                );
-                self.active_connections.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -432,7 +82,7 @@ impl NntpProxy {
             // Pre-establish connections without authentication to avoid complexity
             for i in 0..4 {
                 // Back to 4 connections per server for stability
-                match self.connection_pool.get_connection(server, self).await {
+                match self.connection_pool.get_connection(server).await {
                     Ok(conn) => {
                         info!("Pre-warmed connection {}/4 to {}", i + 1, server.name);
                         self.connection_pool.return_connection(conn).await;
@@ -512,23 +162,25 @@ impl NntpProxy {
 
         // Try to get a pooled connection first
         let (mut backend_stream, is_pooled, server_name, pooled_authenticated) =
-            match self.connection_pool.get_connection(server, self).await {
+            match self.connection_pool.get_connection(server).await {
                 Ok(pooled) => {
+                    let server_name = pooled.server_name().to_string();
+                    let authenticated = pooled.is_authenticated();
                     info!(
                         "Using pooled connection to {} (authenticated: {})",
-                        pooled.server_name, pooled.authenticated
+                        server_name, authenticated
                     );
                     (
-                        pooled.stream,
+                        pooled.into_stream(),
                         true,
-                        pooled.server_name.clone(),
-                        pooled.authenticated,
+                        server_name,
+                        authenticated,
                     )
                 }
                 Err(_) => {
                     // If no pooled connection available, create a new one
                     info!("Creating new connection to {}", backend_addr);
-                    match ConnectionPool::create_optimized_tcp_stream(&backend_addr).await {
+                    match pool::connection::ConnectionPool::create_optimized_tcp_stream(&backend_addr).await {
                         Ok(stream) => (stream, false, server.name.clone(), false),
                         Err(e) => {
                             error!("Failed to connect to backend {}: {}", backend_addr, e);
