@@ -1,15 +1,26 @@
 # NNTP Proxy
 
-A high-performance round-robin NNTP proxy server written in Rust.
+A high-performance stateless NNTP proxy server written in Rust.
+
+## ⚠️ Important: Stateless Mode
+
+This proxy operates in **stateless mode** and **does not support GROUP-based commands**. It's designed for:
+- Message-ID based article retrieval
+- Metadata queries (LIST, CAPABILITIES, etc.)
+- Future connection multiplexing capabilities
+
+**Not compatible with traditional newsreaders** that use GROUP/NEXT/LAST navigation. See [LIMITATIONS.md](LIMITATIONS.md) for details.
 
 ## Features
 
 - 🔄 **Round-robin load balancing** - Distributes connections evenly across backend servers
+- 🚀 **Stateless design** - No session state, enables future multiplexing
 - ⚡ **Async/await** - Built on Tokio for high concurrency
 - 📝 **TOML Configuration** - Simple and readable configuration format
 - 🔍 **Structured logging** - Detailed logging with tracing
 - 🛠️ **Nix development environment** - Reproducible development setup
 - 📊 **Connection tracking** - Logs client connections and backend routing
+- 🔐 **Authentication interception** - Handles client auth locally
 
 ## Quick Start
 
