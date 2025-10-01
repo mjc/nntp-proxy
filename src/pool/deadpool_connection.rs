@@ -69,7 +69,7 @@ impl TcpManager {
         }
 
         // Disable Nagle's algorithm for low latency
-        socket.set_nodelay(true)?;
+        socket.set_tcp_nodelay(true)?;
 
         // Set reuse address for quick restart
         socket.set_reuse_address(true)?;

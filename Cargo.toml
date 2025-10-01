@@ -22,22 +22,21 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-rek2_nntp = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1.0"
-tokio-splice2 = "0.3"  # Zero-copy networking with splice/sendfile
-socket2 = "0.5"  # Safe cross-platform socket operations
+socket2 = "0.6"  # Safe cross-platform socket operations
 crossbeam = "0.8"  # Lock-free data structures for high performance
 nix = { version = "0.30", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.12.3"
 async-trait = "0.1.89"
+memchr = "2.7"  # Fast byte searching for command parsing
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3.23"
 
 
 [profile.release]

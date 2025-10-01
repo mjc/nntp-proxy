@@ -28,6 +28,7 @@ const NNTP_PASSWORD_REQUIRED: &[u8] = b"381 Password required\r\n";
 const NNTP_AUTH_ACCEPTED: &[u8] = b"281 Authentication accepted\r\n";
 const NNTP_BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
 const NNTP_AUTH_FAILED: &[u8] = b"502 Authentication failed\r\n";
+const NNTP_COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy (stateless proxy mode)\r\n";
 
 /// NNTP command classification for different handling strategies
 #[derive(Debug, PartialEq)]
@@ -35,29 +36,72 @@ enum NntpCommand {
     /// Authentication commands (AUTHINFO USER/PASS) - intercepted locally
     AuthUser,
     AuthPass,
-    /// Data retrieval commands that may trigger high-throughput mode
-    DataRetrieval,
-    /// Other commands that are forwarded normally
-    Other,
+    /// Stateful commands that require GROUP context - REJECTED in stateless mode
+    Stateful,
+    /// Stateless commands that can be safely proxied without state
+    Stateless,
+    /// Article retrieval by message-ID (stateless) - can be proxied
+    ArticleByMessageId,
 }
 
 impl NntpCommand {
-    /// Classify an NNTP command based on its content
+    /// Classify an NNTP command based on its content using fast byte-level parsing
     fn classify(command: &str) -> Self {
         let trimmed = command.trim();
-
-        if trimmed.starts_with("AUTHINFO USER") {
-            Self::AuthUser
-        } else if trimmed.starts_with("AUTHINFO PASS") {
-            Self::AuthPass
-        } else if trimmed.starts_with("ARTICLE")
-            || trimmed.starts_with("BODY")
-            || trimmed.starts_with("HEAD")
-            || trimmed.starts_with("STAT")
-        {
-            Self::DataRetrieval
-        } else {
-            Self::Other
+        let bytes = trimmed.as_bytes();
+        
+        // Fast path: find space to separate command from arguments
+        let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+        let cmd = &bytes[..cmd_end];
+        
+        // Convert to uppercase for case-insensitive comparison
+        let cmd_upper = cmd.to_ascii_uppercase();
+        
+        match cmd_upper.as_slice() {
+            // Authentication commands (intercepted locally)
+            b"AUTHINFO" => {
+                if trimmed.to_uppercase().starts_with("AUTHINFO USER") {
+                    Self::AuthUser
+                } else if trimmed.to_uppercase().starts_with("AUTHINFO PASS") {
+                    Self::AuthPass
+                } else {
+                    Self::Stateless
+                }
+            }
+            
+            // Stateful commands - REJECTED (require GROUP context)
+            b"GROUP" | b"NEXT" | b"LAST" | b"LISTGROUP" => Self::Stateful,
+            
+            // XOVER/OVER and HDR/XHDR require group context
+            b"XOVER" | b"OVER" | b"XHDR" | b"HDR" => Self::Stateful,
+            
+            // Article commands - check if by message-ID or number
+            b"ARTICLE" | b"BODY" | b"HEAD" | b"STAT" => {
+                if cmd_end < bytes.len() {
+                    let args = &bytes[cmd_end + 1..];
+                    let args_trimmed = args.iter().position(|&b| !b.is_ascii_whitespace())
+                        .map(|pos| &args[pos..])
+                        .unwrap_or(args);
+                    
+                    // Message-IDs start with '<' and end with '>'
+                    if !args_trimmed.is_empty() && args_trimmed[0] == b'<' {
+                        Self::ArticleByMessageId
+                    } else {
+                        // Article by number or current - needs GROUP context
+                        Self::Stateful
+                    }
+                } else {
+                    // No argument = current article - needs GROUP context
+                    Self::Stateful
+                }
+            }
+            
+            // Stateless commands that don't need GROUP context
+            b"LIST" | b"HELP" | b"DATE" | b"CAPABILITIES" | b"MODE" 
+            | b"NEWGROUPS" | b"NEWNEWS" | b"POST" | b"QUIT" => Self::Stateless,
+            
+            // Unknown commands - treat as stateless (forward and let backend decide)
+            _ => Self::Stateless,
         }
     }
 }
@@ -531,11 +575,17 @@ impl NntpProxy {
                                     backend_to_client_bytes += NNTP_AUTH_ACCEPTED.len() as u64;
                                     debug!("Intercepted AUTHINFO PASS, authenticated client");
                                 }
-                                NntpCommand::DataRetrieval => {
-                                    // Forward data command to backend
+                                NntpCommand::Stateful => {
+                                    // Reject stateful commands (GROUP, NEXT, LAST, etc.)
+                                    warn!("Rejecting stateful command: {}", trimmed);
+                                    client_write.write_all(NNTP_COMMAND_NOT_SUPPORTED).await?;
+                                    backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
+                                }
+                                NntpCommand::ArticleByMessageId => {
+                                    // Forward article retrieval by message-ID to backend
                                     backend_write.write_all(line.as_bytes()).await?;
                                     client_to_backend_bytes += line.len() as u64;
-                                    debug!("Forwarding data command, switching to high-throughput mode");
+                                    debug!("Forwarding article-by-message-ID command, switching to high-throughput mode");
 
                                     // Return the buffer before transitioning
                                     self.buffer_pool.return_buffer(buffer).await;
@@ -548,8 +598,8 @@ impl NntpProxy {
                                         backend_to_client_bytes
                                     ).await;
                                 }
-                                NntpCommand::Other => {
-                                    // Forward other commands to backend
+                                NntpCommand::Stateless => {
+                                    // Forward stateless commands to backend
                                     backend_write.write_all(line.as_bytes()).await?;
                                     client_to_backend_bytes += line.len() as u64;
                                 }
@@ -981,26 +1031,73 @@ mod command_tests {
             NntpCommand::AuthUser
         );
 
-        // Test data retrieval commands
+        // Test stateful commands (should be rejected)
         assert_eq!(
-            NntpCommand::classify("ARTICLE 12345"),
-            NntpCommand::DataRetrieval
+            NntpCommand::classify("GROUP alt.test"),
+            NntpCommand::Stateful
+        );
+        assert_eq!(NntpCommand::classify("NEXT"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::classify("LAST"), NntpCommand::Stateful);
+        assert_eq!(
+            NntpCommand::classify("LISTGROUP alt.test"),
+            NntpCommand::Stateful
         );
         assert_eq!(
-            NntpCommand::classify("BODY <message@example.com>"),
-            NntpCommand::DataRetrieval
+            NntpCommand::classify("ARTICLE 12345"),
+            NntpCommand::Stateful
+        );
+        assert_eq!(
+            NntpCommand::classify("ARTICLE"),
+            NntpCommand::Stateful
         );
         assert_eq!(
             NntpCommand::classify("HEAD 67890"),
-            NntpCommand::DataRetrieval
+            NntpCommand::Stateful
         );
-        assert_eq!(NntpCommand::classify("STAT"), NntpCommand::DataRetrieval);
+        assert_eq!(NntpCommand::classify("STAT"), NntpCommand::Stateful);
+        assert_eq!(
+            NntpCommand::classify("XOVER 1-100"),
+            NntpCommand::Stateful
+        );
 
-        // Test other commands
-        assert_eq!(NntpCommand::classify("HELP"), NntpCommand::Other);
-        assert_eq!(NntpCommand::classify("LIST"), NntpCommand::Other);
-        assert_eq!(NntpCommand::classify("GROUP alt.test"), NntpCommand::Other);
-        assert_eq!(NntpCommand::classify("QUIT"), NntpCommand::Other);
-        assert_eq!(NntpCommand::classify("UNKNOWN COMMAND"), NntpCommand::Other);
+        // Test article retrieval by message-ID (stateless - allowed)
+        assert_eq!(
+            NntpCommand::classify("ARTICLE <message@example.com>"),
+            NntpCommand::ArticleByMessageId
+        );
+        assert_eq!(
+            NntpCommand::classify("BODY <test@server.org>"),
+            NntpCommand::ArticleByMessageId
+        );
+        assert_eq!(
+            NntpCommand::classify("HEAD <another@example.net>"),
+            NntpCommand::ArticleByMessageId
+        );
+        assert_eq!(
+            NntpCommand::classify("STAT <id@host.com>"),
+            NntpCommand::ArticleByMessageId
+        );
+
+        // Test stateless commands (allowed)
+        assert_eq!(NntpCommand::classify("HELP"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::classify("LIST"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::classify("DATE"), NntpCommand::Stateless);
+        assert_eq!(
+            NntpCommand::classify("CAPABILITIES"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(NntpCommand::classify("QUIT"), NntpCommand::Stateless);
+        assert_eq!(
+            NntpCommand::classify("LIST ACTIVE"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::classify("NEWGROUPS 20231201 000000"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::classify("UNKNOWN COMMAND"),
+            NntpCommand::Stateless
+        );
     }
 }
