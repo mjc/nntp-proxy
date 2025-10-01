@@ -65,7 +65,7 @@ mod tests {
         // Buffer sizes should be large but not excessive
         assert!(HIGH_THROUGHPUT_RECV_BUFFER >= 1024 * 1024); // At least 1MB
         assert!(HIGH_THROUGHPUT_RECV_BUFFER <= 128 * 1024 * 1024); // At most 128MB
-        
+
         assert!(HIGH_THROUGHPUT_SEND_BUFFER >= 1024 * 1024);
         assert!(HIGH_THROUGHPUT_SEND_BUFFER <= 128 * 1024 * 1024);
     }
@@ -80,7 +80,7 @@ mod tests {
     fn test_buffer_sizes_are_power_of_two_or_multiple() {
         // Should be aligned to reasonable boundaries
         let size = HIGH_THROUGHPUT_RECV_BUFFER;
-        
+
         // Should be a multiple of 1MB for efficient allocation
         assert_eq!(size % (1024 * 1024), 0);
     }
@@ -96,13 +96,13 @@ mod tests {
         // Create a real TCP listener and connection
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         // Connect to it
         let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        
+
         // Try to optimize (might fail on some systems, but shouldn't panic)
         let result = SocketOptimizer::optimize_for_throughput(&client_stream);
-        
+
         // On most systems this should succeed, but some might not support large buffers
         // The important thing is it doesn't panic
         match result {
@@ -112,7 +112,10 @@ mod tests {
             }
             Err(e) => {
                 // Some systems might not support these buffer sizes
-                println!("Buffer size not supported (expected on some systems): {}", e);
+                println!(
+                    "Buffer size not supported (expected on some systems): {}",
+                    e
+                );
             }
         }
     }
@@ -122,16 +125,16 @@ mod tests {
         // Create two TCP connections
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (server_stream, _) = listener.accept().await.unwrap();
-        
+
         // Apply optimizations to both streams
         let result = SocketOptimizer::apply_to_streams(&client_stream, &server_stream);
-        
+
         // Should always succeed (errors are logged but not propagated)
         assert!(result.is_ok());
-        
+
         // Streams should still be usable
         assert!(client_stream.peer_addr().is_ok());
         assert!(server_stream.peer_addr().is_ok());
@@ -141,10 +144,10 @@ mod tests {
     fn test_buffer_size_calculation() {
         // Verify buffer sizes are calculated correctly
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER, 16 * 1024 * 1024);
-        
+
         // Verify it's 16MB in bytes
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER, 16_777_216);
-        
+
         // Verify relationship to KB/MB
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER / 1024, 16384); // KB
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER / (1024 * 1024), 16); // MB
@@ -156,10 +159,10 @@ mod tests {
         // Our 16MB buffer should handle most efficiently
         let typical_large_article = 10 * 1024 * 1024; // 10MB
         let very_large_article = 100 * 1024 * 1024; // 100MB
-        
+
         // Buffer should be larger than typical article
         assert!(HIGH_THROUGHPUT_RECV_BUFFER > typical_large_article);
-        
+
         // But we accept that very large articles will require multiple buffers
         assert!(HIGH_THROUGHPUT_RECV_BUFFER < very_large_article);
     }

@@ -17,7 +17,7 @@ impl ClientId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
-    
+
     /// Get the underlying UUID
     pub fn as_uuid(&self) -> &Uuid {
         &self.0
@@ -47,7 +47,7 @@ impl RequestId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
-    
+
     /// Get the underlying UUID
     pub fn as_uuid(&self) -> &Uuid {
         &self.0
@@ -78,7 +78,12 @@ impl BackendId {
     pub fn from_index(index: usize) -> Self {
         Self(index)
     }
-    
+
+    /// Get the underlying index
+    pub fn index(&self) -> usize {
+        self.0
+    }
+
     /// Get the underlying index
     pub fn as_index(&self) -> usize {
         self.0
@@ -123,7 +128,7 @@ mod tests {
         let client_id = ClientId::new();
         let request_id = RequestId::new();
         let backend_id = BackendId::from_index(5);
-        
+
         assert!(!format!("{}", client_id).is_empty());
         assert!(!format!("{}", request_id).is_empty());
         assert_eq!(format!("{}", backend_id), "Backend(5)");

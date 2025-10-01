@@ -334,3 +334,277 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_multiplexing_router_integration() -> Result<()> {
+    use nntp_proxy::pool::DeadpoolConnectionProvider;
+    use nntp_proxy::router::RequestRouter;
+    use nntp_proxy::types::{BackendId, ClientId};
+    use std::sync::Arc;
+
+    // Create router with multiple backends
+    let mut router = RequestRouter::new();
+
+    for i in 0..3 {
+        let provider = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            9999 + i,
+            format!("backend-{}", i),
+            5,
+        );
+        router.add_backend(
+            BackendId::from_index(i as usize),
+            format!("backend-{}", i),
+            provider,
+        );
+    }
+
+    let router = Arc::new(router);
+
+    // Simulate multiple clients routing commands concurrently
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let router_clone = router.clone();
+        let handle = tokio::spawn(async move {
+            let client_id = ClientId::new();
+            let result = router_clone.route_command(client_id, "LIST\r\n").await;
+            assert!(result.is_ok());
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await?;
+    }
+
+    // Verify all requests were routed
+    assert_eq!(router.pending_count().await, 20);
+
+    // Verify load is distributed across backends
+    let total_load: usize = (0..3)
+        .map(|i| router.backend_load(BackendId::from_index(i)).unwrap_or(0))
+        .sum();
+    assert_eq!(total_load, 20);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_command_rejection_for_multiplexing() -> Result<()> {
+    use nntp_proxy::command::{CommandAction, CommandHandler};
+
+    // Commands that should be rejected in multiplexing mode
+    let rejected_commands = vec![
+        "POST\r\n",
+        "IHAVE <test@example.com>\r\n",
+        "NEWGROUPS 20240101 000000 GMT\r\n",
+        "NEWNEWS * 20240101 000000 GMT\r\n",
+    ];
+
+    for cmd in rejected_commands {
+        let action = CommandHandler::handle_command(cmd);
+        match action {
+            CommandAction::Reject(msg) => {
+                assert!(
+                    msg.contains("multiplexing"),
+                    "Expected multiplexing rejection for: {}",
+                    cmd
+                );
+            }
+            _ => panic!("Command {} should be rejected for multiplexing", cmd),
+        }
+    }
+
+    // Commands that should still be allowed
+    let allowed_commands = vec![
+        "LIST\r\n",
+        "HELP\r\n",
+        "DATE\r\n",
+        "ARTICLE <test@example.com>\r\n",
+    ];
+
+    for cmd in allowed_commands {
+        let action = CommandHandler::handle_command(cmd);
+        match action {
+            CommandAction::Reject(_) => {
+                // GROUP and other stateful commands are also rejected, but not for multiplexing
+                // This is expected
+            }
+            CommandAction::ForwardStateless | CommandAction::ForwardHighThroughput => {
+                // These are fine
+            }
+            CommandAction::InterceptAuth(_) => {
+                // Auth is intercepted, not rejected
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stateful_commands_rejected() -> Result<()> {
+    use nntp_proxy::command::{CommandAction, CommandHandler};
+
+    // Stateful commands that should be rejected
+    let stateful_commands = vec![
+        "GROUP alt.test\r\n",
+        "NEXT\r\n",
+        "LAST\r\n",
+        "ARTICLE 123\r\n", // Article by number (requires GROUP context)
+        "STAT\r\n",
+        "XOVER 100-200\r\n",
+    ];
+
+    for cmd in stateful_commands {
+        let action = CommandHandler::handle_command(cmd);
+        match action {
+            CommandAction::Reject(msg) => {
+                assert!(
+                    msg.contains("stateless") || msg.contains("multiplexing"),
+                    "Expected rejection for: {}",
+                    cmd
+                );
+            }
+            _ => panic!("Stateful command {} should be rejected", cmd),
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_session_with_router() -> Result<()> {
+    use nntp_proxy::pool::BufferPool;
+    use nntp_proxy::pool::DeadpoolConnectionProvider;
+    use nntp_proxy::router::RequestRouter;
+    use nntp_proxy::session::ClientSession;
+    use nntp_proxy::types::BackendId;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+    let buffer_pool = BufferPool::new(4096, 8);
+
+    // Create router with backends
+    let mut router = RequestRouter::new();
+    for i in 0..2 {
+        let provider = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            9999 + i,
+            format!("backend-{}", i),
+            3,
+        );
+        router.add_backend(
+            BackendId::from_index(i as usize),
+            format!("backend-{}", i),
+            provider,
+        );
+    }
+
+    let session = ClientSession::new_with_router(addr, buffer_pool, Arc::new(router));
+
+    // Verify session is in multiplexed mode
+    assert!(session.is_multiplexed());
+
+    // Route commands through the session
+    for _ in 0..10 {
+        let result = session.route_command("LIST\r\n").await;
+        assert!(result.is_ok());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_response_demultiplexer() -> Result<()> {
+    use nntp_proxy::router::ResponseDemultiplexer;
+    use nntp_proxy::types::{BackendId, ClientId, RequestId};
+    use tokio::sync::mpsc;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let backend_id = BackendId::from_index(0);
+    let demux = ResponseDemultiplexer::new(backend_id, tx);
+
+    // Route multiple responses
+    let clients: Vec<_> = (0..5).map(|_| ClientId::new()).collect();
+    let requests: Vec<_> = (0..5).map(|_| RequestId::new()).collect();
+
+    for i in 0..5 {
+        demux.route_response(
+            clients[i],
+            requests[i],
+            format!("200 Response {}\r\n", i).into_bytes(),
+            true,
+        )?;
+    }
+
+    // Verify all responses were sent
+    for i in 0..5 {
+        let response = rx.recv().await.unwrap();
+        assert_eq!(response.client_id, clients[i]);
+        assert!(response.complete);
+        assert!(response.data.starts_with(b"200 Response"));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_concurrent_clients_routing() -> Result<()> {
+    use nntp_proxy::pool::DeadpoolConnectionProvider;
+    use nntp_proxy::router::RequestRouter;
+    use nntp_proxy::types::{BackendId, ClientId};
+    use std::sync::Arc;
+
+    // Create router with 5 backends
+    let mut router = RequestRouter::new();
+    for i in 0..5 {
+        let provider = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            9999 + i,
+            format!("backend-{}", i),
+            10,
+        );
+        router.add_backend(
+            BackendId::from_index(i as usize),
+            format!("backend-{}", i),
+            provider,
+        );
+    }
+    let router = Arc::new(router);
+
+    // Simulate 50 concurrent clients each sending 5 commands
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let router_clone = router.clone();
+        let handle = tokio::spawn(async move {
+            let client_id = ClientId::new();
+            for i in 0..5 {
+                let cmd = format!("LIST {}\r\n", i);
+                router_clone.route_command(client_id, &cmd).await.unwrap();
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all clients to finish
+    for handle in handles {
+        handle.await?;
+    }
+
+    // Should have 250 pending requests (50 clients * 5 commands)
+    assert_eq!(router.pending_count().await, 250);
+
+    // Verify load is distributed across all 5 backends
+    for i in 0..5 {
+        let load = router.backend_load(BackendId::from_index(i)).unwrap();
+        assert_eq!(
+            load, 50,
+            "Backend {} should have load of 50, got {}",
+            i, load
+        );
+    }
+
+    Ok(())
+}

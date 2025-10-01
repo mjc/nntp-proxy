@@ -12,6 +12,7 @@
 //! - **config**: Configuration loading and management
 //! - **pool**: Connection and buffer pooling for high performance
 //! - **protocol**: NNTP protocol constants and response parsing
+//! - **router**: Request routing and multiplexing coordination
 //! - **types**: Core type definitions (ClientId, RequestId, BackendId)
 //!
 //! ## Design Philosophy
@@ -39,14 +40,17 @@ use tracing::{debug, error, info, warn};
 
 // Module declarations
 mod auth;
-mod command;
-mod config;
 mod network;
-mod pool;
 mod protocol;
-mod session;
 mod streaming;
-mod types;
+
+// Public modules for integration tests
+pub mod command;
+pub mod config;
+pub mod pool;
+pub mod router;
+pub mod session;
+pub mod types;
 
 // Public exports
 pub use config::{Config, ServerConfig, create_default_config, load_config};
@@ -320,14 +324,16 @@ impl NntpProxy {
 
         // Create a client session to handle the connection
         let session = ClientSession::new(client_addr, self.buffer_pool.clone());
-        
+
         // Apply socket optimizations for high-throughput
         if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_stream) {
             debug!("Failed to apply socket optimizations: {}", e);
         }
 
         // Handle the session with the backend connection
-        let copy_result = session.handle_with_backend(client_stream, backend_stream).await;
+        let copy_result = session
+            .handle_with_backend(client_stream, backend_stream)
+            .await;
 
         // Connection will be automatically closed when backend_stream goes out of scope
         debug!("Connection to {} will be closed", server.name);
@@ -355,7 +361,8 @@ impl NntpProxy {
         backend_stream: &mut TcpStream,
         client_stream: &mut TcpStream,
     ) -> Result<()> {
-        BackendAuthenticator::forward_greeting(backend_stream, client_stream, &self.buffer_pool).await
+        BackendAuthenticator::forward_greeting(backend_stream, client_stream, &self.buffer_pool)
+            .await
     }
 
     /// Perform NNTP authentication and forward the final greeting to client
@@ -372,7 +379,8 @@ impl NntpProxy {
             username,
             password,
             &self.buffer_pool,
-        ).await
+        )
+        .await
     }
 
     // Note: Client session handling moved to session module

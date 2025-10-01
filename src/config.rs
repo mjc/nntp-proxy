@@ -199,8 +199,14 @@ mod tests {
         let toml_string = toml::to_string_pretty(&config)?;
         let deserialized: Config = toml::from_str(&toml_string)?;
 
-        assert_eq!(deserialized.servers[0].username, Some("user123".to_string()));
-        assert_eq!(deserialized.servers[0].password, Some("password123".to_string()));
+        assert_eq!(
+            deserialized.servers[0].username,
+            Some("user123".to_string())
+        );
+        assert_eq!(
+            deserialized.servers[0].password,
+            Some("password123".to_string())
+        );
 
         Ok(())
     }
@@ -334,7 +340,10 @@ max_connections = 5
 
         assert_eq!(deserialized.servers[0].host, "news-server.example.com");
         assert_eq!(deserialized.servers[0].name, "Test Server (Production) #1");
-        assert_eq!(deserialized.servers[0].username, Some("user@domain.com".to_string()));
+        assert_eq!(
+            deserialized.servers[0].username,
+            Some("user@domain.com".to_string())
+        );
 
         Ok(())
     }

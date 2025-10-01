@@ -17,6 +17,8 @@ pub enum CommandType {
     AuthPass(String),
     /// Stateful commands that require GROUP context - REJECTED in stateless mode
     Stateful,
+    /// Commands that cannot be multiplexed - REJECTED in multiplexing mode
+    NonMultiplexable,
     /// Stateless commands that can be safely proxied without state
     Stateless,
     /// Article retrieval by message-ID (stateless) - can be proxied
@@ -53,7 +55,7 @@ mod tests {
         let auth_user1 = CommandType::AuthUser("user1".to_string());
         let auth_user2 = CommandType::AuthUser("user1".to_string());
         let auth_user3 = CommandType::AuthUser("user2".to_string());
-        
+
         assert_eq!(auth_user1, auth_user2);
         assert_ne!(auth_user1, auth_user3);
     }
@@ -85,7 +87,7 @@ mod tests {
         let stateful = CommandType::Stateful;
         let stateless = CommandType::Stateless;
         let article = CommandType::ArticleByMessageId;
-        
+
         assert_ne!(stateful, stateless);
         assert_ne!(stateless, article);
         assert_ne!(stateful, article);
@@ -121,7 +123,7 @@ mod tests {
             raw: "CAPABILITIES\r\n".to_string(),
         };
         let cmd2 = cmd1.clone();
-        
+
         assert_eq!(cmd1, cmd2);
         assert_eq!(cmd1.raw, cmd2.raw);
     }
@@ -172,12 +174,12 @@ mod tests {
                 raw: "ARTICLE <123@example.com>\r\n".to_string(),
             },
         ];
-        
+
         assert_eq!(commands.len(), 5);
-        
+
         // Each command should be different
         for i in 0..commands.len() {
-            for j in i+1..commands.len() {
+            for j in i + 1..commands.len() {
                 assert_ne!(commands[i], commands[j]);
             }
         }
