@@ -11,7 +11,6 @@ use tracing::{debug, warn};
 
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
-use crate::command::NntpCommand;
 use crate::pool::BufferPool;
 use crate::protocol::{NNTP_COMMAND_NOT_SUPPORTED};
 use crate::streaming::StreamHandler;

@@ -23,6 +23,7 @@ impl NntpResponse {
     }
     
     /// Check if a response indicates a multiline response
+    #[allow(dead_code)]
     pub fn is_multiline_response(status_code: u16) -> bool {
         // Multiline responses in NNTP typically have codes like:
         // 1xx informational (multiline)
@@ -36,6 +37,7 @@ impl NntpResponse {
     }
     
     /// Check if data contains the end-of-multiline marker
+    #[allow(dead_code)]
     pub fn has_multiline_terminator(data: &[u8]) -> bool {
         // NNTP multiline responses end with "\r\n.\r\n"
         if data.len() < 5 {
@@ -52,6 +54,7 @@ pub struct ResponseParser;
 
 impl ResponseParser {
     /// Check if a response starts with a success code
+    #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
         if let Some(code) = NntpResponse::parse_status_code(data) {
             code >= 200 && code < 400

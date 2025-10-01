@@ -79,8 +79,10 @@ impl NntpCommand {
 }
 
 /// Command classifier for validation and routing
+#[allow(dead_code)]
 pub struct CommandClassifier;
 
+#[allow(dead_code)]
 impl CommandClassifier {
     /// Validate a command and return validation result
     pub fn validate(command: &str) -> ValidationResult {

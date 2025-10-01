@@ -1,6 +1,7 @@
 //! Command types and structures
 
 /// Represents a validated and classified NNTP command
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Command {
     pub command_type: CommandType,
@@ -8,6 +9,7 @@ pub struct Command {
 }
 
 /// Classification of NNTP commands for routing decisions
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandType {
     /// Authentication commands (AUTHINFO USER/PASS) - intercepted locally
@@ -22,6 +24,7 @@ pub enum CommandType {
 }
 
 /// Result of command validation
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
     /// Command is allowed and should be forwarded

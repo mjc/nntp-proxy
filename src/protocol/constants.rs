@@ -16,6 +16,8 @@ pub const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB for direct a
 pub const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5
 pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
 
-/// TCP socket buffer sizes for high-throughput transfers
+/// TCP socket buffer sizes for high-throughput transfers (prepared for future use)
+#[allow(dead_code)]
 pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024; // 16MB
+#[allow(dead_code)]
 pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024; // 16MB

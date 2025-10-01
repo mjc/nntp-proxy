@@ -7,4 +7,8 @@ mod constants;
 mod response;
 
 pub use constants::*;
-pub use response::{NntpResponse, ResponseParser};
+pub use response::ResponseParser;
+
+// Re-export for future use
+#[allow(unused_imports)]
+pub use response::NntpResponse;

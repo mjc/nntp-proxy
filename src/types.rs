@@ -5,10 +5,13 @@
 
 use uuid::Uuid;
 
-/// Unique identifier for a client connection
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+/// Unique identifier for client connections
+/// Used to track which client made which request
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(Uuid);
 
+#[allow(dead_code)]
 impl ClientId {
     /// Generate a new unique client ID
     pub fn new() -> Self {
@@ -34,9 +37,11 @@ impl std::fmt::Display for ClientId {
 }
 
 /// Unique identifier for a request
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct RequestId(Uuid);
 
+#[allow(dead_code)]
 impl RequestId {
     /// Generate a new unique request ID
     pub fn new() -> Self {
@@ -61,10 +66,13 @@ impl std::fmt::Display for RequestId {
     }
 }
 
-/// Unique identifier for a backend connection
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+/// Identifier for backend servers
+/// Used to track which backend is handling which request
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BackendId(usize);
 
+#[allow(dead_code)]
 impl BackendId {
     /// Create a backend ID from an index
     pub fn from_index(index: usize) -> Self {

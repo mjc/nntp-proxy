@@ -1,6 +1,6 @@
 # NNTP Proxy
 
-A high-performance stateless NNTP proxy server written in Rust.
+A high-performance stateless NNTP proxy server written in Rust with a clean, modular architecture.
 
 ## ⚠️ Important: Stateless Mode
 
@@ -21,6 +21,20 @@ This proxy operates in **stateless mode** and **does not support GROUP-based com
 - 🛠️ **Nix development environment** - Reproducible development setup
 - 📊 **Connection tracking** - Logs client connections and backend routing
 - 🔐 **Authentication interception** - Handles client auth locally
+- 🧩 **Modular architecture** - Clean separation of concerns for maintainability
+
+## Architecture
+
+The codebase is organized into focused modules:
+
+- **auth/** - Authentication handling (client & backend)
+- **command/** - Command parsing and classification
+- **config** - Configuration management
+- **pool/** - Connection and buffer pooling
+- **protocol/** - NNTP protocol constants and parsing
+- **types** - Core type definitions
+
+See [REFACTORING.md](REFACTORING.md) for detailed architecture documentation.
 
 ## Quick Start
 
