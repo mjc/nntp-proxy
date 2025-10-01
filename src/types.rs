@@ -80,6 +80,11 @@ impl BackendId {
     }
     
     /// Get the underlying index
+    pub fn index(&self) -> usize {
+        self.0
+    }
+    
+    /// Get the underlying index
     pub fn as_index(&self) -> usize {
         self.0
     }
