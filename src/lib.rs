@@ -40,15 +40,17 @@ use tracing::{debug, error, info, warn};
 
 // Module declarations
 mod auth;
-mod command;
-mod config;
 mod network;
-mod pool;
 mod protocol;
-mod router;
-mod session;
 mod streaming;
-mod types;
+
+// Public modules for integration tests
+pub mod command;
+pub mod config;
+pub mod pool;
+pub mod router;
+pub mod session;
+pub mod types;
 
 // Public exports
 pub use config::{Config, ServerConfig, create_default_config, load_config};
