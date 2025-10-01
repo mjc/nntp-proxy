@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn test_buffer_pool_clone() {
         let pool1 = BufferPool::new(1024, 5);
-        let pool2 = pool1.clone();
+        let _pool2 = pool1.clone();
         
         // Both should share the same underlying pool
         // (Arc ensures shared ownership)

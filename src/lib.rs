@@ -12,6 +12,7 @@
 //! - **config**: Configuration loading and management
 //! - **pool**: Connection and buffer pooling for high performance
 //! - **protocol**: NNTP protocol constants and response parsing
+//! - **router**: Request routing and multiplexing coordination
 //! - **types**: Core type definitions (ClientId, RequestId, BackendId)
 //!
 //! ## Design Philosophy
@@ -44,6 +45,7 @@ mod config;
 mod network;
 mod pool;
 mod protocol;
+mod router;
 mod session;
 mod streaming;
 mod types;

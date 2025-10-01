@@ -10,6 +10,8 @@ pub enum NntpCommand {
     AuthPass,
     /// Stateful commands that require GROUP context - REJECTED in stateless mode
     Stateful,
+    /// Commands that cannot be multiplexed - REJECTED in multiplexing mode
+    NonMultiplexable,
     /// Stateless commands that can be safely proxied without state
     Stateless,
     /// Article retrieval by message-ID (stateless) - can be proxied
@@ -41,6 +43,9 @@ impl NntpCommand {
                 }
             }
             
+            // Commands that cannot be multiplexed (modify state or require streaming)
+            b"POST" | b"IHAVE" | b"NEWGROUPS" | b"NEWNEWS" => Self::NonMultiplexable,
+            
             // Stateful commands - REJECTED (require GROUP context)
             b"GROUP" | b"NEXT" | b"LAST" | b"LISTGROUP" => Self::Stateful,
             
@@ -69,8 +74,7 @@ impl NntpCommand {
             }
             
             // Stateless commands that don't need GROUP context
-            b"LIST" | b"HELP" | b"DATE" | b"CAPABILITIES" | b"MODE" 
-            | b"NEWGROUPS" | b"NEWNEWS" | b"POST" | b"QUIT" => Self::Stateless,
+            b"LIST" | b"HELP" | b"DATE" | b"CAPABILITIES" | b"MODE" | b"QUIT" => Self::Stateless,
             
             // Unknown commands - treat as stateless (forward and let backend decide)
             _ => Self::Stateless,
@@ -89,6 +93,9 @@ impl CommandClassifier {
         match NntpCommand::classify(command) {
             NntpCommand::Stateful => {
                 ValidationResult::Rejected("Command not supported by this proxy (stateless proxy mode)")
+            }
+            NntpCommand::NonMultiplexable => {
+                ValidationResult::Rejected("Command not supported by this proxy (multiplexing mode)")
             }
             NntpCommand::AuthUser | NntpCommand::AuthPass => {
                 ValidationResult::Intercepted
@@ -122,6 +129,7 @@ impl CommandClassifier {
                 CommandType::AuthPass(password)
             }
             NntpCommand::Stateful => CommandType::Stateful,
+            NntpCommand::NonMultiplexable => CommandType::NonMultiplexable,
             NntpCommand::ArticleByMessageId => CommandType::ArticleByMessageId,
             NntpCommand::Stateless => CommandType::Stateless,
         }
@@ -206,10 +214,6 @@ mod tests {
         assert_eq!(NntpCommand::classify("QUIT"), NntpCommand::Stateless);
         assert_eq!(
             NntpCommand::classify("LIST ACTIVE"),
-            NntpCommand::Stateless
-        );
-        assert_eq!(
-            NntpCommand::classify("NEWGROUPS 20231201 000000"),
             NntpCommand::Stateless
         );
         assert_eq!(
@@ -522,6 +526,56 @@ mod tests {
         assert_eq!(
             NntpCommand::classify("ARTICLE test@example.com"),
             NntpCommand::Stateful
+        );
+    }
+
+    #[test]
+    fn test_non_multiplexable_commands() {
+        // POST command - cannot be multiplexed
+        assert_eq!(
+            NntpCommand::classify("POST"),
+            NntpCommand::NonMultiplexable
+        );
+        
+        // IHAVE command - cannot be multiplexed
+        assert_eq!(
+            NntpCommand::classify("IHAVE <test@example.com>"),
+            NntpCommand::NonMultiplexable
+        );
+        
+        // NEWGROUPS command - cannot be multiplexed
+        assert_eq!(
+            NntpCommand::classify("NEWGROUPS 20240101 000000 GMT"),
+            NntpCommand::NonMultiplexable
+        );
+        
+        // NEWNEWS command - cannot be multiplexed
+        assert_eq!(
+            NntpCommand::classify("NEWNEWS * 20240101 000000 GMT"),
+            NntpCommand::NonMultiplexable
+        );
+    }
+
+    #[test]
+    fn test_non_multiplexable_case_insensitive() {
+        assert_eq!(
+            NntpCommand::classify("post"),
+            NntpCommand::NonMultiplexable
+        );
+        
+        assert_eq!(
+            NntpCommand::classify("Post"),
+            NntpCommand::NonMultiplexable
+        );
+        
+        assert_eq!(
+            NntpCommand::classify("IHAVE <msg>"),
+            NntpCommand::NonMultiplexable
+        );
+        
+        assert_eq!(
+            NntpCommand::classify("ihave <msg>"),
+            NntpCommand::NonMultiplexable
         );
     }
 }

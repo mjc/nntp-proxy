@@ -17,6 +17,8 @@ pub enum CommandType {
     AuthPass(String),
     /// Stateful commands that require GROUP context - REJECTED in stateless mode
     Stateful,
+    /// Commands that cannot be multiplexed - REJECTED in multiplexing mode
+    NonMultiplexable,
     /// Stateless commands that can be safely proxied without state
     Stateless,
     /// Article retrieval by message-ID (stateless) - can be proxied

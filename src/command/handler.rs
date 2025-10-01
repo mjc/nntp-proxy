@@ -44,6 +44,9 @@ impl CommandHandler {
             NntpCommand::Stateful => {
                 CommandAction::Reject("Command not supported by this proxy (stateless proxy mode)")
             }
+            NntpCommand::NonMultiplexable => {
+                CommandAction::Reject("Command not supported by this proxy (multiplexing mode)")
+            }
             NntpCommand::ArticleByMessageId => {
                 CommandAction::ForwardHighThroughput
             }
@@ -157,8 +160,6 @@ mod tests {
             "DATE",
             "CAPABILITIES",
             "QUIT",
-            "NEWGROUPS 20231201 000000",
-            "NEWNEWS alt.test 20231201 000000",
         ];
         
         for cmd in stateless_commands {
@@ -325,5 +326,59 @@ mod tests {
                 cmd
             );
         }
+    }
+
+    #[test]
+    fn test_non_multiplexable_commands_rejected() {
+        // POST should be rejected
+        match CommandHandler::handle_command("POST") {
+            CommandAction::Reject(msg) => {
+                assert!(msg.contains("multiplexing"));
+            }
+            _ => panic!("Expected Reject for POST"),
+        }
+        
+        // IHAVE should be rejected
+        match CommandHandler::handle_command("IHAVE <test@example.com>") {
+            CommandAction::Reject(msg) => {
+                assert!(msg.contains("multiplexing"));
+            }
+            _ => panic!("Expected Reject for IHAVE"),
+        }
+        
+        // NEWGROUPS should be rejected
+        match CommandHandler::handle_command("NEWGROUPS 20240101 000000 GMT") {
+            CommandAction::Reject(msg) => {
+                assert!(msg.contains("multiplexing"));
+            }
+            _ => panic!("Expected Reject for NEWGROUPS"),
+        }
+        
+        // NEWNEWS should be rejected
+        match CommandHandler::handle_command("NEWNEWS * 20240101 000000 GMT") {
+            CommandAction::Reject(msg) => {
+                assert!(msg.contains("multiplexing"));
+            }
+            _ => panic!("Expected Reject for NEWNEWS"),
+        }
+    }
+
+    #[test]
+    fn test_reject_message_content() {
+        // Verify different reject messages for different command types
+        let stateful_reject = match CommandHandler::handle_command("GROUP alt.test") {
+            CommandAction::Reject(msg) => msg,
+            _ => panic!("Expected Reject"),
+        };
+        
+        let multiplexing_reject = match CommandHandler::handle_command("POST") {
+            CommandAction::Reject(msg) => msg,
+            _ => panic!("Expected Reject"),
+        };
+        
+        // They should have different messages
+        assert!(stateful_reject.contains("stateless"));
+        assert!(multiplexing_reject.contains("multiplexing"));
+        assert_ne!(stateful_reject, multiplexing_reject);
     }
 }
