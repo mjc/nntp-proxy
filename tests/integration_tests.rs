@@ -337,14 +337,14 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
 
 #[tokio::test]
 async fn test_multiplexing_router_integration() -> Result<()> {
-    use nntp_proxy::router::RequestRouter;
     use nntp_proxy::pool::DeadpoolConnectionProvider;
+    use nntp_proxy::router::RequestRouter;
     use nntp_proxy::types::{BackendId, ClientId};
     use std::sync::Arc;
 
     // Create router with multiple backends
     let mut router = RequestRouter::new();
-    
+
     for i in 0..3 {
         let provider = DeadpoolConnectionProvider::new(
             "localhost".to_string(),
@@ -391,7 +391,7 @@ async fn test_multiplexing_router_integration() -> Result<()> {
 
 #[tokio::test]
 async fn test_command_rejection_for_multiplexing() -> Result<()> {
-    use nntp_proxy::command::{CommandHandler, CommandAction};
+    use nntp_proxy::command::{CommandAction, CommandHandler};
 
     // Commands that should be rejected in multiplexing mode
     let rejected_commands = vec![
@@ -405,7 +405,11 @@ async fn test_command_rejection_for_multiplexing() -> Result<()> {
         let action = CommandHandler::handle_command(cmd);
         match action {
             CommandAction::Reject(msg) => {
-                assert!(msg.contains("multiplexing"), "Expected multiplexing rejection for: {}", cmd);
+                assert!(
+                    msg.contains("multiplexing"),
+                    "Expected multiplexing rejection for: {}",
+                    cmd
+                );
             }
             _ => panic!("Command {} should be rejected for multiplexing", cmd),
         }
@@ -440,14 +444,14 @@ async fn test_command_rejection_for_multiplexing() -> Result<()> {
 
 #[tokio::test]
 async fn test_stateful_commands_rejected() -> Result<()> {
-    use nntp_proxy::command::{CommandHandler, CommandAction};
+    use nntp_proxy::command::{CommandAction, CommandHandler};
 
     // Stateful commands that should be rejected
     let stateful_commands = vec![
         "GROUP alt.test\r\n",
         "NEXT\r\n",
         "LAST\r\n",
-        "ARTICLE 123\r\n",  // Article by number (requires GROUP context)
+        "ARTICLE 123\r\n", // Article by number (requires GROUP context)
         "STAT\r\n",
         "XOVER 100-200\r\n",
     ];
@@ -456,8 +460,11 @@ async fn test_stateful_commands_rejected() -> Result<()> {
         let action = CommandHandler::handle_command(cmd);
         match action {
             CommandAction::Reject(msg) => {
-                assert!(msg.contains("stateless") || msg.contains("multiplexing"),
-                    "Expected rejection for: {}", cmd);
+                assert!(
+                    msg.contains("stateless") || msg.contains("multiplexing"),
+                    "Expected rejection for: {}",
+                    cmd
+                );
             }
             _ => panic!("Stateful command {} should be rejected", cmd),
         }
@@ -468,10 +475,10 @@ async fn test_stateful_commands_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_client_session_with_router() -> Result<()> {
-    use nntp_proxy::session::ClientSession;
     use nntp_proxy::pool::BufferPool;
-    use nntp_proxy::router::RequestRouter;
     use nntp_proxy::pool::DeadpoolConnectionProvider;
+    use nntp_proxy::router::RequestRouter;
+    use nntp_proxy::session::ClientSession;
     use nntp_proxy::types::BackendId;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
@@ -545,8 +552,8 @@ async fn test_response_demultiplexer() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_clients_routing() -> Result<()> {
-    use nntp_proxy::router::RequestRouter;
     use nntp_proxy::pool::DeadpoolConnectionProvider;
+    use nntp_proxy::router::RequestRouter;
     use nntp_proxy::types::{BackendId, ClientId};
     use std::sync::Arc;
 
@@ -592,7 +599,11 @@ async fn test_concurrent_clients_routing() -> Result<()> {
     // Verify load is distributed across all 5 backends
     for i in 0..5 {
         let load = router.backend_load(BackendId::from_index(i)).unwrap();
-        assert_eq!(load, 50, "Backend {} should have load of 50, got {}", i, load);
+        assert_eq!(
+            load, 50,
+            "Backend {} should have load of 50, got {}",
+            i, load
+        );
     }
 
     Ok(())

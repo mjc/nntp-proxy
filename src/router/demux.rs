@@ -35,10 +35,7 @@ pub struct ResponseDemultiplexer {
 #[allow(dead_code)]
 impl ResponseDemultiplexer {
     /// Create a new response demultiplexer
-    pub fn new(
-        backend_id: BackendId,
-        response_tx: mpsc::UnboundedSender<ClientResponse>,
-    ) -> Self {
+    pub fn new(backend_id: BackendId, response_tx: mpsc::UnboundedSender<ClientResponse>) -> Self {
         Self {
             backend_id,
             response_tx,

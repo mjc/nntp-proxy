@@ -83,8 +83,8 @@ impl StreamHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::io::Cursor;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_stream_handler_exists() {
@@ -105,21 +105,21 @@ mod tests {
         // Test with small data that fits in buffer
         let client_data = b"Hello from client";
         let backend_data = b"Hello from backend";
-        
+
         let mut client_read = Cursor::new(client_data);
         let mut client_write = Vec::new();
         let mut backend_read = Cursor::new(backend_data);
         let mut backend_write = Vec::new();
-        
+
         // Simulate a small transfer
         let mut buffer1 = vec![0u8; 1024];
         let mut buffer2 = vec![0u8; 1024];
-        
+
         // Read from client, write to backend
         let n = client_read.read(&mut buffer1).await.unwrap();
         backend_write.write_all(&buffer1[..n]).await.unwrap();
         assert_eq!(&backend_write, client_data);
-        
+
         // Read from backend, write to client
         let n = backend_read.read(&mut buffer2).await.unwrap();
         client_write.write_all(&buffer2[..n]).await.unwrap();
@@ -131,7 +131,7 @@ mod tests {
         // Test that we can allocate the optimized buffer size
         let buffer = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
         assert_eq!(buffer.len(), HIGH_THROUGHPUT_BUFFER_SIZE);
-        
+
         // Test writing to the buffer
         let mut cursor = Cursor::new(buffer);
         cursor.write_all(b"test data").await.unwrap();
@@ -143,7 +143,7 @@ mod tests {
         // News articles are typically 1KB-100KB
         // Our 256KB buffer should handle most articles in one read
         assert!(HIGH_THROUGHPUT_BUFFER_SIZE >= 256 * 1024);
-        
+
         // Should be significantly larger than default socket buffer (64KB)
         assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 65536);
     }
@@ -153,7 +153,7 @@ mod tests {
         // Verify buffer allocation works
         let buffer1 = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
         let buffer2 = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
-        
+
         assert_eq!(buffer1.len(), buffer2.len());
         assert_eq!(buffer1.len(), HIGH_THROUGHPUT_BUFFER_SIZE);
     }
@@ -171,7 +171,7 @@ mod tests {
         let empty_data: &[u8] = b"";
         let mut read_stream = Cursor::new(empty_data);
         let mut buffer = vec![0u8; 1024];
-        
+
         let n = read_stream.read(&mut buffer).await.unwrap();
         assert_eq!(n, 0); // EOF
     }
@@ -182,7 +182,7 @@ mod tests {
         let data = b"Small data";
         let mut read_stream = Cursor::new(data);
         let mut buffer = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
-        
+
         let n = read_stream.read(&mut buffer).await.unwrap();
         assert_eq!(n, data.len());
         assert_eq!(&buffer[..n], data);

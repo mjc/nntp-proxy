@@ -35,24 +35,16 @@ impl CommandHandler {
     /// Process a command and return the action to take
     pub fn handle_command(command: &str) -> CommandAction {
         match NntpCommand::classify(command) {
-            NntpCommand::AuthUser => {
-                CommandAction::InterceptAuth(AuthAction::RequestPassword)
-            }
-            NntpCommand::AuthPass => {
-                CommandAction::InterceptAuth(AuthAction::AcceptAuth)
-            }
+            NntpCommand::AuthUser => CommandAction::InterceptAuth(AuthAction::RequestPassword),
+            NntpCommand::AuthPass => CommandAction::InterceptAuth(AuthAction::AcceptAuth),
             NntpCommand::Stateful => {
                 CommandAction::Reject("Command not supported by this proxy (stateless proxy mode)")
             }
             NntpCommand::NonMultiplexable => {
                 CommandAction::Reject("Command not supported by this proxy (multiplexing mode)")
             }
-            NntpCommand::ArticleByMessageId => {
-                CommandAction::ForwardHighThroughput
-            }
-            NntpCommand::Stateless => {
-                CommandAction::ForwardStateless
-            }
+            NntpCommand::ArticleByMessageId => CommandAction::ForwardHighThroughput,
+            NntpCommand::Stateless => CommandAction::ForwardStateless,
         }
     }
 }
@@ -73,10 +65,7 @@ mod tests {
     #[test]
     fn test_auth_pass_command() {
         let action = CommandHandler::handle_command("AUTHINFO PASS secret");
-        assert_eq!(
-            action,
-            CommandAction::InterceptAuth(AuthAction::AcceptAuth)
-        );
+        assert_eq!(action, CommandAction::InterceptAuth(AuthAction::AcceptAuth));
     }
 
     #[test]
@@ -100,7 +89,7 @@ mod tests {
     fn test_stateless_command() {
         let action = CommandHandler::handle_command("LIST");
         assert_eq!(action, CommandAction::ForwardStateless);
-        
+
         let action = CommandHandler::handle_command("HELP");
         assert_eq!(action, CommandAction::ForwardStateless);
     }
@@ -119,7 +108,7 @@ mod tests {
             "STAT",
             "XOVER 1-100",
         ];
-        
+
         for cmd in stateful_commands {
             match CommandHandler::handle_command(cmd) {
                 CommandAction::Reject(msg) => {
@@ -139,7 +128,7 @@ mod tests {
             "HEAD <id@host.net>",
             "STAT <unique@domain.com>",
         ];
-        
+
         for cmd in msgid_commands {
             assert_eq!(
                 CommandHandler::handle_command(cmd),
@@ -161,7 +150,7 @@ mod tests {
             "CAPABILITIES",
             "QUIT",
         ];
-        
+
         for cmd in stateless_commands {
             assert_eq!(
                 CommandHandler::handle_command(cmd),
@@ -205,7 +194,7 @@ mod tests {
         // Command with leading/trailing whitespace
         let action = CommandHandler::handle_command("  LIST  ");
         assert_eq!(action, CommandAction::ForwardStateless);
-        
+
         // Auth command with extra whitespace
         let action = CommandHandler::handle_command("  AUTHINFO USER test  ");
         assert_eq!(
@@ -219,7 +208,7 @@ mod tests {
         // AUTHINFO without subcommand
         let action = CommandHandler::handle_command("AUTHINFO");
         assert_eq!(action, CommandAction::ForwardStateless);
-        
+
         // AUTHINFO with unknown subcommand
         let action = CommandHandler::handle_command("AUTHINFO INVALID");
         assert_eq!(action, CommandAction::ForwardStateless);
@@ -233,13 +222,10 @@ mod tests {
             action,
             CommandAction::InterceptAuth(AuthAction::RequestPassword)
         );
-        
+
         // AUTHINFO PASS without password (still intercept)
         let action = CommandHandler::handle_command("AUTHINFO PASS");
-        assert_eq!(
-            action,
-            CommandAction::InterceptAuth(AuthAction::AcceptAuth)
-        );
+        assert_eq!(action, CommandAction::InterceptAuth(AuthAction::AcceptAuth));
     }
 
     #[test]
@@ -247,7 +233,7 @@ mod tests {
         // Command with CRLF
         let action = CommandHandler::handle_command("ARTICLE <msg@test.com>\r\n");
         assert_eq!(action, CommandAction::ForwardHighThroughput);
-        
+
         // Command with just LF
         let action = CommandHandler::handle_command("LIST\n");
         assert_eq!(action, CommandAction::ForwardStateless);
@@ -259,7 +245,7 @@ mod tests {
         let long_cmd = format!("LIST {}", "A".repeat(10000));
         let action = CommandHandler::handle_command(&long_cmd);
         assert_eq!(action, CommandAction::ForwardStateless);
-        
+
         // Very long GROUP name (stateful)
         let long_group = format!("GROUP {}", "alt.".repeat(1000));
         match CommandHandler::handle_command(&long_group) {
@@ -283,7 +269,7 @@ mod tests {
             CommandAction::InterceptAuth(AuthAction::RequestPassword),
             CommandAction::InterceptAuth(AuthAction::RequestPassword)
         );
-        
+
         // Test inequality
         assert_ne!(
             CommandAction::ForwardStateless,
@@ -311,13 +297,8 @@ mod tests {
     fn test_unknown_commands_forwarded() {
         // Unknown commands should be forwarded as stateless
         // The backend server will handle the error
-        let unknown_commands = vec![
-            "INVALIDCOMMAND",
-            "XYZABC",
-            "RANDOM DATA",
-            "12345",
-        ];
-        
+        let unknown_commands = vec!["INVALIDCOMMAND", "XYZABC", "RANDOM DATA", "12345"];
+
         for cmd in unknown_commands {
             assert_eq!(
                 CommandHandler::handle_command(cmd),
@@ -337,7 +318,7 @@ mod tests {
             }
             _ => panic!("Expected Reject for POST"),
         }
-        
+
         // IHAVE should be rejected
         match CommandHandler::handle_command("IHAVE <test@example.com>") {
             CommandAction::Reject(msg) => {
@@ -345,7 +326,7 @@ mod tests {
             }
             _ => panic!("Expected Reject for IHAVE"),
         }
-        
+
         // NEWGROUPS should be rejected
         match CommandHandler::handle_command("NEWGROUPS 20240101 000000 GMT") {
             CommandAction::Reject(msg) => {
@@ -353,7 +334,7 @@ mod tests {
             }
             _ => panic!("Expected Reject for NEWGROUPS"),
         }
-        
+
         // NEWNEWS should be rejected
         match CommandHandler::handle_command("NEWNEWS * 20240101 000000 GMT") {
             CommandAction::Reject(msg) => {
@@ -370,12 +351,12 @@ mod tests {
             CommandAction::Reject(msg) => msg,
             _ => panic!("Expected Reject"),
         };
-        
+
         let multiplexing_reject = match CommandHandler::handle_command("POST") {
             CommandAction::Reject(msg) => msg,
             _ => panic!("Expected Reject"),
         };
-        
+
         // They should have different messages
         assert!(stateful_reject.contains("stateless"));
         assert!(multiplexing_reject.contains("multiplexing"));

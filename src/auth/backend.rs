@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::pool::BufferPool;
-use crate::protocol::{ResponseParser};
+use crate::protocol::ResponseParser;
 
 /// Handles authentication to backend NNTP servers
 pub struct BackendAuthenticator;
@@ -123,7 +123,7 @@ impl BackendAuthenticator {
 
         // Forward greeting to client immediately
         client_stream.write_all(greeting).await?;
-        
+
         // Return buffer before calling authenticate
         buffer_pool.return_buffer(buffer).await;
 
@@ -171,17 +171,17 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_pool_usage() {
         let buffer_pool = BufferPool::new(8192, 2);
-        
+
         // Verify we can get and return buffers
         let buffer1 = buffer_pool.get_buffer().await;
         let buffer2 = buffer_pool.get_buffer().await;
-        
+
         assert_eq!(buffer1.len(), 8192);
         assert_eq!(buffer2.len(), 8192);
-        
+
         buffer_pool.return_buffer(buffer1).await;
         buffer_pool.return_buffer(buffer2).await;
-        
+
         // Should be able to get them again
         let buffer3 = buffer_pool.get_buffer().await;
         assert_eq!(buffer3.len(), 8192);
@@ -194,10 +194,10 @@ mod tests {
         // Verify the commands we construct are correct
         let username = "testuser";
         let password = "testpass";
-        
+
         let user_command = format!("AUTHINFO USER {}\r\n", username);
         assert_eq!(user_command, "AUTHINFO USER testuser\r\n");
-        
+
         let pass_command = format!("AUTHINFO PASS {}\r\n", password);
         assert_eq!(pass_command, "AUTHINFO PASS testpass\r\n");
     }
@@ -209,11 +209,11 @@ mod tests {
         let username = "user with spaces";
         let user_command = format!("AUTHINFO USER {}\r\n", username);
         assert!(user_command.contains("user with spaces"));
-        
+
         // Empty username
         let empty_command = format!("AUTHINFO USER {}\r\n", "");
         assert_eq!(empty_command, "AUTHINFO USER \r\n");
-        
+
         // Password with special characters
         let password = "p@ssw0rd!#$";
         let pass_command = format!("AUTHINFO PASS {}\r\n", password);

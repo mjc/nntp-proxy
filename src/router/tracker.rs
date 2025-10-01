@@ -105,9 +105,9 @@ mod tests {
         let mut tracker = RequestTracker::new();
         let request_id = RequestId::new();
         let client_id = ClientId::new();
-        
+
         tracker.add_request(request_id, client_id, "LIST\r\n".to_string());
-        
+
         assert_eq!(tracker.pending_count(), 1);
         assert_eq!(tracker.get_client_id(request_id), Some(client_id));
     }
@@ -118,9 +118,9 @@ mod tests {
         let request_id = RequestId::new();
         let client_id = ClientId::new();
         let command = "HELP\r\n".to_string();
-        
+
         tracker.add_request(request_id, client_id, command.clone());
-        
+
         let request = tracker.get_request(request_id).unwrap();
         assert_eq!(request.client_id, client_id);
         assert_eq!(request.command, command);
@@ -131,10 +131,10 @@ mod tests {
         let mut tracker = RequestTracker::new();
         let request_id = RequestId::new();
         let client_id = ClientId::new();
-        
+
         tracker.add_request(request_id, client_id, "LIST\r\n".to_string());
         assert_eq!(tracker.pending_count(), 1);
-        
+
         let completed = tracker.complete_request(request_id);
         assert_eq!(completed, Some(client_id));
         assert_eq!(tracker.pending_count(), 0);
@@ -147,10 +147,10 @@ mod tests {
         let req2 = RequestId::new();
         let client1 = ClientId::new();
         let client2 = ClientId::new();
-        
+
         tracker.add_request(req1, client1, "LIST\r\n".to_string());
         tracker.add_request(req2, client2, "HELP\r\n".to_string());
-        
+
         assert_eq!(tracker.pending_count(), 2);
         assert_eq!(tracker.get_client_id(req1), Some(client1));
         assert_eq!(tracker.get_client_id(req2), Some(client2));
@@ -163,10 +163,10 @@ mod tests {
         let req2 = RequestId::new();
         let client1 = ClientId::new();
         let client2 = ClientId::new();
-        
+
         tracker.add_request(req1, client1, "LIST\r\n".to_string());
         tracker.add_request(req2, client2, "HELP\r\n".to_string());
-        
+
         let all = tracker.all_pending();
         assert_eq!(all.len(), 2);
     }
@@ -176,12 +176,12 @@ mod tests {
         let mut tracker = RequestTracker::new();
         let request_id = RequestId::new();
         let client_id = ClientId::new();
-        
+
         tracker.add_request(request_id, client_id, "LIST\r\n".to_string());
-        
+
         let request = tracker.get_request(request_id).unwrap();
         let age = request.age();
-        
+
         // Age should be very small (just created)
         assert!(age < Duration::from_secs(1));
     }
@@ -191,14 +191,14 @@ mod tests {
         let mut tracker = RequestTracker::new();
         let request_id = RequestId::new();
         let client_id = ClientId::new();
-        
+
         tracker.add_request(request_id, client_id, "LIST\r\n".to_string());
-        
+
         // No requests should be stale immediately
         let removed = tracker.cleanup_stale(Duration::from_secs(60));
         assert_eq!(removed, 0);
         assert_eq!(tracker.pending_count(), 1);
-        
+
         // All requests should be stale with 0 duration
         let removed = tracker.cleanup_stale(Duration::from_secs(0));
         assert_eq!(removed, 1);
@@ -209,7 +209,7 @@ mod tests {
     fn test_nonexistent_request() {
         let tracker = RequestTracker::new();
         let fake_id = RequestId::new();
-        
+
         assert_eq!(tracker.get_client_id(fake_id), None);
         assert_eq!(tracker.get_request(fake_id), None);
     }
@@ -218,7 +218,7 @@ mod tests {
     fn test_complete_nonexistent() {
         let mut tracker = RequestTracker::new();
         let fake_id = RequestId::new();
-        
+
         let result = tracker.complete_request(fake_id);
         assert_eq!(result, None);
     }
