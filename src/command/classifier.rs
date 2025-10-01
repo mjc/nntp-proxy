@@ -261,4 +261,267 @@ mod tests {
             CommandType::Stateless
         );
     }
+
+    #[test]
+    fn test_case_insensitivity() {
+        // Commands should be case-insensitive per NNTP spec
+        assert_eq!(
+            NntpCommand::classify("list"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::classify("LiSt"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::classify("QUIT"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::classify("quit"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::classify("group alt.test"),
+            NntpCommand::Stateful
+        );
+        assert_eq!(
+            NntpCommand::classify("GROUP alt.test"),
+            NntpCommand::Stateful
+        );
+    }
+
+    #[test]
+    fn test_empty_and_whitespace_commands() {
+        // Empty command
+        assert_eq!(
+            NntpCommand::classify(""),
+            NntpCommand::Stateless
+        );
+        
+        // Only whitespace
+        assert_eq!(
+            NntpCommand::classify("   "),
+            NntpCommand::Stateless
+        );
+        
+        // Tabs and spaces
+        assert_eq!(
+            NntpCommand::classify("\t\t  "),
+            NntpCommand::Stateless
+        );
+    }
+
+    #[test]
+    fn test_malformed_authinfo_commands() {
+        // AUTHINFO without USER or PASS
+        assert_eq!(
+            NntpCommand::classify("AUTHINFO"),
+            NntpCommand::Stateless
+        );
+        
+        // AUTHINFO with unknown subcommand
+        assert_eq!(
+            NntpCommand::classify("AUTHINFO INVALID"),
+            NntpCommand::Stateless
+        );
+        
+        // AUTHINFO USER without username
+        assert_eq!(
+            NntpCommand::classify("AUTHINFO USER"),
+            NntpCommand::AuthUser
+        );
+        
+        // AUTHINFO PASS without password
+        assert_eq!(
+            NntpCommand::classify("AUTHINFO PASS"),
+            NntpCommand::AuthPass
+        );
+    }
+
+    #[test]
+    fn test_article_commands_with_various_message_ids() {
+        // Standard message-ID
+        assert_eq!(
+            NntpCommand::classify("ARTICLE <test@example.com>"),
+            NntpCommand::ArticleByMessageId
+        );
+        
+        // Message-ID with complex domain
+        assert_eq!(
+            NntpCommand::classify("ARTICLE <msg.123@news.example.co.uk>"),
+            NntpCommand::ArticleByMessageId
+        );
+        
+        // Message-ID with special characters
+        assert_eq!(
+            NntpCommand::classify("ARTICLE <user+tag@domain.com>"),
+            NntpCommand::ArticleByMessageId
+        );
+        
+        // BODY with message-ID
+        assert_eq!(
+            NntpCommand::classify("BODY <test@test.com>"),
+            NntpCommand::ArticleByMessageId
+        );
+        
+        // HEAD with message-ID
+        assert_eq!(
+            NntpCommand::classify("HEAD <id@host>"),
+            NntpCommand::ArticleByMessageId
+        );
+        
+        // STAT with message-ID
+        assert_eq!(
+            NntpCommand::classify("STAT <msg@server>"),
+            NntpCommand::ArticleByMessageId
+        );
+    }
+
+    #[test]
+    fn test_article_commands_without_message_id() {
+        // ARTICLE with number (stateful - requires GROUP context)
+        assert_eq!(
+            NntpCommand::classify("ARTICLE 12345"),
+            NntpCommand::Stateful
+        );
+        
+        // ARTICLE without argument (stateful - uses current article)
+        assert_eq!(
+            NntpCommand::classify("ARTICLE"),
+            NntpCommand::Stateful
+        );
+        
+        // BODY with number
+        assert_eq!(
+            NntpCommand::classify("BODY 999"),
+            NntpCommand::Stateful
+        );
+        
+        // HEAD with number
+        assert_eq!(
+            NntpCommand::classify("HEAD 123"),
+            NntpCommand::Stateful
+        );
+    }
+
+    #[test]
+    fn test_special_characters_in_commands() {
+        // Command with newlines
+        assert_eq!(
+            NntpCommand::classify("LIST\r\n"),
+            NntpCommand::Stateless
+        );
+        
+        // Command with extra whitespace
+        assert_eq!(
+            NntpCommand::classify("  LIST   ACTIVE  "),
+            NntpCommand::Stateless
+        );
+        
+        // Command with tabs
+        assert_eq!(
+            NntpCommand::classify("LIST\tACTIVE"),
+            NntpCommand::Stateless
+        );
+    }
+
+    #[test]
+    fn test_very_long_commands() {
+        // Very long command line
+        let long_command = format!("LIST {}", "A".repeat(1000));
+        assert_eq!(
+            NntpCommand::classify(&long_command),
+            NntpCommand::Stateless
+        );
+        
+        // Very long GROUP name
+        let long_group = format!("GROUP {}", "alt.".repeat(100));
+        assert_eq!(
+            NntpCommand::classify(&long_group),
+            NntpCommand::Stateful
+        );
+        
+        // Very long message-ID
+        let long_msgid = format!("ARTICLE <{}@example.com>", "x".repeat(500));
+        assert_eq!(
+            NntpCommand::classify(&long_msgid),
+            NntpCommand::ArticleByMessageId
+        );
+    }
+
+    #[test]
+    fn test_command_parser_extracts_credentials() {
+        // Test username extraction
+        match CommandClassifier::parse("AUTHINFO USER alice") {
+            CommandType::AuthUser(user) => assert_eq!(user, "alice"),
+            _ => panic!("Expected AuthUser"),
+        }
+        
+        // Test username with spaces (takes first word)
+        match CommandClassifier::parse("AUTHINFO USER bob smith") {
+            CommandType::AuthUser(user) => assert_eq!(user, "bob"),
+            _ => panic!("Expected AuthUser"),
+        }
+        
+        // Test password extraction
+        match CommandClassifier::parse("AUTHINFO PASS secret123") {
+            CommandType::AuthPass(pass) => assert_eq!(pass, "secret123"),
+            _ => panic!("Expected AuthPass"),
+        }
+        
+        // Test password with special characters
+        match CommandClassifier::parse("AUTHINFO PASS p@ssw0rd!#$") {
+            CommandType::AuthPass(pass) => assert_eq!(pass, "p@ssw0rd!#$"),
+            _ => panic!("Expected AuthPass"),
+        }
+    }
+
+    #[test]
+    fn test_list_command_variations() {
+        // LIST without arguments
+        assert_eq!(
+            NntpCommand::classify("LIST"),
+            NntpCommand::Stateless
+        );
+        
+        // LIST ACTIVE
+        assert_eq!(
+            NntpCommand::classify("LIST ACTIVE"),
+            NntpCommand::Stateless
+        );
+        
+        // LIST NEWSGROUPS
+        assert_eq!(
+            NntpCommand::classify("LIST NEWSGROUPS"),
+            NntpCommand::Stateless
+        );
+        
+        // LIST OVERVIEW.FMT
+        assert_eq!(
+            NntpCommand::classify("LIST OVERVIEW.FMT"),
+            NntpCommand::Stateless
+        );
+    }
+
+    #[test]
+    fn test_boundary_conditions() {
+        // Single character command
+        assert_eq!(
+            NntpCommand::classify("X"),
+            NntpCommand::Stateless
+        );
+        
+        // Command that looks like message-ID but isn't
+        assert_eq!(
+            NntpCommand::classify("NOTARTICLE <test@example.com>"),
+            NntpCommand::Stateless
+        );
+        
+        // Message-ID without angle brackets (not valid, treated as number)
+        assert_eq!(
+            NntpCommand::classify("ARTICLE test@example.com"),
+            NntpCommand::Stateful
+        );
+    }
 }

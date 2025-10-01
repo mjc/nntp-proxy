@@ -101,4 +101,229 @@ mod tests {
         let action = CommandHandler::handle_command("HELP");
         assert_eq!(action, CommandAction::ForwardStateless);
     }
+
+    #[test]
+    fn test_all_stateful_commands_rejected() {
+        // Test various stateful commands
+        let stateful_commands = vec![
+            "GROUP alt.test",
+            "NEXT",
+            "LAST",
+            "LISTGROUP alt.test",
+            "ARTICLE 123",
+            "HEAD 456",
+            "BODY 789",
+            "STAT",
+            "XOVER 1-100",
+        ];
+        
+        for cmd in stateful_commands {
+            match CommandHandler::handle_command(cmd) {
+                CommandAction::Reject(msg) => {
+                    assert!(msg.contains("stateless") || msg.contains("not supported"));
+                }
+                other => panic!("Expected Reject for '{}', got {:?}", cmd, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_article_by_msgid_as_high_throughput() {
+        // All message-ID based article commands should be high-throughput
+        let msgid_commands = vec![
+            "ARTICLE <test@example.com>",
+            "BODY <msg@server.org>",
+            "HEAD <id@host.net>",
+            "STAT <unique@domain.com>",
+        ];
+        
+        for cmd in msgid_commands {
+            assert_eq!(
+                CommandHandler::handle_command(cmd),
+                CommandAction::ForwardHighThroughput,
+                "Command '{}' should be high-throughput",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_various_stateless_commands() {
+        let stateless_commands = vec![
+            "HELP",
+            "LIST",
+            "LIST ACTIVE",
+            "LIST NEWSGROUPS",
+            "DATE",
+            "CAPABILITIES",
+            "QUIT",
+            "NEWGROUPS 20231201 000000",
+            "NEWNEWS alt.test 20231201 000000",
+        ];
+        
+        for cmd in stateless_commands {
+            assert_eq!(
+                CommandHandler::handle_command(cmd),
+                CommandAction::ForwardStateless,
+                "Command '{}' should be stateless",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_case_insensitive_handling() {
+        // Test that command handling is case-insensitive
+        assert_eq!(
+            CommandHandler::handle_command("list"),
+            CommandAction::ForwardStateless
+        );
+        assert_eq!(
+            CommandHandler::handle_command("LiSt"),
+            CommandAction::ForwardStateless
+        );
+        assert_eq!(
+            CommandHandler::handle_command("QUIT"),
+            CommandAction::ForwardStateless
+        );
+        assert_eq!(
+            CommandHandler::handle_command("quit"),
+            CommandAction::ForwardStateless
+        );
+    }
+
+    #[test]
+    fn test_empty_command() {
+        // Empty command should be treated as stateless (unknown)
+        let action = CommandHandler::handle_command("");
+        assert_eq!(action, CommandAction::ForwardStateless);
+    }
+
+    #[test]
+    fn test_whitespace_handling() {
+        // Command with leading/trailing whitespace
+        let action = CommandHandler::handle_command("  LIST  ");
+        assert_eq!(action, CommandAction::ForwardStateless);
+        
+        // Auth command with extra whitespace
+        let action = CommandHandler::handle_command("  AUTHINFO USER test  ");
+        assert_eq!(
+            action,
+            CommandAction::InterceptAuth(AuthAction::RequestPassword)
+        );
+    }
+
+    #[test]
+    fn test_malformed_auth_commands() {
+        // AUTHINFO without subcommand
+        let action = CommandHandler::handle_command("AUTHINFO");
+        assert_eq!(action, CommandAction::ForwardStateless);
+        
+        // AUTHINFO with unknown subcommand
+        let action = CommandHandler::handle_command("AUTHINFO INVALID");
+        assert_eq!(action, CommandAction::ForwardStateless);
+    }
+
+    #[test]
+    fn test_auth_commands_without_arguments() {
+        // AUTHINFO USER without username (still intercept)
+        let action = CommandHandler::handle_command("AUTHINFO USER");
+        assert_eq!(
+            action,
+            CommandAction::InterceptAuth(AuthAction::RequestPassword)
+        );
+        
+        // AUTHINFO PASS without password (still intercept)
+        let action = CommandHandler::handle_command("AUTHINFO PASS");
+        assert_eq!(
+            action,
+            CommandAction::InterceptAuth(AuthAction::AcceptAuth)
+        );
+    }
+
+    #[test]
+    fn test_article_commands_with_newlines() {
+        // Command with CRLF
+        let action = CommandHandler::handle_command("ARTICLE <msg@test.com>\r\n");
+        assert_eq!(action, CommandAction::ForwardHighThroughput);
+        
+        // Command with just LF
+        let action = CommandHandler::handle_command("LIST\n");
+        assert_eq!(action, CommandAction::ForwardStateless);
+    }
+
+    #[test]
+    fn test_very_long_commands() {
+        // Very long stateless command
+        let long_cmd = format!("LIST {}", "A".repeat(10000));
+        let action = CommandHandler::handle_command(&long_cmd);
+        assert_eq!(action, CommandAction::ForwardStateless);
+        
+        // Very long GROUP name (stateful)
+        let long_group = format!("GROUP {}", "alt.".repeat(1000));
+        match CommandHandler::handle_command(&long_group) {
+            CommandAction::Reject(_) => {} // Expected
+            other => panic!("Expected Reject for long GROUP, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_command_action_equality() {
+        // Test that CommandAction implements PartialEq correctly
+        assert_eq!(
+            CommandAction::ForwardStateless,
+            CommandAction::ForwardStateless
+        );
+        assert_eq!(
+            CommandAction::ForwardHighThroughput,
+            CommandAction::ForwardHighThroughput
+        );
+        assert_eq!(
+            CommandAction::InterceptAuth(AuthAction::RequestPassword),
+            CommandAction::InterceptAuth(AuthAction::RequestPassword)
+        );
+        
+        // Test inequality
+        assert_ne!(
+            CommandAction::ForwardStateless,
+            CommandAction::ForwardHighThroughput
+        );
+        assert_ne!(
+            CommandAction::InterceptAuth(AuthAction::RequestPassword),
+            CommandAction::InterceptAuth(AuthAction::AcceptAuth)
+        );
+    }
+
+    #[test]
+    fn test_reject_messages() {
+        // Verify reject messages are informative
+        match CommandHandler::handle_command("GROUP alt.test") {
+            CommandAction::Reject(msg) => {
+                assert!(!msg.is_empty());
+                assert!(msg.len() > 10); // Should have a meaningful message
+            }
+            _ => panic!("Expected Reject"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_commands_forwarded() {
+        // Unknown commands should be forwarded as stateless
+        // The backend server will handle the error
+        let unknown_commands = vec![
+            "INVALIDCOMMAND",
+            "XYZABC",
+            "RANDOM DATA",
+            "12345",
+        ];
+        
+        for cmd in unknown_commands {
+            assert_eq!(
+                CommandHandler::handle_command(cmd),
+                CommandAction::ForwardStateless,
+                "Unknown command '{}' should be forwarded",
+                cmd
+            );
+        }
+    }
 }
