@@ -3,8 +3,11 @@
 //! This module handles routing NNTP commands to backend servers and
 //! multiplexing multiple client connections over shared backend connections.
 
+mod demux;
 mod tracker;
 
+#[allow(unused_imports)]
+pub use demux::{ClientResponse, ResponseDemultiplexer};
 pub use tracker::RequestTracker;
 
 #[allow(unused_imports)]
