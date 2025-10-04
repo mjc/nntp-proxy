@@ -33,7 +33,7 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
@@ -47,6 +47,8 @@ mod streaming;
 // Public modules for integration tests
 pub mod command;
 pub mod config;
+pub mod constants;
+pub mod health;
 pub mod pool;
 pub mod router;
 pub mod session;
@@ -62,16 +64,16 @@ use pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider};
 use protocol::*;
 use session::ClientSession;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NntpProxy {
     servers: Vec<ServerConfig>,
-    current_index: Arc<AtomicUsize>,
+    current_index: AtomicUsize,
     /// Connection providers per server - easily swappable implementation
     connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
     /// Track if pools have been prewarmed to avoid redundant prewarming
-    pools_prewarmed: Arc<std::sync::atomic::AtomicBool>,
+    pools_prewarmed: AtomicBool,
 }
 
 impl NntpProxy {
@@ -94,17 +96,42 @@ impl NntpProxy {
                     server.port,
                     server.name.clone(),
                     server.max_connections as usize,
+                    server.username.clone(),
+                    server.password.clone(),
                 )
             })
             .collect();
 
+        let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
+
         Ok(Self {
             servers: config.servers,
-            current_index: Arc::new(AtomicUsize::new(0)),
+            current_index: AtomicUsize::new(0),
             connection_providers,
-            buffer_pool: BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE),
-            pools_prewarmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            buffer_pool,
+            pools_prewarmed: AtomicBool::new(false),
         })
+    }
+
+    /// Create a request router for multiplexing mode
+    pub fn create_router(&self) -> router::RequestRouter {
+        use types::BackendId;
+        
+        let mut router = router::RequestRouter::new();
+        
+        for (idx, provider) in self.connection_providers.iter().enumerate() {
+            let backend_id = BackendId::from_index(idx);
+            let server = &self.servers[idx];
+            router.add_backend(
+                backend_id,
+                server.name.clone(),
+                provider.clone(),
+                server.username.clone(),
+                server.password.clone(),
+            );
+        }
+        
+        router
     }
 
     /// Prewarm all connection pools by forcing pool to create max_connections
@@ -355,6 +382,55 @@ impl NntpProxy {
         Ok(())
     }
 
+    /// Handle client connection using multiplexing mode
+    /// 
+    /// This creates a session with the router, allowing commands from this client
+    /// to be routed to different backends based on load balancing.
+    pub async fn handle_client_multiplexed(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        router: Arc<router::RequestRouter>,
+    ) -> Result<()> {
+        debug!("New multiplexed client connection from {}", client_addr);
+
+        // Enable TCP_NODELAY for low latency
+        let _ = client_stream.set_nodelay(true);
+
+        // Prewarm pools on first connection
+        if let Err(e) = self.prewarm_all_pools().await {
+            warn!("Failed to prewarm connection pools: {}", e);
+        }
+
+        // Create session with router for multiplexing
+        let session = ClientSession::new_with_router(
+            client_addr,
+            self.buffer_pool.clone(),
+            router,
+        );
+
+        info!(
+            "Client {} (ID: {}) connected in multiplexing mode",
+            client_addr, session.client_id()
+        );
+
+        // Handle the session with true per-command multiplexing
+        match session.handle_multiplexed(client_stream).await {
+            Ok((client_to_backend, backend_to_client)) => {
+                info!(
+                    "Multiplexed session closed for client {} (ID: {}): {} bytes sent, {} bytes received",
+                    client_addr, session.client_id(), client_to_backend, backend_to_client
+                );
+            }
+            Err(e) => {
+                warn!("Multiplexed session error for client {} (ID: {}): {}", client_addr, session.client_id(), e);
+            }
+        }
+
+        debug!("Multiplexed connection closed for client {} (ID: {})", client_addr, session.client_id());
+        Ok(())
+    }
+
     /// Forward the backend server's greeting to the client
     async fn forward_backend_greeting(
         &self,
@@ -423,6 +499,7 @@ mod tests {
                     max_connections: 12,
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -431,7 +508,7 @@ mod tests {
     #[test]
     fn test_proxy_creation_with_servers() {
         let config = create_test_config();
-        let proxy = NntpProxy::new(config).expect("Failed to create proxy");
+        let proxy = Arc::new(NntpProxy::new(config).expect("Failed to create proxy"));
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.servers()[0].name, "Test Server 1");
@@ -439,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_proxy_creation_with_empty_servers() {
-        let config = Config { servers: vec![] };
+        let config = Config { servers: vec![], ..Default::default() };
         let result = NntpProxy::new(config);
 
         assert!(result.is_err());
@@ -454,7 +531,7 @@ mod tests {
     #[test]
     fn test_round_robin_server_selection() {
         let config = create_test_config();
-        let proxy = NntpProxy::new(config).expect("Failed to create proxy");
+        let proxy = Arc::new(NntpProxy::new(config).expect("Failed to create proxy"));
 
         proxy.reset_index();
 
@@ -479,9 +556,10 @@ mod tests {
                 password: None,
                 max_connections: 3,
             }],
+            ..Default::default()
         };
 
-        let proxy = NntpProxy::new(config).expect("Failed to create proxy");
+        let proxy = Arc::new(NntpProxy::new(config).expect("Failed to create proxy"));
         proxy.reset_index();
 
         // All requests should go to the same server

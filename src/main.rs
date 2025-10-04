@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
@@ -45,6 +46,10 @@ struct Args {
     /// Port to listen on
     #[arg(short, long, default_value = "8119")]
     port: u16,
+
+    /// Enable multiplexing mode (experimental)
+    #[arg(long, default_value = "false")]
+    multiplex: bool,
 
     /// Configuration file path
     #[arg(short, long, default_value = "config.toml")]
@@ -123,13 +128,27 @@ async fn run_proxy(args: Args) -> Result<()> {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
 
-    // Create proxy
-    let proxy = NntpProxy::new(config)?;
+    // Create proxy (wrapped in Arc for sharing across tasks)
+    let proxy = Arc::new(NntpProxy::new(config)?);
+
+    // Optionally create request router for multiplexing mode
+    let router = if args.multiplex {
+        let router = std::sync::Arc::new(proxy.create_router());
+        info!("Request router initialized with {} backends", proxy.servers().len());
+        Some(router)
+    } else {
+        None
+    };
 
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&listen_addr).await?;
-    info!("NNTP proxy listening on {}", listen_addr);
+    if args.multiplex {
+        info!("NNTP proxy listening on {} (multiplexing mode - EXPERIMENTAL)", listen_addr);
+        warn!("Multiplexing mode is experimental and not fully functional yet");
+    } else {
+        info!("NNTP proxy listening on {} (1:1 mode)", listen_addr);
+    }
 
     // Set up graceful shutdown
     let proxy_for_shutdown = proxy.clone();
@@ -145,11 +164,21 @@ async fn run_proxy(args: Args) -> Result<()> {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                        error!("Error handling client {}: {}", addr, e);
-                    }
-                });
+                if let Some(router_clone) = router.clone() {
+                    // Multiplexing mode (experimental)
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_clone.handle_client_multiplexed(stream, addr, router_clone).await {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
+                } else {
+                    // Traditional 1:1 mode
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_clone.handle_client(stream, addr).await {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
+                }
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);

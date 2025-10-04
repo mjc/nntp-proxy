@@ -79,6 +79,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
                 max_connections: 10,
             },
         ],
+        ..Default::default()
     };
 
     let proxy = NntpProxy::new(config)?;
@@ -198,6 +199,7 @@ async fn test_round_robin_distribution() -> Result<()> {
                 max_connections: 10,
             },
         ],
+        ..Default::default()
     };
 
     let proxy = NntpProxy::new(config)?;
@@ -301,6 +303,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
             password: None,
             max_connections: 10,
         }],
+        ..Default::default()
     };
 
     let proxy = NntpProxy::new(config)?;
@@ -351,11 +354,15 @@ async fn test_multiplexing_router_integration() -> Result<()> {
             9999 + i,
             format!("backend-{}", i),
             5,
+            None,
+            None,
         );
         router.add_backend(
             BackendId::from_index(i as usize),
             format!("backend-{}", i),
             provider,
+            None,
+            None,
         );
     }
 
@@ -494,11 +501,15 @@ async fn test_client_session_with_router() -> Result<()> {
             9999 + i,
             format!("backend-{}", i),
             3,
+            None,
+            None,
         );
         router.add_backend(
             BackendId::from_index(i as usize),
             format!("backend-{}", i),
             provider,
+            None,
+            None,
         );
     }
 
@@ -565,11 +576,15 @@ async fn test_concurrent_clients_routing() -> Result<()> {
             9999 + i,
             format!("backend-{}", i),
             10,
+            None,
+            None,
         );
         router.add_backend(
             BackendId::from_index(i as usize),
             format!("backend-{}", i),
             provider,
+            None,
+            None,
         );
     }
     let router = Arc::new(router);

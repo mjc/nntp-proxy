@@ -11,11 +11,54 @@ fn default_max_connections() -> u32 {
     10
 }
 
+/// Default health check interval in seconds
+fn default_health_check_interval() -> u64 {
+    30
+}
+
+/// Default health check timeout in seconds
+fn default_health_check_timeout() -> u64 {
+    5
+}
+
+/// Default unhealthy threshold
+fn default_unhealthy_threshold() -> u32 {
+    3
+}
+
 /// Main proxy configuration
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct Config {
     /// List of backend NNTP servers
+    #[serde(default)]
     pub servers: Vec<ServerConfig>,
+    /// Health check configuration
+    #[serde(default)]
+    pub health_check: HealthCheckConfig,
+}
+
+/// Health check configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HealthCheckConfig {
+    /// Interval between health checks in seconds
+    #[serde(default = "default_health_check_interval")]
+    pub interval_secs: u64,
+    /// Timeout for each health check in seconds
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout_secs: u64,
+    /// Number of consecutive failures before marking unhealthy
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_health_check_interval(),
+            timeout_secs: default_health_check_timeout(),
+            unhealthy_threshold: default_unhealthy_threshold(),
+        }
+    }
 }
 
 /// Configuration for a single backend server
@@ -55,6 +98,7 @@ pub fn create_default_config() -> Config {
             password: None,
             max_connections: default_max_connections(),
         }],
+        ..Default::default()
     }
 }
 
@@ -84,6 +128,7 @@ mod tests {
                     max_connections: 8,
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -193,6 +238,7 @@ mod tests {
                 password: Some("password123".to_string()),
                 max_connections: 10,
             }],
+            ..Default::default()
         };
 
         // Serialize and deserialize
@@ -241,6 +287,7 @@ max_connections = 5
                 password: None,
                 max_connections: 5,
             }],
+            ..Default::default()
         };
         let toml1 = toml::to_string(&config1)?;
         let parsed1: Config = toml::from_str(&toml1)?;
@@ -256,6 +303,7 @@ max_connections = 5
                 password: None,
                 max_connections: 5,
             }],
+            ..Default::default()
         };
         let toml2 = toml::to_string(&config2)?;
         let parsed2: Config = toml::from_str(&toml2)?;
@@ -293,6 +341,7 @@ max_connections = 5
                     max_connections: 15,
                 },
             ],
+            ..Default::default()
         };
 
         let toml_string = toml::to_string_pretty(&config)?;
@@ -333,6 +382,7 @@ max_connections = 5
                 password: Some("p@ssw0rd!#$%".to_string()),
                 max_connections: 5,
             }],
+            ..Default::default()
         };
 
         let toml_string = toml::to_string_pretty(&config)?;
@@ -360,6 +410,7 @@ max_connections = 5
                 password: None,
                 max_connections: 1,
             }],
+            ..Default::default()
         };
         let toml1 = toml::to_string(&config1)?;
         let parsed1: Config = toml::from_str(&toml1)?;
@@ -375,6 +426,7 @@ max_connections = 5
                 password: None,
                 max_connections: 1000,
             }],
+            ..Default::default()
         };
         let toml2 = toml::to_string(&config2)?;
         let parsed2: Config = toml::from_str(&toml2)?;
@@ -412,6 +464,7 @@ max_connections = 5
                     max_connections: 5,
                 },
             ],
+            ..Default::default()
         };
 
         let toml_string = toml::to_string_pretty(&config)?;
@@ -435,6 +488,7 @@ max_connections = 5
                 password: None,
                 max_connections: 5,
             }],
+            ..Default::default()
         };
 
         let toml_string = toml::to_string_pretty(&config)?;

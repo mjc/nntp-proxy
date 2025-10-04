@@ -13,6 +13,7 @@ pub struct NntpResponse {
 
 impl NntpResponse {
     /// Parse a status code from response data
+    #[inline]
     pub fn parse_status_code(data: &[u8]) -> Option<u16> {
         if data.len() < 3 {
             return None;
@@ -23,6 +24,7 @@ impl NntpResponse {
     }
 
     /// Check if a response indicates a multiline response
+    #[inline]
     #[allow(dead_code)]
     pub fn is_multiline_response(status_code: u16) -> bool {
         // Multiline responses in NNTP typically have codes like:
@@ -37,6 +39,7 @@ impl NntpResponse {
     }
 
     /// Check if data contains the end-of-multiline marker
+    #[inline]
     #[allow(dead_code)]
     pub fn has_multiline_terminator(data: &[u8]) -> bool {
         // NNTP multiline responses end with "\r\n.\r\n"
