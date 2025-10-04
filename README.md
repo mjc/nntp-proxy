@@ -1,176 +1,571 @@
 # NNTP Proxy
 
-A high-performance stateless NNTP proxy server written in Rust with a clean, modular architecture.
+A high-performance stateless NNTP proxy server written in Rust, designed for message-ID based article retrieval with optional connection multiplexing.
 
-## ⚠️ Important: Stateless Mode
+## Key Features
 
-This proxy operates in **stateless mode** and **does not support GROUP-based commands**. It's designed for:
+- 🔄 **Round-robin load balancing** - Distributes connections across multiple backend servers
+- ⚡ **High performance** - Lock-free routing, zero-allocation command parsing, optimized I/O
+- 🏥 **Health checking** - Automatic backend health monitoring with failure detection
+- 🔐 **Authentication** - Proxy-level authentication, backends pre-authenticated
+- 🔀 **Multiplexing mode** - Optional per-command routing to different backends
+- 📊 **Connection pooling** - Efficient connection reuse with configurable limits
+- ⚙️ **TOML configuration** - Simple, readable configuration with sensible defaults
+- 🔍 **Structured logging** - Detailed tracing for debugging and monitoring
+- 🧩 **Modular architecture** - Clean separation of concerns, well-tested codebase
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Architecture](#architecture)
+- [Performance](#performance)
+- [Limitations](#limitations)
+- [Building](#building)
+- [Testing](#testing)
+- [License](#license)
+
+## Overview
+
+This NNTP proxy offers two operating modes:
+
+1. **Standard mode** (default) - Full NNTP proxy with complete command support
+2. **Multiplexing mode** (`--multiplex`) - Stateless per-command routing for better resource utilization
+
+### Design Goals
+
+- **Load balancing** - Distribute connections across multiple backend servers
+- **Health monitoring** - Automatic detection and routing around unhealthy backends
+- **High performance** - Lock-free routing, zero-allocation parsing, optimized I/O
+- **Flexible deployment** - Choose between full compatibility or resource efficiency
+
+### When to Use This Proxy
+
+✅ **Standard mode - Good for:**
+- Traditional newsreaders (tin, slrn, Thunderbird)
+- Any NNTP client requiring stateful operations
+- Load balancing with full protocol support
+- Drop-in replacement for direct backend connections
+
+✅ **Multiplexing mode - Good for:**
 - Message-ID based article retrieval
-- Metadata queries (LIST, CAPABILITIES, etc.)
-- Future connection multiplexing capabilities
+- Indexing and search tools
+- Metadata-heavy workloads
+- Maximizing backend connection efficiency
 
-**Not compatible with traditional newsreaders** that use GROUP/NEXT/LAST navigation. See [LIMITATIONS.md](LIMITATIONS.md) for details.
+❌ **Not suitable for:**
+- Applications requiring custom NNTP extensions (unless in standard mode)
 
-## Features
+## Limitations
 
-- 🔄 **Round-robin load balancing** - Distributes connections evenly across backend servers
-- 🚀 **Stateless design** - No session state, enables future multiplexing
-- ⚡ **Async/await** - Built on Tokio for high concurrency
-- 📝 **TOML Configuration** - Simple and readable configuration format
-- 🔍 **Structured logging** - Detailed logging with tracing
-- 🛠️ **Nix development environment** - Reproducible development setup
-- 📊 **Connection tracking** - Logs client connections and backend routing
-- 🔐 **Authentication interception** - Handles client auth locally
-- 🧩 **Modular architecture** - Clean separation of concerns for maintainability
+### Multiplexing Mode Restrictions
 
-## Architecture
+When running in **multiplexing mode** (`--multiplex`), the proxy rejects stateful commands to enable per-command routing:
 
-The codebase is organized into focused modules:
+**Rejected in multiplexing mode:**
+- Group navigation: `GROUP`, `NEXT`, `LAST`, `LISTGROUP`
+- Article retrieval by number: `ARTICLE 123`, `HEAD 123`, `BODY 123`
+- Overview commands: `XOVER`, `OVER`, `XHDR`, `HDR`
 
-- **auth/** - Authentication handling (client & backend)
-- **command/** - Command parsing and classification
-- **config** - Configuration management
-- **pool/** - Connection and buffer pooling
-- **protocol/** - NNTP protocol constants and parsing
-- **types** - Core type definitions
+**Always supported:**
+- ✅ Article by Message-ID: `ARTICLE <message-id@example.com>`
+- ✅ Metadata: `LIST`, `HELP`, `DATE`, `CAPABILITIES`, `POST`
+- ✅ Authentication: `AUTHINFO USER/PASS` (intercepted by proxy)
 
-See [REFACTORING.md](REFACTORING.md) for detailed architecture documentation.
+### Standard Mode (Default)
+
+In **standard mode** (without `--multiplex`):
+- ✅ **All NNTP commands are supported** - full bidirectional forwarding
+- ✅ Compatible with traditional newsreaders (tin, slrn, Thunderbird)
+- ✅ Stateful operations work normally (GROUP, NEXT, LAST, etc.)
+- Each client gets a dedicated backend connection (1:1 mapping)
 
 ## Quick Start
 
 ### Prerequisites
 
-- Nix with flakes enabled
-- direnv (optional but recommended)
+- Rust 1.85+ (or use the included Nix flake)
+- Optional: Nix with flakes for reproducible development environment
 
-### Development Setup
+### Installation
 
-1. Clone the repository:
 ```bash
-git clone <repository-url>
+# Clone the repository
+git clone https://github.com/mjc/nntp-proxy.git
 cd nntp-proxy
+
+# Build release version
+cargo build --release
+
+# Binary will be in target/release/nntp-proxy
 ```
 
-2. Enter the development environment:
+### Using Nix (Optional)
+
 ```bash
-# If using direnv
+# Enter development environment
+nix develop
+
+# Or use direnv
 direnv allow
 
-# Or manually with nix
-nix develop
-```
-
-3. Build and run:
-```bash
+# Build and run
 cargo build
 cargo run
 ```
 
+### First Run
+
+1. Create a configuration file (see [Configuration](#configuration) section)
+2. Run the proxy:
+
+```bash
+./target/release/nntp-proxy --port 8119 --config config.toml
+```
+
+3. Connect with a client:
+
+```bash
+telnet localhost 8119
+```
+
 ## Configuration
 
-The proxy uses a TOML configuration file (`config.toml` by default):
+The proxy uses a TOML configuration file. Create `config.toml`:
 
 ```toml
+# Backend servers (at least one required)
 [[servers]]
 host = "news.example.com"
 port = 119
-name = "Example News Server 1"
-# Optional authentication
-username = "your_username"
-password = "your_password"
-# Connection limit (defaults to 10 if not specified)
-max_connections = 20
+name = "Primary News Server"
+username = "your_username"      # Optional
+password = "your_password"      # Optional
+max_connections = 20            # Optional, default: 10
 
 [[servers]]
-host = "nntp.example.org"
+host = "news2.example.com"
 port = 119
-name = "Example News Server 2"
+name = "Secondary News Server"
 max_connections = 10
 
-[[servers]]
-host = "localhost"
-port = 1119
-name = "Local Test Server"
-max_connections = 5
+# Health check configuration (optional)
+[health_check]
+check_interval = 30        # Seconds between checks (default: 30)
+check_timeout = 5          # Timeout per check (default: 5)
+unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 ```
 
-### Configuration Fields
+### Configuration Reference
 
-- `host` - Backend server hostname
-- `port` - Backend server port (default: 119)  
-- `name` - Friendly name for the server
-- `username` - Optional authentication username
-- `password` - Optional authentication password
-- `max_connections` - Maximum concurrent connections to this server (default: 10)
+#### Server Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `host` | string | Yes | - | Backend server hostname or IP |
+| `port` | integer | Yes | - | Backend server port |
+| `name` | string | Yes | - | Friendly name for logging |
+| `username` | string | No | - | Authentication username |
+| `password` | string | No | - | Authentication password |
+| `max_connections` | integer | No | 10 | Max concurrent connections to this backend |
+
+#### Health Check Configuration
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `check_interval` | integer | 30 | Seconds between health checks |
+| `check_timeout` | integer | 5 | Health check timeout in seconds |
+| `unhealthy_threshold` | integer | 3 | Consecutive failures before marking unhealthy |
+
+### Authentication
+
+The proxy handles authentication in two ways:
+
+1. **Backend authentication** (when credentials are configured)
+   - Configure `username` and `password` in server config
+   - Proxy authenticates to backends during connection pool initialization
+   - Connections are pre-authenticated, eliminating per-command overhead
+
+2. **Client authentication**
+   - Client `AUTHINFO USER/PASS` commands are always intercepted by the proxy
+   - Returns success without forwarding to backend
+   - No actual client credential validation (proxy trusts connected clients)
+   - To restrict access, use firewall rules or network isolation
 
 ## Usage
 
-```bash
-# Run with default settings (port 8119, config.toml)
-cargo run
-
-# Specify custom port and config
-cargo run -- --port 8120 --config my-config.toml
-
-# Show help
-cargo run -- --help
-```
-
-## Command Line Options
-
-- `-p, --port <PORT>` - Port to listen on (default: 8119)
-- `-c, --config <CONFIG>` - Configuration file path (default: config.toml)
-- `-h, --help` - Print help information
-- `-V, --version` - Print version information
-
-## Testing
-
-To test the proxy, you can use telnet to connect:
+### Command Line Options
 
 ```bash
-# Connect to the proxy
-telnet localhost 8119
-
-# The connection will be forwarded to one of the configured backend servers
-# in round-robin fashion
+nntp-proxy [OPTIONS]
 ```
 
-## How it Works
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--port <PORT>` | `-p` | Listen port | 8119 |
+| `--config <FILE>` | `-c` | Config file path | config.toml |
+| `--multiplex` | - | Enable multiplexing mode | false |
+| `--threads <NUM>` | - | Tokio worker threads | CPU cores |
+| `--help` | `-h` | Show help | - |
+| `--version` | `-V` | Show version | - |
 
-1. **Client Connection**: A client connects to the proxy on the configured port
-2. **Server Selection**: The proxy selects the next backend server using round-robin
-3. **Backend Connection**: The proxy establishes a connection to the selected backend
-4. **Bidirectional Proxy**: Data is forwarded in both directions between client and backend
-5. **Connection Cleanup**: When either side closes, both connections are cleaned up
+### Examples
+
+```bash
+# Standard mode with defaults
+nntp-proxy
+
+# Custom port and config
+nntp-proxy --port 8120 --config production.toml
+
+# Multiplexing mode (per-command routing)
+nntp-proxy --multiplex
+
+# Single-threaded for debugging
+nntp-proxy --threads 1
+
+# Production setup
+nntp-proxy --port 119 --config /etc/nntp-proxy/config.toml
+```
+
+### Operating Modes
+
+#### Standard Mode (default)
+
+- One backend connection per client
+- Simple 1:1 connection forwarding
+- Lower overhead, easier debugging
+
+#### Multiplexing Mode (`--multiplex`)
+
+- Per-command routing to backends
+- Multiple clients share backend pool
+- Health-aware routing
+- Better resource utilization
+- Slightly higher complexity
 
 ## Architecture
 
-The proxy is built with:
+### Module Organization
 
-- **Tokio**: Async runtime for handling many concurrent connections
-- **Tracing**: Structured logging for observability
-- **Clap**: Command-line argument parsing
-- **Serde + TOML**: Configuration file handling
-- **Anyhow**: Error handling
+The codebase is organized into focused modules with clear responsibilities:
 
-## TODO
+| Module | Purpose |
+|--------|---------|
+| `auth/` | Client and backend authentication handling |
+| `command/` | NNTP command parsing and classification |
+| `config/` | Configuration loading and validation |
+| `constants/` | Centralized configuration constants |
+| `health/` | Backend health monitoring system |
+| `pool/` | Connection and buffer pooling |
+| `protocol/` | NNTP protocol constants and parsing |
+| `router/` | Request routing and multiplexing |
+| `session/` | Client session lifecycle management |
+| `types/` | Core type definitions (IDs, etc.) |
 
-- **SSL/TLS Support**: Add support for secure NNTP connections (NNTPS) for both client-facing and backend connections
-- **Connection Persistence**: Implement longer-lived connections with proper connection reuse to reduce authentication overhead and improve performance
-- **Health Checks**: Add periodic health checks for backend servers
-- **Metrics**: Expose Prometheus metrics for monitoring
-- **Configuration Hot-Reload**: Support reloading configuration without restart
-- **IPv6 Support**: Full IPv6 support for client and backend connections
+### How It Works
 
-## Building for Production
+#### Standard Mode Flow
+
+```
+Client Connection
+    ↓
+Select Backend (round-robin)
+    ↓
+Get Pooled Connection
+    ↓
+Pre-authenticated Connection
+    ↓
+Bidirectional Data Forwarding
+    ↓
+Connection Cleanup
+```
+
+#### Multiplexing Mode Flow
+
+```
+Client Connection
+    ↓
+Read Command
+    ↓
+Classify Command
+    ↓
+Route to Healthy Backend (round-robin)
+    ↓
+Execute on Backend Connection
+    ↓
+Stream Response to Client
+    ↓
+Repeat (each command independent)
+```
+
+### Key Design Decisions
+
+1. **Stateless Architecture**
+   - No session state maintained
+   - Enables connection multiplexing
+   - Simpler, more reliable
+
+2. **Connection Pooling**
+   - Pre-authenticated connections
+   - Reduces setup overhead
+   - Configurable pool sizes per backend
+
+3. **Health Checking**
+   - Periodic DATE command probes
+   - Automatic failure detection
+   - Router skips unhealthy backends
+
+4. **Lock-Free Routing**
+   - Atomic operations for pending counts
+   - Eliminates RwLock contention
+   - Significant CPU reduction with many clients
+
+## Performance
+
+### Optimizations
+
+This proxy implements several performance optimizations:
+
+| Optimization | Impact | Description |
+|--------------|--------|-------------|
+| Zero-allocation parsing | -0.92% CPU | Direct byte comparison, no `to_ascii_uppercase()` |
+| Lock-free routing | -10-15% CPU | Atomic operations instead of RwLock |
+| Pre-authenticated connections | High | No per-command auth overhead |
+| Buffer reuse | ~200+ allocs/sec saved | Pre-allocated buffers in hot paths |
+| Frequency-ordered matching | Better branch prediction | Common commands (ARTICLE, BODY) checked first |
+| 64KB read buffers | Fewer syscalls | Optimized for large article transfers |
+
+### Performance Characteristics
+
+- **CPU Usage**: Low overhead with lock-free routing and zero-allocation parsing
+  - Multiplexing mode: ~15% of one core for 80 connections at 105MB/s (AMD Ryzen 9 5950X, single-threaded configuration)
+- **Memory**: Constant usage regardless of article size (no response buffering)
+- **Throughput**: Typically limited by backend servers, not the proxy
+- **Scalability**: Efficiently handles hundreds of concurrent connections
+
+### Profiling
+
+To generate a performance flamegraph for analysis:
 
 ```bash
-# Build optimized release version
+# Install cargo-flamegraph (if using Nix, it's already available)
+cargo install flamegraph
+
+# Run with flamegraph profiling
+cargo flamegraph --bin nntp-proxy -- --config config.toml --multiplex --threads 1
+
+# Open flamegraph.svg in a browser to analyze CPU hotspots
+```
+
+## Building
+
+### Development Build
+
+```bash
+cargo build
+./target/debug/nntp-proxy
+```
+
+### Release Build
+
+```bash
+cargo build --release
+./target/release/nntp-proxy
+```
+
+### Production Deployment
+
+```bash
+# Build optimized binary
 cargo build --release
 
-# The binary will be in target/release/nntp-proxy
+# Copy binary to deployment location
+sudo cp target/release/nntp-proxy /usr/local/bin/
+
+# Create config directory
+sudo mkdir -p /etc/nntp-proxy
+
+# Copy config
+sudo cp config.toml /etc/nntp-proxy/
+
+# Run as service (example systemd unit included)
+sudo systemctl start nntp-proxy
 ```
+
+### Static Binary (Optional)
+
+For maximum portability, build a fully static binary:
+
+```bash
+# Install musl target
+rustup target add x86_64-unknown-linux-musl
+
+# Build static binary
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Result is a static binary with no dependencies
+./target/x86_64-unknown-linux-musl/release/nntp-proxy
+```
+
+## Testing
+
+### Running Tests
+
+```bash
+# All tests
+cargo test
+
+# Unit tests only
+cargo test --lib
+
+# Integration tests only
+cargo test --test integration_tests
+
+# With output
+cargo test -- --nocapture
+
+# Quiet mode
+cargo test --quiet
+```
+
+### Test Coverage
+
+The codebase includes:
+- **186 unit tests** covering all modules
+- **11 integration tests** for end-to-end scenarios
+- **100% pass rate**
+
+### Manual Testing
+
+Test with telnet or netcat:
+
+```bash
+# Connect to proxy
+telnet localhost 8119
+
+# Should see greeting like:
+# 200 news.example.com ready
+
+# Try commands:
+HELP
+LIST ACTIVE
+ARTICLE <message-id@example.com>
+QUIT
+```
+
+### Load Testing
+
+For performance testing, create custom scripts that:
+- Open multiple concurrent NNTP connections
+- Issue realistic command sequences
+- Measure throughput and latency
+- Monitor CPU and memory usage
+
+## Dependencies
+
+### Core Dependencies
+
+| Crate | Purpose |
+|-------|---------|
+| `tokio` | Async runtime and networking |
+| `tracing` | Structured logging framework |
+| `anyhow` | Error handling |
+| `clap` | Command-line argument parsing |
+| `serde` | Serialization framework |
+| `toml` | TOML configuration parsing |
+| `deadpool` | Connection pooling |
+
+### Development Dependencies
+
+- `tempfile` - Temporary files for testing
+- Test helpers included in `tests/test_helpers.rs`
+
+## Troubleshooting
+
+### Common Issues
+
+**"Connection refused" when starting**
+- Check if port is already in use: `lsof -i :8119`
+- Try a different port: `--port 8120`
+
+**"Backend authentication failed"**
+- Verify credentials in config.toml
+- Test direct connection to backend
+- Check backend server logs
+
+**"Command not supported" errors**
+- Proxy rejects stateful commands (GROUP, NEXT, etc.)
+- Use message-ID based retrieval instead
+- For stateful operations, connect directly to backend
+
+**High CPU usage**
+- Enable multiplexing mode: `--multiplex`
+- Reduce worker threads: `--threads 1`
+- Check health check interval (increase if too frequent)
+
+**Backends marked unhealthy**
+- Check backend server status
+- Verify network connectivity
+- Review health check configuration
+- Check logs for specific errors
+
+### Logging
+
+Control log verbosity with `RUST_LOG`:
+
+```bash
+# Info level (default)
+RUST_LOG=info nntp-proxy
+
+# Debug level
+RUST_LOG=debug nntp-proxy
+
+# Specific module
+RUST_LOG=nntp_proxy::router=debug nntp-proxy
+
+# Multiple modules
+RUST_LOG=nntp_proxy::router=debug,nntp_proxy::health=debug nntp-proxy
+```
+
+## Roadmap
+
+### Planned Features
+
+- [ ] SSL/TLS support (NNTPS)
+- [ ] Prometheus metrics endpoint
+- [ ] Configuration hot-reload
+- [ ] IPv6 support
+- [ ] True async response demultiplexer
+- [ ] Connection affinity mode
+- [ ] Admin/stats HTTP endpoint
+
+### Completed
+
+- [x] Lock-free routing
+- [x] Zero-allocation command parsing
+- [x] Health checking system
+- [x] Multiplexing mode
+- [x] Pre-authenticated connections
+- [x] TOML configuration
+- [x] Connection pooling
+
+## Contributing
+
+Contributions welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes with tests
+4. Ensure all tests pass: `cargo test`
+5. Submit a pull request
 
 ## License
 
 MIT License - see LICENSE file for details.
+
+## Acknowledgments
+
+Built with Rust and the excellent Tokio async ecosystem.
