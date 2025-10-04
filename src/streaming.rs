@@ -29,9 +29,12 @@ impl StreamHandler {
         // Use direct buffer allocation for high-throughput to avoid pool overhead
         let mut direct_buffer = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
 
+        // Reuse line buffer to avoid allocations
+        let mut line = String::with_capacity(512);
+
         // Continue handling commands and large data responses
         loop {
-            let mut line = String::new();
+            line.clear();
 
             tokio::select! {
                 // Continue reading client commands
