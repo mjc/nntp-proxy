@@ -33,10 +33,6 @@ struct BackendInfo {
     provider: DeadpoolConnectionProvider,
     /// Number of pending requests on this backend (for load balancing)
     pending_count: Arc<AtomicUsize>,
-    /// Optional username for authentication
-    username: Option<String>,
-    /// Optional password for authentication
-    password: Option<String>,
 }
 
 /// Routes requests to backend servers and manages multiplexing
@@ -48,6 +44,12 @@ pub struct RequestRouter {
     backends: Vec<BackendInfo>,
     /// Current backend index for round-robin selection
     current_backend: AtomicUsize,
+}
+
+impl Default for RequestRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[allow(dead_code)]
@@ -67,8 +69,6 @@ impl RequestRouter {
         backend_id: BackendId,
         name: String,
         provider: DeadpoolConnectionProvider,
-        username: Option<String>,
-        password: Option<String>,
     ) {
         info!("Added backend {:?} ({})", backend_id, name);
         self.backends.push(BackendInfo {
@@ -76,8 +76,6 @@ impl RequestRouter {
             name,
             provider,
             pending_count: Arc::new(AtomicUsize::new(0)),
-            username,
-            password,
         });
     }
 
@@ -212,14 +210,6 @@ impl RequestRouter {
             .find(|b| b.id == backend_id)
             .map(|b| b.pending_count.load(Ordering::Relaxed))
     }
-
-    /// Get backend credentials for authentication
-    pub fn get_backend_credentials(&self, backend_id: BackendId) -> Option<(Option<String>, Option<String>)> {
-        self.backends
-            .iter()
-            .find(|b| b.id == backend_id)
-            .map(|b| (b.username.clone(), b.password.clone()))
-    }
 }
 
 #[cfg(test)]
@@ -250,7 +240,7 @@ mod tests {
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
 
-        router.add_backend(backend_id, "test-backend".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test-backend".to_string(), provider);
 
         assert_eq!(router.backend_count(), 1);
     }
@@ -262,7 +252,7 @@ mod tests {
         for i in 0..3 {
             let backend_id = BackendId::from_index(i);
             let provider = create_test_provider();
-            router.add_backend(backend_id, format!("backend-{}", i), provider, None, None);
+            router.add_backend(backend_id, format!("backend-{}", i), provider);
         }
 
         assert_eq!(router.backend_count(), 3);
@@ -273,7 +263,7 @@ mod tests {
         let mut router = RequestRouter::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
-        router.add_backend(backend_id, "test".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test".to_string(), provider);
 
         let client_id = ClientId::new();
         let (request_id, selected_backend) =
@@ -291,7 +281,7 @@ mod tests {
         let mut router = RequestRouter::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
-        router.add_backend(backend_id, "test".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test".to_string(), provider);
 
         let client_id = ClientId::new();
         let (request_id, backend) = router.route_command(client_id, "HELP\r\n").await.unwrap();
@@ -310,7 +300,7 @@ mod tests {
         for i in 0..3 {
             let backend_id = BackendId::from_index(i);
             let provider = create_test_provider();
-            router.add_backend(backend_id, format!("backend-{}", i), provider, None, None);
+            router.add_backend(backend_id, format!("backend-{}", i), provider);
         }
 
         let client_id = ClientId::new();
@@ -331,7 +321,7 @@ mod tests {
         let mut router = RequestRouter::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
-        router.add_backend(backend_id, "test".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test".to_string(), provider);
 
         let client1 = ClientId::new();
         let client2 = ClientId::new();
@@ -369,7 +359,7 @@ mod tests {
         for i in 0..2 {
             let backend_id = BackendId::from_index(i);
             let provider = create_test_provider();
-            router.add_backend(backend_id, format!("backend-{}", i), provider, None, None);
+            router.add_backend(backend_id, format!("backend-{}", i), provider);
         }
 
         let router = Arc::new(router);
@@ -403,7 +393,7 @@ mod tests {
         let mut router = RequestRouter::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
-        router.add_backend(backend_id, "test".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test".to_string(), provider);
 
         let router = Arc::new(router);
 
@@ -444,7 +434,7 @@ mod tests {
         for i in 0..4 {
             let backend_id = BackendId::from_index(i);
             let provider = create_test_provider();
-            router.add_backend(backend_id, format!("backend-{}", i), provider, None, None);
+            router.add_backend(backend_id, format!("backend-{}", i), provider);
         }
 
         let client_id = ClientId::new();
@@ -472,7 +462,7 @@ mod tests {
         let mut router = RequestRouter::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
-        router.add_backend(backend_id, "test".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test".to_string(), provider);
 
         // Should be able to get provider
         let retrieved = router.get_backend_provider(backend_id);
@@ -499,7 +489,7 @@ mod tests {
         for i in 0..3 {
             let backend_id = BackendId::from_index(i);
             let provider = create_test_provider();
-            router.add_backend(backend_id, format!("backend-{}", i), provider, None, None);
+            router.add_backend(backend_id, format!("backend-{}", i), provider);
         }
 
         let router = Arc::new(router);
@@ -524,7 +514,7 @@ mod tests {
         let mut router = RequestRouter::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
-        router.add_backend(backend_id, "test".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test".to_string(), provider);
 
         let client1 = ClientId::new();
         let client2 = ClientId::new();
@@ -553,7 +543,7 @@ mod tests {
         for i in 0..5 {
             let backend_id = BackendId::from_index(i);
             let provider = create_test_provider();
-            router.add_backend(backend_id, format!("backend-{}", i), provider, None, None);
+            router.add_backend(backend_id, format!("backend-{}", i), provider);
         }
 
         assert_eq!(router.backend_count(), 5);
@@ -564,7 +554,7 @@ mod tests {
         let mut router = RequestRouter::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
-        router.add_backend(backend_id, "test".to_string(), provider, None, None);
+        router.add_backend(backend_id, "test".to_string(), provider);
 
         let client_id = ClientId::new();
 
@@ -594,12 +584,12 @@ mod tests {
         for i in 0..3 {
             let backend_id = BackendId::from_index(i);
             let provider = create_test_provider();
-            router.add_backend(backend_id, format!("backend-{}", i), provider, None, None);
+            router.add_backend(backend_id, format!("backend-{}", i), provider);
         }
 
         // Single client requests 10 articles
         let client_id = ClientId::new();
-        let mut backend_distribution = vec![0, 0, 0];
+        let mut backend_distribution = [0, 0, 0];
 
         for i in 0..10 {
             let (_, backend_id) = router

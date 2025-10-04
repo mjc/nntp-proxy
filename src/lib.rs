@@ -125,8 +125,6 @@ impl NntpProxy {
                 backend_id,
                 server.name.clone(),
                 provider.clone(),
-                server.username.clone(),
-                server.password.clone(),
             );
         }
         

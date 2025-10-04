@@ -63,11 +63,12 @@ mod tests {
     #[test]
     fn test_buffer_size_is_reasonable() {
         // Buffer sizes should be large but not excessive
-        assert!(HIGH_THROUGHPUT_RECV_BUFFER >= 1024 * 1024); // At least 1MB
-        assert!(HIGH_THROUGHPUT_RECV_BUFFER <= 128 * 1024 * 1024); // At most 128MB
+        // Compile-time assertions
+        const _: () = assert!(HIGH_THROUGHPUT_RECV_BUFFER >= 1024 * 1024); // At least 1MB
+        const _: () = assert!(HIGH_THROUGHPUT_RECV_BUFFER <= 128 * 1024 * 1024); // At most 128MB
 
-        assert!(HIGH_THROUGHPUT_SEND_BUFFER >= 1024 * 1024);
-        assert!(HIGH_THROUGHPUT_SEND_BUFFER <= 128 * 1024 * 1024);
+        const _: () = assert!(HIGH_THROUGHPUT_SEND_BUFFER >= 1024 * 1024);
+        const _: () = assert!(HIGH_THROUGHPUT_SEND_BUFFER <= 128 * 1024 * 1024);
     }
 
     #[test]

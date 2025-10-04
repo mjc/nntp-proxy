@@ -9,19 +9,20 @@ use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
-fn pin_to_cpu_cores() -> Result<()> {
+fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
     use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
 
-    // Pin to CPU cores 0-1 for optimal performance
+    // Pin to CPU cores based on number of worker threads
     // This reduces context switching and improves cache locality
     let mut cpu_set = CpuSet::new();
-    cpu_set.set(0)?; // CPU 0
-    cpu_set.set(1)?; // CPU 1
+    for core in 0..num_cores {
+        cpu_set.set(core)?;
+    }
 
     match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
         Ok(_) => {
-            info!("Successfully pinned process to CPU cores 0-1 for optimal performance");
+            info!("Successfully pinned process to {} CPU cores for optimal performance", num_cores);
         }
         Err(e) => {
             warn!(
@@ -35,7 +36,7 @@ fn pin_to_cpu_cores() -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores() -> Result<()> {
+fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
     info!("CPU pinning not available on this platform");
     Ok(())
 }
@@ -66,14 +67,14 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Pin to specific CPU cores for optimal performance
-    pin_to_cpu_cores()?;
-
     // Log threading info
     let num_cpus = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
     let worker_threads = args.threads.unwrap_or(num_cpus);
+
+    // Pin to specific CPU cores for optimal performance
+    pin_to_cpu_cores(worker_threads)?;
 
     // Use different runtime based on thread count for optimal performance
     if worker_threads == 1 {

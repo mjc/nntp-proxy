@@ -33,10 +33,15 @@ impl PendingRequest {
     }
 }
 
-/// Tracks pending requests across multiplexed connections
+/// Tracks pending requests per backend
 pub struct RequestTracker {
-    /// Map of request ID to pending request info
     pending: HashMap<RequestId, PendingRequest>,
+}
+
+impl Default for RequestTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RequestTracker {

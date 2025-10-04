@@ -60,7 +60,7 @@ impl ResponseParser {
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
         if let Some(code) = NntpResponse::parse_status_code(data) {
-            code >= 200 && code < 400
+            (200..400).contains(&code)
         } else {
             false
         }

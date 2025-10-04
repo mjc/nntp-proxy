@@ -438,7 +438,7 @@ impl ClientSession {
                             
                             // Check boundary spanning terminator (ONLY if current chunk is small enough)
                             // This is rare - only check if terminator could span from previous chunk
-                            let has_spanning_term = if tail_len >= 2 && current_n >= 1 && current_n <= 4 {
+                            let has_spanning_term = if tail_len >= 2 && (1..=4).contains(&current_n) {
                                 // Build combined view: tail + start of current chunk
                                 let mut check_buf = [0u8; 9]; // max: 4 tail + 5 current
                                 check_buf[..tail_len].copy_from_slice(&tail[..tail_len]);
@@ -653,7 +653,7 @@ mod tests {
             None,
             None,
         );
-        router.add_backend(BackendId::from_index(0), "test".to_string(), provider, None, None);
+        router.add_backend(BackendId::from_index(0), "test".to_string(), provider);
 
         let session = ClientSession::new_with_router(addr, buffer_pool, Arc::new(router));
 
@@ -685,8 +685,6 @@ mod tests {
                 BackendId::from_index(i as usize),
                 format!("backend-{}", i),
                 provider,
-                None,
-                None,
             );
         }
 

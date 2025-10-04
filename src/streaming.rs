@@ -99,8 +99,8 @@ mod tests {
     fn test_buffer_sizes() {
         // Verify we're using optimized buffer sizes
         assert_eq!(HIGH_THROUGHPUT_BUFFER_SIZE, 262144); // 256KB
-        assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 8192); // Larger than default
-        assert!(HIGH_THROUGHPUT_BUFFER_SIZE % 4096 == 0); // Page-aligned
+        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 8192); // Larger than default
+        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE % 4096 == 0); // Page-aligned
     }
 
     #[tokio::test]
@@ -145,10 +145,10 @@ mod tests {
         // Verify buffer size is optimized for typical article sizes
         // News articles are typically 1KB-100KB
         // Our 256KB buffer should handle most articles in one read
-        assert!(HIGH_THROUGHPUT_BUFFER_SIZE >= 256 * 1024);
+        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE >= 256 * 1024);
 
         // Should be significantly larger than default socket buffer (64KB)
-        assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 65536);
+        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 65536);
     }
 
     #[tokio::test]

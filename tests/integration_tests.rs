@@ -535,9 +535,9 @@ async fn test_response_demultiplexer() -> Result<()> {
     }
 
     // Verify all responses were sent
-    for i in 0..5 {
+    for &client_id in clients.iter().take(5) {
         let response = rx.recv().await.unwrap();
-        assert_eq!(response.client_id, clients[i]);
+        assert_eq!(response.client_id, client_id);
         assert!(response.complete);
         assert!(response.data.starts_with(b"200 Response"));
     }

@@ -216,13 +216,11 @@ type Pool = managed::Pool<TcpManager>;
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
     name: String,
-    username: Option<String>,
-    password: Option<String>,
 }
 
 impl DeadpoolConnectionProvider {
     pub fn new(host: String, port: u16, name: String, max_size: usize, username: Option<String>, password: Option<String>) -> Self {
-        let manager = TcpManager::new(host, port, name.clone(), username.clone(), password.clone());
+        let manager = TcpManager::new(host, port, name.clone(), username, password);
         let pool = Pool::builder(manager)
             .max_size(max_size)
             .build()
@@ -233,7 +231,7 @@ impl DeadpoolConnectionProvider {
             name, max_size
         );
 
-        Self { pool, name, username, password }
+        Self { pool, name }
     }
 
     /// Get a connection from the pool that is automatically returned when dropped

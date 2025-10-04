@@ -30,36 +30,31 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
             }
         };
 
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, _)) => {
-                    let name_clone = name.clone();
-                    tokio::spawn(async move {
-                        // Send greeting
-                        let greeting = format!("200 {} Ready\r\n", name_clone);
-                        let _ = stream.write_all(greeting.as_bytes()).await;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let name_clone = name.clone();
+            tokio::spawn(async move {
+                // Send greeting
+                let greeting = format!("200 {} Ready\r\n", name_clone);
+                let _ = stream.write_all(greeting.as_bytes()).await;
 
-                        // Echo commands until QUIT
-                        let mut buffer = [0; 1024];
-                        loop {
-                            match stream.read(&mut buffer).await {
-                                Ok(0) => break,  // Connection closed
-                                Ok(n) => {
-                                    // Check for QUIT
-                                    if buffer[..n].starts_with(b"QUIT") {
-                                        let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                                        break;
-                                    }
-                                    // Echo back a simple response
-                                    let _ = stream.write_all(b"200 OK\r\n").await;
-                                }
-                                Err(_) => break,
+                // Echo commands until QUIT
+                let mut buffer = [0; 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) => break,  // Connection closed
+                        Ok(n) => {
+                            // Check for QUIT
+                            if buffer[..n].starts_with(b"QUIT") {
+                                let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                                break;
                             }
+                            // Echo back a simple response
+                            let _ = stream.write_all(b"200 OK\r\n").await;
                         }
-                    });
+                        Err(_) => break,
+                    }
                 }
-                Err(_) => break,
-            }
+            });
         }
     })
 }

@@ -31,7 +31,7 @@ const NEWNEWS_CASES: &[&[u8]] = &[b"NEWNEWS", b"newnews", b"Newnews"];
 /// Helper: Check if command matches any case variation
 #[inline]
 fn matches_any(cmd: &[u8], cases: &[&[u8]]) -> bool {
-    cases.iter().any(|&c| cmd == c)
+    cases.contains(&cmd)
 }
 
 /// NNTP command classification for different handling strategies

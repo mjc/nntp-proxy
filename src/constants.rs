@@ -90,8 +90,9 @@ mod tests {
 
     #[test]
     fn test_buffer_sizes() {
-        assert!(buffer::DEFAULT_SIZE >= buffer::COMMAND_SIZE);
-        assert!(buffer::MAX_RESPONSE_SIZE > buffer::DEFAULT_SIZE);
+        // Compile-time assertions
+        const _: () = assert!(buffer::DEFAULT_SIZE >= buffer::COMMAND_SIZE);
+        const _: () = assert!(buffer::MAX_RESPONSE_SIZE > buffer::DEFAULT_SIZE);
     }
 
     #[test]
