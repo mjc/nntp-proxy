@@ -67,12 +67,14 @@ impl ResponseParser {
     }
 
     /// Check if response is a greeting (200 or 201)
+    #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
         let response_str = String::from_utf8_lossy(data);
         response_str.starts_with("200") || response_str.starts_with("201")
     }
 
     /// Check if response indicates authentication is required
+    #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
         if let Some(code) = NntpResponse::parse_status_code(data) {
             code == 381 || code == 480
@@ -82,6 +84,7 @@ impl ResponseParser {
     }
 
     /// Check if response indicates successful authentication
+    #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
         if let Some(code) = NntpResponse::parse_status_code(data) {
             code == 281

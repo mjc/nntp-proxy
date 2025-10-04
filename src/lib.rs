@@ -58,22 +58,21 @@ pub mod types;
 pub use config::{Config, ServerConfig, create_default_config, load_config};
 
 // Internal imports
-use auth::BackendAuthenticator;
 use network::SocketOptimizer;
 use pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider};
 use protocol::*;
 use session::ClientSession;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NntpProxy {
-    servers: Vec<ServerConfig>,
-    current_index: AtomicUsize,
+    servers: Arc<Vec<ServerConfig>>,
+    current_index: Arc<AtomicUsize>,
     /// Connection providers per server - easily swappable implementation
-    connection_providers: Vec<DeadpoolConnectionProvider>,
+    connection_providers: Arc<Vec<DeadpoolConnectionProvider>>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
     /// Track if pools have been prewarmed to avoid redundant prewarming
-    pools_prewarmed: AtomicBool,
+    pools_prewarmed: Arc<AtomicBool>,
 }
 
 impl NntpProxy {
@@ -105,11 +104,11 @@ impl NntpProxy {
         let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
 
         Ok(Self {
-            servers: config.servers,
-            current_index: AtomicUsize::new(0),
-            connection_providers,
+            servers: Arc::new(config.servers),
+            current_index: Arc::new(AtomicUsize::new(0)),
+            connection_providers: Arc::new(connection_providers),
             buffer_pool,
-            pools_prewarmed: AtomicBool::new(false),
+            pools_prewarmed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -234,9 +233,10 @@ impl NntpProxy {
         for (i, server) in self.servers.iter().enumerate() {
             let provider = &self.connection_providers[i];
             // Test connection to ensure servers are reachable
-            match provider.get_connection().await {
-                Ok(_) => {
+            match provider.get_pooled_connection().await {
+                Ok(_conn) => {
                     debug!("Successfully tested connection to {}", server.name);
+                    // Connection returns to pool when _conn is dropped
                 }
                 Err(e) => {
                     warn!("Failed to test connection to {}: {}", server.name, e);
@@ -257,7 +257,7 @@ impl NntpProxy {
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown of all connection pools...");
 
-        for provider in &self.connection_providers {
+        for provider in self.connection_providers.iter() {
             provider.graceful_shutdown().await;
         }
 
@@ -296,74 +296,54 @@ impl NntpProxy {
             client_addr, server.host, server.port
         );
 
-        // Prewarm all connection pools on first connection after idle
-        // This ensures subsequent requests can immediately use pooled connections
+        // Prewarm connection pools on first connection
+        // Now safe because connections are properly returned to pool
         if let Err(e) = self.prewarm_all_pools().await {
             warn!("Failed to prewarm connection pools: {}", e);
-            // Continue anyway - this is an optimization, not a requirement
         }
 
-        // Get the connection manager for this server and create connection
-        let mut backend_stream = match self.connection_providers[server_idx].get_connection().await
-        {
-            Ok(stream) => {
-                debug!("Retrieved connection from pool for {}", server.name);
-                stream
+        // Get connection from pool using get_pooled_connection() to avoid Object::take()
+        // This keeps the connection in the pool and returns it when dropped
+        let pool_status = self.connection_providers[server_idx].status();
+        debug!(
+            "Pool status for {}: {}/{} available, {} created",
+            server.name, pool_status.available, pool_status.max_size, pool_status.created
+        );
+        
+        let backend_conn = match self.connection_providers[server_idx].get_pooled_connection().await {
+            Ok(conn) => {
+                debug!("Got pooled connection for {}", server.name);
+                conn
             }
             Err(e) => {
-                error!("Failed to connect to {}: {}", server.name, e);
-                // Don't send greeting on connection failure - send error directly
+                error!("Failed to get pooled connection for {}: {}", server.name, e);
                 let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
                 return Err(e);
             }
         };
 
-        let backend_addr = format!("{}:{}", server.host, server.port);
-        debug!("Connected to backend server {}", backend_addr);
+        // Pool connections are already authenticated, just send greeting to client
+        let proxy_greeting = b"200 NNTP Proxy Ready\r\n";
+        client_stream.write_all(proxy_greeting).await?;
+        debug!("Sent proxy greeting to client {}", client_addr);
 
-        // Handle authentication and greeting forwarding
-        if let (Some(username), Some(password)) = (&server.username, &server.password) {
-            if let Err(e) = self
-                .authenticate_backend_and_forward_greeting(
-                    &mut backend_stream,
-                    &mut client_stream,
-                    username,
-                    password,
-                )
-                .await
-            {
-                error!("Authentication failed for {}: {}", server.name, e);
-                let _ = client_stream.write_all(NNTP_AUTH_FAILED).await;
-                return Err(e);
-            }
-            debug!("Successfully authenticated connection to {}", server.name);
-        } else {
-            // No authentication needed, just read and forward the greeting
-            if let Err(e) = self
-                .forward_backend_greeting(&mut backend_stream, &mut client_stream)
-                .await
-            {
-                error!("Failed to forward greeting from {}: {}", server.name, e);
-                let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
-                return Err(e);
-            }
+        // Apply socket optimizations for high-throughput
+        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_conn) {
+            debug!("Failed to apply socket optimizations: {}", e);
         }
 
         // Create a client session to handle the connection
         let session = ClientSession::new(client_addr, self.buffer_pool.clone());
 
-        // Apply socket optimizations for high-throughput
-        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_stream) {
-            debug!("Failed to apply socket optimizations: {}", e);
-        }
-
-        // Handle the session with the backend connection
+        debug!("Starting session for client {}", client_addr);
+        
+        // Handle the session with the pooled backend connection
+        // Connection automatically returns to pool when backend_conn is dropped
         let copy_result = session
-            .handle_with_backend(client_stream, backend_stream)
+            .handle_with_pooled_backend(client_stream, backend_conn)
             .await;
 
-        // Connection will be automatically closed when backend_stream goes out of scope
-        debug!("Connection to {} will be closed", server.name);
+        debug!("Session completed for client {}", client_addr);
 
         match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
@@ -377,8 +357,7 @@ impl NntpProxy {
             }
         }
 
-        // The permit will be automatically dropped here when _permit goes out of scope
-        debug!("Connection closed for client {}", client_addr);
+        debug!("Connection closed for client {}, returned to pool for {}", client_addr, server.name);
         Ok(())
     }
 
@@ -429,34 +408,6 @@ impl NntpProxy {
 
         debug!("Multiplexed connection closed for client {} (ID: {})", client_addr, session.client_id());
         Ok(())
-    }
-
-    /// Forward the backend server's greeting to the client
-    async fn forward_backend_greeting(
-        &self,
-        backend_stream: &mut TcpStream,
-        client_stream: &mut TcpStream,
-    ) -> Result<()> {
-        BackendAuthenticator::forward_greeting(backend_stream, client_stream, &self.buffer_pool)
-            .await
-    }
-
-    /// Perform NNTP authentication and forward the final greeting to client
-    async fn authenticate_backend_and_forward_greeting(
-        &self,
-        backend_stream: &mut TcpStream,
-        client_stream: &mut TcpStream,
-        username: &str,
-        password: &str,
-    ) -> Result<()> {
-        BackendAuthenticator::authenticate_and_forward_greeting(
-            backend_stream,
-            client_stream,
-            username,
-            password,
-            &self.buffer_pool,
-        )
-        .await
     }
 
     // Note: Client session handling moved to session module

@@ -1,9 +1,12 @@
 //! NNTP protocol constants
 
 /// NNTP response constants
+#[allow(dead_code)]
 pub const NNTP_PASSWORD_REQUIRED: &[u8] = b"381 Password required\r\n";
+#[allow(dead_code)]
 pub const NNTP_AUTH_ACCEPTED: &[u8] = b"281 Authentication accepted\r\n";
 pub const NNTP_BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
+#[allow(dead_code)]
 pub const NNTP_AUTH_FAILED: &[u8] = b"502 Authentication failed\r\n";
 pub const NNTP_COMMAND_NOT_SUPPORTED: &[u8] =
     b"500 Command not supported by this proxy (stateless proxy mode)\r\n";

@@ -12,8 +12,9 @@ use crate::protocol::ResponseParser;
 pub struct BackendAuthenticator;
 
 impl BackendAuthenticator {
-    /// Perform NNTP authentication on a backend connection
-    pub async fn authenticate(
+    /// Authenticate to backend server
+    #[allow(dead_code)]
+    async fn authenticate(
         backend_stream: &mut TcpStream,
         username: &str,
         password: &str,
@@ -67,6 +68,7 @@ impl BackendAuthenticator {
     }
 
     /// Read and forward the backend server's greeting to the client
+    #[allow(dead_code)]
     pub async fn forward_greeting(
         backend_stream: &mut TcpStream,
         client_stream: &mut TcpStream,
@@ -97,6 +99,7 @@ impl BackendAuthenticator {
     }
 
     /// Perform authentication and forward the greeting to the client
+    #[allow(dead_code)]
     pub async fn authenticate_and_forward_greeting(
         backend_stream: &mut TcpStream,
         client_stream: &mut TcpStream,

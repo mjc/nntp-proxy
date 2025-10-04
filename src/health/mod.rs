@@ -2,7 +2,6 @@ mod types;
 
 pub use types::{BackendHealth, HealthMetrics, HealthStatus};
 
-use crate::pool::ConnectionProvider;
 use crate::types::BackendId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,15 +116,15 @@ impl HealthChecker {
         provider: crate::pool::DeadpoolConnectionProvider,
         _backend_id: BackendId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Get a connection from the pool
-        let mut conn = provider.get_connection().await?;
+        // Get a pooled connection
+        let mut conn = provider.get_pooled_connection().await?;
 
         // Send DATE command
         conn.write_all(b"DATE\r\n").await?;
         conn.flush().await?;
 
         // Read response
-        let mut reader = BufReader::new(&mut conn);
+        let mut reader = BufReader::new(&mut *conn);
         let mut response = String::new();
         reader.read_line(&mut response).await?;
 

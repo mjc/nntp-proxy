@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
@@ -67,16 +67,22 @@ impl ClientSession {
         self.router.is_some()
     }
 
-    /// Handle client connection with authentication interception
-    /// Client authenticates to proxy, proxy uses backend connection already authenticated
-    pub async fn handle_with_backend(
+    /// Handle client connection with a pooled backend connection
+    /// This keeps the pooled connection object alive and returns it to the pool when done
+    /// Intercepts authentication commands since backend connection is already authenticated
+    pub async fn handle_with_pooled_backend<T>(
         &self,
         mut client_stream: TcpStream,
-        mut backend_stream: TcpStream,
-    ) -> Result<(u64, u64)> {
+        mut backend_conn: T,
+    ) -> Result<(u64, u64)>
+    where
+        T: std::ops::DerefMut<Target = TcpStream>,
+    {
+        use tokio::io::BufReader;
+        
         // Split streams for independent read/write
         let (client_read, mut client_write) = client_stream.split();
-        let (mut backend_read, mut backend_write) = backend_stream.split();
+        let (mut backend_read, mut backend_write) = backend_conn.split();
         let mut client_reader = BufReader::new(client_read);
 
         let mut client_to_backend_bytes = 0u64;
@@ -85,6 +91,8 @@ impl ClientSession {
         // Reuse line buffer to avoid per-iteration allocations
         let mut line = String::with_capacity(buffer::COMMAND_SIZE);
 
+        debug!("Client {} session loop starting", self.client_addr);
+        
         // Handle the initial command/response phase where we intercept auth
         loop {
             line.clear();
@@ -95,10 +103,12 @@ impl ClientSession {
                 result = client_reader.read_line(&mut line) => {
                     match result {
                         Ok(0) => {
+                            debug!("Client {} disconnected (0 bytes read)", self.client_addr);
                             self.buffer_pool.return_buffer(buffer).await;
                             break; // Client disconnected
                         }
-                        Ok(_) => {
+                        Ok(n) => {
+                            debug!("Client {} sent {} bytes: {:?}", self.client_addr, n, line.trim());
                             let trimmed = line.trim();
                             debug!("Client {} command: {}", self.client_addr, trimmed);
 
@@ -320,13 +330,13 @@ impl ClientSession {
             .ok_or_else(|| anyhow::anyhow!("Backend {:?} not found", backend_id))?;
         
         debug!("Client {} getting pooled connection for backend {:?}", self.client_addr, backend_id);
-        // Use get_pooled_connection() instead of get_connection() to avoid Object::take()
-        // This keeps the connection in the pool and returns it when we're done
+        // Use get_pooled_connection() to get a connection that auto-returns to pool
+        // The pool's recycle() method will health-check connections before reuse
+        // so we don't get stale connections that timed out on the backend
         let mut pooled_conn = provider.get_pooled_connection().await?;
         debug!("Client {} got pooled connection for backend {:?}", self.client_addr, backend_id);
 
         // Connection from pool is already authenticated - no need to consume greeting or auth again
-        // Create a BufReader from the pooled connection for efficient line reading
         
         // Forward the command to the backend
         debug!("Client {} forwarding command to backend {:?}: {}", self.client_addr, backend_id, command.trim());

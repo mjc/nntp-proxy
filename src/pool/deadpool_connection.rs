@@ -153,13 +153,52 @@ impl managed::Manager for TcpManager {
 
     async fn recycle(
         &self,
-        _conn: &mut TcpStream,
+        conn: &mut TcpStream,
         _: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
-        // For NNTP connections, we don't do invasive health checks that might consume data
-        // The connection will be tested when actually used for communication
-        debug!("Connection to {} recycled successfully", self.name);
-        Ok(())
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::time::{timeout, Duration};
+        
+        // Quick health check to detect stale connections (idle timeout on backend)
+        // Send DATE command which is stateless and has minimal overhead
+        debug!("Recycling connection to {} - performing health check", self.name);
+        
+        // Set a reasonable timeout for the health check (3 seconds)
+        // This balances detecting dead connections vs network latency
+        let health_check = async {
+            // Send DATE command
+            conn.write_all(b"DATE\r\n").await?;
+            conn.flush().await?;
+
+            // Read response
+            let mut reader = BufReader::new(conn);
+            let mut response = String::new();
+            reader.read_line(&mut response).await?;
+
+            // Check if response indicates success (111 response)
+            if response.starts_with("111") {
+                debug!("Connection to {} is healthy", self.name);
+                Ok(())
+            } else {
+                warn!("Connection to {} returned unexpected DATE response: {}", self.name, response.trim());
+                Err(anyhow::anyhow!("Unexpected DATE response: {}", response.trim()))
+            }
+        };
+        
+        match timeout(Duration::from_secs(3), health_check).await {
+            Ok(Ok(())) => {
+                debug!("Connection to {} recycled successfully", self.name);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                warn!("Connection to {} failed health check: {}", self.name, e);
+                Err(managed::RecycleError::Message(format!("Health check failed: {}", e).into()))
+            }
+            Err(_) => {
+                warn!("Connection to {} health check timed out after 3s", self.name);
+                Err(managed::RecycleError::Message("Health check timeout".into()))
+            }
+        }
     }
 
     fn detach(&self, _conn: &mut TcpStream) {
@@ -197,11 +236,11 @@ impl DeadpoolConnectionProvider {
         Self { pool, name, username, password }
     }
 
-    /// Get a connection from the pool that can be returned (for prewarming)
-    /// Unlike get_connection(), this doesn't use Object::take() so the connection can return to pool
+    /// Get a connection from the pool that is automatically returned when dropped
+    /// This is the preferred method - connections stay in pool and are reused
     pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
         debug!(
-            "Getting pooled connection for prewarming from {}",
+            "Getting pooled connection from {}",
             self.name
         );
         self.pool
@@ -263,31 +302,6 @@ impl DeadpoolConnectionProvider {
 
 #[async_trait]
 impl ConnectionProvider for DeadpoolConnectionProvider {
-    async fn get_connection(&self) -> Result<TcpStream> {
-        debug!("Getting connection from pool for {}", self.name);
-
-        match self.pool.get().await {
-            Ok(conn) => {
-                debug!("Retrieved connection from pool for {}", self.name);
-                // FIXME: In multiplexing mode, we need to return connections to the pool
-                // Object::take() permanently removes the connection
-                // But ConnectionProvider trait returns owned TcpStream, not borrowed
-                // This is the root cause of re-authentication spam
-                // Solution: Either change trait to return pooled object, or keep per-session connections
-                use deadpool::managed::Object;
-                let stream = Object::take(conn);
-                Ok(stream)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to get connection from pool for {}: {}",
-                    self.name, e
-                );
-                Err(anyhow::anyhow!("Pool connection failed: {}", e))
-            }
-        }
-    }
-
     fn status(&self) -> PoolStatus {
         let status = self.pool.status();
         PoolStatus {

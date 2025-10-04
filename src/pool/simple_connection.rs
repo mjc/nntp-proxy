@@ -1,7 +1,4 @@
-use anyhow::Result;
 use async_trait::async_trait;
-use tokio::net::TcpStream;
-use tracing::info;
 
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 
@@ -24,18 +21,6 @@ impl SimpleConnectionProvider {
 
 #[async_trait]
 impl ConnectionProvider for SimpleConnectionProvider {
-    async fn get_connection(&self) -> Result<TcpStream> {
-        info!("Creating connection to {}", self.name);
-
-        let addr = format!("{}:{}", self.host, self.port);
-        let stream = TcpStream::connect(&addr).await?;
-
-        // Apply basic optimization
-        let _ = stream.set_nodelay(true);
-
-        Ok(stream)
-    }
-
     fn status(&self) -> PoolStatus {
         // Simple provider doesn't pool connections, so always shows max available
         PoolStatus {
