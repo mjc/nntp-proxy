@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
+use crate::constants::buffer;
 use crate::protocol::NntpResponse;
 use crate::types::{BackendId, ClientId, RequestId};
 
@@ -50,8 +51,9 @@ impl ResponseDemultiplexer {
         buffer: &mut Vec<u8>,
     ) -> Result<(Vec<u8>, bool)> {
         buffer.clear();
-        let mut response_data = Vec::new();
-        let mut temp_buf = [0u8; 4096];
+        // Pre-allocate typical response size to reduce reallocations
+        let mut response_data = Vec::with_capacity(buffer::RESPONSE_INITIAL_CAPACITY);
+        let mut temp_buf = [0u8; 8192];
 
         // Read the status line
         loop {

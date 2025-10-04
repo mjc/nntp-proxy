@@ -8,10 +8,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
+use crate::constants::buffer;
 use crate::pool::BufferPool;
 use crate::protocol::NNTP_COMMAND_NOT_SUPPORTED;
 use crate::router::RequestRouter;
@@ -81,9 +82,12 @@ impl ClientSession {
         let mut client_to_backend_bytes = 0u64;
         let mut backend_to_client_bytes = 0u64;
 
+        // Reuse line buffer to avoid per-iteration allocations
+        let mut line = String::with_capacity(buffer::COMMAND_SIZE);
+
         // Handle the initial command/response phase where we intercept auth
         loop {
-            let mut line = String::new();
+            line.clear();
             let mut buffer = self.buffer_pool.get_buffer().await;
 
             tokio::select! {
@@ -194,6 +198,285 @@ impl ClientSession {
         } else {
             anyhow::bail!("Session not configured for multiplexing - no router available")
         }
+    }
+
+    /// Handle a client connection with true per-command multiplexing
+    /// Each command is routed independently to potentially different backends
+    pub async fn handle_multiplexed(&self, mut client_stream: TcpStream) -> Result<(u64, u64)> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        
+        let router = self.router.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Multiplexing mode requires a router"))?;
+
+        let (client_read, mut client_write) = client_stream.split();
+        let mut client_reader = BufReader::new(client_read);
+        
+        let mut client_to_backend_bytes = 0u64;
+        let mut backend_to_client_bytes = 0u64;
+
+        // Send initial greeting to client
+        let greeting = b"200 NNTP Proxy Ready (Multiplexing Mode)\r\n";
+        client_write.write_all(greeting).await?;
+        backend_to_client_bytes += greeting.len() as u64;
+        
+        debug!("Client {} sent greeting, entering command loop", self.client_addr);
+
+        // Reuse command buffer to avoid allocations per command
+        let mut command = String::with_capacity(buffer::COMMAND_SIZE);
+
+        // Process commands one at a time
+        loop {
+            command.clear();
+            
+            match client_reader.read_line(&mut command).await {
+                Ok(0) => {
+                    debug!("Client {} disconnected", self.client_addr);
+                    break; // Client disconnected
+                }
+                Ok(n) => {
+                    client_to_backend_bytes += n as u64;
+                    let trimmed = command.trim();
+                    
+                    debug!("Client {} received command ({} bytes): {}", self.client_addr, n, trimmed);
+
+                    // Handle QUIT locally
+                    if trimmed.eq_ignore_ascii_case("QUIT") {
+                        let response = b"205 Connection closing\r\n";
+                        client_write.write_all(response).await?;
+                        backend_to_client_bytes += response.len() as u64;
+                        break;
+                    }
+
+                    // Check if command should be rejected (stateful commands)
+                    match CommandHandler::handle_command(&command) {
+                        CommandAction::InterceptAuth(auth_action) => {
+                            // Handle authentication locally
+                            let response = match auth_action {
+                                AuthAction::RequestPassword => AuthHandler::user_response(),
+                                AuthAction::AcceptAuth => AuthHandler::pass_response(),
+                            };
+                            client_write.write_all(response).await?;
+                            backend_to_client_bytes += response.len() as u64;
+                            continue;
+                        }
+                        CommandAction::Reject(reason) => {
+                            warn!("Rejecting command from client {}: {} ({})", 
+                                  self.client_addr, trimmed, reason);
+                            client_write.write_all(NNTP_COMMAND_NOT_SUPPORTED).await?;
+                            backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
+                            continue;
+                        }
+                        CommandAction::ForwardStateless | CommandAction::ForwardHighThroughput => {
+                            // Route this command to a backend
+                            match self.route_and_execute_command(
+                                router,
+                                &command,
+                                &mut client_write,
+                                &mut client_to_backend_bytes,
+                                &mut backend_to_client_bytes,
+                            ).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    error!("Error routing command for client {}: {}", self.client_addr, e);
+                                    let error_response = b"503 Backend error\r\n";
+                                    let _ = client_write.write_all(error_response).await;
+                                    backend_to_client_bytes += error_response.len() as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Error reading from client {}: {}", self.client_addr, e);
+                    break;
+                }
+            }
+        }
+
+        Ok((client_to_backend_bytes, backend_to_client_bytes))
+    }
+
+    /// Route a single command to a backend and execute it
+    async fn route_and_execute_command(
+        &self,
+        router: &RequestRouter,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_to_backend_bytes: &mut u64,
+        backend_to_client_bytes: &mut u64,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        
+        // Route the command to get a backend (lock-free!)
+        let backend_id = router.route_command_sync(self.client_id, command)?;
+        
+        debug!(
+            "Client {} routed command to backend {:?}: {}",
+            self.client_addr, backend_id, command.trim()
+        );
+
+        // Get a connection from the router's backend pool
+        let provider = router.get_backend_provider(backend_id)
+            .ok_or_else(|| anyhow::anyhow!("Backend {:?} not found", backend_id))?;
+        
+        debug!("Client {} getting pooled connection for backend {:?}", self.client_addr, backend_id);
+        // Use get_pooled_connection() instead of get_connection() to avoid Object::take()
+        // This keeps the connection in the pool and returns it when we're done
+        let mut pooled_conn = provider.get_pooled_connection().await?;
+        debug!("Client {} got pooled connection for backend {:?}", self.client_addr, backend_id);
+
+        // Connection from pool is already authenticated - no need to consume greeting or auth again
+        // Create a BufReader from the pooled connection for efficient line reading
+        
+        // Forward the command to the backend
+        debug!("Client {} forwarding command to backend {:?}: {}", self.client_addr, backend_id, command.trim());
+        pooled_conn.write_all(command.as_bytes()).await?;
+        pooled_conn.flush().await?;
+        *client_to_backend_bytes += command.len() as u64;
+        debug!("Client {} command sent and flushed to backend {:?}", self.client_addr, backend_id);
+
+        // Read the response from the backend
+        debug!("Client {} reading response from backend {:?}", self.client_addr, backend_id);
+        
+        // Use direct reading from backend - no split() to avoid mutex overhead
+        use tokio::io::AsyncReadExt;
+        
+        let mut chunk = vec![0u8; 65536]; // 64KB chunks
+        let mut total_bytes = 0;
+        
+        // Read first chunk to determine response type
+        let n = pooled_conn.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
+        }
+        
+        // Find first newline to determine if multiline
+        let first_newline = chunk[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
+        let is_multiline = first_newline >= 3 
+            && chunk[0] == b'2' 
+            && !(chunk[1] == b'0' && chunk[2] == b'5');
+        
+        // Log first line (best effort)
+        if let Ok(first_line_str) = std::str::from_utf8(&chunk[..first_newline.min(n)]) {
+            debug!("Client {} got first line from backend {:?}: {}", self.client_addr, backend_id, first_line_str.trim());
+        }
+        
+        // Write first chunk directly to client
+        client_write.write_all(&chunk[..n]).await?;
+        total_bytes += n;
+        
+        if is_multiline {
+            // Fast check if terminator is in first chunk (check end only)
+            let has_terminator = if n >= 5 {
+                chunk[n-5..n] == *b"\r\n.\r\n" || (n >= 3 && chunk[n-3..n] == *b"\n.\n")
+            } else {
+                n >= 3 && chunk[..n] == *b"\n.\n"
+            };
+            
+            if !has_terminator {
+                // For multiline responses, use pipelined streaming
+                // Prepare double buffering for concurrent read/write
+                let mut chunk1 = chunk; // Reuse first buffer
+                let mut chunk2 = vec![0u8; 65536]; // Second buffer for pipelining
+                
+                let mut tail: [u8; 4] = [0; 4]; // Fixed-size tail for span detection
+                let mut tail_len: usize = 0; // How much of tail is valid
+                
+                // Initialize tail with last bytes of first chunk (already written above)
+                if n >= 4 {
+                    tail.copy_from_slice(&chunk1[n-4..n]);
+                    tail_len = 4;
+                } else if n > 0 {
+                    tail[..n].copy_from_slice(&chunk1[..n]);
+                    tail_len = n;
+                }
+                
+                // Check terminator in first chunk (already written)
+                let first_has_term = if n >= 5 {
+                    chunk1[n-5..n] == *b"\r\n.\r\n" ||
+                    (n >= 3 && chunk1[n-3..n] == *b"\n.\n")
+                } else {
+                    n >= 3 && chunk1[..n] == *b"\n.\n"
+                };
+                
+                if !first_has_term {
+                    // First chunk didn't have terminator, continue reading
+                    let mut current_chunk = &mut chunk1;
+                    let mut next_chunk = &mut chunk2;
+                    
+                    // Read next chunk and start loop
+                    let mut current_n = pooled_conn.read(next_chunk).await?;
+                    if current_n > 0 {
+                        std::mem::swap(&mut current_chunk, &mut next_chunk);
+                        
+                        loop {
+                            // Write current chunk to client
+                            client_write.write_all(&current_chunk[..current_n]).await?;
+                            total_bytes += current_n;
+                    
+                            // Check terminator in chunk we just wrote
+                            let has_term = if current_n >= 5 {
+                                current_chunk[current_n-5..current_n] == *b"\r\n.\r\n" ||
+                                (current_n >= 3 && current_chunk[current_n-3..current_n] == *b"\n.\n")
+                            } else {
+                                current_n >= 3 && current_chunk[..current_n] == *b"\n.\n"
+                            };
+                            
+                            if has_term {
+                                break; // Done! We already wrote the final chunk
+                            }
+                            
+                            // Check boundary spanning terminator (ONLY if current chunk is small enough)
+                            // This is rare - only check if terminator could span from previous chunk
+                            let has_spanning_term = if tail_len >= 2 && current_n >= 1 && current_n <= 4 {
+                                // Build combined view: tail + start of current chunk
+                                let mut check_buf = [0u8; 9]; // max: 4 tail + 5 current
+                                check_buf[..tail_len].copy_from_slice(&tail[..tail_len]);
+                                let curr_copy = current_n.min(5);
+                                check_buf[tail_len..tail_len + curr_copy].copy_from_slice(&current_chunk[..curr_copy]);
+                                let total = tail_len + curr_copy;
+                                
+                                (total >= 5 && check_buf[total-5..total] == *b"\r\n.\r\n") ||
+                                (total >= 3 && check_buf[total-3..total] == *b"\n.\n")
+                            } else {
+                                false
+                            };
+                            
+                            if has_spanning_term {
+                                break; // Done! We already wrote the final chunk
+                            }
+                            
+                            // Update tail for next iteration (only last 4 bytes)
+                            if current_n >= 4 {
+                                tail.copy_from_slice(&current_chunk[current_n-4..current_n]);
+                                tail_len = 4;
+                            } else if current_n > 0 {
+                                tail[..current_n].copy_from_slice(&current_chunk[..current_n]);
+                                tail_len = current_n;
+                            }
+                            
+                            // Read next chunk
+                            let next_n = pooled_conn.read(next_chunk).await?;
+                            if next_n == 0 {
+                                break; // EOF
+                            }
+                            
+                            // Swap buffers for next iteration
+                            std::mem::swap(&mut current_chunk, &mut next_chunk);
+                            current_n = next_n;
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("Client {} forwarded response ({} bytes) to client", self.client_addr, total_bytes);
+        *backend_to_client_bytes += total_bytes as u64;
+
+        // Complete the request - decrement pending count (lock-free!)
+        router.complete_command_sync(backend_id);
+
+        Ok(())
     }
 }
 
@@ -357,8 +640,10 @@ mod tests {
             9999,
             "test-backend".to_string(),
             2,
+            None,
+            None,
         );
-        router.add_backend(BackendId::from_index(0), "test".to_string(), provider);
+        router.add_backend(BackendId::from_index(0), "test".to_string(), provider, None, None);
 
         let session = ClientSession::new_with_router(addr, buffer_pool, Arc::new(router));
 
@@ -383,11 +668,15 @@ mod tests {
                 9999 + i,
                 format!("backend-{}", i),
                 2,
+                None,
+                None,
             );
             router.add_backend(
                 BackendId::from_index(i as usize),
                 format!("backend-{}", i),
                 provider,
+                None,
+                None,
             );
         }
 
