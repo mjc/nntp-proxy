@@ -53,7 +53,7 @@ pub enum NntpCommand {
 impl NntpCommand {
     /// Classify an NNTP command based on its content using fast byte-level parsing
     /// Ordered by frequency (most common first) for optimal short-circuit performance
-    /// 
+    ///
     /// Performance: Zero allocations - uses direct byte slice comparison with hardcoded
     /// case permutations instead of case conversion.
     #[inline]
@@ -82,8 +82,11 @@ impl NntpCommand {
 
         // Ordered by frequency: ARTICLE/BODY/HEAD/STAT are 70%+ of traffic
         // Article retrieval commands (MOST FREQUENT ~70% of traffic)
-        if matches_any(cmd, ARTICLE_CASES) || matches_any(cmd, BODY_CASES) 
-            || matches_any(cmd, HEAD_CASES) || matches_any(cmd, STAT_CASES) {
+        if matches_any(cmd, ARTICLE_CASES)
+            || matches_any(cmd, BODY_CASES)
+            || matches_any(cmd, HEAD_CASES)
+            || matches_any(cmd, STAT_CASES)
+        {
             return if is_message_id_arg(bytes, cmd_end) {
                 Self::ArticleByMessageId
             } else {
@@ -112,27 +115,39 @@ impl NntpCommand {
         }
 
         // Stateless commands (moderately common ~5-10%)
-        if matches_any(cmd, LIST_CASES) || matches_any(cmd, DATE_CASES)
-            || matches_any(cmd, CAPABILITIES_CASES) || matches_any(cmd, MODE_CASES)
-            || matches_any(cmd, HELP_CASES) || matches_any(cmd, QUIT_CASES) {
+        if matches_any(cmd, LIST_CASES)
+            || matches_any(cmd, DATE_CASES)
+            || matches_any(cmd, CAPABILITIES_CASES)
+            || matches_any(cmd, MODE_CASES)
+            || matches_any(cmd, HELP_CASES)
+            || matches_any(cmd, QUIT_CASES)
+        {
             return Self::Stateless;
         }
 
         // Header retrieval commands (~5%)
-        if matches_any(cmd, XOVER_CASES) || matches_any(cmd, OVER_CASES)
-            || matches_any(cmd, XHDR_CASES) || matches_any(cmd, HDR_CASES) {
+        if matches_any(cmd, XOVER_CASES)
+            || matches_any(cmd, OVER_CASES)
+            || matches_any(cmd, XHDR_CASES)
+            || matches_any(cmd, HDR_CASES)
+        {
             return Self::Stateful;
         }
 
         // Other stateful commands (rare)
-        if matches_any(cmd, NEXT_CASES) || matches_any(cmd, LAST_CASES)
-            || matches_any(cmd, LISTGROUP_CASES) {
+        if matches_any(cmd, NEXT_CASES)
+            || matches_any(cmd, LAST_CASES)
+            || matches_any(cmd, LISTGROUP_CASES)
+        {
             return Self::Stateful;
         }
 
         // Non-multiplexable commands (very rare in typical usage)
-        if matches_any(cmd, POST_CASES) || matches_any(cmd, IHAVE_CASES)
-            || matches_any(cmd, NEWGROUPS_CASES) || matches_any(cmd, NEWNEWS_CASES) {
+        if matches_any(cmd, POST_CASES)
+            || matches_any(cmd, IHAVE_CASES)
+            || matches_any(cmd, NEWGROUPS_CASES)
+            || matches_any(cmd, NEWNEWS_CASES)
+        {
             return Self::NonMultiplexable;
         }
 

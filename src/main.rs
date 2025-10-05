@@ -22,7 +22,10 @@ fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
 
     match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
         Ok(_) => {
-            info!("Successfully pinned process to {} CPU cores for optimal performance", num_cores);
+            info!(
+                "Successfully pinned process to {} CPU cores for optimal performance",
+                num_cores
+            );
         }
         Err(e) => {
             warn!(
@@ -132,20 +135,14 @@ async fn run_proxy(args: Args) -> Result<()> {
     // Create proxy (wrapped in Arc for sharing across tasks)
     let proxy = Arc::new(NntpProxy::new(config)?);
 
-    // Optionally create request router for multiplexing mode
-    let router = if args.multiplex {
-        let router = std::sync::Arc::new(proxy.create_router());
-        info!("Request router initialized with {} backends", proxy.servers().len());
-        Some(router)
-    } else {
-        None
-    };
-
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&listen_addr).await?;
     if args.multiplex {
-        info!("NNTP proxy listening on {} (multiplexing mode - EXPERIMENTAL)", listen_addr);
+        info!(
+            "NNTP proxy listening on {} (multiplexing mode - EXPERIMENTAL)",
+            listen_addr
+        );
         warn!("Multiplexing mode is experimental and not fully functional yet");
     } else {
         info!("NNTP proxy listening on {} (1:1 mode)", listen_addr);
@@ -165,10 +162,13 @@ async fn run_proxy(args: Args) -> Result<()> {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
-                if let Some(router_clone) = router.clone() {
+                if args.multiplex {
                     // Multiplexing mode (experimental)
                     tokio::spawn(async move {
-                        if let Err(e) = proxy_clone.handle_client_multiplexed(stream, addr, router_clone).await {
+                        if let Err(e) = proxy_clone
+                            .handle_client_multiplexed(stream, addr)
+                            .await
+                        {
                             error!("Error handling client {}: {}", addr, e);
                         }
                     });

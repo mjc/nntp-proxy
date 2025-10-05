@@ -6,12 +6,6 @@
 
 mod classifier;
 mod handler;
-mod types;
 
+pub use classifier::NntpCommand;
 pub use handler::{AuthAction, CommandAction, CommandHandler};
-
-// Re-export types for future multiplexing use
-#[allow(unused_imports)]
-pub use classifier::{CommandClassifier, NntpCommand};
-#[allow(unused_imports)]
-pub use types::{Command, CommandType, ValidationResult};

@@ -83,9 +83,10 @@ impl HealthChecker {
         {
             let health = self.backend_health.read().await;
             if let Some(backend_health) = health.get(&backend_id)
-                && !backend_health.needs_check(self.config.check_interval) {
-                    return;
-                }
+                && !backend_health.needs_check(self.config.check_interval)
+            {
+                return;
+            }
         }
 
         // Perform the health check with timeout
@@ -155,7 +156,10 @@ impl HealthChecker {
         let health = self.backend_health.read().await;
 
         let mut metrics = HealthMetrics {
-            total_checks: health.values().map(|h| h.total_successes + h.total_failures).sum(),
+            total_checks: health
+                .values()
+                .map(|h| h.total_successes + h.total_failures)
+                .sum(),
             ..Default::default()
         };
 

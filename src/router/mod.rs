@@ -23,7 +23,7 @@ use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, RequestId};
 
 /// Backend connection information
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct BackendInfo {
     /// Backend identifier
     id: BackendId,
@@ -37,6 +37,7 @@ struct BackendInfo {
 
 /// Routes requests to backend servers and manages multiplexing
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct RequestRouter {
     /// Tracks pending requests waiting for responses
     tracker: Arc<RwLock<RequestTracker>>,
@@ -104,11 +105,7 @@ impl RequestRouter {
 
     /// Route a command to an available backend
     /// Returns just the backend ID - no request tracking needed for synchronous multiplexing
-    pub fn route_command_sync(
-        &self,
-        _client_id: ClientId,
-        _command: &str,
-    ) -> Result<BackendId> {
+    pub fn route_command_sync(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
         // Select a backend using round-robin
         let backend = self
             .select_backend()

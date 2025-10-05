@@ -33,7 +33,8 @@ impl PendingRequest {
     }
 }
 
-/// Tracks pending requests per backend
+/// Tracks pending requests and their associated clients
+#[derive(Debug)]
 pub struct RequestTracker {
     pending: HashMap<RequestId, PendingRequest>,
 }

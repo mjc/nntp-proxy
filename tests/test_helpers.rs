@@ -11,11 +11,11 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 /// Spawn a mock NNTP server that responds with a greeting
-/// 
+///
 /// # Arguments
 /// * `port` - Port to listen on
 /// * `server_name` - Name to include in greeting message
-/// 
+///
 /// # Returns
 /// Handle to the background task running the mock server
 pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
@@ -41,7 +41,7 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
                 let mut buffer = [0; 1024];
                 loop {
                     match stream.read(&mut buffer).await {
-                        Ok(0) => break,  // Connection closed
+                        Ok(0) => break, // Connection closed
                         Ok(n) => {
                             // Check for QUIT
                             if buffer[..n].starts_with(b"QUIT") {
@@ -60,12 +60,12 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
 }
 
 /// Spawn a mock NNTP server that requires authentication
-/// 
+///
 /// # Arguments
 /// * `port` - Port to listen on
 /// * `expected_user` - Expected username
 /// * `expected_pass` - Expected password
-/// 
+///
 /// # Returns
 /// Handle to the background task running the mock server
 pub fn spawn_mock_server_with_auth(
@@ -75,7 +75,7 @@ pub fn spawn_mock_server_with_auth(
 ) -> JoinHandle<()> {
     let user = expected_user.to_string();
     let pass = expected_pass.to_string();
-    
+
     tokio::spawn(async move {
         let addr = format!("127.0.0.1:{}", port);
         let listener = match TcpListener::bind(&addr).await {
@@ -87,14 +87,16 @@ pub fn spawn_mock_server_with_auth(
             if let Ok((mut stream, _)) = listener.accept().await {
                 let user_clone = user.clone();
                 let pass_clone = pass.clone();
-                
+
                 tokio::spawn(async move {
                     // Send greeting requesting auth
-                    let _ = stream.write_all(b"200 Server ready (auth required)\r\n").await;
+                    let _ = stream
+                        .write_all(b"200 Server ready (auth required)\r\n")
+                        .await;
 
                     let mut authenticated = false;
                     let mut buffer = [0; 1024];
-                    
+
                     while let Ok(n) = stream.read(&mut buffer).await {
                         if n == 0 {
                             break;
@@ -131,10 +133,10 @@ pub fn spawn_mock_server_with_auth(
 }
 
 /// Create a test configuration with the specified backend servers
-/// 
+///
 /// # Arguments
 /// * `server_ports` - List of (port, name) tuples for backend servers
-/// 
+///
 /// # Returns
 /// Configuration object ready for use in tests
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
@@ -156,7 +158,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 
 /// Create a test configuration with authentication
 pub fn create_test_config_with_auth(
-    server_ports: Vec<(u16, &str, &str, &str)>,  // (port, name, user, pass)
+    server_ports: Vec<(u16, &str, &str, &str)>, // (port, name, user, pass)
 ) -> Config {
     Config {
         servers: server_ports
@@ -175,21 +177,21 @@ pub fn create_test_config_with_auth(
 }
 
 /// Wait for a server to be ready by attempting to connect
-/// 
+///
 /// # Arguments
 /// * `addr` - Address to connect to (e.g., "127.0.0.1:8080")
 /// * `max_attempts` - Maximum number of connection attempts
-/// 
+///
 /// # Returns
 /// Ok(()) if connection succeeds, Err otherwise
 pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
     for attempt in 1..=max_attempts {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        
+
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return Ok(());
         }
-        
+
         if attempt == max_attempts {
             return Err(anyhow::anyhow!(
                 "Server at {} did not become ready after {} attempts",
@@ -198,17 +200,17 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
             ));
         }
     }
-    
+
     Ok(())
 }
 
 /// Read a complete NNTP response from a stream
-/// 
+///
 /// # Arguments
 /// * `stream` - TCP stream to read from
 /// * `buffer` - Buffer to read into
 /// * `timeout_ms` - Timeout in milliseconds
-/// 
+///
 /// # Returns
 /// Number of bytes read
 pub async fn read_response(
@@ -216,12 +218,9 @@ pub async fn read_response(
     buffer: &mut [u8],
     timeout_ms: u64,
 ) -> Result<usize> {
-    tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        stream.read(buffer),
-    )
-    .await?
-    .map_err(Into::into)
+    tokio::time::timeout(Duration::from_millis(timeout_ms), stream.read(buffer))
+        .await?
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -251,9 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_test_config() {
-        let config = create_test_config(
-            vec![(19002, "server1"), (19003, "server2")],
-        );
+        let config = create_test_config(vec![(19002, "server1"), (19003, "server2")]);
 
         assert_eq!(config.servers.len(), 2);
         assert_eq!(config.servers[0].port, 19002);
