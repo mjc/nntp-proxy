@@ -1,7 +1,5 @@
 //! Command classification logic for NNTP commands
 
-use super::types::{CommandType, ValidationResult};
-
 // Case permutations for fast matching without allocation
 // Covers: UPPERCASE, lowercase, Titlecase
 const ARTICLE_CASES: &[&[u8]] = &[b"ARTICLE", b"article", b"Article"];
@@ -156,58 +154,6 @@ impl NntpCommand {
     }
 }
 
-/// Command classifier for validation and routing
-#[allow(dead_code)]
-pub struct CommandClassifier;
-
-#[allow(dead_code)]
-impl CommandClassifier {
-    /// Validate a command and return validation result
-    pub fn validate(command: &str) -> ValidationResult {
-        match NntpCommand::classify(command) {
-            NntpCommand::Stateful => ValidationResult::Rejected(
-                "Command not supported by this proxy (stateless proxy mode)",
-            ),
-            NntpCommand::NonMultiplexable => ValidationResult::Rejected(
-                "Command not supported by this proxy (multiplexing mode)",
-            ),
-            NntpCommand::AuthUser | NntpCommand::AuthPass => ValidationResult::Intercepted,
-            _ => ValidationResult::Allowed,
-        }
-    }
-
-    /// Parse and classify a raw command string
-    pub fn parse(raw: &str) -> CommandType {
-        let trimmed = raw.trim();
-        match NntpCommand::classify(trimmed) {
-            NntpCommand::AuthUser => {
-                // Extract username from "AUTHINFO USER <username>"
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                let username = if parts.len() >= 3 {
-                    parts[2].to_string()
-                } else {
-                    String::new()
-                };
-                CommandType::AuthUser(username)
-            }
-            NntpCommand::AuthPass => {
-                // Extract password from "AUTHINFO PASS <password>"
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                let password = if parts.len() >= 3 {
-                    parts[2].to_string()
-                } else {
-                    String::new()
-                };
-                CommandType::AuthPass(password)
-            }
-            NntpCommand::Stateful => CommandType::Stateful,
-            NntpCommand::NonMultiplexable => CommandType::NonMultiplexable,
-            NntpCommand::ArticleByMessageId => CommandType::ArticleByMessageId,
-            NntpCommand::Stateless => CommandType::Stateless,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,49 +226,6 @@ mod tests {
             NntpCommand::classify("UNKNOWN COMMAND"),
             NntpCommand::Stateless
         );
-    }
-
-    #[test]
-    fn test_command_validation() {
-        assert_eq!(
-            CommandClassifier::validate("LIST"),
-            ValidationResult::Allowed
-        );
-        assert_eq!(
-            CommandClassifier::validate("GROUP alt.test"),
-            ValidationResult::Rejected(
-                "Command not supported by this proxy (stateless proxy mode)"
-            )
-        );
-        assert_eq!(
-            CommandClassifier::validate("AUTHINFO USER test"),
-            ValidationResult::Intercepted
-        );
-    }
-
-    #[test]
-    fn test_command_parsing() {
-        match CommandClassifier::parse("AUTHINFO USER testuser") {
-            CommandType::AuthUser(username) => assert_eq!(username, "testuser"),
-            _ => panic!("Expected AuthUser"),
-        }
-
-        match CommandClassifier::parse("AUTHINFO PASS testpass") {
-            CommandType::AuthPass(password) => assert_eq!(password, "testpass"),
-            _ => panic!("Expected AuthPass"),
-        }
-
-        assert_eq!(
-            CommandClassifier::parse("GROUP alt.test"),
-            CommandType::Stateful
-        );
-
-        assert_eq!(
-            CommandClassifier::parse("ARTICLE <msg@example.com>"),
-            CommandType::ArticleByMessageId
-        );
-
-        assert_eq!(CommandClassifier::parse("LIST"), CommandType::Stateless);
     }
 
     #[test]
@@ -469,33 +372,6 @@ mod tests {
             NntpCommand::classify(&long_msgid),
             NntpCommand::ArticleByMessageId
         );
-    }
-
-    #[test]
-    fn test_command_parser_extracts_credentials() {
-        // Test username extraction
-        match CommandClassifier::parse("AUTHINFO USER alice") {
-            CommandType::AuthUser(user) => assert_eq!(user, "alice"),
-            _ => panic!("Expected AuthUser"),
-        }
-
-        // Test username with spaces (takes first word)
-        match CommandClassifier::parse("AUTHINFO USER bob smith") {
-            CommandType::AuthUser(user) => assert_eq!(user, "bob"),
-            _ => panic!("Expected AuthUser"),
-        }
-
-        // Test password extraction
-        match CommandClassifier::parse("AUTHINFO PASS secret123") {
-            CommandType::AuthPass(pass) => assert_eq!(pass, "secret123"),
-            _ => panic!("Expected AuthPass"),
-        }
-
-        // Test password with special characters
-        match CommandClassifier::parse("AUTHINFO PASS p@ssw0rd!#$") {
-            CommandType::AuthPass(pass) => assert_eq!(pass, "p@ssw0rd!#$"),
-            _ => panic!("Expected AuthPass"),
-        }
     }
 
     #[test]

@@ -1,12 +1,11 @@
-//! Connection pool management for backend NNTP servers
+//! Connection pooling and buffer pooling modules
 //!
-//! Provides efficient connection pooling and buffer management
+//! This module provides connection management and buffer pooling for the NNTP proxy.
 
 pub mod buffer;
 pub mod connection_trait;
 pub mod deadpool_connection;
-pub mod prewarming;
-pub mod simple_connection;
 
 pub use buffer::BufferPool;
 pub use connection_trait::ConnectionProvider;
+pub use deadpool_connection::DeadpoolConnectionProvider;

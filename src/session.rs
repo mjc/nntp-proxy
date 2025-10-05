@@ -40,8 +40,7 @@ impl ClientSession {
         }
     }
 
-    /// Create a new client session with router for multiplexing
-    #[allow(dead_code)]
+    /// Create a new client session with router for per-command routing
     pub fn new_with_router(
         client_addr: SocketAddr,
         buffer_pool: BufferPool,
@@ -56,13 +55,11 @@ impl ClientSession {
     }
 
     /// Get the client ID
-    #[allow(dead_code)]
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }
 
-    /// Check if this session is using multiplexed mode
-    #[allow(dead_code)]
+    /// Check if this session is using per-command routing mode
     pub fn is_multiplexed(&self) -> bool {
         self.router.is_some()
     }
@@ -188,29 +185,7 @@ impl ClientSession {
         Ok((client_to_backend_bytes, backend_to_client_bytes))
     }
 
-    /// Route a single command through the router (for multiplexed mode)
-    /// This demonstrates the multiplexing architecture without full implementation
-    #[allow(dead_code)]
-    pub async fn route_command(&self, command: &str) -> Result<()> {
-        if let Some(router) = &self.router {
-            // Route the command through the router
-            let (_request_id, backend_id) = router.route_command(self.client_id, command).await?;
-
-            debug!(
-                "Client {} ({:?}) routed command to backend {:?}: {}",
-                self.client_addr,
-                self.client_id,
-                backend_id,
-                command.trim()
-            );
-
-            Ok(())
-        } else {
-            anyhow::bail!("Session not configured for multiplexing - no router available")
-        }
-    }
-
-    /// Handle a client connection with true per-command multiplexing
+    /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
     pub async fn handle_multiplexed(&self, mut client_stream: TcpStream) -> Result<(u64, u64)> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -669,76 +644,4 @@ mod tests {
         assert_ne!(session1.client_id(), session2.client_id());
     }
 
-    #[tokio::test]
-    async fn test_route_command_without_router_fails() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(1024, 4);
-        let session = ClientSession::new(addr, buffer_pool);
-
-        let result = session.route_command("LIST\r\n").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no router"));
-    }
-
-    #[tokio::test]
-    async fn test_route_command_with_router() {
-        use crate::pool::DeadpoolConnectionProvider;
-        use crate::types::BackendId;
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(1024, 4);
-
-        // Create router with a backend
-        let mut router = RequestRouter::new();
-        let provider = DeadpoolConnectionProvider::new(
-            "localhost".to_string(),
-            9999,
-            "test-backend".to_string(),
-            2,
-            None,
-            None,
-        );
-        router.add_backend(BackendId::from_index(0), "test".to_string(), provider);
-
-        let session = ClientSession::new_with_router(addr, buffer_pool, Arc::new(router));
-
-        // Should successfully route command
-        let result = session.route_command("LIST\r\n").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_multiple_commands_routed() {
-        use crate::pool::DeadpoolConnectionProvider;
-        use crate::types::BackendId;
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(1024, 4);
-
-        // Create router with multiple backends
-        let mut router = RequestRouter::new();
-        for i in 0..3 {
-            let provider = DeadpoolConnectionProvider::new(
-                "localhost".to_string(),
-                9999 + i,
-                format!("backend-{}", i),
-                2,
-                None,
-                None,
-            );
-            router.add_backend(
-                BackendId::from_index(i as usize),
-                format!("backend-{}", i),
-                provider,
-            );
-        }
-
-        let session = ClientSession::new_with_router(addr, buffer_pool, Arc::new(router));
-
-        // Route multiple commands
-        for _ in 0..5 {
-            let result = session.route_command("LIST\r\n").await;
-            assert!(result.is_ok());
-        }
-    }
 }
