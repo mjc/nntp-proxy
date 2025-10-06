@@ -4,6 +4,7 @@ use deadpool::managed;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 
 /// TCP connection manager for deadpool
@@ -56,9 +57,10 @@ impl TcpManager {
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
-        // Set socket buffer sizes for high throughput (2MB each)
-        socket.set_recv_buffer_size(2 * 1024 * 1024)?;
-        socket.set_send_buffer_size(2 * 1024 * 1024)?;
+        // Set socket buffer sizes for connection pools (4MB each)
+        // Smaller than high-throughput to avoid memory exhaustion with 100 connections
+        socket.set_recv_buffer_size(POOL_RECV_BUFFER)?;
+        socket.set_send_buffer_size(POOL_SEND_BUFFER)?;
 
         // Enable keepalive for connection reuse
         socket.set_keepalive(true)?;

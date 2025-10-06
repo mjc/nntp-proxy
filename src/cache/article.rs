@@ -8,7 +8,8 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct CachedArticle {
     /// The complete response including status line and article data
-    pub response: Vec<u8>,
+    /// Wrapped in Arc for cheap cloning when retrieving from cache
+    pub response: Arc<Vec<u8>>,
 }
 
 /// Article cache using LRU eviction with TTL

@@ -10,6 +10,15 @@ pub mod buffer {
     /// Default buffer size for general I/O operations
     pub const DEFAULT_SIZE: usize = 8192;
 
+    /// Large buffer size for high-throughput reading (4MB)
+    /// Used for BufReader when reading large responses
+    /// Covers most Usenet articles in a single buffer
+    pub const LARGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+    
+    /// Medium buffer size for pooled connections (256KB)
+    /// Balances performance with memory usage when many connections are active
+    pub const MEDIUM_BUFFER_SIZE: usize = 256 * 1024;
+
     /// Buffer size for reading commands from clients
     pub const COMMAND_SIZE: usize = 512;
 
@@ -18,6 +27,22 @@ pub mod buffer {
 
     /// Initial capacity for response accumulation buffers
     pub const RESPONSE_INITIAL_CAPACITY: usize = 8192;
+}
+
+/// Socket buffer size constants
+pub mod socket {
+    /// TCP socket receive buffer size for high-throughput transfers (16MB)
+    pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024;
+    
+    /// TCP socket send buffer size for high-throughput transfers (16MB)
+    pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024;
+    
+    /// TCP socket receive buffer size for connection pools (4MB)
+    /// Smaller than high-throughput to avoid memory exhaustion with many connections
+    pub const POOL_RECV_BUFFER: usize = 4 * 1024 * 1024;
+    
+    /// TCP socket send buffer size for connection pools (4MB)
+    pub const POOL_SEND_BUFFER: usize = 4 * 1024 * 1024;
 }
 
 /// Timeout constants

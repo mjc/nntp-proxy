@@ -73,11 +73,12 @@ impl CachingSession {
         let (client_read, mut client_write) = client_stream.split();
         let (backend_read, mut backend_write) = backend_conn.split();
         let mut client_reader = BufReader::new(client_read);
-        let mut backend_reader = BufReader::new(backend_read);
+        let mut backend_reader = BufReader::with_capacity(buffer::MEDIUM_BUFFER_SIZE, backend_read);
 
         let mut client_to_backend_bytes = 0u64;
         let mut backend_to_client_bytes = 0u64;
         let mut line = String::with_capacity(buffer::COMMAND_SIZE);
+        let mut first_line = Vec::new(); // Reusable buffer for first line reads
 
         debug!("Caching session for client {} starting", self.client_addr);
 
@@ -148,7 +149,7 @@ impl CachingSession {
                                     client_to_backend_bytes += line.len() as u64;
 
                                     // Read response using read_until for efficiency
-                                    let mut first_line = Vec::new();
+                                    first_line.clear();
                                     backend_reader.read_until(b'\n', &mut first_line).await?;
 
                                     if first_line.is_empty() {
@@ -156,22 +157,33 @@ impl CachingSession {
                                         break;
                                     }
 
-                                    let mut response_buffer = first_line.clone();
+                                    // Move first_line into response_buffer to avoid clone
+                                    let mut response_buffer = Vec::new();
+                                    std::mem::swap(&mut response_buffer, &mut first_line);
                                     
-                                    let is_multiline = parse_multiline_status(&first_line);
+                                    // Check for backend disconnect (205 status)
+                                    if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
+                                        debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
+                                        client_write.write_all(&response_buffer).await?;
+                                        client_write.flush().await?;
+                                        backend_to_client_bytes += response_buffer.len() as u64;
+                                        break;
+                                    }
+                                    
+                                    let is_multiline = parse_multiline_status(&response_buffer);
 
                                     if is_multiline {
                                         loop {
-                                            let mut line_buf = Vec::new();
-                                            backend_reader.read_until(b'\n', &mut line_buf).await?;
+                                            let start_pos = response_buffer.len();
+                                            backend_reader.read_until(b'\n', &mut response_buffer).await?;
                                             
-                                            if line_buf.is_empty() {
+                                            if response_buffer.len() == start_pos {
                                                 break;
                                             }
                                             
-                                            response_buffer.extend_from_slice(&line_buf);
-                                            
-                                            if line_buf == b".\r\n" || line_buf == b".\n" {
+                                            // Check for end marker by examining just the new data
+                                            let new_data = &response_buffer[start_pos..];
+                                            if new_data == b".\r\n" || new_data == b".\n" {
                                                 break;
                                             }
                                         }
@@ -188,7 +200,7 @@ impl CachingSession {
                                     client_to_backend_bytes += line.len() as u64;
 
                                     // Read first line of response using read_until for efficiency
-                                    let mut first_line = Vec::new();
+                                    first_line.clear();
                                     backend_reader.read_until(b'\n', &mut first_line).await?;
 
                                     if first_line.is_empty() {
@@ -196,25 +208,35 @@ impl CachingSession {
                                         break;
                                     }
 
-                                    let mut response_buffer = first_line.clone();
+                                    // Move first_line into response_buffer to avoid clone
+                                    let mut response_buffer = Vec::new();
+                                    std::mem::swap(&mut response_buffer, &mut first_line);
+                                    
+                                    // Check for backend disconnect (205 status)
+                                    if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
+                                        debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
+                                        client_write.write_all(&response_buffer).await?;
+                                        client_write.flush().await?;
+                                        backend_to_client_bytes += response_buffer.len() as u64;
+                                        break;
+                                    }
                                     
                                     // Check if this is a multiline response by parsing status code
-                                    let is_multiline = parse_multiline_status(&first_line);
+                                    let is_multiline = parse_multiline_status(&response_buffer);
 
                                     // Read multiline data if needed (as raw bytes)
                                     if is_multiline {
                                         loop {
-                                            let mut line_buf = Vec::new();
-                                            backend_reader.read_until(b'\n', &mut line_buf).await?;
+                                            let start_pos = response_buffer.len();
+                                            backend_reader.read_until(b'\n', &mut response_buffer).await?;
                                             
-                                            if line_buf.is_empty() {
+                                            if response_buffer.len() == start_pos {
                                                 break;
                                             }
                                             
-                                            response_buffer.extend_from_slice(&line_buf);
-                                            
-                                            // Check for end-of-multiline marker
-                                            if line_buf == b".\r\n" || line_buf == b".\n" {
+                                            // Check for end marker by examining just the new data
+                                            let new_data = &response_buffer[start_pos..];
+                                            if new_data == b".\r\n" || new_data == b".\n" {
                                                 break;
                                             }
                                         }
@@ -229,7 +251,7 @@ impl CachingSession {
                                                 self.cache.insert(
                                                     message_id,
                                                     CachedArticle {
-                                                        response: response_buffer.clone(),
+                                                        response: Arc::new(response_buffer.clone()),
                                                     }
                                                 ).await;
                                             }
