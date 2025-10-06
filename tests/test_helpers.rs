@@ -157,9 +157,14 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 }
 
 /// Create a test configuration with authentication
+///
+/// # Arguments
+/// * `server_ports` - List of (port, name, user, pass) tuples for backend servers
+///
+/// # Returns
+/// Configuration object ready for use in tests
 pub fn create_test_config_with_auth(
-    server_ports: Vec<(u16, &str, &str, &str)>, // (port, name, user, pass)
-) -> Config {
+    server_ports: Vec<(u16, &str, &str, &str)>,
     Config {
         servers: server_ports
             .into_iter()
