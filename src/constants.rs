@@ -53,15 +53,6 @@ pub mod protocol {
 
     /// Minimum response length (3-digit code + CRLF)
     pub const MIN_RESPONSE_LENGTH: usize = 5;
-
-    /// Greeting message for per-command routing mode
-    pub const GREETING_PER_COMMAND: &[u8] = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
-
-    /// Quit response
-    pub const QUIT_RESPONSE: &[u8] = b"205 Connection closing\r\n";
-
-    /// Backend error response
-    pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 }
 
 /// Connection pool constants
@@ -76,28 +67,6 @@ pub mod pool {
     pub const GET_TIMEOUT_SECS: u64 = 5;
 }
 
-/// Test-related constants
-#[cfg(test)]
-pub mod test {
-    /// Small buffer pool size for tests
-    pub const SMALL_BUFFER_SIZE: usize = 1024;
-
-    /// Small buffer pool count for tests
-    pub const SMALL_BUFFER_COUNT: usize = 4;
-
-    /// Medium buffer pool size for tests
-    pub const MEDIUM_BUFFER_SIZE: usize = 4096;
-
-    /// Medium buffer pool count for tests
-    pub const MEDIUM_BUFFER_COUNT: usize = 8;
-
-    /// Default buffer pool size for tests
-    pub const DEFAULT_BUFFER_SIZE: usize = 8192;
-
-    /// Default buffer pool count for tests
-    pub const DEFAULT_BUFFER_COUNT: usize = 10;
-}
-
 /// Per-command routing constants
 pub mod per_command_routing {
     /// Number of chunks to read ahead when checking for response terminator
@@ -105,12 +74,6 @@ pub mod per_command_routing {
 
     /// Maximum number of bytes to check for spanning terminator
     pub const MAX_TERMINATOR_SPAN_CHECK: usize = 9;
-
-    /// Streaming chunk size (64KB) for reading responses from backend
-    pub const STREAMING_CHUNK_SIZE: usize = 65536;
-
-    /// Size of the tail buffer for terminator span detection
-    pub const TERMINATOR_TAIL_SIZE: usize = 4;
 }
 
 #[cfg(test)]

@@ -153,6 +153,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
             })
             .collect(),
         health_check: Default::default(),
+        cache: None,
     }
 }
 
@@ -165,6 +166,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 /// Configuration object ready for use in tests
 pub fn create_test_config_with_auth(
     server_ports: Vec<(u16, &str, &str, &str)>,
+) -> Config {
     Config {
         servers: server_ports
             .into_iter()
@@ -178,6 +180,7 @@ pub fn create_test_config_with_auth(
             })
             .collect(),
         health_check: Default::default(),
+        cache: None,
     }
 }
 

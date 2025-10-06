@@ -57,7 +57,7 @@ impl NntpProxy {
             })
             .collect();
 
-        let buffer_pool = BufferPool::new(PROTOCOL_BUFFER_SIZE, BUFFER_POOL_SIZE);
+        let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
 
         let servers = Arc::new(config.servers);
         let connection_providers = Arc::new(connection_providers);
@@ -112,6 +112,21 @@ impl NntpProxy {
     /// Get the list of servers
     pub fn servers(&self) -> &[ServerConfig] {
         &self.servers
+    }
+
+    /// Get the router
+    pub fn router(&self) -> &Arc<router::BackendSelector> {
+        &self.router
+    }
+
+    /// Get the connection providers
+    pub fn connection_providers(&self) -> &[DeadpoolConnectionProvider] {
+        &self.connection_providers
+    }
+
+    /// Get the buffer pool
+    pub fn buffer_pool(&self) -> &BufferPool {
+        &self.buffer_pool
     }
 
     /// Common setup for client connections (prewarming and greeting)
@@ -176,7 +191,7 @@ impl NntpProxy {
         };
 
         // Apply socket optimizations for high-throughput
-        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &*backend_conn) {
+        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_conn) {
             debug!("Failed to apply socket optimizations: {}", e);
         }
 

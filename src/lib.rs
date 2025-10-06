@@ -33,12 +33,13 @@
 
 // Module declarations
 mod auth;
-mod network;
-mod protocol;
+pub mod network;
+pub mod protocol;
 mod proxy;
 mod streaming;
 
 // Public modules for integration tests
+pub mod cache;
 pub mod command;
 pub mod config;
 pub mod constants;
@@ -49,5 +50,7 @@ pub mod session;
 pub mod types;
 
 // Public exports
-pub use config::{Config, ServerConfig, create_default_config, load_config};
+pub use config::{CacheConfig, Config, ServerConfig, create_default_config, load_config};
+pub use network::SocketOptimizer;
 pub use proxy::NntpProxy;
+

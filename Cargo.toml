@@ -14,7 +14,11 @@ readme = "README.md"
 
 [[bin]]
 name = "nntp-proxy"
-path = "src/main.rs"
+path = "src/bin/nntp-proxy.rs"
+
+[[bin]]
+name = "nntp-cache-proxy"
+path = "src/bin/nntp-cache-proxy.rs"
 
 [lib]
 name = "nntp_proxy"
@@ -35,6 +39,7 @@ deadpool = "0.12.3"
 async-trait = "0.1.89"
 memchr = "2.7"  # Fast byte searching for command parsing
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
+moka = { version = "0.12", features = ["future"] }  # Async LRU cache with TTL for article caching
 
 [dev-dependencies]
 tempfile = "3.23"

@@ -1,0 +1,26 @@
+# NNTP Caching Proxy Configuration
+
+# Backend NNTP servers
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Example News Server"
+# username = "your_username"
+# password = "your_password"
+max_connections = 10
+
+# Cache configuration
+[cache]
+# Maximum number of articles to cache
+max_capacity = 10000
+# Time-to-live for cached articles in seconds (1 hour)
+ttl_secs = 3600
+
+# Health check configuration
+[health_check]
+# Interval between health checks in seconds
+interval_secs = 30
+# Timeout for each health check in seconds
+timeout_secs = 5
+# Number of consecutive failures before marking unhealthy
+unhealthy_threshold = 3
