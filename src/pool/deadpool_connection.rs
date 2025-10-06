@@ -12,11 +12,25 @@ pub struct TcpManager {
     host: String,
     port: u16,
     name: String,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 impl TcpManager {
-    pub fn new(host: String, port: u16, name: String) -> Self {
-        Self { host, port, name }
+    pub fn new(
+        host: String,
+        port: u16,
+        name: String,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            name,
+            username,
+            password,
+        }
     }
 
     /// Create an optimized TCP connection
@@ -69,7 +83,7 @@ impl TcpManager {
         }
 
         // Disable Nagle's algorithm for low latency
-        socket.set_nodelay(true)?;
+        socket.set_tcp_nodelay(true)?;
 
         // Set reuse address for quick restart
         socket.set_reuse_address(true)?;
@@ -94,19 +108,158 @@ impl managed::Manager for TcpManager {
     type Error = anyhow::Error;
 
     async fn create(&self) -> Result<TcpStream, anyhow::Error> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         debug!("Creating new TCP connection to {} for deadpool", self.name);
-        self.create_optimized_tcp_stream().await
+        let mut stream = self.create_optimized_tcp_stream().await?;
+
+        // Read and consume the greeting
+        let mut buffer = vec![0u8; 4096];
+        let n = stream.read(&mut buffer).await?;
+        let greeting = String::from_utf8_lossy(&buffer[..n]);
+        debug!(
+            "Pool connection greeting for {}: {}",
+            self.name,
+            greeting.trim()
+        );
+
+        if !greeting.starts_with("200") && !greeting.starts_with("201") {
+            return Err(anyhow::anyhow!(
+                "Backend returned non-success greeting: {}",
+                greeting.trim()
+            ));
+        }
+
+        // Authenticate if credentials are provided
+        if let Some(username) = &self.username {
+            // Send AUTHINFO USER
+            let user_command = format!("AUTHINFO USER {}\r\n", username);
+            stream.write_all(user_command.as_bytes()).await?;
+
+            // Read response
+            let n = stream.read(&mut buffer).await?;
+            let response = String::from_utf8_lossy(&buffer[..n]);
+            debug!(
+                "Pool connection AUTHINFO USER response for {}: {}",
+                self.name,
+                response.trim()
+            );
+
+            if response.starts_with("281") {
+                // Already authenticated with just username
+                debug!(
+                    "Pool connection for {} authenticated with username only",
+                    self.name
+                );
+            } else if response.starts_with("381") {
+                // Password required
+                if let Some(password) = &self.password {
+                    let pass_command = format!("AUTHINFO PASS {}\r\n", password);
+                    stream.write_all(pass_command.as_bytes()).await?;
+
+                    // Read final auth response
+                    let n = stream.read(&mut buffer).await?;
+                    let response = String::from_utf8_lossy(&buffer[..n]);
+                    debug!(
+                        "Pool connection AUTHINFO PASS response for {}: {}",
+                        self.name,
+                        response.trim()
+                    );
+
+                    if !response.starts_with("281") {
+                        return Err(anyhow::anyhow!(
+                            "Authentication failed for {}: {}",
+                            self.name,
+                            response.trim()
+                        ));
+                    }
+                    debug!(
+                        "Pool connection for {} authenticated successfully",
+                        self.name
+                    );
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Password required but not provided for {}",
+                        self.name
+                    ));
+                }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Unexpected AUTHINFO USER response for {}: {}",
+                    self.name,
+                    response.trim()
+                ));
+            }
+        }
+
+        Ok(stream)
     }
 
     async fn recycle(
         &self,
-        _conn: &mut TcpStream,
+        conn: &mut TcpStream,
         _: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
-        // For NNTP connections, we don't do invasive health checks that might consume data
-        // The connection will be tested when actually used for communication
-        debug!("Connection to {} recycled successfully", self.name);
-        Ok(())
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::time::{Duration, timeout};
+
+        // Quick health check to detect stale connections (idle timeout on backend)
+        // Send DATE command which is stateless and has minimal overhead
+        debug!(
+            "Recycling connection to {} - performing health check",
+            self.name
+        );
+
+        // Set a reasonable timeout for the health check (3 seconds)
+        // This balances detecting dead connections vs network latency
+        let health_check = async {
+            // Send DATE command
+            conn.write_all(b"DATE\r\n").await?;
+            conn.flush().await?;
+
+            // Read response
+            let mut reader = BufReader::new(conn);
+            let mut response = String::new();
+            reader.read_line(&mut response).await?;
+
+            // Check if response indicates success (111 response)
+            if response.starts_with("111") {
+                debug!("Connection to {} is healthy", self.name);
+                Ok(())
+            } else {
+                warn!(
+                    "Connection to {} returned unexpected DATE response: {}",
+                    self.name,
+                    response.trim()
+                );
+                Err(anyhow::anyhow!(
+                    "Unexpected DATE response: {}",
+                    response.trim()
+                ))
+            }
+        };
+
+        match timeout(Duration::from_secs(3), health_check).await {
+            Ok(Ok(())) => {
+                debug!("Connection to {} recycled successfully", self.name);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                warn!("Connection to {} failed health check: {}", self.name, e);
+                Err(managed::RecycleError::Message(
+                    format!("Health check failed: {}", e).into(),
+                ))
+            }
+            Err(_) => {
+                warn!(
+                    "Connection to {} health check timed out after 3s",
+                    self.name
+                );
+                Err(managed::RecycleError::Message(
+                    "Health check timeout".into(),
+                ))
+            }
+        }
     }
 
     fn detach(&self, _conn: &mut TcpStream) {
@@ -119,7 +272,7 @@ impl managed::Manager for TcpManager {
 
 type Pool = managed::Pool<TcpManager>;
 
-/// Deadpool-based connection provider with connection pooling
+/// Deadpool-based connection provider for high-performance connection pooling
 #[derive(Debug, Clone)]
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
@@ -127,8 +280,15 @@ pub struct DeadpoolConnectionProvider {
 }
 
 impl DeadpoolConnectionProvider {
-    pub fn new(host: String, port: u16, name: String, max_size: usize) -> Self {
-        let manager = TcpManager::new(host, port, name.clone());
+    pub fn new(
+        host: String,
+        port: u16,
+        name: String,
+        max_size: usize,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Self {
+        let manager = TcpManager::new(host, port, name.clone(), username, password);
         let pool = Pool::builder(manager)
             .max_size(max_size)
             .build()
@@ -142,13 +302,10 @@ impl DeadpoolConnectionProvider {
         Self { pool, name }
     }
 
-    /// Get a connection from the pool that can be returned (for prewarming)
-    /// Unlike get_connection(), this doesn't use Object::take() so the connection can return to pool
+    /// Get a connection from the pool that is automatically returned when dropped
+    /// This is the preferred method - connections stay in pool and are reused
     pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
-        debug!(
-            "Getting pooled connection for prewarming from {}",
-            self.name
-        );
+        debug!("Getting pooled connection from {}", self.name);
         self.pool
             .get()
             .await
@@ -208,28 +365,6 @@ impl DeadpoolConnectionProvider {
 
 #[async_trait]
 impl ConnectionProvider for DeadpoolConnectionProvider {
-    async fn get_connection(&self) -> Result<TcpStream> {
-        debug!("Getting connection from pool for {}", self.name);
-
-        match self.pool.get().await {
-            Ok(conn) => {
-                debug!("Retrieved connection from pool for {}", self.name);
-                // Use Object::take() to permanently remove the connection from the pool
-                // This is appropriate for a proxy where connections aren't reused
-                use deadpool::managed::Object;
-                let stream = Object::take(conn);
-                Ok(stream)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to get connection from pool for {}: {}",
-                    self.name, e
-                );
-                Err(anyhow::anyhow!("Pool connection failed: {}", e))
-            }
-        }
-    }
-
     fn status(&self) -> PoolStatus {
         let status = self.pool.status();
         PoolStatus {

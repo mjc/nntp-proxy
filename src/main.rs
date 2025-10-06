@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
@@ -8,19 +9,23 @@ use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
-fn pin_to_cpu_cores() -> Result<()> {
+fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
     use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
 
-    // Pin to CPU cores 0-1 for optimal performance
+    // Pin to CPU cores based on number of worker threads
     // This reduces context switching and improves cache locality
     let mut cpu_set = CpuSet::new();
-    cpu_set.set(0)?; // CPU 0
-    cpu_set.set(1)?; // CPU 1
+    for core in 0..num_cores {
+        cpu_set.set(core)?;
+    }
 
     match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
         Ok(_) => {
-            info!("Successfully pinned process to CPU cores 0-1 for optimal performance");
+            info!(
+                "Successfully pinned process to {} CPU cores for optimal performance",
+                num_cores
+            );
         }
         Err(e) => {
             warn!(
@@ -34,7 +39,7 @@ fn pin_to_cpu_cores() -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores() -> Result<()> {
+fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
     info!("CPU pinning not available on this platform");
     Ok(())
 }
@@ -45,6 +50,10 @@ struct Args {
     /// Port to listen on
     #[arg(short, long, default_value = "8119")]
     port: u16,
+
+    /// Enable per-command routing mode (each command can use a different backend)
+    #[arg(short = 'r', long, default_value = "false")]
+    per_command_routing: bool,
 
     /// Configuration file path
     #[arg(short, long, default_value = "config.toml")]
@@ -61,14 +70,14 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Pin to specific CPU cores for optimal performance
-    pin_to_cpu_cores()?;
-
     // Log threading info
     let num_cpus = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
     let worker_threads = args.threads.unwrap_or(num_cpus);
+
+    // Pin to specific CPU cores for optimal performance
+    pin_to_cpu_cores(worker_threads)?;
 
     // Use different runtime based on thread count for optimal performance
     if worker_threads == 1 {
@@ -123,13 +132,20 @@ async fn run_proxy(args: Args) -> Result<()> {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
 
-    // Create proxy
-    let proxy = NntpProxy::new(config)?;
+    // Create proxy (wrapped in Arc for sharing across tasks)
+    let proxy = Arc::new(NntpProxy::new(config)?);
 
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&listen_addr).await?;
-    info!("NNTP proxy listening on {}", listen_addr);
+    if args.per_command_routing {
+        info!(
+            "NNTP proxy listening on {} (per-command routing mode)",
+            listen_addr
+        );
+    } else {
+        info!("NNTP proxy listening on {} (1:1 mode)", listen_addr);
+    }
 
     // Set up graceful shutdown
     let proxy_for_shutdown = proxy.clone();
@@ -145,11 +161,24 @@ async fn run_proxy(args: Args) -> Result<()> {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                        error!("Error handling client {}: {}", addr, e);
-                    }
-                });
+                if args.per_command_routing {
+                    // Per-command routing mode
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_clone
+                            .handle_client_per_command_routing(stream, addr)
+                            .await
+                        {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
+                } else {
+                    // Traditional 1:1 mode
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_clone.handle_client(stream, addr).await {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
+                }
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);

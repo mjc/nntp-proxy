@@ -29,8 +29,25 @@
       nativeBuildInputs = with pkgs; [
         rustToolchain
         pkg-config
+
+        # Performance profiling
         cargo-flamegraph
         linuxPackages.perf
+
+        # Code quality & linting
+        cargo-deny
+        cargo-audit
+
+        # Testing & coverage
+        cargo-tarpaulin
+        cargo-nextest
+        cargo-mutants
+
+        # Build & dependencies
+        cargo-outdated
+        cargo-bloat
+
+        # Utilities
         gh
       ];
 
@@ -61,8 +78,26 @@
           echo "   cargo run         - Run the NNTP proxy"
           echo "   cargo test        - Run tests"
           echo "   cargo clippy      - Run linter"
+          echo "   cargo fmt         - Format code"
+          echo ""
+          echo "🔍 Code quality:"
+          echo "   cargo deny check  - Check dependencies for security/licenses"
+          echo "   cargo audit       - Check for security vulnerabilities"
+          echo ""
+          echo "🧪 Testing & coverage:"
+          echo "   cargo nextest run - Fast test runner"
+          echo "   cargo tarpaulin   - Code coverage analysis"
+          echo "   cargo mutants     - Mutation testing"
+          echo ""
+          echo "⚡ Performance:"
           echo "   cargo flamegraph  - Generate performance flamegraph"
+          echo "   cargo bench       - Run benchmarks"
           echo "   perf              - Linux performance analysis tools"
+          echo ""
+          echo "📊 Dependencies:"
+          echo "   cargo outdated    - Check for outdated dependencies"
+          echo "   cargo tree        - Visualize dependency tree"
+          echo "   cargo bloat       - Find what takes up space in binary"
           echo ""
         '';
 
