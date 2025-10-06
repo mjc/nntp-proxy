@@ -135,11 +135,9 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     };
 
     // Set up cache configuration
-    let cache_config = config.cache.clone().unwrap_or({
-        CacheConfig {
-            max_capacity: args.cache_capacity,
-            ttl_secs: args.cache_ttl,
-        }
+    let cache_config = config.cache.clone().unwrap_or(CacheConfig {
+        max_capacity: args.cache_capacity,
+        ttl_secs: args.cache_ttl,
     });
 
     info!(

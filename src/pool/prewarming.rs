@@ -16,22 +16,23 @@ use crate::protocol::{BATCH_DELAY_MS, PREWARMING_BATCH_SIZE};
 #[derive(Debug, Clone)]
 pub struct PoolPrewarmer {
     /// Connection providers for each backend
-    providers: Arc<Vec<DeadpoolConnectionProvider>>,
-    /// Server configurations
-    servers: Arc<Vec<ServerConfig>>,
+    providers: Vec<DeadpoolConnectionProvider>,
+    /// Server configurations  
+    servers: Vec<ServerConfig>,
     /// Track if pools have been prewarmed to avoid redundant prewarming
+    /// Wrapped in Arc to share state across clones
     prewarmed: Arc<AtomicBool>,
 }
 
 impl PoolPrewarmer {
     /// Create a new pool prewarmer
     pub fn new(
-        providers: Arc<Vec<DeadpoolConnectionProvider>>,
-        servers: Arc<Vec<ServerConfig>>,
+        providers: &[DeadpoolConnectionProvider],
+        servers: &[ServerConfig],
     ) -> Self {
         Self {
-            providers,
-            servers,
+            providers: providers.to_vec(),
+            servers: servers.to_vec(),
             prewarmed: Arc::new(AtomicBool::new(false)),
         }
     }

@@ -15,11 +15,11 @@ use crate::protocol::NNTP_COMMAND_NOT_SUPPORTED;
 /// Extract message-ID from command arguments
 fn extract_message_id(command: &str) -> Option<String> {
     let trimmed = command.trim();
-    if let Some(start) = trimmed.find('<')
-        && let Some(end) = trimmed[start..].find('>') {
-            return Some(trimmed[start..start + end + 1].to_string());
-        }
-    None
+    trimmed.find('<').and_then(|start| {
+        trimmed[start..].find('>').map(|end| {
+            trimmed[start..start + end + 1].to_string()
+        })
+    })
 }
 
 /// Check if command is cacheable (ARTICLE/BODY/HEAD/STAT with message-ID)
@@ -30,6 +30,15 @@ fn is_cacheable_command(command: &str) -> bool {
         || upper.starts_with("HEAD ") 
         || upper.starts_with("STAT "))
         && extract_message_id(command).is_some()
+}
+
+/// Parse status code from binary data and determine if it's a multiline response
+fn parse_multiline_status(data: &[u8]) -> bool {
+    String::from_utf8(data.to_vec())
+        .ok()
+        .and_then(|line| parse_status_code(&line))
+        .map(is_multiline_status)
+        .unwrap_or(false)
 }
 
 /// Caching session that wraps standard session with article cache
@@ -149,13 +158,7 @@ impl CachingSession {
 
                                     let mut response_buffer = first_line.clone();
                                     
-                                    let is_multiline = if let Ok(status_line) = String::from_utf8(first_line.clone()) {
-                                        parse_status_code(&status_line)
-                                            .map(is_multiline_status)
-                                            .unwrap_or(false)
-                                    } else {
-                                        false
-                                    };
+                                    let is_multiline = parse_multiline_status(&first_line);
 
                                     if is_multiline {
                                         loop {
@@ -196,13 +199,7 @@ impl CachingSession {
                                     let mut response_buffer = first_line.clone();
                                     
                                     // Check if this is a multiline response by parsing status code
-                                    let is_multiline = if let Ok(status_line) = String::from_utf8(first_line.clone()) {
-                                        parse_status_code(&status_line)
-                                            .map(is_multiline_status)
-                                            .unwrap_or(false)
-                                    } else {
-                                        false
-                                    };
+                                    let is_multiline = parse_multiline_status(&first_line);
 
                                     // Read multiline data if needed (as raw bytes)
                                     if is_multiline {

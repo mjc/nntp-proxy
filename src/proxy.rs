@@ -24,7 +24,7 @@ pub struct NntpProxy {
     /// Backend selector for round-robin load balancing
     router: Arc<router::BackendSelector>,
     /// Connection providers per server - easily swappable implementation
-    connection_providers: Arc<Vec<DeadpoolConnectionProvider>>,
+    connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
     /// Pool prewarmer for managing connection prewarming
@@ -60,24 +60,22 @@ impl NntpProxy {
         let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
 
         let servers = Arc::new(config.servers);
-        let connection_providers = Arc::new(connection_providers);
 
         // Create backend selector and add all backends
-        let router = {
+        let router = Arc::new({
             use types::BackendId;
-            let mut r = router::BackendSelector::new();
-
-            for (idx, provider) in connection_providers.iter().enumerate() {
-                let backend_id = BackendId::from_index(idx);
-                let server = &servers[idx];
-                r.add_backend(backend_id, server.name.clone(), provider.clone());
-            }
-
-            Arc::new(r)
-        };
+            connection_providers
+                .iter()
+                .enumerate()
+                .fold(router::BackendSelector::new(), |mut r, (idx, provider)| {
+                    let backend_id = BackendId::from_index(idx);
+                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
+                    r
+                })
+        });
 
         // Create pool prewarmer
-        let prewarmer = PoolPrewarmer::new(connection_providers.clone(), servers.clone());
+        let prewarmer = PoolPrewarmer::new(&connection_providers, &servers);
 
         Ok(Self {
             servers,
@@ -102,7 +100,7 @@ impl NntpProxy {
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown of all connection pools...");
 
-        for provider in self.connection_providers.iter() {
+        for provider in &self.connection_providers {
             provider.graceful_shutdown().await;
         }
 
