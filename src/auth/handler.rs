@@ -1,6 +1,6 @@
 //! Client authentication handling
 
-use crate::protocol::{NNTP_AUTH_ACCEPTED, NNTP_PASSWORD_REQUIRED};
+use crate::constants::protocol;
 
 /// Handles client-facing authentication interception
 pub struct AuthHandler;
@@ -8,12 +8,12 @@ pub struct AuthHandler;
 impl AuthHandler {
     /// Get the response for AUTHINFO USER command
     pub fn user_response() -> &'static [u8] {
-        NNTP_PASSWORD_REQUIRED
+        protocol::AUTH_REQUIRED
     }
 
     /// Get the response for AUTHINFO PASS command
     pub fn pass_response() -> &'static [u8] {
-        NNTP_AUTH_ACCEPTED
+        protocol::AUTH_ACCEPTED
     }
 }
 

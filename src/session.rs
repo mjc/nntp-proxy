@@ -12,9 +12,8 @@ use tracing::{debug, error, warn};
 
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
-use crate::constants::buffer;
+use crate::constants::{buffer, per_command_routing, protocol};
 use crate::pool::BufferPool;
-use crate::protocol::NNTP_COMMAND_NOT_SUPPORTED;
 use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
@@ -122,8 +121,8 @@ impl ClientSession {
                                 }
                                 CommandAction::Reject(_reason) => {
                                     warn!("Rejecting command from client {}: {}", self.client_addr, trimmed);
-                                    client_write.write_all(NNTP_COMMAND_NOT_SUPPORTED).await?;
-                                    backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
+                                    client_write.write_all(protocol::COMMAND_NOT_SUPPORTED).await?;
+                                    backend_to_client_bytes += protocol::COMMAND_NOT_SUPPORTED.len() as u64;
                                 }
                                 CommandAction::ForwardHighThroughput => {
                                     // Forward article retrieval by message-ID to backend
@@ -202,9 +201,8 @@ impl ClientSession {
         let mut backend_to_client_bytes = 0u64;
 
         // Send initial greeting to client
-        let greeting = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
-        client_write.write_all(greeting).await?;
-        backend_to_client_bytes += greeting.len() as u64;
+        client_write.write_all(protocol::GREETING_PER_COMMAND).await?;
+        backend_to_client_bytes += protocol::GREETING_PER_COMMAND.len() as u64;
 
         debug!(
             "Client {} sent greeting, entering command loop",
@@ -234,9 +232,8 @@ impl ClientSession {
 
                     // Handle QUIT locally
                     if trimmed.eq_ignore_ascii_case("QUIT") {
-                        let response = b"205 Connection closing\r\n";
-                        client_write.write_all(response).await?;
-                        backend_to_client_bytes += response.len() as u64;
+                        client_write.write_all(protocol::QUIT_RESPONSE).await?;
+                        backend_to_client_bytes += protocol::QUIT_RESPONSE.len() as u64;
                         break;
                     }
 
@@ -257,8 +254,8 @@ impl ClientSession {
                                 "Rejecting command from client {}: {} ({})",
                                 self.client_addr, trimmed, reason
                             );
-                            client_write.write_all(NNTP_COMMAND_NOT_SUPPORTED).await?;
-                            backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
+                            client_write.write_all(protocol::COMMAND_NOT_SUPPORTED).await?;
+                            backend_to_client_bytes += protocol::COMMAND_NOT_SUPPORTED.len() as u64;
                             continue;
                         }
                         CommandAction::ForwardStateless | CommandAction::ForwardHighThroughput => {
@@ -279,9 +276,8 @@ impl ClientSession {
                                         "Error routing command for client {}: {}",
                                         self.client_addr, e
                                     );
-                                    let error_response = b"503 Backend error\r\n";
-                                    let _ = client_write.write_all(error_response).await;
-                                    backend_to_client_bytes += error_response.len() as u64;
+                                    let _ = client_write.write_all(protocol::BACKEND_ERROR).await;
+                                    backend_to_client_bytes += protocol::BACKEND_ERROR.len() as u64;
                                 }
                             }
                         }
@@ -362,7 +358,7 @@ impl ClientSession {
         // Use direct reading from backend - no split() to avoid mutex overhead
         use tokio::io::AsyncReadExt;
 
-        let mut chunk = vec![0u8; 65536]; // 64KB chunks
+        let mut chunk = vec![0u8; per_command_routing::STREAMING_CHUNK_SIZE];
         let mut total_bytes = 0;
 
         // Read first chunk to determine response type
@@ -402,15 +398,15 @@ impl ClientSession {
                 // For multiline responses, use pipelined streaming
                 // Prepare double buffering for concurrent read/write
                 let mut chunk1 = chunk; // Reuse first buffer
-                let mut chunk2 = vec![0u8; 65536]; // Second buffer for pipelining
+                let mut chunk2 = vec![0u8; per_command_routing::STREAMING_CHUNK_SIZE];
 
-                let mut tail: [u8; 4] = [0; 4]; // Fixed-size tail for span detection
+                let mut tail: [u8; per_command_routing::TERMINATOR_TAIL_SIZE] = [0; per_command_routing::TERMINATOR_TAIL_SIZE];
                 let mut tail_len: usize = 0; // How much of tail is valid
 
                 // Initialize tail with last bytes of first chunk (already written above)
-                if n >= 4 {
-                    tail.copy_from_slice(&chunk1[n - 4..n]);
-                    tail_len = 4;
+                if n >= per_command_routing::TERMINATOR_TAIL_SIZE {
+                    tail.copy_from_slice(&chunk1[n - per_command_routing::TERMINATOR_TAIL_SIZE..n]);
+                    tail_len = per_command_routing::TERMINATOR_TAIL_SIZE;
                 } else if n > 0 {
                     tail[..n].copy_from_slice(&chunk1[..n]);
                     tail_len = n;
@@ -474,9 +470,9 @@ impl ClientSession {
                             }
 
                             // Update tail for next iteration (only last 4 bytes)
-                            if current_n >= 4 {
-                                tail.copy_from_slice(&current_chunk[current_n - 4..current_n]);
-                                tail_len = 4;
+                            if current_n >= per_command_routing::TERMINATOR_TAIL_SIZE {
+                                tail.copy_from_slice(&current_chunk[current_n - per_command_routing::TERMINATOR_TAIL_SIZE..current_n]);
+                                tail_len = per_command_routing::TERMINATOR_TAIL_SIZE;
                             } else if current_n > 0 {
                                 tail[..current_n].copy_from_slice(&current_chunk[..current_n]);
                                 tail_len = current_n;
@@ -513,12 +509,13 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::test;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn test_client_session_creation() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
         let session = ClientSession::new(addr, buffer_pool.clone());
 
         assert_eq!(session.client_addr.port(), 8080);
@@ -530,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_client_session_with_different_ports() {
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
 
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let session1 = ClientSession::new(addr1, buffer_pool.clone());
@@ -545,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_client_session_with_ipv6() {
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
         let addr = SocketAddr::new(IpAddr::V6("::1".parse().unwrap()), 8119);
         let session = ClientSession::new(addr, buffer_pool);
 
@@ -555,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_cloning() {
-        let buffer_pool = BufferPool::new(8192, 10);
+        let buffer_pool = BufferPool::new(test::DEFAULT_BUFFER_SIZE, test::DEFAULT_BUFFER_COUNT);
         let buffer_pool_clone = buffer_pool.clone();
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 1234);
@@ -568,7 +565,7 @@ mod tests {
     #[test]
     fn test_session_addr_formatting() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5555);
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
         let session = ClientSession::new(addr, buffer_pool);
 
         let addr_str = format!("{}", session.client_addr);
@@ -578,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_multiple_sessions_same_buffer_pool() {
-        let buffer_pool = BufferPool::new(4096, 8);
+        let buffer_pool = BufferPool::new(test::MEDIUM_BUFFER_SIZE, test::MEDIUM_BUFFER_COUNT);
         let sessions: Vec<_> = (0..5)
             .map(|i| {
                 let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000 + i);
@@ -594,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_loopback_address() {
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
         let session = ClientSession::new(addr, buffer_pool);
 
@@ -603,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_unspecified_address() {
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let session = ClientSession::new(addr, buffer_pool);
 
@@ -614,7 +611,7 @@ mod tests {
     #[test]
     fn test_session_without_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
         let session = ClientSession::new(addr, buffer_pool);
 
         assert!(!session.is_per_command_routing());
@@ -624,7 +621,7 @@ mod tests {
     #[test]
     fn test_session_with_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
         let router = Arc::new(BackendSelector::new());
         let session = ClientSession::new_with_router(addr, buffer_pool, router);
 
@@ -635,7 +632,7 @@ mod tests {
     #[test]
     fn test_client_id_uniqueness() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(1024, 4);
+        let buffer_pool = BufferPool::new(test::SMALL_BUFFER_SIZE, test::SMALL_BUFFER_COUNT);
 
         let session1 = ClientSession::new(addr, buffer_pool.clone());
         let session2 = ClientSession::new(addr, buffer_pool);
@@ -643,5 +640,4 @@ mod tests {
         // Each session should have a unique client ID
         assert_ne!(session1.client_id(), session2.client_id());
     }
-
 }

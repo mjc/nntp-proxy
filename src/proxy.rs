@@ -57,7 +57,7 @@ impl NntpProxy {
             })
             .collect();
 
-        let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
+        let buffer_pool = BufferPool::new(PROTOCOL_BUFFER_SIZE, BUFFER_POOL_SIZE);
 
         let servers = Arc::new(config.servers);
         let connection_providers = Arc::new(connection_providers);
