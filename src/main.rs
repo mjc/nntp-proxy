@@ -51,9 +51,9 @@ struct Args {
     #[arg(short, long, default_value = "8119")]
     port: u16,
 
-    /// Enable multiplexing mode (experimental)
-    #[arg(long, default_value = "false")]
-    multiplex: bool,
+    /// Enable per-command routing mode (each command can use a different backend)
+    #[arg(short = 'r', long, default_value = "false")]
+    per_command_routing: bool,
 
     /// Configuration file path
     #[arg(short, long, default_value = "config.toml")]
@@ -138,12 +138,11 @@ async fn run_proxy(args: Args) -> Result<()> {
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&listen_addr).await?;
-    if args.multiplex {
+    if args.per_command_routing {
         info!(
-            "NNTP proxy listening on {} (multiplexing mode - EXPERIMENTAL)",
+            "NNTP proxy listening on {} (per-command routing mode)",
             listen_addr
         );
-        warn!("Multiplexing mode is experimental and not fully functional yet");
     } else {
         info!("NNTP proxy listening on {} (1:1 mode)", listen_addr);
     }
@@ -162,11 +161,11 @@ async fn run_proxy(args: Args) -> Result<()> {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
-                if args.multiplex {
-                    // Multiplexing mode (experimental)
+                if args.per_command_routing {
+                    // Per-command routing mode
                     tokio::spawn(async move {
                         if let Err(e) = proxy_clone
-                            .handle_client_multiplexed(stream, addr)
+                            .handle_client_per_command_routing(stream, addr)
                             .await
                         {
                             error!("Error handling client {}: {}", addr, e);

@@ -40,8 +40,8 @@ pub enum NntpCommand {
     AuthPass,
     /// Stateful commands that require GROUP context - REJECTED in stateless mode
     Stateful,
-    /// Commands that cannot be multiplexed - REJECTED in multiplexing mode
-    NonMultiplexable,
+    /// Commands that cannot work with per-command routing - REJECTED in per-command routing mode
+    NonRoutable,
     /// Stateless commands that can be safely proxied without state
     Stateless,
     /// Article retrieval by message-ID (stateless) - can be proxied
@@ -140,13 +140,13 @@ impl NntpCommand {
             return Self::Stateful;
         }
 
-        // Non-multiplexable commands (very rare in typical usage)
+        // Non-routable commands (very rare in typical usage)
         if matches_any(cmd, POST_CASES)
             || matches_any(cmd, IHAVE_CASES)
             || matches_any(cmd, NEWGROUPS_CASES)
             || matches_any(cmd, NEWNEWS_CASES)
         {
-            return Self::NonMultiplexable;
+            return Self::NonRoutable;
         }
 
         // Unknown commands - treat as stateless (forward and let backend decide)
@@ -414,43 +414,43 @@ mod tests {
     }
 
     #[test]
-    fn test_non_multiplexable_commands() {
-        // POST command - cannot be multiplexed
-        assert_eq!(NntpCommand::classify("POST"), NntpCommand::NonMultiplexable);
+    fn test_non_routable_commands() {
+        // POST command - cannot be routed per-command
+        assert_eq!(NntpCommand::classify("POST"), NntpCommand::NonRoutable);
 
-        // IHAVE command - cannot be multiplexed
+        // IHAVE command - cannot be routed per-command
         assert_eq!(
             NntpCommand::classify("IHAVE <test@example.com>"),
-            NntpCommand::NonMultiplexable
+            NntpCommand::NonRoutable
         );
 
-        // NEWGROUPS command - cannot be multiplexed
+        // NEWGROUPS command - cannot be routed per-command
         assert_eq!(
             NntpCommand::classify("NEWGROUPS 20240101 000000 GMT"),
-            NntpCommand::NonMultiplexable
+            NntpCommand::NonRoutable
         );
 
-        // NEWNEWS command - cannot be multiplexed
+        // NEWNEWS command - cannot be routed per-command
         assert_eq!(
             NntpCommand::classify("NEWNEWS * 20240101 000000 GMT"),
-            NntpCommand::NonMultiplexable
+            NntpCommand::NonRoutable
         );
     }
 
     #[test]
-    fn test_non_multiplexable_case_insensitive() {
-        assert_eq!(NntpCommand::classify("post"), NntpCommand::NonMultiplexable);
+    fn test_non_routable_case_insensitive() {
+        assert_eq!(NntpCommand::classify("post"), NntpCommand::NonRoutable);
 
-        assert_eq!(NntpCommand::classify("Post"), NntpCommand::NonMultiplexable);
+        assert_eq!(NntpCommand::classify("Post"), NntpCommand::NonRoutable);
 
         assert_eq!(
             NntpCommand::classify("IHAVE <msg>"),
-            NntpCommand::NonMultiplexable
+            NntpCommand::NonRoutable
         );
 
         assert_eq!(
             NntpCommand::classify("ihave <msg>"),
-            NntpCommand::NonMultiplexable
+            NntpCommand::NonRoutable
         );
     }
 }

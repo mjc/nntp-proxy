@@ -1,6 +1,6 @@
 # NNTP Proxy
 
-A high-performance stateless NNTP proxy server written in Rust, designed for message-ID based article retrieval with optional connection multiplexing.
+A high-performance NNTP proxy server written in Rust, with round-robin load balancing and optional per-command routing.
 
 ## Key Features
 
@@ -8,7 +8,7 @@ A high-performance stateless NNTP proxy server written in Rust, designed for mes
 - ⚡ **High performance** - Lock-free routing, zero-allocation command parsing, optimized I/O
 - 🏥 **Health checking** - Automatic backend health monitoring with failure detection
 - 🔐 **Authentication** - Proxy-level authentication, backends pre-authenticated
-- 🔀 **Multiplexing mode** - Optional per-command routing to different backends
+- 🔀 **Per-command routing mode** - Optional stateless routing for resource efficiency
 - 📊 **Connection pooling** - Efficient connection reuse with configurable limits
 - ⚙️ **TOML configuration** - Simple, readable configuration with sensible defaults
 - 🔍 **Structured logging** - Detailed tracing for debugging and monitoring
@@ -32,7 +32,7 @@ A high-performance stateless NNTP proxy server written in Rust, designed for mes
 This NNTP proxy offers two operating modes:
 
 1. **Standard mode** (default) - Full NNTP proxy with complete command support
-2. **Multiplexing mode** (`--multiplex`) - Stateless per-command routing for better resource utilization
+2. **Per-command routing mode** (`--per-command-routing` or `-r`) - Stateless routing for resource efficiency
 
 ### Design Goals
 
@@ -49,22 +49,23 @@ This NNTP proxy offers two operating modes:
 - Load balancing with full protocol support
 - Drop-in replacement for direct backend connections
 
-✅ **Multiplexing mode - Good for:**
+✅ **Per-command routing mode - Good for:**
 - Message-ID based article retrieval
 - Indexing and search tools
 - Metadata-heavy workloads
-- Maximizing backend connection efficiency
+- Distributing load across multiple backends
 
 ❌ **Not suitable for:**
 - Applications requiring custom NNTP extensions (unless in standard mode)
+- Scenarios requiring true concurrent request processing (NNTP doesn't support this)
 
 ## Limitations
 
-### Multiplexing Mode Restrictions
+### Per-Command Routing Mode Restrictions
 
-When running in **multiplexing mode** (`--multiplex`), the proxy rejects stateful commands to enable per-command routing:
+When running in **per-command routing mode** (`--per-command-routing` or `-r`), the proxy rejects stateful commands:
 
-**Rejected in multiplexing mode:**
+**Rejected in per-command routing mode:**
 - Group navigation: `GROUP`, `NEXT`, `LAST`, `LISTGROUP`
 - Article retrieval by number: `ARTICLE 123`, `HEAD 123`, `BODY 123`
 - Overview commands: `XOVER`, `OVER`, `XHDR`, `HDR`
@@ -76,7 +77,7 @@ When running in **multiplexing mode** (`--multiplex`), the proxy rejects statefu
 
 ### Standard Mode (Default)
 
-In **standard mode** (without `--multiplex`):
+In **standard mode** (without `--per-command-routing`):
 - ✅ **All NNTP commands are supported** - full bidirectional forwarding
 - ✅ Compatible with traditional newsreaders (tin, slrn, Thunderbird)
 - ✅ Stateful operations work normally (GROUP, NEXT, LAST, etc.)
@@ -205,9 +206,9 @@ nntp-proxy [OPTIONS]
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
 | `--port <PORT>` | `-p` | Listen port | 8119 |
+| `--per-command-routing` | `-r` | Enable per-command routing mode | false |
 | `--config <FILE>` | `-c` | Config file path | config.toml |
-| `--multiplex` | - | Enable multiplexing mode | false |
-| `--threads <NUM>` | - | Tokio worker threads | CPU cores |
+| `--threads <NUM>` | `-t` | Tokio worker threads | CPU cores |
 | `--help` | `-h` | Show help | - |
 | `--version` | `-V` | Show version | - |
 
@@ -220,8 +221,11 @@ nntp-proxy
 # Custom port and config
 nntp-proxy --port 8120 --config production.toml
 
-# Multiplexing mode (per-command routing)
-nntp-proxy --multiplex
+# Per-command routing mode (long form)
+nntp-proxy --per-command-routing
+
+# Per-command routing mode (short form)
+nntp-proxy -r
 
 # Single-threaded for debugging
 nntp-proxy --threads 1
@@ -236,15 +240,17 @@ nntp-proxy --port 119 --config /etc/nntp-proxy/config.toml
 
 - One backend connection per client
 - Simple 1:1 connection forwarding
+- All NNTP commands supported
 - Lower overhead, easier debugging
 
-#### Multiplexing Mode (`--multiplex`)
+#### Per-Command Routing Mode (`-r` / `--per-command-routing`)
 
-- Per-command routing to backends
+- Each command routed to next backend (round-robin)
+- Commands processed serially (one at a time)
 - Multiple clients share backend pool
 - Health-aware routing
-- Better resource utilization
-- Slightly higher complexity
+- Better resource distribution
+- Stateful commands rejected
 
 ## Architecture
 
@@ -261,7 +267,7 @@ The codebase is organized into focused modules with clear responsibilities:
 | `health/` | Backend health monitoring system |
 | `pool/` | Connection and buffer pooling |
 | `protocol/` | NNTP protocol constants and parsing |
-| `router/` | Request routing and multiplexing |
+| `router/` | Backend selection and load balancing |
 | `session/` | Client session lifecycle management |
 | `types/` | Core type definitions (IDs, etc.) |
 
@@ -283,7 +289,7 @@ Bidirectional Data Forwarding
 Connection Cleanup
 ```
 
-#### Multiplexing Mode Flow
+#### Per-Command Routing Mode Flow
 
 ```
 Client Connection
@@ -294,19 +300,20 @@ Classify Command
     ↓
 Route to Healthy Backend (round-robin)
     ↓
-Execute on Backend Connection
+Execute on Backend Connection (BLOCKS)
     ↓
 Stream Response to Client
     ↓
-Repeat (each command independent)
+Repeat (commands processed serially)
 ```
 
 ### Key Design Decisions
 
-1. **Stateless Architecture**
-   - No session state maintained
-   - Enables connection multiplexing
-   - Simpler, more reliable
+1. **Serial Processing**
+   - NNTP processes one command at a time
+   - Each command blocks until response received
+   - No concurrent request handling possible
+   - Round-robin distributes load across backends
 
 2. **Connection Pooling**
    - Pre-authenticated connections
@@ -341,7 +348,7 @@ This proxy implements several performance optimizations:
 ### Performance Characteristics
 
 - **CPU Usage**: Low overhead with lock-free routing and zero-allocation parsing
-  - Multiplexing mode: ~15% of one core for 80 connections at 105MB/s (AMD Ryzen 9 5950X, single-threaded configuration)
+  - Per-command routing mode: ~15% of one core for 80 connections at 105MB/s (AMD Ryzen 9 5950X, single-threaded configuration)
 - **Memory**: Constant usage regardless of article size (no response buffering)
 - **Throughput**: Typically limited by backend servers, not the proxy
 - **Scalability**: Efficiently handles hundreds of concurrent connections
@@ -354,8 +361,8 @@ To generate a performance flamegraph for analysis:
 # Install cargo-flamegraph (if using Nix, it's already available)
 cargo install flamegraph
 
-# Run with flamegraph profiling
-cargo flamegraph --bin nntp-proxy -- --config config.toml --multiplex --threads 1
+# Run with flamegraph profiling (per-command routing mode)
+cargo flamegraph --bin nntp-proxy -- --config config.toml -r --threads 1
 
 # Open flamegraph.svg in a browser to analyze CPU hotspots
 ```
@@ -497,12 +504,12 @@ For performance testing, create custom scripts that:
 - Check backend server logs
 
 **"Command not supported" errors**
-- Proxy rejects stateful commands (GROUP, NEXT, etc.)
+- In per-command routing mode, stateful commands are rejected (GROUP, NEXT, etc.)
 - Use message-ID based retrieval instead
-- For stateful operations, connect directly to backend
+- For stateful operations, use standard mode or connect directly to backend
 
 **High CPU usage**
-- Enable multiplexing mode: `--multiplex`
+- Try per-command routing mode: `-r` or `--per-command-routing`
 - Reduce worker threads: `--threads 1`
 - Check health check interval (increase if too frequent)
 
@@ -538,7 +545,6 @@ RUST_LOG=nntp_proxy::router=debug,nntp_proxy::health=debug nntp-proxy
 - [ ] Prometheus metrics endpoint
 - [ ] Configuration hot-reload
 - [ ] IPv6 support
-- [ ] True async response demultiplexer
 - [ ] Connection affinity mode
 - [ ] Admin/stats HTTP endpoint
 
@@ -547,10 +553,11 @@ RUST_LOG=nntp_proxy::router=debug,nntp_proxy::health=debug nntp-proxy
 - [x] Lock-free routing
 - [x] Zero-allocation command parsing
 - [x] Health checking system
-- [x] Multiplexing mode
+- [x] Per-command routing mode
 - [x] Pre-authenticated connections
 - [x] TOML configuration
 - [x] Connection pooling
+- [x] Renamed terminology from "multiplexing" to "per-command routing"
 
 ## Contributing
 

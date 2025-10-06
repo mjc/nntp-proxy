@@ -1,7 +1,7 @@
 //! # NNTP Proxy Library
 //!
-//! A high-performance, stateless NNTP proxy server implementation designed
-//! for future connection multiplexing capabilities.
+//! A high-performance NNTP proxy server implementation with two operating modes:
+//! 1:1 mode (one backend per client) and per-command routing mode.
 //!
 //! ## Architecture
 //!
@@ -13,7 +13,7 @@
 //! - **pool**: Connection and buffer pooling for high performance
 //! - **protocol**: NNTP protocol constants and response parsing
 //! - **proxy**: Main proxy orchestration (NntpProxy struct)
-//! - **router**: Request routing and multiplexing coordination
+//! - **router**: Backend selection and load balancing
 //! - **types**: Core type definitions (ClientId, RequestId, BackendId)
 //!
 //! ## Design Philosophy
@@ -22,14 +22,14 @@
 //! maintaining session state (like GROUP, NEXT, LAST). This design enables:
 //!
 //! - Simpler architecture with clear separation of concerns
-//! - Future multiplexing where multiple clients share backend connections
+//! - Per-command routing mode where each command can use a different backend
 //! - Easy testing and maintenance of individual components
 //!
-//! ## Current Implementation
+//! ## Operating Modes
 //!
-//! The current implementation uses a 1:1 client-to-backend connection model
-//! with connection pooling. The modular architecture is designed to support
-//! future conversion to a true multiplexing proxy.
+//! - **1:1 mode**: Traditional mode where each client gets a dedicated backend connection
+//! - **Per-command routing mode**: Each command is routed to a backend (round-robin),
+//!   but commands are still processed serially (NNTP is synchronous)
 
 // Module declarations
 mod auth;

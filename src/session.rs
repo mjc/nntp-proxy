@@ -15,7 +15,7 @@ use crate::command::{AuthAction, CommandAction, CommandHandler};
 use crate::constants::buffer;
 use crate::pool::BufferPool;
 use crate::protocol::NNTP_COMMAND_NOT_SUPPORTED;
-use crate::router::RequestRouter;
+use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
 
@@ -25,8 +25,8 @@ pub struct ClientSession {
     buffer_pool: BufferPool,
     /// Unique identifier for this client
     client_id: ClientId,
-    /// Optional router for multiplexed connections
-    router: Option<Arc<RequestRouter>>,
+    /// Optional router for per-command routing mode
+    router: Option<Arc<BackendSelector>>,
 }
 
 impl ClientSession {
@@ -44,7 +44,7 @@ impl ClientSession {
     pub fn new_with_router(
         client_addr: SocketAddr,
         buffer_pool: BufferPool,
-        router: Arc<RequestRouter>,
+        router: Arc<BackendSelector>,
     ) -> Self {
         Self {
             client_addr,
@@ -60,7 +60,7 @@ impl ClientSession {
     }
 
     /// Check if this session is using per-command routing mode
-    pub fn is_multiplexed(&self) -> bool {
+    pub fn is_per_command_routing(&self) -> bool {
         self.router.is_some()
     }
 
@@ -187,13 +187,13 @@ impl ClientSession {
 
     /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
-    pub async fn handle_multiplexed(&self, mut client_stream: TcpStream) -> Result<(u64, u64)> {
+    pub async fn handle_per_command_routing(&self, mut client_stream: TcpStream) -> Result<(u64, u64)> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let router = self
             .router
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Multiplexing mode requires a router"))?;
+            .ok_or_else(|| anyhow::anyhow!("Per-command routing mode requires a router"))?;
 
         let (client_read, mut client_write) = client_stream.split();
         let mut client_reader = BufReader::new(client_read);
@@ -202,7 +202,7 @@ impl ClientSession {
         let mut backend_to_client_bytes = 0u64;
 
         // Send initial greeting to client
-        let greeting = b"200 NNTP Proxy Ready (Multiplexing Mode)\r\n";
+        let greeting = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
         client_write.write_all(greeting).await?;
         backend_to_client_bytes += greeting.len() as u64;
 
@@ -300,7 +300,7 @@ impl ClientSession {
     /// Route a single command to a backend and execute it
     async fn route_and_execute_command(
         &self,
-        router: &RequestRouter,
+        router: &BackendSelector,
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut u64,
@@ -617,7 +617,7 @@ mod tests {
         let buffer_pool = BufferPool::new(1024, 4);
         let session = ClientSession::new(addr, buffer_pool);
 
-        assert!(!session.is_multiplexed());
+        assert!(!session.is_per_command_routing());
         assert_eq!(session.client_addr.port(), 8080);
     }
 
@@ -625,10 +625,10 @@ mod tests {
     fn test_session_with_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(1024, 4);
-        let router = Arc::new(RequestRouter::new());
+        let router = Arc::new(BackendSelector::new());
         let session = ClientSession::new_with_router(addr, buffer_pool, router);
 
-        assert!(session.is_multiplexed());
+        assert!(session.is_per_command_routing());
         assert_eq!(session.client_addr.port(), 8080);
     }
 

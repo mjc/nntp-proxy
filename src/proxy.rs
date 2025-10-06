@@ -21,8 +21,8 @@ use crate::types;
 #[derive(Debug, Clone)]
 pub struct NntpProxy {
     servers: Arc<Vec<ServerConfig>>,
-    /// Router handles backend selection and load balancing
-    router: Arc<router::RequestRouter>,
+    /// Backend selector for round-robin load balancing
+    router: Arc<router::BackendSelector>,
     /// Connection providers per server - easily swappable implementation
     connection_providers: Arc<Vec<DeadpoolConnectionProvider>>,
     /// Buffer pool for I/O operations
@@ -62,10 +62,10 @@ impl NntpProxy {
         let servers = Arc::new(config.servers);
         let connection_providers = Arc::new(connection_providers);
 
-        // Create router and add all backends
+        // Create backend selector and add all backends
         let router = {
             use types::BackendId;
-            let mut r = router::RequestRouter::new();
+            let mut r = router::BackendSelector::new();
 
             for (idx, provider) in connection_providers.iter().enumerate() {
                 let backend_id = BackendId::from_index(idx);
@@ -210,16 +210,16 @@ impl NntpProxy {
         Ok(())
     }
 
-    /// Handle client connection using multiplexing mode
+    /// Handle client connection using per-command routing mode
     ///
     /// This creates a session with the router, allowing commands from this client
     /// to be routed to different backends based on load balancing.
-    pub async fn handle_client_multiplexed(
+    pub async fn handle_client_per_command_routing(
         &self,
         mut client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        debug!("New multiplexed client connection from {}", client_addr);
+        debug!("New per-command routing client connection from {}", client_addr);
 
         // Enable TCP_NODELAY for low latency
         let _ = client_stream.set_nodelay(true);
@@ -227,23 +227,23 @@ impl NntpProxy {
         // Setup connection (prewarm and greeting)
         self.setup_client_connection(&mut client_stream, client_addr).await?;
 
-        // Create session with router for multiplexing
+        // Create session with router for per-command routing
         let session = ClientSession::new_with_router(client_addr, self.buffer_pool.clone(), self.router.clone());
 
         info!(
-            "Client {} (ID: {}) connected in multiplexing mode",
+            "Client {} (ID: {}) connected in per-command routing mode",
             client_addr,
             session.client_id()
         );
 
-        // Handle the session with true per-command multiplexing
-        let result = session.handle_multiplexed(client_stream).await;
+        // Handle the session with per-command routing
+        let result = session.handle_per_command_routing(client_stream).await;
 
         // Log session results
         match result {
             Ok((client_to_backend, backend_to_client)) => {
                 info!(
-                    "Multiplexed session closed for {} (ID: {}): {} bytes sent, {} bytes received",
+                    "Per-command routing session closed for {} (ID: {}): {} bytes sent, {} bytes received",
                     client_addr,
                     session.client_id(),
                     client_to_backend,
@@ -252,7 +252,7 @@ impl NntpProxy {
             }
             Err(e) => {
                 warn!(
-                    "Multiplexed session error for {} (ID: {}): {}",
+                    "Per-command routing session error for {} (ID: {}): {}",
                     client_addr,
                     session.client_id(),
                     e
@@ -261,7 +261,7 @@ impl NntpProxy {
         }
 
         debug!(
-            "Multiplexed connection closed for {} (ID: {})",
+            "Per-command routing connection closed for {} (ID: {})",
             client_addr,
             session.client_id()
         );

@@ -1,7 +1,7 @@
 //! Backend server selection and load balancing
 //!
-//! This module handles routing NNTP commands to backend servers using
-//! round-robin selection with simple load tracking.
+//! This module handles selecting backend servers using round-robin
+//! with simple load tracking for monitoring.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -24,23 +24,23 @@ struct BackendInfo {
     pending_count: Arc<AtomicUsize>,
 }
 
-/// Routes requests to backend servers using round-robin selection
+/// Selects backend servers using round-robin with load tracking
 #[derive(Debug)]
-pub struct RequestRouter {
+pub struct BackendSelector {
     /// Backend connection providers
     backends: Vec<BackendInfo>,
     /// Current backend index for round-robin selection
     current_backend: AtomicUsize,
 }
 
-impl Default for RequestRouter {
+impl Default for BackendSelector {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RequestRouter {
-    /// Create a new request router
+impl BackendSelector {
+    /// Create a new backend selector
     pub fn new() -> Self {
         Self {
             backends: Vec::new(),
@@ -74,7 +74,7 @@ impl RequestRouter {
         Some(&self.backends[index])
     }
 
-    /// Route a command to an available backend using round-robin selection
+    /// Select a backend for the given command using round-robin
     /// Returns the backend ID to use for this command
     pub fn route_command_sync(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
         let backend = self
@@ -85,7 +85,7 @@ impl RequestRouter {
         backend.pending_count.fetch_add(1, Ordering::Relaxed);
 
         debug!(
-            "Routed command to backend {:?} ({})",
+            "Selected backend {:?} ({}) for command",
             backend.id, backend.name
         );
 
@@ -141,13 +141,13 @@ mod tests {
 
     #[test]
     fn test_router_creation() {
-        let router = RequestRouter::new();
+        let router = BackendSelector::new();
         assert_eq!(router.backend_count(), 0);
     }
 
     #[test]
     fn test_add_backend() {
-        let mut router = RequestRouter::new();
+        let mut router = BackendSelector::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
 
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_add_multiple_backends() {
-        let mut router = RequestRouter::new();
+        let mut router = BackendSelector::new();
 
         for i in 0..3 {
             let backend_id = BackendId::from_index(i);
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_no_backends_fails() {
-        let router = RequestRouter::new();
+        let router = BackendSelector::new();
         let client_id = ClientId::new();
         let result = router.route_command_sync(client_id, "LIST\r\n");
 
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_round_robin_selection() {
-        let mut router = RequestRouter::new();
+        let mut router = BackendSelector::new();
         let client_id = ClientId::new();
 
         // Add 3 backends
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_backend_load_tracking() {
-        let mut router = RequestRouter::new();
+        let mut router = BackendSelector::new();
         let client_id = ClientId::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_get_backend_provider() {
-        let mut router = RequestRouter::new();
+        let mut router = BackendSelector::new();
         let backend_id = BackendId::from_index(0);
         let provider = create_test_provider();
 
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_load_balancing_fairness() {
-        let mut router = RequestRouter::new();
+        let mut router = BackendSelector::new();
         let client_id = ClientId::new();
 
         // Add 3 backends

@@ -67,8 +67,8 @@ pub mod pool {
     pub const GET_TIMEOUT_SECS: u64 = 5;
 }
 
-/// Multiplexing constants
-pub mod multiplex {
+/// Per-command routing constants
+pub mod per_command_routing {
     /// Number of chunks to read ahead when checking for response terminator
     pub const TERMINATOR_LOOKAHEAD_CHUNKS: usize = 4;
 
