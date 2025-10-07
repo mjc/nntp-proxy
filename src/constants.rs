@@ -140,12 +140,6 @@ pub mod stateless_proxy {
     /// Prewarming configuration constants
     pub const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5
     pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
-    
-    /// TCP socket buffer sizes for high-throughput transfers
-    #[allow(dead_code)]
-    pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024; // 16MB
-    #[allow(dead_code)]
-    pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024; // 16MB
 }
 
 #[cfg(test)]
