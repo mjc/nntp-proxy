@@ -59,38 +59,26 @@ impl ResponseParser {
     /// Check if a response starts with a success code
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
-        if let Some(code) = NntpResponse::parse_status_code(data) {
-            (200..400).contains(&code)
-        } else {
-            false
-        }
+        NntpResponse::parse_status_code(data).is_some_and(|code| (200..400).contains(&code))
     }
 
     /// Check if response is a greeting (200 or 201)
     #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
-        let response_str = String::from_utf8_lossy(data);
-        response_str.starts_with("200") || response_str.starts_with("201")
+        // Check directly on bytes to avoid allocation
+        data.len() >= 3 && (data.starts_with(b"200") || data.starts_with(b"201"))
     }
 
     /// Check if response indicates authentication is required
     #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
-        if let Some(code) = NntpResponse::parse_status_code(data) {
-            code == 381 || code == 480
-        } else {
-            false
-        }
+        NntpResponse::parse_status_code(data).is_some_and(|code| code == 381 || code == 480)
     }
 
     /// Check if response indicates successful authentication
     #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
-        if let Some(code) = NntpResponse::parse_status_code(data) {
-            code == 281
-        } else {
-            false
-        }
+        NntpResponse::parse_status_code(data).is_some_and(|code| code == 281)
     }
 }
 
