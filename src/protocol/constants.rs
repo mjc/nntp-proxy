@@ -15,6 +15,7 @@ pub const NNTP_COMMAND_NOT_SUPPORTED: &[u8] =
 pub const BUFFER_SIZE: usize = 256 * 1024; // 256KB buffers for high throughput
 pub const BUFFER_POOL_SIZE: usize = 32; // Number of buffers in pool
 pub const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB for direct allocation
+pub const STREAMING_CHUNK_SIZE: usize = 65536; // 64KB chunks for streaming responses
 
 /// Connection pool configuration constants
 pub const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5

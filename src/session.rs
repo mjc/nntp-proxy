@@ -14,7 +14,7 @@ use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
 use crate::constants::buffer;
 use crate::pool::BufferPool;
-use crate::protocol::NNTP_COMMAND_NOT_SUPPORTED;
+use crate::constants::stateless_proxy::{NNTP_COMMAND_NOT_SUPPORTED, STREAMING_CHUNK_SIZE};
 use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
@@ -362,7 +362,7 @@ impl ClientSession {
         // Use direct reading from backend - no split() to avoid mutex overhead
         use tokio::io::AsyncReadExt;
 
-        let mut chunk = vec![0u8; 65536]; // 64KB chunks
+        let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
         let mut total_bytes = 0;
 
         // Read first chunk to determine response type
@@ -402,7 +402,7 @@ impl ClientSession {
                 // For multiline responses, use pipelined streaming
                 // Prepare double buffering for concurrent read/write
                 let mut chunk1 = chunk; // Reuse first buffer
-                let mut chunk2 = vec![0u8; 65536]; // Second buffer for pipelining
+                let mut chunk2 = vec![0u8; STREAMING_CHUNK_SIZE]; // Second buffer for pipelining
 
                 let mut tail: [u8; 4] = [0; 4]; // Fixed-size tail for span detection
                 let mut tail_len: usize = 0; // How much of tail is valid

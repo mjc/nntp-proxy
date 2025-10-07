@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{debug, warn};
 
-use crate::protocol::HIGH_THROUGHPUT_BUFFER_SIZE;
+use crate::constants::stateless_proxy::HIGH_THROUGHPUT_BUFFER_SIZE;
 
 /// Streaming handler for bidirectional data transfer
 pub struct StreamHandler;

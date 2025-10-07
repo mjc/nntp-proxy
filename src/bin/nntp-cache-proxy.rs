@@ -11,7 +11,7 @@ use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::CacheConfig;
 use nntp_proxy::network::SocketOptimizer;
-use nntp_proxy::protocol::NNTP_BACKEND_UNAVAILABLE;
+use nntp_proxy::constants::stateless_proxy::NNTP_BACKEND_UNAVAILABLE;
 use nntp_proxy::types::ClientId;
 
 /// Pin current process to specific CPU cores for optimal performance

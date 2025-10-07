@@ -10,7 +10,7 @@ use tracing::{debug, info};
 use crate::cache::article::{ArticleCache, CachedArticle};
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer;
-use crate::protocol::NNTP_COMMAND_NOT_SUPPORTED;
+use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 
 /// Extract message-ID from command arguments
 fn extract_message_id(command: &str) -> Option<String> {
@@ -130,20 +130,7 @@ impl CachingSession {
                                     backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
                                 }
                                 CommandAction::ForwardStateless => {
-                                    // Intercept DATE command for health checks
-                                    let upper = line.trim().to_uppercase();
-                                    if upper.starts_with("DATE") {
-                                        // Generate DATE response: 111 YYYYMMDDhhmmss
-                                        // Fixed timestamp for health checks (actual time doesn't matter)
-                                        let date_response = "111 20251006190000\r\n";
-                                        client_write.write_all(date_response.as_bytes()).await?;
-                                        client_write.flush().await?;
-                                        backend_to_client_bytes += date_response.len() as u64;
-                                        debug!("Intercepted DATE command for client {}", self.client_addr);
-                                        continue;
-                                    }
-                                    
-                                    // Forward other stateless commands to backend
+                                    // Forward stateless commands to backend
                                     backend_write.write_all(line.as_bytes()).await?;
                                     backend_write.flush().await?;
                                     client_to_backend_bytes += line.len() as u64;

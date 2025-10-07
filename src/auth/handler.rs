@@ -1,6 +1,6 @@
 //! Client authentication handling
 
-use crate::protocol::{NNTP_AUTH_ACCEPTED, NNTP_PASSWORD_REQUIRED};
+use crate::constants::stateless_proxy::{NNTP_AUTH_ACCEPTED, NNTP_PASSWORD_REQUIRED};
 
 /// Handles client-facing authentication interception
 pub struct AuthHandler;
