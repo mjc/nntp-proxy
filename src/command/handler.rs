@@ -40,9 +40,9 @@ impl CommandHandler {
             NntpCommand::Stateful => {
                 CommandAction::Reject("Command not supported by this proxy (stateless proxy mode)")
             }
-            NntpCommand::NonRoutable => {
-                CommandAction::Reject("Command not supported by this proxy (per-command routing mode)")
-            }
+            NntpCommand::NonRoutable => CommandAction::Reject(
+                "Command not supported by this proxy (per-command routing mode)",
+            ),
             NntpCommand::ArticleByMessageId => CommandAction::ForwardHighThroughput,
             NntpCommand::Stateless => CommandAction::ForwardStateless,
         }

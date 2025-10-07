@@ -11,10 +11,10 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerConfig};
+use crate::constants::buffer::{BUFFER_POOL_SIZE, BUFFER_SIZE};
+use crate::constants::stateless_proxy::*;
 use crate::network::SocketOptimizer;
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
-use crate::constants::buffer::{BUFFER_SIZE, BUFFER_POOL_SIZE};
-use crate::constants::stateless_proxy::*;
 use crate::router;
 use crate::session::ClientSession;
 use crate::types;
@@ -56,14 +56,14 @@ impl NntpProxy {
         // Create backend selector and add all backends
         let router = Arc::new({
             use types::BackendId;
-            connection_providers
-                .iter()
-                .enumerate()
-                .fold(router::BackendSelector::new(), |mut r, (idx, provider)| {
+            connection_providers.iter().enumerate().fold(
+                router::BackendSelector::new(),
+                |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
                     r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
                     r
-                })
+                },
+            )
         });
 
         Ok(Self {
@@ -143,7 +143,8 @@ impl NntpProxy {
         );
 
         // Setup connection (prewarm and greeting)
-        self.setup_client_connection(&mut client_stream, client_addr).await?;
+        self.setup_client_connection(&mut client_stream, client_addr)
+            .await?;
 
         // Get pooled backend connection
         let pool_status = self.connection_providers[server_idx].status();
@@ -161,7 +162,10 @@ impl NntpProxy {
                 conn
             }
             Err(e) => {
-                error!("Failed to get pooled connection for {} (client {}): {}", server.name, client_addr, e);
+                error!(
+                    "Failed to get pooled connection for {} (client {}): {}",
+                    server.name, client_addr, e
+                );
                 let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
                 return Err(anyhow::anyhow!(
                     "Failed to get pooled connection for backend '{}' (client {}): {}",
@@ -216,16 +220,24 @@ impl NntpProxy {
         mut client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        debug!("New per-command routing client connection from {}", client_addr);
+        debug!(
+            "New per-command routing client connection from {}",
+            client_addr
+        );
 
         // Enable TCP_NODELAY for low latency
         let _ = client_stream.set_nodelay(true);
 
         // Setup connection (prewarm and greeting)
-        self.setup_client_connection(&mut client_stream, client_addr).await?;
+        self.setup_client_connection(&mut client_stream, client_addr)
+            .await?;
 
         // Create session with router for per-command routing
-        let session = ClientSession::new_with_router(client_addr, self.buffer_pool.clone(), self.router.clone());
+        let session = ClientSession::new_with_router(
+            client_addr,
+            self.buffer_pool.clone(),
+            self.router.clone(),
+        );
 
         info!(
             "Client {} (ID: {}) connected in per-command routing mode",

@@ -119,7 +119,9 @@ impl Config {
     /// - At least one server configured
     pub fn validate(&self) -> Result<()> {
         if self.servers.is_empty() {
-            return Err(anyhow::anyhow!("Configuration must have at least one server"));
+            return Err(anyhow::anyhow!(
+                "Configuration must have at least one server"
+            ));
         }
 
         for server in &self.servers {
@@ -130,10 +132,16 @@ impl Config {
                 return Err(anyhow::anyhow!("Server '{}' has empty host", server.name));
             }
             if server.port == 0 {
-                return Err(anyhow::anyhow!("Invalid port 0 for server '{}'", server.name));
+                return Err(anyhow::anyhow!(
+                    "Invalid port 0 for server '{}'",
+                    server.name
+                ));
             }
             if server.max_connections == 0 {
-                return Err(anyhow::anyhow!("max_connections must be > 0 for server '{}'", server.name));
+                return Err(anyhow::anyhow!(
+                    "max_connections must be > 0 for server '{}'",
+                    server.name
+                ));
             }
         }
 
@@ -145,7 +153,9 @@ impl Config {
             return Err(anyhow::anyhow!("health_check.timeout_secs must be > 0"));
         }
         if self.health_check.unhealthy_threshold == 0 {
-            return Err(anyhow::anyhow!("health_check.unhealthy_threshold must be > 0"));
+            return Err(anyhow::anyhow!(
+                "health_check.unhealthy_threshold must be > 0"
+            ));
         }
 
         // Validate cache configuration if present

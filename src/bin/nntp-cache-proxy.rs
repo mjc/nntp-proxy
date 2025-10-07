@@ -6,13 +6,13 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use nntp_proxy::{create_default_config, load_config, NntpProxy};
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::CacheConfig;
-use nntp_proxy::network::SocketOptimizer;
 use nntp_proxy::constants::stateless_proxy::NNTP_BACKEND_UNAVAILABLE;
+use nntp_proxy::network::SocketOptimizer;
 use nntp_proxy::types::ClientId;
+use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
@@ -198,7 +198,9 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
                 let cache_clone = cache.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_caching_client(proxy_clone, cache_clone, stream, addr).await {
+                    if let Err(e) =
+                        handle_caching_client(proxy_clone, cache_clone, stream, addr).await
+                    {
                         error!("Error handling client {}: {}", addr, e);
                     }
                 });
@@ -258,10 +260,7 @@ async fn handle_caching_client(
     }
 
     // Create caching session and handle connection
-    let session = CachingSession::new(
-        client_addr,
-        cache,
-    );
+    let session = CachingSession::new(client_addr, cache);
 
     debug!("Starting caching session for client {}", client_addr);
 

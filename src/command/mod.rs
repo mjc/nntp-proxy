@@ -7,6 +7,5 @@
 mod classifier;
 mod handler;
 
-pub use handler::{AuthAction, CommandAction, CommandHandler};
 pub use classifier::NntpCommand;
-
+pub use handler::{AuthAction, CommandAction, CommandHandler};

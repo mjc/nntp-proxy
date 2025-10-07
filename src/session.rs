@@ -13,9 +13,11 @@ use tracing::{debug, error, warn};
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND_SIZE, STREAMING_CHUNK_SIZE};
-use crate::constants::protocol::{BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE};
-use crate::pool::BufferPool;
+use crate::constants::protocol::{
+    BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE,
+};
 use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
+use crate::pool::BufferPool;
 use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
@@ -196,7 +198,10 @@ impl ClientSession {
 
     /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
-    pub async fn handle_per_command_routing(&self, mut client_stream: TcpStream) -> Result<(u64, u64)> {
+    pub async fn handle_per_command_routing(
+        &self,
+        mut client_stream: TcpStream,
+    ) -> Result<(u64, u64)> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let router = self
@@ -481,7 +486,9 @@ impl ClientSession {
 
                             // Update tail for next iteration (only last 4 bytes)
                             if current_n >= TERMINATOR_TAIL_SIZE {
-                                tail.copy_from_slice(&current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n]);
+                                tail.copy_from_slice(
+                                    &current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n],
+                                );
                                 tail_len = TERMINATOR_TAIL_SIZE;
                             } else if current_n > 0 {
                                 tail[..current_n].copy_from_slice(&current_chunk[..current_n]);
@@ -650,5 +657,3 @@ mod tests {
         assert_ne!(session1.client_id(), session2.client_id());
     }
 }
-
-

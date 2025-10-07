@@ -3,10 +3,10 @@
 //! This module provides utilities for optimizing TCP socket performance
 //! for high-throughput NNTP transfers.
 
+use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
 use std::io;
 use tokio::net::TcpStream;
 use tracing::debug;
-use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
 
 /// Socket optimizer for high-throughput scenarios
 pub struct SocketOptimizer;

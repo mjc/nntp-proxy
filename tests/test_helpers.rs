@@ -164,9 +164,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 ///
 /// # Returns
 /// Configuration object ready for use in tests
-pub fn create_test_config_with_auth(
-    server_ports: Vec<(u16, &str, &str, &str)>,
-) -> Config {
+pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) -> Config {
     Config {
         servers: server_ports
             .into_iter()

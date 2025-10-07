@@ -16,18 +16,18 @@ use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 fn extract_message_id(command: &str) -> Option<String> {
     let trimmed = command.trim();
     trimmed.find('<').and_then(|start| {
-        trimmed[start..].find('>').map(|end| {
-            trimmed[start..start + end + 1].to_string()
-        })
+        trimmed[start..]
+            .find('>')
+            .map(|end| trimmed[start..start + end + 1].to_string())
     })
 }
 
 /// Check if command is cacheable (ARTICLE/BODY/HEAD/STAT with message-ID)
 fn is_cacheable_command(command: &str) -> bool {
     let upper = command.trim().to_uppercase();
-    (upper.starts_with("ARTICLE ") 
-        || upper.starts_with("BODY ") 
-        || upper.starts_with("HEAD ") 
+    (upper.starts_with("ARTICLE ")
+        || upper.starts_with("BODY ")
+        || upper.starts_with("HEAD ")
         || upper.starts_with("STAT "))
         && extract_message_id(command).is_some()
 }
@@ -49,14 +49,8 @@ pub struct CachingSession {
 
 impl CachingSession {
     /// Create a new caching session
-    pub fn new(
-        client_addr: SocketAddr,
-        cache: Arc<ArticleCache>,
-    ) -> Self {
-        Self {
-            client_addr,
-            cache,
-        }
+    pub fn new(client_addr: SocketAddr, cache: Arc<ArticleCache>) -> Self {
+        Self { client_addr, cache }
     }
 
     /// Handle client connection with caching support
@@ -94,7 +88,7 @@ impl CachingSession {
                         }
                         Ok(_n) => {
                             debug!("Client {} sent command: {}", self.client_addr, line.trim());
-                            
+
                             // Check if this is a cacheable command
                             if is_cacheable_command(&line) {
                                 if let Some(message_id) = extract_message_id(&line) {
@@ -147,7 +141,7 @@ impl CachingSession {
                                     // Move first_line into response_buffer to avoid clone
                                     let mut response_buffer = Vec::new();
                                     std::mem::swap(&mut response_buffer, &mut first_line);
-                                    
+
                                     // Check for backend disconnect (205 status)
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
@@ -156,18 +150,18 @@ impl CachingSession {
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
-                                    
+
                                     let is_multiline = parse_multiline_status(&response_buffer);
 
                                     if is_multiline {
                                         loop {
                                             let start_pos = response_buffer.len();
                                             backend_reader.read_until(b'\n', &mut response_buffer).await?;
-                                            
+
                                             if response_buffer.len() == start_pos {
                                                 break;
                                             }
-                                            
+
                                             // Check for end marker by examining just the new data
                                             let new_data = &response_buffer[start_pos..];
                                             if new_data == b".\r\n" || new_data == b".\n" {
@@ -198,7 +192,7 @@ impl CachingSession {
                                     // Move first_line into response_buffer to avoid clone
                                     let mut response_buffer = Vec::new();
                                     std::mem::swap(&mut response_buffer, &mut first_line);
-                                    
+
                                     // Check for backend disconnect (205 status)
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
@@ -207,7 +201,7 @@ impl CachingSession {
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
-                                    
+
                                     // Check if this is a multiline response by parsing status code
                                     let is_multiline = parse_multiline_status(&response_buffer);
 
@@ -216,11 +210,11 @@ impl CachingSession {
                                         loop {
                                             let start_pos = response_buffer.len();
                                             backend_reader.read_until(b'\n', &mut response_buffer).await?;
-                                            
+
                                             if response_buffer.len() == start_pos {
                                                 break;
                                             }
-                                            
+
                                             // Check for end marker by examining just the new data
                                             let new_data = &response_buffer[start_pos..];
                                             if new_data == b".\r\n" || new_data == b".\n" {

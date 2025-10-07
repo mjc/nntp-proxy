@@ -53,4 +53,3 @@ pub mod types;
 pub use config::{CacheConfig, Config, ServerConfig, create_default_config, load_config};
 pub use network::SocketOptimizer;
 pub use proxy::NntpProxy;
-

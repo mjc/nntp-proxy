@@ -55,7 +55,10 @@ impl BackendAuthenticator {
         let result = if ResponseParser::is_auth_success(&buffer[..n]) {
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Authentication failed: {}", response.trim()))
+            Err(anyhow::anyhow!(
+                "Authentication failed: {}",
+                response.trim()
+            ))
         };
 
         // Return buffer to pool
@@ -79,7 +82,10 @@ impl BackendAuthenticator {
         debug!("Backend greeting: {}", greeting_str.trim());
 
         if !ResponseParser::is_greeting(greeting) {
-            let error = format!("Server returned non-success greeting: {}", greeting_str.trim());
+            let error = format!(
+                "Server returned non-success greeting: {}",
+                greeting_str.trim()
+            );
             buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(error));
         }
@@ -109,7 +115,10 @@ impl BackendAuthenticator {
         debug!("Backend greeting: {}", greeting_str.trim());
 
         if !ResponseParser::is_greeting(greeting) {
-            let error = format!("Server returned non-success greeting: {}", greeting_str.trim());
+            let error = format!(
+                "Server returned non-success greeting: {}",
+                greeting_str.trim()
+            );
             buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(error));
         }

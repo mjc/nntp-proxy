@@ -139,12 +139,12 @@ impl BackendSelector {
     /// Select a backend for the given command using round-robin
     /// Returns the backend ID to use for this command
     pub fn route_command_sync(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
-        let backend = self
-            .select_backend()
-            .ok_or_else(|| anyhow::anyhow!(
+        let backend = self.select_backend().ok_or_else(|| {
+            anyhow::anyhow!(
                 "No backends available for routing (total backends: {})",
                 self.backends.len()
-            ))?;
+            )
+        })?;
 
         // Increment pending count for load tracking
         backend.pending_count.fetch_add(1, Ordering::Relaxed);
