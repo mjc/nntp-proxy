@@ -86,11 +86,9 @@ impl NntpProxy {
         })
     }
 
-    /// Prewarm connections to all backend servers before accepting clients
+    /// Prewarm all connection pools before accepting clients
+    /// Creates all connections concurrently and returns when ready
     pub async fn prewarm_connections(&self) -> Result<()> {
-        // Test connections first
-        self.prewarmer.test_connections().await?;
-        // Then prewarm all pools to max_connections
         self.prewarmer.prewarm_all().await
     }
 
