@@ -2,6 +2,33 @@
 //!
 //! This module handles selecting backend servers using round-robin
 //! with simple load tracking for monitoring.
+//!
+//! # Overview
+//!
+//! The `BackendSelector` provides thread-safe backend selection for routing
+//! NNTP commands across multiple backend servers. It uses a lock-free
+//! round-robin algorithm with atomic operations for concurrent access.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use nntp_proxy::router::BackendSelector;
+//! use nntp_proxy::types::{BackendId, ClientId};
+//! # use nntp_proxy::pool::DeadpoolConnectionProvider;
+//!
+//! let mut selector = BackendSelector::new();
+//! # let provider = DeadpoolConnectionProvider::new(
+//! #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
+//! # );
+//! selector.add_backend(BackendId::from_index(0), "server1".to_string(), provider);
+//!
+//! // Route a command
+//! let client_id = ClientId::new();
+//! let backend_id = selector.route_command_sync(client_id, "LIST").unwrap();
+//!
+//! // After command completes
+//! selector.complete_command_sync(backend_id);
+//! ```
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -25,6 +52,40 @@ struct BackendInfo {
 }
 
 /// Selects backend servers using round-robin with load tracking
+///
+/// # Thread Safety
+///
+/// This struct is designed for concurrent access across multiple threads.
+/// The round-robin counter and pending counts use atomic operations for
+/// lock-free performance.
+///
+/// # Load Balancing
+///
+/// - **Strategy**: Round-robin rotation through available backends
+/// - **Tracking**: Atomic counters track pending commands per backend
+/// - **Monitoring**: Load statistics available via `backend_load()`
+///
+/// # Examples
+///
+/// ```no_run
+/// # use nntp_proxy::router::BackendSelector;
+/// # use nntp_proxy::types::{BackendId, ClientId};
+/// # use nntp_proxy::pool::DeadpoolConnectionProvider;
+/// let mut selector = BackendSelector::new();
+///
+/// # let provider = DeadpoolConnectionProvider::new(
+/// #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
+/// # );
+/// selector.add_backend(
+///     BackendId::from_index(0),
+///     "backend-1".to_string(),
+///     provider,
+/// );
+///
+/// // Route commands
+/// let backend = selector.route_command_sync(ClientId::new(), "LIST")?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 #[derive(Debug)]
 pub struct BackendSelector {
     /// Backend connection providers
@@ -41,6 +102,7 @@ impl Default for BackendSelector {
 
 impl BackendSelector {
     /// Create a new backend selector
+    #[must_use]
     pub fn new() -> Self {
         Self {
             backends: Vec::new(),
@@ -79,7 +141,10 @@ impl BackendSelector {
     pub fn route_command_sync(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
         let backend = self
             .select_backend()
-            .ok_or_else(|| anyhow::anyhow!("No backends available"))?;
+            .ok_or_else(|| anyhow::anyhow!(
+                "No backends available for routing (total backends: {})",
+                self.backends.len()
+            ))?;
 
         // Increment pending count for load tracking
         backend.pending_count.fetch_add(1, Ordering::Relaxed);
@@ -100,6 +165,7 @@ impl BackendSelector {
     }
 
     /// Get the connection provider for a backend
+    #[must_use]
     pub fn get_backend_provider(
         &self,
         backend_id: BackendId,
@@ -111,11 +177,13 @@ impl BackendSelector {
     }
 
     /// Get the number of backends
+    #[must_use]
     pub fn backend_count(&self) -> usize {
         self.backends.len()
     }
 
     /// Get backend load (pending requests) for monitoring
+    #[must_use]
     pub fn backend_load(&self, backend_id: BackendId) -> Option<usize> {
         self.backends
             .iter()
