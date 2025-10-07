@@ -34,9 +34,9 @@ fn is_cacheable_command(command: &str) -> bool {
 
 /// Parse status code from binary data and determine if it's a multiline response
 fn parse_multiline_status(data: &[u8]) -> bool {
-    String::from_utf8(data.to_vec())
+    std::str::from_utf8(data)
         .ok()
-        .and_then(|line| parse_status_code(&line))
+        .and_then(parse_status_code)
         .map(is_multiline_status)
         .unwrap_or(false)
 }
