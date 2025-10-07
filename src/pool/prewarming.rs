@@ -27,12 +27,11 @@ async fn prewarm_single_pool(
             let server_name = server_name.clone();
             
             tokio::spawn(async move {
-                provider.get_pooled_connection().await.map(|conn| {
+                provider.get_pooled_connection().await.inspect(|_conn| {
                     debug!(
                         "Created connection {}/{} for '{}'",
                         i + 1, max_connections, server_name
                     );
-                    conn
                 }).ok()
             })
         })

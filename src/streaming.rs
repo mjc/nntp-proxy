@@ -100,7 +100,7 @@ mod tests {
         // Verify we're using optimized buffer sizes
         assert_eq!(HIGH_THROUGHPUT_BUFFER_SIZE, 262144); // 256KB
         const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 8192); // Larger than default
-        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE % 4096 == 0); // Page-aligned
+        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE.is_multiple_of(4096)); // Page-aligned
     }
 
     #[tokio::test]
@@ -165,7 +165,7 @@ mod tests {
     fn test_constants_are_powers_of_two() {
         // Buffer sizes should be powers of 2 for efficiency
         let size = HIGH_THROUGHPUT_BUFFER_SIZE;
-        assert!(size.is_power_of_two() || size % 4096 == 0);
+        assert!(size.is_power_of_two() || size.is_multiple_of(4096));
     }
 
     #[tokio::test]
