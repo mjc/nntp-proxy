@@ -109,15 +109,63 @@ pub async fn prewarm_pools(
 mod tests {
     use super::*;
     use crate::config::ServerConfig;
+    use tokio::net::TcpListener;
+
+    /// Helper to find an available port
+    async fn find_available_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// Spawn a simple mock NNTP server
+    fn spawn_mock_server(port: u16) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            
+            let addr = format!("127.0.0.1:{}", port);
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Send greeting
+                    let _ = stream.write_all(b"200 Mock Server Ready\r\n").await;
+                    
+                    // Handle commands
+                    let mut buffer = [0; 1024];
+                    while let Ok(n) = stream.read(&mut buffer).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if buffer[..n].starts_with(b"QUIT") {
+                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                            break;
+                        }
+                        let _ = stream.write_all(b"200 OK\r\n").await;
+                    }
+                });
+            }
+        })
+    }
 
     #[tokio::test]
     async fn test_prewarm_pools_basic() {
+        let port = find_available_port().await;
+        
+        // Start mock server
+        let _server = spawn_mock_server(port);
+        
+        // Give server time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        
         let servers = vec![
             ServerConfig {
                 name: "TestServer1".to_string(),
-                host: "example.com".to_string(),
-                port: 119,
-                max_connections: 10,
+                host: "127.0.0.1".to_string(),
+                port,
+                max_connections: 2,
                 username: None,
                 password: None,
             },
@@ -130,17 +178,17 @@ mod tests {
                     s.host.clone(),
                     s.port,
                     s.name.clone(),
-                    10,
+                    s.max_connections as usize,
                     s.username.clone(),
                     s.password.clone(),
                 )
             })
             .collect::<Vec<_>>();
 
-        // Verify function accepts the arguments
+        // Prewarm the pools
         let result = prewarm_pools(&providers, &servers).await;
         
-        // Should not fail even if connections fail (just logs warnings)
+        // Should succeed with mock server
         assert!(result.is_ok());
     }
 }
