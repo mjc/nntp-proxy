@@ -10,7 +10,6 @@ use tracing::{debug, info, warn};
 
 use crate::config::ServerConfig;
 use crate::pool::DeadpoolConnectionProvider;
-use crate::protocol::{BATCH_DELAY_MS, PREWARMING_BATCH_SIZE};
 
 /// Manages connection pool prewarming state and operations
 #[derive(Debug, Clone)]
@@ -37,25 +36,24 @@ impl PoolPrewarmer {
         }
     }
 
-    /// Prewarm a single pool by creating connections in batches
+    /// Prewarm a single pool by creating all connections concurrently
     async fn prewarm_single_pool(
         provider: DeadpoolConnectionProvider,
         server_name: String,
         max_connections: usize,
     ) -> Result<()> {
         info!(
-            "Prewarming pool for '{}' with {} connections",
+            "Prewarming pool for '{}' with {} connections (concurrent creation)",
             server_name, max_connections
         );
 
-        let mut total_created = 0;
-
-        for batch_start in (0..max_connections).step_by(PREWARMING_BATCH_SIZE) {
-            let batch_end = std::cmp::min(batch_start + PREWARMING_BATCH_SIZE, max_connections);
-            let mut batch_connections = Vec::new();
-
-            // Create batch connections concurrently
-            for i in batch_start..batch_end {
+        // Create all connections concurrently by spawning tasks
+        let mut tasks = Vec::with_capacity(max_connections);
+        for i in 0..max_connections {
+            let provider = provider.clone();
+            let server_name = server_name.clone();
+            
+            tasks.push(tokio::spawn(async move {
                 match provider.get_pooled_connection().await {
                     Ok(conn) => {
                         debug!(
@@ -64,8 +62,7 @@ impl PoolPrewarmer {
                             max_connections,
                             server_name
                         );
-                        batch_connections.push(conn);
-                        total_created += 1;
+                        Some(conn)
                     }
                     Err(e) => {
                         warn!(
@@ -75,19 +72,25 @@ impl PoolPrewarmer {
                             server_name,
                             e
                         );
+                        None
                     }
                 }
-            }
+            }));
+        }
 
-            // Drop batch connections (return to pool)
-            drop(batch_connections);
-
-            // Wait between batches to avoid overwhelming server
-            if batch_end < max_connections {
-                tokio::time::sleep(std::time::Duration::from_millis(BATCH_DELAY_MS)).await;
+        // Wait for all tasks and collect connections
+        let mut connections = Vec::new();
+        for task in tasks {
+            if let Ok(Some(conn)) = task.await {
+                connections.push(conn);
             }
         }
 
+        let total_created = connections.len();
+        
+        // Drop all connections - they all return to pool as available
+        drop(connections);
+        
         info!(
             "Pool prewarming completed for '{}' - {}/{} connections ready",
             server_name, total_created, max_connections
@@ -96,7 +99,7 @@ impl PoolPrewarmer {
     }
 
     /// Prewarm all connection pools by forcing pool to create max_connections
-    /// Called on first client connection after idle period
+    /// Should be called before accepting client connections
     pub async fn prewarm_all(&self) -> Result<()> {
         // Use compare_and_swap to ensure only one thread prewarms the pools
         if self
@@ -104,10 +107,10 @@ impl PoolPrewarmer {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return Ok(()); // Another thread is already prewarming
+            return Ok(()); // Already prewarmed
         }
 
-        info!("Prewarming all connection pools on first client connection...");
+        info!("Prewarming all connection pools before accepting clients...");
 
         // Spawn tasks to prewarm each pool concurrently
         let handles: Vec<_> = self

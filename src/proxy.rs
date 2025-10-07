@@ -86,14 +86,12 @@ impl NntpProxy {
         })
     }
 
-    /// Prewarm all connection pools (delegates to PoolPrewarmer)
-    async fn prewarm_all_pools(&self) -> Result<()> {
-        self.prewarmer.prewarm_all().await
-    }
-
-    /// Test connections to all backend servers (delegates to PoolPrewarmer)
+    /// Prewarm connections to all backend servers before accepting clients
     pub async fn prewarm_connections(&self) -> Result<()> {
-        self.prewarmer.test_connections().await
+        // Test connections first
+        self.prewarmer.test_connections().await?;
+        // Then prewarm all pools to max_connections
+        self.prewarmer.prewarm_all().await
     }
 
     /// Gracefully shutdown all connection pools
@@ -127,17 +125,12 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
-    /// Common setup for client connections (prewarming and greeting)
+    /// Common setup for client connections (greeting only, prewarming done at startup)
     async fn setup_client_connection(
         &self,
         client_stream: &mut TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        // Prewarm pools on first connection
-        if let Err(e) = self.prewarm_all_pools().await {
-            warn!("Failed to prewarm connection pools: {}", e);
-        }
-
         // Send proxy greeting
         crate::protocol::send_proxy_greeting(client_stream, client_addr).await
     }
