@@ -72,7 +72,9 @@ impl CachingSession {
         let mut client_to_backend_bytes = 0u64;
         let mut backend_to_client_bytes = 0u64;
         let mut line = String::with_capacity(buffer::COMMAND_SIZE);
-        let mut first_line = Vec::new(); // Reusable buffer for first line reads
+        // Pre-allocate with typical NNTP response line size (most are < 512 bytes)
+        // Reduces reallocations during line reading
+        let mut first_line = Vec::with_capacity(512);
 
         debug!("Caching session for client {} starting", self.client_addr);
 
@@ -138,9 +140,9 @@ impl CachingSession {
                                         break;
                                     }
 
-                                    // Move first_line into response_buffer to avoid clone
-                                    let mut response_buffer = Vec::new();
-                                    std::mem::swap(&mut response_buffer, &mut first_line);
+                                    // Use mem::take to transfer ownership from first_line to response_buffer
+                                    // More idiomatic than swap - explicitly shows we're taking the value and leaving default
+                                    let mut response_buffer = std::mem::take(&mut first_line);
 
                                     // Check for backend disconnect (205 status)
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
@@ -189,9 +191,8 @@ impl CachingSession {
                                         break;
                                     }
 
-                                    // Move first_line into response_buffer to avoid clone
-                                    let mut response_buffer = Vec::new();
-                                    std::mem::swap(&mut response_buffer, &mut first_line);
+                                    // Transfer ownership using mem::take (leaves first_line as empty Vec)
+                                    let mut response_buffer = std::mem::take(&mut first_line);
 
                                     // Check for backend disconnect (205 status)
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
@@ -229,10 +230,12 @@ impl CachingSession {
                                             // Only cache successful responses (2xx)
                                             if !response_buffer.is_empty() && response_buffer[0] == b'2' {
                                                 info!("Caching response for message-ID: {}", message_id);
+                                                // Use mem::take to move buffer into Arc without cloning
+                                                // Avoids allocating and copying the entire response
                                                 self.cache.insert(
                                                     message_id,
                                                     CachedArticle {
-                                                        response: Arc::new(response_buffer.clone()),
+                                                        response: Arc::new(std::mem::take(&mut response_buffer)),
                                                     }
                                                 ).await;
                                             }
