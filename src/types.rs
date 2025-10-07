@@ -35,12 +35,14 @@ pub struct BackendId(usize);
 impl BackendId {
     /// Create a backend ID from an index
     #[must_use]
+    #[inline]
     pub fn from_index(index: usize) -> Self {
         Self(index)
     }
 
     /// Get the underlying index
     #[must_use]
+    #[inline]
     pub fn as_index(&self) -> usize {
         self.0
     }

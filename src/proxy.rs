@@ -92,21 +92,25 @@ impl NntpProxy {
     }
 
     /// Get the list of servers
+    #[inline]
     pub fn servers(&self) -> &[ServerConfig] {
         &self.servers
     }
 
     /// Get the router
+    #[inline]
     pub fn router(&self) -> &Arc<router::BackendSelector> {
         &self.router
     }
 
     /// Get the connection providers
+    #[inline]
     pub fn connection_providers(&self) -> &[DeadpoolConnectionProvider] {
         &self.connection_providers
     }
 
     /// Get the buffer pool
+    #[inline]
     pub fn buffer_pool(&self) -> &BufferPool {
         &self.buffer_pool
     }

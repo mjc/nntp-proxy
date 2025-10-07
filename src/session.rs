@@ -64,6 +64,7 @@ impl ClientSession {
     /// Get the client ID
     /// Get the unique client ID
     #[must_use]
+    #[inline]
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }
@@ -71,6 +72,7 @@ impl ClientSession {
     /// Check if this session is using per-command routing mode
     /// Check if this session is using per-command routing
     #[must_use]
+    #[inline]
     pub fn is_per_command_routing(&self) -> bool {
         self.router.is_some()
     }

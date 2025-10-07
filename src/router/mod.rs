@@ -178,6 +178,7 @@ impl BackendSelector {
 
     /// Get the number of backends
     #[must_use]
+    #[inline]
     pub fn backend_count(&self) -> usize {
         self.backends.len()
     }

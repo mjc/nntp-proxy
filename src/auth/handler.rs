@@ -7,11 +7,15 @@ pub struct AuthHandler;
 
 impl AuthHandler {
     /// Get the response for AUTHINFO USER command
+    /// Get the AUTHINFO USER response
+    #[inline]
     pub fn user_response() -> &'static [u8] {
         NNTP_PASSWORD_REQUIRED
     }
 
     /// Get the response for AUTHINFO PASS command
+    /// Get the AUTHINFO PASS response
+    #[inline]
     pub fn pass_response() -> &'static [u8] {
         NNTP_AUTH_ACCEPTED
     }
