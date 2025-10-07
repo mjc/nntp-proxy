@@ -5,11 +5,12 @@
 use uuid::Uuid;
 
 /// Unique identifier for client connections
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(Uuid);
 
 impl ClientId {
     /// Generate a new unique client ID
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -28,18 +29,26 @@ impl std::fmt::Display for ClientId {
 }
 
 /// Identifier for backend servers
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BackendId(usize);
 
 impl BackendId {
     /// Create a backend ID from an index
+    #[must_use]
     pub fn from_index(index: usize) -> Self {
         Self(index)
     }
 
     /// Get the underlying index
+    #[must_use]
     pub fn as_index(&self) -> usize {
         self.0
+    }
+}
+
+impl From<usize> for BackendId {
+    fn from(index: usize) -> Self {
+        Self(index)
     }
 }
 
