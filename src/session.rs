@@ -32,6 +32,8 @@ pub struct ClientSession {
 
 impl ClientSession {
     /// Create a new client session (1:1 mode, no router)
+    /// Create a new client session for 1:1 mode
+    #[must_use]
     pub fn new(client_addr: SocketAddr, buffer_pool: BufferPool) -> Self {
         Self {
             client_addr,
@@ -42,6 +44,8 @@ impl ClientSession {
     }
 
     /// Create a new client session with router for per-command routing
+    /// Create a new client session for per-command routing mode
+    #[must_use]
     pub fn new_with_router(
         client_addr: SocketAddr,
         buffer_pool: BufferPool,
@@ -56,11 +60,15 @@ impl ClientSession {
     }
 
     /// Get the client ID
+    /// Get the unique client ID
+    #[must_use]
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }
 
     /// Check if this session is using per-command routing mode
+    /// Check if this session is using per-command routing
+    #[must_use]
     pub fn is_per_command_routing(&self) -> bool {
         self.router.is_some()
     }
