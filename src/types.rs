@@ -34,9 +34,10 @@ pub struct BackendId(usize);
 
 impl BackendId {
     /// Create a backend ID from an index
+    /// Marked const fn to allow compile-time evaluation
     #[must_use]
     #[inline]
-    pub fn from_index(index: usize) -> Self {
+    pub const fn from_index(index: usize) -> Self {
         Self(index)
     }
 

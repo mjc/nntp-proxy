@@ -23,6 +23,8 @@ async fn prewarm_single_pool(
     // Create all connections concurrently
     let tasks: Vec<_> = (0..max_connections)
         .map(|i| {
+            // Clone Arc references for each async task to satisfy Send + 'static bounds
+            // Arc makes this cheap - only the pointer is cloned, not the underlying data
             let provider = provider.clone();
             let server_name = server_name.clone();
 
