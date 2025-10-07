@@ -53,23 +53,38 @@ fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
 #[command(author, version, about = "NNTP Caching Proxy Server", long_about = None)]
 struct Args {
     /// Port to listen on
-    #[arg(short, long, default_value = "8120")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_PORT environment variable
+    #[arg(short, long, default_value = "8120", env = "NNTP_CACHE_PROXY_PORT")]
     port: u16,
 
     /// Configuration file path
-    #[arg(short, long, default_value = "cache-config.toml")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_CONFIG environment variable
+    #[arg(
+        short,
+        long,
+        default_value = "cache-config.toml",
+        env = "NNTP_CACHE_PROXY_CONFIG"
+    )]
     config: String,
 
     /// Number of worker threads (defaults to number of CPU cores)
-    #[arg(short, long)]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_THREADS environment variable
+    #[arg(short, long, env = "NNTP_CACHE_PROXY_THREADS")]
     threads: Option<usize>,
 
     /// Cache max capacity (number of articles)
-    #[arg(long, default_value = "10000")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_CAPACITY environment variable
+    #[arg(long, default_value = "10000", env = "NNTP_CACHE_PROXY_CACHE_CAPACITY")]
     cache_capacity: u64,
 
     /// Cache TTL in seconds
-    #[arg(long, default_value = "3600")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_TTL environment variable
+    #[arg(long, default_value = "3600", env = "NNTP_CACHE_PROXY_CACHE_TTL")]
     cache_ttl: u64,
 }
 

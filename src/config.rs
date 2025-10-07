@@ -172,13 +172,101 @@ impl Config {
     }
 }
 
-/// Load configuration from a TOML file
+/// Load backend server configuration from environment variables
+///
+/// Supports indexed environment variables for Docker/container deployments:
+/// - `NNTP_SERVER_0_HOST`, `NNTP_SERVER_0_PORT`, `NNTP_SERVER_0_NAME`, etc.
+/// - `NNTP_SERVER_1_HOST`, `NNTP_SERVER_1_PORT`, `NNTP_SERVER_1_NAME`, etc.
+///
+/// Optional per-server variables:
+/// - `NNTP_SERVER_N_USERNAME` - Backend authentication username
+/// - `NNTP_SERVER_N_PASSWORD` - Backend authentication password
+/// - `NNTP_SERVER_N_MAX_CONNECTIONS` - Max connections (default: 10)
+///
+/// If any `NNTP_SERVER_N_HOST` is found, environment variables take precedence
+/// over config file servers.
+fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
+    let mut servers = Vec::new();
+    let mut index = 0;
+
+    loop {
+        // Check if this server index exists by looking for HOST
+        let host_key = format!("NNTP_SERVER_{}_HOST", index);
+        let host = match std::env::var(&host_key) {
+            Ok(h) => h,
+            Err(_) => {
+                // No more servers found
+                break;
+            }
+        };
+
+        // Parse port (required)
+        let port_key = format!("NNTP_SERVER_{}_PORT", index);
+        let port = std::env::var(&port_key)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(119); // Default NNTP port
+
+        // Get name (required, use host as fallback)
+        let name_key = format!("NNTP_SERVER_{}_NAME", index);
+        let name = std::env::var(&name_key).unwrap_or_else(|_| format!("Server {}", index));
+
+        // Optional fields
+        let username_key = format!("NNTP_SERVER_{}_USERNAME", index);
+        let username = std::env::var(&username_key).ok();
+
+        let password_key = format!("NNTP_SERVER_{}_PASSWORD", index);
+        let password = std::env::var(&password_key).ok();
+
+        let max_conn_key = format!("NNTP_SERVER_{}_MAX_CONNECTIONS", index);
+        let max_connections = std::env::var(&max_conn_key)
+            .ok()
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or_else(default_max_connections);
+
+        servers.push(ServerConfig {
+            host,
+            port,
+            name,
+            username,
+            password,
+            max_connections,
+        });
+
+        index += 1;
+    }
+
+    if servers.is_empty() {
+        None
+    } else {
+        Some(servers)
+    }
+}
+
+/// Load configuration from a TOML file, with environment variable overrides
+///
+/// Environment variables for backend servers take precedence over config file:
+/// - `NNTP_SERVER_0_HOST`, `NNTP_SERVER_0_PORT`, `NNTP_SERVER_0_NAME`
+/// - `NNTP_SERVER_1_HOST`, `NNTP_SERVER_1_PORT`, `NNTP_SERVER_1_NAME`
+/// - etc.
+///
+/// This allows Docker/container deployments to override servers without
+/// modifying the config file.
 pub fn load_config(config_path: &str) -> Result<Config> {
     let config_content = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", config_path, e))?;
 
-    let config: Config = toml::from_str(&config_content)
+    let mut config: Config = toml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", config_path, e))?;
+
+    // Check for environment variable server overrides
+    if let Some(env_servers) = load_servers_from_env() {
+        tracing::info!(
+            "Using {} backend server(s) from environment variables (overriding config file)",
+            env_servers.len()
+        );
+        config.servers = env_servers;
+    }
 
     // Validate the loaded configuration
     config.validate()?;
@@ -597,5 +685,71 @@ max_connections = 5
         assert_eq!(deserialized.servers[0].name, "测试服务器 🚀");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_load_servers_from_env() {
+        // Set up environment variables for testing
+        // SAFETY: Test code only, running in single-threaded test context
+        unsafe {
+            std::env::set_var("NNTP_SERVER_0_HOST", "env-server1.com");
+            std::env::set_var("NNTP_SERVER_0_PORT", "8119");
+            std::env::set_var("NNTP_SERVER_0_NAME", "Env Server 1");
+            std::env::set_var("NNTP_SERVER_0_USERNAME", "envuser");
+            std::env::set_var("NNTP_SERVER_0_PASSWORD", "envpass");
+            std::env::set_var("NNTP_SERVER_0_MAX_CONNECTIONS", "15");
+
+            std::env::set_var("NNTP_SERVER_1_HOST", "env-server2.com");
+            std::env::set_var("NNTP_SERVER_1_PORT", "119");
+        }
+        // No name set - should use default "Server 1"
+        // No max_connections set - should use default 10
+
+        let servers = load_servers_from_env().expect("Should load servers from env");
+
+        assert_eq!(servers.len(), 2);
+
+        // Check first server
+        assert_eq!(servers[0].host, "env-server1.com");
+        assert_eq!(servers[0].port, 8119);
+        assert_eq!(servers[0].name, "Env Server 1");
+        assert_eq!(servers[0].username, Some("envuser".to_string()));
+        assert_eq!(servers[0].password, Some("envpass".to_string()));
+        assert_eq!(servers[0].max_connections, 15);
+
+        // Check second server
+        assert_eq!(servers[1].host, "env-server2.com");
+        assert_eq!(servers[1].port, 119);
+        assert_eq!(servers[1].name, "Server 1"); // Default name
+        assert_eq!(servers[1].username, None);
+        assert_eq!(servers[1].password, None);
+        assert_eq!(servers[1].max_connections, 10); // Default
+
+        // Clean up environment variables
+        // SAFETY: Test code only, running in single-threaded test context
+        unsafe {
+            std::env::remove_var("NNTP_SERVER_0_HOST");
+            std::env::remove_var("NNTP_SERVER_0_PORT");
+            std::env::remove_var("NNTP_SERVER_0_NAME");
+            std::env::remove_var("NNTP_SERVER_0_USERNAME");
+            std::env::remove_var("NNTP_SERVER_0_PASSWORD");
+            std::env::remove_var("NNTP_SERVER_0_MAX_CONNECTIONS");
+            std::env::remove_var("NNTP_SERVER_1_HOST");
+            std::env::remove_var("NNTP_SERVER_1_PORT");
+        }
+    }
+
+    #[test]
+    fn test_load_servers_from_env_empty() {
+        // Ensure no env vars are set
+        // SAFETY: Test code only, running in single-threaded test context
+        unsafe {
+            for i in 0..5 {
+                std::env::remove_var(format!("NNTP_SERVER_{}_HOST", i));
+            }
+        }
+
+        let servers = load_servers_from_env();
+        assert!(servers.is_none(), "Should return None when no env vars set");
     }
 }

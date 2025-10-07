@@ -48,19 +48,32 @@ fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Port to listen on
-    #[arg(short, long, default_value = "8119")]
+    ///
+    /// Can be overridden with NNTP_PROXY_PORT environment variable
+    #[arg(short, long, default_value = "8119", env = "NNTP_PROXY_PORT")]
     port: u16,
 
     /// Enable per-command routing mode (each command can use a different backend)
-    #[arg(short = 'r', long, default_value = "false")]
+    ///
+    /// Can be overridden with NNTP_PROXY_PER_COMMAND_ROUTING environment variable
+    #[arg(
+        short = 'r',
+        long,
+        default_value = "false",
+        env = "NNTP_PROXY_PER_COMMAND_ROUTING"
+    )]
     per_command_routing: bool,
 
     /// Configuration file path
-    #[arg(short, long, default_value = "config.toml")]
+    ///
+    /// Can be overridden with NNTP_PROXY_CONFIG environment variable
+    #[arg(short, long, default_value = "config.toml", env = "NNTP_PROXY_CONFIG")]
     config: String,
 
     /// Number of worker threads (defaults to number of CPU cores)
-    #[arg(short, long)]
+    ///
+    /// Can be overridden with NNTP_PROXY_THREADS environment variable
+    #[arg(short, long, env = "NNTP_PROXY_THREADS")]
     threads: Option<usize>,
 }
 
