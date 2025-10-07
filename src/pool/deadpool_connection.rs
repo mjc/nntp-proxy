@@ -12,6 +12,7 @@ use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 pub struct TcpManager {
     host: String,
     port: u16,
+    #[allow(dead_code)]
     name: String,
     username: Option<String>,
     password: Option<String>,
