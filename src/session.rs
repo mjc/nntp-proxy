@@ -12,9 +12,9 @@ use tracing::{debug, error, warn};
 
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
-use crate::constants::buffer;
+use crate::constants::buffer::{COMMAND_SIZE, STREAMING_CHUNK_SIZE};
 use crate::pool::BufferPool;
-use crate::constants::stateless_proxy::{NNTP_COMMAND_NOT_SUPPORTED, STREAMING_CHUNK_SIZE};
+use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
@@ -86,7 +86,7 @@ impl ClientSession {
         let mut backend_to_client_bytes = 0u64;
 
         // Reuse line buffer to avoid per-iteration allocations
-        let mut line = String::with_capacity(buffer::COMMAND_SIZE);
+        let mut line = String::with_capacity(COMMAND_SIZE);
 
         debug!("Client {} session loop starting", self.client_addr);
 
@@ -212,7 +212,7 @@ impl ClientSession {
         );
 
         // Reuse command buffer to avoid allocations per command
-        let mut command = String::with_capacity(buffer::COMMAND_SIZE);
+        let mut command = String::with_capacity(COMMAND_SIZE);
 
         // Process commands one at a time
         loop {

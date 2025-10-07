@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, ServerConfig};
 use crate::network::SocketOptimizer;
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
+use crate::constants::buffer::{BUFFER_SIZE, BUFFER_POOL_SIZE};
 use crate::constants::stateless_proxy::*;
 use crate::router;
 use crate::session::ClientSession;

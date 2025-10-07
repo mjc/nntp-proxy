@@ -27,6 +27,19 @@ pub mod buffer {
 
     /// Initial capacity for response accumulation buffers
     pub const RESPONSE_INITIAL_CAPACITY: usize = 8192;
+    
+    /// Buffer size for high throughput operations (256KB)
+    /// Used by BufferPool for pooled buffers
+    pub const BUFFER_SIZE: usize = 256 * 1024;
+    
+    /// Number of buffers in the buffer pool
+    pub const BUFFER_POOL_SIZE: usize = 32;
+    
+    /// Buffer size for direct allocation in high-throughput scenarios (256KB)
+    pub const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024;
+    
+    /// Chunk size for streaming responses (64KB)
+    pub const STREAMING_CHUNK_SIZE: usize = 65536;
 }
 
 /// Socket buffer size constants
@@ -101,7 +114,7 @@ pub mod per_command_routing {
     pub const MAX_TERMINATOR_SPAN_CHECK: usize = 9;
 }
 
-/// Stateless proxy protocol constants (from old src/protocol/constants.rs)
+/// Stateless proxy protocol constants
 pub mod stateless_proxy {
     #[allow(dead_code)]
     pub const NNTP_PASSWORD_REQUIRED: &[u8] = b"381 Password required\r\n";
@@ -111,12 +124,12 @@ pub mod stateless_proxy {
     #[allow(dead_code)]
     pub const NNTP_AUTH_FAILED: &[u8] = b"502 Authentication failed\r\n";
     pub const NNTP_COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy (stateless proxy mode)\r\n";
-    pub const BUFFER_SIZE: usize = 256 * 1024; // 256KB buffers for high throughput
-    pub const BUFFER_POOL_SIZE: usize = 32; // Number of buffers in pool
-    pub const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB for direct allocation
-    pub const STREAMING_CHUNK_SIZE: usize = 65536; // 64KB chunks for streaming responses
+    
+    /// Prewarming configuration constants
     pub const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5
     pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
+    
+    /// TCP socket buffer sizes for high-throughput transfers
     #[allow(dead_code)]
     pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024; // 16MB
     #[allow(dead_code)]
