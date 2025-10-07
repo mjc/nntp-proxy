@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
@@ -99,6 +99,14 @@ impl TcpManager {
         // Convert socket2::Socket to tokio TcpStream
         let std_stream: std::net::TcpStream = socket.into();
         std_stream.set_nonblocking(true)?;
+        
+        // Enable TCP keepalive to detect dead connections automatically
+        // This helps catch connections that were idle-timed out by the backend
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))  // Start probing after 60s idle
+            .with_interval(std::time::Duration::from_secs(10)); // Probe every 10s
+        socket2::SockRef::from(&std_stream).set_tcp_keepalive(&keepalive)?;
+        
         let stream = TcpStream::from_std(std_stream)?;
 
         Ok(stream)
@@ -202,64 +210,29 @@ impl managed::Manager for TcpManager {
         conn: &mut TcpStream,
         _: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::time::{Duration, timeout};
-
-        // Quick health check to detect stale connections (idle timeout on backend)
-        // Send DATE command which is stateless and has minimal overhead
-        debug!(
-            "Recycling connection to {} - performing health check",
-            self.name
-        );
-
-        // Set a reasonable timeout for the health check (3 seconds)
-        // This balances detecting dead connections vs network latency
-        let health_check = async {
-            // Send DATE command
-            conn.write_all(b"DATE\r\n").await?;
-            conn.flush().await?;
-
-            // Read response
-            let mut reader = BufReader::new(conn);
-            let mut response = String::new();
-            reader.read_line(&mut response).await?;
-
-            // Check if response indicates success (111 response)
-            if response.starts_with("111") {
-                debug!("Connection to {} is healthy", self.name);
-                Ok(())
-            } else {
-                warn!(
-                    "Connection to {} returned unexpected DATE response: {}",
-                    self.name,
-                    response.trim()
-                );
-                Err(anyhow::anyhow!(
-                    "Unexpected DATE response: {}",
-                    response.trim()
-                ))
+        // Fast TCP-level health check using try_read() to detect closed connections
+        // This is much faster than sending a DATE command (~1µs vs ~50ms)
+        
+        let mut peek_buf = [0u8; 1];
+        match conn.try_read(&mut peek_buf) {
+            Ok(0) => {
+                // Connection cleanly closed by remote
+                debug!("Connection to {} was closed by remote", self.name);
+                Err(managed::RecycleError::Message("Connection closed".into()))
             }
-        };
-
-        match timeout(Duration::from_secs(3), health_check).await {
-            Ok(Ok(())) => {
-                debug!("Connection to {} recycled successfully", self.name);
+            Ok(_) => {
+                // Unexpected data - connection might be in bad state
+                debug!("Unexpected data on idle connection to {}", self.name);
+                Err(managed::RecycleError::Message("Unexpected data on idle connection".into()))
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data available - connection is healthy and idle
                 Ok(())
             }
-            Ok(Err(e)) => {
-                warn!("Connection to {} failed health check: {}", self.name, e);
-                Err(managed::RecycleError::Message(
-                    format!("Health check failed: {}", e).into(),
-                ))
-            }
-            Err(_) => {
-                warn!(
-                    "Connection to {} health check timed out after 3s",
-                    self.name
-                );
-                Err(managed::RecycleError::Message(
-                    "Health check timeout".into(),
-                ))
+            Err(e) => {
+                // Other error - connection is broken
+                debug!("Connection to {} failed health check: {}", self.name, e);
+                Err(managed::RecycleError::Message(format!("Connection error: {}", e).into()))
             }
         }
     }
