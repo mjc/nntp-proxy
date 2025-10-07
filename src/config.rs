@@ -109,6 +109,59 @@ pub struct ServerConfig {
     pub max_connections: u32,
 }
 
+impl Config {
+    /// Validate configuration for correctness
+    ///
+    /// Checks for:
+    /// - Empty server names
+    /// - Invalid ports (0)
+    /// - Invalid max_connections (0)
+    /// - At least one server configured
+    pub fn validate(&self) -> Result<()> {
+        if self.servers.is_empty() {
+            return Err(anyhow::anyhow!("Configuration must have at least one server"));
+        }
+
+        for server in &self.servers {
+            if server.name.trim().is_empty() {
+                return Err(anyhow::anyhow!("Server name cannot be empty"));
+            }
+            if server.host.trim().is_empty() {
+                return Err(anyhow::anyhow!("Server '{}' has empty host", server.name));
+            }
+            if server.port == 0 {
+                return Err(anyhow::anyhow!("Invalid port 0 for server '{}'", server.name));
+            }
+            if server.max_connections == 0 {
+                return Err(anyhow::anyhow!("max_connections must be > 0 for server '{}'", server.name));
+            }
+        }
+
+        // Validate health check configuration
+        if self.health_check.interval_secs == 0 {
+            return Err(anyhow::anyhow!("health_check.interval_secs must be > 0"));
+        }
+        if self.health_check.timeout_secs == 0 {
+            return Err(anyhow::anyhow!("health_check.timeout_secs must be > 0"));
+        }
+        if self.health_check.unhealthy_threshold == 0 {
+            return Err(anyhow::anyhow!("health_check.unhealthy_threshold must be > 0"));
+        }
+
+        // Validate cache configuration if present
+        if let Some(cache) = &self.cache {
+            if cache.max_capacity == 0 {
+                return Err(anyhow::anyhow!("cache.max_capacity must be > 0"));
+            }
+            if cache.ttl_secs == 0 {
+                return Err(anyhow::anyhow!("cache.ttl_secs must be > 0"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Load configuration from a TOML file
 pub fn load_config(config_path: &str) -> Result<Config> {
     let config_content = std::fs::read_to_string(config_path)
@@ -117,10 +170,14 @@ pub fn load_config(config_path: &str) -> Result<Config> {
     let config: Config = toml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", config_path, e))?;
 
+    // Validate the loaded configuration
+    config.validate()?;
+
     Ok(config)
 }
 
 /// Create a default configuration for examples/testing
+#[must_use]
 pub fn create_default_config() -> Config {
     Config {
         servers: vec![ServerConfig {
