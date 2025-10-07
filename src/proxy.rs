@@ -33,7 +33,7 @@ pub struct NntpProxy {
 impl NntpProxy {
     pub fn new(config: Config) -> Result<Self> {
         if config.servers.is_empty() {
-            anyhow::bail!("No servers configured");
+            anyhow::bail!("No servers configured in configuration");
         }
 
         // Create deadpool connection providers for each server
@@ -45,14 +45,7 @@ impl NntpProxy {
                     "Configuring deadpool connection provider for '{}'",
                     server.name
                 );
-                DeadpoolConnectionProvider::new(
-                    server.host.clone(),
-                    server.port,
-                    server.name.clone(),
-                    server.max_connections as usize,
-                    server.username.clone(),
-                    server.password.clone(),
-                )
+                DeadpoolConnectionProvider::from_server_config(server)
             })
             .collect();
 
@@ -168,9 +161,14 @@ impl NntpProxy {
                 conn
             }
             Err(e) => {
-                error!("Failed to get pooled connection for {}: {}", server.name, e);
+                error!("Failed to get pooled connection for {} (client {}): {}", server.name, client_addr, e);
                 let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
-                return Err(e);
+                return Err(anyhow::anyhow!(
+                    "Failed to get pooled connection for backend '{}' (client {}): {}",
+                    server.name,
+                    client_addr,
+                    e
+                ));
             }
         };
 

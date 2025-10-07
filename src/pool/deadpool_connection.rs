@@ -164,6 +164,20 @@ impl DeadpoolConnectionProvider {
         Self { pool, name }
     }
 
+    /// Create a connection provider from a server configuration
+    ///
+    /// This avoids unnecessary cloning of individual fields.
+    pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        Self::new(
+            server.host.clone(),
+            server.port,
+            server.name.clone(),
+            server.max_connections as usize,
+            server.username.clone(),
+            server.password.clone(),
+        )
+    }
+
     /// Get a connection from the pool (automatically returned when dropped)
     pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
         self.pool
