@@ -88,9 +88,21 @@ pub mod protocol {
 
     /// Command not supported response
     pub const COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy\r\n";
+    
+    /// Proxy greeting for per-command routing mode
+    pub const PROXY_GREETING_PCR: &[u8] = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
+    
+    /// Connection closing response
+    pub const CONNECTION_CLOSING: &[u8] = b"205 Connection closing\r\n";
+    
+    /// Backend error response
+    pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 
     /// Minimum response length (3-digit code + CRLF)
     pub const MIN_RESPONSE_LENGTH: usize = 5;
+    
+    /// Terminator tail size for spanning terminator detection
+    pub const TERMINATOR_TAIL_SIZE: usize = 4;
 }
 
 /// Connection pool constants

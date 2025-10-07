@@ -13,6 +13,7 @@ use tracing::{debug, error, warn};
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND_SIZE, STREAMING_CHUNK_SIZE};
+use crate::constants::protocol::{BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE};
 use crate::pool::BufferPool;
 use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 use crate::router::BackendSelector;
@@ -202,9 +203,8 @@ impl ClientSession {
         let mut backend_to_client_bytes = 0u64;
 
         // Send initial greeting to client
-        let greeting = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
-        client_write.write_all(greeting).await?;
-        backend_to_client_bytes += greeting.len() as u64;
+        client_write.write_all(PROXY_GREETING_PCR).await?;
+        backend_to_client_bytes += PROXY_GREETING_PCR.len() as u64;
 
         debug!(
             "Client {} sent greeting, entering command loop",
@@ -234,9 +234,8 @@ impl ClientSession {
 
                     // Handle QUIT locally
                     if trimmed.eq_ignore_ascii_case("QUIT") {
-                        let response = b"205 Connection closing\r\n";
-                        client_write.write_all(response).await?;
-                        backend_to_client_bytes += response.len() as u64;
+                        client_write.write_all(CONNECTION_CLOSING).await?;
+                        backend_to_client_bytes += CONNECTION_CLOSING.len() as u64;
                         break;
                     }
 
@@ -279,9 +278,8 @@ impl ClientSession {
                                         "Error routing command for client {}: {}",
                                         self.client_addr, e
                                     );
-                                    let error_response = b"503 Backend error\r\n";
-                                    let _ = client_write.write_all(error_response).await;
-                                    backend_to_client_bytes += error_response.len() as u64;
+                                    let _ = client_write.write_all(BACKEND_ERROR).await;
+                                    backend_to_client_bytes += BACKEND_ERROR.len() as u64;
                                 }
                             }
                         }
@@ -404,13 +402,13 @@ impl ClientSession {
                 let mut chunk1 = chunk; // Reuse first buffer
                 let mut chunk2 = vec![0u8; STREAMING_CHUNK_SIZE]; // Second buffer for pipelining
 
-                let mut tail: [u8; 4] = [0; 4]; // Fixed-size tail for span detection
+                let mut tail: [u8; TERMINATOR_TAIL_SIZE] = [0; TERMINATOR_TAIL_SIZE]; // Fixed-size tail for span detection
                 let mut tail_len: usize = 0; // How much of tail is valid
 
                 // Initialize tail with last bytes of first chunk (already written above)
-                if n >= 4 {
-                    tail.copy_from_slice(&chunk1[n - 4..n]);
-                    tail_len = 4;
+                if n >= TERMINATOR_TAIL_SIZE {
+                    tail.copy_from_slice(&chunk1[n - TERMINATOR_TAIL_SIZE..n]);
+                    tail_len = TERMINATOR_TAIL_SIZE;
                 } else if n > 0 {
                     tail[..n].copy_from_slice(&chunk1[..n]);
                     tail_len = n;
@@ -474,9 +472,9 @@ impl ClientSession {
                             }
 
                             // Update tail for next iteration (only last 4 bytes)
-                            if current_n >= 4 {
-                                tail.copy_from_slice(&current_chunk[current_n - 4..current_n]);
-                                tail_len = 4;
+                            if current_n >= TERMINATOR_TAIL_SIZE {
+                                tail.copy_from_slice(&current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n]);
+                                tail_len = TERMINATOR_TAIL_SIZE;
                             } else if current_n > 0 {
                                 tail[..current_n].copy_from_slice(&current_chunk[..current_n]);
                                 tail_len = current_n;
