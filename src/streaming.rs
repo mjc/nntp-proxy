@@ -110,9 +110,10 @@ mod tests {
         let backend_data = b"Hello from backend";
 
         let mut client_read = Cursor::new(client_data);
-        let mut client_write = Vec::new();
+        // Pre-allocate buffers with capacity matching test data size
+        let mut client_write = Vec::with_capacity(backend_data.len());
         let mut backend_read = Cursor::new(backend_data);
-        let mut backend_write = Vec::new();
+        let mut backend_write = Vec::with_capacity(client_data.len());
 
         // Simulate a small transfer
         let mut buffer1 = vec![0u8; 1024];

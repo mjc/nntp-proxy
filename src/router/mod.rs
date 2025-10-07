@@ -105,7 +105,8 @@ impl BackendSelector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            backends: Vec::new(),
+            // Pre-allocate for typical number of backend servers (most setups have 2-8)
+            backends: Vec::with_capacity(4),
             current_backend: AtomicUsize::new(0),
         }
     }

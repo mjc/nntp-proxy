@@ -125,7 +125,8 @@ impl HealthChecker {
 
         // Read response
         let mut reader = BufReader::new(&mut *conn);
-        let mut response = String::new();
+        // Pre-allocate for typical NNTP DATE response ("111 YYYYMMDDhhmmss\r\n" ~20-30 bytes)
+        let mut response = String::with_capacity(64);
         reader.read_line(&mut response).await?;
 
         // Check if response indicates success (111 response)
