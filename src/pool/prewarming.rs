@@ -14,10 +14,10 @@ use crate::pool::DeadpoolConnectionProvider;
 /// Manages connection pool prewarming state and operations
 #[derive(Debug, Clone)]
 pub struct PoolPrewarmer {
-    /// Connection providers for each backend
-    providers: Vec<DeadpoolConnectionProvider>,
-    /// Server configurations  
-    servers: Vec<ServerConfig>,
+    /// Connection providers for each backend (Arc for cheap cloning)
+    providers: Arc<Vec<DeadpoolConnectionProvider>>,
+    /// Server configurations (Arc for cheap cloning)
+    servers: Arc<Vec<ServerConfig>>,
     /// Track if pools have been prewarmed to avoid redundant prewarming
     prewarmed: Arc<AtomicBool>,
 }
@@ -29,8 +29,8 @@ impl PoolPrewarmer {
         servers: &[ServerConfig],
     ) -> Self {
         Self {
-            providers: providers.to_vec(),
-            servers: servers.to_vec(),
+            providers: Arc::new(providers.to_vec()),
+            servers: Arc::new(servers.to_vec()),
             prewarmed: Arc::new(AtomicBool::new(false)),
         }
     }
