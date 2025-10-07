@@ -37,12 +37,9 @@ impl BackendAuthenticator {
             buffer_pool.return_buffer(buffer).await;
             return Ok(());
         } else if !ResponseParser::is_auth_required(&buffer[..n]) {
-            let error_msg = response.trim().to_string();
+            let error = format!("Unexpected response to AUTHINFO USER: {}", response.trim());
             buffer_pool.return_buffer(buffer).await;
-            return Err(anyhow::anyhow!(
-                "Unexpected response to AUTHINFO USER: {}",
-                error_msg
-            ));
+            return Err(anyhow::anyhow!(error));
         }
 
         // Send AUTHINFO PASS command
@@ -58,8 +55,7 @@ impl BackendAuthenticator {
         let result = if ResponseParser::is_auth_success(&buffer[..n]) {
             Ok(())
         } else {
-            let error_msg = response.trim().to_string();
-            Err(anyhow::anyhow!("Authentication failed: {}", error_msg))
+            Err(anyhow::anyhow!("Authentication failed: {}", response.trim()))
         };
 
         // Return buffer to pool
@@ -83,12 +79,9 @@ impl BackendAuthenticator {
         debug!("Backend greeting: {}", greeting_str.trim());
 
         if !ResponseParser::is_greeting(greeting) {
-            let error_msg = greeting_str.trim().to_string();
+            let error = format!("Server returned non-success greeting: {}", greeting_str.trim());
             buffer_pool.return_buffer(buffer).await;
-            return Err(anyhow::anyhow!(
-                "Server returned non-success greeting: {}",
-                error_msg
-            ));
+            return Err(anyhow::anyhow!(error));
         }
 
         // Forward greeting to client
@@ -116,12 +109,9 @@ impl BackendAuthenticator {
         debug!("Backend greeting: {}", greeting_str.trim());
 
         if !ResponseParser::is_greeting(greeting) {
-            let error_msg = greeting_str.trim().to_string();
+            let error = format!("Server returned non-success greeting: {}", greeting_str.trim());
             buffer_pool.return_buffer(buffer).await;
-            return Err(anyhow::anyhow!(
-                "Server returned non-success greeting: {}",
-                error_msg
-            ));
+            return Err(anyhow::anyhow!(error));
         }
 
         // Forward greeting to client immediately

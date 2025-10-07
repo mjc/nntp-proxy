@@ -135,6 +135,13 @@ async fn run_proxy(args: Args) -> Result<()> {
     // Create proxy (wrapped in Arc for sharing across tasks)
     let proxy = Arc::new(NntpProxy::new(config)?);
 
+    // Prewarm connection pools before accepting clients
+    info!("Prewarming connection pools...");
+    if let Err(e) = proxy.prewarm_connections().await {
+        warn!("Failed to prewarm connection pools: {}", e);
+    }
+    info!("Connection pools ready");
+
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&listen_addr).await?;

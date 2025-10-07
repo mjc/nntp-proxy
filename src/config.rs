@@ -26,6 +26,16 @@ fn default_unhealthy_threshold() -> u32 {
     3
 }
 
+/// Default cache max capacity (number of articles)
+fn default_cache_max_capacity() -> u64 {
+    10000
+}
+
+/// Default cache TTL in seconds (1 hour)
+fn default_cache_ttl_secs() -> u64 {
+    3600
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct Config {
@@ -35,6 +45,29 @@ pub struct Config {
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// Cache configuration (optional, for caching proxy)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
+}
+
+/// Cache configuration for article caching
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheConfig {
+    /// Maximum number of articles to cache
+    #[serde(default = "default_cache_max_capacity")]
+    pub max_capacity: u64,
+    /// Time-to-live for cached articles in seconds
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_capacity: default_cache_max_capacity(),
+            ttl_secs: default_cache_ttl_secs(),
+        }
+    }
 }
 
 /// Health check configuration

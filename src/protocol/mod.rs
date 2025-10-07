@@ -1,7 +1,6 @@
 //! NNTP protocol handling module
 //!
-//! This module contains protocol-specific constants, response parsing,
-//! and protocol utilities for NNTP communication.
+//! This module contains response parsing and protocol utilities for NNTP communication.
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -9,10 +8,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-mod constants;
 mod response;
 
-pub use constants::*;
 pub use response::ResponseParser;
 
 // Re-export for future use

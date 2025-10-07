@@ -12,8 +12,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerConfig};
 use crate::network::SocketOptimizer;
-use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, PoolPrewarmer};
-use crate::protocol::*;
+use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
+use crate::constants::buffer::{BUFFER_SIZE, BUFFER_POOL_SIZE};
+use crate::constants::stateless_proxy::*;
 use crate::router;
 use crate::session::ClientSession;
 use crate::types;
@@ -24,11 +25,9 @@ pub struct NntpProxy {
     /// Backend selector for round-robin load balancing
     router: Arc<router::BackendSelector>,
     /// Connection providers per server - easily swappable implementation
-    connection_providers: Arc<Vec<DeadpoolConnectionProvider>>,
+    connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
-    /// Pool prewarmer for managing connection prewarming
-    prewarmer: PoolPrewarmer,
 }
 
 impl NntpProxy {
@@ -57,52 +56,42 @@ impl NntpProxy {
             })
             .collect();
 
-        let buffer_pool = BufferPool::new(PROTOCOL_BUFFER_SIZE, BUFFER_POOL_SIZE);
+        let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
 
         let servers = Arc::new(config.servers);
-        let connection_providers = Arc::new(connection_providers);
 
         // Create backend selector and add all backends
-        let router = {
+        let router = Arc::new({
             use types::BackendId;
-            let mut r = router::BackendSelector::new();
-
-            for (idx, provider) in connection_providers.iter().enumerate() {
-                let backend_id = BackendId::from_index(idx);
-                let server = &servers[idx];
-                r.add_backend(backend_id, server.name.clone(), provider.clone());
-            }
-
-            Arc::new(r)
-        };
-
-        // Create pool prewarmer
-        let prewarmer = PoolPrewarmer::new(connection_providers.clone(), servers.clone());
+            connection_providers
+                .iter()
+                .enumerate()
+                .fold(router::BackendSelector::new(), |mut r, (idx, provider)| {
+                    let backend_id = BackendId::from_index(idx);
+                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
+                    r
+                })
+        });
 
         Ok(Self {
             servers,
             router,
             connection_providers,
             buffer_pool,
-            prewarmer,
         })
     }
 
-    /// Prewarm all connection pools (delegates to PoolPrewarmer)
-    async fn prewarm_all_pools(&self) -> Result<()> {
-        self.prewarmer.prewarm_all().await
-    }
-
-    /// Test connections to all backend servers (delegates to PoolPrewarmer)
+    /// Prewarm all connection pools before accepting clients
+    /// Creates all connections concurrently and returns when ready
     pub async fn prewarm_connections(&self) -> Result<()> {
-        self.prewarmer.test_connections().await
+        prewarm_pools(&self.connection_providers, &self.servers).await
     }
 
     /// Gracefully shutdown all connection pools
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown of all connection pools...");
 
-        for provider in self.connection_providers.iter() {
+        for provider in &self.connection_providers {
             provider.graceful_shutdown().await;
         }
 
@@ -114,17 +103,27 @@ impl NntpProxy {
         &self.servers
     }
 
-    /// Common setup for client connections (prewarming and greeting)
+    /// Get the router
+    pub fn router(&self) -> &Arc<router::BackendSelector> {
+        &self.router
+    }
+
+    /// Get the connection providers
+    pub fn connection_providers(&self) -> &[DeadpoolConnectionProvider] {
+        &self.connection_providers
+    }
+
+    /// Get the buffer pool
+    pub fn buffer_pool(&self) -> &BufferPool {
+        &self.buffer_pool
+    }
+
+    /// Common setup for client connections (greeting only, prewarming done at startup)
     async fn setup_client_connection(
         &self,
         client_stream: &mut TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        // Prewarm pools on first connection
-        if let Err(e) = self.prewarm_all_pools().await {
-            warn!("Failed to prewarm connection pools: {}", e);
-        }
-
         // Send proxy greeting
         crate::protocol::send_proxy_greeting(client_stream, client_addr).await
     }
@@ -176,7 +175,7 @@ impl NntpProxy {
         };
 
         // Apply socket optimizations for high-throughput
-        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &*backend_conn) {
+        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_conn) {
             debug!("Failed to apply socket optimizations: {}", e);
         }
 

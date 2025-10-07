@@ -10,6 +10,15 @@ pub mod buffer {
     /// Default buffer size for general I/O operations
     pub const DEFAULT_SIZE: usize = 8192;
 
+    /// Large buffer size for high-throughput reading (4MB)
+    /// Used for BufReader when reading large responses
+    /// Covers most Usenet articles in a single buffer
+    pub const LARGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+    
+    /// Medium buffer size for pooled connections (256KB)
+    /// Balances performance with memory usage when many connections are active
+    pub const MEDIUM_BUFFER_SIZE: usize = 256 * 1024;
+
     /// Buffer size for reading commands from clients
     pub const COMMAND_SIZE: usize = 512;
 
@@ -18,6 +27,35 @@ pub mod buffer {
 
     /// Initial capacity for response accumulation buffers
     pub const RESPONSE_INITIAL_CAPACITY: usize = 8192;
+    
+    /// Buffer size for high throughput operations (256KB)
+    /// Used by BufferPool for pooled buffers
+    pub const BUFFER_SIZE: usize = 256 * 1024;
+    
+    /// Number of buffers in the buffer pool
+    pub const BUFFER_POOL_SIZE: usize = 32;
+    
+    /// Buffer size for direct allocation in high-throughput scenarios (256KB)
+    pub const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024;
+    
+    /// Chunk size for streaming responses (64KB)
+    pub const STREAMING_CHUNK_SIZE: usize = 65536;
+}
+
+/// Socket buffer size constants
+pub mod socket {
+    /// TCP socket receive buffer size for high-throughput transfers (16MB)
+    pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024;
+    
+    /// TCP socket send buffer size for high-throughput transfers (16MB)
+    pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024;
+    
+    /// TCP socket receive buffer size for connection pools (4MB)
+    /// Smaller than high-throughput to avoid memory exhaustion with many connections
+    pub const POOL_RECV_BUFFER: usize = 4 * 1024 * 1024;
+    
+    /// TCP socket send buffer size for connection pools (4MB)
+    pub const POOL_SEND_BUFFER: usize = 4 * 1024 * 1024;
 }
 
 /// Timeout constants
@@ -50,18 +88,21 @@ pub mod protocol {
 
     /// Command not supported response
     pub const COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy\r\n";
+    
+    /// Proxy greeting for per-command routing mode
+    pub const PROXY_GREETING_PCR: &[u8] = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
+    
+    /// Connection closing response
+    pub const CONNECTION_CLOSING: &[u8] = b"205 Connection closing\r\n";
+    
+    /// Backend error response
+    pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 
     /// Minimum response length (3-digit code + CRLF)
     pub const MIN_RESPONSE_LENGTH: usize = 5;
-
-    /// Greeting message for per-command routing mode
-    pub const GREETING_PER_COMMAND: &[u8] = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
-
-    /// Quit response
-    pub const QUIT_RESPONSE: &[u8] = b"205 Connection closing\r\n";
-
-    /// Backend error response
-    pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
+    
+    /// Terminator tail size for spanning terminator detection
+    pub const TERMINATOR_TAIL_SIZE: usize = 4;
 }
 
 /// Connection pool constants
@@ -76,28 +117,6 @@ pub mod pool {
     pub const GET_TIMEOUT_SECS: u64 = 5;
 }
 
-/// Test-related constants
-#[cfg(test)]
-pub mod test {
-    /// Small buffer pool size for tests
-    pub const SMALL_BUFFER_SIZE: usize = 1024;
-
-    /// Small buffer pool count for tests
-    pub const SMALL_BUFFER_COUNT: usize = 4;
-
-    /// Medium buffer pool size for tests
-    pub const MEDIUM_BUFFER_SIZE: usize = 4096;
-
-    /// Medium buffer pool count for tests
-    pub const MEDIUM_BUFFER_COUNT: usize = 8;
-
-    /// Default buffer pool size for tests
-    pub const DEFAULT_BUFFER_SIZE: usize = 8192;
-
-    /// Default buffer pool count for tests
-    pub const DEFAULT_BUFFER_COUNT: usize = 10;
-}
-
 /// Per-command routing constants
 pub mod per_command_routing {
     /// Number of chunks to read ahead when checking for response terminator
@@ -105,12 +124,28 @@ pub mod per_command_routing {
 
     /// Maximum number of bytes to check for spanning terminator
     pub const MAX_TERMINATOR_SPAN_CHECK: usize = 9;
+}
 
-    /// Streaming chunk size (64KB) for reading responses from backend
-    pub const STREAMING_CHUNK_SIZE: usize = 65536;
-
-    /// Size of the tail buffer for terminator span detection
-    pub const TERMINATOR_TAIL_SIZE: usize = 4;
+/// Stateless proxy protocol constants
+pub mod stateless_proxy {
+    #[allow(dead_code)]
+    pub const NNTP_PASSWORD_REQUIRED: &[u8] = b"381 Password required\r\n";
+    #[allow(dead_code)]
+    pub const NNTP_AUTH_ACCEPTED: &[u8] = b"281 Authentication accepted\r\n";
+    pub const NNTP_BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
+    #[allow(dead_code)]
+    pub const NNTP_AUTH_FAILED: &[u8] = b"502 Authentication failed\r\n";
+    pub const NNTP_COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy (stateless proxy mode)\r\n";
+    
+    /// Prewarming configuration constants
+    pub const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5
+    pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
+    
+    /// TCP socket buffer sizes for high-throughput transfers
+    #[allow(dead_code)]
+    pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024; // 16MB
+    #[allow(dead_code)]
+    pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024; // 16MB
 }
 
 #[cfg(test)]

@@ -6,10 +6,7 @@
 use std::io;
 use tokio::net::TcpStream;
 use tracing::debug;
-
-/// TCP socket buffer sizes for high-throughput transfers
-pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 16 * 1024 * 1024; // 16MB
-pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024; // 16MB
+use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
 
 /// Socket optimizer for high-throughput scenarios
 pub struct SocketOptimizer;
