@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerConfig};
 use crate::network::SocketOptimizer;
-use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, PoolPrewarmer};
+use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
 use crate::constants::stateless_proxy::*;
 use crate::router;
 use crate::session::ClientSession;
@@ -27,8 +27,6 @@ pub struct NntpProxy {
     connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
-    /// Pool prewarmer for managing connection prewarming
-    prewarmer: PoolPrewarmer,
 }
 
 impl NntpProxy {
@@ -74,22 +72,18 @@ impl NntpProxy {
                 })
         });
 
-        // Create pool prewarmer
-        let prewarmer = PoolPrewarmer::new(&connection_providers, &servers);
-
         Ok(Self {
             servers,
             router,
             connection_providers,
             buffer_pool,
-            prewarmer,
         })
     }
 
     /// Prewarm all connection pools before accepting clients
     /// Creates all connections concurrently and returns when ready
     pub async fn prewarm_connections(&self) -> Result<()> {
-        self.prewarmer.prewarm_all().await
+        prewarm_pools(&self.connection_providers, &self.servers).await
     }
 
     /// Gracefully shutdown all connection pools

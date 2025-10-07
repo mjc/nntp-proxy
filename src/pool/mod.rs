@@ -8,6 +8,6 @@ pub mod deadpool_connection;
 pub mod prewarming;
 
 pub use buffer::BufferPool;
-pub use connection_trait::ConnectionProvider;
+pub use connection_trait::{ConnectionProvider, PoolStatus};
 pub use deadpool_connection::DeadpoolConnectionProvider;
-pub use prewarming::PoolPrewarmer;
+pub use prewarming::prewarm_pools;
