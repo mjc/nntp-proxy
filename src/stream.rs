@@ -121,14 +121,10 @@ mod tests {
     #[tokio::test]
     async fn test_connection_stream_plain_tcp() {
         // Create a listener and client
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let client_handle = tokio::spawn(async move {
-            TcpStream::connect(addr).await.unwrap()
-        });
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
 
         let (server_stream, _) = listener.accept().await.unwrap();
         let client_stream = client_handle.await.unwrap();
@@ -163,13 +159,13 @@ mod tests {
     async fn test_connection_stream_tcp_access() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         let tcp_stream = std::net::TcpStream::connect(addr).unwrap();
         tcp_stream.set_nonblocking(true).unwrap();
         let tokio_stream = TcpStream::from_std(tcp_stream).unwrap();
-        
+
         let mut conn_stream = ConnectionStream::plain(tokio_stream);
-        
+
         // Should be able to access underlying TCP stream
         assert!(conn_stream.as_tcp_stream().is_some());
         assert!(conn_stream.as_tcp_stream_mut().is_some());

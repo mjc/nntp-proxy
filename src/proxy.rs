@@ -157,7 +157,7 @@ impl NntpProxy {
             server.name, pool_status.available, pool_status.max_size, pool_status.created
         );
 
-        let backend_conn = match self.connection_providers[server_idx]
+        let mut backend_conn = match self.connection_providers[server_idx]
             .get_pooled_connection()
             .await
         {
@@ -190,7 +190,7 @@ impl NntpProxy {
         debug!("Starting session for client {}", client_addr);
 
         let copy_result = session
-            .handle_with_pooled_backend(client_stream, backend_conn)
+            .handle_with_pooled_backend(client_stream, &mut *backend_conn)
             .await;
 
         debug!("Session completed for client {}", client_addr);

@@ -28,32 +28,19 @@ pub enum ConnectionError {
     },
 
     /// Backend authentication failed
-    AuthenticationFailed {
-        backend: String,
-        response: String,
-    },
+    AuthenticationFailed { backend: String, response: String },
 
     /// Invalid or unexpected greeting from backend
-    InvalidGreeting {
-        backend: String,
-        greeting: String,
-    },
+    InvalidGreeting { backend: String, greeting: String },
 
     /// Connection pool exhausted
-    PoolExhausted {
-        backend: String,
-        max_size: usize,
-    },
+    PoolExhausted { backend: String, max_size: usize },
 
     /// Connection is stale or broken
-    StaleConnection {
-        backend: String,
-        reason: String,
-    },
+    StaleConnection { backend: String, reason: String },
 
     /// I/O error during communication
     IoError(std::io::Error),
-
     // Future: TLS/SSL errors
     // TlsHandshake { backend: String, source: ... },
     // CertificateVerification { backend: String, reason: String },
@@ -93,11 +80,7 @@ impl fmt::Display for ConnectionError {
                 )
             }
             Self::StaleConnection { backend, reason } => {
-                write!(
-                    f,
-                    "Stale connection to backend '{}': {}",
-                    backend, reason
-                )
+                write!(f, "Stale connection to backend '{}': {}", backend, reason)
             }
             Self::IoError(e) => write!(f, "I/O error: {}", e),
         }

@@ -57,15 +57,15 @@ impl CachingSession {
     pub async fn handle_with_pooled_backend<T>(
         &self,
         mut client_stream: TcpStream,
-        mut backend_conn: T,
+        backend_conn: T,
     ) -> Result<(u64, u64)>
     where
-        T: std::ops::DerefMut<Target = TcpStream>,
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         use tokio::io::BufReader;
 
         let (client_read, mut client_write) = client_stream.split();
-        let (backend_read, mut backend_write) = backend_conn.split();
+        let (backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::new(client_read);
         let mut backend_reader = BufReader::with_capacity(buffer::MEDIUM_BUFFER_SIZE, backend_read);
 

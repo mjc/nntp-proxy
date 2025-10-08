@@ -83,16 +83,16 @@ impl ClientSession {
     pub async fn handle_with_pooled_backend<T>(
         &self,
         mut client_stream: TcpStream,
-        mut backend_conn: T,
+        backend_conn: T,
     ) -> Result<(u64, u64)>
     where
-        T: std::ops::DerefMut<Target = TcpStream>,
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         use tokio::io::BufReader;
 
         // Split streams for independent read/write
         let (client_read, mut client_write) = client_stream.split();
-        let (mut backend_read, mut backend_write) = backend_conn.split();
+        let (mut backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::new(client_read);
 
         let mut client_to_backend_bytes = 0u64;

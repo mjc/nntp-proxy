@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{debug, warn};
 
 use crate::constants::buffer::HIGH_THROUGHPUT_BUFFER_SIZE;
@@ -16,14 +15,21 @@ pub struct StreamHandler;
 impl StreamHandler {
     /// Handle high-throughput data transfer after initial command
     /// This is optimized for large article transfers
-    pub async fn high_throughput_transfer(
-        mut client_reader: BufReader<ReadHalf<'_>>,
-        mut client_write: WriteHalf<'_>,
-        mut backend_read: ReadHalf<'_>,
-        mut backend_write: WriteHalf<'_>,
+    /// Now generic over stream types to support both TCP and future TLS
+    pub async fn high_throughput_transfer<CR, CW, BR, BW>(
+        mut client_reader: BufReader<CR>,
+        mut client_write: CW,
+        mut backend_read: BR,
+        mut backend_write: BW,
         mut client_to_backend_bytes: u64,
         mut backend_to_client_bytes: u64,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64)>
+    where
+        CR: AsyncReadExt + Unpin,
+        CW: AsyncWriteExt + Unpin,
+        BR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
         debug!("Starting high-throughput data transfer");
 
         // Use direct buffer allocation for high-throughput to avoid pool overhead
