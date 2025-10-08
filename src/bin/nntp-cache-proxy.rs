@@ -254,7 +254,7 @@ async fn handle_caching_client(
     nntp_proxy::protocol::send_proxy_greeting(&mut client_stream, client_addr).await?;
 
     // Get pooled backend connection
-    let backend_conn = match proxy.connection_providers()[server_idx]
+    let mut backend_conn = match proxy.connection_providers()[server_idx]
         .get_pooled_connection()
         .await
     {
@@ -280,7 +280,7 @@ async fn handle_caching_client(
     debug!("Starting caching session for client {}", client_addr);
 
     let copy_result = session
-        .handle_with_pooled_backend(client_stream, backend_conn)
+        .handle_with_pooled_backend(client_stream, &mut *backend_conn)
         .await;
 
     debug!("Caching session completed for client {}", client_addr);

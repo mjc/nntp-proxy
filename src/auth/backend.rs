@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::pool::BufferPool;
@@ -13,13 +12,17 @@ pub struct BackendAuthenticator;
 
 impl BackendAuthenticator {
     /// Authenticate to backend server
+    /// Now generic over stream types to support both TCP and future TLS
     #[allow(dead_code)]
-    async fn authenticate(
-        backend_stream: &mut TcpStream,
+    async fn authenticate<S>(
+        backend_stream: &mut S,
         username: &str,
         password: &str,
         buffer_pool: &BufferPool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Send AUTHINFO USER command
@@ -67,12 +70,17 @@ impl BackendAuthenticator {
     }
 
     /// Read and forward the backend server's greeting to the client
+    /// Now generic over stream types to support both TCP and future TLS
     #[allow(dead_code)]
-    pub async fn forward_greeting(
-        backend_stream: &mut TcpStream,
-        client_stream: &mut TcpStream,
+    pub async fn forward_greeting<B, C>(
+        backend_stream: &mut B,
+        client_stream: &mut C,
         buffer_pool: &BufferPool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: AsyncReadExt + AsyncWriteExt + Unpin,
+        C: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting
@@ -98,14 +106,19 @@ impl BackendAuthenticator {
     }
 
     /// Perform authentication and forward the greeting to the client
+    /// Now generic over stream types to support both TCP and future TLS
     #[allow(dead_code)]
-    pub async fn authenticate_and_forward_greeting(
-        backend_stream: &mut TcpStream,
-        client_stream: &mut TcpStream,
+    pub async fn authenticate_and_forward_greeting<B, C>(
+        backend_stream: &mut B,
+        client_stream: &mut C,
         username: &str,
         password: &str,
         buffer_pool: &BufferPool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: AsyncReadExt + AsyncWriteExt + Unpin,
+        C: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting first and forward it
