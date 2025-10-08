@@ -4,6 +4,7 @@ use deadpool::managed;
 use tokio::net::TcpStream;
 use tracing::info;
 
+use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 
