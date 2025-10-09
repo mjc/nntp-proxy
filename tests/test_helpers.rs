@@ -132,13 +132,7 @@ pub fn spawn_mock_server_with_auth(
     })
 }
 
-/// Create a test configuration with the specified backend servers
-///
-/// # Arguments
-/// * `server_ports` - List of (port, name) tuples for backend servers
-///
-/// # Returns
-/// Configuration object ready for use in tests
+/// Create a test configuration with servers on the given ports
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     Config {
         servers: server_ports
@@ -156,7 +150,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
             })
             .collect(),
         health_check: Default::default(),
-        cache: None,
+        cache: Default::default(),
     }
 }
 

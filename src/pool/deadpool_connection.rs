@@ -1,37 +1,23 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
-use rustls::{ClientConfig, RootCertStore};
-use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsConnector, client::TlsStream};
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 use crate::stream::ConnectionStream;
-
-/// Configuration for TLS connections
-#[derive(Debug, Clone)]
-pub struct TlsConfig {
-    pub use_tls: bool,
-    pub tls_verify_cert: bool,
-    pub tls_cert_path: Option<String>,
-}
+use crate::tls::{TlsConfig, TlsManager};
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
 pub struct TcpManager {
     host: String,
     port: u16,
-    #[allow(dead_code)]
     name: String,
     username: Option<String>,
     password: Option<String>,
-    use_tls: bool,
-    tls_verify_cert: bool,
-    tls_cert_path: Option<String>,
+    tls_config: TlsConfig,
 }
 
 impl TcpManager {
@@ -48,9 +34,7 @@ impl TcpManager {
             name,
             username,
             password,
-            use_tls: false,
-            tls_verify_cert: true,
-            tls_cert_path: None,
+            tls_config: TlsConfig::default(),
         }
     }
 
@@ -69,9 +53,7 @@ impl TcpManager {
             name,
             username,
             password,
-            use_tls: tls_config.use_tls,
-            tls_verify_cert: tls_config.tls_verify_cert,
-            tls_cert_path: tls_config.tls_cert_path,
+            tls_config,
         }
     }
 
@@ -116,124 +98,16 @@ impl TcpManager {
         let tcp_stream = TcpStream::from_std(std_stream)?;
 
         // Perform TLS handshake if enabled
-        if self.use_tls {
-            let tls_stream = self.tls_handshake(tcp_stream).await?;
+        if self.tls_config.use_tls {
+            let tls_manager = TlsManager::new(self.tls_config.clone());
+            let tls_stream = tls_manager.handshake(tcp_stream, &self.host, &self.name).await?;
             Ok(ConnectionStream::Tls(tls_stream))
         } else {
             Ok(ConnectionStream::Plain(tcp_stream))
         }
     }
 
-    /// Performs TLS handshake with the NNTP server using rustls optimized for maximum performance.
-    /// 
-    /// This method uses rustls with performance optimizations:
-    /// - Ring crypto provider for fastest cryptographic operations
-    /// - TLS 1.3 early data (0-RTT) enabled for faster reconnections
-    /// - Session resumption enabled to avoid full handshakes
-    /// - Pure Rust implementation (memory safe, no C dependencies)
-    /// - Support for loading system certificates with rustls-native-certs
-    /// - Fallback to Mozilla's webpki-roots CA bundle if system certs unavailable
-    /// 
-    /// Certificate loading priority:
-    /// 1. Custom certificate from tls_cert_path (if provided)
-    /// 2. System certificate store (via rustls-native-certs)
-    /// 3. Mozilla CA bundle (webpki-roots) as fallback
-    async fn tls_handshake(
-        &self,
-        stream: TcpStream,
-    ) -> Result<TlsStream<TcpStream>, anyhow::Error> {
-        use tracing::debug;
 
-        // Create root certificate store
-        let mut root_store = RootCertStore::empty();
-        let mut cert_sources = Vec::new();
-
-        // 1. Load custom CA certificate if provided
-        if let Some(cert_path) = &self.tls_cert_path {
-            debug!("TLS: Loading custom CA certificate from: {}", cert_path);
-            let cert_data = std::fs::read(cert_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read TLS certificate from {}: {}", cert_path, e)
-            })?;
-            
-            let certs = rustls_pemfile::certs(&mut cert_data.as_slice())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("Failed to parse TLS certificate: {}", e))?;
-            
-            for cert in certs {
-                root_store.add(cert).map_err(|e| {
-                    anyhow::anyhow!("Failed to add custom certificate to store: {}", e)
-                })?;
-            }
-            cert_sources.push("custom certificate");
-        }
-
-        // 2. Try to load system certificates
-        let cert_result = rustls_native_certs::load_native_certs();
-        let mut added_count = 0;
-        for cert in cert_result.certs {
-            if root_store.add(cert).is_ok() {
-                added_count += 1;
-            }
-        }
-        if added_count > 0 {
-            debug!("TLS: Loaded {} certificates from system store", added_count);
-            cert_sources.push("system certificates");
-        }
-        
-        // Log any errors but don't fail - we have fallback
-        for error in cert_result.errors {
-            warn!("TLS: Certificate loading error: {}", error);
-        }
-
-        // 3. Fallback to Mozilla CA bundle if no certificates loaded
-        if root_store.is_empty() {
-            debug!("TLS: No system certificates available, using Mozilla CA bundle fallback");
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            cert_sources.push("Mozilla CA bundle");
-        }
-
-        debug!("TLS: Certificate sources: {}", cert_sources.join(", "));
-
-        // Create client config optimized for performance using ring crypto provider
-        let config_builder = ClientConfig::builder_with_provider(
-            Arc::new(rustls::crypto::ring::default_provider())
-        )
-        .with_safe_default_protocol_versions()
-        .map_err(|e| anyhow::anyhow!("Failed to create TLS config with ring provider: {}", e))?
-        .with_root_certificates(root_store);
-
-        let mut config = if self.tls_verify_cert {
-            debug!("TLS: Certificate verification enabled with ring crypto provider");
-            config_builder.with_no_client_auth()
-        } else {
-            debug!("TLS: WARNING - Certificate verification disabled (insecure!)");
-            // For rustls, disabling cert verification requires a custom verifier
-            // This is intentionally more difficult than native-tls for security
-            return Err(anyhow::anyhow!(
-                "Certificate verification cannot be disabled with rustls. \
-                This is intentional for security. If you need to connect to \
-                servers with invalid certificates, consider using a custom CA certificate."
-            ));
-        };
-
-        // Performance optimizations
-        config.enable_early_data = true;  // Enable TLS 1.3 0-RTT for faster reconnections
-        config.resumption = rustls::client::Resumption::default();  // Enable session resumption
-
-        let connector = TlsConnector::from(Arc::new(config));
-        let domain = rustls_pki_types::ServerName::try_from(self.host.as_str())
-            .map_err(|e| anyhow::anyhow!("Invalid hostname for TLS: {}", e))?
-            .to_owned();
-
-        debug!("TLS: Connecting to {} with rustls", self.host);
-        connector.connect(domain, stream).await.map_err(|e| {
-            ConnectionError::TlsHandshake {
-                backend: self.name.clone(),
-                source: Box::new(e),
-            }
-            .into()
-        })
-    }
 }
 
 impl managed::Manager for TcpManager {

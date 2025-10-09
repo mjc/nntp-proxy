@@ -48,6 +48,7 @@ pub mod constants;
 pub mod health;
 pub mod pool;
 pub mod router;
+pub mod tls;
 pub mod session;
 pub mod types;
 
