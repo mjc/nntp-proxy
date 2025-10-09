@@ -39,42 +39,6 @@ impl SocketOptimizer {
         Ok(())
     }
 
-    /// Apply socket optimizations to ConnectionStream (extracts TCP stream if available)
-    ///
-    /// # Deprecated
-    /// This method is maintained for backward compatibility.
-    /// New code should use `ConnectionOptimizer::new(stream).optimize()`.
-    pub fn optimize_connection_stream(stream: &ConnectionStream) -> Result<(), io::Error> {
-        let optimizer = ConnectionOptimizer::new(stream);
-        optimizer.optimize()
-    }
-
-    /// Apply aggressive socket optimizations for 1GB+ transfers
-    /// Works with both TcpStream and ConnectionStream
-    ///
-    /// # Deprecated
-    /// This method is maintained for backward compatibility.
-    /// New code should use `ConnectionOptimizer` for better separation of concerns.
-    pub fn apply_to_streams(
-        client_stream: &TcpStream,
-        backend_stream: &crate::stream::ConnectionStream,
-    ) -> Result<(), io::Error> {
-        debug!("Applying high-throughput socket optimizations (legacy method)");
-
-        // Use the new trait-based approach internally
-        let client_optimizer = TcpOptimizer::new(client_stream);
-        if let Err(e) = client_optimizer.optimize() {
-            debug!("Failed to set client socket optimizations: {}", e);
-        }
-
-        let backend_optimizer = ConnectionOptimizer::new(backend_stream);
-        if let Err(e) = backend_optimizer.optimize() {
-            debug!("Failed to set backend socket optimizations: {}", e);
-        }
-
-        Ok(())
-    }
-
     /// Apply optimizations using the new trait-based approach (recommended)
     pub fn apply_to_connection_streams(
         client_stream: &ConnectionStream,
@@ -164,30 +128,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_apply_to_streams() {
+    async fn test_apply_to_connection_streams() {
         use crate::stream::ConnectionStream;
 
         // Create two TCP connections
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (server_tcp, _) = listener.accept().await.unwrap();
+        
+        let client_stream = ConnectionStream::plain(client_tcp);
         let server_stream = ConnectionStream::plain(server_tcp);
 
-        // Apply optimizations to both streams
-        let result = SocketOptimizer::apply_to_streams(&client_stream, &server_stream);
+        // Apply optimizations using the trait-based approach
+        let result = SocketOptimizer::apply_to_connection_streams(&client_stream, &server_stream);
 
-        // Should always succeed (errors are logged but not propagated)
+        // Should always succeed
         assert!(result.is_ok());
 
         // Streams should still be usable
-        assert!(client_stream.peer_addr().is_ok());
+        assert!(client_stream.as_tcp_stream().unwrap().peer_addr().is_ok());
         assert!(server_stream.as_tcp_stream().unwrap().peer_addr().is_ok());
     }
 
     #[tokio::test]
-    async fn test_optimize_connection_stream() {
+    async fn test_connection_optimizer() {
         use crate::stream::ConnectionStream;
 
         // Create a test server and connection
@@ -200,8 +166,9 @@ mod tests {
 
         let conn_stream = ConnectionStream::plain(tokio_stream);
 
-        // Should successfully optimize ConnectionStream
-        let result = SocketOptimizer::optimize_connection_stream(&conn_stream);
+        // Should successfully optimize ConnectionStream using trait-based approach
+        let optimizer = ConnectionOptimizer::new(&conn_stream);
+        let result = optimizer.optimize();
         assert!(result.is_ok());
     }
 

@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, ServerConfig};
 use crate::constants::buffer::{BUFFER_POOL_SIZE, BUFFER_SIZE};
 use crate::constants::stateless_proxy::*;
-use crate::network::SocketOptimizer;
+use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
 use crate::router;
 use crate::session::ClientSession;
@@ -181,8 +181,14 @@ impl NntpProxy {
         };
 
         // Apply socket optimizations for high-throughput
-        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_conn) {
-            debug!("Failed to apply socket optimizations: {}", e);
+        let client_optimizer = TcpOptimizer::new(&client_stream);
+        if let Err(e) = client_optimizer.optimize() {
+            debug!("Failed to optimize client socket: {}", e);
+        }
+        
+        let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
+        if let Err(e) = backend_optimizer.optimize() {
+            debug!("Failed to optimize backend socket: {}", e);
         }
 
         // Create session and handle connection

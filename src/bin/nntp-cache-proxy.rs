@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::CacheConfig;
 use nntp_proxy::constants::stateless_proxy::NNTP_BACKEND_UNAVAILABLE;
-use nntp_proxy::network::SocketOptimizer;
+use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use nntp_proxy::types::ClientId;
 use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
@@ -275,8 +275,14 @@ async fn handle_caching_client(
     };
 
     // Apply socket optimizations
-    if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_conn) {
-        debug!("Failed to apply socket optimizations: {}", e);
+    let client_optimizer = TcpOptimizer::new(&client_stream);
+    if let Err(e) = client_optimizer.optimize() {
+        debug!("Failed to optimize client socket: {}", e);
+    }
+    
+    let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
+    if let Err(e) = backend_optimizer.optimize() {
+        debug!("Failed to optimize backend socket: {}", e);
     }
 
     // Create caching session and handle connection
