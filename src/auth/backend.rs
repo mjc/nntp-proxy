@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::pool::BufferPool;
@@ -12,14 +11,17 @@ use crate::protocol::ResponseParser;
 pub struct BackendAuthenticator;
 
 impl BackendAuthenticator {
-    /// Authenticate to backend server
+    /// Authenticate to backend server - generic over stream types to support both TCP and future TLS
     #[allow(dead_code)]
-    async fn authenticate(
-        backend_stream: &mut TcpStream,
+    async fn authenticate<S>(
+        backend_stream: &mut S,
         username: &str,
         password: &str,
         buffer_pool: &BufferPool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Send AUTHINFO USER command
@@ -55,7 +57,10 @@ impl BackendAuthenticator {
         let result = if ResponseParser::is_auth_success(&buffer[..n]) {
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Authentication failed: {}", response.trim()))
+            Err(anyhow::anyhow!(
+                "Authentication failed: {}",
+                response.trim()
+            ))
         };
 
         // Return buffer to pool
@@ -63,13 +68,17 @@ impl BackendAuthenticator {
         result
     }
 
-    /// Read and forward the backend server's greeting to the client
+    /// Read and forward the backend server's greeting to the client - generic over stream types
     #[allow(dead_code)]
-    pub async fn forward_greeting(
-        backend_stream: &mut TcpStream,
-        client_stream: &mut TcpStream,
+    pub async fn forward_greeting<B, C>(
+        backend_stream: &mut B,
+        client_stream: &mut C,
         buffer_pool: &BufferPool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: AsyncReadExt + AsyncWriteExt + Unpin,
+        C: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting
@@ -79,7 +88,10 @@ impl BackendAuthenticator {
         debug!("Backend greeting: {}", greeting_str.trim());
 
         if !ResponseParser::is_greeting(greeting) {
-            let error = format!("Server returned non-success greeting: {}", greeting_str.trim());
+            let error = format!(
+                "Server returned non-success greeting: {}",
+                greeting_str.trim()
+            );
             buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(error));
         }
@@ -91,15 +103,19 @@ impl BackendAuthenticator {
         Ok(())
     }
 
-    /// Perform authentication and forward the greeting to the client
+    /// Perform authentication and forward the greeting to the client - generic over stream types
     #[allow(dead_code)]
-    pub async fn authenticate_and_forward_greeting(
-        backend_stream: &mut TcpStream,
-        client_stream: &mut TcpStream,
+    pub async fn authenticate_and_forward_greeting<B, C>(
+        backend_stream: &mut B,
+        client_stream: &mut C,
         username: &str,
         password: &str,
         buffer_pool: &BufferPool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: AsyncReadExt + AsyncWriteExt + Unpin,
+        C: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting first and forward it
@@ -109,7 +125,10 @@ impl BackendAuthenticator {
         debug!("Backend greeting: {}", greeting_str.trim());
 
         if !ResponseParser::is_greeting(greeting) {
-            let error = format!("Server returned non-success greeting: {}", greeting_str.trim());
+            let error = format!(
+                "Server returned non-success greeting: {}",
+                greeting_str.trim()
+            );
             buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(error));
         }

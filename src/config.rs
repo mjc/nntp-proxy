@@ -107,20 +107,181 @@ pub struct ServerConfig {
     /// Maximum number of concurrent connections to this server
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+
+    // TODO(SSL): Add TLS configuration fields when implementing SSL support:
+    // See SSL_IMPLEMENTATION.md for details
+    // pub use_tls: bool,
+    // pub tls_verify_cert: bool,
+    // pub tls_cert_path: Option<String>,
 }
 
-/// Load configuration from a TOML file
+impl Config {
+    /// Validate configuration for correctness
+    ///
+    /// Checks for:
+    /// - Empty server names
+    /// - Invalid ports (0)
+    /// - Invalid max_connections (0)
+    /// - At least one server configured
+    pub fn validate(&self) -> Result<()> {
+        if self.servers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Configuration must have at least one server"
+            ));
+        }
+
+        for server in &self.servers {
+            if server.name.trim().is_empty() {
+                return Err(anyhow::anyhow!("Server name cannot be empty"));
+            }
+            if server.host.trim().is_empty() {
+                return Err(anyhow::anyhow!("Server '{}' has empty host", server.name));
+            }
+            if server.port == 0 {
+                return Err(anyhow::anyhow!(
+                    "Invalid port 0 for server '{}'",
+                    server.name
+                ));
+            }
+            if server.max_connections == 0 {
+                return Err(anyhow::anyhow!(
+                    "max_connections must be > 0 for server '{}'",
+                    server.name
+                ));
+            }
+        }
+
+        // Validate health check configuration
+        if self.health_check.interval_secs == 0 {
+            return Err(anyhow::anyhow!("health_check.interval_secs must be > 0"));
+        }
+        if self.health_check.timeout_secs == 0 {
+            return Err(anyhow::anyhow!("health_check.timeout_secs must be > 0"));
+        }
+        if self.health_check.unhealthy_threshold == 0 {
+            return Err(anyhow::anyhow!(
+                "health_check.unhealthy_threshold must be > 0"
+            ));
+        }
+
+        // Validate cache configuration if present
+        if let Some(cache) = &self.cache {
+            if cache.max_capacity == 0 {
+                return Err(anyhow::anyhow!("cache.max_capacity must be > 0"));
+            }
+            if cache.ttl_secs == 0 {
+                return Err(anyhow::anyhow!("cache.ttl_secs must be > 0"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Load backend server configuration from environment variables
+///
+/// Supports indexed environment variables for Docker/container deployments:
+/// - `NNTP_SERVER_0_HOST`, `NNTP_SERVER_0_PORT`, `NNTP_SERVER_0_NAME`, etc.
+/// - `NNTP_SERVER_1_HOST`, `NNTP_SERVER_1_PORT`, `NNTP_SERVER_1_NAME`, etc.
+///
+/// Optional per-server variables:
+/// - `NNTP_SERVER_N_USERNAME` - Backend authentication username
+/// - `NNTP_SERVER_N_PASSWORD` - Backend authentication password
+/// - `NNTP_SERVER_N_MAX_CONNECTIONS` - Max connections (default: 10)
+///
+/// If any `NNTP_SERVER_N_HOST` is found, environment variables take precedence
+/// over config file servers.
+fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
+    let mut servers = Vec::new();
+    let mut index = 0;
+
+    loop {
+        // Check if this server index exists by looking for HOST
+        let host_key = format!("NNTP_SERVER_{}_HOST", index);
+        let host = match std::env::var(&host_key) {
+            Ok(h) => h,
+            Err(_) => {
+                // No more servers found
+                break;
+            }
+        };
+
+        // Parse port (required)
+        let port_key = format!("NNTP_SERVER_{}_PORT", index);
+        let port = std::env::var(&port_key)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(119); // Default NNTP port
+
+        // Get name (required, use host as fallback)
+        let name_key = format!("NNTP_SERVER_{}_NAME", index);
+        let name = std::env::var(&name_key).unwrap_or_else(|_| format!("Server {}", index));
+
+        // Optional fields
+        let username_key = format!("NNTP_SERVER_{}_USERNAME", index);
+        let username = std::env::var(&username_key).ok();
+
+        let password_key = format!("NNTP_SERVER_{}_PASSWORD", index);
+        let password = std::env::var(&password_key).ok();
+
+        let max_conn_key = format!("NNTP_SERVER_{}_MAX_CONNECTIONS", index);
+        let max_connections = std::env::var(&max_conn_key)
+            .ok()
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or_else(default_max_connections);
+
+        servers.push(ServerConfig {
+            host,
+            port,
+            name,
+            username,
+            password,
+            max_connections,
+        });
+
+        index += 1;
+    }
+
+    if servers.is_empty() {
+        None
+    } else {
+        Some(servers)
+    }
+}
+
+/// Load configuration from a TOML file, with environment variable overrides
+///
+/// Environment variables for backend servers take precedence over config file:
+/// - `NNTP_SERVER_0_HOST`, `NNTP_SERVER_0_PORT`, `NNTP_SERVER_0_NAME`
+/// - `NNTP_SERVER_1_HOST`, `NNTP_SERVER_1_PORT`, `NNTP_SERVER_1_NAME`
+/// - etc.
+///
+/// This allows Docker/container deployments to override servers without
+/// modifying the config file.
 pub fn load_config(config_path: &str) -> Result<Config> {
     let config_content = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", config_path, e))?;
 
-    let config: Config = toml::from_str(&config_content)
+    let mut config: Config = toml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", config_path, e))?;
+
+    // Check for environment variable server overrides
+    if let Some(env_servers) = load_servers_from_env() {
+        tracing::info!(
+            "Using {} backend server(s) from environment variables (overriding config file)",
+            env_servers.len()
+        );
+        config.servers = env_servers;
+    }
+
+    // Validate the loaded configuration
+    config.validate()?;
 
     Ok(config)
 }
 
 /// Create a default configuration for examples/testing
+#[must_use]
 pub fn create_default_config() -> Config {
     Config {
         servers: vec![ServerConfig {
@@ -530,5 +691,98 @@ max_connections = 5
         assert_eq!(deserialized.servers[0].name, "测试服务器 🚀");
 
         Ok(())
+    }
+
+    // Test helper functions to encapsulate unsafe env var operations
+    // SAFETY: These are only safe when tests are run serially (not in parallel)
+    // Use #[serial] attribute to ensure thread-safety
+    #[cfg(test)]
+    mod test_env_helpers {
+        /// Set an environment variable (test helper)
+        /// SAFETY: Only safe when called from #[serial] tests to avoid race conditions
+        pub fn set_env(key: &str, value: &str) {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        /// Remove an environment variable (test helper)
+        /// SAFETY: Only safe when called from #[serial] tests to avoid race conditions
+        pub fn remove_env(key: &str) {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+
+        /// Remove multiple environment variables (test helper)
+        /// SAFETY: Only safe when called from #[serial] tests to avoid race conditions
+        pub fn remove_env_range(prefix: &str, start: usize, end: usize) {
+            unsafe {
+                for i in start..end {
+                    std::env::remove_var(format!("{}_{}", prefix, i));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_load_servers_from_env() {
+        use test_env_helpers::*;
+
+        // Set up environment variables for testing
+        set_env("NNTP_SERVER_0_HOST", "env-server1.com");
+        set_env("NNTP_SERVER_0_PORT", "8119");
+        set_env("NNTP_SERVER_0_NAME", "Env Server 1");
+        set_env("NNTP_SERVER_0_USERNAME", "envuser");
+        set_env("NNTP_SERVER_0_PASSWORD", "envpass");
+        set_env("NNTP_SERVER_0_MAX_CONNECTIONS", "15");
+
+        set_env("NNTP_SERVER_1_HOST", "env-server2.com");
+        set_env("NNTP_SERVER_1_PORT", "119");
+        // No name set - should use default "Server 1"
+        // No max_connections set - should use default 10
+
+        let servers = load_servers_from_env().expect("Should load servers from env");
+
+        assert_eq!(servers.len(), 2);
+
+        // Check first server
+        assert_eq!(servers[0].host, "env-server1.com");
+        assert_eq!(servers[0].port, 8119);
+        assert_eq!(servers[0].name, "Env Server 1");
+        assert_eq!(servers[0].username, Some("envuser".to_string()));
+        assert_eq!(servers[0].password, Some("envpass".to_string()));
+        assert_eq!(servers[0].max_connections, 15);
+
+        // Check second server
+        assert_eq!(servers[1].host, "env-server2.com");
+        assert_eq!(servers[1].port, 119);
+        assert_eq!(servers[1].name, "Server 1"); // Default name
+        assert_eq!(servers[1].username, None);
+        assert_eq!(servers[1].password, None);
+        assert_eq!(servers[1].max_connections, 10); // Default
+
+        // Clean up environment variables
+        remove_env("NNTP_SERVER_0_HOST");
+        remove_env("NNTP_SERVER_0_PORT");
+        remove_env("NNTP_SERVER_0_NAME");
+        remove_env("NNTP_SERVER_0_USERNAME");
+        remove_env("NNTP_SERVER_0_PASSWORD");
+        remove_env("NNTP_SERVER_0_MAX_CONNECTIONS");
+        remove_env("NNTP_SERVER_1_HOST");
+        remove_env("NNTP_SERVER_1_PORT");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_load_servers_from_env_empty() {
+        use test_env_helpers::*;
+
+        // Ensure no env vars are set
+        remove_env_range("NNTP_SERVER", 0, 5);
+
+        let servers = load_servers_from_env();
+        assert!(servers.is_none(), "Should return None when no env vars set");
     }
 }

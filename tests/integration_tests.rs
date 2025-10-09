@@ -341,4 +341,3 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
 
     Ok(())
 }
-

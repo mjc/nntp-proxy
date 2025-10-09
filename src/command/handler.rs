@@ -40,9 +40,9 @@ impl CommandHandler {
             NntpCommand::Stateful => {
                 CommandAction::Reject("Command not supported by this proxy (stateless proxy mode)")
             }
-            NntpCommand::NonRoutable => {
-                CommandAction::Reject("Command not supported by this proxy (per-command routing mode)")
-            }
+            NntpCommand::NonRoutable => CommandAction::Reject(
+                "Command not supported by this proxy (per-command routing mode)",
+            ),
             NntpCommand::ArticleByMessageId => CommandAction::ForwardHighThroughput,
             NntpCommand::Stateless => CommandAction::ForwardStateless,
         }
@@ -71,12 +71,10 @@ mod tests {
     #[test]
     fn test_stateful_command_rejected() {
         let action = CommandHandler::handle_command("GROUP alt.test");
-        match action {
-            CommandAction::Reject(msg) => {
-                assert!(msg.contains("stateless"));
-            }
-            _ => panic!("Expected Reject action"),
-        }
+        assert!(
+            matches!(action, CommandAction::Reject(msg) if msg.contains("stateless")),
+            "Expected Reject with 'stateless' in message"
+        );
     }
 
     #[test]
@@ -284,77 +282,79 @@ mod tests {
     #[test]
     fn test_reject_messages() {
         // Verify reject messages are informative
-        match CommandHandler::handle_command("GROUP alt.test") {
-            CommandAction::Reject(msg) => {
-                assert!(!msg.is_empty());
-                assert!(msg.len() > 10); // Should have a meaningful message
-            }
-            _ => panic!("Expected Reject"),
-        }
+        assert!(
+            matches!(
+                CommandHandler::handle_command("GROUP alt.test"),
+                CommandAction::Reject(msg) if !msg.is_empty() && msg.len() > 10
+            ),
+            "Expected Reject with meaningful message"
+        );
     }
 
     #[test]
     fn test_unknown_commands_forwarded() {
         // Unknown commands should be forwarded as stateless
         // The backend server will handle the error
-        let unknown_commands = vec!["INVALIDCOMMAND", "XYZABC", "RANDOM DATA", "12345"];
+        let unknown_commands = ["INVALIDCOMMAND", "XYZABC", "RANDOM DATA", "12345"];
 
-        for cmd in unknown_commands {
-            assert_eq!(
-                CommandHandler::handle_command(cmd),
-                CommandAction::ForwardStateless,
-                "Unknown command '{}' should be forwarded",
-                cmd
-            );
-        }
+        assert!(
+            unknown_commands.iter().all(|cmd| {
+                CommandHandler::handle_command(cmd) == CommandAction::ForwardStateless
+            }),
+            "All unknown commands should be forwarded as stateless"
+        );
     }
 
     #[test]
     fn test_non_routable_commands_rejected() {
         // POST should be rejected
-        match CommandHandler::handle_command("POST") {
-            CommandAction::Reject(msg) => {
-                assert!(msg.contains("routing"));
-            }
-            _ => panic!("Expected Reject for POST"),
-        }
+        assert!(
+            matches!(
+                CommandHandler::handle_command("POST"),
+                CommandAction::Reject(msg) if msg.contains("routing")
+            ),
+            "Expected Reject for POST"
+        );
 
         // IHAVE should be rejected
-        match CommandHandler::handle_command("IHAVE <test@example.com>") {
-            CommandAction::Reject(msg) => {
-                assert!(msg.contains("routing"));
-            }
-            _ => panic!("Expected Reject for IHAVE"),
-        }
+        assert!(
+            matches!(
+                CommandHandler::handle_command("IHAVE <test@example.com>"),
+                CommandAction::Reject(msg) if msg.contains("routing")
+            ),
+            "Expected Reject for IHAVE"
+        );
 
         // NEWGROUPS should be rejected
-        match CommandHandler::handle_command("NEWGROUPS 20240101 000000 GMT") {
-            CommandAction::Reject(msg) => {
-                assert!(msg.contains("routing"));
-            }
-            _ => panic!("Expected Reject for NEWGROUPS"),
-        }
+        assert!(
+            matches!(
+                CommandHandler::handle_command("NEWGROUPS 20240101 000000 GMT"),
+                CommandAction::Reject(msg) if msg.contains("routing")
+            ),
+            "Expected Reject for NEWGROUPS"
+        );
 
         // NEWNEWS should be rejected
-        match CommandHandler::handle_command("NEWNEWS * 20240101 000000 GMT") {
-            CommandAction::Reject(msg) => {
-                assert!(msg.contains("routing"));
-            }
-            _ => panic!("Expected Reject for NEWNEWS"),
-        }
+        assert!(
+            matches!(
+                CommandHandler::handle_command("NEWNEWS * 20240101 000000 GMT"),
+                CommandAction::Reject(msg) if msg.contains("routing")
+            ),
+            "Expected Reject for NEWNEWS"
+        );
     }
 
     #[test]
     fn test_reject_message_content() {
         // Verify different reject messages for different command types
-        let stateful_reject = match CommandHandler::handle_command("GROUP alt.test") {
-            CommandAction::Reject(msg) => msg,
-            _ => panic!("Expected Reject"),
+        let CommandAction::Reject(stateful_reject) =
+            CommandHandler::handle_command("GROUP alt.test")
+        else {
+            panic!("Expected Reject")
         };
 
-        let routing_reject = match CommandHandler::handle_command("POST") {
-            CommandAction::Reject(msg) => msg,
-            _ => panic!("Expected Reject"),
+        let CommandAction::Reject(routing_reject) = CommandHandler::handle_command("POST") else {
+            panic!("Expected Reject")
         };
 
         // They should have different messages

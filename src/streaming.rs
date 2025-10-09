@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{debug, warn};
 
 use crate::constants::buffer::HIGH_THROUGHPUT_BUFFER_SIZE;
@@ -16,14 +15,21 @@ pub struct StreamHandler;
 impl StreamHandler {
     /// Handle high-throughput data transfer after initial command
     /// This is optimized for large article transfers
-    pub async fn high_throughput_transfer(
-        mut client_reader: BufReader<ReadHalf<'_>>,
-        mut client_write: WriteHalf<'_>,
-        mut backend_read: ReadHalf<'_>,
-        mut backend_write: WriteHalf<'_>,
+    /// Now generic over stream types to support both TCP and future TLS
+    pub async fn high_throughput_transfer<CR, CW, BR, BW>(
+        mut client_reader: BufReader<CR>,
+        mut client_write: CW,
+        mut backend_read: BR,
+        mut backend_write: BW,
         mut client_to_backend_bytes: u64,
         mut backend_to_client_bytes: u64,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64)>
+    where
+        CR: AsyncReadExt + Unpin,
+        CW: AsyncWriteExt + Unpin,
+        BR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
         debug!("Starting high-throughput data transfer");
 
         // Use direct buffer allocation for high-throughput to avoid pool overhead
@@ -100,7 +106,7 @@ mod tests {
         // Verify we're using optimized buffer sizes
         assert_eq!(HIGH_THROUGHPUT_BUFFER_SIZE, 262144); // 256KB
         const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 8192); // Larger than default
-        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE % 4096 == 0); // Page-aligned
+        const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE.is_multiple_of(4096)); // Page-aligned
     }
 
     #[tokio::test]
@@ -110,9 +116,10 @@ mod tests {
         let backend_data = b"Hello from backend";
 
         let mut client_read = Cursor::new(client_data);
-        let mut client_write = Vec::new();
+        // Pre-allocate buffers with capacity matching test data size
+        let mut client_write = Vec::with_capacity(backend_data.len());
         let mut backend_read = Cursor::new(backend_data);
-        let mut backend_write = Vec::new();
+        let mut backend_write = Vec::with_capacity(client_data.len());
 
         // Simulate a small transfer
         let mut buffer1 = vec![0u8; 1024];
@@ -165,7 +172,7 @@ mod tests {
     fn test_constants_are_powers_of_two() {
         // Buffer sizes should be powers of 2 for efficiency
         let size = HIGH_THROUGHPUT_BUFFER_SIZE;
-        assert!(size.is_power_of_two() || size % 4096 == 0);
+        assert!(size.is_power_of_two() || size.is_multiple_of(4096));
     }
 
     #[tokio::test]

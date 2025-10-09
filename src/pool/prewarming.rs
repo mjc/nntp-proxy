@@ -23,17 +23,24 @@ async fn prewarm_single_pool(
     // Create all connections concurrently
     let tasks: Vec<_> = (0..max_connections)
         .map(|i| {
+            // Clone Arc references for each async task to satisfy Send + 'static bounds
+            // Arc makes this cheap - only the pointer is cloned, not the underlying data
             let provider = provider.clone();
             let server_name = server_name.clone();
-            
+
             tokio::spawn(async move {
-                provider.get_pooled_connection().await.map(|conn| {
-                    debug!(
-                        "Created connection {}/{} for '{}'",
-                        i + 1, max_connections, server_name
-                    );
-                    conn
-                }).ok()
+                provider
+                    .get_pooled_connection()
+                    .await
+                    .inspect(|_conn| {
+                        debug!(
+                            "Created connection {}/{} for '{}'",
+                            i + 1,
+                            max_connections,
+                            server_name
+                        );
+                    })
+                    .ok()
             })
         })
         .collect();
@@ -47,15 +54,15 @@ async fn prewarm_single_pool(
     }
 
     let created = connections.len();
-    
+
     // Drop all connections - they return to pool as available
     drop(connections);
-    
+
     info!(
         "Pool '{}' ready: {}/{} connections created",
         server_name, created, max_connections
     );
-    
+
     Ok(created)
 }
 
@@ -76,18 +83,14 @@ pub async fn prewarm_pools(
             let server_name = server.name.clone();
             let max_connections = server.max_connections as usize;
 
-            tokio::spawn(prewarm_single_pool(
-                provider,
-                server_name,
-                max_connections,
-            ))
+            tokio::spawn(prewarm_single_pool(provider, server_name, max_connections))
         })
         .collect();
 
     // Wait for all pools and collect results
     let mut total_created = 0;
     let mut total_expected = 0;
-    
+
     for (task, server) in tasks.into_iter().zip(servers.iter()) {
         total_expected += server.max_connections as usize;
         match task.await {
@@ -121,7 +124,7 @@ mod tests {
     fn spawn_mock_server(port: u16) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            
+
             let addr = format!("127.0.0.1:{}", port);
             let listener = match TcpListener::bind(&addr).await {
                 Ok(l) => l,
@@ -132,7 +135,7 @@ mod tests {
                 tokio::spawn(async move {
                     // Send greeting
                     let _ = stream.write_all(b"200 Mock Server Ready\r\n").await;
-                    
+
                     // Handle commands
                     let mut buffer = [0; 1024];
                     while let Ok(n) = stream.read(&mut buffer).await {
@@ -153,23 +156,21 @@ mod tests {
     #[tokio::test]
     async fn test_prewarm_pools_basic() {
         let port = find_available_port().await;
-        
+
         // Start mock server
         let _server = spawn_mock_server(port);
-        
+
         // Give server time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        
-        let servers = vec![
-            ServerConfig {
-                name: "TestServer1".to_string(),
-                host: "127.0.0.1".to_string(),
-                port,
-                max_connections: 2,
-                username: None,
-                password: None,
-            },
-        ];
+
+        let servers = vec![ServerConfig {
+            name: "TestServer1".to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
+            max_connections: 2,
+            username: None,
+            password: None,
+        }];
 
         let providers = servers
             .iter()
@@ -187,7 +188,7 @@ mod tests {
 
         // Prewarm the pools
         let result = prewarm_pools(&providers, &servers).await;
-        
+
         // Should succeed with mock server
         assert!(result.is_ok());
     }

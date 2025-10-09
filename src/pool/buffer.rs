@@ -26,6 +26,14 @@ impl BufferPool {
         buffer
     }
 
+    /// Create a new buffer pool with pre-allocated buffers
+    ///
+    /// # Arguments
+    /// * `buffer_size` - Size of each buffer in bytes
+    /// * `max_pool_size` - Maximum number of buffers to pool
+    ///
+    /// All buffers are pre-allocated at creation time for optimal performance.
+    #[must_use]
     pub fn new(buffer_size: usize, max_pool_size: usize) -> Self {
         let pool = Arc::new(SegQueue::new());
         let pool_size = Arc::new(AtomicUsize::new(0));

@@ -6,13 +6,13 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use nntp_proxy::{create_default_config, load_config, NntpProxy};
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::CacheConfig;
-use nntp_proxy::network::SocketOptimizer;
 use nntp_proxy::constants::stateless_proxy::NNTP_BACKEND_UNAVAILABLE;
+use nntp_proxy::network::SocketOptimizer;
 use nntp_proxy::types::ClientId;
+use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
@@ -53,23 +53,38 @@ fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
 #[command(author, version, about = "NNTP Caching Proxy Server", long_about = None)]
 struct Args {
     /// Port to listen on
-    #[arg(short, long, default_value = "8120")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_PORT environment variable
+    #[arg(short, long, default_value = "8120", env = "NNTP_CACHE_PROXY_PORT")]
     port: u16,
 
     /// Configuration file path
-    #[arg(short, long, default_value = "cache-config.toml")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_CONFIG environment variable
+    #[arg(
+        short,
+        long,
+        default_value = "cache-config.toml",
+        env = "NNTP_CACHE_PROXY_CONFIG"
+    )]
     config: String,
 
     /// Number of worker threads (defaults to number of CPU cores)
-    #[arg(short, long)]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_THREADS environment variable
+    #[arg(short, long, env = "NNTP_CACHE_PROXY_THREADS")]
     threads: Option<usize>,
 
     /// Cache max capacity (number of articles)
-    #[arg(long, default_value = "10000")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_CAPACITY environment variable
+    #[arg(long, default_value = "10000", env = "NNTP_CACHE_PROXY_CACHE_CAPACITY")]
     cache_capacity: u64,
 
     /// Cache TTL in seconds
-    #[arg(long, default_value = "3600")]
+    ///
+    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_TTL environment variable
+    #[arg(long, default_value = "3600", env = "NNTP_CACHE_PROXY_CACHE_TTL")]
     cache_ttl: u64,
 }
 
@@ -198,7 +213,9 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
                 let cache_clone = cache.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_caching_client(proxy_clone, cache_clone, stream, addr).await {
+                    if let Err(e) =
+                        handle_caching_client(proxy_clone, cache_clone, stream, addr).await
+                    {
                         error!("Error handling client {}: {}", addr, e);
                     }
                 });
@@ -237,7 +254,7 @@ async fn handle_caching_client(
     nntp_proxy::protocol::send_proxy_greeting(&mut client_stream, client_addr).await?;
 
     // Get pooled backend connection
-    let backend_conn = match proxy.connection_providers()[server_idx]
+    let mut backend_conn = match proxy.connection_providers()[server_idx]
         .get_pooled_connection()
         .await
     {
@@ -258,15 +275,12 @@ async fn handle_caching_client(
     }
 
     // Create caching session and handle connection
-    let session = CachingSession::new(
-        client_addr,
-        cache,
-    );
+    let session = CachingSession::new(client_addr, cache);
 
     debug!("Starting caching session for client {}", client_addr);
 
     let copy_result = session
-        .handle_with_pooled_backend(client_stream, backend_conn)
+        .handle_with_pooled_backend(client_stream, &mut *backend_conn)
         .await;
 
     debug!("Caching session completed for client {}", client_addr);

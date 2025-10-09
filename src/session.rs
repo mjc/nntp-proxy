@@ -13,9 +13,11 @@ use tracing::{debug, error, warn};
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND_SIZE, STREAMING_CHUNK_SIZE};
-use crate::constants::protocol::{BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE};
-use crate::pool::BufferPool;
+use crate::constants::protocol::{
+    BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE,
+};
 use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
+use crate::pool::BufferPool;
 use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
@@ -31,7 +33,8 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
-    /// Create a new client session (1:1 mode, no router)
+    /// Create a new client session for 1:1 mode
+    #[must_use]
     pub fn new(client_addr: SocketAddr, buffer_pool: BufferPool) -> Self {
         Self {
             client_addr,
@@ -41,7 +44,8 @@ impl ClientSession {
         }
     }
 
-    /// Create a new client session with router for per-command routing
+    /// Create a new client session for per-command routing mode
+    #[must_use]
     pub fn new_with_router(
         client_addr: SocketAddr,
         buffer_pool: BufferPool,
@@ -55,12 +59,16 @@ impl ClientSession {
         }
     }
 
-    /// Get the client ID
+    /// Get the unique client ID
+    #[must_use]
+    #[inline]
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }
 
-    /// Check if this session is using per-command routing mode
+    /// Check if this session is using per-command routing
+    #[must_use]
+    #[inline]
     pub fn is_per_command_routing(&self) -> bool {
         self.router.is_some()
     }
@@ -71,16 +79,16 @@ impl ClientSession {
     pub async fn handle_with_pooled_backend<T>(
         &self,
         mut client_stream: TcpStream,
-        mut backend_conn: T,
+        backend_conn: T,
     ) -> Result<(u64, u64)>
     where
-        T: std::ops::DerefMut<Target = TcpStream>,
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         use tokio::io::BufReader;
 
         // Split streams for independent read/write
         let (client_read, mut client_write) = client_stream.split();
-        let (mut backend_read, mut backend_write) = backend_conn.split();
+        let (mut backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::new(client_read);
 
         let mut client_to_backend_bytes = 0u64;
@@ -188,7 +196,10 @@ impl ClientSession {
 
     /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
-    pub async fn handle_per_command_routing(&self, mut client_stream: TcpStream) -> Result<(u64, u64)> {
+    pub async fn handle_per_command_routing(
+        &self,
+        mut client_stream: TcpStream,
+    ) -> Result<(u64, u64)> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let router = self
@@ -473,7 +484,9 @@ impl ClientSession {
 
                             // Update tail for next iteration (only last 4 bytes)
                             if current_n >= TERMINATOR_TAIL_SIZE {
-                                tail.copy_from_slice(&current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n]);
+                                tail.copy_from_slice(
+                                    &current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n],
+                                );
                                 tail_len = TERMINATOR_TAIL_SIZE;
                             } else if current_n > 0 {
                                 tail[..current_n].copy_from_slice(&current_chunk[..current_n]);
@@ -642,5 +655,3 @@ mod tests {
         assert_ne!(session1.client_id(), session2.client_id());
     }
 }
-
-

@@ -16,27 +16,27 @@ use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 fn extract_message_id(command: &str) -> Option<String> {
     let trimmed = command.trim();
     trimmed.find('<').and_then(|start| {
-        trimmed[start..].find('>').map(|end| {
-            trimmed[start..start + end + 1].to_string()
-        })
+        trimmed[start..]
+            .find('>')
+            .map(|end| trimmed[start..start + end + 1].to_string())
     })
 }
 
 /// Check if command is cacheable (ARTICLE/BODY/HEAD/STAT with message-ID)
 fn is_cacheable_command(command: &str) -> bool {
     let upper = command.trim().to_uppercase();
-    (upper.starts_with("ARTICLE ") 
-        || upper.starts_with("BODY ") 
-        || upper.starts_with("HEAD ") 
+    (upper.starts_with("ARTICLE ")
+        || upper.starts_with("BODY ")
+        || upper.starts_with("HEAD ")
         || upper.starts_with("STAT "))
         && extract_message_id(command).is_some()
 }
 
 /// Parse status code from binary data and determine if it's a multiline response
 fn parse_multiline_status(data: &[u8]) -> bool {
-    String::from_utf8(data.to_vec())
+    std::str::from_utf8(data)
         .ok()
-        .and_then(|line| parse_status_code(&line))
+        .and_then(parse_status_code)
         .map(is_multiline_status)
         .unwrap_or(false)
 }
@@ -49,36 +49,32 @@ pub struct CachingSession {
 
 impl CachingSession {
     /// Create a new caching session
-    pub fn new(
-        client_addr: SocketAddr,
-        cache: Arc<ArticleCache>,
-    ) -> Self {
-        Self {
-            client_addr,
-            cache,
-        }
+    pub fn new(client_addr: SocketAddr, cache: Arc<ArticleCache>) -> Self {
+        Self { client_addr, cache }
     }
 
     /// Handle client connection with caching support
     pub async fn handle_with_pooled_backend<T>(
         &self,
         mut client_stream: TcpStream,
-        mut backend_conn: T,
+        backend_conn: T,
     ) -> Result<(u64, u64)>
     where
-        T: std::ops::DerefMut<Target = TcpStream>,
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         use tokio::io::BufReader;
 
         let (client_read, mut client_write) = client_stream.split();
-        let (backend_read, mut backend_write) = backend_conn.split();
+        let (backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::new(client_read);
         let mut backend_reader = BufReader::with_capacity(buffer::MEDIUM_BUFFER_SIZE, backend_read);
 
         let mut client_to_backend_bytes = 0u64;
         let mut backend_to_client_bytes = 0u64;
         let mut line = String::with_capacity(buffer::COMMAND_SIZE);
-        let mut first_line = Vec::new(); // Reusable buffer for first line reads
+        // Pre-allocate with typical NNTP response line size (most are < 512 bytes)
+        // Reduces reallocations during line reading
+        let mut first_line = Vec::with_capacity(512);
 
         debug!("Caching session for client {} starting", self.client_addr);
 
@@ -94,7 +90,7 @@ impl CachingSession {
                         }
                         Ok(_n) => {
                             debug!("Client {} sent command: {}", self.client_addr, line.trim());
-                            
+
                             // Check if this is a cacheable command
                             if is_cacheable_command(&line) {
                                 if let Some(message_id) = extract_message_id(&line) {
@@ -144,10 +140,10 @@ impl CachingSession {
                                         break;
                                     }
 
-                                    // Move first_line into response_buffer to avoid clone
-                                    let mut response_buffer = Vec::new();
-                                    std::mem::swap(&mut response_buffer, &mut first_line);
-                                    
+                                    // Use mem::take to transfer ownership from first_line to response_buffer
+                                    // More idiomatic than swap - explicitly shows we're taking the value and leaving default
+                                    let mut response_buffer = std::mem::take(&mut first_line);
+
                                     // Check for backend disconnect (205 status)
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
@@ -156,18 +152,18 @@ impl CachingSession {
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
-                                    
+
                                     let is_multiline = parse_multiline_status(&response_buffer);
 
                                     if is_multiline {
                                         loop {
                                             let start_pos = response_buffer.len();
                                             backend_reader.read_until(b'\n', &mut response_buffer).await?;
-                                            
+
                                             if response_buffer.len() == start_pos {
                                                 break;
                                             }
-                                            
+
                                             // Check for end marker by examining just the new data
                                             let new_data = &response_buffer[start_pos..];
                                             if new_data == b".\r\n" || new_data == b".\n" {
@@ -195,10 +191,9 @@ impl CachingSession {
                                         break;
                                     }
 
-                                    // Move first_line into response_buffer to avoid clone
-                                    let mut response_buffer = Vec::new();
-                                    std::mem::swap(&mut response_buffer, &mut first_line);
-                                    
+                                    // Transfer ownership using mem::take (leaves first_line as empty Vec)
+                                    let mut response_buffer = std::mem::take(&mut first_line);
+
                                     // Check for backend disconnect (205 status)
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
@@ -207,7 +202,7 @@ impl CachingSession {
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
-                                    
+
                                     // Check if this is a multiline response by parsing status code
                                     let is_multiline = parse_multiline_status(&response_buffer);
 
@@ -216,11 +211,11 @@ impl CachingSession {
                                         loop {
                                             let start_pos = response_buffer.len();
                                             backend_reader.read_until(b'\n', &mut response_buffer).await?;
-                                            
+
                                             if response_buffer.len() == start_pos {
                                                 break;
                                             }
-                                            
+
                                             // Check for end marker by examining just the new data
                                             let new_data = &response_buffer[start_pos..];
                                             if new_data == b".\r\n" || new_data == b".\n" {

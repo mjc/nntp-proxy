@@ -47,7 +47,11 @@ impl TcpManager {
             .ok_or_else(|| anyhow::anyhow!("No addresses found for {}", addr))?;
 
         // Create and configure socket
-        let domain = if socket_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let domain = if socket_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
         // Socket buffers (4MB for pooled connections)
@@ -69,7 +73,7 @@ impl TcpManager {
         socket.connect(&socket_addr.into())?;
         let std_stream: std::net::TcpStream = socket.into();
         std_stream.set_nonblocking(true)?;
-        
+
         Ok(TcpStream::from_std(std_stream)?)
     }
 }
@@ -94,16 +98,22 @@ impl managed::Manager for TcpManager {
 
         // Authenticate if needed
         if let Some(username) = &self.username {
-            stream.write_all(format!("AUTHINFO USER {}\r\n", username).as_bytes()).await?;
+            stream
+                .write_all(format!("AUTHINFO USER {}\r\n", username).as_bytes())
+                .await?;
             let n = stream.read(&mut buffer).await?;
             let response = String::from_utf8_lossy(&buffer[..n]);
 
             if response.starts_with("381") {
                 // Password required
-                let password = self.password.as_ref()
+                let password = self
+                    .password
+                    .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Password required but not provided"))?;
-                    
-                stream.write_all(format!("AUTHINFO PASS {}\r\n", password).as_bytes()).await?;
+
+                stream
+                    .write_all(format!("AUTHINFO PASS {}\r\n", password).as_bytes())
+                    .await?;
                 let n = stream.read(&mut buffer).await?;
                 let response = String::from_utf8_lossy(&buffer[..n]);
 
@@ -111,7 +121,10 @@ impl managed::Manager for TcpManager {
                     return Err(anyhow::anyhow!("Auth failed: {}", response.trim()));
                 }
             } else if !response.starts_with("281") {
-                return Err(anyhow::anyhow!("Unexpected auth response: {}", response.trim()));
+                return Err(anyhow::anyhow!(
+                    "Unexpected auth response: {}",
+                    response.trim()
+                ));
             }
         }
 
@@ -164,6 +177,20 @@ impl DeadpoolConnectionProvider {
         Self { pool, name }
     }
 
+    /// Create a connection provider from a server configuration
+    ///
+    /// This avoids unnecessary cloning of individual fields.
+    pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        Self::new(
+            server.host.clone(),
+            server.port,
+            server.name.clone(),
+            server.max_connections as usize,
+            server.username.clone(),
+            server.password.clone(),
+        )
+    }
+
     /// Get a connection from the pool (automatically returned when dropped)
     pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
         self.pool
@@ -178,7 +205,10 @@ impl DeadpoolConnectionProvider {
         use tokio::io::AsyncWriteExt;
 
         let status = self.pool.status();
-        info!("Shutting down pool '{}' ({} idle connections)", self.name, status.available);
+        info!(
+            "Shutting down pool '{}' ({} idle connections)",
+            self.name, status.available
+        );
 
         // Send QUIT to idle connections with minimal timeout
         let mut timeouts = managed::Timeouts::new();

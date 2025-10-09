@@ -3,10 +3,11 @@
 //! This module provides utilities for optimizing TCP socket performance
 //! for high-throughput NNTP transfers.
 
+use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
+use crate::stream::ConnectionStream;
 use std::io;
 use tokio::net::TcpStream;
 use tracing::debug;
-use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
 
 /// Socket optimizer for high-throughput scenarios
 pub struct SocketOptimizer;
@@ -29,7 +30,18 @@ impl SocketOptimizer {
         Ok(())
     }
 
+    /// Apply socket optimizations to ConnectionStream (extracts TCP stream if available)
+    pub fn optimize_connection_stream(stream: &ConnectionStream) -> Result<(), io::Error> {
+        if let Some(tcp_stream) = stream.as_tcp_stream() {
+            Self::optimize_for_throughput(tcp_stream)
+        } else {
+            // TLS streams will be handled differently when implemented
+            Ok(())
+        }
+    }
+
     /// Apply aggressive socket optimizations for 1GB+ transfers
+    /// Works with both TcpStream and ConnectionStream
     pub fn apply_to_streams(
         client_stream: &TcpStream,
         backend_stream: &TcpStream,
@@ -136,6 +148,25 @@ mod tests {
         // Streams should still be usable
         assert!(client_stream.peer_addr().is_ok());
         assert!(server_stream.peer_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_optimize_connection_stream() {
+        use crate::stream::ConnectionStream;
+
+        // Create a test server and connection
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tcp_stream = std::net::TcpStream::connect(addr).unwrap();
+        tcp_stream.set_nonblocking(true).unwrap();
+        let tokio_stream = TcpStream::from_std(tcp_stream).unwrap();
+
+        let conn_stream = ConnectionStream::plain(tokio_stream);
+
+        // Should successfully optimize ConnectionStream
+        let result = SocketOptimizer::optimize_connection_stream(&conn_stream);
+        assert!(result.is_ok());
     }
 
     #[test]

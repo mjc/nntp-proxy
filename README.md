@@ -172,6 +172,34 @@ unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 | `password` | string | No | - | Authentication password |
 | `max_connections` | integer | No | 10 | Max concurrent connections to this backend |
 
+#### Environment Variable Overrides for Servers
+
+Backend servers can be configured entirely via environment variables, useful for Docker/container deployments. If any `NNTP_SERVER_N_HOST` variable is found, environment variables take precedence over the config file.
+
+**Per-server variables (N = 0, 1, 2, ...):**
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `NNTP_SERVER_N_HOST` | Yes | - | Backend hostname/IP (presence triggers env mode) |
+| `NNTP_SERVER_N_PORT` | No | 119 | Backend port |
+| `NNTP_SERVER_N_NAME` | No | "Server N" | Friendly name for logging |
+| `NNTP_SERVER_N_USERNAME` | No | - | Backend authentication username |
+| `NNTP_SERVER_N_PASSWORD` | No | - | Backend authentication password |
+| `NNTP_SERVER_N_MAX_CONNECTIONS` | No | 10 | Max concurrent connections |
+
+**Example Docker deployment:**
+```bash
+docker run -e NNTP_SERVER_0_HOST=news.example.com \
+           -e NNTP_SERVER_0_PORT=119 \
+           -e NNTP_SERVER_0_NAME="Primary" \
+           -e NNTP_SERVER_0_USERNAME=user \
+           -e NNTP_SERVER_0_PASSWORD=pass \
+           -e NNTP_SERVER_1_HOST=news2.example.com \
+           -e NNTP_SERVER_1_PORT=119 \
+           -e NNTP_PROXY_PORT=8119 \
+           nntp-proxy
+```
+
 #### Health Check Configuration
 
 | Field | Type | Default | Description |
@@ -203,14 +231,16 @@ The proxy handles authentication in two ways:
 nntp-proxy [OPTIONS]
 ```
 
-| Option | Short | Description | Default |
-|--------|-------|-------------|---------|
-| `--port <PORT>` | `-p` | Listen port | 8119 |
-| `--per-command-routing` | `-r` | Enable per-command routing mode | false |
-| `--config <FILE>` | `-c` | Config file path | config.toml |
-| `--threads <NUM>` | `-t` | Tokio worker threads | CPU cores |
-| `--help` | `-h` | Show help | - |
-| `--version` | `-V` | Show version | - |
+| Option | Short | Environment Variable | Description | Default |
+|--------|-------|---------------------|-------------|---------|
+| `--port <PORT>` | `-p` | `NNTP_PROXY_PORT` | Listen port | 8119 |
+| `--per-command-routing` | `-r` | `NNTP_PROXY_PER_COMMAND_ROUTING` | Enable per-command routing mode | false |
+| `--config <FILE>` | `-c` | `NNTP_PROXY_CONFIG` | Config file path | config.toml |
+| `--threads <NUM>` | `-t` | `NNTP_PROXY_THREADS` | Tokio worker threads | CPU cores |
+| `--help` | `-h` | - | Show help | - |
+| `--version` | `-V` | - | Show version | - |
+
+**Note**: Environment variables take precedence over default values but are overridden by command-line arguments.
 
 ### Examples
 
@@ -232,6 +262,24 @@ nntp-proxy --threads 1
 
 # Production setup
 nntp-proxy --port 119 --config /etc/nntp-proxy/config.toml
+
+# Using environment variables for configuration
+NNTP_PROXY_PORT=8119 \
+NNTP_PROXY_THREADS=4 \
+NNTP_SERVER_0_HOST=news.example.com \
+NNTP_SERVER_0_PORT=119 \
+NNTP_SERVER_0_NAME="Primary" \
+nntp-proxy
+
+# Docker deployment with environment variables
+docker run -d \
+  -e NNTP_PROXY_PORT=119 \
+  -e NNTP_SERVER_0_HOST=news.provider.com \
+  -e NNTP_SERVER_0_USERNAME=myuser \
+  -e NNTP_SERVER_0_PASSWORD=mypass \
+  -e NNTP_SERVER_1_HOST=news2.provider.com \
+  -p 119:119 \
+  nntp-proxy
 ```
 
 ### Operating Modes
