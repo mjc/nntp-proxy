@@ -118,16 +118,31 @@ impl TcpManager {
     }
 
     /// Perform TLS handshake on a TCP stream
+    ///
+    /// This uses the system's trusted certificate store by default.
+    /// If `tls_cert_path` is provided, it adds the custom CA certificate
+    /// to the system certificates (does not replace them).
     async fn tls_handshake(&self, stream: TcpStream) -> Result<tokio_native_tls::TlsStream<TcpStream>, anyhow::Error> {
+        use tracing::debug;
+        
         let mut builder = NativeTlsConnector::builder();
         
         // Configure certificate verification
-        builder.danger_accept_invalid_certs(!self.tls_verify_cert);
+        // Note: By default, native-tls uses the system's trusted certificate store
+        if self.tls_verify_cert {
+            debug!("TLS: Using system certificate store for verification");
+        } else {
+            debug!("TLS: WARNING - Certificate verification disabled (insecure!)");
+            builder.danger_accept_invalid_certs(true);
+        }
         
-        // Load custom CA certificate if provided
+        // Load custom CA certificate if provided (adds to system certs, doesn't replace)
         if let Some(cert_path) = &self.tls_cert_path {
-            let cert_data = std::fs::read(cert_path)?;
-            let cert = native_tls::Certificate::from_pem(&cert_data)?;
+            debug!("TLS: Adding custom CA certificate from: {}", cert_path);
+            let cert_data = std::fs::read(cert_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read TLS certificate from {}: {}", cert_path, e))?;
+            let cert = native_tls::Certificate::from_pem(&cert_data)
+                .map_err(|e| anyhow::anyhow!("Failed to parse TLS certificate: {}", e))?;
             builder.add_root_certificate(cert);
         }
         
@@ -139,6 +154,7 @@ impl TcpManager {
         
         let connector = TlsConnector::from(connector);
         
+        debug!("TLS: Connecting to {} with TLS", self.host);
         connector.connect(&self.host, stream)
             .await
             .map_err(|e| ConnectionError::TlsHandshake {

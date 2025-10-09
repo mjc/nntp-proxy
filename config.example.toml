@@ -52,8 +52,16 @@ tls_verify_cert = true
 
 # TLS/SSL Configuration Guide:
 # - use_tls: Enable TLS/SSL encryption for this server (default: false)
-# - tls_verify_cert: Verify server certificates (default: true, recommended for production)
-# - tls_cert_path: Optional path to custom CA certificate file
+# - tls_verify_cert: Verify server certificates using system certificate store (default: true, STRONGLY recommended)
+# - tls_cert_path: Optional path to additional CA certificate file (PEM format)
+#                  Note: This ADDS to system certs, does not replace them
+#
+# System Certificate Stores by OS:
+# - Linux: Uses system CA bundle (usually /etc/ssl/certs)
+# - macOS: Uses Security.framework (Keychain)
+# - Windows: Uses SChannel (Windows Certificate Store)
+#
+# Only disable tls_verify_cert for testing/development - it's a security risk!
 #
 # Note: max_connections defaults to 10 if not specified
 # Each server can have different limits based on your provider's restrictions

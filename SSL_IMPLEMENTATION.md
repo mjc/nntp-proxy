@@ -198,14 +198,42 @@ max_connections = 20
 
 ## Certificate Verification
 
-For production:
-- Always verify certificates (`tls_verify_cert = true`)
-- Use system certificate store
-- Support custom CA certificates if needed
+### System Certificate Store (Default)
 
-For testing:
-- Allow skipping verification (`tls_verify_cert = false`)
-- Document security implications
+The implementation uses `native-tls`, which automatically uses the operating system's trusted certificate store:
+
+- **Linux**: Uses system CA bundle (typically `/etc/ssl/certs/ca-certificates.crt` or `/etc/pki/tls/certs/ca-bundle.crt`)
+- **macOS**: Uses Security.framework (system Keychain)
+- **Windows**: Uses SChannel (Windows Certificate Store)
+
+**No additional configuration needed** for standard TLS connections - the system certificates are used by default when `tls_verify_cert = true`.
+
+### Custom CA Certificates
+
+For self-signed certificates or private CAs, use `tls_cert_path`:
+
+```toml
+[[servers]]
+host = "private-news.company.com"
+port = 563
+use_tls = true
+tls_verify_cert = true
+tls_cert_path = "/etc/nntp-proxy/custom-ca.pem"  # PEM format
+```
+
+**Important**: Custom certificates are **added to** the system certificate store, not replacing it. Both system and custom certificates are trusted.
+
+### Testing/Development Only
+
+For testing with self-signed certificates (NOT for production):
+
+```toml
+[[servers]]
+host = "test-news.local"
+port = 563
+use_tls = true
+tls_verify_cert = false  # ⚠️ INSECURE - skips all certificate verification
+```
 
 ## Performance Considerations
 
@@ -223,14 +251,44 @@ For testing:
 
 ## Security Notes
 
-- Use TLS 1.2 or higher
-- Disable weak ciphers
-- Enable certificate pinning for critical backends
+- **Always verify certificates in production** (`tls_verify_cert = true`)
+- Uses TLS 1.2 or higher (enforced by native-tls)
+- System certificate store is automatically trusted
+- Custom CAs can be added without replacing system trust
 - Log TLS handshake failures for monitoring
-- Consider adding mutual TLS (client certificates) support
+- Consider adding mutual TLS (client certificates) support in future
+
+## Troubleshooting
+
+### Certificate Verification Failures
+
+If you see `CertificateVerification` errors:
+
+1. **Check server certificate**: Ensure the server's certificate is valid and not expired
+2. **Verify hostname**: The certificate must match the hostname in the `host` field
+3. **System certificates**: Ensure your OS certificate store is up to date
+   - Linux: `sudo update-ca-certificates` (Debian/Ubuntu) or `sudo update-ca-trust` (RHEL/CentOS)
+   - macOS: Certificates auto-update with system updates
+   - Windows: Certificates auto-update via Windows Update
+
+4. **Private CA**: If using a private CA, add it via `tls_cert_path`
+
+### Debug Logging
+
+Enable debug logging to see TLS handshake details:
+
+```bash
+RUST_LOG=debug ./nntp-proxy
+```
+
+Look for log lines like:
+- `TLS: Using system certificate store for verification`
+- `TLS: Adding custom CA certificate from: /path/to/cert.pem`
+- `TLS: Connecting to hostname with TLS`
 
 ## References
 
 - [tokio-native-tls documentation](https://docs.rs/tokio-native-tls)
-- [tokio-rustls documentation](https://docs.rs/tokio-rustls)
+- [native-tls documentation](https://docs.rs/native-tls)
+- [tokio-rustls documentation](https://docs.rs/tokio-rustls) (alternative TLS implementation)
 - RFC 4642: Using TLS with NNTP
