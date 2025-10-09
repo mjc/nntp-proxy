@@ -5,7 +5,7 @@
 //!
 //! The module is organized into:
 //! - `optimizers`: Trait-based optimization strategies for different connection types
-//! - Legacy `SocketOptimizer`: Maintained for backward compatibility
+//! - `SocketOptimizer`: Convenience wrappers for common optimization patterns
 
 pub mod optimizers;
 

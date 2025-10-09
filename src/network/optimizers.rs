@@ -153,26 +153,6 @@ impl<'a> ConnectionOptimizer<'a> {
             send_buffer_size: Some(send_size),
         }
     }
-
-    /// Apply optimizations with custom buffer sizes (legacy method)
-    pub fn optimize_with_buffer_sizes(
-        &self,
-        recv_size: usize,
-        send_size: usize,
-    ) -> Result<(), io::Error> {
-        match self.stream {
-            ConnectionStream::Plain(tcp) => {
-                let optimizer = TcpOptimizer::with_buffer_sizes(tcp, recv_size, send_size);
-                debug!("Using {} with custom buffers", optimizer.description());
-                optimizer.optimize()
-            }
-            ConnectionStream::Tls(tls) => {
-                let optimizer = TlsOptimizer::with_buffer_sizes(tls.as_ref(), recv_size, send_size);
-                debug!("Using {} with custom buffers", optimizer.description());
-                optimizer.optimize()
-            }
-        }
-    }
 }
 
 impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
