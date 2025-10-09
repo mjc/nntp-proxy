@@ -108,11 +108,20 @@ pub struct ServerConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
-    // TODO(SSL): Add TLS configuration fields when implementing SSL support:
-    // See SSL_IMPLEMENTATION.md for details
-    // pub use_tls: bool,
-    // pub tls_verify_cert: bool,
-    // pub tls_cert_path: Option<String>,
+    /// Enable TLS/SSL for this backend connection
+    #[serde(default)]
+    pub use_tls: bool,
+    /// Verify TLS certificates (recommended for production)
+    #[serde(default = "default_tls_verify_cert")]
+    pub tls_verify_cert: bool,
+    /// Optional path to custom CA certificate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert_path: Option<String>,
+}
+
+/// Default for TLS certificate verification (true for security)
+fn default_tls_verify_cert() -> bool {
+    true
 }
 
 impl Config {
@@ -237,6 +246,9 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
             username,
             password,
             max_connections,
+            use_tls: false,
+            tls_verify_cert: default_tls_verify_cert(),
+            tls_cert_path: None,
         });
 
         index += 1;
@@ -291,6 +303,9 @@ pub fn create_default_config() -> Config {
             username: None,
             password: None,
             max_connections: default_max_connections(),
+            use_tls: false,
+            tls_verify_cert: default_tls_verify_cert(),
+            tls_cert_path: None,
         }],
         ..Default::default()
     }
@@ -312,6 +327,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 5,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -320,6 +338,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 8,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
             ],
             ..Default::default()
@@ -335,6 +356,9 @@ mod tests {
             username: None,
             password: None,
             max_connections: 15,
+            use_tls: false,
+            tls_verify_cert: default_tls_verify_cert(),
+            tls_cert_path: None,
         };
 
         assert_eq!(config.host, "news.example.com");
@@ -431,6 +455,9 @@ mod tests {
                 username: Some("user123".to_string()),
                 password: Some("password123".to_string()),
                 max_connections: 10,
+                use_tls: false,
+                tls_verify_cert: default_tls_verify_cert(),
+                tls_cert_path: None,
             }],
             ..Default::default()
         };
@@ -480,6 +507,9 @@ max_connections = 5
                 username: None,
                 password: None,
                 max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: default_tls_verify_cert(),
+                tls_cert_path: None,
             }],
             ..Default::default()
         };
@@ -496,6 +526,9 @@ max_connections = 5
                 username: None,
                 password: None,
                 max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: default_tls_verify_cert(),
+                tls_cert_path: None,
             }],
             ..Default::default()
         };
@@ -517,6 +550,9 @@ max_connections = 5
                     username: None,
                     password: None,
                     max_connections: 5,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "server2.com".to_string(),
@@ -525,6 +561,9 @@ max_connections = 5
                     username: Some("user".to_string()),
                     password: Some("pass".to_string()),
                     max_connections: 10,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "server3.com".to_string(),
@@ -533,6 +572,9 @@ max_connections = 5
                     username: None,
                     password: None,
                     max_connections: 15,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
             ],
             ..Default::default()
@@ -575,6 +617,9 @@ max_connections = 5
                 username: Some("user@domain.com".to_string()),
                 password: Some("p@ssw0rd!#$%".to_string()),
                 max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: default_tls_verify_cert(),
+                tls_cert_path: None,
             }],
             ..Default::default()
         };
@@ -603,6 +648,9 @@ max_connections = 5
                 username: None,
                 password: None,
                 max_connections: 1,
+                use_tls: false,
+                tls_verify_cert: default_tls_verify_cert(),
+                tls_cert_path: None,
             }],
             ..Default::default()
         };
@@ -619,6 +667,9 @@ max_connections = 5
                 username: None,
                 password: None,
                 max_connections: 1000,
+                use_tls: false,
+                tls_verify_cert: default_tls_verify_cert(),
+                tls_cert_path: None,
             }],
             ..Default::default()
         };
@@ -640,6 +691,9 @@ max_connections = 5
                     username: None,
                     password: None,
                     max_connections: 5,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "::1".to_string(),
@@ -648,6 +702,9 @@ max_connections = 5
                     username: None,
                     password: None,
                     max_connections: 5,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "2001:db8::1".to_string(),
@@ -656,6 +713,9 @@ max_connections = 5
                     username: None,
                     password: None,
                     max_connections: 5,
+                    use_tls: false,
+                    tls_verify_cert: default_tls_verify_cert(),
+                    tls_cert_path: None,
                 },
             ],
             ..Default::default()
@@ -681,6 +741,9 @@ max_connections = 5
                 username: None,
                 password: None,
                 max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: default_tls_verify_cert(),
+                tls_cert_path: None,
             }],
             ..Default::default()
         };

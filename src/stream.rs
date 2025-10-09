@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_native_tls::TlsStream;
 
 /// Trait for async streams that can be used for NNTP connections
 ///
@@ -21,23 +22,15 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 /// Unified stream type that can represent different connection types
 ///
-/// This enum allows the proxy to handle both plain TCP and future TLS connections
+/// This enum allows the proxy to handle both plain TCP and TLS connections
 /// through a single type, avoiding the need for trait objects and their associated
 /// heap allocation overhead.
-///
-/// # Future SSL Support
-///
-/// When adding SSL/TLS support, add a new variant:
-/// ```ignore
-/// Tls(tokio_rustls::TlsStream<TcpStream>),
-/// ```
-/// TODO(SSL): Add Tls variant here - see SSL_IMPLEMENTATION.md for details
 #[derive(Debug)]
 pub enum ConnectionStream {
     /// Plain TCP connection
     Plain(TcpStream),
-    // TODO(SSL): Uncomment when implementing TLS:
-    // Tls(tokio_rustls::TlsStream<TcpStream>),
+    /// TLS-encrypted connection
+    Tls(TlsStream<TcpStream>),
 }
 
 impl ConnectionStream {
@@ -53,7 +46,7 @@ impl ConnectionStream {
     pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match self {
             Self::Plain(tcp) => Some(tcp),
-            // Future TLS variant would return None or use get_ref()
+            Self::Tls(_) => None,
         }
     }
 
@@ -61,6 +54,7 @@ impl ConnectionStream {
     pub fn as_tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
         match self {
             Self::Plain(tcp) => Some(tcp),
+            Self::Tls(_) => None,
         }
     }
 
@@ -69,9 +63,17 @@ impl ConnectionStream {
         matches!(self, Self::Plain(_))
     }
 
-    /// Returns true if this is a TLS connection (currently always false)
+    /// Returns true if this is a TLS connection
     pub fn is_tls(&self) -> bool {
-        false // Will be updated when TLS variant is added
+        matches!(self, Self::Tls(_))
+    }
+
+    /// Get a reference to the TLS stream (if TLS connection)
+    pub fn as_tls_stream(&self) -> Option<&TlsStream<TcpStream>> {
+        match self {
+            Self::Tls(tls) => Some(tls),
+            Self::Plain(_) => None,
+        }
     }
 }
 
@@ -83,7 +85,7 @@ impl AsyncRead for ConnectionStream {
     ) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -96,21 +98,21 @@ impl AsyncWrite for ConnectionStream {
     ) -> Poll<io::Result<usize>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }

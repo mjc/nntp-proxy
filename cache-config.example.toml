@@ -8,6 +8,10 @@ name = "Example News Server"
 # username = "your_username"
 # password = "your_password"
 max_connections = 10
+# TLS/SSL configuration
+use_tls = false
+tls_verify_cert = true
+# tls_cert_path = "/path/to/ca-cert.pem"
 
 # Cache configuration
 [cache]

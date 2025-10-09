@@ -40,6 +40,8 @@ async-trait = "0.1.89"
 memchr = "2.7"  # Fast byte searching for command parsing
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
 moka = { version = "0.12", features = ["future"] }  # Async LRU cache with TTL for article caching
+tokio-native-tls = "0.3"  # TLS support for NNTP connections
+native-tls = "0.2"  # Native TLS backend
 
 [dev-dependencies]
 tempfile = "3.23"

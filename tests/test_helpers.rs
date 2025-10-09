@@ -150,6 +150,9 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 username: None,
                 password: None,
                 max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
             })
             .collect(),
         health_check: Default::default(),
@@ -175,6 +178,9 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
                 username: Some(user.to_string()),
                 password: Some(pass.to_string()),
                 max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
             })
             .collect(),
         health_check: Default::default(),

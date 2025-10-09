@@ -7,6 +7,9 @@ name = "Example News Server 1"
 # password = "your_password"
 # High-capacity server allows many connections
 max_connections = 20
+# TLS/SSL configuration
+use_tls = false
+tls_verify_cert = true
 
 [[servers]]
 host = "nntp.example.org"
@@ -17,16 +20,25 @@ username = "testuser"
 password = "testpass"
 # Standard connection limit
 max_connections = 10
+# Plain TCP connection (default)
+use_tls = false
+tls_verify_cert = true
 
 [[servers]]
 host = "secure-news.example.com"
 port = 563
 name = "Secure News Server"
-# Example with SSL port and authentication
+# Example with SSL/TLS port and authentication
 username = "premium_user"
 password = "secure_password"
 # Premium server allows more connections
 max_connections = 15
+# Enable TLS for secure connection (NNTPS)
+use_tls = true
+# Verify server certificates (recommended for production)
+tls_verify_cert = true
+# Optional: custom CA certificate
+# tls_cert_path = "/path/to/ca-cert.pem"
 
 [[servers]]
 host = "localhost"
@@ -35,6 +47,14 @@ name = "Local Test Server"
 # No authentication needed for local server
 # Limited connections for test server
 max_connections = 5
+use_tls = false
+tls_verify_cert = true
 
+# TLS/SSL Configuration Guide:
+# - use_tls: Enable TLS/SSL encryption for this server (default: false)
+# - tls_verify_cert: Verify server certificates (default: true, recommended for production)
+# - tls_cert_path: Optional path to custom CA certificate file
+#
 # Note: max_connections defaults to 10 if not specified
 # Each server can have different limits based on your provider's restrictions
+# Common NNTP ports: 119 (plain), 563 (NNTPS/SSL), 8119 (custom)

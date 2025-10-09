@@ -44,15 +44,21 @@ impl SocketOptimizer {
     /// Works with both TcpStream and ConnectionStream
     pub fn apply_to_streams(
         client_stream: &TcpStream,
-        backend_stream: &TcpStream,
+        backend_stream: &crate::stream::ConnectionStream,
     ) -> Result<(), io::Error> {
         debug!("Applying high-throughput socket optimizations");
 
         if let Err(e) = Self::optimize_for_throughput(client_stream) {
             debug!("Failed to set client socket optimizations: {}", e);
         }
-        if let Err(e) = Self::optimize_for_throughput(backend_stream) {
-            debug!("Failed to set backend socket optimizations: {}", e);
+        
+        // Only optimize if it's a plain TCP stream
+        if let Some(tcp) = backend_stream.as_tcp_stream() {
+            if let Err(e) = Self::optimize_for_throughput(tcp) {
+                debug!("Failed to set backend socket optimizations: {}", e);
+            }
+        } else {
+            debug!("Backend is TLS, skipping TCP-level optimizations");
         }
 
         Ok(())
@@ -132,12 +138,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_to_streams() {
+        use crate::stream::ConnectionStream;
+        
         // Create two TCP connections
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (server_stream, _) = listener.accept().await.unwrap();
+        let (server_tcp, _) = listener.accept().await.unwrap();
+        let server_stream = ConnectionStream::plain(server_tcp);
 
         // Apply optimizations to both streams
         let result = SocketOptimizer::apply_to_streams(&client_stream, &server_stream);
@@ -147,7 +156,7 @@ mod tests {
 
         // Streams should still be usable
         assert!(client_stream.peer_addr().is_ok());
-        assert!(server_stream.peer_addr().is_ok());
+        assert!(server_stream.as_tcp_stream().unwrap().peer_addr().is_ok());
     }
 
     #[tokio::test]

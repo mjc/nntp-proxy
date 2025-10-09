@@ -297,6 +297,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 5,
+                    use_tls: false,
+                    tls_verify_cert: true,
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -305,6 +308,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 8,
+                    use_tls: false,
+                    tls_verify_cert: true,
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "server3.example.com".to_string(),
@@ -313,6 +319,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 12,
+                    use_tls: false,
+                    tls_verify_cert: true,
+                    tls_cert_path: None,
                 },
             ],
             ..Default::default()

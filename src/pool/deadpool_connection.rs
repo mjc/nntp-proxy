@@ -3,9 +3,13 @@ use async_trait::async_trait;
 use deadpool::managed;
 use tokio::net::TcpStream;
 use tracing::info;
+use native_tls::TlsConnector as NativeTlsConnector;
+use tokio_native_tls::TlsConnector;
 
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
+use crate::stream::ConnectionStream;
+use crate::connection_error::ConnectionError;
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
@@ -16,6 +20,9 @@ pub struct TcpManager {
     name: String,
     username: Option<String>,
     password: Option<String>,
+    use_tls: bool,
+    tls_verify_cert: bool,
+    tls_cert_path: Option<String>,
 }
 
 impl TcpManager {
@@ -32,11 +39,37 @@ impl TcpManager {
             name,
             username,
             password,
+            use_tls: false,
+            tls_verify_cert: true,
+            tls_cert_path: None,
         }
     }
 
-    /// Create an optimized TCP connection
-    async fn create_optimized_tcp_stream(&self) -> Result<TcpStream, anyhow::Error> {
+    /// Create a new TcpManager with TLS configuration
+    pub fn new_with_tls(
+        host: String,
+        port: u16,
+        name: String,
+        username: Option<String>,
+        password: Option<String>,
+        use_tls: bool,
+        tls_verify_cert: bool,
+        tls_cert_path: Option<String>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            name,
+            username,
+            password,
+            use_tls,
+            tls_verify_cert,
+            tls_cert_path,
+        }
+    }
+
+    /// Create an optimized connection (TCP or TLS)
+    async fn create_optimized_stream(&self) -> Result<ConnectionStream, anyhow::Error> {
         use socket2::{Domain, Protocol, Socket, Type};
 
         // Resolve hostname
@@ -73,19 +106,56 @@ impl TcpManager {
         socket.connect(&socket_addr.into())?;
         let std_stream: std::net::TcpStream = socket.into();
         std_stream.set_nonblocking(true)?;
+        let tcp_stream = TcpStream::from_std(std_stream)?;
 
-        Ok(TcpStream::from_std(std_stream)?)
+        // Perform TLS handshake if enabled
+        if self.use_tls {
+            let tls_stream = self.tls_handshake(tcp_stream).await?;
+            Ok(ConnectionStream::Tls(tls_stream))
+        } else {
+            Ok(ConnectionStream::Plain(tcp_stream))
+        }
+    }
+
+    /// Perform TLS handshake on a TCP stream
+    async fn tls_handshake(&self, stream: TcpStream) -> Result<tokio_native_tls::TlsStream<TcpStream>, anyhow::Error> {
+        let mut builder = NativeTlsConnector::builder();
+        
+        // Configure certificate verification
+        builder.danger_accept_invalid_certs(!self.tls_verify_cert);
+        
+        // Load custom CA certificate if provided
+        if let Some(cert_path) = &self.tls_cert_path {
+            let cert_data = std::fs::read(cert_path)?;
+            let cert = native_tls::Certificate::from_pem(&cert_data)?;
+            builder.add_root_certificate(cert);
+        }
+        
+        let connector = builder.build()
+            .map_err(|e| ConnectionError::TlsHandshake {
+                backend: self.name.clone(),
+                source: Box::new(e),
+            })?;
+        
+        let connector = TlsConnector::from(connector);
+        
+        connector.connect(&self.host, stream)
+            .await
+            .map_err(|e| ConnectionError::TlsHandshake {
+                backend: self.name.clone(),
+                source: Box::new(e),
+            }.into())
     }
 }
 
 impl managed::Manager for TcpManager {
-    type Type = TcpStream;
+    type Type = ConnectionStream;
     type Error = anyhow::Error;
 
-    async fn create(&self) -> Result<TcpStream, anyhow::Error> {
+    async fn create(&self) -> Result<ConnectionStream, anyhow::Error> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream = self.create_optimized_tcp_stream().await?;
+        let mut stream = self.create_optimized_stream().await?;
 
         // Consume greeting
         let mut buffer = vec![0u8; 4096];
@@ -133,21 +203,32 @@ impl managed::Manager for TcpManager {
 
     async fn recycle(
         &self,
-        conn: &mut TcpStream,
+        conn: &mut ConnectionStream,
         _: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
         // Fast TCP-level health check: try reading without blocking
         // Healthy idle connections return WouldBlock, dead ones return 0 or error
         let mut peek_buf = [0u8; 1];
-        match conn.try_read(&mut peek_buf) {
-            Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
-            Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-            Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
+        
+        // Only plain TCP supports try_read directly, for TLS we just return Ok
+        match conn {
+            ConnectionStream::Plain(tcp) => {
+                match tcp.try_read(&mut peek_buf) {
+                    Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
+                    Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                    Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
+                }
+            }
+            ConnectionStream::Tls(_) => {
+                // For TLS connections, we can't easily peek without blocking
+                // Just assume the connection is healthy
+                Ok(())
+            }
         }
     }
 
-    fn detach(&self, _conn: &mut TcpStream) {}
+    fn detach(&self, _conn: &mut ConnectionStream) {}
 }
 
 type Pool = managed::Pool<TcpManager>;
@@ -177,17 +258,50 @@ impl DeadpoolConnectionProvider {
         Self { pool, name }
     }
 
+    /// Create a new connection provider with TLS support
+    pub fn new_with_tls(
+        host: String,
+        port: u16,
+        name: String,
+        max_size: usize,
+        username: Option<String>,
+        password: Option<String>,
+        use_tls: bool,
+        tls_verify_cert: bool,
+        tls_cert_path: Option<String>,
+    ) -> Self {
+        let manager = TcpManager::new_with_tls(
+            host, 
+            port, 
+            name.clone(), 
+            username, 
+            password,
+            use_tls,
+            tls_verify_cert,
+            tls_cert_path,
+        );
+        let pool = Pool::builder(manager)
+            .max_size(max_size)
+            .build()
+            .expect("Failed to create connection pool");
+
+        Self { pool, name }
+    }
+
     /// Create a connection provider from a server configuration
     ///
     /// This avoids unnecessary cloning of individual fields.
     pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
-        Self::new(
+        Self::new_with_tls(
             server.host.clone(),
             server.port,
             server.name.clone(),
             server.max_connections as usize,
             server.username.clone(),
             server.password.clone(),
+            server.use_tls,
+            server.tls_verify_cert,
+            server.tls_cert_path.clone(),
         )
     }
 

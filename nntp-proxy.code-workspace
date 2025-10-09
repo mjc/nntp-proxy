@@ -7,10 +7,14 @@
 	"settings": {
 		"cSpell.words": [
 			"addrs",
+			"deadpool",
 			"Deadpool",
 			"demultiplexer",
 			"demux",
 			"keepalive",
+			"memchr",
+			"Mika",
+			"moka",
 			"Nagle",
 			"nodelay",
 			"setsockopt",
