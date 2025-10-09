@@ -806,7 +806,8 @@ mod tests {
             
             // Read greeting
             let mut buf = [0u8; 256];
-            client.read(&mut buf).await.unwrap();
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "Should receive greeting");
             
             // Send QUIT
             client.write_all(b"QUIT\r\n").await.unwrap();
