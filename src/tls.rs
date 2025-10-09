@@ -11,7 +11,7 @@ use crate::connection_error::ConnectionError;
 use rustls::{ClientConfig, RootCertStore};
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio_rustls::{client::TlsStream, TlsConnector};
+use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{debug, warn};
 
 /// Configuration for TLS connections
@@ -62,9 +62,12 @@ impl TlsManager {
     ) -> Result<TlsStream<TcpStream>, anyhow::Error> {
         let cert_result = self.load_certificates().await?;
         let client_config = self.create_optimized_config(cert_result.root_store)?;
-        
-        debug!("TLS: Certificate sources: {}", cert_result.sources.join(", "));
-        
+
+        debug!(
+            "TLS: Certificate sources: {}",
+            cert_result.sources.join(", ")
+        );
+
         let connector = TlsConnector::from(Arc::new(client_config));
         let domain = rustls_pki_types::ServerName::try_from(hostname)
             .map_err(|e| anyhow::anyhow!("Invalid hostname for TLS: {}", e))?
@@ -95,7 +98,10 @@ impl TlsManager {
         // 2. Try to load system certificates
         let system_count = self.load_system_certificates(&mut root_store)?;
         if system_count > 0 {
-            debug!("TLS: Loaded {} certificates from system store", system_count);
+            debug!(
+                "TLS: Loaded {} certificates from system store",
+                system_count
+            );
             sources.push("system certificates".to_string());
         }
 
@@ -106,7 +112,10 @@ impl TlsManager {
             sources.push("Mozilla CA bundle".to_string());
         }
 
-        Ok(CertificateLoadResult { root_store, sources })
+        Ok(CertificateLoadResult {
+            root_store,
+            sources,
+        })
     }
 
     /// Load custom certificate from file
@@ -118,47 +127,54 @@ impl TlsManager {
         let cert_data = std::fs::read(cert_path).map_err(|e| {
             anyhow::anyhow!("Failed to read TLS certificate from {}: {}", cert_path, e)
         })?;
-        
+
         let certs = rustls_pemfile::certs(&mut cert_data.as_slice())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse TLS certificate: {}", e))?;
-        
+
         for cert in certs {
-            root_store.add(cert).map_err(|e| {
-                anyhow::anyhow!("Failed to add custom certificate to store: {}", e)
-            })?;
+            root_store
+                .add(cert)
+                .map_err(|e| anyhow::anyhow!("Failed to add custom certificate to store: {}", e))?;
         }
-        
+
         Ok(())
     }
 
     /// Load system certificates, returning count of successfully loaded certificates
-    fn load_system_certificates(&self, root_store: &mut RootCertStore) -> Result<usize, anyhow::Error> {
+    fn load_system_certificates(
+        &self,
+        root_store: &mut RootCertStore,
+    ) -> Result<usize, anyhow::Error> {
         let cert_result = rustls_native_certs::load_native_certs();
         let mut added_count = 0;
-        
+
         for cert in cert_result.certs {
             if root_store.add(cert).is_ok() {
                 added_count += 1;
             }
         }
-        
+
         // Log any errors but don't fail - we have fallback
         for error in cert_result.errors {
             warn!("TLS: Certificate loading error: {}", error);
         }
-        
+
         Ok(added_count)
     }
 
     /// Create optimized client configuration using ring crypto provider
-    fn create_optimized_config(&self, root_store: RootCertStore) -> Result<ClientConfig, anyhow::Error> {
-        let config_builder = ClientConfig::builder_with_provider(
-            Arc::new(rustls::crypto::ring::default_provider())
-        )
-        .with_safe_default_protocol_versions()
-        .map_err(|e| anyhow::anyhow!("Failed to create TLS config with ring provider: {}", e))?
-        .with_root_certificates(root_store);
+    fn create_optimized_config(
+        &self,
+        root_store: RootCertStore,
+    ) -> Result<ClientConfig, anyhow::Error> {
+        let config_builder =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create TLS config with ring provider: {}", e)
+                })?
+                .with_root_certificates(root_store);
 
         let mut config = if self.config.tls_verify_cert {
             debug!("TLS: Certificate verification enabled with ring crypto provider");
@@ -175,8 +191,8 @@ impl TlsManager {
         };
 
         // Performance optimizations
-        config.enable_early_data = true;  // Enable TLS 1.3 0-RTT for faster reconnections
-        config.resumption = rustls::client::Resumption::default();  // Enable session resumption
+        config.enable_early_data = true; // Enable TLS 1.3 0-RTT for faster reconnections
+        config.resumption = rustls::client::Resumption::default(); // Enable session resumption
 
         Ok(config)
     }
@@ -204,14 +220,17 @@ mod tests {
     async fn test_certificate_loading() {
         let config = TlsConfig::default();
         let manager = TlsManager::new(config);
-        
+
         let result = manager.load_certificates().await.unwrap();
         assert!(!result.root_store.is_empty());
         // Should have at least one source (system certificates or Mozilla CA bundle)
         assert!(!result.sources.is_empty());
         // Common sources include "system certificates" or "Mozilla CA bundle"
-        assert!(result.sources.iter().any(|s| 
-            s.contains("Mozilla") || s.contains("system")
-        ));
+        assert!(
+            result
+                .sources
+                .iter()
+                .any(|s| s.contains("Mozilla") || s.contains("system"))
+        );
     }
 }

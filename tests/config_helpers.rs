@@ -19,8 +19,8 @@ pub fn create_test_server_config(host: &str, port: u16, name: &str) -> ServerCon
 
 /// Create a server configuration with authentication
 pub fn create_test_server_config_with_auth(
-    host: &str, 
-    port: u16, 
+    host: &str,
+    port: u16,
     name: &str,
     username: &str,
     password: &str,
@@ -41,7 +41,7 @@ pub fn create_test_server_config_with_auth(
 /// Create a TLS-enabled server configuration
 pub fn create_test_server_config_with_tls(
     host: &str,
-    port: u16, 
+    port: u16,
     name: &str,
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
@@ -99,11 +99,11 @@ mod tests {
     #[test]
     fn test_create_server_config_with_auth() {
         let config = create_test_server_config_with_auth(
-            "server.example.com", 
-            563, 
+            "server.example.com",
+            563,
             "secure-server",
             "testuser",
-            "testpass"
+            "testpass",
         );
         assert_eq!(config.username, Some("testuser".to_string()));
         assert_eq!(config.password, Some("testpass".to_string()));
@@ -116,7 +116,7 @@ mod tests {
             563,
             "tls-server",
             false,
-            Some("/path/to/cert.pem".to_string())
+            Some("/path/to/cert.pem".to_string()),
         );
         assert!(config.use_tls);
         assert!(!config.tls_verify_cert);
@@ -129,7 +129,7 @@ mod tests {
             "busy.example.com",
             119,
             "busy-server",
-            20
+            20,
         );
         assert_eq!(config.max_connections, 20);
     }

@@ -71,10 +71,8 @@ impl NntpCommand {
             }
             let args = &bytes[cmd_end + 1..];
             // Fast skip whitespace using memchr - find first non-whitespace
-            let first_non_ws = args
-                .iter()
-                .position(|&b| !b.is_ascii_whitespace());
-            
+            let first_non_ws = args.iter().position(|&b| !b.is_ascii_whitespace());
+
             if let Some(pos) = first_non_ws {
                 args[pos] == b'<'
             } else {

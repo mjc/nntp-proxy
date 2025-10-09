@@ -16,10 +16,9 @@ use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 fn extract_message_id(command: &str) -> Option<String> {
     let trimmed = command.trim();
     let bytes = trimmed.as_bytes();
-    
+
     memchr::memchr(b'<', bytes).and_then(|start| {
-        memchr::memchr(b'>', &bytes[start..])
-            .map(|end| trimmed[start..start + end + 1].to_string())
+        memchr::memchr(b'>', &bytes[start..]).map(|end| trimmed[start..start + end + 1].to_string())
     })
 }
 

@@ -40,7 +40,7 @@ impl SocketOptimizer {
     }
 
     /// Apply socket optimizations to ConnectionStream (extracts TCP stream if available)
-    /// 
+    ///
     /// # Deprecated
     /// This method is maintained for backward compatibility.
     /// New code should use `ConnectionOptimizer::new(stream).optimize()`.
@@ -51,9 +51,9 @@ impl SocketOptimizer {
 
     /// Apply aggressive socket optimizations for 1GB+ transfers
     /// Works with both TcpStream and ConnectionStream
-    /// 
+    ///
     /// # Deprecated
-    /// This method is maintained for backward compatibility. 
+    /// This method is maintained for backward compatibility.
     /// New code should use `ConnectionOptimizer` for better separation of concerns.
     pub fn apply_to_streams(
         client_stream: &TcpStream,
@@ -242,7 +242,7 @@ mod tests {
 
         let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (server_tcp, _) = listener.accept().await.unwrap();
-        
+
         let client_stream = ConnectionStream::plain(client_tcp);
         let server_stream = ConnectionStream::plain(server_tcp);
 
@@ -253,7 +253,7 @@ mod tests {
         // Test individual optimizers
         let client_optimizer = ConnectionOptimizer::new(&client_stream);
         let server_optimizer = ConnectionOptimizer::new(&server_stream);
-        
+
         assert!(client_optimizer.optimize().is_ok());
         assert!(server_optimizer.optimize().is_ok());
     }
