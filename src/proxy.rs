@@ -270,6 +270,16 @@ impl NntpProxy {
                     session.client_id(),
                     e
                 );
+                
+                // For debugging SABnzbd test connections and other short sessions,
+                // log additional context when transfers are small (likely test scenarios)
+                debug!(
+                    "Session error details for {} (ID: {}): Error occurred during per-command routing. \
+                     This may be a client test connection or early disconnection. \
+                     Check session debug logs above for command/response details.",
+                    client_addr,
+                    session.client_id()
+                );
             }
         }
 

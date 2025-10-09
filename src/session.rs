@@ -344,6 +344,18 @@ impl ClientSession {
                                     // Try to send error response, but don't log failure if client is gone
                                     let _ = client_write.write_all(BACKEND_ERROR).await;
                                     backend_to_client_bytes += BACKEND_ERROR.len() as u64;
+                                    
+                                    // For debugging test connections and small transfers, log detailed info
+                                    if client_to_backend_bytes + backend_to_client_bytes < 500 {
+                                        debug!(
+                                            "ERROR SUMMARY for small transfer - Client {}: \
+                                             Command '{}' failed with {}. \
+                                             Total session: {} bytes to backend, {} bytes from backend. \
+                                             This appears to be a short session (test connection?). \
+                                             Check debug logs above for full command/response hex dumps.",
+                                            self.client_addr, trimmed, e, client_to_backend_bytes, backend_to_client_bytes
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -380,6 +392,17 @@ impl ClientSession {
                     break;
                 }
             }
+        }
+
+        // Log session summary for debugging, especially useful for test connections
+        if client_to_backend_bytes + backend_to_client_bytes < 500 {
+            debug!(
+                "SESSION SUMMARY for Client {}: Small transfer completed successfully. \
+                 {} bytes sent to backend, {} bytes received from backend. \
+                 This appears to be a short session (likely test connection). \
+                 Check debug logs above for individual command/response details.",
+                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+            );
         }
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
