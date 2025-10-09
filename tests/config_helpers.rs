@@ -1,7 +1,6 @@
 //! Test configuration helpers to reduce boilerplate and improve maintainability
 
 use nntp_proxy::config::ServerConfig;
-use nntp_proxy::tls::TlsConfig;
 
 /// Create a basic server configuration for testing (no TLS)
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> ServerConfig {

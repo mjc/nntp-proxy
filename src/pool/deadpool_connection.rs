@@ -100,14 +100,14 @@ impl TcpManager {
         // Perform TLS handshake if enabled
         if self.tls_config.use_tls {
             let tls_manager = TlsManager::new(self.tls_config.clone());
-            let tls_stream = tls_manager.handshake(tcp_stream, &self.host, &self.name).await?;
-            Ok(ConnectionStream::Tls(tls_stream))
+            let tls_stream = tls_manager
+                .handshake(tcp_stream, &self.host, &self.name)
+                .await?;
+            Ok(ConnectionStream::Tls(Box::new(tls_stream)))
         } else {
             Ok(ConnectionStream::Plain(tcp_stream))
         }
     }
-
-
 }
 
 impl managed::Manager for TcpManager {

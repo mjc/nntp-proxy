@@ -2,12 +2,21 @@
 //!
 //! This module provides utilities for optimizing TCP socket performance
 //! for high-throughput NNTP transfers.
+//!
+//! The module is organized into:
+//! - `optimizers`: Trait-based optimization strategies for different connection types
+//! - Legacy `SocketOptimizer`: Maintained for backward compatibility
+
+pub mod optimizers;
 
 use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
 use crate::stream::ConnectionStream;
 use std::io;
 use tokio::net::TcpStream;
 use tracing::debug;
+
+// Re-export the new optimizers for easier access
+pub use optimizers::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer, TlsOptimizer};
 
 /// Socket optimizer for high-throughput scenarios
 pub struct SocketOptimizer;
@@ -31,35 +40,53 @@ impl SocketOptimizer {
     }
 
     /// Apply socket optimizations to ConnectionStream (extracts TCP stream if available)
+    /// 
+    /// # Deprecated
+    /// This method is maintained for backward compatibility.
+    /// New code should use `ConnectionOptimizer::new(stream).optimize()`.
     pub fn optimize_connection_stream(stream: &ConnectionStream) -> Result<(), io::Error> {
-        if let Some(tcp_stream) = stream.as_tcp_stream() {
-            Self::optimize_for_throughput(tcp_stream)
-        } else {
-            // TLS streams will be handled differently when implemented
-            Ok(())
-        }
+        let optimizer = ConnectionOptimizer::new(stream);
+        optimizer.optimize()
     }
 
     /// Apply aggressive socket optimizations for 1GB+ transfers
     /// Works with both TcpStream and ConnectionStream
+    /// 
+    /// # Deprecated
+    /// This method is maintained for backward compatibility. 
+    /// New code should use `ConnectionOptimizer` for better separation of concerns.
     pub fn apply_to_streams(
         client_stream: &TcpStream,
         backend_stream: &crate::stream::ConnectionStream,
     ) -> Result<(), io::Error> {
-        debug!("Applying high-throughput socket optimizations");
+        debug!("Applying high-throughput socket optimizations (legacy method)");
 
-        if let Err(e) = Self::optimize_for_throughput(client_stream) {
+        // Use the new trait-based approach internally
+        let client_optimizer = TcpOptimizer::new(client_stream);
+        if let Err(e) = client_optimizer.optimize() {
             debug!("Failed to set client socket optimizations: {}", e);
         }
 
-        // Only optimize if it's a plain TCP stream
-        if let Some(tcp) = backend_stream.as_tcp_stream() {
-            if let Err(e) = Self::optimize_for_throughput(tcp) {
-                debug!("Failed to set backend socket optimizations: {}", e);
-            }
-        } else {
-            debug!("Backend is TLS, skipping TCP-level optimizations");
+        let backend_optimizer = ConnectionOptimizer::new(backend_stream);
+        if let Err(e) = backend_optimizer.optimize() {
+            debug!("Failed to set backend socket optimizations: {}", e);
         }
+
+        Ok(())
+    }
+
+    /// Apply optimizations using the new trait-based approach (recommended)
+    pub fn apply_to_connection_streams(
+        client_stream: &ConnectionStream,
+        backend_stream: &ConnectionStream,
+    ) -> Result<(), io::Error> {
+        debug!("Applying connection optimizations with trait-based approach");
+
+        let client_optimizer = ConnectionOptimizer::new(client_stream);
+        let backend_optimizer = ConnectionOptimizer::new(backend_stream);
+
+        client_optimizer.optimize()?;
+        backend_optimizer.optimize()?;
 
         Ok(())
     }
@@ -203,5 +230,31 @@ mod tests {
 
         // But we accept that very large articles will require multiple buffers
         assert!(HIGH_THROUGHPUT_RECV_BUFFER < very_large_article);
+    }
+
+    #[tokio::test]
+    async fn test_new_trait_based_approach() {
+        use crate::stream::ConnectionStream;
+
+        // Create two TCP connections
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_tcp, _) = listener.accept().await.unwrap();
+        
+        let client_stream = ConnectionStream::plain(client_tcp);
+        let server_stream = ConnectionStream::plain(server_tcp);
+
+        // Use the new trait-based approach
+        let result = SocketOptimizer::apply_to_connection_streams(&client_stream, &server_stream);
+        assert!(result.is_ok());
+
+        // Test individual optimizers
+        let client_optimizer = ConnectionOptimizer::new(&client_stream);
+        let server_optimizer = ConnectionOptimizer::new(&server_stream);
+        
+        assert!(client_optimizer.optimize().is_ok());
+        assert!(server_optimizer.optimize().is_ok());
     }
 }
