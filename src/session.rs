@@ -245,8 +245,11 @@ impl ClientSession {
 
                     // Handle QUIT locally
                     if trimmed.eq_ignore_ascii_case("QUIT") {
-                        client_write.write_all(CONNECTION_CLOSING).await?;
+                        // Send closing message - ignore errors if client already disconnected
+                        let _ = client_write.write_all(CONNECTION_CLOSING).await;
+                        let _ = client_write.flush().await;
                         backend_to_client_bytes += CONNECTION_CLOSING.len() as u64;
+                        debug!("Client {} sent QUIT, closing connection", self.client_addr);
                         break;
                     }
 
