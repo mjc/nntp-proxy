@@ -114,6 +114,7 @@ impl std::error::Error for ConnectionError {
             Self::DnsResolution { source, .. } => Some(source),
             Self::SocketConfig { source, .. } => Some(source),
             Self::IoError(e) => Some(e),
+            Self::TlsHandshake { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

@@ -8,7 +8,9 @@
 //! - System certificate loading with Mozilla CA bundle fallback
 
 use crate::connection_error::ConnectionError;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -40,6 +42,67 @@ impl Default for TlsConfig {
 pub struct CertificateLoadResult {
     pub root_store: RootCertStore,
     pub sources: Vec<String>,
+}
+
+/// Custom certificate verifier that accepts all certificates (INSECURE!)
+/// 
+/// This is used when `tls_verify_cert = false` for NNTP servers without valid certificates.
+/// **WARNING**: This disables all certificate validation and should only be used for testing
+/// or with trusted private networks.
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        // Accept all certificates without verification
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        // Accept all signatures without verification
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        // Accept all signatures without verification
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        // Support all signature schemes
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
 }
 
 /// High-performance TLS connector with optimized configuration
@@ -168,26 +231,26 @@ impl TlsManager {
         &self,
         root_store: RootCertStore,
     ) -> Result<ClientConfig, anyhow::Error> {
-        let config_builder =
+        let mut config = if self.config.tls_verify_cert {
+            debug!("TLS: Certificate verification enabled with ring crypto provider");
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .map_err(|e| {
                     anyhow::anyhow!("Failed to create TLS config with ring provider: {}", e)
                 })?
-                .with_root_certificates(root_store);
-
-        let mut config = if self.config.tls_verify_cert {
-            debug!("TLS: Certificate verification enabled with ring crypto provider");
-            config_builder.with_no_client_auth()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
         } else {
-            debug!("TLS: WARNING - Certificate verification disabled (insecure!)");
-            // For rustls, disabling cert verification requires a custom verifier
-            // This is intentionally more difficult than native-tls for security
-            return Err(anyhow::anyhow!(
-                "Certificate verification cannot be disabled with rustls. \
-                This is intentional for security. If you need to connect to \
-                servers with invalid certificates, consider using a custom CA certificate."
-            ));
+            warn!("TLS: Certificate verification DISABLED - this is insecure and should only be used for testing!");
+            // Use custom verifier that accepts all certificates
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create TLS config with ring provider: {}", e)
+                })?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth()
         };
 
         // Performance optimizations
