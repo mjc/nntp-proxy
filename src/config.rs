@@ -694,11 +694,12 @@ max_connections = 5
     }
 
     // Test helper functions to encapsulate unsafe env var operations
-    // SAFETY: These are only safe to use in single-threaded test context
+    // SAFETY: These are only safe when tests are run serially (not in parallel)
+    // Use #[serial] attribute to ensure thread-safety
     #[cfg(test)]
     mod test_env_helpers {
         /// Set an environment variable (test helper)
-        /// SAFETY: Only safe in single-threaded test context
+        /// SAFETY: Only safe when called from #[serial] tests to avoid race conditions
         pub fn set_env(key: &str, value: &str) {
             unsafe {
                 std::env::set_var(key, value);
@@ -706,7 +707,7 @@ max_connections = 5
         }
 
         /// Remove an environment variable (test helper)
-        /// SAFETY: Only safe in single-threaded test context
+        /// SAFETY: Only safe when called from #[serial] tests to avoid race conditions
         pub fn remove_env(key: &str) {
             unsafe {
                 std::env::remove_var(key);
@@ -714,7 +715,7 @@ max_connections = 5
         }
 
         /// Remove multiple environment variables (test helper)
-        /// SAFETY: Only safe in single-threaded test context
+        /// SAFETY: Only safe when called from #[serial] tests to avoid race conditions
         pub fn remove_env_range(prefix: &str, start: usize, end: usize) {
             unsafe {
                 for i in start..end {
@@ -725,6 +726,7 @@ max_connections = 5
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_load_servers_from_env() {
         use test_env_helpers::*;
 
@@ -773,6 +775,7 @@ max_connections = 5
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_load_servers_from_env_empty() {
         use test_env_helpers::*;
 

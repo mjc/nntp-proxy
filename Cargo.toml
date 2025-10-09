@@ -43,6 +43,7 @@ moka = { version = "0.12", features = ["future"] }  # Async LRU cache with TTL f
 
 [dev-dependencies]
 tempfile = "3.23"
+serial_test = "3.2"
 
 
 [profile.release]
