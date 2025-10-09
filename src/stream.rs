@@ -38,6 +38,29 @@ impl ConnectionStream {
     pub fn plain(stream: TcpStream) -> Self {
         Self::Plain(stream)
     }
+    
+    /// Create a new TLS-encrypted connection stream
+    pub fn tls(stream: TlsStream<TcpStream>) -> Self {
+        Self::Tls(Box::new(stream))
+    }
+    
+    /// Returns the connection type as a string for logging/debugging
+    pub fn connection_type(&self) -> &'static str {
+        match self {
+            Self::Plain(_) => "TCP",
+            Self::Tls(_) => "TLS",
+        }
+    }
+    
+    /// Returns true if this connection uses encryption (TLS/SSL)
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+    
+    /// Returns true if this connection is unencrypted (plain TCP)
+    pub fn is_unencrypted(&self) -> bool {
+        matches!(self, Self::Plain(_))
+    }
 
     /// Get a reference to the underlying TCP stream (if plain TCP)
     ///
@@ -59,11 +82,17 @@ impl ConnectionStream {
     }
 
     /// Returns true if this is a plain TCP connection
+    /// 
+    /// Deprecated: Use `is_unencrypted()` for more explicit naming
+    #[deprecated(since = "0.2.0", note = "Use is_unencrypted() instead for clarity")]
     pub fn is_plain_tcp(&self) -> bool {
         matches!(self, Self::Plain(_))
     }
 
     /// Returns true if this is a TLS connection
+    /// 
+    /// Deprecated: Use `is_encrypted()` for more explicit naming
+    #[deprecated(since = "0.2.0", note = "Use is_encrypted() instead for clarity")]
     pub fn is_tls(&self) -> bool {
         matches!(self, Self::Tls(_))
     }
@@ -73,6 +102,25 @@ impl ConnectionStream {
         match self {
             Self::Tls(tls) => Some(tls.as_ref()),
             Self::Plain(_) => None,
+        }
+    }
+    
+    /// Get a mutable reference to the TLS stream (if TLS connection)
+    pub fn as_tls_stream_mut(&mut self) -> Option<&mut TlsStream<TcpStream>> {
+        match self {
+            Self::Tls(tls) => Some(tls.as_mut()),
+            Self::Plain(_) => None,
+        }
+    }
+    
+    /// Get the underlying TCP stream reference regardless of connection type
+    /// 
+    /// For plain TCP, returns the stream directly.
+    /// For TLS, returns the underlying TCP stream within the TLS wrapper.
+    pub fn underlying_tcp_stream(&self) -> &TcpStream {
+        match self {
+            Self::Plain(tcp) => tcp,
+            Self::Tls(tls) => tls.get_ref().0,
         }
     }
 }
@@ -146,8 +194,9 @@ mod tests {
         assert_eq!(&buf, b"Hello");
 
         // Test stream type checking
-        assert!(client_conn.is_plain_tcp());
-        assert!(!client_conn.is_tls());
+        assert!(client_conn.is_unencrypted());
+        assert!(!client_conn.is_encrypted());
+        assert_eq!(client_conn.connection_type(), "TCP");
         assert!(client_conn.as_tcp_stream().is_some());
     }
 
@@ -173,5 +222,33 @@ mod tests {
         // Should be able to access underlying TCP stream
         assert!(conn_stream.as_tcp_stream().is_some());
         assert!(conn_stream.as_tcp_stream_mut().is_some());
+        
+        // Test new API methods
+        assert!(conn_stream.is_unencrypted());
+        assert!(!conn_stream.is_encrypted());
+        assert_eq!(conn_stream.connection_type(), "TCP");
+        
+        // Test underlying TCP access
+        let _underlying = conn_stream.underlying_tcp_stream();
+    }
+    
+    #[tokio::test]
+    async fn test_connection_type_methods() {
+        // Test that the new API names are more explicit and clear
+        use std::net::TcpListener;
+        
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(tcp).unwrap();
+        
+        let conn = ConnectionStream::plain(stream);
+        
+        // New explicit method names
+        assert!(conn.is_unencrypted(), "Plain TCP should be unencrypted");
+        assert!(!conn.is_encrypted(), "Plain TCP should not be encrypted");
+        assert_eq!(conn.connection_type(), "TCP");
     }
 }
