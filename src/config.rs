@@ -693,21 +693,51 @@ max_connections = 5
         Ok(())
     }
 
+    // Test helper functions to encapsulate unsafe env var operations
+    // SAFETY: These are only safe to use in single-threaded test context
+    #[cfg(test)]
+    mod test_env_helpers {
+        /// Set an environment variable (test helper)
+        /// SAFETY: Only safe in single-threaded test context
+        pub fn set_env(key: &str, value: &str) {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        /// Remove an environment variable (test helper)
+        /// SAFETY: Only safe in single-threaded test context
+        pub fn remove_env(key: &str) {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+
+        /// Remove multiple environment variables (test helper)
+        /// SAFETY: Only safe in single-threaded test context
+        pub fn remove_env_range(prefix: &str, start: usize, end: usize) {
+            unsafe {
+                for i in start..end {
+                    std::env::remove_var(format!("{}_{}", prefix, i));
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_load_servers_from_env() {
-        // Set up environment variables for testing
-        // SAFETY: Test code only, running in single-threaded test context
-        unsafe {
-            std::env::set_var("NNTP_SERVER_0_HOST", "env-server1.com");
-            std::env::set_var("NNTP_SERVER_0_PORT", "8119");
-            std::env::set_var("NNTP_SERVER_0_NAME", "Env Server 1");
-            std::env::set_var("NNTP_SERVER_0_USERNAME", "envuser");
-            std::env::set_var("NNTP_SERVER_0_PASSWORD", "envpass");
-            std::env::set_var("NNTP_SERVER_0_MAX_CONNECTIONS", "15");
+        use test_env_helpers::*;
 
-            std::env::set_var("NNTP_SERVER_1_HOST", "env-server2.com");
-            std::env::set_var("NNTP_SERVER_1_PORT", "119");
-        }
+        // Set up environment variables for testing
+        set_env("NNTP_SERVER_0_HOST", "env-server1.com");
+        set_env("NNTP_SERVER_0_PORT", "8119");
+        set_env("NNTP_SERVER_0_NAME", "Env Server 1");
+        set_env("NNTP_SERVER_0_USERNAME", "envuser");
+        set_env("NNTP_SERVER_0_PASSWORD", "envpass");
+        set_env("NNTP_SERVER_0_MAX_CONNECTIONS", "15");
+
+        set_env("NNTP_SERVER_1_HOST", "env-server2.com");
+        set_env("NNTP_SERVER_1_PORT", "119");
         // No name set - should use default "Server 1"
         // No max_connections set - should use default 10
 
@@ -732,28 +762,22 @@ max_connections = 5
         assert_eq!(servers[1].max_connections, 10); // Default
 
         // Clean up environment variables
-        // SAFETY: Test code only, running in single-threaded test context
-        unsafe {
-            std::env::remove_var("NNTP_SERVER_0_HOST");
-            std::env::remove_var("NNTP_SERVER_0_PORT");
-            std::env::remove_var("NNTP_SERVER_0_NAME");
-            std::env::remove_var("NNTP_SERVER_0_USERNAME");
-            std::env::remove_var("NNTP_SERVER_0_PASSWORD");
-            std::env::remove_var("NNTP_SERVER_0_MAX_CONNECTIONS");
-            std::env::remove_var("NNTP_SERVER_1_HOST");
-            std::env::remove_var("NNTP_SERVER_1_PORT");
-        }
+        remove_env("NNTP_SERVER_0_HOST");
+        remove_env("NNTP_SERVER_0_PORT");
+        remove_env("NNTP_SERVER_0_NAME");
+        remove_env("NNTP_SERVER_0_USERNAME");
+        remove_env("NNTP_SERVER_0_PASSWORD");
+        remove_env("NNTP_SERVER_0_MAX_CONNECTIONS");
+        remove_env("NNTP_SERVER_1_HOST");
+        remove_env("NNTP_SERVER_1_PORT");
     }
 
     #[test]
     fn test_load_servers_from_env_empty() {
+        use test_env_helpers::*;
+
         // Ensure no env vars are set
-        // SAFETY: Test code only, running in single-threaded test context
-        unsafe {
-            for i in 0..5 {
-                std::env::remove_var(format!("NNTP_SERVER_{}_HOST", i));
-            }
-        }
+        remove_env_range("NNTP_SERVER", 0, 5);
 
         let servers = load_servers_from_env();
         assert!(servers.is_none(), "Should return None when no env vars set");

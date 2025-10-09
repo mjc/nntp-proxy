@@ -230,12 +230,10 @@ impl CachingSession {
                                             // Only cache successful responses (2xx)
                                             if !response_buffer.is_empty() && response_buffer[0] == b'2' {
                                                 info!("Caching response for message-ID: {}", message_id);
-                                                // Use mem::take to move buffer into Arc without cloning
-                                                // Avoids allocating and copying the entire response
                                                 self.cache.insert(
                                                     message_id,
                                                     CachedArticle {
-                                                        response: Arc::new(std::mem::take(&mut response_buffer)),
+                                                        response: Arc::new(response_buffer.clone()),
                                                     }
                                                 ).await;
                                             }

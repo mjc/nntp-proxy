@@ -11,8 +11,7 @@ use crate::protocol::ResponseParser;
 pub struct BackendAuthenticator;
 
 impl BackendAuthenticator {
-    /// Authenticate to backend server
-    /// Now generic over stream types to support both TCP and future TLS
+    /// Authenticate to backend server - generic over stream types to support both TCP and future TLS
     #[allow(dead_code)]
     async fn authenticate<S>(
         backend_stream: &mut S,
@@ -69,8 +68,7 @@ impl BackendAuthenticator {
         result
     }
 
-    /// Read and forward the backend server's greeting to the client
-    /// Now generic over stream types to support both TCP and future TLS
+    /// Read and forward the backend server's greeting to the client - generic over stream types
     #[allow(dead_code)]
     pub async fn forward_greeting<B, C>(
         backend_stream: &mut B,
@@ -105,8 +103,7 @@ impl BackendAuthenticator {
         Ok(())
     }
 
-    /// Perform authentication and forward the greeting to the client
-    /// Now generic over stream types to support both TCP and future TLS
+    /// Perform authentication and forward the greeting to the client - generic over stream types
     #[allow(dead_code)]
     pub async fn authenticate_and_forward_greeting<B, C>(
         backend_stream: &mut B,
