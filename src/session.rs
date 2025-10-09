@@ -564,7 +564,10 @@ mod tests {
     #[test]
     fn test_client_session_with_ipv6() {
         let buffer_pool = BufferPool::new(1024, 4);
-        let addr = SocketAddr::new(IpAddr::V6("::1".parse().unwrap()), 8119);
+        let addr = SocketAddr::new(
+            IpAddr::V6("::1".parse().expect("Failed to parse IPv6 address")),
+            8119,
+        );
         let session = ClientSession::new(addr, buffer_pool);
 
         assert_eq!(session.client_addr.port(), 8119);
@@ -668,8 +671,12 @@ mod tests {
         use tokio::net::TcpListener;
 
         // Start a mock server for the backend
-        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind backend listener");
+        let backend_addr = backend_listener
+            .local_addr()
+            .expect("Failed to get backend address");
 
         // Spawn mock backend server
         tokio::spawn(async move {
@@ -703,8 +710,12 @@ mod tests {
         );
 
         // Create client connection
-        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_addr = client_listener.local_addr().unwrap();
+        let client_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind client listener");
+        let client_addr = client_listener
+            .local_addr()
+            .expect("Failed to get client address");
 
         // Create session
         let buffer_pool = BufferPool::new(1024, 4);
@@ -716,15 +727,23 @@ mod tests {
 
         // Spawn client that sends QUIT and immediately closes
         let client_handle = tokio::spawn(async move {
-            let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(client_addr)
+                .await
+                .expect("Failed to connect client");
             
             // Read greeting
             let mut greeting = [0u8; 256];
-            let n = client.read(&mut greeting).await.unwrap();
+            let n = client
+                .read(&mut greeting)
+                .await
+                .expect("Failed to read greeting");
             assert!(n > 0);
             
             // Send QUIT command
-            client.write_all(b"QUIT\r\n").await.unwrap();
+            client
+                .write_all(b"QUIT\r\n")
+                .await
+                .expect("Failed to send QUIT");
             
             // Try to read response (might fail if we close too fast, which is fine)
             let mut response = [0u8; 256];
@@ -735,7 +754,10 @@ mod tests {
         });
 
         // Accept client connection
-        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let (client_stream, _) = client_listener
+            .accept()
+            .await
+            .expect("Failed to accept client connection");
 
         // Handle the session - should not return an error despite client closing
         let result = session.handle_per_command_routing(client_stream).await;
@@ -760,8 +782,12 @@ mod tests {
         use tokio::net::TcpListener;
 
         // Start a mock backend
-        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind backend listener");
+        let backend_addr = backend_listener
+            .local_addr()
+            .expect("Failed to get backend address");
 
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = backend_listener.accept().await {
@@ -790,8 +816,12 @@ mod tests {
         );
 
         // Create client
-        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_addr = client_listener.local_addr().unwrap();
+        let client_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind client listener");
+        let client_addr = client_listener
+            .local_addr()
+            .expect("Failed to get client address");
 
         let buffer_pool = BufferPool::new(1024, 4);
         let session = ClientSession::new_with_router(
@@ -802,29 +832,37 @@ mod tests {
 
         // Client that sends QUIT and waits for response
         let client_handle = tokio::spawn(async move {
-            let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(client_addr)
+                .await
+                .expect("Failed to connect client");
             
             // Read greeting
             let mut buf = [0u8; 256];
-            let n = client.read(&mut buf).await.unwrap();
+            let n = client.read(&mut buf).await.expect("Failed to read greeting");
             assert!(n > 0, "Should receive greeting");
             
             // Send QUIT
-            client.write_all(b"QUIT\r\n").await.unwrap();
+            client
+                .write_all(b"QUIT\r\n")
+                .await
+                .expect("Failed to send QUIT");
             
             // Read closing response
-            let n = client.read(&mut buf).await.unwrap();
+            let n = client.read(&mut buf).await.expect("Failed to read response");
             
             // Should receive "205 Connection closing"
             let response = String::from_utf8_lossy(&buf[..n]);
             assert!(response.contains("205"), "Should receive 205 closing response");
         });
 
-        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let (client_stream, _) = client_listener
+            .accept()
+            .await
+            .expect("Failed to accept client connection");
         let result = session.handle_per_command_routing(client_stream).await;
         
         assert!(result.is_ok(), "Session should handle QUIT cleanly");
         
-        client_handle.await.unwrap();
+        client_handle.await.expect("Client task failed");
     }
 }

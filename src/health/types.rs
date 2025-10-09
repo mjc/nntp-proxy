@@ -181,7 +181,9 @@ mod tests {
         let mut health = BackendHealth::new();
 
         sleep(Duration::from_millis(10));
-        let elapsed = health.time_since_healthy().unwrap();
+        let elapsed = health
+            .time_since_healthy()
+            .expect("Should have last_healthy time");
         assert!(elapsed >= Duration::from_millis(10));
 
         // Make unhealthy

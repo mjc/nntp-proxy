@@ -123,24 +123,36 @@ mod tests {
     #[tokio::test]
     async fn test_connection_stream_plain_tcp() {
         // Create a listener and client
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind listener");
+        let addr = listener.local_addr().expect("Failed to get local address");
 
-        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let client_handle = tokio::spawn(async move {
+            TcpStream::connect(addr)
+                .await
+                .expect("Failed to connect client")
+        });
 
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let client_stream = client_handle.await.unwrap();
+        let (server_stream, _) = listener.accept().await.expect("Failed to accept connection");
+        let client_stream = client_handle.await.expect("Failed to join client task");
 
         // Wrap in ConnectionStream
         let mut server_conn = ConnectionStream::plain(server_stream);
         let mut client_conn = ConnectionStream::plain(client_stream);
 
         // Test writing and reading
-        client_conn.write_all(b"Hello").await.unwrap();
-        client_conn.flush().await.unwrap();
+        client_conn
+            .write_all(b"Hello")
+            .await
+            .expect("Failed to write data");
+        client_conn.flush().await.expect("Failed to flush");
 
         let mut buf = [0u8; 5];
-        server_conn.read_exact(&mut buf).await.unwrap();
+        server_conn
+            .read_exact(&mut buf)
+            .await
+            .expect("Failed to read data");
         assert_eq!(&buf, b"Hello");
 
         // Test stream type checking
@@ -159,12 +171,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_stream_tcp_access() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to bind listener");
+        let addr = listener
+            .local_addr()
+            .expect("Failed to get local address");
 
-        let tcp_stream = std::net::TcpStream::connect(addr).unwrap();
-        tcp_stream.set_nonblocking(true).unwrap();
-        let tokio_stream = TcpStream::from_std(tcp_stream).unwrap();
+        let tcp_stream = std::net::TcpStream::connect(addr).expect("Failed to connect");
+        tcp_stream
+            .set_nonblocking(true)
+            .expect("Failed to set nonblocking");
+        let tokio_stream = TcpStream::from_std(tcp_stream).expect("Failed to convert to tokio stream");
 
         let mut conn_stream = ConnectionStream::plain(tokio_stream);
 

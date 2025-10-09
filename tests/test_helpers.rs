@@ -244,10 +244,10 @@ mod tests {
         // Connect and verify greeting
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
-            .unwrap();
+            .expect("Failed to connect to test server");
 
         let mut buffer = [0; 1024];
-        let n = stream.read(&mut buffer).await.unwrap();
+        let n = stream.read(&mut buffer).await.expect("Failed to read greeting");
         let response = String::from_utf8_lossy(&buffer[..n]);
 
         assert!(response.contains("200"));

@@ -104,11 +104,17 @@ mod tests {
     #[tokio::test]
     async fn test_optimize_for_throughput_with_real_socket() {
         // Create a real TCP listener and connection
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind listener");
+        let addr = listener
+            .local_addr()
+            .expect("Failed to get local address");
 
         // Connect to it
-        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("Failed to connect client");
 
         // Try to optimize (might fail on some systems, but shouldn't panic)
         let result = SocketOptimizer::optimize_for_throughput(&client_stream);
@@ -133,11 +139,20 @@ mod tests {
     #[tokio::test]
     async fn test_apply_to_streams() {
         // Create two TCP connections
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind listener");
+        let addr = listener
+            .local_addr()
+            .expect("Failed to get local address");
 
-        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("Failed to connect client");
+        let (server_stream, _) = listener
+            .accept()
+            .await
+            .expect("Failed to accept connection");
 
         // Apply optimizations to both streams
         let result = SocketOptimizer::apply_to_streams(&client_stream, &server_stream);
@@ -155,12 +170,17 @@ mod tests {
         use crate::stream::ConnectionStream;
 
         // Create a test server and connection
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to bind listener");
+        let addr = listener
+            .local_addr()
+            .expect("Failed to get local address");
 
-        let tcp_stream = std::net::TcpStream::connect(addr).unwrap();
-        tcp_stream.set_nonblocking(true).unwrap();
-        let tokio_stream = TcpStream::from_std(tcp_stream).unwrap();
+        let tcp_stream = std::net::TcpStream::connect(addr).expect("Failed to connect");
+        tcp_stream
+            .set_nonblocking(true)
+            .expect("Failed to set nonblocking");
+        let tokio_stream = TcpStream::from_std(tcp_stream).expect("Failed to convert to tokio stream");
 
         let conn_stream = ConnectionStream::plain(tokio_stream);
 

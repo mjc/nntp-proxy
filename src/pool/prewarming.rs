@@ -116,8 +116,13 @@ mod tests {
 
     /// Helper to find an available port
     async fn find_available_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind to any available port");
+        listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port()
     }
 
     /// Spawn a simple mock NNTP server

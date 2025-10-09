@@ -126,13 +126,25 @@ mod tests {
         let mut buffer2 = vec![0u8; 1024];
 
         // Read from client, write to backend
-        let n = client_read.read(&mut buffer1).await.unwrap();
-        backend_write.write_all(&buffer1[..n]).await.unwrap();
+        let n = client_read
+            .read(&mut buffer1)
+            .await
+            .expect("Failed to read from client");
+        backend_write
+            .write_all(&buffer1[..n])
+            .await
+            .expect("Failed to write to backend");
         assert_eq!(&backend_write, client_data);
 
         // Read from backend, write to client
-        let n = backend_read.read(&mut buffer2).await.unwrap();
-        client_write.write_all(&buffer2[..n]).await.unwrap();
+        let n = backend_read
+            .read(&mut buffer2)
+            .await
+            .expect("Failed to read from backend");
+        client_write
+            .write_all(&buffer2[..n])
+            .await
+            .expect("Failed to write to client");
         assert_eq!(&client_write, backend_data);
     }
 
@@ -144,7 +156,10 @@ mod tests {
 
         // Test writing to the buffer
         let mut cursor = Cursor::new(buffer);
-        cursor.write_all(b"test data").await.unwrap();
+        cursor
+            .write_all(b"test data")
+            .await
+            .expect("Failed to write to buffer");
     }
 
     #[test]
@@ -182,7 +197,10 @@ mod tests {
         let mut read_stream = Cursor::new(empty_data);
         let mut buffer = vec![0u8; 1024];
 
-        let n = read_stream.read(&mut buffer).await.unwrap();
+        let n = read_stream
+            .read(&mut buffer)
+            .await
+            .expect("Failed to read from stream");
         assert_eq!(n, 0); // EOF
     }
 
@@ -193,7 +211,10 @@ mod tests {
         let mut read_stream = Cursor::new(data);
         let mut buffer = vec![0u8; HIGH_THROUGHPUT_BUFFER_SIZE];
 
-        let n = read_stream.read(&mut buffer).await.unwrap();
+        let n = read_stream
+            .read(&mut buffer)
+            .await
+            .expect("Failed to read from stream");
         assert_eq!(n, data.len());
         assert_eq!(&buffer[..n], data);
     }

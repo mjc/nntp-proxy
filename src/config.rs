@@ -353,7 +353,12 @@ mod tests {
         write!(temp_file, "{}", config_toml)?;
 
         // Load config from file
-        let loaded_config = load_config(temp_file.path().to_str().unwrap())?;
+        let loaded_config = load_config(
+            temp_file
+                .path()
+                .to_str()
+                .expect("Failed to convert path to string"),
+        )?;
 
         assert_eq!(loaded_config.servers.len(), 2);
         assert_eq!(loaded_config.servers[0].name, "Test Server 1");
@@ -383,7 +388,12 @@ mod tests {
         let mut temp_file = NamedTempFile::new()?;
         write!(temp_file, "{}", invalid_toml)?;
 
-        let result = load_config(temp_file.path().to_str().unwrap());
+        let result = load_config(
+            temp_file
+                .path()
+                .to_str()
+                .expect("Failed to convert path to string"),
+        );
         assert!(result.is_err());
         assert!(
             result

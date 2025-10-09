@@ -9,8 +9,12 @@ use nntp_proxy::{Config, NntpProxy, ServerConfig, load_config};
 
 /// Helper function to find an available port
 async fn find_available_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind to any available port");
+    let addr = listener
+        .local_addr()
+        .expect("Failed to get local address");
     addr.port()
 }
 
@@ -140,7 +144,9 @@ async fn test_round_robin_distribution() -> Result<()> {
     // Start mock servers that identify themselves
     tokio::spawn(async move {
         let addr = format!("127.0.0.1:{}", mock_port1);
-        let listener = TcpListener::bind(&addr).await.unwrap();
+        let listener = TcpListener::bind(&addr)
+            .await
+            .expect("Failed to bind mock server 1");
 
         loop {
             if let Ok((mut stream, _)) = listener.accept().await {
@@ -169,7 +175,9 @@ async fn test_round_robin_distribution() -> Result<()> {
 
     tokio::spawn(async move {
         let addr = format!("127.0.0.1:{}", mock_port2);
-        let listener = TcpListener::bind(&addr).await.unwrap();
+        let listener = TcpListener::bind(&addr)
+            .await
+            .expect("Failed to bind mock server 2");
 
         loop {
             if let Ok((mut stream, _)) = listener.accept().await {
@@ -281,7 +289,12 @@ name = "Test Server 2"
     let mut temp_file = NamedTempFile::new()?;
     write!(temp_file, "{}", config_content)?;
 
-    let config = load_config(temp_file.path().to_str().unwrap())?;
+    let config = load_config(
+        temp_file
+            .path()
+            .to_str()
+            .expect("Failed to convert path to string"),
+    )?;
 
     assert_eq!(config.servers.len(), 2);
     assert_eq!(config.servers[0].host, "test1.example.com");

@@ -162,7 +162,7 @@ mod tests {
 
         // Wait for all tasks to complete
         for handle in handles {
-            handle.await.unwrap();
+            handle.await.expect("Task failed");
         }
     }
 
@@ -303,7 +303,7 @@ mod tests {
         }
 
         for handle in handles {
-            handle.await.unwrap();
+            handle.await.expect("Task failed");
         }
     }
 }

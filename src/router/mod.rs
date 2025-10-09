@@ -11,11 +11,13 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```
+//! # use anyhow::Result;
 //! use nntp_proxy::router::BackendSelector;
 //! use nntp_proxy::types::{BackendId, ClientId};
 //! # use nntp_proxy::pool::DeadpoolConnectionProvider;
 //!
+//! # fn main() -> Result<()> {
 //! let mut selector = BackendSelector::new();
 //! # let provider = DeadpoolConnectionProvider::new(
 //! #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
@@ -24,10 +26,12 @@
 //!
 //! // Route a command
 //! let client_id = ClientId::new();
-//! let backend_id = selector.route_command_sync(client_id, "LIST").unwrap();
+//! let backend_id = selector.route_command_sync(client_id, "LIST")?;
 //!
 //! // After command completes
 //! selector.complete_command_sync(backend_id);
+//! # Ok(())
+//! # }
 //! ```
 
 use anyhow::Result;
@@ -261,12 +265,24 @@ mod tests {
         }
 
         // Route 6 commands and verify round-robin
-        let backend1 = router.route_command_sync(client_id, "LIST\r\n").unwrap();
-        let backend2 = router.route_command_sync(client_id, "DATE\r\n").unwrap();
-        let backend3 = router.route_command_sync(client_id, "HELP\r\n").unwrap();
-        let backend4 = router.route_command_sync(client_id, "LIST\r\n").unwrap();
-        let backend5 = router.route_command_sync(client_id, "DATE\r\n").unwrap();
-        let backend6 = router.route_command_sync(client_id, "HELP\r\n").unwrap();
+        let backend1 = router
+            .route_command_sync(client_id, "LIST\r\n")
+            .expect("Failed to route command");
+        let backend2 = router
+            .route_command_sync(client_id, "DATE\r\n")
+            .expect("Failed to route command");
+        let backend3 = router
+            .route_command_sync(client_id, "HELP\r\n")
+            .expect("Failed to route command");
+        let backend4 = router
+            .route_command_sync(client_id, "LIST\r\n")
+            .expect("Failed to route command");
+        let backend5 = router
+            .route_command_sync(client_id, "DATE\r\n")
+            .expect("Failed to route command");
+        let backend6 = router
+            .route_command_sync(client_id, "HELP\r\n")
+            .expect("Failed to route command");
 
         // Should cycle through backends in order
         assert_eq!(backend1.as_index(), 0);
@@ -290,11 +306,15 @@ mod tests {
         assert_eq!(router.backend_load(backend_id), Some(0));
 
         // Route a command
-        router.route_command_sync(client_id, "LIST\r\n").unwrap();
+        router
+            .route_command_sync(client_id, "LIST\r\n")
+            .expect("Failed to route command");
         assert_eq!(router.backend_load(backend_id), Some(1));
 
         // Route another
-        router.route_command_sync(client_id, "DATE\r\n").unwrap();
+        router
+            .route_command_sync(client_id, "DATE\r\n")
+            .expect("Failed to route command");
         assert_eq!(router.backend_load(backend_id), Some(2));
 
         // Complete one
@@ -338,7 +358,9 @@ mod tests {
         // Route 9 commands
         let mut backend_counts = vec![0, 0, 0];
         for _ in 0..9 {
-            let backend_id = router.route_command_sync(client_id, "LIST\r\n").unwrap();
+            let backend_id = router
+                .route_command_sync(client_id, "LIST\r\n")
+                .expect("Failed to route command");
             backend_counts[backend_id.as_index()] += 1;
         }
 
