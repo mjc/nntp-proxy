@@ -201,6 +201,11 @@ impl ClientSession {
         mut client_stream: TcpStream,
     ) -> Result<(u64, u64)> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        
+        debug!(
+            "Client {} starting per-command routing session",
+            self.client_addr
+        );
 
         let router = self
             .router
@@ -214,11 +219,25 @@ impl ClientSession {
         let mut backend_to_client_bytes = 0u64;
 
         // Send initial greeting to client
-        client_write.write_all(PROXY_GREETING_PCR).await?;
+        debug!(
+            "Client {} sending greeting: {} | hex: {:02x?}",
+            self.client_addr,
+            String::from_utf8_lossy(PROXY_GREETING_PCR),
+            PROXY_GREETING_PCR
+        );
+        
+        if let Err(e) = client_write.write_all(PROXY_GREETING_PCR).await {
+            debug!(
+                "Client {} failed to send greeting: {} (kind: {:?}). \
+                 This suggests the client disconnected immediately after connecting.",
+                self.client_addr, e, e.kind()
+            );
+            return Err(e.into());
+        }
         backend_to_client_bytes += PROXY_GREETING_PCR.len() as u64;
 
         debug!(
-            "Client {} sent greeting, entering command loop",
+            "Client {} sent greeting successfully, entering command loop",
             self.client_addr
         );
 

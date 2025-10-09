@@ -264,12 +264,28 @@ impl NntpProxy {
                 );
             }
             Err(e) => {
-                warn!(
-                    "Per-command routing session error for {} (ID: {}): {}",
-                    client_addr,
-                    session.client_id(),
-                    e
-                );
+                // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
+                let is_broken_pipe = if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    matches!(io_err.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+                } else {
+                    false
+                };
+                
+                if is_broken_pipe {
+                    debug!(
+                        "Client {} (ID: {}) disconnected during session: {} - This is normal for test connections",
+                        client_addr,
+                        session.client_id(),
+                        e
+                    );
+                } else {
+                    warn!(
+                        "Per-command routing session error for {} (ID: {}): {}",
+                        client_addr,
+                        session.client_id(),
+                        e
+                    );
+                }
                 
                 // For debugging SABnzbd test connections and other short sessions,
                 // log additional context when transfers are small (likely test scenarios)
