@@ -201,6 +201,11 @@ impl ClientSession {
         mut client_stream: TcpStream,
     ) -> Result<(u64, u64)> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        
+        debug!(
+            "Client {} starting per-command routing session",
+            self.client_addr
+        );
 
         let router = self
             .router
@@ -214,11 +219,25 @@ impl ClientSession {
         let mut backend_to_client_bytes = 0u64;
 
         // Send initial greeting to client
-        client_write.write_all(PROXY_GREETING_PCR).await?;
+        debug!(
+            "Client {} sending greeting: {} | hex: {:02x?}",
+            self.client_addr,
+            String::from_utf8_lossy(PROXY_GREETING_PCR),
+            PROXY_GREETING_PCR
+        );
+        
+        if let Err(e) = client_write.write_all(PROXY_GREETING_PCR).await {
+            debug!(
+                "Client {} failed to send greeting: {} (kind: {:?}). \
+                 This suggests the client disconnected immediately after connecting.",
+                self.client_addr, e, e.kind()
+            );
+            return Err(e.into());
+        }
         backend_to_client_bytes += PROXY_GREETING_PCR.len() as u64;
 
         debug!(
-            "Client {} sent greeting, entering command loop",
+            "Client {} sent greeting successfully, entering command loop",
             self.client_addr
         );
 
@@ -239,18 +258,24 @@ impl ClientSession {
                     let trimmed = command.trim();
 
                     debug!(
-                        "Client {} received command ({} bytes): {}",
-                        self.client_addr, n, trimmed
+                        "Client {} received command ({} bytes): {} | hex: {:02x?}",
+                        self.client_addr, n, trimmed, command.as_bytes()
                     );
 
                     // Handle QUIT locally
                     if trimmed.eq_ignore_ascii_case("QUIT") {
                         // Send closing message - ignore errors if client already disconnected, but log for debugging
                         if let Err(e) = client_write.write_all(CONNECTION_CLOSING).await {
-                            debug!("Failed to write CONNECTION_CLOSING to client {}: {}", self.client_addr, e);
+                            debug!(
+                                "Failed to write CONNECTION_CLOSING to client {}: {}",
+                                self.client_addr, e
+                            );
                         }
                         if let Err(e) = client_write.flush().await {
-                            debug!("Failed to flush CONNECTION_CLOSING to client {}: {}", self.client_addr, e);
+                            debug!(
+                                "Failed to flush CONNECTION_CLOSING to client {}: {}",
+                                self.client_addr, e
+                            );
                         }
                         backend_to_client_bytes += CONNECTION_CLOSING.len() as u64;
                         debug!("Client {} sent QUIT, closing connection", self.client_addr);
@@ -292,22 +317,111 @@ impl ClientSession {
                             {
                                 Ok(()) => {}
                                 Err(e) => {
-                                    error!(
-                                        "Error routing command for client {}: {}",
-                                        self.client_addr, e
-                                    );
+                                    // Provide detailed context for broken pipe errors
+                                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                                        match io_err.kind() {
+                                            std::io::ErrorKind::BrokenPipe => {
+                                                warn!(
+                                                    "Client {} disconnected unexpectedly while routing command '{}' (broken pipe). \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                                                     This usually indicates the client closed the connection before receiving the response.",
+                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                            std::io::ErrorKind::ConnectionReset => {
+                                                warn!(
+                                                    "Client {} connection reset while routing command '{}'. \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                                                     This usually indicates a network issue or client crash.",
+                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                            std::io::ErrorKind::ConnectionAborted => {
+                                                warn!(
+                                                    "Client {} connection aborted while routing command '{}'. \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                                                     This usually indicates the connection was terminated by the local system.",
+                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                            _ => {
+                                                error!(
+                                                    "I/O error routing command '{}' for client {}: {} (kind: {:?}). \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                                    trimmed, self.client_addr, e, io_err.kind(), client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        error!(
+                                            "Error routing command '{}' for client {}: {}. \
+                                             Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                            trimmed, self.client_addr, e, client_to_backend_bytes, backend_to_client_bytes
+                                        );
+                                    }
+                                    
+                                    // Try to send error response, but don't log failure if client is gone
                                     let _ = client_write.write_all(BACKEND_ERROR).await;
                                     backend_to_client_bytes += BACKEND_ERROR.len() as u64;
+                                    
+                                    // For debugging test connections and small transfers, log detailed info
+                                    if client_to_backend_bytes + backend_to_client_bytes < 500 {
+                                        debug!(
+                                            "ERROR SUMMARY for small transfer - Client {}: \
+                                             Command '{}' failed with {}. \
+                                             Total session: {} bytes to backend, {} bytes from backend. \
+                                             This appears to be a short session (test connection?). \
+                                             Check debug logs above for full command/response hex dumps.",
+                                            self.client_addr, trimmed, e, client_to_backend_bytes, backend_to_client_bytes
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Error reading from client {}: {}", self.client_addr, e);
+                    // Provide detailed context for client read errors
+                    match e.kind() {
+                        std::io::ErrorKind::UnexpectedEof => {
+                            debug!(
+                                "Client {} closed connection (EOF). Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                        std::io::ErrorKind::BrokenPipe => {
+                            debug!(
+                                "Client {} connection broken pipe while reading. Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                        std::io::ErrorKind::ConnectionReset => {
+                            warn!(
+                                "Client {} connection reset while reading. Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                        _ => {
+                            warn!(
+                                "Error reading from client {}: {} (kind: {:?}). Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, e, e.kind(), client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                    }
                     break;
                 }
             }
+        }
+
+        // Log session summary for debugging, especially useful for test connections
+        if client_to_backend_bytes + backend_to_client_bytes < 500 {
+            debug!(
+                "SESSION SUMMARY for Client {}: Small transfer completed successfully. \
+                 {} bytes sent to backend, {} bytes received from backend. \
+                 This appears to be a short session (likely test connection). \
+                 Check debug logs above for individual command/response details.",
+                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+            );
         }
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
@@ -356,10 +470,12 @@ impl ClientSession {
 
         // Forward the command to the backend
         debug!(
-            "Client {} forwarding command to backend {:?}: {}",
+            "Client {} forwarding command to backend {:?} ({} bytes): {} | hex: {:02x?}",
             self.client_addr,
             backend_id,
-            command.trim()
+            command.len(),
+            command.trim(),
+            command.as_bytes()
         );
         pooled_conn.write_all(command.as_bytes()).await?;
         pooled_conn.flush().await?;
@@ -386,6 +502,13 @@ impl ClientSession {
         if n == 0 {
             return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
         }
+        
+        debug!(
+            "Client {} received backend response chunk ({} bytes): {} | hex: {:02x?}",
+            self.client_addr, n,
+            String::from_utf8_lossy(&chunk[..n.min(100)]), // Show first 100 bytes max
+            &chunk[..n.min(32)] // Show first 32 bytes in hex
+        );
 
         // Find first newline to determine if multiline
         let first_newline = chunk[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
@@ -403,6 +526,12 @@ impl ClientSession {
         }
 
         // Write first chunk directly to client
+        debug!(
+            "Client {} sending first chunk ({} bytes): {} | hex: {:02x?}",
+            self.client_addr, n, 
+            String::from_utf8_lossy(&chunk[..n.min(100)]), // Show first 100 bytes max
+            &chunk[..n.min(32)] // Show first 32 bytes in hex
+        );
         client_write.write_all(&chunk[..n]).await?;
         total_bytes += n;
 
@@ -451,6 +580,12 @@ impl ClientSession {
 
                         loop {
                             // Write current chunk to client
+                            debug!(
+                                "Client {} sending streaming chunk ({} bytes): {} | hex: {:02x?}",
+                                self.client_addr, current_n,
+                                String::from_utf8_lossy(&current_chunk[..current_n.min(100)]), // Show first 100 bytes max
+                                &current_chunk[..current_n.min(32)] // Show first 32 bytes in hex
+                            );
                             client_write.write_all(&current_chunk[..current_n]).await?;
                             total_bytes += current_n;
 
@@ -676,7 +811,7 @@ mod tests {
             if let Ok((mut stream, _)) = backend_listener.accept().await {
                 // Send greeting
                 let _ = stream.write_all(b"200 Mock Server Ready\r\n").await;
-                
+
                 // Read and discard any commands, keep connection alive briefly
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -708,28 +843,24 @@ mod tests {
 
         // Create session
         let buffer_pool = BufferPool::new(1024, 4);
-        let session = ClientSession::new_with_router(
-            client_addr,
-            buffer_pool,
-            Arc::new(router),
-        );
+        let session = ClientSession::new_with_router(client_addr, buffer_pool, Arc::new(router));
 
         // Spawn client that sends QUIT and immediately closes
         let client_handle = tokio::spawn(async move {
             let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
-            
+
             // Read greeting
             let mut greeting = [0u8; 256];
             let n = client.read(&mut greeting).await.unwrap();
             assert!(n > 0);
-            
+
             // Send QUIT command
             client.write_all(b"QUIT\r\n").await.unwrap();
-            
+
             // Try to read response (might fail if we close too fast, which is fine)
             let mut response = [0u8; 256];
             let _ = client.read(&mut response).await;
-            
+
             // Close connection immediately (simulating SABnzbd behavior)
             drop(client);
         });
@@ -739,10 +870,14 @@ mod tests {
 
         // Handle the session - should not return an error despite client closing
         let result = session.handle_per_command_routing(client_stream).await;
-        
+
         // Should succeed (not propagate broken pipe error)
-        assert!(result.is_ok(), "QUIT handling should not return error: {:?}", result);
-        
+        assert!(
+            result.is_ok(),
+            "QUIT handling should not return error: {:?}",
+            result
+        );
+
         if let Ok((sent, received)) = result {
             // Should have sent QUIT command
             assert!(sent > 0, "Should have sent bytes (QUIT command)");
@@ -794,37 +929,36 @@ mod tests {
         let client_addr = client_listener.local_addr().unwrap();
 
         let buffer_pool = BufferPool::new(1024, 4);
-        let session = ClientSession::new_with_router(
-            client_addr,
-            buffer_pool,
-            Arc::new(router),
-        );
+        let session = ClientSession::new_with_router(client_addr, buffer_pool, Arc::new(router));
 
         // Client that sends QUIT and waits for response
         let client_handle = tokio::spawn(async move {
             let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
-            
+
             // Read greeting
             let mut buf = [0u8; 256];
             let n = client.read(&mut buf).await.unwrap();
             assert!(n > 0, "Should receive greeting");
-            
+
             // Send QUIT
             client.write_all(b"QUIT\r\n").await.unwrap();
-            
+
             // Read closing response
             let n = client.read(&mut buf).await.unwrap();
-            
+
             // Should receive "205 Connection closing"
             let response = String::from_utf8_lossy(&buf[..n]);
-            assert!(response.contains("205"), "Should receive 205 closing response");
+            assert!(
+                response.contains("205"),
+                "Should receive 205 closing response"
+            );
         });
 
         let (client_stream, _) = client_listener.accept().await.unwrap();
         let result = session.handle_per_command_routing(client_stream).await;
-        
+
         assert!(result.is_ok(), "Session should handle QUIT cleanly");
-        
+
         client_handle.await.unwrap();
     }
 }

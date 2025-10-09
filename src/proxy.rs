@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, ServerConfig};
 use crate::constants::buffer::{BUFFER_POOL_SIZE, BUFFER_SIZE};
 use crate::constants::stateless_proxy::*;
-use crate::network::SocketOptimizer;
+use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
 use crate::router;
 use crate::session::ClientSession;
@@ -181,8 +181,14 @@ impl NntpProxy {
         };
 
         // Apply socket optimizations for high-throughput
-        if let Err(e) = SocketOptimizer::apply_to_streams(&client_stream, &backend_conn) {
-            debug!("Failed to apply socket optimizations: {}", e);
+        let client_optimizer = TcpOptimizer::new(&client_stream);
+        if let Err(e) = client_optimizer.optimize() {
+            debug!("Failed to optimize client socket: {}", e);
+        }
+        
+        let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
+        if let Err(e) = backend_optimizer.optimize() {
+            debug!("Failed to optimize backend socket: {}", e);
         }
 
         // Create session and handle connection
@@ -264,11 +270,37 @@ impl NntpProxy {
                 );
             }
             Err(e) => {
-                warn!(
-                    "Per-command routing session error for {} (ID: {}): {}",
+                // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
+                let is_broken_pipe = if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    matches!(io_err.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+                } else {
+                    false
+                };
+                
+                if is_broken_pipe {
+                    debug!(
+                        "Client {} (ID: {}) disconnected during session: {} - This is normal for test connections",
+                        client_addr,
+                        session.client_id(),
+                        e
+                    );
+                } else {
+                    warn!(
+                        "Per-command routing session error for {} (ID: {}): {}",
+                        client_addr,
+                        session.client_id(),
+                        e
+                    );
+                }
+                
+                // For debugging SABnzbd test connections and other short sessions,
+                // log additional context when transfers are small (likely test scenarios)
+                debug!(
+                    "Session error details for {} (ID: {}): Error occurred during per-command routing. \
+                     This may be a client test connection or early disconnection. \
+                     Check session debug logs above for command/response details.",
                     client_addr,
-                    session.client_id(),
-                    e
+                    session.client_id()
                 );
             }
         }
@@ -297,6 +329,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 5,
+                    use_tls: false,
+                    tls_verify_cert: true,
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -305,6 +340,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 8,
+                    use_tls: false,
+                    tls_verify_cert: true,
+                    tls_cert_path: None,
                 },
                 ServerConfig {
                     host: "server3.example.com".to_string(),
@@ -313,6 +351,9 @@ mod tests {
                     username: None,
                     password: None,
                     max_connections: 12,
+                    use_tls: false,
+                    tls_verify_cert: true,
+                    tls_cert_path: None,
                 },
             ],
             ..Default::default()

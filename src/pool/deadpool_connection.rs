@@ -6,16 +6,18 @@ use tracing::info;
 
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
+use crate::stream::ConnectionStream;
+use crate::tls::{TlsConfig, TlsManager};
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
 pub struct TcpManager {
     host: String,
     port: u16,
-    #[allow(dead_code)]
     name: String,
     username: Option<String>,
     password: Option<String>,
+    tls_config: TlsConfig,
 }
 
 impl TcpManager {
@@ -32,11 +34,31 @@ impl TcpManager {
             name,
             username,
             password,
+            tls_config: TlsConfig::default(),
         }
     }
 
-    /// Create an optimized TCP connection
-    async fn create_optimized_tcp_stream(&self) -> Result<TcpStream, anyhow::Error> {
+    /// Create a new TcpManager with TLS configuration
+    pub fn new_with_tls(
+        host: String,
+        port: u16,
+        name: String,
+        username: Option<String>,
+        password: Option<String>,
+        tls_config: TlsConfig,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            name,
+            username,
+            password,
+            tls_config,
+        }
+    }
+
+    /// Create an optimized connection (TCP or TLS)
+    async fn create_optimized_stream(&self) -> Result<ConnectionStream, anyhow::Error> {
         use socket2::{Domain, Protocol, Socket, Type};
 
         // Resolve hostname
@@ -73,19 +95,29 @@ impl TcpManager {
         socket.connect(&socket_addr.into())?;
         let std_stream: std::net::TcpStream = socket.into();
         std_stream.set_nonblocking(true)?;
+        let tcp_stream = TcpStream::from_std(std_stream)?;
 
-        Ok(TcpStream::from_std(std_stream)?)
+        // Perform TLS handshake if enabled
+        if self.tls_config.use_tls {
+            let tls_manager = TlsManager::new(self.tls_config.clone());
+            let tls_stream = tls_manager
+                .handshake(tcp_stream, &self.host, &self.name)
+                .await?;
+            Ok(ConnectionStream::Tls(Box::new(tls_stream)))
+        } else {
+            Ok(ConnectionStream::Plain(tcp_stream))
+        }
     }
 }
 
 impl managed::Manager for TcpManager {
-    type Type = TcpStream;
+    type Type = ConnectionStream;
     type Error = anyhow::Error;
 
-    async fn create(&self) -> Result<TcpStream, anyhow::Error> {
+    async fn create(&self) -> Result<ConnectionStream, anyhow::Error> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream = self.create_optimized_tcp_stream().await?;
+        let mut stream = self.create_optimized_stream().await?;
 
         // Consume greeting
         let mut buffer = vec![0u8; 4096];
@@ -133,21 +165,30 @@ impl managed::Manager for TcpManager {
 
     async fn recycle(
         &self,
-        conn: &mut TcpStream,
+        conn: &mut ConnectionStream,
         _: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
         // Fast TCP-level health check: try reading without blocking
         // Healthy idle connections return WouldBlock, dead ones return 0 or error
         let mut peek_buf = [0u8; 1];
-        match conn.try_read(&mut peek_buf) {
-            Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
-            Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-            Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
+
+        // Only plain TCP supports try_read directly, for TLS we just return Ok
+        match conn {
+            ConnectionStream::Plain(tcp) => match tcp.try_read(&mut peek_buf) {
+                Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
+                Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
+            },
+            ConnectionStream::Tls(_) => {
+                // For TLS connections, we can't easily peek without blocking
+                // Just assume the connection is healthy
+                Ok(())
+            }
         }
     }
 
-    fn detach(&self, _conn: &mut TcpStream) {}
+    fn detach(&self, _conn: &mut ConnectionStream) {}
 }
 
 type Pool = managed::Pool<TcpManager>;
@@ -177,17 +218,44 @@ impl DeadpoolConnectionProvider {
         Self { pool, name }
     }
 
+    /// Create a new connection provider with TLS support
+    pub fn new_with_tls(
+        host: String,
+        port: u16,
+        name: String,
+        max_size: usize,
+        username: Option<String>,
+        password: Option<String>,
+        tls_config: TlsConfig,
+    ) -> Self {
+        let manager =
+            TcpManager::new_with_tls(host, port, name.clone(), username, password, tls_config);
+        let pool = Pool::builder(manager)
+            .max_size(max_size)
+            .build()
+            .expect("Failed to create connection pool");
+
+        Self { pool, name }
+    }
+
     /// Create a connection provider from a server configuration
     ///
     /// This avoids unnecessary cloning of individual fields.
     pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
-        Self::new(
+        let tls_config = TlsConfig {
+            use_tls: server.use_tls,
+            tls_verify_cert: server.tls_verify_cert,
+            tls_cert_path: server.tls_cert_path.clone(),
+        };
+
+        Self::new_with_tls(
             server.host.clone(),
             server.port,
             server.name.clone(),
             server.max_connections as usize,
             server.username.clone(),
             server.password.clone(),
+            tls_config,
         )
     }
 

@@ -69,6 +69,9 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
                 username: None,
                 password: None,
                 max_connections: 10,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
             },
             ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -77,6 +80,9 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
                 username: None,
                 password: None,
                 max_connections: 10,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
             },
         ],
         ..Default::default()
@@ -209,6 +215,9 @@ async fn test_round_robin_distribution() -> Result<()> {
                 username: None,
                 password: None,
                 max_connections: 10,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
             },
             ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -217,6 +226,9 @@ async fn test_round_robin_distribution() -> Result<()> {
                 username: None,
                 password: None,
                 max_connections: 10,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
             },
         ],
         ..Default::default()
@@ -306,6 +318,9 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
             username: None,
             password: None,
             max_connections: 10,
+            use_tls: false,
+            tls_verify_cert: true,
+            tls_cert_path: None,
         }],
         ..Default::default()
     };

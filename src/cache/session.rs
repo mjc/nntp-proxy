@@ -12,14 +12,25 @@ use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer;
 use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 
-/// Extract message-ID from command arguments
+/// Extract message-ID from command arguments using fast byte searching
+/// 
+/// Message-IDs are ASCII and must be in the format <...@...>
+/// See RFC 5536 Section 3.1.3: https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3
 fn extract_message_id(command: &str) -> Option<String> {
     let trimmed = command.trim();
-    trimmed.find('<').and_then(|start| {
-        trimmed[start..]
-            .find('>')
-            .map(|end| trimmed[start..start + end + 1].to_string())
-    })
+    let bytes = trimmed.as_bytes();
+
+    // Find opening '<'
+    let start = memchr::memchr(b'<', bytes)?;
+    
+    // Find closing '>' after the '<'
+    // Since end is relative to &bytes[start..], the actual position is start + end
+    let end = memchr::memchr(b'>', &bytes[start + 1..])?;
+    let msgid_end = start + end + 2; // +1 for the slice offset, +1 to include '>'
+    
+    // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
+    // We already know msgid_end is valid since memchr found '>' at that position
+    Some(trimmed[start..msgid_end].to_string())
 }
 
 /// Check if command is cacheable (ARTICLE/BODY/HEAD/STAT with message-ID)

@@ -42,20 +42,14 @@ pub enum ConnectionError {
     /// I/O error during communication
     IoError(std::io::Error),
 
-    // TODO(SSL): Uncomment these variants when implementing TLS support:
-    // See SSL_IMPLEMENTATION.md for implementation details
-    //
-    // /// TLS handshake failed
-    // TlsHandshake {
-    //     backend: String,
-    //     source: Box<dyn std::error::Error + Send + Sync>,
-    // },
-    //
-    // /// Certificate verification failed  
-    // CertificateVerification {
-    //     backend: String,
-    //     reason: String,
-    // },
+    /// TLS handshake failed
+    TlsHandshake {
+        backend: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Certificate verification failed
+    CertificateVerification { backend: String, reason: String },
 }
 
 impl fmt::Display for ConnectionError {
@@ -95,6 +89,20 @@ impl fmt::Display for ConnectionError {
                 write!(f, "Stale connection to backend '{}': {}", backend, reason)
             }
             Self::IoError(e) => write!(f, "I/O error: {}", e),
+            Self::TlsHandshake { backend, source } => {
+                write!(
+                    f,
+                    "TLS handshake failed for backend '{}': {}",
+                    backend, source
+                )
+            }
+            Self::CertificateVerification { backend, reason } => {
+                write!(
+                    f,
+                    "Certificate verification failed for backend '{}': {}",
+                    backend, reason
+                )
+            }
         }
     }
 }
@@ -106,6 +114,7 @@ impl std::error::Error for ConnectionError {
             Self::DnsResolution { source, .. } => Some(source),
             Self::SocketConfig { source, .. } => Some(source),
             Self::IoError(e) => Some(e),
+            Self::TlsHandshake { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

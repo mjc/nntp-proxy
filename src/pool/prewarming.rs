@@ -170,6 +170,9 @@ mod tests {
             max_connections: 2,
             username: None,
             password: None,
+            use_tls: false,
+            tls_verify_cert: true,
+            tls_cert_path: None,
         }];
 
         let providers = servers

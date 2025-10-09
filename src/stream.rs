@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
 
 /// Trait for async streams that can be used for NNTP connections
 ///
@@ -21,29 +22,44 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 /// Unified stream type that can represent different connection types
 ///
-/// This enum allows the proxy to handle both plain TCP and future TLS connections
+/// This enum allows the proxy to handle both plain TCP and TLS connections
 /// through a single type, avoiding the need for trait objects and their associated
 /// heap allocation overhead.
-///
-/// # Future SSL Support
-///
-/// When adding SSL/TLS support, add a new variant:
-/// ```ignore
-/// Tls(tokio_rustls::TlsStream<TcpStream>),
-/// ```
-/// TODO(SSL): Add Tls variant here - see SSL_IMPLEMENTATION.md for details
 #[derive(Debug)]
 pub enum ConnectionStream {
     /// Plain TCP connection
     Plain(TcpStream),
-    // TODO(SSL): Uncomment when implementing TLS:
-    // Tls(tokio_rustls::TlsStream<TcpStream>),
+    /// TLS-encrypted connection
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 impl ConnectionStream {
     /// Create a new plain TCP connection stream
     pub fn plain(stream: TcpStream) -> Self {
         Self::Plain(stream)
+    }
+    
+    /// Create a new TLS-encrypted connection stream
+    pub fn tls(stream: TlsStream<TcpStream>) -> Self {
+        Self::Tls(Box::new(stream))
+    }
+    
+    /// Returns the connection type as a string for logging/debugging
+    pub fn connection_type(&self) -> &'static str {
+        match self {
+            Self::Plain(_) => "TCP",
+            Self::Tls(_) => "TLS",
+        }
+    }
+    
+    /// Returns true if this connection uses encryption (TLS/SSL)
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+    
+    /// Returns true if this connection is unencrypted (plain TCP)
+    pub fn is_unencrypted(&self) -> bool {
+        matches!(self, Self::Plain(_))
     }
 
     /// Get a reference to the underlying TCP stream (if plain TCP)
@@ -53,7 +69,7 @@ impl ConnectionStream {
     pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match self {
             Self::Plain(tcp) => Some(tcp),
-            // Future TLS variant would return None or use get_ref()
+            Self::Tls(_) => None,
         }
     }
 
@@ -61,17 +77,35 @@ impl ConnectionStream {
     pub fn as_tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
         match self {
             Self::Plain(tcp) => Some(tcp),
+            Self::Tls(_) => None,
         }
     }
 
-    /// Returns true if this is a plain TCP connection
-    pub fn is_plain_tcp(&self) -> bool {
-        matches!(self, Self::Plain(_))
+    /// Get a reference to the TLS stream (if TLS connection)
+    pub fn as_tls_stream(&self) -> Option<&TlsStream<TcpStream>> {
+        match self {
+            Self::Tls(tls) => Some(tls.as_ref()),
+            Self::Plain(_) => None,
+        }
     }
-
-    /// Returns true if this is a TLS connection (currently always false)
-    pub fn is_tls(&self) -> bool {
-        false // Will be updated when TLS variant is added
+    
+    /// Get a mutable reference to the TLS stream (if TLS connection)
+    pub fn as_tls_stream_mut(&mut self) -> Option<&mut TlsStream<TcpStream>> {
+        match self {
+            Self::Tls(tls) => Some(tls.as_mut()),
+            Self::Plain(_) => None,
+        }
+    }
+    
+    /// Get the underlying TCP stream reference regardless of connection type
+    /// 
+    /// For plain TCP, returns the stream directly.
+    /// For TLS, returns the underlying TCP stream within the TLS wrapper.
+    pub fn underlying_tcp_stream(&self) -> &TcpStream {
+        match self {
+            Self::Plain(tcp) => tcp,
+            Self::Tls(tls) => tls.get_ref().0,
+        }
     }
 }
 
@@ -83,7 +117,7 @@ impl AsyncRead for ConnectionStream {
     ) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -96,21 +130,21 @@ impl AsyncWrite for ConnectionStream {
     ) -> Poll<io::Result<usize>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            // Future: Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -144,8 +178,9 @@ mod tests {
         assert_eq!(&buf, b"Hello");
 
         // Test stream type checking
-        assert!(client_conn.is_plain_tcp());
-        assert!(!client_conn.is_tls());
+        assert!(client_conn.is_unencrypted());
+        assert!(!client_conn.is_encrypted());
+        assert_eq!(client_conn.connection_type(), "TCP");
         assert!(client_conn.as_tcp_stream().is_some());
     }
 
@@ -171,5 +206,33 @@ mod tests {
         // Should be able to access underlying TCP stream
         assert!(conn_stream.as_tcp_stream().is_some());
         assert!(conn_stream.as_tcp_stream_mut().is_some());
+        
+        // Test new API methods
+        assert!(conn_stream.is_unencrypted());
+        assert!(!conn_stream.is_encrypted());
+        assert_eq!(conn_stream.connection_type(), "TCP");
+        
+        // Test underlying TCP access
+        let _underlying = conn_stream.underlying_tcp_stream();
+    }
+    
+    #[tokio::test]
+    async fn test_connection_type_methods() {
+        // Test that the new API names are more explicit and clear
+        use std::net::TcpListener;
+        
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(tcp).unwrap();
+        
+        let conn = ConnectionStream::plain(stream);
+        
+        // New explicit method names
+        assert!(conn.is_unencrypted(), "Plain TCP should be unencrypted");
+        assert!(!conn.is_encrypted(), "Plain TCP should not be encrypted");
+        assert_eq!(conn.connection_type(), "TCP");
     }
 }

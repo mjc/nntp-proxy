@@ -8,7 +8,8 @@ A high-performance NNTP proxy server written in Rust, with round-robin load bala
 - ⚡ **High performance** - Lock-free routing, zero-allocation command parsing, optimized I/O
 - 🏥 **Health checking** - Automatic backend health monitoring with failure detection
 - 🔐 **Authentication** - Proxy-level authentication, backends pre-authenticated
-- 🔀 **Per-command routing mode** - Optional stateless routing for resource efficiency
+- � **TLS/SSL support** - Secure backend connections with system certificate store
+- �🔀 **Per-command routing mode** - Optional stateless routing for resource efficiency
 - 📊 **Connection pooling** - Efficient connection reuse with configurable limits
 - ⚙️ **TOML configuration** - Simple, readable configuration with sensible defaults
 - 🔍 **Structured logging** - Detailed tracing for debugging and monitoring
@@ -154,8 +155,8 @@ max_connections = 10
 
 # Health check configuration (optional)
 [health_check]
-check_interval = 30        # Seconds between checks (default: 30)
-check_timeout = 5          # Timeout per check (default: 5)
+interval_secs = 30         # Seconds between checks (default: 30)
+timeout_secs = 5           # Timeout per check (default: 5)
 unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 ```
 
@@ -171,6 +172,75 @@ unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 | `username` | string | No | - | Authentication username |
 | `password` | string | No | - | Authentication password |
 | `max_connections` | integer | No | 10 | Max concurrent connections to this backend |
+| `use_tls` | boolean | No | false | Enable TLS/SSL encryption |
+| `tls_verify_cert` | boolean | No | true | Verify server certificates (uses system CA store) |
+| `tls_cert_path` | string | No | - | Path to additional CA certificate (PEM format) |
+
+### TLS/SSL Support
+
+The proxy supports TLS/SSL encrypted connections to backend servers using your operating system's trusted certificate store by default.
+
+#### Basic TLS Configuration
+
+For servers with valid SSL certificates from recognized CAs:
+
+```toml
+[[servers]]
+host = "secure.newsserver.com"
+port = 563  # Standard NNTPS port
+name = "Secure News Server"
+use_tls = true
+tls_verify_cert = true  # Uses system certificate store (default)
+max_connections = 20
+```
+
+**That's it!** No additional certificate configuration needed. The proxy will:
+- Use your operating system's trusted certificate store automatically
+- Verify the server's certificate
+- Establish a secure TLS connection
+
+#### Private/Self-Signed CA
+
+For servers using certificates from a private CA:
+
+```toml
+[[servers]]
+host = "internal.newsserver.local"
+port = 563
+name = "Internal News Server"
+use_tls = true
+tls_verify_cert = true
+tls_cert_path = "/etc/nntp-proxy/internal-ca.pem"  # PEM format
+max_connections = 10
+```
+
+**Note**: The custom certificate is **added to** the system certificates, not replacing them.
+
+#### System Certificate Stores
+
+| Operating System | Certificate Store |
+|-----------------|-------------------|
+| Linux (Debian/Ubuntu) | `/etc/ssl/certs/ca-certificates.crt` |
+| Linux (RHEL/CentOS) | `/etc/pki/tls/certs/ca-bundle.crt` |
+| macOS | Security.framework (Keychain) |
+| Windows | SChannel (Windows Certificate Store) |
+
+#### Port Reference
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 119  | NNTP | Unencrypted, standard NNTP |
+| 563  | NNTPS | NNTP over TLS/SSL (encrypted) |
+| 8119 | Custom | Common alternative port |
+
+#### Security Best Practices
+
+✅ **Always verify certificates in production** (`tls_verify_cert = true`)  
+✅ **Keep system certificates updated** via OS package manager  
+✅ **Use standard NNTPS port 563** for encrypted connections  
+✅ **Monitor TLS handshake failures** in logs  
+
+⚠️ **Never set `tls_verify_cert = false` in production** - this disables all certificate verification!
 
 #### Environment Variable Overrides for Servers
 
@@ -204,8 +274,8 @@ docker run -e NNTP_SERVER_0_HOST=news.example.com \
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `check_interval` | integer | 30 | Seconds between health checks |
-| `check_timeout` | integer | 5 | Health check timeout in seconds |
+| `interval_secs` | integer | 30 | Seconds between health checks |
+| `timeout_secs` | integer | 5 | Health check timeout in seconds |
 | `unhealthy_threshold` | integer | 3 | Consecutive failures before marking unhealthy |
 
 ### Authentication
@@ -489,8 +559,8 @@ cargo test --quiet
 ### Test Coverage
 
 The codebase includes:
-- **186 unit tests** covering all modules
-- **11 integration tests** for end-to-end scenarios
+- **165 unit tests** covering all modules
+- **Integration tests** for end-to-end scenarios
 - **100% pass rate**
 
 ### Manual Testing
@@ -526,6 +596,8 @@ For performance testing, create custom scripts that:
 | Crate | Purpose |
 |-------|---------|
 | `tokio` | Async runtime and networking |
+| `tokio-native-tls` | TLS/SSL support for async streams |
+| `native-tls` | Native TLS backend (uses system certificate store) |
 | `tracing` | Structured logging framework |
 | `anyhow` | Error handling |
 | `clap` | Command-line argument parsing |
@@ -589,7 +661,6 @@ RUST_LOG=nntp_proxy::router=debug,nntp_proxy::health=debug nntp-proxy
 
 ### Planned Features
 
-- [ ] SSL/TLS support (NNTPS)
 - [ ] Prometheus metrics endpoint
 - [ ] Configuration hot-reload
 - [ ] IPv6 support
@@ -598,6 +669,7 @@ RUST_LOG=nntp_proxy::router=debug,nntp_proxy::health=debug nntp-proxy
 
 ### Completed
 
+- [x] SSL/TLS support (NNTPS) with system certificate store
 - [x] Lock-free routing
 - [x] Zero-allocation command parsing
 - [x] Health checking system
