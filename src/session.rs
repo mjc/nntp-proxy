@@ -239,8 +239,8 @@ impl ClientSession {
                     let trimmed = command.trim();
 
                     debug!(
-                        "Client {} received command ({} bytes): {}",
-                        self.client_addr, n, trimmed
+                        "Client {} received command ({} bytes): {} | hex: {:02x?}",
+                        self.client_addr, n, trimmed, command.as_bytes()
                     );
 
                     // Handle QUIT locally
@@ -298,10 +298,50 @@ impl ClientSession {
                             {
                                 Ok(()) => {}
                                 Err(e) => {
-                                    error!(
-                                        "Error routing command for client {}: {}",
-                                        self.client_addr, e
-                                    );
+                                    // Provide detailed context for broken pipe errors
+                                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                                        match io_err.kind() {
+                                            std::io::ErrorKind::BrokenPipe => {
+                                                warn!(
+                                                    "Client {} disconnected unexpectedly while routing command '{}' (broken pipe). \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                                                     This usually indicates the client closed the connection before receiving the response.",
+                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                            std::io::ErrorKind::ConnectionReset => {
+                                                warn!(
+                                                    "Client {} connection reset while routing command '{}'. \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                                                     This usually indicates a network issue or client crash.",
+                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                            std::io::ErrorKind::ConnectionAborted => {
+                                                warn!(
+                                                    "Client {} connection aborted while routing command '{}'. \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                                                     This usually indicates the connection was terminated by the local system.",
+                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                            _ => {
+                                                error!(
+                                                    "I/O error routing command '{}' for client {}: {} (kind: {:?}). \
+                                                     Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                                    trimmed, self.client_addr, e, io_err.kind(), client_to_backend_bytes, backend_to_client_bytes
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        error!(
+                                            "Error routing command '{}' for client {}: {}. \
+                                             Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                            trimmed, self.client_addr, e, client_to_backend_bytes, backend_to_client_bytes
+                                        );
+                                    }
+                                    
+                                    // Try to send error response, but don't log failure if client is gone
                                     let _ = client_write.write_all(BACKEND_ERROR).await;
                                     backend_to_client_bytes += BACKEND_ERROR.len() as u64;
                                 }
@@ -310,7 +350,33 @@ impl ClientSession {
                     }
                 }
                 Err(e) => {
-                    warn!("Error reading from client {}: {}", self.client_addr, e);
+                    // Provide detailed context for client read errors
+                    match e.kind() {
+                        std::io::ErrorKind::UnexpectedEof => {
+                            debug!(
+                                "Client {} closed connection (EOF). Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                        std::io::ErrorKind::BrokenPipe => {
+                            debug!(
+                                "Client {} connection broken pipe while reading. Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                        std::io::ErrorKind::ConnectionReset => {
+                            warn!(
+                                "Client {} connection reset while reading. Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                        _ => {
+                            warn!(
+                                "Error reading from client {}: {} (kind: {:?}). Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                self.client_addr, e, e.kind(), client_to_backend_bytes, backend_to_client_bytes
+                            );
+                        }
+                    }
                     break;
                 }
             }
@@ -362,10 +428,12 @@ impl ClientSession {
 
         // Forward the command to the backend
         debug!(
-            "Client {} forwarding command to backend {:?}: {}",
+            "Client {} forwarding command to backend {:?} ({} bytes): {} | hex: {:02x?}",
             self.client_addr,
             backend_id,
-            command.trim()
+            command.len(),
+            command.trim(),
+            command.as_bytes()
         );
         pooled_conn.write_all(command.as_bytes()).await?;
         pooled_conn.flush().await?;
@@ -392,6 +460,13 @@ impl ClientSession {
         if n == 0 {
             return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
         }
+        
+        debug!(
+            "Client {} received backend response chunk ({} bytes): {} | hex: {:02x?}",
+            self.client_addr, n,
+            String::from_utf8_lossy(&chunk[..n.min(100)]), // Show first 100 bytes max
+            &chunk[..n.min(32)] // Show first 32 bytes in hex
+        );
 
         // Find first newline to determine if multiline
         let first_newline = chunk[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
@@ -409,6 +484,12 @@ impl ClientSession {
         }
 
         // Write first chunk directly to client
+        debug!(
+            "Client {} sending first chunk ({} bytes): {} | hex: {:02x?}",
+            self.client_addr, n, 
+            String::from_utf8_lossy(&chunk[..n.min(100)]), // Show first 100 bytes max
+            &chunk[..n.min(32)] // Show first 32 bytes in hex
+        );
         client_write.write_all(&chunk[..n]).await?;
         total_bytes += n;
 
@@ -457,6 +538,12 @@ impl ClientSession {
 
                         loop {
                             // Write current chunk to client
+                            debug!(
+                                "Client {} sending streaming chunk ({} bytes): {} | hex: {:02x?}",
+                                self.client_addr, current_n,
+                                String::from_utf8_lossy(&current_chunk[..current_n.min(100)]), // Show first 100 bytes max
+                                &current_chunk[..current_n.min(32)] // Show first 32 bytes in hex
+                            );
                             client_write.write_all(&current_chunk[..current_n]).await?;
                             total_bytes += current_n;
 
