@@ -247,10 +247,16 @@ impl ClientSession {
                     if trimmed.eq_ignore_ascii_case("QUIT") {
                         // Send closing message - ignore errors if client already disconnected, but log for debugging
                         if let Err(e) = client_write.write_all(CONNECTION_CLOSING).await {
-                            debug!("Failed to write CONNECTION_CLOSING to client {}: {}", self.client_addr, e);
+                            debug!(
+                                "Failed to write CONNECTION_CLOSING to client {}: {}",
+                                self.client_addr, e
+                            );
                         }
                         if let Err(e) = client_write.flush().await {
-                            debug!("Failed to flush CONNECTION_CLOSING to client {}: {}", self.client_addr, e);
+                            debug!(
+                                "Failed to flush CONNECTION_CLOSING to client {}: {}",
+                                self.client_addr, e
+                            );
                         }
                         backend_to_client_bytes += CONNECTION_CLOSING.len() as u64;
                         debug!("Client {} sent QUIT, closing connection", self.client_addr);
@@ -676,7 +682,7 @@ mod tests {
             if let Ok((mut stream, _)) = backend_listener.accept().await {
                 // Send greeting
                 let _ = stream.write_all(b"200 Mock Server Ready\r\n").await;
-                
+
                 // Read and discard any commands, keep connection alive briefly
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -708,28 +714,24 @@ mod tests {
 
         // Create session
         let buffer_pool = BufferPool::new(1024, 4);
-        let session = ClientSession::new_with_router(
-            client_addr,
-            buffer_pool,
-            Arc::new(router),
-        );
+        let session = ClientSession::new_with_router(client_addr, buffer_pool, Arc::new(router));
 
         // Spawn client that sends QUIT and immediately closes
         let client_handle = tokio::spawn(async move {
             let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
-            
+
             // Read greeting
             let mut greeting = [0u8; 256];
             let n = client.read(&mut greeting).await.unwrap();
             assert!(n > 0);
-            
+
             // Send QUIT command
             client.write_all(b"QUIT\r\n").await.unwrap();
-            
+
             // Try to read response (might fail if we close too fast, which is fine)
             let mut response = [0u8; 256];
             let _ = client.read(&mut response).await;
-            
+
             // Close connection immediately (simulating SABnzbd behavior)
             drop(client);
         });
@@ -739,10 +741,14 @@ mod tests {
 
         // Handle the session - should not return an error despite client closing
         let result = session.handle_per_command_routing(client_stream).await;
-        
+
         // Should succeed (not propagate broken pipe error)
-        assert!(result.is_ok(), "QUIT handling should not return error: {:?}", result);
-        
+        assert!(
+            result.is_ok(),
+            "QUIT handling should not return error: {:?}",
+            result
+        );
+
         if let Ok((sent, received)) = result {
             // Should have sent QUIT command
             assert!(sent > 0, "Should have sent bytes (QUIT command)");
@@ -794,37 +800,36 @@ mod tests {
         let client_addr = client_listener.local_addr().unwrap();
 
         let buffer_pool = BufferPool::new(1024, 4);
-        let session = ClientSession::new_with_router(
-            client_addr,
-            buffer_pool,
-            Arc::new(router),
-        );
+        let session = ClientSession::new_with_router(client_addr, buffer_pool, Arc::new(router));
 
         // Client that sends QUIT and waits for response
         let client_handle = tokio::spawn(async move {
             let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
-            
+
             // Read greeting
             let mut buf = [0u8; 256];
             let n = client.read(&mut buf).await.unwrap();
             assert!(n > 0, "Should receive greeting");
-            
+
             // Send QUIT
             client.write_all(b"QUIT\r\n").await.unwrap();
-            
+
             // Read closing response
             let n = client.read(&mut buf).await.unwrap();
-            
+
             // Should receive "205 Connection closing"
             let response = String::from_utf8_lossy(&buf[..n]);
-            assert!(response.contains("205"), "Should receive 205 closing response");
+            assert!(
+                response.contains("205"),
+                "Should receive 205 closing response"
+            );
         });
 
         let (client_stream, _) = client_listener.accept().await.unwrap();
         let result = session.handle_per_command_routing(client_stream).await;
-        
+
         assert!(result.is_ok(), "Session should handle QUIT cleanly");
-        
+
         client_handle.await.unwrap();
     }
 }

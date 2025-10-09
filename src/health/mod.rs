@@ -194,7 +194,7 @@ mod tests {
     async fn test_health_checker_creation() {
         let config = HealthCheckConfig::default();
         let checker = HealthChecker::new(config);
-        
+
         let metrics = checker.get_metrics().await;
         assert_eq!(metrics.healthy_count, 0);
         assert_eq!(metrics.unhealthy_count, 0);
@@ -204,10 +204,10 @@ mod tests {
     async fn test_register_backend() {
         let config = HealthCheckConfig::default();
         let checker = HealthChecker::new(config);
-        
+
         let backend_id = BackendId::from_index(0);
         checker.register_backend(backend_id).await;
-        
+
         let metrics = checker.get_metrics().await;
         assert_eq!(metrics.healthy_count, 1);
         assert_eq!(metrics.unhealthy_count, 0);
@@ -217,11 +217,11 @@ mod tests {
     async fn test_multiple_backend_registration() {
         let config = HealthCheckConfig::default();
         let checker = HealthChecker::new(config);
-        
+
         for i in 0..3 {
             checker.register_backend(BackendId::from_index(i)).await;
         }
-        
+
         let metrics = checker.get_metrics().await;
         assert_eq!(metrics.healthy_count, 3);
         assert_eq!(metrics.unhealthy_count, 0);
@@ -231,17 +231,17 @@ mod tests {
     async fn test_get_healthy_backends() {
         let config = HealthCheckConfig::default();
         let checker = HealthChecker::new(config);
-        
+
         let backend_ids = vec![
             BackendId::from_index(0),
             BackendId::from_index(1),
             BackendId::from_index(2),
         ];
-        
+
         for id in &backend_ids {
             checker.register_backend(*id).await;
         }
-        
+
         let healthy = checker.get_healthy_backends().await;
         assert_eq!(healthy.len(), 3);
     }
@@ -261,7 +261,7 @@ mod tests {
             check_timeout: Duration::from_secs(2),
             unhealthy_threshold: 5,
         };
-        
+
         let checker = HealthChecker::new(config.clone());
         assert_eq!(checker.config.check_interval, Duration::from_secs(10));
         assert_eq!(checker.config.check_timeout, Duration::from_secs(2));
@@ -277,9 +277,9 @@ mod tests {
         };
         let checker = HealthChecker::new(config);
         let backend_id = BackendId::from_index(0);
-        
+
         checker.register_backend(backend_id).await;
-        
+
         // Simulate failures by manually updating health
         {
             let mut health = checker.backend_health.write().await;
@@ -289,7 +289,7 @@ mod tests {
                 backend_health.record_failure(2);
             }
         }
-        
+
         let metrics = checker.get_metrics().await;
         assert_eq!(metrics.unhealthy_count, 1);
         assert_eq!(metrics.healthy_count, 0);
@@ -304,9 +304,9 @@ mod tests {
         };
         let checker = HealthChecker::new(config);
         let backend_id = BackendId::from_index(0);
-        
+
         checker.register_backend(backend_id).await;
-        
+
         // Simulate failures then success
         {
             let mut health = checker.backend_health.write().await;
@@ -317,7 +317,7 @@ mod tests {
                 backend_health.record_success();
             }
         }
-        
+
         let metrics = checker.get_metrics().await;
         assert_eq!(metrics.healthy_count, 1);
         assert_eq!(metrics.unhealthy_count, 0);
@@ -327,12 +327,12 @@ mod tests {
     async fn test_health_metrics_mixed_states() {
         let config = HealthCheckConfig::default();
         let checker = HealthChecker::new(config);
-        
+
         // Register multiple backends
         for i in 0..5 {
             checker.register_backend(BackendId::from_index(i)).await;
         }
-        
+
         // Make some unhealthy
         {
             let mut health = checker.backend_health.write().await;
@@ -348,11 +348,11 @@ mod tests {
                 backend_health.record_failure(3);
             }
         }
-        
+
         let metrics = checker.get_metrics().await;
         assert_eq!(metrics.healthy_count, 3);
         assert_eq!(metrics.unhealthy_count, 2);
-        
+
         let healthy = checker.get_healthy_backends().await;
         assert_eq!(healthy.len(), 3);
         assert!(healthy.contains(&BackendId::from_index(0)));
@@ -364,13 +364,13 @@ mod tests {
     async fn test_backend_health_isolation() {
         let config = HealthCheckConfig::default();
         let checker = HealthChecker::new(config);
-        
+
         let backend1 = BackendId::from_index(0);
         let backend2 = BackendId::from_index(1);
-        
+
         checker.register_backend(backend1).await;
         checker.register_backend(backend2).await;
-        
+
         // Fail only backend1
         {
             let mut health = checker.backend_health.write().await;
@@ -380,7 +380,7 @@ mod tests {
                 backend_health.record_failure(3);
             }
         }
-        
+
         let healthy = checker.get_healthy_backends().await;
         assert_eq!(healthy.len(), 1);
         assert_eq!(healthy[0], backend2);

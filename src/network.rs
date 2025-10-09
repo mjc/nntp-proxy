@@ -51,7 +51,7 @@ impl SocketOptimizer {
         if let Err(e) = Self::optimize_for_throughput(client_stream) {
             debug!("Failed to set client socket optimizations: {}", e);
         }
-        
+
         // Only optimize if it's a plain TCP stream
         if let Some(tcp) = backend_stream.as_tcp_stream() {
             if let Err(e) = Self::optimize_for_throughput(tcp) {
@@ -139,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_to_streams() {
         use crate::stream::ConnectionStream;
-        
+
         // Create two TCP connections
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

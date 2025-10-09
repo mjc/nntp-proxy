@@ -49,10 +49,7 @@ pub enum ConnectionError {
     },
 
     /// Certificate verification failed
-    CertificateVerification {
-        backend: String,
-        reason: String,
-    },
+    CertificateVerification { backend: String, reason: String },
 }
 
 impl fmt::Display for ConnectionError {
@@ -93,7 +90,11 @@ impl fmt::Display for ConnectionError {
             }
             Self::IoError(e) => write!(f, "I/O error: {}", e),
             Self::TlsHandshake { backend, source } => {
-                write!(f, "TLS handshake failed for backend '{}': {}", backend, source)
+                write!(
+                    f,
+                    "TLS handshake failed for backend '{}': {}",
+                    backend, source
+                )
             }
             Self::CertificateVerification { backend, reason } => {
                 write!(

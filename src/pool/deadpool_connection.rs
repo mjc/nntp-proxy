@@ -1,15 +1,23 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
-use tokio::net::TcpStream;
-use tracing::info;
 use native_tls::TlsConnector as NativeTlsConnector;
+use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
+use tracing::info;
 
+use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 use crate::stream::ConnectionStream;
-use crate::connection_error::ConnectionError;
+
+/// Configuration for TLS connections
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub use_tls: bool,
+    pub tls_verify_cert: bool,
+    pub tls_cert_path: Option<String>,
+}
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
@@ -52,9 +60,7 @@ impl TcpManager {
         name: String,
         username: Option<String>,
         password: Option<String>,
-        use_tls: bool,
-        tls_verify_cert: bool,
-        tls_cert_path: Option<String>,
+        tls_config: TlsConfig,
     ) -> Self {
         Self {
             host,
@@ -62,9 +68,9 @@ impl TcpManager {
             name,
             username,
             password,
-            use_tls,
-            tls_verify_cert,
-            tls_cert_path,
+            use_tls: tls_config.use_tls,
+            tls_verify_cert: tls_config.tls_verify_cert,
+            tls_cert_path: tls_config.tls_cert_path,
         }
     }
 
@@ -122,11 +128,14 @@ impl TcpManager {
     /// This uses the system's trusted certificate store by default.
     /// If `tls_cert_path` is provided, it adds the custom CA certificate
     /// to the system certificates (does not replace them).
-    async fn tls_handshake(&self, stream: TcpStream) -> Result<tokio_native_tls::TlsStream<TcpStream>, anyhow::Error> {
+    async fn tls_handshake(
+        &self,
+        stream: TcpStream,
+    ) -> Result<tokio_native_tls::TlsStream<TcpStream>, anyhow::Error> {
         use tracing::debug;
-        
+
         let mut builder = NativeTlsConnector::builder();
-        
+
         // Configure certificate verification
         // Note: By default, native-tls uses the system's trusted certificate store
         if self.tls_verify_cert {
@@ -135,32 +144,33 @@ impl TcpManager {
             debug!("TLS: WARNING - Certificate verification disabled (insecure!)");
             builder.danger_accept_invalid_certs(true);
         }
-        
+
         // Load custom CA certificate if provided (adds to system certs, doesn't replace)
         if let Some(cert_path) = &self.tls_cert_path {
             debug!("TLS: Adding custom CA certificate from: {}", cert_path);
-            let cert_data = std::fs::read(cert_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read TLS certificate from {}: {}", cert_path, e))?;
+            let cert_data = std::fs::read(cert_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read TLS certificate from {}: {}", cert_path, e)
+            })?;
             let cert = native_tls::Certificate::from_pem(&cert_data)
                 .map_err(|e| anyhow::anyhow!("Failed to parse TLS certificate: {}", e))?;
             builder.add_root_certificate(cert);
         }
-        
-        let connector = builder.build()
-            .map_err(|e| ConnectionError::TlsHandshake {
-                backend: self.name.clone(),
-                source: Box::new(e),
-            })?;
-        
+
+        let connector = builder.build().map_err(|e| ConnectionError::TlsHandshake {
+            backend: self.name.clone(),
+            source: Box::new(e),
+        })?;
+
         let connector = TlsConnector::from(connector);
-        
+
         debug!("TLS: Connecting to {} with TLS", self.host);
-        connector.connect(&self.host, stream)
-            .await
-            .map_err(|e| ConnectionError::TlsHandshake {
+        connector.connect(&self.host, stream).await.map_err(|e| {
+            ConnectionError::TlsHandshake {
                 backend: self.name.clone(),
                 source: Box::new(e),
-            }.into())
+            }
+            .into()
+        })
     }
 }
 
@@ -225,17 +235,15 @@ impl managed::Manager for TcpManager {
         // Fast TCP-level health check: try reading without blocking
         // Healthy idle connections return WouldBlock, dead ones return 0 or error
         let mut peek_buf = [0u8; 1];
-        
+
         // Only plain TCP supports try_read directly, for TLS we just return Ok
         match conn {
-            ConnectionStream::Plain(tcp) => {
-                match tcp.try_read(&mut peek_buf) {
-                    Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
-                    Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-                    Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
-                }
-            }
+            ConnectionStream::Plain(tcp) => match tcp.try_read(&mut peek_buf) {
+                Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
+                Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
+            },
             ConnectionStream::Tls(_) => {
                 // For TLS connections, we can't easily peek without blocking
                 // Just assume the connection is healthy
@@ -282,20 +290,10 @@ impl DeadpoolConnectionProvider {
         max_size: usize,
         username: Option<String>,
         password: Option<String>,
-        use_tls: bool,
-        tls_verify_cert: bool,
-        tls_cert_path: Option<String>,
+        tls_config: TlsConfig,
     ) -> Self {
-        let manager = TcpManager::new_with_tls(
-            host, 
-            port, 
-            name.clone(), 
-            username, 
-            password,
-            use_tls,
-            tls_verify_cert,
-            tls_cert_path,
-        );
+        let manager =
+            TcpManager::new_with_tls(host, port, name.clone(), username, password, tls_config);
         let pool = Pool::builder(manager)
             .max_size(max_size)
             .build()
@@ -308,6 +306,12 @@ impl DeadpoolConnectionProvider {
     ///
     /// This avoids unnecessary cloning of individual fields.
     pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        let tls_config = TlsConfig {
+            use_tls: server.use_tls,
+            tls_verify_cert: server.tls_verify_cert,
+            tls_cert_path: server.tls_cert_path.clone(),
+        };
+
         Self::new_with_tls(
             server.host.clone(),
             server.port,
@@ -315,9 +319,7 @@ impl DeadpoolConnectionProvider {
             server.max_connections as usize,
             server.username.clone(),
             server.password.clone(),
-            server.use_tls,
-            server.tls_verify_cert,
-            server.tls_cert_path.clone(),
+            tls_config,
         )
     }
 
