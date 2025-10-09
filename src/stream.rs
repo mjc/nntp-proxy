@@ -81,22 +81,6 @@ impl ConnectionStream {
         }
     }
 
-    /// Returns true if this is a plain TCP connection
-    /// 
-    /// Deprecated: Use `is_unencrypted()` for more explicit naming
-    #[deprecated(since = "0.2.0", note = "Use is_unencrypted() instead for clarity")]
-    pub fn is_plain_tcp(&self) -> bool {
-        matches!(self, Self::Plain(_))
-    }
-
-    /// Returns true if this is a TLS connection
-    /// 
-    /// Deprecated: Use `is_encrypted()` for more explicit naming
-    #[deprecated(since = "0.2.0", note = "Use is_encrypted() instead for clarity")]
-    pub fn is_tls(&self) -> bool {
-        matches!(self, Self::Tls(_))
-    }
-
     /// Get a reference to the TLS stream (if TLS connection)
     pub fn as_tls_stream(&self) -> Option<&TlsStream<TcpStream>> {
         match self {
