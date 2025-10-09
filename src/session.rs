@@ -657,4 +657,169 @@ mod tests {
         // Each session should have a unique client ID
         assert_ne!(session1.client_id(), session2.client_id());
     }
+
+    #[tokio::test]
+    async fn test_quit_command_per_command_routing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Start a mock server for the backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        // Spawn mock backend server
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = backend_listener.accept().await {
+                // Send greeting
+                let _ = stream.write_all(b"200 Mock Server Ready\r\n").await;
+                
+                // Read and discard any commands, keep connection alive briefly
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
+
+        // Give server time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create a router with the mock backend
+        let mut router = BackendSelector::new();
+        let provider = crate::pool::DeadpoolConnectionProvider::new(
+            "127.0.0.1".to_string(),
+            backend_addr.port(),
+            "test-backend".to_string(),
+            2,
+            None,
+            None,
+        );
+        router.add_backend(
+            crate::types::BackendId::from_index(0),
+            "test-backend".to_string(),
+            provider,
+        );
+
+        // Create client connection
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+
+        // Create session
+        let buffer_pool = BufferPool::new(1024, 4);
+        let session = ClientSession::new_with_router(
+            client_addr,
+            buffer_pool,
+            Arc::new(router),
+        );
+
+        // Spawn client that sends QUIT and immediately closes
+        let client_handle = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+            
+            // Read greeting
+            let mut greeting = [0u8; 256];
+            let n = client.read(&mut greeting).await.unwrap();
+            assert!(n > 0);
+            
+            // Send QUIT command
+            client.write_all(b"QUIT\r\n").await.unwrap();
+            
+            // Try to read response (might fail if we close too fast, which is fine)
+            let mut response = [0u8; 256];
+            let _ = client.read(&mut response).await;
+            
+            // Close connection immediately (simulating SABnzbd behavior)
+            drop(client);
+        });
+
+        // Accept client connection
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+
+        // Handle the session - should not return an error despite client closing
+        let result = session.handle_per_command_routing(client_stream).await;
+        
+        // Should succeed (not propagate broken pipe error)
+        assert!(result.is_ok(), "QUIT handling should not return error: {:?}", result);
+        
+        if let Ok((sent, received)) = result {
+            // Should have sent QUIT command
+            assert!(sent > 0, "Should have sent bytes (QUIT command)");
+            // Should have received greeting and possibly closing message
+            assert!(received > 0, "Should have received bytes (greeting)");
+        }
+
+        // Wait for client to finish
+        let _ = client_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_quit_command_closes_connection_cleanly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Start a mock backend
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = backend_listener.accept().await {
+                let _ = stream.write_all(b"200 Ready\r\n").await;
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Create router
+        let mut router = BackendSelector::new();
+        let provider = crate::pool::DeadpoolConnectionProvider::new(
+            "127.0.0.1".to_string(),
+            backend_addr.port(),
+            "test".to_string(),
+            1,
+            None,
+            None,
+        );
+        router.add_backend(
+            crate::types::BackendId::from_index(0),
+            "test".to_string(),
+            provider,
+        );
+
+        // Create client
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+
+        let buffer_pool = BufferPool::new(1024, 4);
+        let session = ClientSession::new_with_router(
+            client_addr,
+            buffer_pool,
+            Arc::new(router),
+        );
+
+        // Client that sends QUIT and waits for response
+        let client_handle = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+            
+            // Read greeting
+            let mut buf = [0u8; 256];
+            client.read(&mut buf).await.unwrap();
+            
+            // Send QUIT
+            client.write_all(b"QUIT\r\n").await.unwrap();
+            
+            // Read closing response
+            let n = client.read(&mut buf).await.unwrap();
+            
+            // Should receive "205 Connection closing"
+            let response = String::from_utf8_lossy(&buf[..n]);
+            assert!(response.contains("205"), "Should receive 205 closing response");
+        });
+
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let result = session.handle_per_command_routing(client_stream).await;
+        
+        assert!(result.is_ok(), "Session should handle QUIT cleanly");
+        
+        client_handle.await.unwrap();
+    }
 }
