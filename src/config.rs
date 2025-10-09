@@ -107,6 +107,12 @@ pub struct ServerConfig {
     /// Maximum number of concurrent connections to this server
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+
+    // TODO(SSL): Add TLS configuration fields when implementing SSL support:
+    // See SSL_IMPLEMENTATION.md for details
+    // pub use_tls: bool,
+    // pub tls_verify_cert: bool,
+    // pub tls_cert_path: Option<String>,
 }
 
 impl Config {

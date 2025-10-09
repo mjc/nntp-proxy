@@ -41,9 +41,21 @@ pub enum ConnectionError {
 
     /// I/O error during communication
     IoError(std::io::Error),
-    // Future: TLS/SSL errors
-    // TlsHandshake { backend: String, source: ... },
-    // CertificateVerification { backend: String, reason: String },
+
+    // TODO(SSL): Uncomment these variants when implementing TLS support:
+    // See SSL_IMPLEMENTATION.md for implementation details
+    //
+    // /// TLS handshake failed
+    // TlsHandshake {
+    //     backend: String,
+    //     source: Box<dyn std::error::Error + Send + Sync>,
+    // },
+    //
+    // /// Certificate verification failed  
+    // CertificateVerification {
+    //     backend: String,
+    //     reason: String,
+    // },
 }
 
 impl fmt::Display for ConnectionError {

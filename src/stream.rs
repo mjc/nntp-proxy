@@ -31,11 +31,13 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 /// ```ignore
 /// Tls(tokio_rustls::TlsStream<TcpStream>),
 /// ```
+/// TODO(SSL): Add Tls variant here - see SSL_IMPLEMENTATION.md for details
 #[derive(Debug)]
 pub enum ConnectionStream {
     /// Plain TCP connection
     Plain(TcpStream),
-    // Future: Tls(tokio_rustls::TlsStream<TcpStream>),
+    // TODO(SSL): Uncomment when implementing TLS:
+    // Tls(tokio_rustls::TlsStream<TcpStream>),
 }
 
 impl ConnectionStream {
