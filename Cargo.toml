@@ -25,23 +25,28 @@ name = "nntp_proxy"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["net", "rt-multi-thread", "io-util", "time", "macros", "signal"] }
 clap = { version = "4.0", features = ["derive", "env"] }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 toml = "0.9"
-tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing = { version = "0.1", features = ["std", "release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "ansi"] }
 anyhow = "1.0"
-socket2 = "0.6"  # Safe cross-platform socket operations
-crossbeam = "0.8"  # Lock-free data structures for high performance
+socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
+crossbeam = { version = "0.8", features = ["nightly"] }  # Lock-free data structures with nightly optimizations
 nix = { version = "0.30", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.12.3"
 async-trait = "0.1.89"
-memchr = "2.7"  # Fast byte searching for command parsing
+memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
-moka = { version = "0.12", features = ["future"] }  # Async LRU cache with TTL for article caching
-tokio-native-tls = "0.3"  # TLS support for NNTP connections
-native-tls = "0.2"  # Native TLS backend
+moka = { version = "0.12", features = ["future", "atomic64"] }  # Async LRU cache with 64-bit atomic optimizations
+tokio-rustls = { version = "0.26", features = ["early-data", "ring"] }  # TLS support for NNTP connections  
+rustls = { version = "0.23", features = ["ring", "std"], default-features = false }  # Pure Rust TLS implementation optimized for performance
+rustls-native-certs = "0.8"  # Load system CA certificates
+rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
+rustls-pki-types = "1.8"  # PKI types for rustls
+webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
+
 
 [dev-dependencies]
 tempfile = "3.23"

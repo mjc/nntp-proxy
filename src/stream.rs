@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
+use tokio_rustls::client::TlsStream;
 
 /// Trait for async streams that can be used for NNTP connections
 ///

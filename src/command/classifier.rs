@@ -70,12 +70,16 @@ impl NntpCommand {
                 return false;
             }
             let args = &bytes[cmd_end + 1..];
-            let args_trimmed = args
+            // Fast skip whitespace using memchr - find first non-whitespace
+            let first_non_ws = args
                 .iter()
-                .position(|&b| !b.is_ascii_whitespace())
-                .map(|pos| &args[pos..])
-                .unwrap_or(args);
-            !args_trimmed.is_empty() && args_trimmed[0] == b'<'
+                .position(|&b| !b.is_ascii_whitespace());
+            
+            if let Some(pos) = first_non_ws {
+                args[pos] == b'<'
+            } else {
+                false
+            }
         }
 
         // Ordered by frequency: ARTICLE/BODY/HEAD/STAT are 70%+ of traffic

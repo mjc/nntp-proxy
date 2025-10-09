@@ -12,12 +12,13 @@ use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer;
 use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 
-/// Extract message-ID from command arguments
+/// Extract message-ID from command arguments using fast byte searching
 fn extract_message_id(command: &str) -> Option<String> {
     let trimmed = command.trim();
-    trimmed.find('<').and_then(|start| {
-        trimmed[start..]
-            .find('>')
+    let bytes = trimmed.as_bytes();
+    
+    memchr::memchr(b'<', bytes).and_then(|start| {
+        memchr::memchr(b'>', &bytes[start..])
             .map(|end| trimmed[start..start + end + 1].to_string())
     })
 }
