@@ -399,8 +399,8 @@ fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     }
 }
 
-/// Test that responses are properly flushed - simulates rapid article requests
-/// This test would fail without proper flush() calls after write_all()
+/// Test that responses are delivered promptly - simulates rapid article requests
+/// This test validates response delivery timing regardless of flush implementation.
 #[tokio::test]
 async fn test_response_flushing_with_rapid_commands() -> Result<()> {
 
