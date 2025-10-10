@@ -484,7 +484,7 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
         client.flush().await?;
 
         // Try to read response with a VERY short timeout
-        // Without flush() in the proxy, this would timeout because data sits in buffer
+        // This validates that responses are delivered immediately by the proxy.
         let n = timeout(Duration::from_millis(200), client.read(&mut buffer))
             .await
             .map_err(|_| {
