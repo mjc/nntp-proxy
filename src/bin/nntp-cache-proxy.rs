@@ -9,8 +9,8 @@ use tracing::{debug, error, info, warn};
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::CacheConfig;
-use nntp_proxy::constants::stateless_proxy::NNTP_BACKEND_UNAVAILABLE;
 use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
+use nntp_proxy::protocol::BACKEND_UNAVAILABLE;
 use nntp_proxy::types::ClientId;
 use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
@@ -269,7 +269,7 @@ async fn handle_caching_client(
         }
         Err(e) => {
             error!("Failed to get pooled connection for {}: {}", server.name, e);
-            let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
+            let _ = client_stream.write_all(BACKEND_UNAVAILABLE).await;
             return Err(e);
         }
     };
@@ -279,7 +279,7 @@ async fn handle_caching_client(
     if let Err(e) = client_optimizer.optimize() {
         debug!("Failed to optimize client socket: {}", e);
     }
-    
+
     let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
     if let Err(e) = backend_optimizer.optimize() {
         debug!("Failed to optimize backend socket: {}", e);

@@ -10,7 +10,9 @@
 use crate::connection_error::ConnectionError;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -45,7 +47,7 @@ pub struct CertificateLoadResult {
 }
 
 /// Custom certificate verifier that accepts all certificates (INSECURE!)
-/// 
+///
 /// This is used when `tls_verify_cert = false` for NNTP servers without valid certificates.
 /// **WARNING**: This disables all certificate validation and should only be used for testing
 /// or with trusted private networks.
@@ -241,7 +243,9 @@ impl TlsManager {
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         } else {
-            warn!("TLS: Certificate verification DISABLED - this is insecure and should only be used for testing!");
+            warn!(
+                "TLS: Certificate verification DISABLED - this is insecure and should only be used for testing!"
+            );
             // Use custom verifier that accepts all certificates
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()

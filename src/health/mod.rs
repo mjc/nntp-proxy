@@ -2,6 +2,7 @@ mod types;
 
 pub use types::{BackendHealth, HealthMetrics, HealthStatus};
 
+use crate::protocol::{DATE, ResponseParser};
 use crate::types::BackendId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,16 +121,16 @@ impl HealthChecker {
         let mut conn = provider.get_pooled_connection().await?;
 
         // Send DATE command
-        conn.write_all(b"DATE\r\n").await?;
+        conn.write_all(DATE).await?;
 
         // Read response
         let mut reader = BufReader::new(&mut *conn);
         // Pre-allocate for typical NNTP DATE response ("111 YYYYMMDDhhmmss\r\n" ~20-30 bytes)
-        let mut response = String::with_capacity(64);
-        reader.read_line(&mut response).await?;
+        let mut response = Vec::with_capacity(64);
+        reader.read_until(b'\n', &mut response).await?;
 
         // Check if response indicates success (111 response)
-        if response.starts_with("111") {
+        if ResponseParser::is_response_code(&response, 111) {
             Ok(())
         } else {
             Err("Unexpected response from DATE command".into())
