@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
 use crate::pool::BufferPool;
-use crate::protocol::ResponseParser;
+use crate::protocol::{ResponseParser, authinfo_pass, authinfo_user};
 
 /// Handles authentication to backend NNTP servers
 pub struct BackendAuthenticator;
@@ -25,8 +25,9 @@ impl BackendAuthenticator {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Send AUTHINFO USER command
-        let user_command = format!("AUTHINFO USER {}\r\n", username);
-        backend_stream.write_all(user_command.as_bytes()).await?;
+        backend_stream
+            .write_all(authinfo_user(username).as_bytes())
+            .await?;
 
         // Read response
         let n = backend_stream.read(&mut buffer).await?;
@@ -45,8 +46,9 @@ impl BackendAuthenticator {
         }
 
         // Send AUTHINFO PASS command
-        let pass_command = format!("AUTHINFO PASS {}\r\n", password);
-        backend_stream.write_all(pass_command.as_bytes()).await?;
+        backend_stream
+            .write_all(authinfo_pass(password).as_bytes())
+            .await?;
 
         // Read final response
         let n = backend_stream.read(&mut buffer).await?;
@@ -207,10 +209,10 @@ mod tests {
         let username = "testuser";
         let password = "testpass";
 
-        let user_command = format!("AUTHINFO USER {}\r\n", username);
+        let user_command = authinfo_user(username);
         assert_eq!(user_command, "AUTHINFO USER testuser\r\n");
 
-        let pass_command = format!("AUTHINFO PASS {}\r\n", password);
+        let pass_command = authinfo_pass(password);
         assert_eq!(pass_command, "AUTHINFO PASS testpass\r\n");
     }
 
@@ -219,16 +221,16 @@ mod tests {
     fn test_authentication_command_edge_cases() {
         // Username with spaces (invalid but test the format)
         let username = "user with spaces";
-        let user_command = format!("AUTHINFO USER {}\r\n", username);
+        let user_command = authinfo_user(username);
         assert!(user_command.contains("user with spaces"));
 
         // Empty username
-        let empty_command = format!("AUTHINFO USER {}\r\n", "");
+        let empty_command = authinfo_user("");
         assert_eq!(empty_command, "AUTHINFO USER \r\n");
 
         // Password with special characters
         let password = "p@ssw0rd!#$";
-        let pass_command = format!("AUTHINFO PASS {}\r\n", password);
+        let pass_command = authinfo_pass(password);
         assert_eq!(pass_command, "AUTHINFO PASS p@ssw0rd!#$\r\n");
     }
 }
