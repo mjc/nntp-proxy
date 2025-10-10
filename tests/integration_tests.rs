@@ -688,7 +688,8 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
         buffer = [0; 1024];
 
         // Each response should arrive within 500ms (increased timeout for connection pool)
-        // Without flush, responses would be buffered and timeout
+        // This test verifies that explicit flush() calls are not required for TCP streams,
+        // and that responses are received promptly after write_all().
         let n = timeout(Duration::from_millis(1000), client.read(&mut buffer))
             .await
             .map_err(|_| {
