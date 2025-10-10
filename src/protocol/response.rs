@@ -1,5 +1,73 @@
 //! NNTP response parsing and handling
 
+/// Categorized NNTP response code for type-safe handling
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseCode {
+    /// Server greeting (200 posting allowed, 201 no posting)
+    Greeting(u16),
+    /// Disconnect/goodbye (205)
+    Disconnect,
+    /// Authentication required (381, 480)
+    AuthRequired(u16),
+    /// Authentication successful (281)
+    AuthSuccess,
+    /// Multiline data response (1xx, specific 2xx codes)
+    MultilineData(u16),
+    /// Single-line response (everything else)
+    SingleLine(u16),
+    /// Invalid or unparseable response
+    Invalid,
+}
+
+impl ResponseCode {
+    /// Parse response data into a categorized response code
+    #[inline]
+    pub fn parse(data: &[u8]) -> Self {
+        let code = match NntpResponse::parse_status_code(data) {
+            Some(c) => c,
+            None => return Self::Invalid,
+        };
+
+        match code {
+            200 | 201 => Self::Greeting(code),
+            205 => Self::Disconnect,
+            281 => Self::AuthSuccess,
+            381 | 480 => Self::AuthRequired(code),
+            // Multiline: 1xx and specific 2xx codes
+            100..=199 => Self::MultilineData(code),
+            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
+            _ => Self::SingleLine(code),
+        }
+    }
+
+    /// Check if this response type is multiline
+    #[inline]
+    pub fn is_multiline(&self) -> bool {
+        matches!(self, Self::MultilineData(_))
+    }
+
+    /// Get the numeric status code if available
+    #[inline]
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::Greeting(c)
+            | Self::AuthRequired(c)
+            | Self::MultilineData(c)
+            | Self::SingleLine(c) => Some(*c),
+            Self::Disconnect => Some(205),
+            Self::AuthSuccess => Some(281),
+            Self::Invalid => None,
+        }
+    }
+
+    /// Check if this is a success response (2xx or 3xx)
+    #[inline]
+    pub fn is_success(&self) -> bool {
+        self.status_code()
+            .is_some_and(|code| (200..400).contains(&code))
+    }
+}
+
 /// Represents a parsed NNTP response
 #[derive(Debug, Clone, PartialEq)]
 pub struct NntpResponse {
@@ -24,21 +92,121 @@ impl NntpResponse {
     }
 
     /// Check if a response indicates a multiline response
+    ///
+    /// Per RFC 3977 Section 3.2, multiline responses are specific codes
     #[inline]
-    #[allow(dead_code)]
     pub fn is_multiline_response(status_code: u16) -> bool {
-        // Multiline responses in NNTP typically have codes like:
-        // 1xx informational (multiline)
-        // 2xx success with data (some multiline: 215, 220, 221, 222, 224, 225, 230, 231, 282)
-        // 4xx/5xx errors are single line
         match status_code {
-            100..=199 => true, // Informational multiline
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Article/list data
+            100..=199 => true, // All 1xx are multiline
+            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
             _ => false,
         }
     }
 
-    /// Check if data contains the end-of-multiline marker
+    /// Check if data ends with the NNTP multiline terminator
+    ///
+    /// NNTP multiline responses end with "\r\n.\r\n" (RFC 3977)
+    /// Also accepts "\n.\n" for compatibility with some implementations
+    #[inline]
+    pub fn has_terminator_at_end(data: &[u8]) -> bool {
+        let n = data.len();
+        if n >= 5 {
+            data[n - 5..n] == *b"\r\n.\r\n" || (n >= 3 && data[n - 3..n] == *b"\n.\n")
+        } else {
+            n >= 3 && data[..n] == *b"\n.\n"
+        }
+    }
+
+    /// Check if a terminator spans across a boundary between tail and current chunk
+    ///
+    /// This handles the case where a multiline terminator is split across two read chunks.
+    /// For example: previous chunk ends with "\r\n." and current starts with "\r\n"
+    #[inline]
+    pub fn has_spanning_terminator(
+        tail: &[u8],
+        tail_len: usize,
+        current: &[u8],
+        current_len: usize,
+    ) -> bool {
+        // Only check if we have a tail and current chunk is small enough for spanning
+        if tail_len < 2 || !(1..=4).contains(&current_len) {
+            return false;
+        }
+
+        // Build combined view: tail + start of current chunk
+        let mut check_buf = [0u8; 9]; // max: 4 tail + 5 current bytes
+        check_buf[..tail_len].copy_from_slice(&tail[..tail_len]);
+        let curr_copy = current_len.min(5);
+        check_buf[tail_len..tail_len + curr_copy].copy_from_slice(&current[..curr_copy]);
+        let total = tail_len + curr_copy;
+
+        (total >= 5 && check_buf[total - 5..total] == *b"\r\n.\r\n")
+            || (total >= 3 && check_buf[total - 3..total] == *b"\n.\n")
+    }
+
+    /// Check if response is a disconnect/goodbye (205)
+    #[inline]
+    pub fn is_disconnect(data: &[u8]) -> bool {
+        data.len() >= 3 && data.starts_with(b"205")
+    }
+
+    /// Extract message-ID from command arguments using fast byte searching
+    ///
+    /// Message-IDs are ASCII and must be in the format <...@...>
+    /// See RFC 5536 Section 3.1.3: https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3
+    #[inline]
+    pub fn extract_message_id(command: &str) -> Option<String> {
+        let trimmed = command.trim();
+        let bytes = trimmed.as_bytes();
+
+        // Find opening '<'
+        let start = memchr::memchr(b'<', bytes)?;
+
+        // Find closing '>' after the '<'
+        // Since end is relative to &bytes[start..], the actual position is start + end
+        let end = memchr::memchr(b'>', &bytes[start + 1..])?;
+        let msgid_end = start + end + 2; // +1 for the slice offset, +1 to include '>'
+
+        // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
+        // We already know msgid_end is valid since memchr found '>' at that position
+        Some(trimmed[start..msgid_end].to_string())
+    }
+
+    /// Validate message-ID format according to RFC 5536 Section 3.1.3
+    ///
+    /// A valid message-ID must:
+    /// - Start with '<' and end with '>'
+    /// - Contain exactly one '@' character
+    /// - Have content before and after the '@'
+    ///
+    /// This is a basic validation - full RFC 5536 validation is more complex.
+    #[inline]
+    pub fn validate_message_id(msgid: &str) -> bool {
+        let trimmed = msgid.trim();
+
+        // Must start with < and end with >
+        if !trimmed.starts_with('<') || !trimmed.ends_with('>') {
+            return false;
+        }
+
+        // Extract content between < and >
+        let content = &trimmed[1..trimmed.len() - 1];
+
+        // Must contain exactly one @
+        let at_count = content.bytes().filter(|&b| b == b'@').count();
+        if at_count != 1 {
+            return false;
+        }
+
+        // Must have content before and after @
+        if let Some(at_pos) = content.find('@') {
+            at_pos > 0 && at_pos < content.len() - 1
+        } else {
+            false
+        }
+    }
+
+    /// Check if data contains the end-of-multiline marker (legacy method)
     #[inline]
     #[allow(dead_code)]
     pub fn has_multiline_terminator(data: &[u8]) -> bool {
@@ -56,29 +224,36 @@ impl NntpResponse {
 pub struct ResponseParser;
 
 impl ResponseParser {
-    /// Check if a response starts with a success code
+    /// Check if a response starts with a success code (2xx or 3xx)
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
-        NntpResponse::parse_status_code(data).is_some_and(|code| (200..400).contains(&code))
+        ResponseCode::parse(data).is_success()
     }
 
     /// Check if response is a greeting (200 or 201)
     #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
-        // Check directly on bytes to avoid allocation
-        data.len() >= 3 && (data.starts_with(b"200") || data.starts_with(b"201"))
+        matches!(ResponseCode::parse(data), ResponseCode::Greeting(_))
     }
 
-    /// Check if response indicates authentication is required
+    /// Check if response indicates authentication is required (381 or 480)
     #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
-        NntpResponse::parse_status_code(data).is_some_and(|code| code == 381 || code == 480)
+        matches!(ResponseCode::parse(data), ResponseCode::AuthRequired(_))
     }
 
-    /// Check if response indicates successful authentication
+    /// Check if response indicates successful authentication (281)
     #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
-        NntpResponse::parse_status_code(data).is_some_and(|code| code == 281)
+        matches!(ResponseCode::parse(data), ResponseCode::AuthSuccess)
+    }
+
+    /// Check if response has a specific status code
+    ///
+    /// This is useful for checking specific response codes like 111 (DATE response),
+    /// or any other specific code that doesn't have a dedicated helper.
+    pub fn is_response_code(data: &[u8], code: u16) -> bool {
+        NntpResponse::parse_status_code(data) == Some(code)
     }
 }
 
@@ -151,6 +326,23 @@ mod tests {
         assert!(!ResponseParser::is_auth_success(
             b"381 Password required\r\n"
         ));
+    }
+
+    #[test]
+    fn test_is_response_code() {
+        assert!(ResponseParser::is_response_code(
+            b"111 20251010120000\r\n",
+            111
+        ));
+        assert!(ResponseParser::is_response_code(b"200 Ready\r\n", 200));
+        assert!(ResponseParser::is_response_code(b"201 Read-only\r\n", 201));
+        assert!(ResponseParser::is_response_code(b"281 Auth OK\r\n", 281));
+        assert!(ResponseParser::is_response_code(
+            b"381 Password required\r\n",
+            381
+        ));
+        assert!(!ResponseParser::is_response_code(b"200 Ready\r\n", 201));
+        assert!(!ResponseParser::is_response_code(b"111 Date\r\n", 200));
     }
 
     #[test]
@@ -398,5 +590,153 @@ mod tests {
         // Response with high bytes
         let with_high_bytes = b"200 \xFF\xFE\r\n";
         assert_eq!(NntpResponse::parse_status_code(with_high_bytes), Some(200));
+    }
+
+    #[test]
+    fn test_response_code_parse() {
+        // Greetings
+        assert_eq!(
+            ResponseCode::parse(b"200 Ready\r\n"),
+            ResponseCode::Greeting(200)
+        );
+        assert_eq!(
+            ResponseCode::parse(b"201 No posting\r\n"),
+            ResponseCode::Greeting(201)
+        );
+
+        // Disconnect
+        assert_eq!(
+            ResponseCode::parse(b"205 Goodbye\r\n"),
+            ResponseCode::Disconnect
+        );
+
+        // Auth
+        assert_eq!(
+            ResponseCode::parse(b"381 Password required\r\n"),
+            ResponseCode::AuthRequired(381)
+        );
+        assert_eq!(
+            ResponseCode::parse(b"480 Auth required\r\n"),
+            ResponseCode::AuthRequired(480)
+        );
+        assert_eq!(
+            ResponseCode::parse(b"281 Auth success\r\n"),
+            ResponseCode::AuthSuccess
+        );
+
+        // Multiline
+        assert_eq!(
+            ResponseCode::parse(b"100 Help\r\n"),
+            ResponseCode::MultilineData(100)
+        );
+        assert_eq!(
+            ResponseCode::parse(b"215 LIST\r\n"),
+            ResponseCode::MultilineData(215)
+        );
+        assert_eq!(
+            ResponseCode::parse(b"220 Article\r\n"),
+            ResponseCode::MultilineData(220)
+        );
+
+        // Single-line
+        assert_eq!(
+            ResponseCode::parse(b"211 Group selected\r\n"),
+            ResponseCode::SingleLine(211)
+        );
+        assert_eq!(
+            ResponseCode::parse(b"400 Error\r\n"),
+            ResponseCode::SingleLine(400)
+        );
+
+        // Invalid
+        assert_eq!(ResponseCode::parse(b"XXX\r\n"), ResponseCode::Invalid);
+    }
+
+    #[test]
+    fn test_response_code_is_multiline() {
+        assert!(ResponseCode::parse(b"215 LIST\r\n").is_multiline());
+        assert!(ResponseCode::parse(b"220 Article\r\n").is_multiline());
+        assert!(!ResponseCode::parse(b"200 Ready\r\n").is_multiline());
+        assert!(!ResponseCode::parse(b"211 Group\r\n").is_multiline());
+    }
+
+    #[test]
+    fn test_response_code_status_code() {
+        assert_eq!(ResponseCode::parse(b"200 OK\r\n").status_code(), Some(200));
+        assert_eq!(ResponseCode::Disconnect.status_code(), Some(205));
+        assert_eq!(ResponseCode::AuthSuccess.status_code(), Some(281));
+        assert_eq!(ResponseCode::Invalid.status_code(), None);
+    }
+
+    #[test]
+    fn test_response_code_is_success() {
+        assert!(ResponseCode::parse(b"200 OK\r\n").is_success());
+        assert!(ResponseCode::parse(b"215 LIST\r\n").is_success());
+        assert!(ResponseCode::parse(b"381 Auth\r\n").is_success());
+        assert!(!ResponseCode::parse(b"400 Error\r\n").is_success());
+        assert!(!ResponseCode::Invalid.is_success());
+    }
+
+    #[test]
+    fn test_extract_message_id() {
+        // Standard message-ID
+        assert_eq!(
+            NntpResponse::extract_message_id("ARTICLE <test@example.com>"),
+            Some("<test@example.com>".to_string())
+        );
+
+        // With extra whitespace
+        assert_eq!(
+            NntpResponse::extract_message_id("  BODY  <msg123@news.com>  "),
+            Some("<msg123@news.com>".to_string())
+        );
+
+        // No message-ID
+        assert_eq!(NntpResponse::extract_message_id("ARTICLE 123"), None);
+
+        // Malformed (no closing >)
+        assert_eq!(
+            NntpResponse::extract_message_id("ARTICLE <test@example.com"),
+            None
+        );
+
+        // Multiple message-IDs (returns first)
+        assert_eq!(
+            NntpResponse::extract_message_id("TEST <first@example.com> <second@example.com>"),
+            Some("<first@example.com>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_message_id() {
+        // Valid message-IDs
+        assert!(NntpResponse::validate_message_id("<test@example.com>"));
+        assert!(NntpResponse::validate_message_id(
+            "<msg123@news.server.com>"
+        ));
+        assert!(NntpResponse::validate_message_id("<a@b>"));
+        assert!(NntpResponse::validate_message_id("  <valid@test.com>  "));
+
+        // Invalid: missing brackets
+        assert!(!NntpResponse::validate_message_id("test@example.com"));
+        assert!(!NntpResponse::validate_message_id("<test@example.com"));
+        assert!(!NntpResponse::validate_message_id("test@example.com>"));
+
+        // Invalid: missing @
+        assert!(!NntpResponse::validate_message_id("<testexample.com>"));
+
+        // Invalid: multiple @
+        assert!(!NntpResponse::validate_message_id("<test@example@com>"));
+
+        // Invalid: @ at start or end
+        assert!(!NntpResponse::validate_message_id("<@example.com>"));
+        assert!(!NntpResponse::validate_message_id("<test@>"));
+
+        // Invalid: empty
+        assert!(!NntpResponse::validate_message_id(""));
+        assert!(!NntpResponse::validate_message_id("<>"));
+
+        // Invalid: only brackets
+        assert!(!NntpResponse::validate_message_id("<@>"));
     }
 }
