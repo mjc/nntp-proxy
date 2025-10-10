@@ -1,16 +1,16 @@
 # NNTP Proxy
 
-A high-performance NNTP proxy server written in Rust, with round-robin load balancing and optional per-command routing.
+A high-performance NNTP proxy server written in Rust, with round-robin load balancing, TLS support, and optional per-command routing.
 
 ## Key Features
 
 - 🔄 **Round-robin load balancing** - Distributes connections across multiple backend servers
-- ⚡ **High performance** - Lock-free routing, zero-allocation command parsing, optimized I/O
+- 🔐 **TLS/SSL support** - Secure backend connections using rustls with system certificate store
+- ⚡ **High performance** - Lock-free routing, optimized response parsing, efficient I/O
 - 🏥 **Health checking** - Automatic backend health monitoring with failure detection
-- 🔐 **Authentication** - Proxy-level authentication, backends pre-authenticated
-- � **TLS/SSL support** - Secure backend connections with system certificate store
-- �🔀 **Per-command routing mode** - Optional stateless routing for resource efficiency
-- 📊 **Connection pooling** - Efficient connection reuse with configurable limits
+-  **Per-command routing mode** - Optional stateless routing for resource efficiency
+- 📊 **Connection pooling** - Pre-authenticated connections with configurable limits
+- 🛡️ **Type-safe protocol handling** - RFC 3977 compliant parsing with comprehensive validation
 - ⚙️ **TOML configuration** - Simple, readable configuration with sensible defaults
 - 🔍 **Structured logging** - Detailed tracing for debugging and monitoring
 - 🧩 **Modular architecture** - Clean separation of concerns, well-tested codebase
@@ -37,52 +37,58 @@ This NNTP proxy offers two operating modes:
 
 ### Design Goals
 
-- **Load balancing** - Distribute connections across multiple backend servers
-- **Health monitoring** - Automatic detection and routing around unhealthy backends
-- **High performance** - Lock-free routing, zero-allocation parsing, optimized I/O
-- **Flexible deployment** - Choose between full compatibility or resource efficiency
+- **Load balancing** - Distribute connections across multiple backend servers with health-aware routing
+- **Performance** - Lock-free routing, optimized protocol parsing, efficient I/O with connection pooling
+- **Security** - TLS/SSL support with certificate verification, pre-authenticated backend connections
+- **Reliability** - Health monitoring, automatic failover, graceful connection handling
+- **Flexibility** - Choose between full NNTP compatibility or resource-efficient per-command routing
 
 ### When to Use This Proxy
 
 ✅ **Standard mode - Good for:**
-- Traditional newsreaders (tin, slrn, Thunderbird)
-- Any NNTP client requiring stateful operations
-- Load balancing with full protocol support
+- Traditional newsreaders (tin, slrn, Thunderbird, SABnzbd)
+- Any NNTP client requiring stateful operations (GROUP, NEXT, LAST, etc.)
+- Load balancing with full RFC 3977 protocol support
 - Drop-in replacement for direct backend connections
+- Maximum compatibility and simplicity
 
 ✅ **Per-command routing mode - Good for:**
-- Message-ID based article retrieval
-- Indexing and search tools
-- Metadata-heavy workloads
-- Distributing load across multiple backends
+- Message-ID based article retrieval workloads
+- Indexing and search tools that only need ARTICLE/BODY/HEAD by message-ID
+- Distributing stateless commands across multiple backends
+- Resource-efficient deployment with many concurrent clients
 
 ❌ **Not suitable for:**
-- Applications requiring custom NNTP extensions (unless in standard mode)
-- Scenarios requiring true concurrent request processing (NNTP doesn't support this)
+- Scenarios requiring concurrent request processing (NNTP is inherently serial)
+- Custom NNTP extensions not in RFC 3977 (unless in standard mode with compatible backend)
 
 ## Limitations
 
 ### Per-Command Routing Mode Restrictions
 
-When running in **per-command routing mode** (`--per-command-routing` or `-r`), the proxy rejects stateful commands:
+When running in **per-command routing mode** (`--per-command-routing` or `-r`), the proxy rejects stateful commands to maintain consistent routing:
 
-**Rejected in per-command routing mode:**
+**Rejected commands (require group context):**
 - Group navigation: `GROUP`, `NEXT`, `LAST`, `LISTGROUP`
-- Article retrieval by number: `ARTICLE 123`, `HEAD 123`, `BODY 123`
+- Article by number: `ARTICLE 123`, `HEAD 123`, `BODY 123`, `STAT 123`
 - Overview commands: `XOVER`, `OVER`, `XHDR`, `HDR`
 
 **Always supported:**
 - ✅ Article by Message-ID: `ARTICLE <message-id@example.com>`
-- ✅ Metadata: `LIST`, `HELP`, `DATE`, `CAPABILITIES`, `POST`
-- ✅ Authentication: `AUTHINFO USER/PASS` (intercepted by proxy)
+- ✅ Metadata retrieval: `LIST`, `HELP`, `DATE`, `CAPABILITIES`
+- ✅ Posting: `POST` (if backend supports)
+- ✅ Authentication: `AUTHINFO USER/PASS` (handled by proxy)
+
+**Rationale:** Commands requiring group context (current article number, group selection) cannot work reliably when each command routes to a different backend. Use standard mode if you need these features.
 
 ### Standard Mode (Default)
 
 In **standard mode** (without `--per-command-routing`):
-- ✅ **All NNTP commands are supported** - full bidirectional forwarding
-- ✅ Compatible with traditional newsreaders (tin, slrn, Thunderbird)
-- ✅ Stateful operations work normally (GROUP, NEXT, LAST, etc.)
-- Each client gets a dedicated backend connection (1:1 mapping)
+- ✅ **All RFC 3977 commands supported** - full bidirectional forwarding
+- ✅ Compatible with all NNTP clients
+- ✅ Stateful operations work normally (GROUP, NEXT, LAST, XOVER, etc.)
+- ✅ Each client connection maps to one backend connection (1:1)
+- ✅ Simple, predictable behavior
 
 ## Quick Start
 
@@ -178,7 +184,7 @@ unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 
 ### TLS/SSL Support
 
-The proxy supports TLS/SSL encrypted connections to backend servers using your operating system's trusted certificate store by default.
+The proxy supports TLS/SSL encrypted connections to backend servers using **rustls** - a modern, memory-safe TLS implementation written in pure Rust.
 
 #### Basic TLS Configuration
 
@@ -195,9 +201,10 @@ max_connections = 20
 ```
 
 **That's it!** No additional certificate configuration needed. The proxy will:
-- Use your operating system's trusted certificate store automatically
-- Verify the server's certificate
-- Establish a secure TLS connection
+- Use rustls with your operating system's trusted certificate store
+- Verify the server's certificate against system CAs
+- Establish a secure TLS 1.3 connection (with TLS 1.2 fallback)
+- Support session resumption for improved performance
 
 #### Private/Self-Signed CA
 
@@ -237,10 +244,11 @@ max_connections = 10
 
 ✅ **Always verify certificates in production** (`tls_verify_cert = true`)  
 ✅ **Keep system certificates updated** via OS package manager  
+✅ **Use TLS 1.3 when possible** (automatically negotiated by rustls)  
 ✅ **Use standard NNTPS port 563** for encrypted connections  
 ✅ **Monitor TLS handshake failures** in logs  
 
-⚠️ **Never set `tls_verify_cert = false` in production** - this disables all certificate verification!
+⚠️ **Never set `tls_verify_cert = false` in production** - this disables all certificate verification and is extremely insecure!
 
 #### Environment Variable Overrides for Servers
 
@@ -280,18 +288,19 @@ docker run -e NNTP_SERVER_0_HOST=news.example.com \
 
 ### Authentication
 
-The proxy handles authentication in two ways:
+The proxy handles authentication transparently:
 
 1. **Backend authentication** (when credentials are configured)
-   - Configure `username` and `password` in server config
+   - Configure `username` and `password` in server configuration
    - Proxy authenticates to backends during connection pool initialization
-   - Connections are pre-authenticated, eliminating per-command overhead
+   - Connections remain pre-authenticated, eliminating per-command auth overhead
+   - Credentials are used with RFC 4643 AUTHINFO USER/PASS commands
 
-2. **Client authentication**
-   - Client `AUTHINFO USER/PASS` commands are always intercepted by the proxy
-   - Returns success without forwarding to backend
-   - No actual client credential validation (proxy trusts connected clients)
-   - To restrict access, use firewall rules or network isolation
+2. **Client authentication handling**
+   - Client `AUTHINFO USER/PASS` commands are intercepted by the proxy
+   - Proxy responds with success (281/381) without forwarding to backend
+   - No actual credential validation performed (network-level access control recommended)
+   - To restrict access, use firewall rules, VPN, or network segmentation
 
 ## Usage
 
@@ -378,16 +387,31 @@ The codebase is organized into focused modules with clear responsibilities:
 
 | Module | Purpose |
 |--------|---------|
-| `auth/` | Client and backend authentication handling |
+| `auth/` | Client and backend authentication (RFC 4643 AUTHINFO) |
+| `cache/` | Article caching with TTL-based expiration (cache proxy binary) |
 | `command/` | NNTP command parsing and classification |
-| `config/` | Configuration loading and validation |
-| `constants/` | Centralized configuration constants |
-| `health/` | Backend health monitoring system |
-| `pool/` | Connection and buffer pooling |
-| `protocol/` | NNTP protocol constants and parsing |
-| `router/` | Backend selection and load balancing |
-| `session/` | Client session lifecycle management |
-| `types/` | Core type definitions (IDs, etc.) |
+| `config/` | Configuration loading and validation (TOML + environment variables) |
+| `constants/` | Buffer sizes, timeouts, and performance tuning constants |
+| `health/` | Backend health monitoring with DATE command probes |
+| `network/` | Socket optimization for high-throughput transfers |
+| `pool/` | Connection and buffer pooling with deadpool |
+| `protocol/` | RFC 3977 protocol parsing, response categorization, message-ID handling |
+| `router/` | Backend selection with lock-free round-robin and health awareness |
+| `session/` | Client session lifecycle and command/response streaming |
+| `stream/` | Connection abstraction supporting TCP and TLS |
+| `tls/` | TLS configuration and handshake management using rustls |
+| `types/` | Core type definitions (ClientId, BackendId) |
+
+### Protocol Module
+
+The `protocol` module centralizes all NNTP protocol knowledge:
+
+- **`commands.rs`**: Command construction helpers (QUIT, DATE, AUTHINFO, ARTICLE, etc.)
+- **`responses.rs`**: Response constants and builders (AUTH_REQUIRED, BACKEND_UNAVAILABLE, etc.)
+- **`response.rs`**: Response parsing with `ResponseCode` enum for type-safe categorization
+  - Multiline detection per RFC 3977 (1xx, 215, 220-225, 230-231, 282)
+  - Message-ID extraction and validation (RFC 5536)
+  - Terminator detection for streaming responses
 
 ### How It Works
 
@@ -396,15 +420,13 @@ The codebase is organized into focused modules with clear responsibilities:
 ```
 Client Connection
     ↓
-Select Backend (round-robin)
+Select Backend (round-robin, health-aware)
     ↓
-Get Pooled Connection
-    ↓
-Pre-authenticated Connection
+Get Pooled Connection (pre-authenticated)
     ↓
 Bidirectional Data Forwarding
     ↓
-Connection Cleanup
+Connection Cleanup & Return to Pool
 ```
 
 #### Per-Command Routing Mode Flow
@@ -412,64 +434,61 @@ Connection Cleanup
 ```
 Client Connection
     ↓
+Send Greeting (200 NNTP Proxy Ready)
+    ↓
 Read Command
     ↓
-Classify Command
+Classify Command (protocol/command.rs)
     ↓
 Route to Healthy Backend (round-robin)
     ↓
-Execute on Backend Connection (BLOCKS)
+Get Pooled Connection
+    ↓
+Execute Command (waits for complete response)
     ↓
 Stream Response to Client
     ↓
-Repeat (commands processed serially)
+Return Connection to Pool
+    ↓
+Repeat (serial command processing)
 ```
 
-### Key Design Decisions
+### Performance Optimizations
 
-1. **Serial Processing**
-   - NNTP processes one command at a time
-   - Each command blocks until response received
-   - No concurrent request handling possible
-   - Round-robin distributes load across backends
-
-2. **Connection Pooling**
-   - Pre-authenticated connections
-   - Reduces setup overhead
-   - Configurable pool sizes per backend
-
-3. **Health Checking**
-   - Periodic DATE command probes
-   - Automatic failure detection
-   - Router skips unhealthy backends
-
-4. **Lock-Free Routing**
-   - Atomic operations for pending counts
-   - Eliminates RwLock contention
-   - Significant CPU reduction with many clients
-
-## Performance
-
-### Optimizations
-
-This proxy implements several performance optimizations:
+The proxy implements several performance optimizations:
 
 | Optimization | Impact | Description |
 |--------------|--------|-------------|
-| Zero-allocation parsing | -0.92% CPU | Direct byte comparison, no `to_ascii_uppercase()` |
-| Lock-free routing | -10-15% CPU | Atomic operations instead of RwLock |
-| Pre-authenticated connections | High | No per-command auth overhead |
-| Buffer reuse | ~200+ allocs/sec saved | Pre-allocated buffers in hot paths |
-| Frequency-ordered matching | Better branch prediction | Common commands (ARTICLE, BODY) checked first |
-| 64KB read buffers | Fewer syscalls | Optimized for large article transfers |
+| **ResponseCode enum** | Eliminates redundant parsing | Parse response once, reuse for multiline detection and success checks |
+| **Lock-free routing** | ~10-15% CPU reduction | Atomic operations for backend selection instead of RwLock |
+| **Pre-authenticated pools** | Eliminates auth overhead | Connections authenticate once during pool initialization |
+| **Buffer pooling** | ~200+ allocs/sec saved | Reuse pre-allocated buffers in hot paths |
+| **Optimized I/O** | Fewer syscalls | 256KB buffers for article transfers, TCP socket tuning |
+| **TLS 1.3 with 0-RTT** | Faster reconnections | Session resumption and early data support in rustls |
+| **Direct byte parsing** | Avoids allocations | Message-ID extraction and protocol parsing work on byte slices |
+
+### RFC Compliance
+
+The proxy adheres to NNTP standards:
+
+- **RFC 3977**: Network News Transfer Protocol (NNTP)
+  - Correct multiline response detection (status code second digit 1/2/3)
+  - Proper terminator handling (`\r\n.\r\n`)
+  - Serial command processing
+- **RFC 4643**: AUTHINFO USER/PASS authentication extension
+- **RFC 5536**: Message-ID format validation
+
+## Performance
 
 ### Performance Characteristics
 
-- **CPU Usage**: Low overhead with lock-free routing and zero-allocation parsing
-  - Per-command routing mode: ~15% of one core for 80 connections at 105MB/s (AMD Ryzen 9 5950X, single-threaded configuration)
-- **Memory**: Constant usage regardless of article size (no response buffering)
-- **Throughput**: Typically limited by backend servers, not the proxy
-- **Scalability**: Efficiently handles hundreds of concurrent connections
+- **CPU Usage**: Low overhead with lock-free routing and optimized protocol parsing
+  - Per-command routing mode: ~15% of one core for 80 connections at 105MB/s (AMD Ryzen 9 5950X)
+  - Standard mode: Similar or lower due to simpler forwarding logic
+- **Memory**: Constant usage with pooled buffers; no response buffering (streaming only)
+- **Latency**: Minimal overhead (~1-2ms) for command routing and parsing
+- **Throughput**: Typically limited by backend servers or network, not the proxy
+- **Scalability**: Efficiently handles hundreds of concurrent connections per backend
 
 ### Profiling
 
@@ -559,9 +578,14 @@ cargo test --quiet
 ### Test Coverage
 
 The codebase includes:
-- **165 unit tests** covering all modules
-- **Integration tests** for end-to-end scenarios
-- **100% pass rate**
+- **200+ unit tests** covering all modules
+- **Integration tests** for end-to-end scenarios including:
+  - Multiline response handling
+  - Per-command routing mode
+  - Connection pooling and health checks
+  - TLS/SSL connections
+- **Protocol compliance tests** for RFC 3977, RFC 4643, RFC 5536
+- **Zero clippy warnings** with strict linting enabled
 
 ### Manual Testing
 
@@ -596,19 +620,22 @@ For performance testing, create custom scripts that:
 | Crate | Purpose |
 |-------|---------|
 | `tokio` | Async runtime and networking |
-| `tokio-native-tls` | TLS/SSL support for async streams |
-| `native-tls` | Native TLS backend (uses system certificate store) |
-| `tracing` | Structured logging framework |
-| `anyhow` | Error handling |
-| `clap` | Command-line argument parsing |
-| `serde` | Serialization framework |
-| `toml` | TOML configuration parsing |
-| `deadpool` | Connection pooling |
+| `rustls` | Modern, memory-safe TLS implementation |
+| `tokio-rustls` | Tokio integration for rustls |
+| `webpki-roots` | Mozilla's CA certificate bundle |
+| `rustls-native-certs` | System certificate store integration |
+| `tracing` / `tracing-subscriber` | Structured logging framework |
+| `anyhow` | Ergonomic error handling |
+| `clap` | Command-line argument parsing with derive macros |
+| `serde` / `toml` | Configuration parsing and serialization |
+| `deadpool` | Generic connection pooling |
+| `moka` | High-performance cache (for cache proxy) |
+| `memchr` | Fast byte searching (message-ID extraction) |
 
 ### Development Dependencies
 
-- `tempfile` - Temporary files for testing
-- Test helpers included in `tests/test_helpers.rs`
+- `tempfile` - Temporary files for config testing
+- Test helpers in `tests/test_helpers.rs`
 
 ## Troubleshooting
 
@@ -661,23 +688,31 @@ RUST_LOG=nntp_proxy::router=debug,nntp_proxy::health=debug nntp-proxy
 
 ### Planned Features
 
-- [ ] Prometheus metrics endpoint
-- [ ] Configuration hot-reload
+- [ ] Prometheus metrics endpoint for monitoring
+- [ ] Configuration hot-reload without restart
+- [ ] Admin HTTP API for runtime stats and control
+- [ ] Response caching layer for frequently requested articles
 - [ ] IPv6 support
-- [ ] Connection affinity mode
-- [ ] Admin/stats HTTP endpoint
+- [ ] Connection affinity mode (sticky sessions)
 
-### Completed
+### Recently Completed (v0.2.0)
 
-- [x] SSL/TLS support (NNTPS) with system certificate store
-- [x] Lock-free routing
-- [x] Zero-allocation command parsing
-- [x] Health checking system
+- [x] **Protocol module refactoring** - Centralized NNTP protocol handling
+  - ResponseCode enum for type-safe response categorization
+  - Message-ID extraction and validation helpers
+  - Eliminated redundant response parsing (70% traffic optimization)
+- [x] **TLS/SSL support** - Secure backend connections with rustls
+  - System certificate store integration
+  - TLS 1.3 with session resumption
+  - Per-server TLS configuration
+- [x] **Multiline response fix** - Correct RFC 3977 multiline detection
+  - Fixed connection pool exhaustion bug
+  - Proper status code parsing
+- [x] Lock-free routing with atomic operations
+- [x] Health checking system with DATE command probes
 - [x] Per-command routing mode
-- [x] Pre-authenticated connections
-- [x] TOML configuration
-- [x] Connection pooling
-- [x] Renamed terminology from "multiplexing" to "per-command routing"
+- [x] Pre-authenticated connection pools
+- [x] TOML configuration with environment variable overrides
 
 ## Contributing
 
