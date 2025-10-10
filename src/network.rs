@@ -137,7 +137,7 @@ mod tests {
 
         let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (server_tcp, _) = listener.accept().await.unwrap();
-        
+
         let client_stream = ConnectionStream::plain(client_tcp);
         let server_stream = ConnectionStream::plain(server_tcp);
 
