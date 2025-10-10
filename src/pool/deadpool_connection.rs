@@ -6,6 +6,7 @@ use tracing::info;
 
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
+use crate::protocol::{ResponseParser, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
 
@@ -122,40 +123,39 @@ impl managed::Manager for TcpManager {
         // Consume greeting
         let mut buffer = vec![0u8; 4096];
         let n = stream.read(&mut buffer).await?;
-        let greeting = String::from_utf8_lossy(&buffer[..n]);
+        let greeting = &buffer[..n];
+        let greeting_str = String::from_utf8_lossy(greeting);
 
-        if !greeting.starts_with("200") && !greeting.starts_with("201") {
-            return Err(anyhow::anyhow!("Invalid greeting: {}", greeting.trim()));
+        if !ResponseParser::is_greeting(greeting) {
+            return Err(anyhow::anyhow!("Invalid greeting: {}", greeting_str.trim()));
         }
 
         // Authenticate if needed
         if let Some(username) = &self.username {
-            stream
-                .write_all(format!("AUTHINFO USER {}\r\n", username).as_bytes())
-                .await?;
+            stream.write_all(authinfo_user(username).as_bytes()).await?;
             let n = stream.read(&mut buffer).await?;
-            let response = String::from_utf8_lossy(&buffer[..n]);
+            let response = &buffer[..n];
+            let response_str = String::from_utf8_lossy(response);
 
-            if response.starts_with("381") {
+            if ResponseParser::is_auth_required(response) {
                 // Password required
                 let password = self
                     .password
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Password required but not provided"))?;
 
-                stream
-                    .write_all(format!("AUTHINFO PASS {}\r\n", password).as_bytes())
-                    .await?;
+                stream.write_all(authinfo_pass(password).as_bytes()).await?;
                 let n = stream.read(&mut buffer).await?;
-                let response = String::from_utf8_lossy(&buffer[..n]);
+                let response = &buffer[..n];
+                let response_str = String::from_utf8_lossy(response);
 
-                if !response.starts_with("281") {
-                    return Err(anyhow::anyhow!("Auth failed: {}", response.trim()));
+                if !ResponseParser::is_auth_success(response) {
+                    return Err(anyhow::anyhow!("Auth failed: {}", response_str.trim()));
                 }
-            } else if !response.starts_with("281") {
+            } else if !ResponseParser::is_auth_success(response) {
                 return Err(anyhow::anyhow!(
                     "Unexpected auth response: {}",
-                    response.trim()
+                    response_str.trim()
                 ));
             }
         }
