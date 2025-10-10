@@ -693,7 +693,7 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Timeout on command {} - responses not being flushed!",
+                    "Timeout waiting for response to command {}. Possible server or network issue.",
                     i
                 )
             })?
