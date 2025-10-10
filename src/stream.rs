@@ -171,7 +171,6 @@ mod tests {
 
         // Test writing and reading
         client_conn.write_all(b"Hello").await.unwrap();
-        client_conn.flush().await.unwrap();
 
         let mut buf = [0u8; 5];
         server_conn.read_exact(&mut buf).await.unwrap();

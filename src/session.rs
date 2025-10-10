@@ -271,12 +271,6 @@ impl ClientSession {
                                 self.client_addr, e
                             );
                         }
-                        if let Err(e) = client_write.flush().await {
-                            debug!(
-                                "Failed to flush CONNECTION_CLOSING to client {}: {}",
-                                self.client_addr, e
-                            );
-                        }
                         backend_to_client_bytes += CONNECTION_CLOSING.len() as u64;
                         debug!("Client {} sent QUIT, closing connection", self.client_addr);
                         break;
@@ -478,10 +472,9 @@ impl ClientSession {
             command.as_bytes()
         );
         pooled_conn.write_all(command.as_bytes()).await?;
-        pooled_conn.flush().await?;
         *client_to_backend_bytes += command.len() as u64;
         debug!(
-            "Client {} command sent and flushed to backend {:?}",
+            "Client {} command sent to backend {:?}",
             self.client_addr, backend_id
         );
 
