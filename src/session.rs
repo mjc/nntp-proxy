@@ -13,11 +13,11 @@ use tracing::{debug, error, warn};
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND_SIZE, STREAMING_CHUNK_SIZE};
-use crate::constants::protocol::{
-    BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE,
-};
-use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
 use crate::pool::BufferPool;
+use crate::protocol::{
+    BACKEND_ERROR, COMMAND_NOT_SUPPORTED_STATELESS, CONNECTION_CLOSING, NntpResponse,
+    PROXY_GREETING_PCR, ResponseCode, TERMINATOR_TAIL_SIZE,
+};
 use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
@@ -131,8 +131,8 @@ impl ClientSession {
                                 }
                                 CommandAction::Reject(_reason) => {
                                     warn!("Rejecting command from client {}: {}", self.client_addr, trimmed);
-                                    client_write.write_all(NNTP_COMMAND_NOT_SUPPORTED).await?;
-                                    backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
+                                    client_write.write_all(COMMAND_NOT_SUPPORTED_STATELESS).await?;
+                                    backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
                                 }
                                 CommandAction::ForwardHighThroughput => {
                                     // Forward article retrieval by message-ID to backend
@@ -201,7 +201,7 @@ impl ClientSession {
         mut client_stream: TcpStream,
     ) -> Result<(u64, u64)> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        
+
         debug!(
             "Client {} starting per-command routing session",
             self.client_addr
@@ -225,12 +225,14 @@ impl ClientSession {
             String::from_utf8_lossy(PROXY_GREETING_PCR),
             PROXY_GREETING_PCR
         );
-        
+
         if let Err(e) = client_write.write_all(PROXY_GREETING_PCR).await {
             debug!(
                 "Client {} failed to send greeting: {} (kind: {:?}). \
                  This suggests the client disconnected immediately after connecting.",
-                self.client_addr, e, e.kind()
+                self.client_addr,
+                e,
+                e.kind()
             );
             return Err(e.into());
         }
@@ -259,7 +261,10 @@ impl ClientSession {
 
                     debug!(
                         "Client {} received command ({} bytes): {} | hex: {:02x?}",
-                        self.client_addr, n, trimmed, command.as_bytes()
+                        self.client_addr,
+                        n,
+                        trimmed,
+                        command.as_bytes()
                     );
 
                     // Handle QUIT locally
@@ -293,8 +298,10 @@ impl ClientSession {
                                 "Rejecting command from client {}: {} ({})",
                                 self.client_addr, trimmed, reason
                             );
-                            client_write.write_all(NNTP_COMMAND_NOT_SUPPORTED).await?;
-                            backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
+                            client_write
+                                .write_all(COMMAND_NOT_SUPPORTED_STATELESS)
+                                .await?;
+                            backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
                             continue;
                         }
                         CommandAction::ForwardStateless | CommandAction::ForwardHighThroughput => {
@@ -319,7 +326,10 @@ impl ClientSession {
                                                     "Client {} disconnected unexpectedly while routing command '{}' (broken pipe). \
                                                      Session stats: {} bytes sent to backend, {} bytes received from backend. \
                                                      This usually indicates the client closed the connection before receiving the response.",
-                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                    self.client_addr,
+                                                    trimmed,
+                                                    client_to_backend_bytes,
+                                                    backend_to_client_bytes
                                                 );
                                             }
                                             std::io::ErrorKind::ConnectionReset => {
@@ -327,7 +337,10 @@ impl ClientSession {
                                                     "Client {} connection reset while routing command '{}'. \
                                                      Session stats: {} bytes sent to backend, {} bytes received from backend. \
                                                      This usually indicates a network issue or client crash.",
-                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                    self.client_addr,
+                                                    trimmed,
+                                                    client_to_backend_bytes,
+                                                    backend_to_client_bytes
                                                 );
                                             }
                                             std::io::ErrorKind::ConnectionAborted => {
@@ -335,14 +348,22 @@ impl ClientSession {
                                                     "Client {} connection aborted while routing command '{}'. \
                                                      Session stats: {} bytes sent to backend, {} bytes received from backend. \
                                                      This usually indicates the connection was terminated by the local system.",
-                                                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                                                    self.client_addr,
+                                                    trimmed,
+                                                    client_to_backend_bytes,
+                                                    backend_to_client_bytes
                                                 );
                                             }
                                             _ => {
                                                 error!(
                                                     "I/O error routing command '{}' for client {}: {} (kind: {:?}). \
                                                      Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                                    trimmed, self.client_addr, e, io_err.kind(), client_to_backend_bytes, backend_to_client_bytes
+                                                    trimmed,
+                                                    self.client_addr,
+                                                    e,
+                                                    io_err.kind(),
+                                                    client_to_backend_bytes,
+                                                    backend_to_client_bytes
                                                 );
                                             }
                                         }
@@ -350,14 +371,18 @@ impl ClientSession {
                                         error!(
                                             "Error routing command '{}' for client {}: {}. \
                                              Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                            trimmed, self.client_addr, e, client_to_backend_bytes, backend_to_client_bytes
+                                            trimmed,
+                                            self.client_addr,
+                                            e,
+                                            client_to_backend_bytes,
+                                            backend_to_client_bytes
                                         );
                                     }
-                                    
+
                                     // Try to send error response, but don't log failure if client is gone
                                     let _ = client_write.write_all(BACKEND_ERROR).await;
                                     backend_to_client_bytes += BACKEND_ERROR.len() as u64;
-                                    
+
                                     // For debugging test connections and small transfers, log detailed info
                                     if client_to_backend_bytes + backend_to_client_bytes < 500 {
                                         debug!(
@@ -366,7 +391,11 @@ impl ClientSession {
                                              Total session: {} bytes to backend, {} bytes from backend. \
                                              This appears to be a short session (test connection?). \
                                              Check debug logs above for full command/response hex dumps.",
-                                            self.client_addr, trimmed, e, client_to_backend_bytes, backend_to_client_bytes
+                                            self.client_addr,
+                                            trimmed,
+                                            e,
+                                            client_to_backend_bytes,
+                                            backend_to_client_bytes
                                         );
                                     }
                                 }
@@ -398,7 +427,11 @@ impl ClientSession {
                         _ => {
                             warn!(
                                 "Error reading from client {}: {} (kind: {:?}). Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                self.client_addr, e, e.kind(), client_to_backend_bytes, backend_to_client_bytes
+                                self.client_addr,
+                                e,
+                                e.kind(),
+                                client_to_backend_bytes,
+                                backend_to_client_bytes
                             );
                         }
                     }
@@ -495,29 +528,23 @@ impl ClientSession {
         if n == 0 {
             return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
         }
-        
+
         debug!(
             "Client {} received backend response chunk ({} bytes): {} | hex: {:02x?}",
-            self.client_addr, n,
+            self.client_addr,
+            n,
             String::from_utf8_lossy(&chunk[..n.min(100)]), // Show first 100 bytes max
-            &chunk[..n.min(32)] // Show first 32 bytes in hex
+            &chunk[..n.min(32)]                            // Show first 32 bytes in hex
         );
 
-        // Find first newline to determine if multiline
-        let first_newline = chunk[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
+        // Parse response code and check if multiline per RFC 3977
+        let response_code = ResponseCode::parse(&chunk[..n]);
+        let is_multiline = response_code.is_multiline();
 
-        // Multiline responses have second digit of 1, 2, or 3 (e.g., 215, 220-225, 230-235)
-        // Single-line responses have second digit of 0, 4, or 8 (e.g., 200, 201, 205, 400, 480)
-        // See RFC 3977 Section 3.2: https://tools.ietf.org/html/rfc3977#section-3.2
-        // "Multi-line data blocks are used for responses where the length is not known
-        //  in advance... The response code for a multi-line response will always begin
-        //  with the digit 2 or 3, and the second digit will be 1, 2, or 3."
-        let is_multiline = first_newline >= 3
-            && chunk[0] == b'2'
-            && (chunk[1] == b'1' || chunk[1] == b'2' || chunk[1] == b'3');
-
-        // Log first line (best effort)
-        if let Ok(first_line_str) = std::str::from_utf8(&chunk[..first_newline.min(n)]) {
+        // Log first line (best effort) - find newline for logging only
+        if let Some(newline_pos) = chunk[..n].iter().position(|&b| b == b'\n')
+            && let Ok(first_line_str) = std::str::from_utf8(&chunk[..newline_pos])
+        {
             debug!(
                 "Client {} got first line from backend {:?}: {}",
                 self.client_addr,
@@ -529,20 +556,17 @@ impl ClientSession {
         // Write first chunk directly to client
         debug!(
             "Client {} sending first chunk ({} bytes): {} | hex: {:02x?}",
-            self.client_addr, n, 
+            self.client_addr,
+            n,
             String::from_utf8_lossy(&chunk[..n.min(100)]), // Show first 100 bytes max
-            &chunk[..n.min(32)] // Show first 32 bytes in hex
+            &chunk[..n.min(32)]                            // Show first 32 bytes in hex
         );
         client_write.write_all(&chunk[..n]).await?;
         total_bytes += n;
 
         if is_multiline {
             // Fast check if terminator is in first chunk (check end only)
-            let has_terminator = if n >= 5 {
-                chunk[n - 5..n] == *b"\r\n.\r\n" || (n >= 3 && chunk[n - 3..n] == *b"\n.\n")
-            } else {
-                n >= 3 && chunk[..n] == *b"\n.\n"
-            };
+            let has_terminator = NntpResponse::has_terminator_at_end(&chunk[..n]);
 
             if !has_terminator {
                 // For multiline responses, use pipelined streaming
@@ -563,11 +587,7 @@ impl ClientSession {
                 }
 
                 // Check terminator in first chunk (already written)
-                let first_has_term = if n >= 5 {
-                    chunk1[n - 5..n] == *b"\r\n.\r\n" || (n >= 3 && chunk1[n - 3..n] == *b"\n.\n")
-                } else {
-                    n >= 3 && chunk1[..n] == *b"\n.\n"
-                };
+                let first_has_term = NntpResponse::has_terminator_at_end(&chunk1[..n]);
 
                 if !first_has_term {
                     // First chunk didn't have terminator, continue reading
@@ -583,7 +603,8 @@ impl ClientSession {
                             // Write current chunk to client
                             debug!(
                                 "Client {} sending streaming chunk ({} bytes): {} | hex: {:02x?}",
-                                self.client_addr, current_n,
+                                self.client_addr,
+                                current_n,
                                 String::from_utf8_lossy(&current_chunk[..current_n.min(100)]), // Show first 100 bytes max
                                 &current_chunk[..current_n.min(32)] // Show first 32 bytes in hex
                             );
@@ -591,13 +612,8 @@ impl ClientSession {
                             total_bytes += current_n;
 
                             // Check terminator in chunk we just wrote
-                            let has_term = if current_n >= 5 {
-                                current_chunk[current_n - 5..current_n] == *b"\r\n.\r\n"
-                                    || (current_n >= 3
-                                        && current_chunk[current_n - 3..current_n] == *b"\n.\n")
-                            } else {
-                                current_n >= 3 && current_chunk[..current_n] == *b"\n.\n"
-                            };
+                            let has_term =
+                                NntpResponse::has_terminator_at_end(&current_chunk[..current_n]);
 
                             if has_term {
                                 break; // Done! We already wrote the final chunk
@@ -605,21 +621,12 @@ impl ClientSession {
 
                             // Check boundary spanning terminator (ONLY if current chunk is small enough)
                             // This is rare - only check if terminator could span from previous chunk
-                            let has_spanning_term = if tail_len >= 2 && (1..=4).contains(&current_n)
-                            {
-                                // Build combined view: tail + start of current chunk
-                                let mut check_buf = [0u8; 9]; // max: 4 tail + 5 current
-                                check_buf[..tail_len].copy_from_slice(&tail[..tail_len]);
-                                let curr_copy = current_n.min(5);
-                                check_buf[tail_len..tail_len + curr_copy]
-                                    .copy_from_slice(&current_chunk[..curr_copy]);
-                                let total = tail_len + curr_copy;
-
-                                (total >= 5 && check_buf[total - 5..total] == *b"\r\n.\r\n")
-                                    || (total >= 3 && check_buf[total - 3..total] == *b"\n.\n")
-                            } else {
-                                false
-                            };
+                            let has_spanning_term = NntpResponse::has_spanning_terminator(
+                                &tail,
+                                tail_len,
+                                current_chunk,
+                                current_n,
+                            );
 
                             if has_spanning_term {
                                 break; // Done! We already wrote the final chunk
@@ -667,6 +674,7 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::QUIT;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -856,7 +864,7 @@ mod tests {
             assert!(n > 0);
 
             // Send QUIT command
-            client.write_all(b"QUIT\r\n").await.unwrap();
+            client.write_all(QUIT).await.unwrap();
 
             // Try to read response (might fail if we close too fast, which is fine)
             let mut response = [0u8; 256];
@@ -942,7 +950,7 @@ mod tests {
             assert!(n > 0, "Should receive greeting");
 
             // Send QUIT
-            client.write_all(b"QUIT\r\n").await.unwrap();
+            client.write_all(QUIT).await.unwrap();
 
             // Read closing response
             let n = client.read(&mut buf).await.unwrap();

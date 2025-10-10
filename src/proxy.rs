@@ -12,9 +12,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ServerConfig};
 use crate::constants::buffer::{BUFFER_POOL_SIZE, BUFFER_SIZE};
-use crate::constants::stateless_proxy::*;
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
+use crate::protocol::BACKEND_UNAVAILABLE;
 use crate::router;
 use crate::session::ClientSession;
 use crate::types;
@@ -170,7 +170,7 @@ impl NntpProxy {
                     "Failed to get pooled connection for {} (client {}): {}",
                     server.name, client_addr, e
                 );
-                let _ = client_stream.write_all(NNTP_BACKEND_UNAVAILABLE).await;
+                let _ = client_stream.write_all(BACKEND_UNAVAILABLE).await;
                 return Err(anyhow::anyhow!(
                     "Failed to get pooled connection for backend '{}' (client {}): {}",
                     server.name,
@@ -185,7 +185,7 @@ impl NntpProxy {
         if let Err(e) = client_optimizer.optimize() {
             debug!("Failed to optimize client socket: {}", e);
         }
-        
+
         let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
         if let Err(e) = backend_optimizer.optimize() {
             debug!("Failed to optimize backend socket: {}", e);
@@ -272,11 +272,14 @@ impl NntpProxy {
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
                 let is_broken_pipe = if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    matches!(io_err.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+                    matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
                 } else {
                     false
                 };
-                
+
                 if is_broken_pipe {
                     debug!(
                         "Client {} (ID: {}) disconnected during session: {} - This is normal for test connections",
@@ -292,7 +295,7 @@ impl NntpProxy {
                         e
                     );
                 }
-                
+
                 // For debugging SABnzbd test connections and other short sessions,
                 // log additional context when transfers are small (likely test scenarios)
                 debug!(
