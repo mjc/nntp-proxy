@@ -271,12 +271,6 @@ impl ClientSession {
                                 self.client_addr, e
                             );
                         }
-                        if let Err(e) = client_write.flush().await {
-                            debug!(
-                                "Failed to flush CONNECTION_CLOSING to client {}: {}",
-                                self.client_addr, e
-                            );
-                        }
                         backend_to_client_bytes += CONNECTION_CLOSING.len() as u64;
                         debug!("Client {} sent QUIT, closing connection", self.client_addr);
                         break;
@@ -478,10 +472,9 @@ impl ClientSession {
             command.as_bytes()
         );
         pooled_conn.write_all(command.as_bytes()).await?;
-        pooled_conn.flush().await?;
         *client_to_backend_bytes += command.len() as u64;
         debug!(
-            "Client {} command sent and flushed to backend {:?}",
+            "Client {} command sent to backend {:?}",
             self.client_addr, backend_id
         );
 
@@ -512,8 +505,16 @@ impl ClientSession {
 
         // Find first newline to determine if multiline
         let first_newline = chunk[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
-        let is_multiline =
-            first_newline >= 3 && chunk[0] == b'2' && !(chunk[1] == b'0' && chunk[2] == b'5');
+
+        // Multiline responses have second digit of 1, 2, or 3 (e.g., 215, 220-225, 230-235)
+        // Single-line responses have second digit of 0, 4, or 8 (e.g., 200, 201, 205, 400, 480)
+        // See RFC 3977 Section 3.2: https://tools.ietf.org/html/rfc3977#section-3.2
+        // "Multi-line data blocks are used for responses where the length is not known
+        //  in advance... The response code for a multi-line response will always begin
+        //  with the digit 2 or 3, and the second digit will be 1, 2, or 3."
+        let is_multiline = first_newline >= 3
+            && chunk[0] == b'2'
+            && (chunk[1] == b'1' || chunk[1] == b'2' || chunk[1] == b'3');
 
         // Log first line (best effort)
         if let Ok(first_line_str) = std::str::from_utf8(&chunk[..first_newline.min(n)]) {

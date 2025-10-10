@@ -121,7 +121,6 @@ impl HealthChecker {
 
         // Send DATE command
         conn.write_all(b"DATE\r\n").await?;
-        conn.flush().await?;
 
         // Read response
         let mut reader = BufReader::new(&mut *conn);

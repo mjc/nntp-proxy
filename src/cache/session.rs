@@ -109,7 +109,6 @@ impl CachingSession {
                                     if let Some(cached) = self.cache.get(&message_id).await {
                                         info!("Cache HIT for message-ID: {} (size: {} bytes)", message_id, cached.response.len());
                                         client_write.write_all(&cached.response).await?;
-                                        client_write.flush().await?;
                                         backend_to_client_bytes += cached.response.len() as u64;
                                         continue;
                                     } else {
@@ -139,7 +138,6 @@ impl CachingSession {
                                 CommandAction::ForwardStateless => {
                                     // Forward stateless commands to backend
                                     backend_write.write_all(line.as_bytes()).await?;
-                                    backend_write.flush().await?;
                                     client_to_backend_bytes += line.len() as u64;
 
                                     // Read response using read_until for efficiency
@@ -159,7 +157,6 @@ impl CachingSession {
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
                                         client_write.write_all(&response_buffer).await?;
-                                        client_write.flush().await?;
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
@@ -184,13 +181,11 @@ impl CachingSession {
                                     }
 
                                     client_write.write_all(&response_buffer).await?;
-                                    client_write.flush().await?;
                                     backend_to_client_bytes += response_buffer.len() as u64;
                                 }
                                 CommandAction::ForwardHighThroughput => {
                                     // Forward to backend
                                     backend_write.write_all(line.as_bytes()).await?;
-                                    backend_write.flush().await?;
                                     client_to_backend_bytes += line.len() as u64;
 
                                     // Read first line of response using read_until for efficiency
@@ -209,7 +204,6 @@ impl CachingSession {
                                     if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
                                         client_write.write_all(&response_buffer).await?;
-                                        client_write.flush().await?;
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
@@ -252,7 +246,6 @@ impl CachingSession {
 
                                     // Forward response to client
                                     client_write.write_all(&response_buffer).await?;
-                                    client_write.flush().await?;
                                     backend_to_client_bytes += response_buffer.len() as u64;
                                 }
                             }
