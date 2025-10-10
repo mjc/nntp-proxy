@@ -72,39 +72,6 @@ pub mod timeout {
     pub const CONNECTION: Duration = Duration::from_secs(10);
 }
 
-/// NNTP protocol constants
-pub mod protocol {
-    /// Multiline response terminator: "\r\n.\r\n"
-    pub const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n";
-
-    /// Line ending: "\r\n"
-    pub const CRLF: &[u8] = b"\r\n";
-
-    /// Authentication required response
-    pub const AUTH_REQUIRED: &[u8] = b"381 Password required\r\n";
-
-    /// Authentication accepted response
-    pub const AUTH_ACCEPTED: &[u8] = b"281 Authentication accepted\r\n";
-
-    /// Command not supported response
-    pub const COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy\r\n";
-
-    /// Proxy greeting for per-command routing mode
-    pub const PROXY_GREETING_PCR: &[u8] = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
-
-    /// Connection closing response
-    pub const CONNECTION_CLOSING: &[u8] = b"205 Connection closing\r\n";
-
-    /// Backend error response
-    pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
-
-    /// Minimum response length (3-digit code + CRLF)
-    pub const MIN_RESPONSE_LENGTH: usize = 5;
-
-    /// Terminator tail size for spanning terminator detection
-    pub const TERMINATOR_TAIL_SIZE: usize = 4;
-}
-
 /// Connection pool constants
 pub mod pool {
     /// Default maximum connections per backend pool
@@ -128,13 +95,7 @@ pub mod per_command_routing {
 
 /// Stateless proxy protocol constants
 pub mod stateless_proxy {
-    #[allow(dead_code)]
-    pub const NNTP_PASSWORD_REQUIRED: &[u8] = b"381 Password required\r\n";
-    #[allow(dead_code)]
-    pub const NNTP_AUTH_ACCEPTED: &[u8] = b"281 Authentication accepted\r\n";
     pub const NNTP_BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
-    #[allow(dead_code)]
-    pub const NNTP_AUTH_FAILED: &[u8] = b"502 Authentication failed\r\n";
     pub const NNTP_COMMAND_NOT_SUPPORTED: &[u8] =
         b"500 Command not supported by this proxy (stateless proxy mode)\r\n";
 
@@ -146,13 +107,6 @@ pub mod stateless_proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_protocol_constants() {
-        assert_eq!(protocol::CRLF, b"\r\n");
-        assert_eq!(protocol::MULTILINE_TERMINATOR, b"\r\n.\r\n");
-        assert_eq!(protocol::MULTILINE_TERMINATOR.len(), 5);
-    }
 
     #[test]
     fn test_buffer_sizes() {
