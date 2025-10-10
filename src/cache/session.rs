@@ -8,49 +8,9 @@ use tokio::net::TcpStream;
 use tracing::{debug, info};
 
 use crate::cache::article::{ArticleCache, CachedArticle};
-use crate::command::{CommandAction, CommandHandler};
+use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::constants::buffer;
-use crate::constants::stateless_proxy::NNTP_COMMAND_NOT_SUPPORTED;
-
-/// Extract message-ID from command arguments using fast byte searching
-/// 
-/// Message-IDs are ASCII and must be in the format <...@...>
-/// See RFC 5536 Section 3.1.3: https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3
-fn extract_message_id(command: &str) -> Option<String> {
-    let trimmed = command.trim();
-    let bytes = trimmed.as_bytes();
-
-    // Find opening '<'
-    let start = memchr::memchr(b'<', bytes)?;
-    
-    // Find closing '>' after the '<'
-    // Since end is relative to &bytes[start..], the actual position is start + end
-    let end = memchr::memchr(b'>', &bytes[start + 1..])?;
-    let msgid_end = start + end + 2; // +1 for the slice offset, +1 to include '>'
-    
-    // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
-    // We already know msgid_end is valid since memchr found '>' at that position
-    Some(trimmed[start..msgid_end].to_string())
-}
-
-/// Check if command is cacheable (ARTICLE/BODY/HEAD/STAT with message-ID)
-fn is_cacheable_command(command: &str) -> bool {
-    let upper = command.trim().to_uppercase();
-    (upper.starts_with("ARTICLE ")
-        || upper.starts_with("BODY ")
-        || upper.starts_with("HEAD ")
-        || upper.starts_with("STAT "))
-        && extract_message_id(command).is_some()
-}
-
-/// Parse status code from binary data and determine if it's a multiline response
-fn parse_multiline_status(data: &[u8]) -> bool {
-    std::str::from_utf8(data)
-        .ok()
-        .and_then(parse_status_code)
-        .map(is_multiline_status)
-        .unwrap_or(false)
-}
+use crate::protocol::{COMMAND_NOT_SUPPORTED_STATELESS, NntpResponse, ResponseCode};
 
 /// Caching session that wraps standard session with article cache
 pub struct CachingSession {
@@ -102,9 +62,9 @@ impl CachingSession {
                         Ok(_n) => {
                             debug!("Client {} sent command: {}", self.client_addr, line.trim());
 
-                            // Check if this is a cacheable command
-                            if is_cacheable_command(&line) {
-                                if let Some(message_id) = extract_message_id(&line) {
+                            // Check if this is a cacheable command (article by message-ID)
+                            if matches!(NntpCommand::classify(&line), NntpCommand::ArticleByMessageId) {
+                                if let Some(message_id) = NntpResponse::extract_message_id(&line) {
                                     // Check cache first
                                     if let Some(cached) = self.cache.get(&message_id).await {
                                         info!("Cache HIT for message-ID: {} (size: {} bytes)", message_id, cached.response.len());
@@ -132,8 +92,8 @@ impl CachingSession {
                                     backend_to_client_bytes += response.len() as u64;
                                 }
                                 CommandAction::Reject(_reason) => {
-                                    client_write.write_all(NNTP_COMMAND_NOT_SUPPORTED).await?;
-                                    backend_to_client_bytes += NNTP_COMMAND_NOT_SUPPORTED.len() as u64;
+                                    client_write.write_all(COMMAND_NOT_SUPPORTED_STATELESS).await?;
+                                    backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
                                 }
                                 CommandAction::ForwardStateless => {
                                     // Forward stateless commands to backend
@@ -154,14 +114,16 @@ impl CachingSession {
                                     let mut response_buffer = std::mem::take(&mut first_line);
 
                                     // Check for backend disconnect (205 status)
-                                    if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
+                                    if NntpResponse::is_disconnect(&response_buffer) {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
                                         client_write.write_all(&response_buffer).await?;
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
 
-                                    let is_multiline = parse_multiline_status(&response_buffer);
+                                    // Parse response code once and reuse it
+                                    let response_code = ResponseCode::parse(&response_buffer);
+                                    let is_multiline = response_code.is_multiline();
 
                                     if is_multiline {
                                         loop {
@@ -201,15 +163,16 @@ impl CachingSession {
                                     let mut response_buffer = std::mem::take(&mut first_line);
 
                                     // Check for backend disconnect (205 status)
-                                    if response_buffer.len() >= 3 && &response_buffer[0..3] == b"205" {
+                                    if NntpResponse::is_disconnect(&response_buffer) {
                                         debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
                                         client_write.write_all(&response_buffer).await?;
                                         backend_to_client_bytes += response_buffer.len() as u64;
                                         break;
                                     }
 
-                                    // Check if this is a multiline response by parsing status code
-                                    let is_multiline = parse_multiline_status(&response_buffer);
+                                    // Parse response code once and reuse it (avoid redundant parsing)
+                                    let response_code = ResponseCode::parse(&response_buffer);
+                                    let is_multiline = response_code.is_multiline();
 
                                     // Read multiline data if needed (as raw bytes)
                                     if is_multiline {
@@ -229,11 +192,11 @@ impl CachingSession {
                                         }
                                     }
 
-                                    // Cache if it was a cacheable command
-                                    if is_cacheable_command(&line)
-                                        && let Some(message_id) = extract_message_id(&line) {
-                                            // Only cache successful responses (2xx)
-                                            if !response_buffer.is_empty() && response_buffer[0] == b'2' {
+                                    // Cache if it was a cacheable command (article by message-ID)
+                                    if matches!(NntpCommand::classify(&line), NntpCommand::ArticleByMessageId)
+                                        && let Some(message_id) = NntpResponse::extract_message_id(&line) {
+                                            // Only cache successful responses (2xx) - reuse already-parsed response_code
+                                            if response_code.is_success() {
                                                 info!("Caching response for message-ID: {}", message_id);
                                                 self.cache.insert(
                                                     message_id,
@@ -260,24 +223,5 @@ impl CachingSession {
         }
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
-    }
-}
-
-/// Parse status code from NNTP response line
-fn parse_status_code(line: &str) -> Option<u16> {
-    let trimmed = line.trim();
-    if trimmed.len() < 3 {
-        return None;
-    }
-    trimmed[0..3].parse().ok()
-}
-
-/// Check if a status code indicates a multiline response
-fn is_multiline_status(status_code: u16) -> bool {
-    // Multiline responses: 1xx informational, and specific 2xx codes
-    match status_code {
-        100..=199 => true, // Informational multiline
-        215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Article/list data
-        _ => false,
     }
 }
