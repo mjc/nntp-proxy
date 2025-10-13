@@ -512,8 +512,6 @@ impl ClientSession {
         mut client_to_backend_bytes: u64,
         mut backend_to_client_bytes: u64,
     ) -> Result<(u64, u64)> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         debug!(
             "Client {} acquiring dedicated backend connection for stateful mode",
             self.client_addr
@@ -881,7 +879,6 @@ impl ClientSession {
 mod tests {
     use super::*;
     use crate::protocol::QUIT;
-
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
