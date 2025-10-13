@@ -88,7 +88,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);

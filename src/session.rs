@@ -532,10 +532,11 @@ impl ClientSession {
                 "Client {} cannot switch to stateful mode: backend {:?} stateful limit reached",
                 self.client_addr, backend_id
             );
+            const STATEFUL_SLOTS_ERROR: &[u8] = b"503 All stateful connection slots are in use. Try again later.\r\n";
             client_write
-                .write_all(b"503 All stateful connection slots are in use. Try again later.\r\n")
+                .write_all(STATEFUL_SLOTS_ERROR)
                 .await?;
-            backend_to_client_bytes += 65;
+            backend_to_client_bytes += STATEFUL_SLOTS_ERROR.len() as u64;
 
             // Continue in per-command mode
             return Ok((client_to_backend_bytes, backend_to_client_bytes));
@@ -1006,7 +1007,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_quit_command_per_command_routing() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         // Start a mock server for the backend
@@ -1103,7 +1103,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_quit_command_closes_connection_cleanly() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         // Start a mock backend

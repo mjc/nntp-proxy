@@ -19,6 +19,9 @@ pub enum RoutingMode {
 }
 
 impl Default for RoutingMode {
+    /// Default routing mode is Hybrid, which provides optimal performance and full protocol support.
+    /// This mode automatically starts in per-command routing for efficiency and seamlessly switches
+    /// to stateful mode when commands requiring group context are detected.
     fn default() -> Self {
         Self::Hybrid
     }

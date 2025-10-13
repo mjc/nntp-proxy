@@ -269,8 +269,7 @@ impl BackendSelector {
                         backend.name
                     );
                 }
-                // Should not happen, as only possible error is current == 0
-                Err(_) => {}
+                Err(other) => unreachable!("Unexpected error in fetch_update: got Err({other}), expected only Err(0)")
             }
         }
     }
