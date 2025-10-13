@@ -6,6 +6,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::constants::pool::{MAX_RECOMMENDED_KEEPALIVE_SECS, MIN_RECOMMENDED_KEEPALIVE_SECS};
+
 /// Routing mode for the proxy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -152,6 +154,10 @@ pub struct ServerConfig {
     /// Optional path to custom CA certificate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_cert_path: Option<String>,
+    /// Interval in seconds to send keep-alive commands (DATE) on idle connections
+    /// Set to 0 to disable keep-alive (default)
+    #[serde(default)]
+    pub connection_keepalive_secs: u64,
 }
 
 /// Default for TLS certificate verification (true for security)
@@ -192,6 +198,28 @@ impl Config {
                     "max_connections must be > 0 for server '{}'",
                     server.name
                 ));
+            }
+            // Warn if connection_keepalive_secs is outside recommended range
+            if server.connection_keepalive_secs > 0 {
+                if server.connection_keepalive_secs < MIN_RECOMMENDED_KEEPALIVE_SECS {
+                    tracing::warn!(
+                        "Server '{}' has connection_keepalive_secs set to {} seconds (< {} seconds). \
+                         This may cause excessive health check traffic and connection churn. \
+                         Consider using at least {} seconds or 0 to disable.",
+                        server.name,
+                        server.connection_keepalive_secs,
+                        MIN_RECOMMENDED_KEEPALIVE_SECS,
+                        MIN_RECOMMENDED_KEEPALIVE_SECS
+                    );
+                } else if server.connection_keepalive_secs > MAX_RECOMMENDED_KEEPALIVE_SECS {
+                    tracing::warn!(
+                        "Server '{}' has connection_keepalive_secs set to {} seconds (> {} seconds / 5 minutes). \
+                         This may not detect stale connections quickly enough. Consider a lower value.",
+                        server.name,
+                        server.connection_keepalive_secs,
+                        MAX_RECOMMENDED_KEEPALIVE_SECS
+                    );
+                }
             }
         }
 
@@ -284,6 +312,7 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
             use_tls: false,
             tls_verify_cert: default_tls_verify_cert(),
             tls_cert_path: None,
+            connection_keepalive_secs: 0,
         });
 
         index += 1;
@@ -341,6 +370,7 @@ pub fn create_default_config() -> Config {
             use_tls: false,
             tls_verify_cert: default_tls_verify_cert(),
             tls_cert_path: None,
+            connection_keepalive_secs: 0,
         }],
         ..Default::default()
     }
@@ -365,6 +395,7 @@ mod tests {
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -376,6 +407,7 @@ mod tests {
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
             ],
             ..Default::default()
@@ -394,6 +426,7 @@ mod tests {
             use_tls: false,
             tls_verify_cert: default_tls_verify_cert(),
             tls_cert_path: None,
+            connection_keepalive_secs: 0,
         };
 
         assert_eq!(config.host, "news.example.com");
@@ -493,6 +526,7 @@ mod tests {
                 use_tls: false,
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             }],
             ..Default::default()
         };
@@ -545,6 +579,7 @@ max_connections = 5
                 use_tls: false,
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             }],
             ..Default::default()
         };
@@ -564,6 +599,7 @@ max_connections = 5
                 use_tls: false,
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             }],
             ..Default::default()
         };
@@ -588,6 +624,7 @@ max_connections = 5
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
                 ServerConfig {
                     host: "server2.com".to_string(),
@@ -599,6 +636,7 @@ max_connections = 5
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
                 ServerConfig {
                     host: "server3.com".to_string(),
@@ -610,6 +648,7 @@ max_connections = 5
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
             ],
             ..Default::default()
@@ -655,6 +694,7 @@ max_connections = 5
                 use_tls: false,
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             }],
             ..Default::default()
         };
@@ -686,6 +726,7 @@ max_connections = 5
                 use_tls: false,
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             }],
             ..Default::default()
         };
@@ -705,6 +746,7 @@ max_connections = 5
                 use_tls: false,
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             }],
             ..Default::default()
         };
@@ -729,6 +771,7 @@ max_connections = 5
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
                 ServerConfig {
                     host: "::1".to_string(),
@@ -740,6 +783,7 @@ max_connections = 5
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
                 ServerConfig {
                     host: "2001:db8::1".to_string(),
@@ -751,6 +795,7 @@ max_connections = 5
                     use_tls: false,
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
             ],
             ..Default::default()
@@ -779,6 +824,7 @@ max_connections = 5
                 use_tls: false,
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             }],
             ..Default::default()
         };

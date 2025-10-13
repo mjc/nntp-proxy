@@ -32,6 +32,7 @@ toml = "0.9"
 tracing = { version = "0.1", features = ["std", "release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "ansi"] }
 anyhow = "1.0"
+thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
 crossbeam = { version = "0.8", features = ["nightly"] }  # Lock-free data structures with nightly optimizations
 nix = { version = "0.30", features = ["sched", "process"] }  # Low-level system calls for CPU pinning

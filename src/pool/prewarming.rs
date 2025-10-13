@@ -173,6 +173,7 @@ mod tests {
             use_tls: false,
             tls_verify_cert: true,
             tls_cert_path: None,
+            connection_keepalive_secs: 0,
         }];
 
         let providers = servers

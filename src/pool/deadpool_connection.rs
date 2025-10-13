@@ -1,14 +1,61 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
+use thiserror::Error;
 use tokio::net::TcpStream;
 use tracing::info;
 
+use crate::constants::pool::{
+    DATE_COMMAND, EXPECTED_DATE_RESPONSE_PREFIX, HEALTH_CHECK_BUFFER_SIZE, HEALTH_CHECK_TIMEOUT,
+    TCP_PEEK_BUFFER_SIZE,
+};
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 use crate::protocol::{ResponseParser, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
+
+/// Errors that can occur during connection health checks
+#[derive(Debug, Error)]
+pub enum HealthCheckError {
+    /// TCP connection is closed
+    #[error("TCP connection closed")]
+    TcpClosed,
+
+    /// Unexpected data found in the buffer before health check
+    #[error("Unexpected data in buffer")]
+    UnexpectedData,
+
+    /// TCP-level error occurred
+    #[error("TCP error: {0}")]
+    TcpError(std::io::Error),
+
+    /// Failed to write DATE command to the connection
+    #[error("Failed to write health check: {0}")]
+    WriteError(std::io::Error),
+
+    /// Failed to read response from the connection
+    #[error("Failed to read health check response: {0}")]
+    ReadError(std::io::Error),
+
+    /// Health check operation timed out
+    #[error("Health check timeout")]
+    Timeout,
+
+    /// Server returned unexpected response to DATE command
+    #[error("Unexpected health check response: {0}")]
+    UnexpectedResponse(String),
+
+    /// Connection closed while waiting for health check response
+    #[error("Connection closed during health check")]
+    ConnectionClosedDuringCheck,
+}
+
+impl From<HealthCheckError> for managed::RecycleError<anyhow::Error> {
+    fn from(err: HealthCheckError) -> Self {
+        managed::RecycleError::Message(err.to_string().into())
+    }
+}
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
@@ -111,6 +158,83 @@ impl TcpManager {
     }
 }
 
+/// Fast TCP-level check for obviously dead connections
+///
+/// Uses non-blocking peek to detect closed connections without consuming data.
+/// Only applicable to plain TCP connections; TLS connections skip this check.
+///
+/// # How it works
+/// - `try_read()` attempts a non-blocking read of 1 byte
+/// - `Ok(0)` means the connection is closed (EOF)
+/// - `Ok(n)` means data is available (unexpected - should be idle)
+/// - `Err(WouldBlock)` means no data available - this is **expected** for an idle,
+///   healthy connection, as there should be no data to read between commands
+/// - Other errors indicate TCP-level problems
+fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
+    if let ConnectionStream::Plain(tcp) = conn {
+        let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
+        match tcp.try_read(&mut peek_buf) {
+            Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
+            Ok(_) => return Err(HealthCheckError::UnexpectedData.into()),
+            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                // Clone to preserve original error details and message
+                return Err(HealthCheckError::TcpError(std::io::Error::new(
+                    e.kind(),
+                    e.to_string(),
+                ))
+                .into());
+            }
+            // WouldBlock is the expected case - no data available on idle connection
+            Err(_) => {}
+        }
+    }
+    // TLS connections skip TCP-level check
+    Ok(())
+}
+
+/// Application-level health check using DATE command
+///
+/// Sends DATE command and verifies response to ensure the NNTP connection
+/// is still functional. This detects server-side timeouts that TCP keepalive
+/// might miss.
+async fn check_date_response(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
+
+    // Wrap entire health check in single timeout
+    let health_check = async {
+        // Send DATE command
+        conn.write_all(DATE_COMMAND)
+            .await
+            .map_err(HealthCheckError::WriteError)?;
+
+        // Read response
+        let mut response_buf = [0u8; HEALTH_CHECK_BUFFER_SIZE];
+        let n = conn
+            .read(&mut response_buf)
+            .await
+            .map_err(HealthCheckError::ReadError)?;
+
+        if n == 0 {
+            return Err(HealthCheckError::ConnectionClosedDuringCheck);
+        }
+
+        // Validate DATE response
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+        if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
+            Ok(())
+        } else {
+            Err(HealthCheckError::UnexpectedResponse(response.to_string()))
+        }
+    };
+
+    // Apply timeout and convert errors
+    match timeout(HEALTH_CHECK_TIMEOUT, health_check).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_elapsed) => Err(HealthCheckError::Timeout.into()),
+    }
+}
+
 impl managed::Manager for TcpManager {
     type Type = ConnectionStream;
     type Error = anyhow::Error;
@@ -166,26 +290,13 @@ impl managed::Manager for TcpManager {
     async fn recycle(
         &self,
         conn: &mut ConnectionStream,
-        _: &managed::Metrics,
+        _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
-        // Fast TCP-level health check: try reading without blocking
-        // Healthy idle connections return WouldBlock, dead ones return 0 or error
-        let mut peek_buf = [0u8; 1];
+        // Fast TCP-level check for plain connections
+        check_tcp_alive(conn)?;
 
-        // Only plain TCP supports try_read directly, for TLS we just return Ok
-        match conn {
-            ConnectionStream::Plain(tcp) => match tcp.try_read(&mut peek_buf) {
-                Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
-                Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-                Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
-            },
-            ConnectionStream::Tls(_) => {
-                // For TLS connections, we can't easily peek without blocking
-                // Just assume the connection is healthy
-                Ok(())
-            }
-        }
+        // Application-level health check using DATE command
+        check_date_response(conn).await
     }
 
     fn detach(&self, _conn: &mut ConnectionStream) {}
@@ -311,5 +422,298 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
             max_size: status.max_size,
             created: status.size,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadpool::managed::Manager;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{Duration, sleep};
+
+    /// Behavior modes for mock NNTP server
+    #[derive(Clone, Copy, Debug)]
+    enum MockServerBehavior {
+        /// Responds normally to DATE commands with "111 ..."
+        Healthy,
+        /// Responds with error to DATE commands
+        WrongResponse,
+        /// Receives DATE but never responds (causes timeout)
+        Timeout,
+        /// Closes connection immediately after greeting
+        CloseImmediately,
+        /// Closes connection when DATE command is received
+        CloseOnHealthCheck,
+    }
+
+    /// Mock NNTP server for testing health checks
+    ///
+    /// Automatically manages server lifecycle and provides clean teardown.
+    /// Uses a builder pattern for configuration.
+    struct MockNntpServer {
+        port: u16,
+        behavior: MockServerBehavior,
+    }
+
+    impl MockNntpServer {
+        /// Create a new mock server with the specified behavior
+        async fn new(behavior: MockServerBehavior) -> Self {
+            let port = Self::find_available_port().await;
+            let server = Self { port, behavior };
+            server.start().await;
+            // Give server time to start accepting connections
+            sleep(Duration::from_millis(50)).await;
+            server
+        }
+
+        /// Find an available port for the mock server
+        async fn find_available_port() -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            addr.port()
+        }
+
+        /// Start the mock server in the background
+        async fn start(&self) {
+            let port = self.port;
+            let behavior = self.behavior;
+
+            tokio::spawn(async move {
+                let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+                    .await
+                    .unwrap();
+
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0u8; 1024];
+
+                        // Send greeting
+                        let _ = stream.write_all(b"200 Mock NNTP Server Ready\r\n").await;
+
+                        loop {
+                            match stream.read(&mut buffer).await {
+                                Ok(0) => break, // Connection closed
+                                Ok(n) => {
+                                    let command = String::from_utf8_lossy(&buffer[..n]);
+
+                                    match behavior {
+                                        MockServerBehavior::Healthy => {
+                                            if command.starts_with("DATE") {
+                                                let _ = stream
+                                                    .write_all(b"111 20251013120000\r\n")
+                                                    .await;
+                                            }
+                                        }
+                                        MockServerBehavior::WrongResponse => {
+                                            if command.starts_with("DATE") {
+                                                let _ = stream
+                                                    .write_all(b"500 Command not recognized\r\n")
+                                                    .await;
+                                            }
+                                        }
+                                        MockServerBehavior::Timeout => {
+                                            if command.starts_with("DATE") {
+                                                // Don't respond, causing timeout
+                                                sleep(Duration::from_secs(5)).await;
+                                            }
+                                        }
+                                        MockServerBehavior::CloseImmediately => {
+                                            // Close connection immediately after greeting
+                                            break;
+                                        }
+                                        MockServerBehavior::CloseOnHealthCheck => {
+                                            if command.starts_with("DATE") {
+                                                // Close without responding
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        /// Create a TcpManager configured to connect to this mock server
+        fn create_manager(&self) -> TcpManager {
+            TcpManager::new(
+                "127.0.0.1".to_string(),
+                self.port,
+                "test".to_string(),
+                None,
+                None,
+            )
+        }
+
+        /// Create a connection to this mock server
+        async fn create_connection(&self) -> ConnectionStream {
+            self.create_manager().create().await.unwrap()
+        }
+    }
+
+    /// Test helper to run a health check and return the result
+    async fn run_health_check(
+        manager: &TcpManager,
+        conn: &mut ConnectionStream,
+    ) -> managed::RecycleResult<anyhow::Error> {
+        manager.recycle(conn, &managed::Metrics::default()).await
+    }
+
+    /// Assert that an error message contains one of the expected substrings
+    fn assert_error_contains(result: managed::RecycleResult<anyhow::Error>, expected: &[&str]) {
+        assert!(result.is_err(), "Expected error but got Ok");
+        if let Err(e) = result {
+            let msg = format!("{:?}", e);
+            let found = expected.iter().any(|s| msg.contains(s));
+            assert!(
+                found,
+                "Error should contain one of {:?}, but was: {}",
+                expected, msg
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_check_passes_for_healthy_connection() {
+        let server = MockNntpServer::new(MockServerBehavior::Healthy).await;
+        let manager = server.create_manager();
+        let mut conn = server.create_connection().await;
+
+        let result = run_health_check(&manager, &mut conn).await;
+
+        assert!(
+            result.is_ok(),
+            "Health check should pass for healthy connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check_fails_for_closed_connection() {
+        let server = MockNntpServer::new(MockServerBehavior::CloseImmediately).await;
+        let manager = server.create_manager();
+        let mut conn = server.create_connection().await;
+
+        // Wait for server to close
+        sleep(Duration::from_millis(200)).await;
+
+        let result = run_health_check(&manager, &mut conn).await;
+
+        assert_error_contains(result, &["closed", "Connection"]);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_fails_for_wrong_response() {
+        let server = MockNntpServer::new(MockServerBehavior::WrongResponse).await;
+        let manager = server.create_manager();
+        let mut conn = server.create_connection().await;
+
+        let result = run_health_check(&manager, &mut conn).await;
+
+        assert_error_contains(result, &["Unexpected", "500"]);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_timeout() {
+        let server = MockNntpServer::new(MockServerBehavior::Timeout).await;
+        let manager = server.create_manager();
+        let mut conn = server.create_connection().await;
+
+        let start = std::time::Instant::now();
+        let result = run_health_check(&manager, &mut conn).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_secs() <= 3,
+            "Health check should timeout within ~2 seconds, took {:?}",
+            elapsed
+        );
+        assert_error_contains(result, &["timeout", "Timeout"]);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_connection_closed_during_check() {
+        let server = MockNntpServer::new(MockServerBehavior::CloseOnHealthCheck).await;
+        let manager = server.create_manager();
+        let mut conn = server.create_connection().await;
+
+        let result = run_health_check(&manager, &mut conn).await;
+
+        assert_error_contains(result, &["closed", "Connection"]);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_level_check_detects_closed_plain_connection() {
+        // This test needs manual setup since we need the server to close immediately
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept and immediately close
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = stream.try_write(b"200 Mock NNTP Server\r\n");
+                drop(stream); // Close immediately
+            }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+
+        // Connect and get a stream
+        let tcp = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        let mut conn = ConnectionStream::Plain(tcp);
+
+        // Consume greeting
+        let mut buf = vec![0u8; 1024];
+        let _ = conn.read(&mut buf).await;
+
+        // Give the server time to close
+        sleep(Duration::from_millis(100)).await;
+
+        let manager = TcpManager::new(
+            "127.0.0.1".to_string(),
+            port,
+            "test".to_string(),
+            None,
+            None,
+        );
+
+        let result = run_health_check(&manager, &mut conn).await;
+
+        assert!(
+            result.is_err(),
+            "TCP-level check should detect closed connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check_preserves_connection_on_success() {
+        let server = MockNntpServer::new(MockServerBehavior::Healthy).await;
+        let manager = server.create_manager();
+        let mut conn = server.create_connection().await;
+
+        // Run health check multiple times - should keep succeeding
+        for i in 0..3 {
+            let result = run_health_check(&manager, &mut conn).await;
+            assert!(result.is_ok(), "Health check #{} should pass", i + 1);
+        }
+
+        // Connection should still be usable
+        conn.write_all(b"DATE\r\n").await.unwrap();
+
+        let mut response = vec![0u8; 512];
+        let n = conn.read(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response[..n]);
+
+        assert!(
+            response_str.starts_with("111"),
+            "Connection should still work after health checks"
+        );
     }
 }

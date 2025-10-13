@@ -339,6 +339,7 @@ mod tests {
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -350,6 +351,7 @@ mod tests {
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
                 ServerConfig {
                     host: "server3.example.com".to_string(),
@@ -361,6 +363,7 @@ mod tests {
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
+                    connection_keepalive_secs: 0,
                 },
             ],
             ..Default::default()
