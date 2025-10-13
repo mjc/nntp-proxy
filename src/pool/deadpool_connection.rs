@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
+use std::fmt;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tracing::info;
@@ -16,6 +17,54 @@ const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_CHECK_BUFFER_SIZE: usize = 512;
 const DATE_COMMAND: &[u8] = b"DATE\r\n";
 const EXPECTED_DATE_RESPONSE_PREFIX: &str = "111 ";
+
+/// Errors that can occur during connection health checks
+#[derive(Debug)]
+pub enum HealthCheckError {
+    /// TCP connection is closed
+    TcpClosed,
+    /// Unexpected data found in the buffer before health check
+    UnexpectedData,
+    /// TCP-level error occurred
+    TcpError(std::io::Error),
+    /// Failed to write DATE command to the connection
+    WriteError(std::io::Error),
+    /// Failed to read response from the connection
+    ReadError(std::io::Error),
+    /// Health check operation timed out
+    Timeout,
+    /// Server returned unexpected response to DATE command
+    UnexpectedResponse(String),
+    /// Connection closed while waiting for health check response
+    ConnectionClosedDuringCheck,
+}
+
+impl fmt::Display for HealthCheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TcpClosed => write!(f, "TCP connection closed"),
+            Self::UnexpectedData => write!(f, "Unexpected data in buffer"),
+            Self::TcpError(e) => write!(f, "TCP error: {}", e),
+            Self::WriteError(e) => write!(f, "Failed to write health check: {}", e),
+            Self::ReadError(e) => write!(f, "Failed to read health check response: {}", e),
+            Self::Timeout => write!(f, "Health check timeout"),
+            Self::UnexpectedResponse(response) => {
+                write!(f, "Unexpected health check response: {}", response.trim())
+            }
+            Self::ConnectionClosedDuringCheck => {
+                write!(f, "Connection closed during health check")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HealthCheckError {}
+
+impl From<HealthCheckError> for managed::RecycleError<anyhow::Error> {
+    fn from(err: HealthCheckError) -> Self {
+        managed::RecycleError::Message(err.to_string().into())
+    }
+}
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
@@ -126,18 +175,10 @@ fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow
     if let ConnectionStream::Plain(tcp) = conn {
         let mut peek_buf = [0u8; 1];
         match tcp.try_read(&mut peek_buf) {
-            Ok(0) => {
-                return Err(managed::RecycleError::Message("Connection closed".into()));
-            }
-            Ok(_) => {
-                return Err(managed::RecycleError::Message(
-                    "Unexpected data in buffer".into(),
-                ));
-            }
+            Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
+            Ok(_) => return Err(HealthCheckError::UnexpectedData.into()),
             Err(ref e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                return Err(managed::RecycleError::Message(
-                    format!("TCP error: {}", e).into(),
-                ));
+                return Err(HealthCheckError::TcpError(std::io::Error::from(e.kind())).into());
             }
             Err(_) => {} // WouldBlock is expected, connection appears alive
         }
@@ -158,20 +199,19 @@ async fn check_date_response(conn: &mut ConnectionStream) -> managed::RecycleRes
     // Wrap entire health check in single timeout
     let health_check = async {
         // Send DATE command
-        conn.write_all(DATE_COMMAND).await.map_err(|e| {
-            managed::RecycleError::Message(format!("Health check write failed: {}", e).into())
-        })?;
+        conn.write_all(DATE_COMMAND)
+            .await
+            .map_err(HealthCheckError::WriteError)?;
 
         // Read response
         let mut response_buf = [0u8; HEALTH_CHECK_BUFFER_SIZE];
-        let n = conn.read(&mut response_buf).await.map_err(|e| {
-            managed::RecycleError::Message(format!("Health check read failed: {}", e).into())
-        })?;
+        let n = conn
+            .read(&mut response_buf)
+            .await
+            .map_err(HealthCheckError::ReadError)?;
 
         if n == 0 {
-            return Err(managed::RecycleError::Message(
-                "Connection closed during health check".into(),
-            ));
+            return Err(HealthCheckError::ConnectionClosedDuringCheck);
         }
 
         // Validate DATE response
@@ -179,19 +219,14 @@ async fn check_date_response(conn: &mut ConnectionStream) -> managed::RecycleRes
         if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
             Ok(())
         } else {
-            Err(managed::RecycleError::Message(
-                format!("Unexpected health check response: {}", response.trim()).into(),
-            ))
+            Err(HealthCheckError::UnexpectedResponse(response.to_string()))
         }
     };
 
     timeout(HEALTH_CHECK_TIMEOUT, health_check)
         .await
-        .unwrap_or_else(|_| {
-            Err(managed::RecycleError::Message(
-                "Health check timeout".into(),
-            ))
-        })
+        .unwrap_or(Err(HealthCheckError::Timeout))
+        .map_err(|e| e.into())
 }
 
 impl managed::Manager for TcpManager {
