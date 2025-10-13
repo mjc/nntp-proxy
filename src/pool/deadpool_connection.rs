@@ -3,21 +3,17 @@ use async_trait::async_trait;
 use deadpool::managed;
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::time::Duration;
 use tracing::info;
 
-use crate::constants::pool::TCP_PEEK_BUFFER_SIZE;
+use crate::constants::pool::{
+    DATE_COMMAND, EXPECTED_DATE_RESPONSE_PREFIX, HEALTH_CHECK_BUFFER_SIZE, HEALTH_CHECK_TIMEOUT,
+    TCP_PEEK_BUFFER_SIZE,
+};
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 use crate::protocol::{ResponseParser, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
-
-// Health check constants
-const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-const HEALTH_CHECK_BUFFER_SIZE: usize = 512;
-const DATE_COMMAND: &[u8] = b"DATE\r\n";
-const EXPECTED_DATE_RESPONSE_PREFIX: &str = "111 ";
 
 /// Errors that can occur during connection health checks
 #[derive(Debug, Error)]
@@ -180,8 +176,13 @@ fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow
         match tcp.try_read(&mut peek_buf) {
             Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
             Ok(_) => return Err(HealthCheckError::UnexpectedData.into()),
-            Err(ref e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                return Err(HealthCheckError::TcpError(std::io::Error::from(e.kind())).into());
+            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                // Clone to preserve original error details and message
+                return Err(HealthCheckError::TcpError(std::io::Error::new(
+                    e.kind(),
+                    e.to_string(),
+                ))
+                .into());
             }
             // WouldBlock is the expected case - no data available on idle connection
             Err(_) => {}

@@ -7,6 +7,9 @@ name = "Example News Server 1"
 # password = "your_password"
 # High-capacity server allows many connections
 max_connections = 20
+# Connection health check interval (0 = disabled, recommended: 60-120 seconds)
+# Sends DATE command to detect stale connections before reuse
+connection_keepalive_secs = 0
 # TLS/SSL configuration
 use_tls = false
 tls_verify_cert = true
@@ -20,6 +23,8 @@ username = "testuser"
 password = "testpass"
 # Standard connection limit
 max_connections = 10
+# Enable health checks every 60 seconds for this server
+connection_keepalive_secs = 60
 # Plain TCP connection (default)
 use_tls = false
 tls_verify_cert = true
@@ -33,6 +38,8 @@ username = "premium_user"
 password = "secure_password"
 # Premium server allows more connections
 max_connections = 15
+# Health checks recommended for production servers
+connection_keepalive_secs = 120
 # Enable TLS for secure connection (NNTPS)
 use_tls = true
 # Verify server certificates (recommended for production)
@@ -47,6 +54,8 @@ name = "Local Test Server"
 # No authentication needed for local server
 # Limited connections for test server
 max_connections = 5
+# No health checks needed for local testing
+connection_keepalive_secs = 0
 use_tls = false
 tls_verify_cert = true
 

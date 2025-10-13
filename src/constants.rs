@@ -74,6 +74,8 @@ pub mod timeout {
 
 /// Connection pool constants
 pub mod pool {
+    use super::Duration;
+
     /// Default maximum connections per backend pool
     pub const DEFAULT_MAX_CONNECTIONS: usize = 10;
 
@@ -86,6 +88,26 @@ pub mod pool {
     /// Buffer size for TCP peek during health checks
     /// Only 1 byte needed to detect if connection is readable/closed
     pub const TCP_PEEK_BUFFER_SIZE: usize = 1;
+
+    /// Health check timeout - how long to wait for DATE command response
+    pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Buffer size for reading health check responses
+    pub const HEALTH_CHECK_BUFFER_SIZE: usize = 512;
+
+    /// DATE command bytes sent during health check
+    pub const DATE_COMMAND: &[u8] = b"DATE\r\n";
+
+    /// Expected prefix of DATE command response (NNTP 111 response code)
+    pub const EXPECTED_DATE_RESPONSE_PREFIX: &str = "111 ";
+
+    /// Minimum recommended keep-alive interval in seconds
+    /// Values below this may cause excessive health check traffic
+    pub const MIN_RECOMMENDED_KEEPALIVE_SECS: u64 = 30;
+
+    /// Maximum recommended keep-alive interval in seconds (5 minutes)
+    /// Values above this may not detect stale connections quickly enough
+    pub const MAX_RECOMMENDED_KEEPALIVE_SECS: u64 = 300;
 }
 
 /// Per-command routing constants

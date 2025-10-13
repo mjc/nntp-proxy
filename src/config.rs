@@ -6,6 +6,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::constants::pool::{MAX_RECOMMENDED_KEEPALIVE_SECS, MIN_RECOMMENDED_KEEPALIVE_SECS};
+
 /// Routing mode for the proxy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -199,20 +201,23 @@ impl Config {
             }
             // Warn if connection_keepalive_secs is outside recommended range
             if server.connection_keepalive_secs > 0 {
-                if server.connection_keepalive_secs < 30 {
+                if server.connection_keepalive_secs < MIN_RECOMMENDED_KEEPALIVE_SECS {
                     tracing::warn!(
-                        "Server '{}' has connection_keepalive_secs set to {} seconds (< 30 seconds). \
+                        "Server '{}' has connection_keepalive_secs set to {} seconds (< {} seconds). \
                          This may cause excessive health check traffic and connection churn. \
-                         Consider using at least 30 seconds or 0 to disable.",
+                         Consider using at least {} seconds or 0 to disable.",
                         server.name,
-                        server.connection_keepalive_secs
+                        server.connection_keepalive_secs,
+                        MIN_RECOMMENDED_KEEPALIVE_SECS,
+                        MIN_RECOMMENDED_KEEPALIVE_SECS
                     );
-                } else if server.connection_keepalive_secs > 300 {
+                } else if server.connection_keepalive_secs > MAX_RECOMMENDED_KEEPALIVE_SECS {
                     tracing::warn!(
-                        "Server '{}' has connection_keepalive_secs set to {} seconds (> 5 minutes). \
+                        "Server '{}' has connection_keepalive_secs set to {} seconds (> {} seconds / 5 minutes). \
                          This may not detect stale connections quickly enough. Consider a lower value.",
                         server.name,
-                        server.connection_keepalive_secs
+                        server.connection_keepalive_secs,
+                        MAX_RECOMMENDED_KEEPALIVE_SECS
                     );
                 }
             }
