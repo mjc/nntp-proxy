@@ -244,41 +244,33 @@ impl BackendSelector {
     /// Release a stateful connection slot
     pub fn release_stateful(&self, backend_id: BackendId) {
         if let Some(backend) = self.backends.iter().find(|b| b.id == backend_id) {
-            // Use compare_exchange_weak loop to avoid underflow
-            loop {
-                let current = backend.stateful_count.load(Ordering::Acquire);
+            // Atomically decrement if greater than zero, avoiding underflow and spurious logs
+            let result = backend.stateful_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current == 0 {
-                    // Already at zero, nothing to release
+                    None
+                } else {
+                    Some(current - 1)
+                }
+            });
+            match result {
+                Ok(prev) => {
+                    debug!(
+                        "Backend {:?} ({}) released stateful slot: {}/{}",
+                        backend_id,
+                        backend.name,
+                        prev - 1,
+                        backend.provider.max_size().saturating_sub(1)
+                    );
+                }
+                Err(0) => {
                     debug!(
                         "Backend {:?} ({}) release_stateful called when count already 0",
                         backend_id,
                         backend.name
                     );
-                    return;
                 }
-                
-                // Try to decrement
-                match backend.stateful_count.compare_exchange_weak(
-                    current,
-                    current - 1,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        debug!(
-                            "Backend {:?} ({}) released stateful slot: {}/{}",
-                            backend_id,
-                            backend.name,
-                            current - 1,
-                            backend.provider.max_size().saturating_sub(1)
-                        );
-                        return;
-                    }
-                    Err(_) => {
-                        // Retry - another thread modified the count
-                        continue;
-                    }
-                }
+                // Should not happen, as only possible error is current == 0
+                Err(_) => {}
             }
         }
     }

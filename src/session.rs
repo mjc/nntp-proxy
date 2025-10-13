@@ -564,26 +564,19 @@ impl ClientSession {
 
         // Forward the initial command that triggered the switch
         pooled_conn.write_all(initial_command.as_bytes()).await?;
+        // Only increment byte count after successful write
         client_to_backend_bytes += initial_command.len() as u64;
 
-        // Read and forward the response for the initial command
+        // Read and forward the initial response chunk
         let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
-        loop {
-            let n = pooled_conn.read(&mut chunk).await?;
-            if n == 0 {
-                return Err(anyhow::anyhow!(
-                    "Backend connection closed while reading initial response"
-                ));
-            }
-            client_write.write_all(&chunk[..n]).await?;
-            backend_to_client_bytes += n as u64;
-
-            // Check if we've reached end of response (for single-line responses)
-            // For multi-line responses, we'll continue in the bidirectional loop below
-            if n < chunk.len() {
-                break;
-            }
+        let n = pooled_conn.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "Backend connection closed while reading initial response"
+            ));
         }
+        client_write.write_all(&chunk[..n]).await?;
+        backend_to_client_bytes += n as u64;
 
         // Now enter bidirectional forwarding mode - hold this connection until client disconnects
         debug!(
