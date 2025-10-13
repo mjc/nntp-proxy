@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use tokio::net::TcpStream;
+use tokio::time::Duration;
 use tracing::info;
 
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
@@ -9,6 +10,12 @@ use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 use crate::protocol::{ResponseParser, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
+
+// Health check constants
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_CHECK_BUFFER_SIZE: usize = 512;
+const DATE_COMMAND: &[u8] = b"DATE\r\n";
+const EXPECTED_DATE_RESPONSE_PREFIX: &str = "111 ";
 
 /// TCP connection manager for deadpool
 #[derive(Debug)]
@@ -111,6 +118,82 @@ impl TcpManager {
     }
 }
 
+/// Fast TCP-level check for obviously dead connections
+///
+/// Uses non-blocking peek to detect closed connections without consuming data.
+/// Only applicable to plain TCP connections; TLS connections skip this check.
+fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
+    if let ConnectionStream::Plain(tcp) = conn {
+        let mut peek_buf = [0u8; 1];
+        match tcp.try_read(&mut peek_buf) {
+            Ok(0) => {
+                return Err(managed::RecycleError::Message("Connection closed".into()));
+            }
+            Ok(_) => {
+                return Err(managed::RecycleError::Message(
+                    "Unexpected data in buffer".into(),
+                ));
+            }
+            Err(ref e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                return Err(managed::RecycleError::Message(
+                    format!("TCP error: {}", e).into(),
+                ));
+            }
+            Err(_) => {} // WouldBlock is expected, connection appears alive
+        }
+    }
+    // TLS connections skip TCP-level check
+    Ok(())
+}
+
+/// Application-level health check using DATE command
+///
+/// Sends DATE command and verifies response to ensure the NNTP connection
+/// is still functional. This detects server-side timeouts that TCP keepalive
+/// might miss.
+async fn check_date_response(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
+
+    // Wrap entire health check in single timeout
+    let health_check = async {
+        // Send DATE command
+        conn.write_all(DATE_COMMAND).await.map_err(|e| {
+            managed::RecycleError::Message(format!("Health check write failed: {}", e).into())
+        })?;
+
+        // Read response
+        let mut response_buf = [0u8; HEALTH_CHECK_BUFFER_SIZE];
+        let n = conn.read(&mut response_buf).await.map_err(|e| {
+            managed::RecycleError::Message(format!("Health check read failed: {}", e).into())
+        })?;
+
+        if n == 0 {
+            return Err(managed::RecycleError::Message(
+                "Connection closed during health check".into(),
+            ));
+        }
+
+        // Validate DATE response
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+        if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
+            Ok(())
+        } else {
+            Err(managed::RecycleError::Message(
+                format!("Unexpected health check response: {}", response.trim()).into(),
+            ))
+        }
+    };
+
+    timeout(HEALTH_CHECK_TIMEOUT, health_check)
+        .await
+        .unwrap_or_else(|_| {
+            Err(managed::RecycleError::Message(
+                "Health check timeout".into(),
+            ))
+        })
+}
+
 impl managed::Manager for TcpManager {
     type Type = ConnectionStream;
     type Error = anyhow::Error;
@@ -168,64 +251,11 @@ impl managed::Manager for TcpManager {
         conn: &mut ConnectionStream,
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::{Duration, timeout};
+        // Fast TCP-level check for plain connections
+        check_tcp_alive(conn)?;
 
-        // First, do a fast TCP-level check for obviously dead connections
-        let mut peek_buf = [0u8; 1];
-        match conn {
-            ConnectionStream::Plain(tcp) => {
-                match tcp.try_read(&mut peek_buf) {
-                    Ok(0) => {
-                        return Err(managed::RecycleError::Message("Connection closed".into()));
-                    }
-                    Ok(_) => return Err(managed::RecycleError::Message("Unexpected data".into())),
-                    Err(ref e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                        return Err(managed::RecycleError::Message(format!("{}", e).into()));
-                    }
-                    Err(_) => {} // WouldBlock is expected, continue to application-level check
-                }
-            }
-            ConnectionStream::Tls(_) => {
-                // TLS connections need application-level check
-            }
-        }
-
-        // Application-level health check: send DATE command to verify the connection is still alive
-        // This detects server-side timeouts that TCP keepalive might miss
-        let health_check_cmd = b"DATE\r\n";
-
-        // Send DATE command with timeout
-        if let Err(e) = timeout(Duration::from_secs(2), conn.write_all(health_check_cmd)).await {
-            return Err(managed::RecycleError::Message(
-                format!("Health check write timeout: {}", e).into(),
-            ));
-        }
-
-        // Read response with timeout
-        let mut response_buf = [0u8; 512];
-        match timeout(Duration::from_secs(2), conn.read(&mut response_buf)).await {
-            Ok(Ok(0)) => Err(managed::RecycleError::Message(
-                "Connection closed during health check".into(),
-            )),
-            Ok(Ok(n)) => {
-                let response = String::from_utf8_lossy(&response_buf[..n]);
-                // DATE should return "111 YYYYMMDDhhmmss" response
-                if response.starts_with("111 ") {
-                    Ok(())
-                } else {
-                    Err(managed::RecycleError::Message(
-                        format!("Unexpected health check response: {}", response.trim()).into(),
-                    ))
-                }
-            }
-            Ok(Err(e)) => Err(managed::RecycleError::Message(
-                format!("Health check read error: {}", e).into(),
-            )),
-            Err(_) => Err(managed::RecycleError::Message(
-                "Health check read timeout".into(),
-            )),
-        }
+        // Application-level health check using DATE command
+        check_date_response(conn).await
     }
 
     fn detach(&self, _conn: &mut ConnectionStream) {}
