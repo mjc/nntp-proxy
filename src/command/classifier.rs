@@ -485,4 +485,129 @@ mod tests {
         assert!(!NntpCommand::classify("LIST").is_stateful());
         assert!(!NntpCommand::classify("AUTHINFO USER test").is_stateful());
     }
+
+    #[test]
+    fn test_comprehensive_stateful_commands() {
+        // All GROUP command variants are stateful
+        assert!(NntpCommand::classify("GROUP alt.test").is_stateful());
+        assert!(NntpCommand::classify("group comp.lang.rust").is_stateful());
+        assert!(NntpCommand::classify("Group misc.test").is_stateful());
+        
+        // All XOVER variants are stateful
+        assert!(NntpCommand::classify("XOVER 1-100").is_stateful());
+        assert!(NntpCommand::classify("xover 50-75").is_stateful());
+        assert!(NntpCommand::classify("Xover 200").is_stateful());
+        assert!(NntpCommand::classify("XOVER").is_stateful()); // Without range
+        
+        // OVER command variants (same as XOVER)
+        assert!(NntpCommand::classify("OVER 1-100").is_stateful());
+        assert!(NntpCommand::classify("over 50-75").is_stateful());
+        assert!(NntpCommand::classify("Over 200").is_stateful());
+        
+        // XHDR/HDR commands are stateful
+        assert!(NntpCommand::classify("XHDR subject 1-100").is_stateful());
+        assert!(NntpCommand::classify("xhdr from 50-75").is_stateful());
+        assert!(NntpCommand::classify("HDR message-id 1-10").is_stateful());
+        assert!(NntpCommand::classify("hdr references 100").is_stateful());
+        
+        // Navigation commands are stateful
+        assert!(NntpCommand::classify("NEXT").is_stateful());
+        assert!(NntpCommand::classify("next").is_stateful());
+        assert!(NntpCommand::classify("Next").is_stateful());
+        assert!(NntpCommand::classify("LAST").is_stateful());
+        assert!(NntpCommand::classify("last").is_stateful());
+        assert!(NntpCommand::classify("Last").is_stateful());
+        
+        // LISTGROUP is stateful
+        assert!(NntpCommand::classify("LISTGROUP alt.test").is_stateful());
+        assert!(NntpCommand::classify("listgroup comp.lang.rust").is_stateful());
+        assert!(NntpCommand::classify("Listgroup misc.test 1-100").is_stateful());
+        
+        // Article by number commands are stateful (require current group context)
+        assert!(NntpCommand::classify("ARTICLE 123").is_stateful());
+        assert!(NntpCommand::classify("article 456").is_stateful());
+        assert!(NntpCommand::classify("Article 789").is_stateful());
+        assert!(NntpCommand::classify("HEAD 123").is_stateful());
+        assert!(NntpCommand::classify("head 456").is_stateful());
+        assert!(NntpCommand::classify("Head 789").is_stateful());
+        assert!(NntpCommand::classify("BODY 123").is_stateful());
+        assert!(NntpCommand::classify("body 456").is_stateful());
+        assert!(NntpCommand::classify("Body 789").is_stateful());
+        assert!(NntpCommand::classify("STAT 123").is_stateful());
+        assert!(NntpCommand::classify("stat 456").is_stateful());
+        assert!(NntpCommand::classify("Stat 789").is_stateful());
+    }
+
+    #[test]
+    fn test_comprehensive_stateless_commands() {
+        // Article by message-ID commands are stateless
+        assert!(!NntpCommand::classify("ARTICLE <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::classify("article <test@test.com>").is_stateful());
+        assert!(!NntpCommand::classify("Article <foo@bar.net>").is_stateful());
+        assert!(!NntpCommand::classify("HEAD <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::classify("head <test@test.com>").is_stateful());
+        assert!(!NntpCommand::classify("BODY <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::classify("body <test@test.com>").is_stateful());
+        assert!(!NntpCommand::classify("STAT <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::classify("stat <test@test.com>").is_stateful());
+        
+        // LIST commands are stateless
+        assert!(!NntpCommand::classify("LIST").is_stateful());
+        assert!(!NntpCommand::classify("list").is_stateful());
+        assert!(!NntpCommand::classify("List").is_stateful());
+        assert!(!NntpCommand::classify("LIST ACTIVE").is_stateful());
+        assert!(!NntpCommand::classify("LIST NEWSGROUPS").is_stateful());
+        assert!(!NntpCommand::classify("list active alt.*").is_stateful());
+        
+        // Metadata commands are stateless
+        assert!(!NntpCommand::classify("DATE").is_stateful());
+        assert!(!NntpCommand::classify("date").is_stateful());
+        assert!(!NntpCommand::classify("CAPABILITIES").is_stateful());
+        assert!(!NntpCommand::classify("capabilities").is_stateful());
+        assert!(!NntpCommand::classify("HELP").is_stateful());
+        assert!(!NntpCommand::classify("help").is_stateful());
+        assert!(!NntpCommand::classify("QUIT").is_stateful());
+        assert!(!NntpCommand::classify("quit").is_stateful());
+        
+        // Authentication commands are stateless (handled locally)
+        assert!(!NntpCommand::classify("AUTHINFO USER testuser").is_stateful());
+        assert!(!NntpCommand::classify("authinfo user test").is_stateful());
+        assert!(!NntpCommand::classify("AUTHINFO PASS testpass").is_stateful());
+        assert!(!NntpCommand::classify("authinfo pass secret").is_stateful());
+        
+        // Posting commands are stateless (not group-dependent)
+        assert!(!NntpCommand::classify("POST").is_stateful());
+        assert!(!NntpCommand::classify("post").is_stateful());
+        assert!(!NntpCommand::classify("IHAVE <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::classify("ihave <test@test.com>").is_stateful());
+    }
+
+    #[test]
+    fn test_edge_cases_for_stateful_detection() {
+        // Empty article number should still be stateful (current article)
+        assert!(NntpCommand::classify("ARTICLE").is_stateful());
+        assert!(NntpCommand::classify("HEAD").is_stateful());
+        assert!(NntpCommand::classify("BODY").is_stateful());
+        assert!(NntpCommand::classify("STAT").is_stateful());
+        
+        // Commands with extra whitespace
+        assert!(NntpCommand::classify("GROUP  alt.test").is_stateful());
+        assert!(NntpCommand::classify("XOVER   1-100").is_stateful());
+        assert!(!NntpCommand::classify("LIST  ACTIVE").is_stateful());
+        
+        // Mixed case commands - classifier may not support all permutations
+        // Only test the explicitly supported case variants
+        assert!(NntpCommand::classify("Group alt.test").is_stateful());
+        assert!(NntpCommand::classify("Xover 1-100").is_stateful());
+        assert!(!NntpCommand::classify("List").is_stateful());
+        
+        // Article commands - distinguish by argument format
+        assert!(NntpCommand::classify("ARTICLE 12345").is_stateful()); // Number = stateful
+        assert!(!NntpCommand::classify("ARTICLE <12345@example.com>").is_stateful()); // Message-ID = stateless
+        
+        // Ensure message-IDs with various formats are detected as stateless
+        assert!(!NntpCommand::classify("ARTICLE <a.b.c@example.com>").is_stateful());
+        assert!(!NntpCommand::classify("ARTICLE <123.456.789@server.net>").is_stateful());
+        assert!(!NntpCommand::classify("HEAD <very-long-message-id@domain.example.org>").is_stateful());
+    }
 }
