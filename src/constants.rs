@@ -82,6 +82,10 @@ pub mod pool {
 
     /// Connection pool timeout for getting a connection
     pub const GET_TIMEOUT_SECS: u64 = 5;
+
+    /// Buffer size for TCP peek during health checks
+    /// Only 1 byte needed to detect if connection is readable/closed
+    pub const TCP_PEEK_BUFFER_SIZE: usize = 1;
 }
 
 /// Per-command routing constants

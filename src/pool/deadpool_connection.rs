@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tracing::info;
 
+use crate::constants::pool::TCP_PEEK_BUFFER_SIZE;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::pool::connection_trait::{ConnectionProvider, PoolStatus};
 use crate::protocol::{ResponseParser, authinfo_pass, authinfo_user};
@@ -165,16 +166,25 @@ impl TcpManager {
 ///
 /// Uses non-blocking peek to detect closed connections without consuming data.
 /// Only applicable to plain TCP connections; TLS connections skip this check.
+///
+/// # How it works
+/// - `try_read()` attempts a non-blocking read of 1 byte
+/// - `Ok(0)` means the connection is closed (EOF)
+/// - `Ok(n)` means data is available (unexpected - should be idle)
+/// - `Err(WouldBlock)` means no data available - this is **expected** for an idle,
+///   healthy connection, as there should be no data to read between commands
+/// - Other errors indicate TCP-level problems
 fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
     if let ConnectionStream::Plain(tcp) = conn {
-        let mut peek_buf = [0u8; 1];
+        let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
         match tcp.try_read(&mut peek_buf) {
             Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
             Ok(_) => return Err(HealthCheckError::UnexpectedData.into()),
             Err(ref e) if e.kind() != std::io::ErrorKind::WouldBlock => {
                 return Err(HealthCheckError::TcpError(std::io::Error::from(e.kind())).into());
             }
-            Err(_) => {} // WouldBlock is expected, connection appears alive
+            // WouldBlock is the expected case - no data available on idle connection
+            Err(_) => {}
         }
     }
     // TLS connections skip TCP-level check
@@ -217,10 +227,11 @@ async fn check_date_response(conn: &mut ConnectionStream) -> managed::RecycleRes
         }
     };
 
-    timeout(HEALTH_CHECK_TIMEOUT, health_check)
-        .await
-        .unwrap_or(Err(HealthCheckError::Timeout))
-        .map_err(|e| e.into())
+    // Apply timeout and convert errors
+    match timeout(HEALTH_CHECK_TIMEOUT, health_check).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_elapsed) => Err(HealthCheckError::Timeout.into()),
+    }
 }
 
 impl managed::Manager for TcpManager {
