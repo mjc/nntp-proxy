@@ -207,7 +207,7 @@ impl NntpProxy {
         // Complete the routing (decrement pending count)
         self.router.complete_command_sync(backend_id);
 
-        // Log session results
+        // Log session results and handle backend connection errors
         match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
                 info!(
@@ -216,6 +216,15 @@ impl NntpProxy {
                 );
             }
             Err(e) => {
+                // Check if this is a backend I/O error - if so, remove connection from pool
+                if crate::pool::is_connection_error(&e) {
+                    warn!(
+                        "Backend connection error for client {}: {} - removing connection from pool",
+                        client_addr, e
+                    );
+                    crate::pool::remove_from_pool(backend_conn);
+                    return Err(e);
+                }
                 warn!("Session error for client {}: {}", client_addr, e);
             }
         }
