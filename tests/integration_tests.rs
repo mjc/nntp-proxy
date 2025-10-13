@@ -5,7 +5,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-use nntp_proxy::{Config, NntpProxy, RoutingMode, ServerConfig, load_config};
+use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
+
+mod config_helpers;
+use config_helpers::*;
 
 /// Helper function to find an available port
 async fn find_available_port() -> u16 {
@@ -62,30 +65,8 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     // Create proxy configuration
     let config = Config {
         servers: vec![
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port1,
-                name: "Mock Server 1".to_string(),
-                username: None,
-                password: None,
-                max_connections: 10,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive_secs: 0,
-            },
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port2,
-                name: "Mock Server 2".to_string(),
-                username: None,
-                password: None,
-                max_connections: 10,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive_secs: 0,
-            },
+            create_test_server_config_with_max_connections("127.0.0.1", mock_port1, "Mock Server 1", 10),
+            create_test_server_config_with_max_connections("127.0.0.1", mock_port2, "Mock Server 2", 10),
         ],
         ..Default::default()
     };
@@ -210,30 +191,8 @@ async fn test_round_robin_distribution() -> Result<()> {
     // Create proxy configuration
     let config = Config {
         servers: vec![
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port1,
-                name: "Mock Server 1".to_string(),
-                username: None,
-                password: None,
-                max_connections: 10,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive_secs: 0,
-            },
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port2,
-                name: "Mock Server 2".to_string(),
-                username: None,
-                password: None,
-                max_connections: 10,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive_secs: 0,
-            },
+            create_test_server_config_with_max_connections("127.0.0.1", mock_port1, "Mock Server 1", 10),
+            create_test_server_config_with_max_connections("127.0.0.1", mock_port2, "Mock Server 2", 10),
         ],
         ..Default::default()
     };
@@ -315,18 +274,9 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
 
     // Create proxy configuration with a server that doesn't exist
     let config = Config {
-        servers: vec![ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: nonexistent_port,
-            name: "Nonexistent Server".to_string(),
-            username: None,
-            password: None,
-            max_connections: 10,
-            use_tls: false,
-            tls_verify_cert: true,
-            tls_cert_path: None,
-            connection_keepalive_secs: 0,
-        }],
+        servers: vec![
+            create_test_server_config_with_max_connections("127.0.0.1", nonexistent_port, "Nonexistent Server", 10),
+        ],
         ..Default::default()
     };
 
@@ -390,18 +340,7 @@ fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     Config {
         servers: server_ports
             .into_iter()
-            .map(|(port, name)| ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port,
-                name: name.to_string(),
-                username: None,
-                password: None,
-                max_connections: 5,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive_secs: 0,
-            })
+            .map(|(port, name)| create_test_server_config(&"127.0.0.1", port, &name))
             .collect(),
         ..Default::default()
     }
@@ -755,30 +694,8 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
 
     let config = Config {
         servers: vec![
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port1,
-                name: "Mock Server 1".to_string(),
-                username: None,
-                password: None,
-                max_connections: 5,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive_secs: 0,
-            },
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port2,
-                name: "Mock Server 2".to_string(),
-                username: None,
-                password: None,
-                max_connections: 5,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive_secs: 0,
-            },
+            create_test_server_config("127.0.0.1", mock_port1, "Mock Server 1"),
+            create_test_server_config("127.0.0.1", mock_port2, "Mock Server 2"),
         ],
         ..Default::default()
     };
@@ -858,18 +775,9 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
-        servers: vec![ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: mock_port,
-            name: "Mock Server".to_string(),
-            username: None,
-            password: None,
-            max_connections: 5, // Allow max 4 stateful connections (5-1)
-            use_tls: false,
-            tls_verify_cert: true,
-            tls_cert_path: None,
-            connection_keepalive_secs: 0,
-        }],
+        servers: vec![
+            create_test_server_config("127.0.0.1", mock_port, "Mock Server"),
+        ],
         ..Default::default()
     };
 
@@ -959,18 +867,9 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
-        servers: vec![ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: mock_port,
-            name: "Mock Server".to_string(),
-            username: None,
-            password: None,
-            max_connections: 6, // Allow max 5 stateful connections (6-1)
-            use_tls: false,
-            tls_verify_cert: true,
-            tls_cert_path: None,
-            connection_keepalive_secs: 0,
-        }],
+        servers: vec![
+            create_test_server_config_with_max_connections("127.0.0.1", mock_port, "Mock Server", 6),
+        ],
         ..Default::default()
     };
 

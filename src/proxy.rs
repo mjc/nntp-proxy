@@ -327,6 +327,7 @@ mod tests {
     use std::sync::Arc;
 
     fn create_test_config() -> Config {
+        use crate::config::{default_health_check_max_per_cycle, default_health_check_pool_timeout_ms};
         Config {
             servers: vec![
                 ServerConfig {
@@ -340,6 +341,8 @@ mod tests {
                     tls_verify_cert: true,
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -352,6 +355,8 @@ mod tests {
                     tls_verify_cert: true,
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "server3.example.com".to_string(),
@@ -364,6 +369,8 @@ mod tests {
                     tls_verify_cert: true,
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
             ],
             ..Default::default()

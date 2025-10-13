@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use deadpool::managed;
 use thiserror::Error;
 use tokio::net::TcpStream;
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::constants::pool::{
@@ -54,6 +56,43 @@ pub enum HealthCheckError {
 impl From<HealthCheckError> for managed::RecycleError<anyhow::Error> {
     fn from(err: HealthCheckError) -> Self {
         managed::RecycleError::Message(err.to_string().into())
+    }
+}
+
+/// Metrics for periodic health checks
+#[derive(Debug, Default, Clone)]
+pub struct HealthCheckMetrics {
+    /// Total number of health check cycles run
+    pub cycles_run: u64,
+    /// Total number of connections checked
+    pub connections_checked: u64,
+    /// Total number of connections that failed health checks
+    pub connections_failed: u64,
+    /// Last check timestamp
+    pub last_check_time: Option<std::time::Instant>,
+}
+
+impl HealthCheckMetrics {
+    /// Create a new metrics instance
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a health check cycle
+    pub fn record_cycle(&mut self, checked: u64, failed: u64) {
+        self.cycles_run += 1;
+        self.connections_checked += checked;
+        self.connections_failed += failed;
+        self.last_check_time = Some(std::time::Instant::now());
+    }
+
+    /// Get the failure rate (0.0 to 1.0)
+    pub fn failure_rate(&self) -> f64 {
+        if self.connections_checked == 0 {
+            0.0
+        } else {
+            self.connections_failed as f64 / self.connections_checked as f64
+        }
     }
 }
 
@@ -310,6 +349,12 @@ pub struct DeadpoolConnectionProvider {
     /// Keepalive interval for periodic health checks (stored for debugging/info)
     #[allow(dead_code)]
     keepalive_interval: Option<std::time::Duration>,
+    /// Shutdown signal sender for background health check task
+    /// Kept alive to enable graceful shutdown when the provider is dropped
+    #[allow(dead_code)]
+    shutdown_tx: Option<broadcast::Sender<()>>,
+    /// Metrics for health check operations
+    pub health_check_metrics: Arc<Mutex<HealthCheckMetrics>>,
 }
 
 impl DeadpoolConnectionProvider {
@@ -331,6 +376,8 @@ impl DeadpoolConnectionProvider {
             pool, 
             name,
             keepalive_interval: None,
+            shutdown_tx: None,
+            health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
         }
     }
 
@@ -355,6 +402,8 @@ impl DeadpoolConnectionProvider {
             pool, 
             name,
             keepalive_interval: None,
+            shutdown_tx: None,
+            health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
         }
     }
 
@@ -381,22 +430,32 @@ impl DeadpoolConnectionProvider {
             None
         };
 
-        let provider = Self { 
-            pool: pool.clone(), 
-            name: server.name.clone(),
-            keepalive_interval,
+        // Create metrics and shutdown channel if keepalive is enabled
+        let metrics = Arc::new(Mutex::new(HealthCheckMetrics::new()));
+        let shutdown_tx = if keepalive_interval.is_some() {
+            let (tx, rx) = broadcast::channel(1);
+            
+            // Spawn background health check task
+            let pool_clone = pool.clone();
+            let name_clone = server.name.clone();
+            let interval = keepalive_interval.unwrap();
+            let metrics_clone = metrics.clone();
+            tokio::spawn(async move {
+                Self::run_periodic_health_checks(pool_clone, name_clone, interval, rx, metrics_clone).await;
+            });
+            
+            Some(tx)
+        } else {
+            None
         };
 
-        // Spawn background health check task if keepalive is enabled
-        if let Some(interval) = keepalive_interval {
-            let pool_clone = pool;
-            let name_clone = server.name.clone();
-            tokio::spawn(async move {
-                Self::run_periodic_health_checks(pool_clone, name_clone, interval).await;
-            });
+        Self { 
+            pool, 
+            name: server.name.clone(),
+            keepalive_interval,
+            shutdown_tx,
+            health_check_metrics: metrics,
         }
-
-        provider
     }
 
     /// Get a connection from the pool (automatically returned when dropped)
@@ -414,19 +473,57 @@ impl DeadpoolConnectionProvider {
         self.pool.status().max_size
     }
 
-    /// Run periodic health checks on idle connections
-    async fn run_periodic_health_checks(pool: Pool, name: String, interval: std::time::Duration) {
-        use tokio::time::{sleep, Duration};
-        use tracing::{debug, warn};
+    /// Get a snapshot of the current health check metrics
+    ///
+    /// Returns None if the metrics lock cannot be acquired.
+    pub fn get_health_check_metrics(&self) -> Option<HealthCheckMetrics> {
+        self.health_check_metrics.lock().ok().map(|m| m.clone())
+    }
 
-        debug!(
-            "Starting periodic health checks for pool '{}' every {} seconds",
-            name,
-            interval.as_secs()
+    /// Gracefully shutdown the periodic health check task
+    ///
+    /// This sends a shutdown signal to the background health check task.
+    /// The task will complete its current cycle and then terminate.
+    pub fn shutdown(&self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Run periodic health checks on idle connections
+    ///
+    /// This task runs in the background checking a limited number of idle connections
+    /// each cycle. It can be gracefully shut down via the shutdown_rx channel.
+    /// Health check metrics are recorded in the provided metrics object.
+    async fn run_periodic_health_checks(
+        pool: Pool,
+        name: String,
+        interval: std::time::Duration,
+        mut shutdown_rx: broadcast::Receiver<()>,
+        metrics: Arc<Mutex<HealthCheckMetrics>>,
+    ) {
+        use crate::constants::pool::{
+            HEALTH_CHECK_POOL_TIMEOUT_MS, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE,
+        };
+        use tokio::time::{sleep, Duration};
+        use tracing::{debug, info, warn};
+
+        info!(
+            pool = %name,
+            interval_secs = interval.as_secs(),
+            "Starting periodic health checks"
         );
 
         loop {
-            sleep(interval).await;
+            tokio::select! {
+                _ = sleep(interval) => {
+                    // Time to run health check
+                }
+                _ = shutdown_rx.recv() => {
+                    info!(pool = %name, "Shutting down periodic health check task");
+                    break;
+                }
+            }
 
             let status = pool.status();
             if status.available == 0 {
@@ -434,17 +531,19 @@ impl DeadpoolConnectionProvider {
             }
 
             debug!(
-                "Running health check on {} idle connections in pool '{}'",
-                status.available, name
+                pool = %name,
+                available = status.available,
+                max_check = MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE,
+                "Running health check cycle"
             );
 
-            // Check up to 5 idle connections per cycle to avoid holding the pool
-            let check_count = std::cmp::min(status.available, 5);
+            // Check up to MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE idle connections per cycle
+            let check_count = std::cmp::min(status.available, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE);
             let mut checked = 0;
             let mut failed = 0;
 
             let mut timeouts = managed::Timeouts::new();
-            timeouts.wait = Some(Duration::from_millis(100));
+            timeouts.wait = Some(Duration::from_millis(HEALTH_CHECK_POOL_TIMEOUT_MS));
 
             for _ in 0..check_count {
                 if let Ok(mut conn_obj) = pool.timeout_get(&timeouts).await {
@@ -454,8 +553,9 @@ impl DeadpoolConnectionProvider {
                     if let Err(e) = check_date_response(&mut conn_obj).await {
                         failed += 1;
                         warn!(
-                            "Health check failed for connection in pool '{}': {}. Connection will be discarded.",
-                            name, e
+                            pool = %name,
+                            error = %e,
+                            "Health check failed, discarding connection"
                         );
                         // Drop the connection without returning it to pool
                         drop(managed::Object::take(conn_obj));
@@ -469,12 +569,21 @@ impl DeadpoolConnectionProvider {
             }
 
             if checked > 0 {
+                // Record metrics
+                if let Ok(mut m) = metrics.lock() {
+                    m.record_cycle(checked, failed);
+                }
+                
                 debug!(
-                    "Health check complete for pool '{}': checked {}, failed {}",
-                    name, checked, failed
+                    pool = %name,
+                    checked = checked,
+                    failed = failed,
+                    "Health check cycle complete"
                 );
             }
         }
+
+        info!(pool = %name, "Periodic health check task terminated");
     }
 
     /// Gracefully shutdown the pool
@@ -834,20 +943,25 @@ mod tests {
         let name = "test-pool".to_string();
         let interval = Duration::from_millis(500);
         
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let metrics = Arc::new(Mutex::new(HealthCheckMetrics::new()));
+        
         let checker_handle = tokio::spawn(async move {
-            // Run just one cycle
             DeadpoolConnectionProvider::run_periodic_health_checks(
                 pool_clone, 
                 name, 
-                interval
+                interval,
+                shutdown_rx,
+                metrics
             ).await;
         });
 
         // Wait for one health check cycle to complete
         sleep(Duration::from_millis(600)).await;
         
-        // Stop the checker
-        checker_handle.abort();
+        // Stop the checker gracefully
+        let _ = shutdown_tx.send(());
+        let _ = checker_handle.await;
 
         // Healthy connections should still be in the pool
         let status_after = pool.status();
