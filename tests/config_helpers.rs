@@ -14,6 +14,7 @@ pub fn create_test_server_config(host: &str, port: u16, name: &str) -> ServerCon
         use_tls: false,
         tls_verify_cert: true,
         tls_cert_path: None,
+        connection_keepalive_secs: 0,
     }
 }
 
@@ -35,6 +36,7 @@ pub fn create_test_server_config_with_auth(
         use_tls: false,
         tls_verify_cert: true,
         tls_cert_path: None,
+        connection_keepalive_secs: 0,
     }
 }
 
@@ -56,6 +58,7 @@ pub fn create_test_server_config_with_tls(
         use_tls: true,
         tls_verify_cert,
         tls_cert_path,
+        connection_keepalive_secs: 0,
     }
 }
 
@@ -76,6 +79,7 @@ pub fn create_test_server_config_with_max_connections(
         use_tls: false,
         tls_verify_cert: true,
         tls_cert_path: None,
+        connection_keepalive_secs: 0,
     }
 }
 

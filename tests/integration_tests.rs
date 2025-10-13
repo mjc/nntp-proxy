@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-use nntp_proxy::{Config, NntpProxy, ServerConfig, load_config, RoutingMode};
+use nntp_proxy::{Config, NntpProxy, RoutingMode, ServerConfig, load_config};
 
 /// Helper function to find an available port
 async fn find_available_port() -> u16 {
@@ -72,6 +72,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             },
             ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -83,6 +84,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             },
         ],
         ..Default::default()
@@ -218,6 +220,7 @@ async fn test_round_robin_distribution() -> Result<()> {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             },
             ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -229,6 +232,7 @@ async fn test_round_robin_distribution() -> Result<()> {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             },
         ],
         ..Default::default()
@@ -321,6 +325,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
             use_tls: false,
             tls_verify_cert: true,
             tls_cert_path: None,
+            connection_keepalive_secs: 0,
         }],
         ..Default::default()
     };
@@ -395,6 +400,7 @@ fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             })
             .collect(),
         ..Default::default()
@@ -759,6 +765,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             },
             ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -770,6 +777,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             },
         ],
         ..Default::default()
@@ -805,7 +813,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     // Send multiple stateless commands - should distribute across backends
     let stateless_commands = vec![
         "LIST\r\n",
-        "DATE\r\n", 
+        "DATE\r\n",
         "CAPABILITIES\r\n",
         "HELP\r\n",
         "ARTICLE <msg1@example.com>\r\n",
@@ -838,7 +846,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test] 
+#[tokio::test]
 async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     // Test hybrid mode switching from per-command to stateful on GROUP command
     let mock_port = find_available_port().await;
@@ -850,19 +858,18 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
-        servers: vec![
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port,
-                name: "Mock Server".to_string(),
-                username: None,
-                password: None,
-                max_connections: 5, // Allow max 4 stateful connections (5-1)
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-            },
-        ],
+        servers: vec![ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: mock_port,
+            name: "Mock Server".to_string(),
+            username: None,
+            password: None,
+            max_connections: 5, // Allow max 4 stateful connections (5-1)
+            use_tls: false,
+            tls_verify_cert: true,
+            tls_cert_path: None,
+            connection_keepalive_secs: 0,
+        }],
         ..Default::default()
     };
 
@@ -901,7 +908,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     assert!(n > 0);
 
     // Send GROUP command - should trigger switch to stateful mode
-    client.write_all(b"GROUP alt.test\r\n").await?; 
+    client.write_all(b"GROUP alt.test\r\n").await?;
     client.flush().await?;
 
     // Read response
@@ -916,12 +923,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     assert!(n > 0, "Empty response to GROUP command");
 
     // Now send stateful commands that should work
-    let stateful_commands = vec![
-        "ARTICLE 1\r\n",
-        "HEAD 2\r\n", 
-        "XOVER 1-10\r\n",
-        "NEXT\r\n",
-    ];
+    let stateful_commands = vec!["ARTICLE 1\r\n", "HEAD 2\r\n", "XOVER 1-10\r\n", "NEXT\r\n"];
 
     for cmd in stateful_commands {
         client.write_all(cmd.as_bytes()).await?;
@@ -957,19 +959,18 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
-        servers: vec![
-            ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: mock_port,
-                name: "Mock Server".to_string(),
-                username: None,
-                password: None,
-                max_connections: 6, // Allow max 5 stateful connections (6-1)
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-            },
-        ],
+        servers: vec![ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: mock_port,
+            name: "Mock Server".to_string(),
+            username: None,
+            password: None,
+            max_connections: 6, // Allow max 5 stateful connections (6-1)
+            use_tls: false,
+            tls_verify_cert: true,
+            tls_cert_path: None,
+            connection_keepalive_secs: 0,
+        }],
         ..Default::default()
     };
 
@@ -998,11 +999,11 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     let proxy_addr_clone = proxy_addr.clone();
     client_tasks.push(tokio::spawn(async move {
         let mut client = TcpStream::connect(&proxy_addr_clone).await.unwrap();
-        
+
         // Read greeting
         let mut buffer = [0; 1024];
         let _ = client.read(&mut buffer).await.unwrap();
-        
+
         // Send only stateless commands
         for _ in 0..3 {
             client.write_all(b"LIST\r\n").await.unwrap();
@@ -1010,7 +1011,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
             buffer = [0; 1024];
             let _ = client.read(&mut buffer).await.unwrap();
         }
-        
+
         client.write_all(b"QUIT\r\n").await.unwrap();
     }));
 
@@ -1018,46 +1019,49 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     let proxy_addr_clone = proxy_addr.clone();
     client_tasks.push(tokio::spawn(async move {
         let mut client = TcpStream::connect(&proxy_addr_clone).await.unwrap();
-        
+
         // Read greeting
         let mut buffer = [0; 1024];
         let _ = client.read(&mut buffer).await.unwrap();
-        
+
         // Start with stateless
         client.write_all(b"DATE\r\n").await.unwrap();
         client.flush().await.unwrap();
         buffer = [0; 1024];
         let _ = client.read(&mut buffer).await.unwrap();
-        
+
         // Switch to stateful
         client.write_all(b"GROUP alt.test\r\n").await.unwrap();
         client.flush().await.unwrap();
         buffer = [0; 1024];
         let _ = client.read(&mut buffer).await.unwrap();
-        
+
         // Use stateful commands
         client.write_all(b"ARTICLE 1\r\n").await.unwrap();
         client.flush().await.unwrap();
         buffer = [0; 1024];
         let _ = client.read(&mut buffer).await.unwrap();
-        
+
         client.write_all(b"QUIT\r\n").await.unwrap();
     }));
 
     // Client 3: Another stateless client
     client_tasks.push(tokio::spawn(async move {
         let mut client = TcpStream::connect(&proxy_addr).await.unwrap();
-        
+
         // Read greeting
         let mut buffer = [0; 1024];
         let _ = client.read(&mut buffer).await.unwrap();
-        
+
         // Send only stateless commands
-        client.write_all(b"ARTICLE <msg@example.com>\r\n").await.unwrap();
+        client
+            .write_all(b"ARTICLE <msg@example.com>\r\n")
+            .await
+            .unwrap();
         client.flush().await.unwrap();
         buffer = [0; 1024];
         let _ = client.read(&mut buffer).await.unwrap();
-        
+
         client.write_all(b"QUIT\r\n").await.unwrap();
     }));
 
@@ -1093,25 +1097,45 @@ async fn create_smart_mock_server(port: u16, server_name: &str) -> Result<()> {
 
                     let command = String::from_utf8_lossy(&buffer[..n]);
                     let command = command.trim();
-                    
+
                     let response = match command {
                         cmd if cmd.starts_with("QUIT") => {
                             let _ = stream.write_all(b"205 Goodbye\r\n").await;
                             break;
                         }
-                        cmd if cmd.starts_with("LIST") => "215 List of newsgroups\r\nalt.test 100 1 y\r\n.\r\n",
+                        cmd if cmd.starts_with("LIST") => {
+                            "215 List of newsgroups\r\nalt.test 100 1 y\r\n.\r\n"
+                        }
                         cmd if cmd.starts_with("DATE") => "111 20231013120000\r\n",
-                        cmd if cmd.starts_with("CAPABILITIES") => "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n",
-                        cmd if cmd.starts_with("HELP") => "100 Help text\r\nCommands available\r\n.\r\n",
+                        cmd if cmd.starts_with("CAPABILITIES") => {
+                            "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                        }
+                        cmd if cmd.starts_with("HELP") => {
+                            "100 Help text\r\nCommands available\r\n.\r\n"
+                        }
                         cmd if cmd.starts_with("GROUP") => "211 100 1 100 alt.test\r\n",
-                        cmd if cmd.starts_with("ARTICLE") && cmd.contains('<') => "220 1 <msg@example.com>\r\nSubject: Test\r\n\r\nTest body\r\n.\r\n",
-                        cmd if cmd.starts_with("ARTICLE") => "220 1 <current@example.com>\r\nSubject: Current\r\n\r\nCurrent body\r\n.\r\n",
-                        cmd if cmd.starts_with("HEAD") && cmd.contains('<') => "221 1 <msg@example.com>\r\nSubject: Test\r\n.\r\n",
-                        cmd if cmd.starts_with("HEAD") => "221 1 <current@example.com>\r\nSubject: Current\r\n.\r\n",
-                        cmd if cmd.starts_with("BODY") && cmd.contains('<') => "222 1 <msg@example.com>\r\nTest body\r\n.\r\n",
-                        cmd if cmd.starts_with("BODY") => "222 1 <current@example.com>\r\nCurrent body\r\n.\r\n",
+                        cmd if cmd.starts_with("ARTICLE") && cmd.contains('<') => {
+                            "220 1 <msg@example.com>\r\nSubject: Test\r\n\r\nTest body\r\n.\r\n"
+                        }
+                        cmd if cmd.starts_with("ARTICLE") => {
+                            "220 1 <current@example.com>\r\nSubject: Current\r\n\r\nCurrent body\r\n.\r\n"
+                        }
+                        cmd if cmd.starts_with("HEAD") && cmd.contains('<') => {
+                            "221 1 <msg@example.com>\r\nSubject: Test\r\n.\r\n"
+                        }
+                        cmd if cmd.starts_with("HEAD") => {
+                            "221 1 <current@example.com>\r\nSubject: Current\r\n.\r\n"
+                        }
+                        cmd if cmd.starts_with("BODY") && cmd.contains('<') => {
+                            "222 1 <msg@example.com>\r\nTest body\r\n.\r\n"
+                        }
+                        cmd if cmd.starts_with("BODY") => {
+                            "222 1 <current@example.com>\r\nCurrent body\r\n.\r\n"
+                        }
                         cmd if cmd.starts_with("STAT") => "223 1 <current@example.com>\r\n",
-                        cmd if cmd.starts_with("XOVER") => "224 Overview\r\n1\tTest Subject\tauthor@example.com\t13 Oct 2023\t<msg1@example.com>\t\t100\t5\r\n.\r\n",
+                        cmd if cmd.starts_with("XOVER") => {
+                            "224 Overview\r\n1\tTest Subject\tauthor@example.com\t13 Oct 2023\t<msg1@example.com>\t\t100\t5\r\n.\r\n"
+                        }
                         cmd if cmd.starts_with("NEXT") => "223 2 <next@example.com>\r\n",
                         cmd if cmd.starts_with("LAST") => "223 1 <prev@example.com>\r\n",
                         cmd if cmd.starts_with("AUTHINFO") => "281 Authentication accepted\r\n",

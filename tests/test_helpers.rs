@@ -147,6 +147,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             })
             .collect(),
         health_check: Default::default(),
@@ -175,6 +176,7 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
+                connection_keepalive_secs: 0,
             })
             .collect(),
         health_check: Default::default(),

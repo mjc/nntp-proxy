@@ -532,10 +532,9 @@ impl ClientSession {
                 "Client {} cannot switch to stateful mode: backend {:?} stateful limit reached",
                 self.client_addr, backend_id
             );
-            const STATEFUL_SLOTS_ERROR: &[u8] = b"503 All stateful connection slots are in use. Try again later.\r\n";
-            client_write
-                .write_all(STATEFUL_SLOTS_ERROR)
-                .await?;
+            const STATEFUL_SLOTS_ERROR: &[u8] =
+                b"503 All stateful connection slots are in use. Try again later.\r\n";
+            client_write.write_all(STATEFUL_SLOTS_ERROR).await?;
             backend_to_client_bytes += STATEFUL_SLOTS_ERROR.len() as u64;
 
             // Continue in per-command mode
@@ -1197,13 +1196,13 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(1024, 4);
         let router = Arc::new(BackendSelector::new());
-        
+
         // Test hybrid mode session creation
         let session = ClientSession::new_with_router(
-            addr, 
-            buffer_pool.clone(), 
-            router.clone(), 
-            RoutingMode::Hybrid
+            addr,
+            buffer_pool.clone(),
+            router.clone(),
+            RoutingMode::Hybrid,
         );
 
         assert!(session.is_per_command_routing());
@@ -1219,10 +1218,10 @@ mod tests {
 
         // Test Standard mode
         let session = ClientSession::new_with_router(
-            addr, 
-            buffer_pool.clone(), 
-            router.clone(), 
-            RoutingMode::Standard
+            addr,
+            buffer_pool.clone(),
+            router.clone(),
+            RoutingMode::Standard,
         );
         // Standard mode still has per-command routing capability (router is present)
         assert!(session.is_per_command_routing());
@@ -1230,10 +1229,10 @@ mod tests {
 
         // Test PerCommand mode
         let session = ClientSession::new_with_router(
-            addr, 
-            buffer_pool.clone(), 
-            router.clone(), 
-            RoutingMode::PerCommand
+            addr,
+            buffer_pool.clone(),
+            router.clone(),
+            RoutingMode::PerCommand,
         );
         assert!(session.is_per_command_routing());
         assert_eq!(session.routing_mode, RoutingMode::PerCommand);
@@ -1241,10 +1240,10 @@ mod tests {
 
         // Test Hybrid mode
         let session = ClientSession::new_with_router(
-            addr, 
-            buffer_pool.clone(), 
-            router.clone(), 
-            RoutingMode::Hybrid
+            addr,
+            buffer_pool.clone(),
+            router.clone(),
+            RoutingMode::Hybrid,
         );
         assert!(session.is_per_command_routing());
         assert_eq!(session.routing_mode, RoutingMode::Hybrid);
@@ -1258,12 +1257,8 @@ mod tests {
         let buffer_pool = BufferPool::new(1024, 4);
         let router = Arc::new(BackendSelector::new());
 
-        let session = ClientSession::new_with_router(
-            addr,
-            buffer_pool,
-            router,
-            RoutingMode::Hybrid,
-        );
+        let session =
+            ClientSession::new_with_router(addr, buffer_pool, router, RoutingMode::Hybrid);
 
         // Initially should be in per-command mode
         assert_eq!(session.mode, SessionMode::PerCommand);
@@ -1279,28 +1274,28 @@ mod tests {
 
         // Standard mode has router capability (can do per-command routing)
         let session = ClientSession::new_with_router(
-            addr, 
-            buffer_pool.clone(), 
-            router.clone(), 
-            RoutingMode::Standard
+            addr,
+            buffer_pool.clone(),
+            router.clone(),
+            RoutingMode::Standard,
         );
         assert!(session.is_per_command_routing());
 
         // PerCommand mode should be per-command routing
         let session = ClientSession::new_with_router(
-            addr, 
-            buffer_pool.clone(), 
-            router.clone(), 
-            RoutingMode::PerCommand
+            addr,
+            buffer_pool.clone(),
+            router.clone(),
+            RoutingMode::PerCommand,
         );
         assert!(session.is_per_command_routing());
 
         // Hybrid mode should be per-command routing (initially)
         let session = ClientSession::new_with_router(
-            addr, 
-            buffer_pool.clone(), 
-            router.clone(), 
-            RoutingMode::Hybrid
+            addr,
+            buffer_pool.clone(),
+            router.clone(),
+            RoutingMode::Hybrid,
         );
         assert!(session.is_per_command_routing());
 
@@ -1308,6 +1303,4 @@ mod tests {
         let session = ClientSession::new(addr, buffer_pool);
         assert!(!session.is_per_command_routing());
     }
-
-
 }
