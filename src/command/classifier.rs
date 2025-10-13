@@ -49,6 +49,15 @@ pub enum NntpCommand {
 }
 
 impl NntpCommand {
+    /// Check if this command requires stateful session (for hybrid routing mode)
+    ///
+    /// Returns true if the command requires a dedicated backend connection
+    /// with maintained state (e.g., GROUP, XOVER, article-by-number).
+    #[inline]
+    pub fn is_stateful(&self) -> bool {
+        matches!(self, Self::Stateful)
+    }
+
     /// Classify an NNTP command based on its content using fast byte-level parsing
     /// Ordered by frequency (most common first) for optimal short-circuit performance
     ///
@@ -454,5 +463,26 @@ mod tests {
             NntpCommand::classify("ihave <msg>"),
             NntpCommand::NonRoutable
         );
+    }
+
+    #[test]
+    fn test_is_stateful() {
+        // Stateful commands should return true
+        assert!(NntpCommand::Stateful.is_stateful());
+
+        // All other commands should return false
+        assert!(!NntpCommand::ArticleByMessageId.is_stateful());
+        assert!(!NntpCommand::Stateless.is_stateful());
+        assert!(!NntpCommand::AuthUser.is_stateful());
+        assert!(!NntpCommand::AuthPass.is_stateful());
+        assert!(!NntpCommand::NonRoutable.is_stateful());
+
+        // Test with classified commands
+        assert!(NntpCommand::classify("GROUP alt.test").is_stateful());
+        assert!(NntpCommand::classify("XOVER 1-100").is_stateful());
+        assert!(NntpCommand::classify("ARTICLE 123").is_stateful());
+        assert!(!NntpCommand::classify("ARTICLE <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::classify("LIST").is_stateful());
+        assert!(!NntpCommand::classify("AUTHINFO USER test").is_stateful());
     }
 }

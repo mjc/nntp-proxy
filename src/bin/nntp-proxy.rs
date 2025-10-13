@@ -53,16 +53,21 @@ struct Args {
     #[arg(short, long, default_value = "8119", env = "NNTP_PROXY_PORT")]
     port: u16,
 
-    /// Enable per-command routing mode (each command can use a different backend)
+    /// Routing mode: standard, per-command, or hybrid
     ///
-    /// Can be overridden with NNTP_PROXY_PER_COMMAND_ROUTING environment variable
+    /// - standard: 1:1 mode, each client gets a dedicated backend connection
+    /// - per-command: Each command can use a different backend (stateless only)
+    /// - hybrid: Starts in per-command mode, auto-switches to stateful on first stateful command
+    ///
+    /// Can be overridden with NNTP_PROXY_ROUTING_MODE environment variable
     #[arg(
-        short = 'r',
-        long,
-        default_value = "false",
-        env = "NNTP_PROXY_PER_COMMAND_ROUTING"
+        short = 'm',
+        long = "routing-mode",
+        value_enum,
+        default_value = "hybrid",
+        env = "NNTP_PROXY_ROUTING_MODE"
     )]
-    per_command_routing: bool,
+    routing_mode: RoutingModeArg,
 
     /// Configuration file path
     ///
@@ -75,6 +80,24 @@ struct Args {
     /// Can be overridden with NNTP_PROXY_THREADS environment variable
     #[arg(short, long, env = "NNTP_PROXY_THREADS")]
     threads: Option<usize>,
+}
+
+/// Routing mode for CLI argument parsing
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum RoutingModeArg {
+    Standard,
+    PerCommand,
+    Hybrid,
+}
+
+impl From<RoutingModeArg> for nntp_proxy::RoutingMode {
+    fn from(arg: RoutingModeArg) -> Self {
+        match arg {
+            RoutingModeArg::Standard => nntp_proxy::RoutingMode::Standard,
+            RoutingModeArg::PerCommand => nntp_proxy::RoutingMode::PerCommand,
+            RoutingModeArg::Hybrid => nntp_proxy::RoutingMode::Hybrid,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -150,8 +173,11 @@ async fn run_proxy(args: Args) -> Result<()> {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
 
+    // Convert routing mode arg to internal type
+    let routing_mode: nntp_proxy::RoutingMode = args.routing_mode.into();
+
     // Create proxy (wrapped in Arc for sharing across tasks)
-    let proxy = Arc::new(NntpProxy::new(config)?);
+    let proxy = Arc::new(NntpProxy::new(config, routing_mode)?);
 
     // Prewarm connection pools before accepting clients
     info!("Prewarming connection pools...");
@@ -163,13 +189,25 @@ async fn run_proxy(args: Args) -> Result<()> {
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&listen_addr).await?;
-    if args.per_command_routing {
-        info!(
-            "NNTP proxy listening on {} (per-command routing mode)",
-            listen_addr
-        );
-    } else {
-        info!("NNTP proxy listening on {} (1:1 mode)", listen_addr);
+    match routing_mode {
+        nntp_proxy::RoutingMode::Standard => {
+            info!(
+                "NNTP proxy listening on {} (standard 1:1 mode)",
+                listen_addr
+            );
+        }
+        nntp_proxy::RoutingMode::PerCommand => {
+            info!(
+                "NNTP proxy listening on {} (per-command routing mode)",
+                listen_addr
+            );
+        }
+        nntp_proxy::RoutingMode::Hybrid => {
+            info!(
+                "NNTP proxy listening on {} (hybrid routing mode)",
+                listen_addr
+            );
+        }
     }
 
     // Set up graceful shutdown
@@ -186,23 +224,37 @@ async fn run_proxy(args: Args) -> Result<()> {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
-                if args.per_command_routing {
-                    // Per-command routing mode
-                    tokio::spawn(async move {
-                        if let Err(e) = proxy_clone
-                            .handle_client_per_command_routing(stream, addr)
-                            .await
-                        {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
-                } else {
-                    // Traditional 1:1 mode
-                    tokio::spawn(async move {
-                        if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
+                match routing_mode {
+                    nntp_proxy::RoutingMode::Standard => {
+                        // Traditional 1:1 mode
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy_clone.handle_client(stream, addr).await {
+                                error!("Error handling client {}: {}", addr, e);
+                            }
+                        });
+                    }
+                    nntp_proxy::RoutingMode::PerCommand => {
+                        // Per-command routing mode
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy_clone
+                                .handle_client_per_command_routing(stream, addr)
+                                .await
+                            {
+                                error!("Error handling client {}: {}", addr, e);
+                            }
+                        });
+                    }
+                    nntp_proxy::RoutingMode::Hybrid => {
+                        // Hybrid routing mode - starts in per-command, switches to stateful on demand
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy_clone
+                                .handle_client_per_command_routing(stream, addr)
+                                .await
+                            {
+                                error!("Error handling client {}: {}", addr, e);
+                            }
+                        });
+                    }
                 }
             }
             Err(e) => {

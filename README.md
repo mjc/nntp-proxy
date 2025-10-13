@@ -1,15 +1,15 @@
 # NNTP Proxy
 
-A high-performance NNTP proxy server written in Rust, with round-robin load balancing, TLS support, and optional per-command routing.
+A high-performance NNTP proxy server written in Rust, with intelligent hybrid routing, round-robin load balancing, and TLS support.
 
 ## Key Features
 
+- 🧠 **Hybrid routing mode** - Intelligent per-command routing that auto-switches to stateful when needed (default)
 - 🔄 **Round-robin load balancing** - Distributes connections across multiple backend servers
 - 🔐 **TLS/SSL support** - Secure backend connections using rustls with system certificate store
 - ⚡ **High performance** - Lock-free routing, optimized response parsing, efficient I/O
 - 🏥 **Health checking** - Automatic backend health monitoring with failure detection
--  **Per-command routing mode** - Optional stateless routing for resource efficiency
-- 📊 **Connection pooling** - Pre-authenticated connections with configurable limits
+- 📊 **Connection pooling** - Pre-authenticated connections with configurable limits and reservation
 - 🛡️ **Type-safe protocol handling** - RFC 3977 compliant parsing with comprehensive validation
 - ⚙️ **TOML configuration** - Simple, readable configuration with sensible defaults
 - 🔍 **Structured logging** - Detailed tracing for debugging and monitoring
@@ -30,10 +30,11 @@ A high-performance NNTP proxy server written in Rust, with round-robin load bala
 
 ## Overview
 
-This NNTP proxy offers two operating modes:
+This NNTP proxy offers three operating modes:
 
-1. **Standard mode** (default) - Full NNTP proxy with complete command support
-2. **Per-command routing mode** (`--per-command-routing` or `-r`) - Stateless routing for resource efficiency
+1. **Hybrid mode** (default) - Starts with per-command routing, automatically switches to stateful when needed
+2. **Standard mode** (`--routing-mode standard`) - Full NNTP proxy with complete command support
+3. **Per-command routing mode** (`--routing-mode per-command`) - Pure stateless routing for maximum efficiency
 
 ### Design Goals
 
@@ -45,18 +46,24 @@ This NNTP proxy offers two operating modes:
 
 ### When to Use This Proxy
 
+✅ **Hybrid mode (default) - Best for:**
+- **Universal compatibility** - Works with any NNTP client automatically
+- **Optimal performance** - Efficient per-command routing until stateful operations needed
+- **Intelligent switching** - Automatically detects when clients need stateful mode (GROUP, XOVER, etc.)
+- **Resource efficiency** - Uses per-command routing when possible, stateful only when necessary
+- **Most deployments** - Recommended default that adapts to client behavior
+
 ✅ **Standard mode - Good for:**
-- Traditional newsreaders (tin, slrn, Thunderbird, SABnzbd)
-- Any NNTP client requiring stateful operations (GROUP, NEXT, LAST, etc.)
-- Load balancing with full RFC 3977 protocol support
-- Drop-in replacement for direct backend connections
+- Traditional newsreaders requiring guaranteed stateful behavior
+- Debugging or when you need predictable 1:1 connection mapping
+- Legacy deployments where hybrid mode is not desired
 - Maximum compatibility and simplicity
 
 ✅ **Per-command routing mode - Good for:**
-- Message-ID based article retrieval workloads
+- Message-ID based article retrieval workloads only
 - Indexing and search tools that only need ARTICLE/BODY/HEAD by message-ID
-- Distributing stateless commands across multiple backends
-- Resource-efficient deployment with many concurrent clients
+- Specialized deployments where stateful operations are never needed
+- Maximum resource efficiency when you control all clients
 
 ❌ **Not suitable for:**
 - Scenarios requiring concurrent request processing (NNTP is inherently serial)
@@ -79,11 +86,20 @@ When running in **per-command routing mode** (`--per-command-routing` or `-r`), 
 - ✅ Posting: `POST` (if backend supports)
 - ✅ Authentication: `AUTHINFO USER/PASS` (handled by proxy)
 
-**Rationale:** Commands requiring group context (current article number, group selection) cannot work reliably when each command routes to a different backend. Use standard mode if you need these features.
+**Rationale:** Commands requiring group context (current article number, group selection) cannot work reliably when each command routes to a different backend. Use standard mode or hybrid mode if you need these features.
 
-### Standard Mode (Default)
+### Hybrid Mode Advantage (Default)
 
-In **standard mode** (without `--per-command-routing`):
+**Hybrid mode** automatically handles the per-command routing limitations:
+- ✅ **Starts efficiently** - Uses per-command routing for stateless operations (ARTICLE by message-ID, LIST, etc.)
+- ✅ **Switches intelligently** - Detects stateful commands (GROUP, XOVER, etc.) and seamlessly switches to dedicated backend
+- ✅ **Universal compatibility** - Works with any NNTP client without configuration
+- ✅ **Resource efficient** - Uses shared pool when possible, dedicated connections only when needed
+- ✅ **Best of both worlds** - Combines per-command efficiency with full protocol support
+
+### Standard Mode
+
+In **standard mode** (`--routing-mode standard`):
 - ✅ **All RFC 3977 commands supported** - full bidirectional forwarding
 - ✅ Compatible with all NNTP clients
 - ✅ Stateful operations work normally (GROUP, NEXT, LAST, XOVER, etc.)
@@ -313,7 +329,7 @@ nntp-proxy [OPTIONS]
 | Option | Short | Environment Variable | Description | Default |
 |--------|-------|---------------------|-------------|---------|
 | `--port <PORT>` | `-p` | `NNTP_PROXY_PORT` | Listen port | 8119 |
-| `--per-command-routing` | `-r` | `NNTP_PROXY_PER_COMMAND_ROUTING` | Enable per-command routing mode | false |
+| `--routing-mode <MODE>` | `-r` | `NNTP_PROXY_ROUTING_MODE` | Routing mode: hybrid, standard, per-command | hybrid |
 | `--config <FILE>` | `-c` | `NNTP_PROXY_CONFIG` | Config file path | config.toml |
 | `--threads <NUM>` | `-t` | `NNTP_PROXY_THREADS` | Tokio worker threads | CPU cores |
 | `--help` | `-h` | - | Show help | - |
@@ -324,17 +340,21 @@ nntp-proxy [OPTIONS]
 ### Examples
 
 ```bash
-# Standard mode with defaults
+# Hybrid mode with defaults (recommended)
 nntp-proxy
 
-# Custom port and config
+# Custom port and config (still uses hybrid mode)
 nntp-proxy --port 8120 --config production.toml
 
-# Per-command routing mode (long form)
-nntp-proxy --per-command-routing
+# Standard mode (full stateful behavior)
+nntp-proxy --routing-mode standard
 
-# Per-command routing mode (short form)
-nntp-proxy -r
+# Per-command routing mode (pure stateless)
+nntp-proxy --routing-mode per-command
+
+# Short form for routing modes
+nntp-proxy -r standard
+nntp-proxy -r per-command
 
 # Single-threaded for debugging
 nntp-proxy --threads 1
@@ -363,21 +383,31 @@ docker run -d \
 
 ### Operating Modes
 
-#### Standard Mode (default)
+#### Hybrid Mode (default) - `--routing-mode hybrid`
+
+- **Intelligent switching** - Starts each client in efficient per-command routing mode
+- **Auto-detection** - Switches to stateful mode when client uses GROUP, XOVER, NEXT, LAST, etc.
+- **Resource efficiency** - Uses shared connection pool until stateful behavior is needed
+- **Seamless transition** - Switching happens transparently without client awareness
+- **Pool reservation** - Reserves stateful connections (max_connections - 1) while keeping 1 for per-command routing
+- **Universal compatibility** - Works with any NNTP client, optimizing automatically based on usage patterns
+
+#### Standard Mode - `--routing-mode standard`
 
 - One backend connection per client
 - Simple 1:1 connection forwarding
 - All NNTP commands supported
 - Lower overhead, easier debugging
+- Predictable behavior for legacy deployments
 
-#### Per-Command Routing Mode (`-r` / `--per-command-routing`)
+#### Per-Command Routing Mode - `--routing-mode per-command`
 
 - Each command routed to next backend (round-robin)
 - Commands processed serially (one at a time)
 - Multiple clients share backend pool
 - Health-aware routing
 - Better resource distribution
-- Stateful commands rejected
+- Stateful commands rejected (GROUP, XOVER, etc.)
 
 ## Architecture
 
@@ -414,6 +444,27 @@ The `protocol` module centralizes all NNTP protocol knowledge:
   - Terminator detection for streaming responses
 
 ### How It Works
+
+#### Hybrid Mode Flow (Default)
+
+```
+Client Connection
+    ↓
+Send Greeting (200 NNTP Proxy Ready)
+    ↓
+Read Command
+    ↓
+Classify Command (is_stateful check)
+    ↓
+┌─ Stateless Command ─────┐    ┌─ Stateful Command ────┐
+│  Route to Backend       │    │  Switch to Stateful   │
+│  (per-command routing)  │    │  Reserve Backend       │
+│  Execute & Stream       │    │  Bidirectional Forward │
+│  Return to Pool         │    │  (until disconnect)    │
+└─────────────────────────┘    └────────────────────────┘
+    ↓                              ↓
+Return to Command Reading      Connection Cleanup
+```
 
 #### Standard Mode Flow
 

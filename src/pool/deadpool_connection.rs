@@ -267,6 +267,13 @@ impl DeadpoolConnectionProvider {
             .map_err(|e| anyhow::anyhow!("Failed to get connection from {}: {}", self.name, e))
     }
 
+    /// Get the maximum pool size
+    #[must_use]
+    #[inline]
+    pub fn max_size(&self) -> usize {
+        self.pool.status().max_size
+    }
+
     /// Gracefully shutdown the pool
     pub async fn graceful_shutdown(&self) {
         use deadpool::managed::Object;

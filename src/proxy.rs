@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, ServerConfig};
+use crate::config::{Config, RoutingMode, ServerConfig};
 use crate::constants::buffer::{BUFFER_POOL_SIZE, BUFFER_SIZE};
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
@@ -28,10 +28,12 @@ pub struct NntpProxy {
     connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     buffer_pool: BufferPool,
+    /// Routing mode (Standard, PerCommand, or Hybrid)
+    routing_mode: RoutingMode,
 }
 
 impl NntpProxy {
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config, routing_mode: RoutingMode) -> Result<Self> {
         if config.servers.is_empty() {
             anyhow::bail!("No servers configured in configuration");
         }
@@ -71,6 +73,7 @@ impl NntpProxy {
             router,
             connection_providers,
             buffer_pool,
+            routing_mode,
         })
     }
 
@@ -247,6 +250,7 @@ impl NntpProxy {
             client_addr,
             self.buffer_pool.clone(),
             self.router.clone(),
+            self.routing_mode,
         );
 
         info!(
@@ -366,7 +370,9 @@ mod tests {
     #[test]
     fn test_proxy_creation_with_servers() {
         let config = create_test_config();
-        let proxy = Arc::new(NntpProxy::new(config).expect("Failed to create proxy"));
+        let proxy = Arc::new(
+            NntpProxy::new(config, RoutingMode::Standard).expect("Failed to create proxy"),
+        );
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.servers()[0].name, "Test Server 1");
@@ -378,7 +384,7 @@ mod tests {
             servers: vec![],
             ..Default::default()
         };
-        let result = NntpProxy::new(config);
+        let result = NntpProxy::new(config, RoutingMode::Standard);
 
         assert!(result.is_err());
         assert!(
@@ -392,7 +398,9 @@ mod tests {
     #[test]
     fn test_proxy_has_router() {
         let config = create_test_config();
-        let proxy = Arc::new(NntpProxy::new(config).expect("Failed to create proxy"));
+        let proxy = Arc::new(
+            NntpProxy::new(config, RoutingMode::Standard).expect("Failed to create proxy"),
+        );
 
         // Proxy should have a router with backends
         assert_eq!(proxy.router.backend_count(), 3);

@@ -49,6 +49,8 @@ struct BackendInfo {
     provider: DeadpoolConnectionProvider,
     /// Number of pending requests on this backend (for load balancing)
     pending_count: Arc<AtomicUsize>,
+    /// Number of connections in stateful mode (for hybrid routing reservation)
+    stateful_count: Arc<AtomicUsize>,
 }
 
 /// Selects backend servers using round-robin with load tracking
@@ -124,6 +126,7 @@ impl BackendSelector {
             name,
             provider,
             pending_count: Arc::new(AtomicUsize::new(0)),
+            stateful_count: Arc::new(AtomicUsize::new(0)),
         });
     }
 
@@ -191,6 +194,74 @@ impl BackendSelector {
             .iter()
             .find(|b| b.id == backend_id)
             .map(|b| b.pending_count.load(Ordering::Relaxed))
+    }
+
+    /// Try to acquire a stateful connection slot for hybrid mode
+    /// Returns true if acquisition succeeded (within max_connections-1 limit)
+    /// Returns false if all stateful slots are taken (need to keep 1 for PCR)
+    pub fn try_acquire_stateful(&self, backend_id: BackendId) -> bool {
+        if let Some(backend) = self.backends.iter().find(|b| b.id == backend_id) {
+            // Get max connections from the provider's pool
+            let max_connections = backend.provider.max_size();
+
+            // Reserve 1 connection for per-command routing
+            let max_stateful = max_connections.saturating_sub(1);
+
+            // Try to increment if we haven't hit the limit
+            let mut current = backend.stateful_count.load(Ordering::Acquire);
+            loop {
+                if current >= max_stateful {
+                    debug!(
+                        "Backend {:?} ({}) stateful limit reached: {}/{}",
+                        backend_id, backend.name, current, max_stateful
+                    );
+                    return false;
+                }
+
+                match backend.stateful_count.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        debug!(
+                            "Backend {:?} ({}) acquired stateful slot: {}/{}",
+                            backend_id,
+                            backend.name,
+                            current + 1,
+                            max_stateful
+                        );
+                        return true;
+                    }
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+        false
+    }
+
+    /// Release a stateful connection slot
+    pub fn release_stateful(&self, backend_id: BackendId) {
+        if let Some(backend) = self.backends.iter().find(|b| b.id == backend_id) {
+            let prev = backend.stateful_count.fetch_sub(1, Ordering::Release);
+            debug!(
+                "Backend {:?} ({}) released stateful slot: {}/{}",
+                backend_id,
+                backend.name,
+                prev.saturating_sub(1),
+                backend.provider.max_size().saturating_sub(1)
+            );
+        }
+    }
+
+    /// Get the number of stateful connections for a backend
+    #[must_use]
+    pub fn stateful_count(&self, backend_id: BackendId) -> Option<usize> {
+        self.backends
+            .iter()
+            .find(|b| b.id == backend_id)
+            .map(|b| b.stateful_count.load(Ordering::Relaxed))
     }
 }
 

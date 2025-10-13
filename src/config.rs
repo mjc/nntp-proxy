@@ -6,6 +6,38 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Routing mode for the proxy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    /// Standard 1:1 mode - each client gets a dedicated backend connection
+    Standard,
+    /// Per-command routing - each command can use a different backend (stateless only)
+    PerCommand,
+    /// Hybrid mode - starts in per-command routing, auto-switches to stateful on first stateful command
+    Hybrid,
+}
+
+impl Default for RoutingMode {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
+impl RoutingMode {
+    /// Check if this mode supports per-command routing
+    #[must_use]
+    pub fn supports_per_command_routing(&self) -> bool {
+        matches!(self, Self::PerCommand | Self::Hybrid)
+    }
+
+    /// Check if this mode can handle stateful commands
+    #[must_use]
+    pub fn supports_stateful_commands(&self) -> bool {
+        matches!(self, Self::Standard | Self::Hybrid)
+    }
+}
+
 /// Default maximum connections per server
 fn default_max_connections() -> u32 {
     10
