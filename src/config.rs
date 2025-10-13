@@ -197,6 +197,15 @@ impl Config {
                     server.name
                 ));
             }
+            // Warn if connection_keepalive_secs is unusually high (> 5 minutes)
+            if server.connection_keepalive_secs > 300 {
+                tracing::warn!(
+                    "Server '{}' has connection_keepalive_secs set to {} seconds (> 5 minutes). \
+                     This may cause excessive health check traffic. Consider a lower value.",
+                    server.name,
+                    server.connection_keepalive_secs
+                );
+            }
         }
 
         // Validate health check configuration
