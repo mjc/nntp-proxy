@@ -166,25 +166,53 @@ impl managed::Manager for TcpManager {
     async fn recycle(
         &self,
         conn: &mut ConnectionStream,
-        _: &managed::Metrics,
+        _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
-        // Fast TCP-level health check: try reading without blocking
-        // Healthy idle connections return WouldBlock, dead ones return 0 or error
-        let mut peek_buf = [0u8; 1];
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
 
-        // Only plain TCP supports try_read directly, for TLS we just return Ok
+        // First, do a fast TCP-level check for obviously dead connections
+        let mut peek_buf = [0u8; 1];
         match conn {
-            ConnectionStream::Plain(tcp) => match tcp.try_read(&mut peek_buf) {
-                Ok(0) => Err(managed::RecycleError::Message("Connection closed".into())),
-                Ok(_) => Err(managed::RecycleError::Message("Unexpected data".into())),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-                Err(e) => Err(managed::RecycleError::Message(format!("{}", e).into())),
-            },
-            ConnectionStream::Tls(_) => {
-                // For TLS connections, we can't easily peek without blocking
-                // Just assume the connection is healthy
-                Ok(())
+            ConnectionStream::Plain(tcp) => {
+                match tcp.try_read(&mut peek_buf) {
+                    Ok(0) => return Err(managed::RecycleError::Message("Connection closed".into())),
+                    Ok(_) => return Err(managed::RecycleError::Message("Unexpected data".into())),
+                    Err(ref e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                        return Err(managed::RecycleError::Message(format!("{}", e).into()));
+                    }
+                    Err(_) => {} // WouldBlock is expected, continue to application-level check
+                }
             }
+            ConnectionStream::Tls(_) => {
+                // TLS connections need application-level check
+            }
+        }
+
+        // Application-level health check: send DATE command to verify the connection is still alive
+        // This detects server-side timeouts that TCP keepalive might miss
+        let health_check_cmd = b"DATE\r\n";
+        
+        // Send DATE command with timeout
+        if let Err(e) = timeout(Duration::from_secs(2), conn.write_all(health_check_cmd)).await {
+            return Err(managed::RecycleError::Message(format!("Health check write timeout: {}", e).into()));
+        }
+
+        // Read response with timeout
+        let mut response_buf = [0u8; 512];
+        match timeout(Duration::from_secs(2), conn.read(&mut response_buf)).await {
+            Ok(Ok(0)) => Err(managed::RecycleError::Message("Connection closed during health check".into())),
+            Ok(Ok(n)) => {
+                let response = String::from_utf8_lossy(&response_buf[..n]);
+                // DATE should return "111 YYYYMMDDhhmmss" response
+                if response.starts_with("111 ") {
+                    Ok(())
+                } else {
+                    Err(managed::RecycleError::Message(format!("Unexpected health check response: {}", response.trim()).into()))
+                }
+            }
+            Ok(Err(e)) => Err(managed::RecycleError::Message(format!("Health check read error: {}", e).into())),
+            Err(_) => Err(managed::RecycleError::Message("Health check read timeout".into())),
         }
     }
 
