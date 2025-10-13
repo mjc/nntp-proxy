@@ -8,10 +8,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthHandler;
-use crate::command::{AuthAction, CommandAction, CommandHandler};
+use crate::command::{AuthAction, CommandAction, CommandHandler, NntpCommand};
+use crate::config::RoutingMode;
 use crate::constants::buffer::{COMMAND_SIZE, STREAMING_CHUNK_SIZE};
 use crate::pool::BufferPool;
 use crate::protocol::{
@@ -22,6 +23,15 @@ use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
 use crate::types::ClientId;
 
+/// Session mode for hybrid routing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMode {
+    /// Per-command routing mode - each command can use a different backend
+    PerCommand,
+    /// Stateful mode - using a dedicated backend connection
+    Stateful,
+}
+
 /// Represents an active client session
 pub struct ClientSession {
     client_addr: SocketAddr,
@@ -30,6 +40,10 @@ pub struct ClientSession {
     client_id: ClientId,
     /// Optional router for per-command routing mode
     router: Option<Arc<BackendSelector>>,
+    /// Current session mode (for hybrid routing)
+    mode: SessionMode,
+    /// Routing mode configuration (Standard, PerCommand, or Hybrid)
+    routing_mode: RoutingMode,
 }
 
 impl ClientSession {
@@ -41,6 +55,8 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: None,
+            mode: SessionMode::Stateful, // 1:1 mode is always stateful
+            routing_mode: RoutingMode::Standard,
         }
     }
 
@@ -50,12 +66,15 @@ impl ClientSession {
         client_addr: SocketAddr,
         buffer_pool: BufferPool,
         router: Arc<BackendSelector>,
+        routing_mode: RoutingMode,
     ) -> Self {
         Self {
             client_addr,
             buffer_pool,
             client_id: ClientId::new(),
             router: Some(router),
+            mode: SessionMode::PerCommand, // Starts in per-command mode
+            routing_mode,
         }
     }
 
@@ -71,6 +90,13 @@ impl ClientSession {
     #[inline]
     pub fn is_per_command_routing(&self) -> bool {
         self.router.is_some()
+    }
+
+    /// Get the current session mode
+    #[must_use]
+    #[inline]
+    pub fn mode(&self) -> SessionMode {
+        self.mode
     }
 
     /// Handle client connection with a pooled backend connection
@@ -281,7 +307,7 @@ impl ClientSession {
                         break;
                     }
 
-                    // Check if command should be rejected (stateful commands)
+                    // Check if command should be rejected or if we need to switch modes in hybrid routing
                     match CommandHandler::handle_command(&command) {
                         CommandAction::InterceptAuth(auth_action) => {
                             // Handle authentication locally
@@ -294,6 +320,28 @@ impl ClientSession {
                             continue;
                         }
                         CommandAction::Reject(reason) => {
+                            // In hybrid mode, stateful commands trigger a switch to stateful connection
+                            if self.routing_mode == RoutingMode::Hybrid
+                                && NntpCommand::classify(&command).is_stateful()
+                            {
+                                info!(
+                                    "Client {} switching to stateful mode (command: {})",
+                                    self.client_addr, trimmed
+                                );
+
+                                // Switch to stateful mode - acquire a dedicated backend connection
+                                return self
+                                    .switch_to_stateful_mode(
+                                        client_reader,
+                                        client_write,
+                                        &command,
+                                        client_to_backend_bytes,
+                                        backend_to_client_bytes,
+                                    )
+                                    .await;
+                            }
+
+                            // In non-hybrid per-command mode, reject stateful commands
                             warn!(
                                 "Rejecting command from client {}: {} ({})",
                                 self.client_addr, trimmed, reason
@@ -450,6 +498,156 @@ impl ClientSession {
                 self.client_addr, client_to_backend_bytes, backend_to_client_bytes
             );
         }
+
+        Ok((client_to_backend_bytes, backend_to_client_bytes))
+    }
+
+    /// Switch from per-command routing to stateful mode with a dedicated backend connection
+    /// This is called in hybrid mode when a stateful command is detected
+    async fn switch_to_stateful_mode(
+        &self,
+        mut client_reader: tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
+        mut client_write: tokio::net::tcp::WriteHalf<'_>,
+        initial_command: &str,
+        mut client_to_backend_bytes: u64,
+        mut backend_to_client_bytes: u64,
+    ) -> Result<(u64, u64)> {
+        debug!(
+            "Client {} acquiring dedicated backend connection for stateful mode",
+            self.client_addr
+        );
+
+        let router = self
+            .router
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Router not available"))?;
+
+        // Get a backend for this session
+        let backend_id = router.route_command_sync(self.client_id, initial_command)?;
+
+        // Try to acquire a stateful slot (respects max_connections-1 limit)
+        if !router.try_acquire_stateful(backend_id) {
+            // All stateful slots are taken - reject this switch
+            warn!(
+                "Client {} cannot switch to stateful mode: backend {:?} stateful limit reached",
+                self.client_addr, backend_id
+            );
+            const STATEFUL_SLOTS_ERROR: &[u8] = b"503 All stateful connection slots are in use. Try again later.\r\n";
+            client_write
+                .write_all(STATEFUL_SLOTS_ERROR)
+                .await?;
+            backend_to_client_bytes += STATEFUL_SLOTS_ERROR.len() as u64;
+
+            // Continue in per-command mode
+            return Ok((client_to_backend_bytes, backend_to_client_bytes));
+        }
+
+        let provider = router.get_backend_provider(backend_id).ok_or_else(|| {
+            // Release the slot if provider lookup fails
+            router.release_stateful(backend_id);
+            anyhow::anyhow!("Backend {:?} not found", backend_id)
+        })?;
+
+        // Acquire a dedicated connection from the pool
+        let mut pooled_conn = match provider.get_pooled_connection().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Release the stateful slot on connection failure
+                router.release_stateful(backend_id);
+                return Err(e);
+            }
+        };
+
+        info!(
+            "Client {} switched to stateful mode with backend {:?}",
+            self.client_addr, backend_id
+        );
+
+        // Forward the initial command that triggered the switch
+        pooled_conn.write_all(initial_command.as_bytes()).await?;
+        // Only increment byte count after successful write
+        client_to_backend_bytes += initial_command.len() as u64;
+
+        // Read and forward the initial response chunk
+        let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
+        let n = pooled_conn.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "Backend connection closed while reading initial response"
+            ));
+        }
+        client_write.write_all(&chunk[..n]).await?;
+        backend_to_client_bytes += n as u64;
+
+        // Now enter bidirectional forwarding mode - hold this connection until client disconnects
+        debug!(
+            "Client {} entering stateful bidirectional forwarding",
+            self.client_addr
+        );
+
+        // Manual bidirectional forwarding using select!
+        // We can't use copy_bidirectional because the pooled_conn must be dropped properly
+        let buffer_c2b = self.buffer_pool.get_buffer().await;
+        let mut buffer_b2c = self.buffer_pool.get_buffer().await;
+        let mut command = String::with_capacity(COMMAND_SIZE);
+
+        loop {
+            tokio::select! {
+                // Read from client and forward to backend
+                result = client_reader.read_line(&mut command) => {
+                    match result {
+                        Ok(0) => {
+                            debug!("Client {} disconnected from stateful session", self.client_addr);
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = pooled_conn.write_all(command.as_bytes()).await {
+                                debug!("Backend write error for client {}: {}", self.client_addr, e);
+                                break;
+                            }
+                            client_to_backend_bytes += n as u64;
+                            command.clear();
+                        }
+                        Err(e) => {
+                            debug!("Client {} read error in stateful mode: {}", self.client_addr, e);
+                            break;
+                        }
+                    }
+                }
+
+                // Read from backend and forward to client
+                result = pooled_conn.read(&mut buffer_b2c) => {
+                    match result {
+                        Ok(0) => {
+                            debug!("Backend disconnected while in stateful mode for client {}", self.client_addr);
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = client_write.write_all(&buffer_b2c[..n]).await {
+                                debug!("Client write error for {}: {}", self.client_addr, e);
+                                break;
+                            }
+                            backend_to_client_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            debug!("Backend read error for client {}: {}", self.client_addr, e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.buffer_pool.return_buffer(buffer_c2b).await;
+        self.buffer_pool.return_buffer(buffer_b2c).await;
+
+        // Release the stateful slot
+        router.release_stateful(backend_id);
+
+        info!(
+            "Client {} stateful session ended: {} bytes sent, {} bytes received",
+            self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+        );
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
     }
@@ -788,7 +986,8 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(1024, 4);
         let router = Arc::new(BackendSelector::new());
-        let session = ClientSession::new_with_router(addr, buffer_pool, router);
+        let session =
+            ClientSession::new_with_router(addr, buffer_pool, router, RoutingMode::PerCommand);
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.client_addr.port(), 8080);
@@ -808,7 +1007,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_quit_command_per_command_routing() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         // Start a mock server for the backend
@@ -852,7 +1050,12 @@ mod tests {
 
         // Create session
         let buffer_pool = BufferPool::new(1024, 4);
-        let session = ClientSession::new_with_router(client_addr, buffer_pool, Arc::new(router));
+        let session = ClientSession::new_with_router(
+            client_addr,
+            buffer_pool,
+            Arc::new(router),
+            RoutingMode::PerCommand,
+        );
 
         // Spawn client that sends QUIT and immediately closes
         let client_handle = tokio::spawn(async move {
@@ -900,7 +1103,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_quit_command_closes_connection_cleanly() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         // Start a mock backend
@@ -938,7 +1140,12 @@ mod tests {
         let client_addr = client_listener.local_addr().unwrap();
 
         let buffer_pool = BufferPool::new(1024, 4);
-        let session = ClientSession::new_with_router(client_addr, buffer_pool, Arc::new(router));
+        let session = ClientSession::new_with_router(
+            client_addr,
+            buffer_pool,
+            Arc::new(router),
+            RoutingMode::PerCommand,
+        );
 
         // Client that sends QUIT and waits for response
         let client_handle = tokio::spawn(async move {
@@ -970,4 +1177,137 @@ mod tests {
 
         client_handle.await.unwrap();
     }
+
+    #[test]
+    fn test_session_mode_enum() {
+        // Test SessionMode enum behavior
+        assert_eq!(SessionMode::PerCommand, SessionMode::PerCommand);
+        assert_eq!(SessionMode::Stateful, SessionMode::Stateful);
+        assert_ne!(SessionMode::PerCommand, SessionMode::Stateful);
+
+        // Test Debug formatting
+        let per_command = format!("{:?}", SessionMode::PerCommand);
+        let stateful = format!("{:?}", SessionMode::Stateful);
+        assert!(per_command.contains("PerCommand"));
+        assert!(stateful.contains("Stateful"));
+    }
+
+    #[test]
+    fn test_hybrid_session_creation() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(1024, 4);
+        let router = Arc::new(BackendSelector::new());
+        
+        // Test hybrid mode session creation
+        let session = ClientSession::new_with_router(
+            addr, 
+            buffer_pool.clone(), 
+            router.clone(), 
+            RoutingMode::Hybrid
+        );
+
+        assert!(session.is_per_command_routing());
+        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode, SessionMode::PerCommand);
+    }
+
+    #[test]
+    fn test_routing_mode_configurations() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(1024, 4);
+        let router = Arc::new(BackendSelector::new());
+
+        // Test Standard mode
+        let session = ClientSession::new_with_router(
+            addr, 
+            buffer_pool.clone(), 
+            router.clone(), 
+            RoutingMode::Standard
+        );
+        // Standard mode still has per-command routing capability (router is present)
+        assert!(session.is_per_command_routing());
+        assert_eq!(session.routing_mode, RoutingMode::Standard);
+
+        // Test PerCommand mode
+        let session = ClientSession::new_with_router(
+            addr, 
+            buffer_pool.clone(), 
+            router.clone(), 
+            RoutingMode::PerCommand
+        );
+        assert!(session.is_per_command_routing());
+        assert_eq!(session.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(session.mode, SessionMode::PerCommand);
+
+        // Test Hybrid mode
+        let session = ClientSession::new_with_router(
+            addr, 
+            buffer_pool.clone(), 
+            router.clone(), 
+            RoutingMode::Hybrid
+        );
+        assert!(session.is_per_command_routing());
+        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode, SessionMode::PerCommand);
+    }
+
+    #[test]
+    fn test_hybrid_mode_initial_state() {
+        // Test that hybrid mode starts in per-command mode
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(1024, 4);
+        let router = Arc::new(BackendSelector::new());
+
+        let session = ClientSession::new_with_router(
+            addr,
+            buffer_pool,
+            router,
+            RoutingMode::Hybrid,
+        );
+
+        // Initially should be in per-command mode
+        assert_eq!(session.mode, SessionMode::PerCommand);
+        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert!(session.is_per_command_routing());
+    }
+
+    #[test]
+    fn test_is_per_command_routing_logic() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(1024, 4);
+        let router = Arc::new(BackendSelector::new());
+
+        // Standard mode has router capability (can do per-command routing)
+        let session = ClientSession::new_with_router(
+            addr, 
+            buffer_pool.clone(), 
+            router.clone(), 
+            RoutingMode::Standard
+        );
+        assert!(session.is_per_command_routing());
+
+        // PerCommand mode should be per-command routing
+        let session = ClientSession::new_with_router(
+            addr, 
+            buffer_pool.clone(), 
+            router.clone(), 
+            RoutingMode::PerCommand
+        );
+        assert!(session.is_per_command_routing());
+
+        // Hybrid mode should be per-command routing (initially)
+        let session = ClientSession::new_with_router(
+            addr, 
+            buffer_pool.clone(), 
+            router.clone(), 
+            RoutingMode::Hybrid
+        );
+        assert!(session.is_per_command_routing());
+
+        // Session without router should not be per-command routing
+        let session = ClientSession::new(addr, buffer_pool);
+        assert!(!session.is_per_command_routing());
+    }
+
+
 }

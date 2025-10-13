@@ -176,8 +176,8 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
 
-    // Create proxy
-    let proxy = Arc::new(NntpProxy::new(config)?);
+    // Create proxy (cache proxy always uses Standard/1:1 mode)
+    let proxy = Arc::new(NntpProxy::new(config, nntp_proxy::RoutingMode::Standard)?);
 
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);

@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-use nntp_proxy::{Config, NntpProxy, ServerConfig, load_config};
+use nntp_proxy::{Config, NntpProxy, ServerConfig, load_config, RoutingMode};
 
 /// Helper function to find an available port
 async fn find_available_port() -> u16 {
@@ -88,7 +88,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -234,7 +234,7 @@ async fn test_round_robin_distribution() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -325,7 +325,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -462,7 +462,7 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
 
     // Create proxy config
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
 
     // Start proxy in per-command routing mode
     spawn_test_proxy(proxy, proxy_port, true).await;
@@ -564,7 +564,7 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
 
     spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -675,7 +675,7 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
     spawn_test_proxy(proxy, proxy_port, true).await;
 
     // Give proxy more time to initialize connection pool
@@ -731,4 +731,396 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
     client.write_all(b"QUIT\r\n").await?;
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_hybrid_mode_stateless_commands() -> Result<()> {
+    // Test hybrid mode with stateless commands only (should stay in per-command routing)
+    let mock_port1 = find_available_port().await;
+    let mock_port2 = find_available_port().await;
+    let proxy_port = find_available_port().await;
+
+    // Start mock servers that track command distribution
+    tokio::spawn(create_smart_mock_server(mock_port1, "Server1"));
+    tokio::spawn(create_smart_mock_server(mock_port2, "Server2"));
+
+    // Give servers time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = Config {
+        servers: vec![
+            ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: mock_port1,
+                name: "Mock Server 1".to_string(),
+                username: None,
+                password: None,
+                max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
+            },
+            ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: mock_port2,
+                name: "Mock Server 2".to_string(),
+                username: None,
+                password: None,
+                max_connections: 5,
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let listener = TcpListener::bind(&proxy_addr).await?;
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = listener.accept().await {
+                let proxy_clone = proxy.clone();
+                tokio::spawn(async move {
+                    let _ = proxy_clone.handle_client(stream, addr).await;
+                });
+            }
+        }
+    });
+
+    // Give proxy time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect to proxy and send stateless commands
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+
+    // Read greeting
+    let mut buffer = [0; 1024];
+    let n = client.read(&mut buffer).await?;
+    let greeting = String::from_utf8_lossy(&buffer[..n]);
+    assert!(greeting.contains("200"));
+
+    // Send multiple stateless commands - should distribute across backends
+    let stateless_commands = vec![
+        "LIST\r\n",
+        "DATE\r\n", 
+        "CAPABILITIES\r\n",
+        "HELP\r\n",
+        "ARTICLE <msg1@example.com>\r\n",
+        "HEAD <msg2@example.com>\r\n",
+        "BODY <msg3@example.com>\r\n",
+        "STAT <msg4@example.com>\r\n",
+    ];
+
+    for cmd in stateless_commands {
+        client.write_all(cmd.as_bytes()).await?;
+        client.flush().await?;
+
+        // Read response
+        buffer = [0; 1024];
+        let n = timeout(Duration::from_millis(2000), client.read(&mut buffer))
+            .await
+            .map_err(|_| anyhow::anyhow!("Timeout waiting for response to: {}", cmd.trim()))?
+            .map_err(|e| anyhow::anyhow!("Read error for command {}: {}", cmd.trim(), e))?;
+
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        println!("Response to {}: {}", cmd.trim(), response.trim());
+
+        // Should get some response (exact code depends on mock server implementation)
+        assert!(n > 0, "Empty response to command: {}", cmd.trim());
+    }
+
+    // Send QUIT
+    client.write_all(b"QUIT\r\n").await?;
+
+    Ok(())
+}
+
+#[tokio::test] 
+async fn test_hybrid_mode_stateful_switching() -> Result<()> {
+    // Test hybrid mode switching from per-command to stateful on GROUP command
+    let mock_port = find_available_port().await;
+    let proxy_port = find_available_port().await;
+
+    tokio::spawn(create_smart_mock_server(mock_port, "StatefulServer"));
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = Config {
+        servers: vec![
+            ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: mock_port,
+                name: "Mock Server".to_string(),
+                username: None,
+                password: None,
+                max_connections: 5, // Allow max 4 stateful connections (5-1)
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let listener = TcpListener::bind(&proxy_addr).await?;
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = listener.accept().await {
+                let proxy_clone = proxy.clone();
+                tokio::spawn(async move {
+                    let _ = proxy_clone.handle_client(stream, addr).await;
+                });
+            }
+        }
+    });
+
+    // Give proxy time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect to proxy
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+
+    // Read greeting
+    let mut buffer = [0; 1024];
+    let n = client.read(&mut buffer).await?;
+    let greeting = String::from_utf8_lossy(&buffer[..n]);
+    assert!(greeting.contains("200"));
+
+    // Start with stateless commands
+    client.write_all(b"LIST\r\n").await?;
+    client.flush().await?;
+    buffer = [0; 1024];
+    let n = client.read(&mut buffer).await?;
+    assert!(n > 0);
+
+    // Send GROUP command - should trigger switch to stateful mode
+    client.write_all(b"GROUP alt.test\r\n").await?; 
+    client.flush().await?;
+
+    // Read response
+    buffer = [0; 1024];
+    let n = timeout(Duration::from_millis(2000), client.read(&mut buffer))
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for GROUP response"))?
+        .map_err(|e| anyhow::anyhow!("Read error for GROUP command: {}", e))?;
+
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    println!("GROUP Response: {}", response.trim());
+    assert!(n > 0, "Empty response to GROUP command");
+
+    // Now send stateful commands that should work
+    let stateful_commands = vec![
+        "ARTICLE 1\r\n",
+        "HEAD 2\r\n", 
+        "XOVER 1-10\r\n",
+        "NEXT\r\n",
+    ];
+
+    for cmd in stateful_commands {
+        client.write_all(cmd.as_bytes()).await?;
+        client.flush().await?;
+
+        // Read response
+        buffer = [0; 1024];
+        let n = timeout(Duration::from_millis(2000), client.read(&mut buffer))
+            .await
+            .map_err(|_| anyhow::anyhow!("Timeout waiting for response to: {}", cmd.trim()))?
+            .map_err(|e| anyhow::anyhow!("Read error for command {}: {}", cmd.trim(), e))?;
+
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        println!("Response to {}: {}", cmd.trim(), response.trim());
+        assert!(n > 0, "Empty response to command: {}", cmd.trim());
+    }
+
+    // Send QUIT
+    client.write_all(b"QUIT\r\n").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hybrid_mode_multiple_clients() -> Result<()> {
+    // Test hybrid mode with multiple clients, some stateless, some stateful
+    let mock_port = find_available_port().await;
+    let proxy_port = find_available_port().await;
+
+    tokio::spawn(create_smart_mock_server(mock_port, "MultiServer"));
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = Config {
+        servers: vec![
+            ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: mock_port,
+                name: "Mock Server".to_string(),
+                username: None,
+                password: None,
+                max_connections: 6, // Allow max 5 stateful connections (6-1)
+                use_tls: false,
+                tls_verify_cert: true,
+                tls_cert_path: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let listener = TcpListener::bind(&proxy_addr).await?;
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = listener.accept().await {
+                let proxy_clone = proxy.clone();
+                tokio::spawn(async move {
+                    let _ = proxy_clone.handle_client(stream, addr).await;
+                });
+            }
+        }
+    });
+
+    // Give proxy time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create multiple client tasks
+    let mut client_tasks = Vec::new();
+
+    // Client 1: Stateless only
+    let proxy_addr_clone = proxy_addr.clone();
+    client_tasks.push(tokio::spawn(async move {
+        let mut client = TcpStream::connect(&proxy_addr_clone).await.unwrap();
+        
+        // Read greeting
+        let mut buffer = [0; 1024];
+        let _ = client.read(&mut buffer).await.unwrap();
+        
+        // Send only stateless commands
+        for _ in 0..3 {
+            client.write_all(b"LIST\r\n").await.unwrap();
+            client.flush().await.unwrap();
+            buffer = [0; 1024];
+            let _ = client.read(&mut buffer).await.unwrap();
+        }
+        
+        client.write_all(b"QUIT\r\n").await.unwrap();
+    }));
+
+    // Client 2: Switch to stateful
+    let proxy_addr_clone = proxy_addr.clone();
+    client_tasks.push(tokio::spawn(async move {
+        let mut client = TcpStream::connect(&proxy_addr_clone).await.unwrap();
+        
+        // Read greeting
+        let mut buffer = [0; 1024];
+        let _ = client.read(&mut buffer).await.unwrap();
+        
+        // Start with stateless
+        client.write_all(b"DATE\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        buffer = [0; 1024];
+        let _ = client.read(&mut buffer).await.unwrap();
+        
+        // Switch to stateful
+        client.write_all(b"GROUP alt.test\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        buffer = [0; 1024];
+        let _ = client.read(&mut buffer).await.unwrap();
+        
+        // Use stateful commands
+        client.write_all(b"ARTICLE 1\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        buffer = [0; 1024];
+        let _ = client.read(&mut buffer).await.unwrap();
+        
+        client.write_all(b"QUIT\r\n").await.unwrap();
+    }));
+
+    // Client 3: Another stateless client
+    client_tasks.push(tokio::spawn(async move {
+        let mut client = TcpStream::connect(&proxy_addr).await.unwrap();
+        
+        // Read greeting
+        let mut buffer = [0; 1024];
+        let _ = client.read(&mut buffer).await.unwrap();
+        
+        // Send only stateless commands
+        client.write_all(b"ARTICLE <msg@example.com>\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        buffer = [0; 1024];
+        let _ = client.read(&mut buffer).await.unwrap();
+        
+        client.write_all(b"QUIT\r\n").await.unwrap();
+    }));
+
+    // Wait for all clients to complete
+    for task in client_tasks {
+        task.await?;
+    }
+
+    Ok(())
+}
+
+/// Enhanced mock server that can handle more NNTP-like responses
+async fn create_smart_mock_server(port: u16, server_name: &str) -> Result<()> {
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&addr).await?;
+    let server_name = server_name.to_string();
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let server_name_clone = server_name.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0; 1024];
+
+                // Send welcome message
+                let welcome = format!("200 {} Mock NNTP Server Ready\r\n", server_name_clone);
+                let _ = stream.write_all(welcome.as_bytes()).await;
+
+                // Handle commands
+                while let Ok(n) = stream.read(&mut buffer).await {
+                    if n == 0 {
+                        break;
+                    }
+
+                    let command = String::from_utf8_lossy(&buffer[..n]);
+                    let command = command.trim();
+                    
+                    let response = match command {
+                        cmd if cmd.starts_with("QUIT") => {
+                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                            break;
+                        }
+                        cmd if cmd.starts_with("LIST") => "215 List of newsgroups\r\nalt.test 100 1 y\r\n.\r\n",
+                        cmd if cmd.starts_with("DATE") => "111 20231013120000\r\n",
+                        cmd if cmd.starts_with("CAPABILITIES") => "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n",
+                        cmd if cmd.starts_with("HELP") => "100 Help text\r\nCommands available\r\n.\r\n",
+                        cmd if cmd.starts_with("GROUP") => "211 100 1 100 alt.test\r\n",
+                        cmd if cmd.starts_with("ARTICLE") && cmd.contains('<') => "220 1 <msg@example.com>\r\nSubject: Test\r\n\r\nTest body\r\n.\r\n",
+                        cmd if cmd.starts_with("ARTICLE") => "220 1 <current@example.com>\r\nSubject: Current\r\n\r\nCurrent body\r\n.\r\n",
+                        cmd if cmd.starts_with("HEAD") && cmd.contains('<') => "221 1 <msg@example.com>\r\nSubject: Test\r\n.\r\n",
+                        cmd if cmd.starts_with("HEAD") => "221 1 <current@example.com>\r\nSubject: Current\r\n.\r\n",
+                        cmd if cmd.starts_with("BODY") && cmd.contains('<') => "222 1 <msg@example.com>\r\nTest body\r\n.\r\n",
+                        cmd if cmd.starts_with("BODY") => "222 1 <current@example.com>\r\nCurrent body\r\n.\r\n",
+                        cmd if cmd.starts_with("STAT") => "223 1 <current@example.com>\r\n",
+                        cmd if cmd.starts_with("XOVER") => "224 Overview\r\n1\tTest Subject\tauthor@example.com\t13 Oct 2023\t<msg1@example.com>\t\t100\t5\r\n.\r\n",
+                        cmd if cmd.starts_with("NEXT") => "223 2 <next@example.com>\r\n",
+                        cmd if cmd.starts_with("LAST") => "223 1 <prev@example.com>\r\n",
+                        cmd if cmd.starts_with("AUTHINFO") => "281 Authentication accepted\r\n",
+                        _ => "500 Unknown command\r\n",
+                    };
+
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+        }
+    }
 }
