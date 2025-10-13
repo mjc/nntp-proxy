@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
-use std::fmt;
+use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tracing::info;
@@ -19,46 +19,40 @@ const DATE_COMMAND: &[u8] = b"DATE\r\n";
 const EXPECTED_DATE_RESPONSE_PREFIX: &str = "111 ";
 
 /// Errors that can occur during connection health checks
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum HealthCheckError {
     /// TCP connection is closed
+    #[error("TCP connection closed")]
     TcpClosed,
+
     /// Unexpected data found in the buffer before health check
+    #[error("Unexpected data in buffer")]
     UnexpectedData,
+
     /// TCP-level error occurred
+    #[error("TCP error: {0}")]
     TcpError(std::io::Error),
+
     /// Failed to write DATE command to the connection
+    #[error("Failed to write health check: {0}")]
     WriteError(std::io::Error),
+
     /// Failed to read response from the connection
+    #[error("Failed to read health check response: {0}")]
     ReadError(std::io::Error),
+
     /// Health check operation timed out
+    #[error("Health check timeout")]
     Timeout,
+
     /// Server returned unexpected response to DATE command
+    #[error("Unexpected health check response: {0}")]
     UnexpectedResponse(String),
+
     /// Connection closed while waiting for health check response
+    #[error("Connection closed during health check")]
     ConnectionClosedDuringCheck,
 }
-
-impl fmt::Display for HealthCheckError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TcpClosed => write!(f, "TCP connection closed"),
-            Self::UnexpectedData => write!(f, "Unexpected data in buffer"),
-            Self::TcpError(e) => write!(f, "TCP error: {}", e),
-            Self::WriteError(e) => write!(f, "Failed to write health check: {}", e),
-            Self::ReadError(e) => write!(f, "Failed to read health check response: {}", e),
-            Self::Timeout => write!(f, "Health check timeout"),
-            Self::UnexpectedResponse(response) => {
-                write!(f, "Unexpected health check response: {}", response.trim())
-            }
-            Self::ConnectionClosedDuringCheck => {
-                write!(f, "Connection closed during health check")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HealthCheckError {}
 
 impl From<HealthCheckError> for managed::RecycleError<anyhow::Error> {
     fn from(err: HealthCheckError) -> Self {
