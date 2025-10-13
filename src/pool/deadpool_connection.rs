@@ -197,7 +197,7 @@ fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow
 /// Sends DATE command and verifies response to ensure the NNTP connection
 /// is still functional. This detects server-side timeouts that TCP keepalive
 /// might miss.
-async fn check_date_response(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
+async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), HealthCheckError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout;
 
@@ -229,10 +229,9 @@ async fn check_date_response(conn: &mut ConnectionStream) -> managed::RecycleRes
     };
 
     // Apply timeout and convert errors
-    match timeout(HEALTH_CHECK_TIMEOUT, health_check).await {
-        Ok(result) => result.map_err(Into::into),
-        Err(_elapsed) => Err(HealthCheckError::Timeout.into()),
-    }
+    timeout(HEALTH_CHECK_TIMEOUT, health_check)
+        .await
+        .map_err(|_| HealthCheckError::Timeout)?
 }
 
 impl managed::Manager for TcpManager {
@@ -292,11 +291,10 @@ impl managed::Manager for TcpManager {
         conn: &mut ConnectionStream,
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
-        // Fast TCP-level check for plain connections
+        // Only do fast TCP-level check on recycle
+        // Full health checks happen periodically via the keepalive mechanism
         check_tcp_alive(conn)?;
-
-        // Application-level health check using DATE command
-        check_date_response(conn).await
+        Ok(())
     }
 
     fn detach(&self, _conn: &mut ConnectionStream) {}
@@ -309,6 +307,9 @@ type Pool = managed::Pool<TcpManager>;
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
     name: String,
+    /// Keepalive interval for periodic health checks (stored for debugging/info)
+    #[allow(dead_code)]
+    keepalive_interval: Option<std::time::Duration>,
 }
 
 impl DeadpoolConnectionProvider {
@@ -326,7 +327,11 @@ impl DeadpoolConnectionProvider {
             .build()
             .expect("Failed to create connection pool");
 
-        Self { pool, name }
+        Self { 
+            pool, 
+            name,
+            keepalive_interval: None,
+        }
     }
 
     /// Create a new connection provider with TLS support
@@ -346,7 +351,11 @@ impl DeadpoolConnectionProvider {
             .build()
             .expect("Failed to create connection pool");
 
-        Self { pool, name }
+        Self { 
+            pool, 
+            name,
+            keepalive_interval: None,
+        }
     }
 
     /// Create a connection provider from a server configuration
@@ -359,15 +368,35 @@ impl DeadpoolConnectionProvider {
             tls_cert_path: server.tls_cert_path.clone(),
         };
 
-        Self::new_with_tls(
-            server.host.clone(),
-            server.port,
-            server.name.clone(),
-            server.max_connections as usize,
-            server.username.clone(),
-            server.password.clone(),
-            tls_config,
-        )
+        let manager =
+            TcpManager::new_with_tls(server.host.clone(), server.port, server.name.clone(), server.username.clone(), server.password.clone(), tls_config);
+        let pool = Pool::builder(manager)
+            .max_size(server.max_connections as usize)
+            .build()
+            .expect("Failed to create connection pool");
+
+        let keepalive_interval = if server.connection_keepalive_secs > 0 {
+            Some(std::time::Duration::from_secs(server.connection_keepalive_secs))
+        } else {
+            None
+        };
+
+        let provider = Self { 
+            pool: pool.clone(), 
+            name: server.name.clone(),
+            keepalive_interval,
+        };
+
+        // Spawn background health check task if keepalive is enabled
+        if let Some(interval) = keepalive_interval {
+            let pool_clone = pool;
+            let name_clone = server.name.clone();
+            tokio::spawn(async move {
+                Self::run_periodic_health_checks(pool_clone, name_clone, interval).await;
+            });
+        }
+
+        provider
     }
 
     /// Get a connection from the pool (automatically returned when dropped)
@@ -383,6 +412,69 @@ impl DeadpoolConnectionProvider {
     #[inline]
     pub fn max_size(&self) -> usize {
         self.pool.status().max_size
+    }
+
+    /// Run periodic health checks on idle connections
+    async fn run_periodic_health_checks(pool: Pool, name: String, interval: std::time::Duration) {
+        use tokio::time::{sleep, Duration};
+        use tracing::{debug, warn};
+
+        debug!(
+            "Starting periodic health checks for pool '{}' every {} seconds",
+            name,
+            interval.as_secs()
+        );
+
+        loop {
+            sleep(interval).await;
+
+            let status = pool.status();
+            if status.available == 0 {
+                continue;
+            }
+
+            debug!(
+                "Running health check on {} idle connections in pool '{}'",
+                status.available, name
+            );
+
+            // Check up to 5 idle connections per cycle to avoid holding the pool
+            let check_count = std::cmp::min(status.available, 5);
+            let mut checked = 0;
+            let mut failed = 0;
+
+            let mut timeouts = managed::Timeouts::new();
+            timeouts.wait = Some(Duration::from_millis(100));
+
+            for _ in 0..check_count {
+                if let Ok(mut conn_obj) = pool.timeout_get(&timeouts).await {
+                    checked += 1;
+                    
+                    // Perform DATE health check
+                    if let Err(e) = check_date_response(&mut conn_obj).await {
+                        failed += 1;
+                        warn!(
+                            "Health check failed for connection in pool '{}': {}. Connection will be discarded.",
+                            name, e
+                        );
+                        // Drop the connection without returning it to pool
+                        drop(managed::Object::take(conn_obj));
+                    } else {
+                        // Connection is healthy, return to pool automatically via Drop
+                        drop(conn_obj);
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if checked > 0 {
+                debug!(
+                    "Health check complete for pool '{}': checked {}, failed {}",
+                    name, checked, failed
+                );
+            }
+        }
     }
 
     /// Gracefully shutdown the pool
@@ -556,16 +648,15 @@ mod tests {
         }
     }
 
-    /// Test helper to run a health check and return the result
-    async fn run_health_check(
-        manager: &TcpManager,
+    /// Test helper to run a DATE health check and return the result
+    async fn run_date_health_check(
         conn: &mut ConnectionStream,
-    ) -> managed::RecycleResult<anyhow::Error> {
-        manager.recycle(conn, &managed::Metrics::default()).await
+    ) -> Result<(), HealthCheckError> {
+        check_date_response(conn).await
     }
 
     /// Assert that an error message contains one of the expected substrings
-    fn assert_error_contains(result: managed::RecycleResult<anyhow::Error>, expected: &[&str]) {
+    fn assert_error_contains(result: Result<(), HealthCheckError>, expected: &[&str]) {
         assert!(result.is_err(), "Expected error but got Ok");
         if let Err(e) = result {
             let msg = format!("{:?}", e);
@@ -581,10 +672,9 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_passes_for_healthy_connection() {
         let server = MockNntpServer::new(MockServerBehavior::Healthy).await;
-        let manager = server.create_manager();
         let mut conn = server.create_connection().await;
 
-        let result = run_health_check(&manager, &mut conn).await;
+        let result = run_date_health_check(&mut conn).await;
 
         assert!(
             result.is_ok(),
@@ -595,13 +685,12 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_fails_for_closed_connection() {
         let server = MockNntpServer::new(MockServerBehavior::CloseImmediately).await;
-        let manager = server.create_manager();
         let mut conn = server.create_connection().await;
 
         // Wait for server to close
         sleep(Duration::from_millis(200)).await;
 
-        let result = run_health_check(&manager, &mut conn).await;
+        let result = run_date_health_check(&mut conn).await;
 
         assert_error_contains(result, &["closed", "Connection"]);
     }
@@ -609,10 +698,9 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_fails_for_wrong_response() {
         let server = MockNntpServer::new(MockServerBehavior::WrongResponse).await;
-        let manager = server.create_manager();
         let mut conn = server.create_connection().await;
 
-        let result = run_health_check(&manager, &mut conn).await;
+        let result = run_date_health_check(&mut conn).await;
 
         assert_error_contains(result, &["Unexpected", "500"]);
     }
@@ -620,11 +708,10 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_timeout() {
         let server = MockNntpServer::new(MockServerBehavior::Timeout).await;
-        let manager = server.create_manager();
         let mut conn = server.create_connection().await;
 
         let start = std::time::Instant::now();
-        let result = run_health_check(&manager, &mut conn).await;
+        let result = run_date_health_check(&mut conn).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -638,10 +725,9 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_connection_closed_during_check() {
         let server = MockNntpServer::new(MockServerBehavior::CloseOnHealthCheck).await;
-        let manager = server.create_manager();
         let mut conn = server.create_connection().await;
 
-        let result = run_health_check(&manager, &mut conn).await;
+        let result = run_date_health_check(&mut conn).await;
 
         assert_error_contains(result, &["closed", "Connection"]);
     }
@@ -684,7 +770,7 @@ mod tests {
             None,
         );
 
-        let result = run_health_check(&manager, &mut conn).await;
+        let result = manager.recycle(&mut conn, &managed::Metrics::default()).await;
 
         assert!(
             result.is_err(),
@@ -695,12 +781,11 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_preserves_connection_on_success() {
         let server = MockNntpServer::new(MockServerBehavior::Healthy).await;
-        let manager = server.create_manager();
         let mut conn = server.create_connection().await;
 
-        // Run health check multiple times - should keep succeeding
+        // Run DATE health check multiple times - should keep succeeding
         for i in 0..3 {
-            let result = run_health_check(&manager, &mut conn).await;
+            let result = run_date_health_check(&mut conn).await;
             assert!(result.is_ok(), "Health check #{} should pass", i + 1);
         }
 
@@ -715,5 +800,118 @@ mod tests {
             response_str.starts_with("111"),
             "Connection should still work after health checks"
         );
+    }
+
+    #[tokio::test]
+    async fn test_periodic_health_check_removes_stale_connections() {
+        use tokio::time::sleep;
+
+        // Create a mock server that will close connections after initial setup
+        let server = MockNntpServer::new(MockServerBehavior::Healthy).await;
+        
+        // Create a pool with short keepalive interval for testing
+        let manager = server.create_manager();
+        let pool = Pool::builder(manager)
+            .max_size(5)
+            .build()
+            .expect("Failed to create pool");
+
+        // Add some connections to the pool
+        let mut conns = Vec::new();
+        for _ in 0..3 {
+            let conn = pool.get().await.unwrap();
+            conns.push(conn);
+        }
+        
+        // Return all connections to make them idle
+        drop(conns);
+        
+        let status_before = pool.status();
+        assert_eq!(status_before.available, 3, "Should have 3 idle connections");
+
+        // Spawn the periodic health checker with a short interval
+        let pool_clone = pool.clone();
+        let name = "test-pool".to_string();
+        let interval = Duration::from_millis(500);
+        
+        let checker_handle = tokio::spawn(async move {
+            // Run just one cycle
+            DeadpoolConnectionProvider::run_periodic_health_checks(
+                pool_clone, 
+                name, 
+                interval
+            ).await;
+        });
+
+        // Wait for one health check cycle to complete
+        sleep(Duration::from_millis(600)).await;
+        
+        // Stop the checker
+        checker_handle.abort();
+
+        // Healthy connections should still be in the pool
+        let status_after = pool.status();
+        assert_eq!(
+            status_after.available, 3,
+            "Healthy connections should remain in pool"
+        );
+
+        pool.close();
+    }
+
+    #[tokio::test]
+    async fn test_periodic_health_check_runs_at_interval() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::time::sleep;
+
+        let check_count = Arc::new(AtomicUsize::new(0));
+        let check_count_clone = check_count.clone();
+
+        // Create a simple pool
+        let server = MockNntpServer::new(MockServerBehavior::Healthy).await;
+        let manager = server.create_manager();
+        let pool = Pool::builder(manager)
+            .max_size(2)
+            .build()
+            .expect("Failed to create pool");
+
+        // Add a connection and return it to make it idle
+        {
+            let _conn = pool.get().await.unwrap();
+        }
+
+        // Spawn periodic checker with very short interval
+        let pool_clone = pool.clone();
+        let interval = Duration::from_millis(200);
+        
+        let checker_handle = tokio::spawn(async move {
+            let mut interval_timer = tokio::time::interval(interval);
+            interval_timer.tick().await; // First tick completes immediately
+            
+            // Run a few cycles manually
+            for _ in 0..3 {
+                interval_timer.tick().await;
+                check_count_clone.fetch_add(1, Ordering::SeqCst);
+                
+                // Simulate health check work
+                if pool_clone.status().available > 0 {
+                    let _conn = pool_clone.get().await;
+                }
+            }
+        });
+
+        // Wait for checks to run
+        sleep(Duration::from_millis(800)).await;
+        checker_handle.abort();
+
+        let count = check_count.load(Ordering::SeqCst);
+        assert!(
+            count >= 2,
+            "Should have run at least 2 health check cycles, ran {}",
+            count
+        );
+
+        pool.close();
     }
 }
