@@ -148,10 +148,10 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 tls_verify_cert: true,
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
-                health_check_max_per_cycle: nntp_proxy::config::default_health_check_max_per_cycle(
+                health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(
                 ),
                 health_check_pool_timeout_ms:
-                    nntp_proxy::config::default_health_check_pool_timeout_ms(),
+                    nntp_proxy::config::health_check_pool_timeout_ms(),
             })
             .collect(),
         health_check: Default::default(),
@@ -181,10 +181,10 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
                 tls_verify_cert: true,
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
-                health_check_max_per_cycle: nntp_proxy::config::default_health_check_max_per_cycle(
+                health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(
                 ),
                 health_check_pool_timeout_ms:
-                    nntp_proxy::config::default_health_check_pool_timeout_ms(),
+                    nntp_proxy::config::health_check_pool_timeout_ms(),
             })
             .collect(),
         health_check: Default::default(),
