@@ -3,7 +3,7 @@
 //! Handles streaming response data from backend to client with pipelined I/O.
 //! Uses double-buffering for optimal performance on large transfers.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
@@ -11,6 +11,12 @@ use crate::constants::buffer::STREAMING_CHUNK_SIZE;
 
 mod tail_buffer;
 use tail_buffer::TailBuffer;
+
+/// Swap between two buffer indices (0 <-> 1)
+#[inline]
+const fn alternate_buffer_index(current: usize) -> usize {
+    1 - current
+}
 
 /// Drain remaining response from backend until terminator is found
 ///
@@ -30,7 +36,10 @@ where
     tail.update(initial_tail);
     
     loop {
-        let n = backend_read.read(&mut chunk).await?;
+        let n = backend_read
+            .read(&mut chunk)
+            .await
+            .context("Failed to read from backend while draining response")?;
         if n == 0 {
             break; // EOF
         }
@@ -124,8 +133,11 @@ where
         tail.update(&data[..write_len]);
         
         // Read next chunk into alternate buffer
-        let next_idx = 1 - current_idx;
-        let next_n = backend_read.read(&mut buffers[next_idx]).await?;
+        let next_idx = alternate_buffer_index(current_idx);
+        let next_n = backend_read
+            .read(&mut buffers[next_idx])
+            .await
+            .context("Failed to read next chunk from backend")?;
         if next_n == 0 {
             debug!(
                 "Client {} multiline streaming complete ({} bytes, EOF)",
