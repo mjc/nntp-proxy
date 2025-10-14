@@ -82,7 +82,7 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE].into_boxed_slice();
-    let mut tail = TailBuffer::new();
+    let mut tail = TailBuffer::default();
     tail.update(initial_tail);
     loop {
         let n = backend_read
@@ -132,7 +132,7 @@ where
     buffers[0][..first_n].copy_from_slice(&first_chunk[..first_n]);
     let mut current_n = first_n;
     // Track tail for spanning terminator detection
-    let mut tail = TailBuffer::new();
+    let mut tail = TailBuffer::default();
     // Main streaming loop - processes first chunk and all subsequent chunks uniformly
     loop {
         let data = &buffers[current_idx][..current_n];

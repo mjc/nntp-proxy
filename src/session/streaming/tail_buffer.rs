@@ -39,9 +39,6 @@ pub(super) struct TailBuffer {
 }
 
 impl TailBuffer {
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
     /// Update tail with the last bytes from a chunk
     pub(super) fn update(&mut self, chunk: &[u8]) {
         if chunk.len() >= TERMINATOR_TAIL_SIZE {

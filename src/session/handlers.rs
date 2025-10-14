@@ -25,6 +25,13 @@ use crate::streaming::StreamHandler;
 
 use super::{backend, connection, streaming};
 
+/// Extract message-ID from NNTP command if present
+fn extract_message_id(command: &str) -> Option<&str> {
+    let start = command.find('<')?;
+    let end = command[start..].find('>')?;
+    Some(&command[start..start + end + 1])
+}
+
 impl ClientSession {
     /// Handle a client connection with a dedicated backend connection (standard 1:1 mode)
     pub async fn handle_with_pooled_backend<T>(
@@ -289,36 +296,20 @@ impl ClientSession {
                             {
                                 Ok(_backend_id) => {}
                                 Err(e) => {
-                                    // Extract backend_id from error context if possible
-                                    // Try to route the command again to get backend_id for logging
-                                    let backend_id =
-                                        router.route_command_sync(self.client_id, &command).ok();
-
-                                    // Provide detailed context for broken pipe errors
+                                    // Provide detailed context for errors
                                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                                        if let Some(bid) = backend_id {
-                                            connection::log_routing_error(
-                                                self.client_addr,
-                                                io_err,
-                                                &command,
-                                                client_to_backend_bytes,
-                                                backend_to_client_bytes,
-                                                bid,
-                                            );
-                                        } else {
-                                            warn!(
-                                                "Client {} error routing '{}': {} | ↑{} ↓{}",
-                                                self.client_addr,
-                                                trimmed,
-                                                io_err,
-                                                crate::formatting::format_bytes(
-                                                    client_to_backend_bytes
-                                                ),
-                                                crate::formatting::format_bytes(
-                                                    backend_to_client_bytes
-                                                )
-                                            );
-                                        }
+                                        warn!(
+                                            "Client {} error routing '{}': {} | ↑{} ↓{}",
+                                            self.client_addr,
+                                            trimmed,
+                                            io_err,
+                                            crate::formatting::format_bytes(
+                                                client_to_backend_bytes
+                                            ),
+                                            crate::formatting::format_bytes(
+                                                backend_to_client_bytes
+                                            )
+                                        );
                                     } else {
                                         error!(
                                             "Error routing '{}' for client {}: {} | ↑{} ↓{}",
@@ -643,13 +634,7 @@ impl ClientSession {
         *client_to_backend_bytes += command.len() as u64;
 
         // Extract message-ID from command if present (for correlation with SABnzbd errors)
-        let msgid = if let Some(start) = command.find('<') {
-            command[start..]
-                .find('>')
-                .map(|end| &command[start..start + end + 1])
-        } else {
-            None
-        };
+        let msgid = extract_message_id(command);
 
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
