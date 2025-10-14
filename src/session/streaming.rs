@@ -5,10 +5,84 @@
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::constants::buffer::STREAMING_CHUNK_SIZE;
 use crate::protocol::{NntpResponse, TERMINATOR_TAIL_SIZE};
+
+/// Helper for tracking the last few bytes of streamed data
+/// 
+/// Used to detect terminators that span across chunk boundaries.
+struct TailBuffer {
+    data: [u8; TERMINATOR_TAIL_SIZE],
+    len: usize,
+}
+
+impl TailBuffer {
+    fn new() -> Self {
+        Self {
+            data: [0; TERMINATOR_TAIL_SIZE],
+            len: 0,
+        }
+    }
+    
+    /// Update tail with the last bytes from a chunk
+    fn update(&mut self, chunk: &[u8]) {
+        if chunk.len() >= TERMINATOR_TAIL_SIZE {
+            self.data.copy_from_slice(&chunk[chunk.len() - TERMINATOR_TAIL_SIZE..]);
+            self.len = TERMINATOR_TAIL_SIZE;
+        } else if !chunk.is_empty() {
+            self.data[..chunk.len()].copy_from_slice(chunk);
+            self.len = chunk.len();
+        }
+    }
+    
+    /// Get the tail data as a slice
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
+/// Drain remaining response from backend until terminator is found
+///
+/// This is called when the client disconnects mid-stream to ensure the backend
+/// connection is left in a clean state and can be recycled.
+async fn drain_until_terminator<R>(
+    backend_read: &mut R,
+    initial_tail: &[u8],
+    client_addr: std::net::SocketAddr,
+    backend_id: crate::types::BackendId,
+) -> Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
+    let mut tail = TailBuffer::new();
+    tail.update(initial_tail);
+    
+    loop {
+        let n = backend_read.read(&mut chunk).await?;
+        if n == 0 {
+            break; // EOF
+        }
+        
+        let data = &chunk[..n];
+        if NntpResponse::has_terminator_at_end(data) 
+            || NntpResponse::has_spanning_terminator(tail.as_slice(), tail.len, data, n) 
+        {
+            break;
+        }
+        
+        tail.update(data);
+    }
+    
+    debug!(
+        "Client {} drained remaining response from backend {:?}, connection is clean",
+        client_addr, backend_id
+    );
+    
+    Ok(())
+}
 
 /// Stream multiline response from backend to client using pipelined double-buffering
 ///
@@ -27,233 +101,86 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut total_bytes = 0u64;
-
-    // Check if terminator is in first chunk (could be at end or in middle)
-    let first_write_len = if let Some(term_end) = NntpResponse::find_terminator_end(&first_chunk[..first_n]) {
-        // Terminator found in first chunk! Only write up to and including it
-        term_end
-    } else {
-        // No terminator in first chunk, write all of it
-        first_n
-    };
-
-    // Write first chunk (or portion up to terminator) to client
-    if let Err(e) = client_write.write_all(&first_chunk[..first_write_len]).await {
-        // Client disconnected on first chunk - need to drain if multiline and no terminator yet
-        let has_terminator = first_write_len < first_n || NntpResponse::has_terminator_at_end(&first_chunk[..first_write_len]);
-        use tracing::warn;
-        warn!(
-            "Client {} disconnected on first chunk write ({} bytes of {}, terminator={}) → backend {:?}",
-            client_addr, first_write_len, first_n, has_terminator, backend_id
-        );
-        if !has_terminator {
-            use tracing::debug;
-            debug!(
-                "Client {} disconnected on first chunk, draining remaining response from backend {:?}",
-                client_addr, backend_id
-            );
-            
-            // Drain the rest of the response
-            let mut drain_chunk = vec![0u8; STREAMING_CHUNK_SIZE];
-            let mut tail: [u8; TERMINATOR_TAIL_SIZE] = [0; TERMINATOR_TAIL_SIZE];
-            let mut tail_len: usize = 0;
-            
-            // Initialize tail from first chunk
-            if first_n >= TERMINATOR_TAIL_SIZE {
-                tail.copy_from_slice(&first_chunk[first_n - TERMINATOR_TAIL_SIZE..first_n]);
-                tail_len = TERMINATOR_TAIL_SIZE;
-            } else if first_n > 0 {
-                tail[..first_n].copy_from_slice(&first_chunk[..first_n]);
-                tail_len = first_n;
-            }
-            
-            loop {
-                let n = backend_read.read(&mut drain_chunk).await?;
-                if n == 0 {
-                    break; // EOF
-                }
-                
-                if NntpResponse::has_terminator_at_end(&drain_chunk[..n]) {
-                    break;
-                }
-                
-                if NntpResponse::has_spanning_terminator(&tail, tail_len, &drain_chunk, n) {
-                    break;
-                }
-                
-                // Update tail
-                if n >= TERMINATOR_TAIL_SIZE {
-                    tail.copy_from_slice(&drain_chunk[n - TERMINATOR_TAIL_SIZE..n]);
-                    tail_len = TERMINATOR_TAIL_SIZE;
-                } else if n > 0 {
-                    tail[..n].copy_from_slice(&drain_chunk[..n]);
-                    tail_len = n;
-                }
-            }
-            
-            debug!(
-                "Client {} drained response from backend {:?} after first chunk disconnect",
-                client_addr, backend_id
-            );
-        }
-        return Err(e.into());
-    }
-    total_bytes += first_write_len as u64;
-
-    // Check if we found and wrote the terminator in first chunk
-    if first_write_len < first_n {
-        // Terminator was in middle of first chunk, we only wrote up to it
-        debug!(
-            "Client {} multiline response complete in first chunk ({} bytes, terminator at position {})",
-            client_addr, total_bytes, first_write_len
-        );
-        return Ok(total_bytes);
-    }
-
-    // Check if terminator is at end of first chunk
-    let has_terminator = NntpResponse::has_terminator_at_end(&first_chunk[..first_write_len]);
-    if has_terminator {
-        debug!(
-            "Client {} multiline response complete in first chunk ({} bytes)",
-            client_addr, total_bytes
-        );
-        return Ok(total_bytes);
-    }
-
+    
     // Prepare double buffering for pipelined streaming
-    let mut chunk1 = vec![0u8; STREAMING_CHUNK_SIZE];
-    let mut chunk2 = vec![0u8; STREAMING_CHUNK_SIZE];
-
-    let mut tail: [u8; TERMINATOR_TAIL_SIZE] = [0; TERMINATOR_TAIL_SIZE];
-    let mut tail_len: usize = 0;
-
-    // Initialize tail with last bytes of first chunk (what we actually wrote)
-    if first_write_len >= TERMINATOR_TAIL_SIZE {
-        tail.copy_from_slice(&first_chunk[first_write_len - TERMINATOR_TAIL_SIZE..first_write_len]);
-        tail_len = TERMINATOR_TAIL_SIZE;
-    } else if first_write_len > 0 {
-        tail[..first_write_len].copy_from_slice(&first_chunk[..first_write_len]);
-        tail_len = first_write_len;
-    }
-
-    let mut current_chunk = &mut chunk1;
-    let mut next_chunk = &mut chunk2;
-
-    // Read next chunk and start loop
-    let mut current_n = backend_read.read(next_chunk).await?;
-    if current_n > 0 {
-        std::mem::swap(&mut current_chunk, &mut next_chunk);
-
-        loop {
-            // Check if terminator is in this chunk (could be in middle or at end)
-            let write_len = if let Some(term_end) = NntpResponse::find_terminator_end(&current_chunk[..current_n]) {
-                // Terminator found! Only write up to and including the terminator
-                term_end
+    let mut buffers = [vec![0u8; STREAMING_CHUNK_SIZE], vec![0u8; STREAMING_CHUNK_SIZE]];
+    let mut current_idx = 0;
+    
+    // Copy first chunk into buffer
+    buffers[0][..first_n].copy_from_slice(&first_chunk[..first_n]);
+    let mut current_n = first_n;
+    
+    // Track tail for spanning terminator detection
+    let mut tail = TailBuffer::new();
+    
+    // Main streaming loop - processes first chunk and all subsequent chunks uniformly
+    loop {
+        let current_chunk = &buffers[current_idx];
+        let data = &current_chunk[..current_n];
+        
+        // Detect terminator location: within chunk or spanning boundary
+        let (write_len, terminator_found) = 
+            if let Some(term_end) = NntpResponse::find_terminator_end(data) {
+                // Complete terminator found within chunk (middle or end)
+                (term_end, true)
+            } else if NntpResponse::has_spanning_terminator(tail.as_slice(), tail.len, data, current_n) {
+                // Terminator spans across chunk boundary
+                (current_n, true)
             } else {
-                // No terminator, write entire chunk
-                current_n
+                // No terminator yet, write entire chunk
+                (current_n, false)
             };
-
-            // Write current chunk (or portion up to terminator) to client
-            if let Err(e) = client_write.write_all(&current_chunk[..write_len]).await {
-                // Client disconnected - drain the rest from backend to keep connection clean
-                use tracing::warn;
-                warn!(
-                    "Client {} disconnected while streaming, draining remaining response from backend {:?}",
-                    client_addr, backend_id
-                );
-                
-                // Check if we've already seen the terminator in current chunk
-                let has_term = write_len < current_n || NntpResponse::has_terminator_at_end(&current_chunk[..write_len]);
-                if !has_term {
-                    let has_spanning_term =
-                        NntpResponse::has_spanning_terminator(&tail, tail_len, current_chunk, current_n);
-                    
-                    if !has_spanning_term {
-                        // Need to keep reading until we find the terminator
-                        let mut drain_chunk = vec![0u8; STREAMING_CHUNK_SIZE];
-                        let mut drain_tail = tail;
-                        let mut drain_tail_len = tail_len;
-                        
-                        loop {
-                            let n = backend_read.read(&mut drain_chunk).await?;
-                            if n == 0 {
-                                break; // EOF
-                            }
-                            
-                            if NntpResponse::has_terminator_at_end(&drain_chunk[..n]) {
-                                break; // Found terminator
-                            }
-                            
-                            if NntpResponse::has_spanning_terminator(&drain_tail, drain_tail_len, &drain_chunk, n) {
-                                break; // Found spanning terminator
-                            }
-                            
-                            // Update tail for next iteration
-                            if n >= TERMINATOR_TAIL_SIZE {
-                                drain_tail.copy_from_slice(&drain_chunk[n - TERMINATOR_TAIL_SIZE..n]);
-                                drain_tail_len = TERMINATOR_TAIL_SIZE;
-                            } else if n > 0 {
-                                drain_tail[..n].copy_from_slice(&drain_chunk[..n]);
-                                drain_tail_len = n;
-                            }
-                        }
-                        
-                        debug!(
-                            "Client {} drained remaining response from backend {:?}, connection is clean",
-                            client_addr, backend_id
-                        );
-                    }
-                }
-                
-                return Err(e.into());
+        
+        // Write current chunk (or portion up to terminator) to client
+        if let Err(e) = client_write.write_all(&data[..write_len]).await {
+            // Client disconnected - drain remaining response from backend if terminator not yet seen
+            warn!(
+                "Client {} disconnected while streaming ({} bytes of {}, total {} bytes so far) → backend {:?}",
+                client_addr, write_len, current_n, total_bytes, backend_id
+            );
+            
+            if !terminator_found {
+                // Need to drain the rest to keep connection clean
+                drain_until_terminator(
+                    backend_read,
+                    &data[..write_len],
+                    client_addr,
+                    backend_id,
+                )
+                .await?;
             }
-            total_bytes += write_len as u64;
-
-            // Check if we found and wrote the terminator
-            if write_len < current_n {
-                // We found terminator in middle of chunk and only wrote up to it
-                break; // Done!
-            }
-
-            // Check terminator at end of chunk we just wrote
-            let has_term = NntpResponse::has_terminator_at_end(&current_chunk[..write_len]);
-            if has_term {
-                break; // Done!
-            }
-
-            // Check boundary spanning terminator
-            let has_spanning_term =
-                NntpResponse::has_spanning_terminator(&tail, tail_len, current_chunk, write_len);
-            if has_spanning_term {
-                break; // Done!
-            }
-
-            // Update tail for next iteration
-            if current_n >= TERMINATOR_TAIL_SIZE {
-                tail.copy_from_slice(&current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n]);
-                tail_len = TERMINATOR_TAIL_SIZE;
-            } else if current_n > 0 {
-                tail[..current_n].copy_from_slice(&current_chunk[..current_n]);
-                tail_len = current_n;
-            }
-
-            // Read next chunk
-            let next_n = backend_read.read(next_chunk).await?;
-            if next_n == 0 {
-                break; // EOF
-            }
-
-            // Swap buffers for next iteration
-            std::mem::swap(&mut current_chunk, &mut next_chunk);
-            current_n = next_n;
+            
+            return Err(e.into());
         }
+        total_bytes += write_len as u64;
+        
+        // If terminator found, we're done
+        if terminator_found {
+            debug!(
+                "Client {} multiline response complete ({} bytes)",
+                client_addr, total_bytes
+            );
+            break;
+        }
+        
+        // Update tail for next iteration
+        tail.update(&data[..write_len]);
+        
+        // Read next chunk into alternate buffer
+        let next_idx = 1 - current_idx;
+        let next_n = backend_read.read(&mut buffers[next_idx]).await?;
+        if next_n == 0 {
+            debug!(
+                "Client {} multiline streaming complete ({} bytes, EOF)",
+                client_addr, total_bytes
+            );
+            break; // EOF
+        }
+        
+        // Swap buffers for next iteration
+        current_idx = next_idx;
+        current_n = next_n;
     }
-
-    debug!(
-        "Client {} multiline streaming complete ({} bytes)",
-        client_addr, total_bytes
-    );
-
+    
     Ok(total_bytes)
 }
