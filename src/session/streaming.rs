@@ -81,7 +81,7 @@ async fn drain_until_terminator<R>(
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE].into_boxed_slice();
+    let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
     let mut tail = TailBuffer::default();
     tail.update(initial_tail);
     loop {

@@ -130,6 +130,7 @@ pub fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<an
         ConnectionStream::Tls(tls) => {
             // For TLS connections, check the underlying TCP socket for readable data
             // We can't use try_read on TlsStream directly, so we check the inner TCP stream
+            // Only the underlying TCP stream is needed for the health check; TLS state is ignored.
             let (tcp_stream, _) = tls.get_ref();
             match tcp_stream.try_read(&mut peek_buf) {
                 Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
