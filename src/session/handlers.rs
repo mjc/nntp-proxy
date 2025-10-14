@@ -656,15 +656,6 @@ impl ClientSession {
             };
             debug!("{}", log_msg);
             
-            // Warn if we're streaming a suspiciously small response
-            if n < 100 {
-                warn!(
-                    "Client {} starting multiline stream for small response: {} bytes, status={:?}, hex={:02x?}",
-                    self.client_addr, n, _response_code.status_code(),
-                    &chunk[..n]
-                );
-            }
-            
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
