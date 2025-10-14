@@ -30,9 +30,11 @@ impl Port {
     }
 
     /// NNTP port (119)
+    /// Safety: 119 is a non-zero, valid u16 value
     pub const NNTP: Self = Self(NonZeroU16::new(119).unwrap());
 
     /// NNTPS port (563)
+    /// Safety: 563 is a non-zero, valid u16 value
     pub const NNTPS: Self = Self(NonZeroU16::new(563).unwrap());
 }
 

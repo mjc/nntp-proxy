@@ -161,7 +161,9 @@ mod tests {
 
     #[test]
     fn test_hostname_valid_with_port_notation() {
-        // Note: validation doesn't parse port, just checks non-empty
+        // HostName only validates non-empty, does not parse or validate port notation.
+        // In production, host and port are stored separately (HostName + Port types).
+        // This test verifies the type doesn't reject strings with colons.
         let host = HostName::new("example.com:119".to_string()).unwrap();
         assert_eq!(host.as_str(), "example.com:119");
     }

@@ -26,6 +26,10 @@ use crate::types::{BytesTransferred, TransferMetrics};
 
 use super::{backend, connection, streaming};
 
+/// Threshold for logging detailed transfer info (bytes)
+/// Transfers under this size are considered "small" (test connections, etc.)
+const SMALL_TRANSFER_THRESHOLD: u64 = 500;
+
 /// Extract message-ID from NNTP command if present
 fn extract_message_id(command: &str) -> Option<&str> {
     let start = command.find('<')?;
@@ -332,7 +336,7 @@ impl ClientSession {
 
                                     // For debugging test connections and small transfers, log detailed info
                                     if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
-                                        < 500
+                                        < SMALL_TRANSFER_THRESHOLD
                                     {
                                         debug!(
                                             "ERROR SUMMARY for small transfer - Client {}: \
@@ -367,7 +371,8 @@ impl ClientSession {
         }
 
         // Log session summary for debugging, especially useful for test connections
-        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < 500 {
+        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < SMALL_TRANSFER_THRESHOLD
+        {
             debug!(
                 "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
                 self.client_addr,

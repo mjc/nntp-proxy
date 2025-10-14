@@ -97,6 +97,7 @@ impl MessageId {
     /// Extract a message ID from an NNTP command line
     ///
     /// Looks for a message ID (text enclosed in angle brackets) in the command.
+    /// Ensures '<' comes before '>' to form a proper pair.
     ///
     /// # Examples
     /// ```
@@ -107,11 +108,9 @@ impl MessageId {
     /// ```
     pub fn extract_from_command(command: &str) -> Option<Self> {
         let start = command.find('<')?;
-        let end = command.find('>')?;
-        if end <= start {
-            return None;
-        }
-        Self::new(command[start..=end].to_string()).ok()
+        // Search for '>' only after the '<' position
+        let end = command[start..].find('>')?;
+        Self::new(command[start..start + end + 1].to_string()).ok()
     }
 }
 
