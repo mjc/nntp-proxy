@@ -15,6 +15,9 @@ pub enum ValidationError {
 
     #[error("invalid hostname: {0}")]
     InvalidHostName(String),
+
+    #[error("port cannot be 0")]
+    InvalidPort,
 }
 
 /// A validated hostname that cannot be empty or whitespace-only

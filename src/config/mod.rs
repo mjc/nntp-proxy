@@ -14,7 +14,7 @@ pub use types::{CacheConfig, Config, HealthCheckConfig, RoutingMode, ServerConfi
 
 // Re-export default functions for use in tests and other modules
 pub use defaults::{
-    cache_max_capacity, cache_ttl_secs, health_check_interval, health_check_max_per_cycle,
-    health_check_pool_timeout_ms, health_check_timeout, max_connections, tls_verify_cert,
+    cache_max_capacity, cache_ttl, health_check_interval, health_check_max_per_cycle,
+    health_check_pool_timeout, health_check_timeout, max_connections, tls_verify_cert,
     unhealthy_threshold,
 };

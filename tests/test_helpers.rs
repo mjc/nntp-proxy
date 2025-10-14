@@ -134,22 +134,23 @@ pub fn spawn_mock_server_with_auth(
 
 /// Create a test configuration with servers on the given ports
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
+    use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
     Config {
         servers: server_ports
             .into_iter()
             .map(|(port, name)| ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port,
-                name: name.to_string(),
+                host: HostName::new("127.0.0.1".to_string()).unwrap(),
+                port: Port::new(port).unwrap(),
+                name: ServerName::new(name.to_string()).unwrap(),
                 username: None,
                 password: None,
-                max_connections: 5,
+                max_connections: MaxConnections::new(5).unwrap(),
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
-                connection_keepalive_secs: 0,
+                connection_keepalive: None,
                 health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-                health_check_pool_timeout_ms: nntp_proxy::config::health_check_pool_timeout_ms(),
+                health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
             })
             .collect(),
         health_check: Default::default(),
@@ -165,22 +166,23 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 /// # Returns
 /// Configuration object ready for use in tests
 pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) -> Config {
+    use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
     Config {
         servers: server_ports
             .into_iter()
             .map(|(port, name, user, pass)| ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port,
-                name: name.to_string(),
+                host: HostName::new("127.0.0.1".to_string()).unwrap(),
+                port: Port::new(port).unwrap(),
+                name: ServerName::new(name.to_string()).unwrap(),
                 username: Some(user.to_string()),
                 password: Some(pass.to_string()),
-                max_connections: 5,
+                max_connections: MaxConnections::new(5).unwrap(),
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
-                connection_keepalive_secs: 0,
+                connection_keepalive: None,
                 health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-                health_check_pool_timeout_ms: nntp_proxy::config::health_check_pool_timeout_ms(),
+                health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
             })
             .collect(),
         health_check: Default::default(),
@@ -265,9 +267,9 @@ mod tests {
         let config = create_test_config(vec![(19002, "server1"), (19003, "server2")]);
 
         assert_eq!(config.servers.len(), 2);
-        assert_eq!(config.servers[0].port, 19002);
-        assert_eq!(config.servers[1].port, 19003);
-        assert_eq!(config.servers[0].name, "server1");
+        assert_eq!(config.servers[0].port.get(), 19002);
+        assert_eq!(config.servers[1].port.get(), 19003);
+        assert_eq!(config.servers[0].name.as_str(), "server1");
     }
 
     #[tokio::test]

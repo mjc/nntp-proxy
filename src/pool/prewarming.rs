@@ -80,8 +80,8 @@ pub async fn prewarm_pools(
         .enumerate()
         .map(|(i, server)| {
             let provider = providers[i].clone();
-            let server_name = server.name.clone();
-            let max_connections = server.max_connections as usize;
+            let server_name = server.name.as_str().to_string();
+            let max_connections = server.max_connections.get();
 
             tokio::spawn(prewarm_single_pool(provider, server_name, max_connections))
         })
@@ -92,11 +92,11 @@ pub async fn prewarm_pools(
     let mut total_expected = 0;
 
     for (task, server) in tasks.into_iter().zip(servers.iter()) {
-        total_expected += server.max_connections as usize;
+        total_expected += server.max_connections.get();
         match task.await {
             Ok(Ok(created)) => total_created += created,
-            Ok(Err(e)) => warn!("Failed to prewarm pool for '{}': {}", server.name, e),
-            Err(e) => warn!("Prewarming task panicked for '{}': {}", server.name, e),
+            Ok(Err(e)) => warn!("Failed to prewarm pool for '{}': {}", server.name.as_str(), e),
+            Err(e) => warn!("Prewarming task panicked for '{}': {}", server.name.as_str(), e),
         }
     }
 
@@ -164,28 +164,28 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let servers = vec![ServerConfig {
-            name: "TestServer1".to_string(),
-            host: "127.0.0.1".to_string(),
-            port,
-            max_connections: 2,
+            name: crate::types::ServerName::new("TestServer1".to_string()).unwrap(),
+            host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
+            port: crate::types::Port::new(port).unwrap(),
+            max_connections: crate::types::MaxConnections::new(2).unwrap(),
             username: None,
             password: None,
             use_tls: false,
             tls_verify_cert: true,
             tls_cert_path: None,
-            connection_keepalive_secs: 0,
+            connection_keepalive: None,
             health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
-            health_check_pool_timeout_ms: crate::config::health_check_pool_timeout_ms(),
+            health_check_pool_timeout: crate::config::health_check_pool_timeout(),
         }];
 
         let providers = servers
             .iter()
             .map(|s| {
                 crate::pool::DeadpoolConnectionProvider::new(
-                    s.host.clone(),
-                    s.port,
-                    s.name.clone(),
-                    s.max_connections as usize,
+                    s.host.as_str().to_string(),
+                    s.port.get(),
+                    s.name.as_str().to_string(),
+                    s.max_connections.get(),
                     s.username.clone(),
                     s.password.clone(),
                 )

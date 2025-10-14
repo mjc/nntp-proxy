@@ -155,25 +155,36 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     };
 
     // Set up cache configuration
-    let cache_config = config.cache.clone().unwrap_or(CacheConfig {
-        max_capacity: args.cache_capacity,
-        ttl_secs: args.cache_ttl,
+    let cache_config = config.cache.clone().unwrap_or_else(|| {
+        use nntp_proxy::types::CacheCapacity;
+        use std::time::Duration;
+        CacheConfig {
+            max_capacity: CacheCapacity::new(args.cache_capacity as usize)
+                .expect("Valid cache capacity"),
+            ttl: Duration::from_secs(args.cache_ttl),
+        }
     });
 
     info!(
-        "Cache configuration: max_capacity={}, ttl={}s",
-        cache_config.max_capacity, cache_config.ttl_secs
+        "Cache configuration: max_capacity={}, ttl={:?}",
+        cache_config.max_capacity.get(),
+        cache_config.ttl
     );
 
     // Create article cache
     let cache = Arc::new(ArticleCache::new(
-        cache_config.max_capacity,
-        Duration::from_secs(cache_config.ttl_secs),
+        cache_config.max_capacity.get() as u64,
+        cache_config.ttl,
     ));
 
     info!("Loaded {} backend servers:", config.servers.len());
     for server in &config.servers {
-        info!("  - {} ({}:{})", server.name, server.host, server.port);
+        info!(
+            "  - {} ({}:{})",
+            server.name.as_str(),
+            server.host.as_str(),
+            server.port.get()
+        );
     }
 
     // Create proxy (cache proxy always uses Standard/1:1 mode)

@@ -2,9 +2,14 @@
 //!
 //! This module provides unique identifiers used throughout the proxy.
 
+pub mod config;
 pub mod metrics;
 pub mod validated;
 
+pub use config::{
+    duration_serde, option_duration_serde, CacheCapacity, MaxConnections, MaxErrors, Port,
+    WindowSize,
+};
 pub use metrics::{BytesTransferred, TransferMetrics};
 pub use validated::{HostName, ServerName, ValidationError};
 

@@ -1,22 +1,23 @@
 //! Test configuration helpers to reduce boilerplate and improve maintainability
 
 use nntp_proxy::config::ServerConfig;
+use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
 
 /// Create a basic server configuration for testing (no TLS)
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> ServerConfig {
     ServerConfig {
-        host: host.to_string(),
-        port,
-        name: name.to_string(),
+        host: HostName::new(host.to_string()).expect("Valid hostname"),
+        port: Port::new(port).expect("Valid port"),
+        name: ServerName::new(name.to_string()).expect("Valid server name"),
         username: None,
         password: None,
-        max_connections: 5,
+        max_connections: MaxConnections::new(5).unwrap(),
         use_tls: false,
         tls_verify_cert: true,
         tls_cert_path: None,
-        connection_keepalive_secs: 0,
+        connection_keepalive: None,
         health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout_ms: nntp_proxy::config::health_check_pool_timeout_ms(),
+        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
     }
 }
 
@@ -29,18 +30,18 @@ pub fn create_test_server_config_with_auth(
     password: &str,
 ) -> ServerConfig {
     ServerConfig {
-        host: host.to_string(),
-        port,
-        name: name.to_string(),
+        host: HostName::new(host.to_string()).expect("Valid hostname"),
+        port: Port::new(port).expect("Valid port"),
+        name: ServerName::new(name.to_string()).expect("Valid server name"),
         username: Some(username.to_string()),
         password: Some(password.to_string()),
-        max_connections: 5,
+        max_connections: MaxConnections::new(5).unwrap(),
         use_tls: false,
         tls_verify_cert: true,
         tls_cert_path: None,
-        connection_keepalive_secs: 0,
+        connection_keepalive: None,
         health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout_ms: nntp_proxy::config::health_check_pool_timeout_ms(),
+        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
     }
 }
 
@@ -53,18 +54,18 @@ pub fn create_test_server_config_with_tls(
     tls_cert_path: Option<String>,
 ) -> ServerConfig {
     ServerConfig {
-        host: host.to_string(),
-        port,
-        name: name.to_string(),
+        host: HostName::new(host.to_string()).expect("Valid hostname"),
+        port: Port::new(port).expect("Valid port"),
+        name: ServerName::new(name.to_string()).expect("Valid server name"),
         username: None,
         password: None,
-        max_connections: 5,
+        max_connections: MaxConnections::new(5).unwrap(),
         use_tls: true,
         tls_verify_cert,
         tls_cert_path,
-        connection_keepalive_secs: 0,
+        connection_keepalive: None,
         health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout_ms: nntp_proxy::config::health_check_pool_timeout_ms(),
+        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
     }
 }
 
@@ -73,21 +74,21 @@ pub fn create_test_server_config_with_max_connections(
     host: &str,
     port: u16,
     name: &str,
-    max_connections: u32,
+    max_connections: usize,
 ) -> ServerConfig {
     ServerConfig {
-        host: host.to_string(),
-        port,
-        name: name.to_string(),
+        host: HostName::new(host.to_string()).expect("Valid hostname"),
+        port: Port::new(port).expect("Valid port"),
+        name: ServerName::new(name.to_string()).expect("Valid server name"),
         username: None,
         password: None,
-        max_connections,
+        max_connections: MaxConnections::new(max_connections).unwrap(),
         use_tls: false,
         tls_verify_cert: true,
         tls_cert_path: None,
-        connection_keepalive_secs: 0,
+        connection_keepalive: None,
         health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout_ms: nntp_proxy::config::health_check_pool_timeout_ms(),
+        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
     }
 }
 
@@ -98,14 +99,14 @@ mod tests {
     #[test]
     fn test_create_basic_server_config() {
         let config = create_test_server_config("localhost", 119, "test-server");
-        assert_eq!(config.host, "localhost");
-        assert_eq!(config.port, 119);
-        assert_eq!(config.name, "test-server");
+        assert_eq!(config.host.as_str(), "localhost");
+        assert_eq!(config.port.get(), 119);
+        assert_eq!(config.name.as_str(), "test-server");
         assert!(!config.use_tls);
         assert!(config.tls_verify_cert);
         assert!(config.username.is_none());
         assert!(config.password.is_none());
-        assert_eq!(config.max_connections, 5);
+        assert_eq!(config.max_connections.get(), 5);
     }
 
     #[test]
@@ -143,6 +144,6 @@ mod tests {
             "busy-server",
             20,
         );
-        assert_eq!(config.max_connections, 20);
+        assert_eq!(config.max_connections.get(), 20);
     }
 }
