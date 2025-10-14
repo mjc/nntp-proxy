@@ -49,7 +49,7 @@ where
         crate::formatting::format_bytes(ctx.total_bytes),
         ctx.backend_id
     );
-    
+
     if !ctx.terminator_found {
         // Need to drain the rest to keep connection clean
         if let Err(drain_err) = drain_until_terminator(
@@ -66,7 +66,7 @@ where
             );
         }
     }
-    
+
     error.into()
 }
 
@@ -86,7 +86,7 @@ where
     let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE].into_boxed_slice();
     let mut tail = TailBuffer::new();
     tail.update(initial_tail);
-    
+
     loop {
         let n = backend_read
             .read(&mut chunk)
@@ -95,20 +95,20 @@ where
         if n == 0 {
             break; // EOF
         }
-        
+
         let data = &chunk[..n];
         if tail.detect_terminator(data).is_found() {
             break;
         }
-        
+
         tail.update(data);
     }
-    
+
     debug!(
         "Client {} drained remaining response from backend {:?}, connection is clean",
         client_addr, backend_id
     );
-    
+
     Ok(())
 }
 
@@ -129,29 +129,29 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut total_bytes = 0u64;
-    
+
     // Prepare double buffering for pipelined streaming
     let mut buffers = [
         vec![0u8; STREAMING_CHUNK_SIZE].into_boxed_slice(),
         vec![0u8; STREAMING_CHUNK_SIZE].into_boxed_slice(),
     ];
     let mut current_idx = 0;
-    
+
     // Copy first chunk into buffer
     buffers[0][..first_n].copy_from_slice(&first_chunk[..first_n]);
     let mut current_n = first_n;
-    
+
     // Track tail for spanning terminator detection
     let mut tail = TailBuffer::new();
-    
+
     // Main streaming loop - processes first chunk and all subsequent chunks uniformly
     loop {
         let data = &buffers[current_idx][..current_n];
-        
+
         // Detect terminator location: within chunk or spanning boundary
         let status = tail.detect_terminator(data);
         let write_len = status.write_len(current_n);
-        
+
         // Write current chunk (or portion up to terminator) to client
         if let Err(e) = client_write.write_all(&data[..write_len]).await {
             return Err(handle_client_write_error(
@@ -170,7 +170,7 @@ where
             .await);
         }
         total_bytes += write_len as u64;
-        
+
         // If terminator found, we're done
         if status.is_found() {
             debug!(
@@ -180,10 +180,10 @@ where
             );
             break;
         }
-        
+
         // Update tail for next iteration
         tail.update(&data[..write_len]);
-        
+
         // Read next chunk into alternate buffer
         let next_idx = alternate_buffer_index(current_idx);
         let next_n = backend_read
@@ -198,12 +198,12 @@ where
             );
             break; // EOF
         }
-        
+
         // Swap buffers for next iteration
         current_idx = next_idx;
         current_n = next_n;
     }
-    
+
     Ok(total_bytes)
 }
 

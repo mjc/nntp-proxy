@@ -9,14 +9,14 @@
 
 use super::connection_trait::ConnectionProvider;
 use super::deadpool_connection::{Pool, TcpManager};
-use super::health_check::{check_date_response, HealthCheckMetrics};
+use super::health_check::{HealthCheckMetrics, check_date_response};
 use crate::pool::PoolStatus;
 use crate::tls::TlsConfig;
 use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, info, warn};
 
 /// Connection provider using deadpool for connection pooling
@@ -196,7 +196,7 @@ impl DeadpoolConnectionProvider {
         use crate::constants::pool::{
             HEALTH_CHECK_POOL_TIMEOUT_MS, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE,
         };
-        use tokio::time::{sleep, Duration};
+        use tokio::time::{Duration, sleep};
 
         info!(
             pool = %name,

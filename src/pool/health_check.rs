@@ -7,8 +7,8 @@
 
 use deadpool::managed;
 use thiserror::Error;
-use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::constants::pool::{
     DATE_COMMAND, EXPECTED_DATE_RESPONSE_PREFIX, HEALTH_CHECK_BUFFER_SIZE, HEALTH_CHECK_TIMEOUT,
@@ -109,7 +109,7 @@ impl HealthCheckMetrics {
 /// - Other errors indicate TCP-level problems
 pub fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
     let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
-    
+
     match conn {
         ConnectionStream::Plain(tcp) => {
             match tcp.try_read(&mut peek_buf) {
@@ -150,7 +150,7 @@ pub fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<an
             }
         }
     }
-    
+
     Ok(())
 }
 

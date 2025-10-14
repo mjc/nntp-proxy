@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::constants::buffer::STREAMING_CHUNK_SIZE;
-use crate::protocol::{ResponseCode, MIN_RESPONSE_LENGTH};
+use crate::protocol::{MIN_RESPONSE_LENGTH, ResponseCode};
 use crate::types::BackendId;
 
 /// Send command to backend and read first chunk
@@ -63,7 +63,11 @@ where
     if n < MIN_RESPONSE_LENGTH {
         warn!(
             "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
-            client_addr, backend_id, n, MIN_RESPONSE_LENGTH, &chunk[..n]
+            client_addr,
+            backend_id,
+            n,
+            MIN_RESPONSE_LENGTH,
+            &chunk[..n]
         );
     }
 

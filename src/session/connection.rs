@@ -12,9 +12,15 @@ use crate::pool::BufferPool;
 /// Result of bidirectional forwarding
 pub enum ForwardResult {
     /// Normal disconnection
-    NormalDisconnect { client_to_backend: u64, backend_to_client: u64 },
+    NormalDisconnect {
+        client_to_backend: u64,
+        backend_to_client: u64,
+    },
     /// Backend error - connection should be removed from pool
-    BackendError { client_to_backend: u64, backend_to_client: u64 },
+    BackendError {
+        client_to_backend: u64,
+        backend_to_client: u64,
+    },
 }
 
 /// Bidirectional forwarding between client and backend in stateful mode
@@ -180,7 +186,9 @@ pub fn log_routing_error(
         std::io::ErrorKind::BrokenPipe => {
             warn!(
                 "Client {} disconnected during '{}' → {:?} (broken pipe) | ↑{} ↓{} | Client closed connection early",
-                client_addr, trimmed, backend_id,
+                client_addr,
+                trimmed,
+                backend_id,
                 crate::formatting::format_bytes(client_to_backend_bytes),
                 crate::formatting::format_bytes(backend_to_client_bytes)
             );
@@ -188,7 +196,9 @@ pub fn log_routing_error(
         std::io::ErrorKind::ConnectionReset => {
             warn!(
                 "Client {} connection reset during '{}' → {:?} | ↑{} ↓{} | Network issue or client crash",
-                client_addr, trimmed, backend_id,
+                client_addr,
+                trimmed,
+                backend_id,
                 crate::formatting::format_bytes(client_to_backend_bytes),
                 crate::formatting::format_bytes(backend_to_client_bytes)
             );
@@ -196,7 +206,9 @@ pub fn log_routing_error(
         std::io::ErrorKind::ConnectionAborted => {
             warn!(
                 "Client {} connection aborted during '{}' → {:?} | ↑{} ↓{} | Check debug logs for details",
-                client_addr, trimmed, backend_id,
+                client_addr,
+                trimmed,
+                backend_id,
                 crate::formatting::format_bytes(client_to_backend_bytes),
                 crate::formatting::format_bytes(backend_to_client_bytes)
             );

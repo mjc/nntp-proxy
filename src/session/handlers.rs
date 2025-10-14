@@ -291,8 +291,9 @@ impl ClientSession {
                                 Err(e) => {
                                     // Extract backend_id from error context if possible
                                     // Try to route the command again to get backend_id for logging
-                                    let backend_id = router.route_command_sync(self.client_id, &command).ok();
-                                    
+                                    let backend_id =
+                                        router.route_command_sync(self.client_id, &command).ok();
+
                                     // Provide detailed context for broken pipe errors
                                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                                         if let Some(bid) = backend_id {
@@ -310,8 +311,12 @@ impl ClientSession {
                                                 self.client_addr,
                                                 trimmed,
                                                 io_err,
-                                                crate::formatting::format_bytes(client_to_backend_bytes),
-                                                crate::formatting::format_bytes(backend_to_client_bytes)
+                                                crate::formatting::format_bytes(
+                                                    client_to_backend_bytes
+                                                ),
+                                                crate::formatting::format_bytes(
+                                                    backend_to_client_bytes
+                                                )
                                             );
                                         }
                                     } else {
@@ -320,8 +325,12 @@ impl ClientSession {
                                             trimmed,
                                             self.client_addr,
                                             e,
-                                            crate::formatting::format_bytes(client_to_backend_bytes),
-                                            crate::formatting::format_bytes(backend_to_client_bytes)
+                                            crate::formatting::format_bytes(
+                                                client_to_backend_bytes
+                                            ),
+                                            crate::formatting::format_bytes(
+                                                backend_to_client_bytes
+                                            )
                                         );
                                     }
 
@@ -635,11 +644,9 @@ impl ClientSession {
 
         // Extract message-ID from command if present (for correlation with SABnzbd errors)
         let msgid = if let Some(start) = command.find('<') {
-            if let Some(end) = command[start..].find('>') {
-                Some(&command[start..start + end + 1])
-            } else {
-                None
-            }
+            command[start..]
+                .find('>')
+                .map(|end| &command[start..start + end + 1])
         } else {
             None
         };
@@ -647,16 +654,24 @@ impl ClientSession {
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
             let log_msg = if let Some(id) = msgid {
-                format!("Client {} ARTICLE {} → multiline ({:?}), streaming {}", 
-                    self.client_addr, id, _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64))
+                format!(
+                    "Client {} ARTICLE {} → multiline ({:?}), streaming {}",
+                    self.client_addr,
+                    id,
+                    _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64)
+                )
             } else {
-                format!("Client {} '{}' → multiline ({:?}), streaming {}",
-                    self.client_addr, command.trim(), _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64))
+                format!(
+                    "Client {} '{}' → multiline ({:?}), streaming {}",
+                    self.client_addr,
+                    command.trim(),
+                    _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64)
+                )
             };
             debug!("{}", log_msg);
-            
+
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
@@ -675,26 +690,45 @@ impl ClientSession {
             let log_msg = if let Some(id) = msgid {
                 // 430 (No such article) and other 4xx errors are expected single-line responses
                 if let Some(code) = _response_code.status_code() {
-                    if code >= 400 && code < 500 {
-                        format!("Client {} ARTICLE {} → error {} (single-line), writing {}",
-                            self.client_addr, id, code,
-                            crate::formatting::format_bytes(n as u64))
+                    if (400..500).contains(&code) {
+                        format!(
+                            "Client {} ARTICLE {} → error {} (single-line), writing {}",
+                            self.client_addr,
+                            id,
+                            code,
+                            crate::formatting::format_bytes(n as u64)
+                        )
                     } else {
-                        format!("Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
-                            self.client_addr, id, _response_code.status_code(),
-                            crate::formatting::format_bytes(n as u64), &chunk[..n.min(50)])
+                        format!(
+                            "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
+                            self.client_addr,
+                            id,
+                            _response_code.status_code(),
+                            crate::formatting::format_bytes(n as u64),
+                            &chunk[..n.min(50)]
+                        )
                     }
                 } else {
-                    format!("Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
-                        self.client_addr, id, _response_code.status_code(),
-                        crate::formatting::format_bytes(n as u64), &chunk[..n.min(50)])
+                    format!(
+                        "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
+                        self.client_addr,
+                        id,
+                        _response_code.status_code(),
+                        crate::formatting::format_bytes(n as u64),
+                        &chunk[..n.min(50)]
+                    )
                 }
             } else {
-                format!("Client {} '{}' → single-line ({:?}), writing {}: {:02x?}",
-                    self.client_addr, command.trim(), _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64), &chunk[..n.min(50)])
+                format!(
+                    "Client {} '{}' → single-line ({:?}), writing {}: {:02x?}",
+                    self.client_addr,
+                    command.trim(),
+                    _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64),
+                    &chunk[..n.min(50)]
+                )
             };
-            
+
             // Only warn if it's truly unusual (not a 4xx/5xx error response)
             if let Some(code) = _response_code.status_code() {
                 if code >= 400 {
@@ -707,7 +741,7 @@ impl ClientSession {
             } else {
                 debug!("{}", log_msg);
             }
-            
+
             match client_write.write_all(&chunk[..n]).await {
                 Ok(_) => n as u64,
                 Err(e) => return (Err(e.into()), got_backend_data),
