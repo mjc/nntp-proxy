@@ -359,15 +359,16 @@ async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool
 }
 
 /// Helper to create test config from port/name pairs
-    fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
-        Config {
-            servers: server_ports
-                .into_iter()
-                .map(|(port, name)| create_test_server_config("127.0.0.1", port, name))
-                .collect(),
-            ..Default::default()
-        }
-    }/// Test that responses are delivered promptly - simulates rapid article requests
+fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
+    Config {
+        servers: server_ports
+            .into_iter()
+            .map(|(port, name)| create_test_server_config("127.0.0.1", port, name))
+            .collect(),
+        ..Default::default()
+    }
+}
+/// Test that responses are delivered promptly - simulates rapid article requests
 /// This test validates response delivery timing regardless of flush implementation.
 #[tokio::test]
 async fn test_response_flushing_with_rapid_commands() -> Result<()> {

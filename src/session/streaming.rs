@@ -89,8 +89,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::protocol::ResponseCode;
+    use bytes::Bytes;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[tokio::test]
@@ -194,12 +194,7 @@ mod tests {
     async fn test_stream_empty_chunks() {
         // Edge case: response with no chunks (shouldn't happen in practice, but let's handle it)
         let chunks = vec![];
-        let response = BackendResponse::new(
-            ResponseCode::parse(b"200 OK\r\n"),
-            false,
-            chunks,
-            0,
-        );
+        let response = BackendResponse::new(ResponseCode::parse(b"200 OK\r\n"), false, chunks, 0);
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let (_, mut server) = tokio::io::duplex(1024);
