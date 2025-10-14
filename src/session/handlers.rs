@@ -617,15 +617,28 @@ impl ClientSession {
 
         *client_to_backend_bytes += command.len() as u64;
 
+        // Extract message-ID from command if present (for correlation with SABnzbd errors)
+        let msgid = if let Some(start) = command.find('<') {
+            if let Some(end) = command[start..].find('>') {
+                Some(&command[start..start + end + 1])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
-            debug!(
-                "Client {} command '{}' -> multiline response (status code: {:?}), streaming {} bytes",
-                self.client_addr,
-                command.trim(),
-                _response_code.status_code(),
-                n
-            );
+            let log_msg = if let Some(id) = msgid {
+                format!("Client {} ARTICLE {} -> multiline response (status code: {:?}), streaming {} bytes", 
+                    self.client_addr, id, _response_code.status_code(), n)
+            } else {
+                format!("Client {} command '{}' -> multiline response (status code: {:?}), streaming {} bytes",
+                    self.client_addr, command.trim(), _response_code.status_code(), n)
+            };
+            debug!("{}", log_msg);
+            
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
@@ -640,14 +653,15 @@ impl ClientSession {
             }
         } else {
             // Single-line response - just write the first chunk
-            debug!(
-                "Client {} command '{}' -> single-line response (status code: {:?}), writing {} bytes: {:02x?}",
-                self.client_addr,
-                command.trim(),
-                _response_code.status_code(),
-                n,
-                &chunk[..n.min(50)]
-            );
+            let log_msg = if let Some(id) = msgid {
+                format!("Client {} ARTICLE {} -> UNUSUAL single-line response (status code: {:?}), writing {} bytes: {:02x?}",
+                    self.client_addr, id, _response_code.status_code(), n, &chunk[..n.min(50)])
+            } else {
+                format!("Client {} command '{}' -> single-line response (status code: {:?}), writing {} bytes: {:02x?}",
+                    self.client_addr, command.trim(), _response_code.status_code(), n, &chunk[..n.min(50)])
+            };
+            warn!("{}", log_msg); // Use warn for single-line ARTICLE responses since they're unusual
+            
             match client_write.write_all(&chunk[..n]).await {
                 Ok(_) => n as u64,
                 Err(e) => return (Err(e.into()), got_backend_data),
@@ -656,14 +670,12 @@ impl ClientSession {
 
         *backend_to_client_bytes += bytes_written;
 
-        debug!(
-            "Client {} command '{}' completed: wrote {} bytes to client (total session: {}→{} bytes)",
-            self.client_addr,
-            command.trim(),
-            bytes_written,
-            client_to_backend_bytes,
-            backend_to_client_bytes
-        );
+        if let Some(id) = msgid {
+            debug!(
+                "Client {} ARTICLE {} completed: wrote {} bytes to client",
+                self.client_addr, id, bytes_written
+            );
+        }
 
         (Ok(()), got_backend_data)
     }
