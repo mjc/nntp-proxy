@@ -5,6 +5,7 @@
 
 // New refactored modules
 pub mod backend;
+pub mod streaming;
 
 // Legacy module (will be gradually refactored)
 mod legacy;
@@ -14,3 +15,4 @@ pub use legacy::{ClientSession, SessionMode};
 
 // Re-export new modules for convenience
 pub use backend::{BackendResponse, fetch_backend_response};
+pub use streaming::{ClientError, stream_to_client};
