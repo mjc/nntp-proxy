@@ -641,11 +641,12 @@ impl ClientSession {
         } else {
             // Single-line response - just write the first chunk
             debug!(
-                "Client {} command '{}' -> single-line response (status code: {:?}), writing {} bytes",
+                "Client {} command '{}' -> single-line response (status code: {:?}), writing {} bytes: {:02x?}",
                 self.client_addr,
                 command.trim(),
                 _response_code.status_code(),
-                n
+                n,
+                &chunk[..n.min(50)]
             );
             match client_write.write_all(&chunk[..n]).await {
                 Ok(_) => n as u64,
