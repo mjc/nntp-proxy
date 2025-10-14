@@ -117,6 +117,34 @@ impl NntpResponse {
         }
     }
 
+    /// Find the position of the NNTP multiline terminator in data
+    ///
+    /// Returns the position AFTER the terminator (exclusive end), or None if not found.
+    /// This handles the case where extra data appears after the terminator in the same chunk.
+    #[inline]
+    pub fn find_terminator_end(data: &[u8]) -> Option<usize> {
+        let n = data.len();
+        if n < 3 {
+            return None;
+        }
+
+        // Search for "\r\n.\r\n" (5 bytes)
+        for i in 0..=n.saturating_sub(5) {
+            if &data[i..i + 5] == b"\r\n.\r\n" {
+                return Some(i + 5);
+            }
+        }
+
+        // Also search for "\n.\n" (3 bytes) for compatibility
+        for i in 0..=n.saturating_sub(3) {
+            if &data[i..i + 3] == b"\n.\n" {
+                return Some(i + 3);
+            }
+        }
+
+        None
+    }
+
     /// Check if a terminator spans across a boundary between tail and current chunk
     ///
     /// This handles the case where a multiline terminator is split across two read chunks.

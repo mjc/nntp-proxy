@@ -32,6 +32,11 @@ where
     if let Err(e) = client_write.write_all(&first_chunk[..first_n]).await {
         // Client disconnected on first chunk - need to drain if multiline and no terminator yet
         let has_terminator = NntpResponse::has_terminator_at_end(&first_chunk[..first_n]);
+        use tracing::warn;
+        warn!(
+            "Client {} disconnected on first chunk write ({} bytes, terminator={}) → backend {:?}",
+            client_addr, first_n, has_terminator, backend_id
+        );
         if !has_terminator {
             use tracing::debug;
             debug!(
@@ -120,17 +125,26 @@ where
         std::mem::swap(&mut current_chunk, &mut next_chunk);
 
         loop {
-            // Write current chunk to client
-            if let Err(e) = client_write.write_all(&current_chunk[..current_n]).await {
+            // Check if terminator is in this chunk (could be in middle or at end)
+            let write_len = if let Some(term_end) = NntpResponse::find_terminator_end(&current_chunk[..current_n]) {
+                // Terminator found! Only write up to and including the terminator
+                term_end
+            } else {
+                // No terminator, write entire chunk
+                current_n
+            };
+
+            // Write current chunk (or portion up to terminator) to client
+            if let Err(e) = client_write.write_all(&current_chunk[..write_len]).await {
                 // Client disconnected - drain the rest from backend to keep connection clean
-                use tracing::debug;
-                debug!(
+                use tracing::warn;
+                warn!(
                     "Client {} disconnected while streaming, draining remaining response from backend {:?}",
                     client_addr, backend_id
                 );
                 
                 // Check if we've already seen the terminator in current chunk
-                let has_term = NntpResponse::has_terminator_at_end(&current_chunk[..current_n]);
+                let has_term = write_len < current_n || NntpResponse::has_terminator_at_end(&current_chunk[..write_len]);
                 if !has_term {
                     let has_spanning_term =
                         NntpResponse::has_spanning_terminator(&tail, tail_len, current_chunk, current_n);
@@ -174,17 +188,23 @@ where
                 
                 return Err(e.into());
             }
-            total_bytes += current_n as u64;
+            total_bytes += write_len as u64;
 
-            // Check terminator in chunk we just wrote
-            let has_term = NntpResponse::has_terminator_at_end(&current_chunk[..current_n]);
+            // Check if we found and wrote the terminator
+            if write_len < current_n {
+                // We found terminator in middle of chunk and only wrote up to it
+                break; // Done!
+            }
+
+            // Check terminator at end of chunk we just wrote
+            let has_term = NntpResponse::has_terminator_at_end(&current_chunk[..write_len]);
             if has_term {
                 break; // Done!
             }
 
             // Check boundary spanning terminator
             let has_spanning_term =
-                NntpResponse::has_spanning_terminator(&tail, tail_len, current_chunk, current_n);
+                NntpResponse::has_spanning_terminator(&tail, tail_len, current_chunk, write_len);
             if has_spanning_term {
                 break; // Done!
             }
