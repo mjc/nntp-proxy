@@ -306,24 +306,22 @@ impl ClientSession {
                                             );
                                         } else {
                                             warn!(
-                                                "Client {} error routing command '{}': {}. \
-                                                 Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                                "Client {} error routing '{}': {} | ↑{} ↓{}",
                                                 self.client_addr,
                                                 trimmed,
                                                 io_err,
-                                                client_to_backend_bytes,
-                                                backend_to_client_bytes
+                                                crate::formatting::format_bytes(client_to_backend_bytes),
+                                                crate::formatting::format_bytes(backend_to_client_bytes)
                                             );
                                         }
                                     } else {
                                         error!(
-                                            "Error routing command '{}' for client {}: {}. \
-                                             Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                            "Error routing '{}' for client {}: {} | ↑{} ↓{}",
                                             trimmed,
                                             self.client_addr,
                                             e,
-                                            client_to_backend_bytes,
-                                            backend_to_client_bytes
+                                            crate::formatting::format_bytes(client_to_backend_bytes),
+                                            crate::formatting::format_bytes(backend_to_client_bytes)
                                         );
                                     }
 
@@ -366,11 +364,10 @@ impl ClientSession {
         // Log session summary for debugging, especially useful for test connections
         if client_to_backend_bytes + backend_to_client_bytes < 500 {
             debug!(
-                "SESSION SUMMARY for Client {}: Small transfer completed successfully. \
-                 {} bytes sent to backend, {} bytes received from backend. \
-                 This appears to be a short session (likely test connection). \
-                 Check debug logs above for individual command/response details.",
-                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
+                self.client_addr,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
 
@@ -501,8 +498,10 @@ impl ClientSession {
         }
 
         info!(
-            "Client {} stateful session ended: {} bytes sent, {} bytes received",
-            self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+            "Stateful session ended {} | ↑{} ↓{}",
+            self.client_addr,
+            crate::formatting::format_bytes(client_to_backend_bytes),
+            crate::formatting::format_bytes(backend_to_client_bytes)
         );
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
@@ -648,11 +647,13 @@ impl ClientSession {
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
             let log_msg = if let Some(id) = msgid {
-                format!("Client {} ARTICLE {} -> multiline response (status code: {:?}), streaming {} bytes", 
-                    self.client_addr, id, _response_code.status_code(), n)
+                format!("Client {} ARTICLE {} → multiline ({:?}), streaming {}", 
+                    self.client_addr, id, _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64))
             } else {
-                format!("Client {} command '{}' -> multiline response (status code: {:?}), streaming {} bytes",
-                    self.client_addr, command.trim(), _response_code.status_code(), n)
+                format!("Client {} '{}' → multiline ({:?}), streaming {}",
+                    self.client_addr, command.trim(), _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64))
             };
             debug!("{}", log_msg);
             

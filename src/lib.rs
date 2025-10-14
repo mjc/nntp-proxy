@@ -34,6 +34,7 @@
 // Module declarations
 mod auth;
 pub mod connection_error;
+mod formatting;
 pub mod network;
 pub mod protocol;
 mod proxy;

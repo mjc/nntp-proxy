@@ -42,8 +42,12 @@ where
     R: AsyncReadExt + Unpin,
 {
     warn!(
-        "Client {} disconnected while streaming ({} bytes of {}, total {} bytes so far) → backend {:?}",
-        ctx.client_addr, ctx.write_len, ctx.current_n, ctx.total_bytes, ctx.backend_id
+        "Client {} disconnected while streaming ({} of {}, total {} so far) → backend {:?}",
+        ctx.client_addr,
+        crate::formatting::format_bytes(ctx.write_len as u64),
+        crate::formatting::format_bytes(ctx.current_n as u64),
+        crate::formatting::format_bytes(ctx.total_bytes),
+        ctx.backend_id
     );
     
     if !ctx.terminator_found {
@@ -170,8 +174,9 @@ where
         // If terminator found, we're done
         if status.is_found() {
             debug!(
-                "Client {} multiline response complete ({} bytes)",
-                client_addr, total_bytes
+                "Client {} multiline response complete ({})",
+                client_addr,
+                crate::formatting::format_bytes(total_bytes)
             );
             break;
         }
@@ -187,8 +192,9 @@ where
             .context("Failed to read next chunk from backend")?;
         if next_n == 0 {
             debug!(
-                "Client {} multiline streaming complete ({} bytes, EOF)",
-                client_addr, total_bytes
+                "Client {} multiline streaming complete ({}, EOF)",
+                client_addr,
+                crate::formatting::format_bytes(total_bytes)
             );
             break; // EOF
         }

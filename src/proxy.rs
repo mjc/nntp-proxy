@@ -275,11 +275,11 @@ impl NntpProxy {
         match result {
             Ok((client_to_backend, backend_to_client)) => {
                 info!(
-                    "Per-command routing session closed for {} (ID: {}): {} bytes sent, {} bytes received",
+                    "Session closed {} [{}] ↑{} ↓{}",
                     client_addr,
-                    session.client_id(),
-                    client_to_backend,
-                    backend_to_client
+                    crate::formatting::short_id(session.client_id().as_uuid()),
+                    crate::formatting::format_bytes(client_to_backend),
+                    crate::formatting::format_bytes(backend_to_client)
                 );
             }
             Err(e) => {
@@ -295,29 +295,19 @@ impl NntpProxy {
 
                 if is_broken_pipe {
                     debug!(
-                        "Client {} (ID: {}) disconnected during session: {} - This is normal for test connections",
+                        "Client {} [{}] disconnected: {} (normal for test connections)",
                         client_addr,
-                        session.client_id(),
+                        crate::formatting::short_id(session.client_id().as_uuid()),
                         e
                     );
                 } else {
                     warn!(
-                        "Per-command routing session error for {} (ID: {}): {}",
+                        "Session error {} [{}]: {}",
                         client_addr,
-                        session.client_id(),
+                        crate::formatting::short_id(session.client_id().as_uuid()),
                         e
                     );
                 }
-
-                // For debugging SABnzbd test connections and other short sessions,
-                // log additional context when transfers are small (likely test scenarios)
-                debug!(
-                    "Session error details for {} (ID: {}): Error occurred during per-command routing. \
-                     This may be a client test connection or early disconnection. \
-                     Check session debug logs above for command/response details.",
-                    client_addr,
-                    session.client_id()
-                );
             }
         }
 
