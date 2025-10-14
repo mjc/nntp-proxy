@@ -654,13 +654,36 @@ impl ClientSession {
         } else {
             // Single-line response - just write the first chunk
             let log_msg = if let Some(id) = msgid {
-                format!("Client {} ARTICLE {} -> UNUSUAL single-line response (status code: {:?}), writing {} bytes: {:02x?}",
-                    self.client_addr, id, _response_code.status_code(), n, &chunk[..n.min(50)])
+                // 430 (No such article) and other 4xx errors are expected single-line responses
+                if let Some(code) = _response_code.status_code() {
+                    if code >= 400 && code < 500 {
+                        format!("Client {} ARTICLE {} -> error response {} (single-line), writing {} bytes",
+                            self.client_addr, id, code, n)
+                    } else {
+                        format!("Client {} ARTICLE {} -> UNUSUAL single-line response (status code: {:?}), writing {} bytes: {:02x?}",
+                            self.client_addr, id, _response_code.status_code(), n, &chunk[..n.min(50)])
+                    }
+                } else {
+                    format!("Client {} ARTICLE {} -> UNUSUAL single-line response (status code: {:?}), writing {} bytes: {:02x?}",
+                        self.client_addr, id, _response_code.status_code(), n, &chunk[..n.min(50)])
+                }
             } else {
                 format!("Client {} command '{}' -> single-line response (status code: {:?}), writing {} bytes: {:02x?}",
                     self.client_addr, command.trim(), _response_code.status_code(), n, &chunk[..n.min(50)])
             };
-            warn!("{}", log_msg); // Use warn for single-line ARTICLE responses since they're unusual
+            
+            // Only warn if it's truly unusual (not a 4xx/5xx error response)
+            if let Some(code) = _response_code.status_code() {
+                if code >= 400 {
+                    debug!("{}", log_msg); // Errors are expected, just debug
+                } else if msgid.is_some() {
+                    warn!("{}", log_msg); // ARTICLE with 2xx/3xx single-line is unusual
+                } else {
+                    debug!("{}", log_msg);
+                }
+            } else {
+                debug!("{}", log_msg);
+            }
             
             match client_write.write_all(&chunk[..n]).await {
                 Ok(_) => n as u64,
