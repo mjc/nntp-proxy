@@ -1,6 +1,7 @@
 use super::*;
 use crate::protocol::QUIT;
 use std::net::{IpAddr, Ipv4Addr};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_client_session_creation() {
