@@ -108,24 +108,49 @@ impl HealthCheckMetrics {
 ///   healthy connection, as there should be no data to read between commands
 /// - Other errors indicate TCP-level problems
 pub fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
-    if let ConnectionStream::Plain(tcp) = conn {
-        let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
-        match tcp.try_read(&mut peek_buf) {
-            Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
-            Ok(_) => return Err(HealthCheckError::UnexpectedData.into()),
-            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                // Clone to preserve original error details and message
-                return Err(HealthCheckError::TcpError(std::io::Error::new(
-                    e.kind(),
-                    e.to_string(),
-                ))
-                .into());
+    let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
+    
+    match conn {
+        ConnectionStream::Plain(tcp) => {
+            match tcp.try_read(&mut peek_buf) {
+                Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
+                Ok(_) => return Err(HealthCheckError::UnexpectedData.into()),
+                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                    // Clone to preserve original error details and message
+                    return Err(HealthCheckError::TcpError(std::io::Error::new(
+                        e.kind(),
+                        e.to_string(),
+                    ))
+                    .into());
+                }
+                // WouldBlock is the expected case - no data available on idle connection
+                Err(_) => {}
             }
-            // WouldBlock is the expected case - no data available on idle connection
-            Err(_) => {}
+        }
+        ConnectionStream::Tls(tls) => {
+            // For TLS connections, check the underlying TCP socket for readable data
+            // We can't use try_read on TlsStream directly, so we check the inner TCP stream
+            let (tcp_stream, _) = tls.get_ref();
+            match tcp_stream.try_read(&mut peek_buf) {
+                Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
+                Ok(_) => {
+                    // Data available on TCP socket - could be TLS records or buffered application data
+                    // Either way, this connection has data we haven't consumed, so reject it
+                    return Err(HealthCheckError::UnexpectedData.into());
+                }
+                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                    return Err(HealthCheckError::TcpError(std::io::Error::new(
+                        e.kind(),
+                        e.to_string(),
+                    ))
+                    .into());
+                }
+                // WouldBlock is the expected case - no data available on idle connection
+                Err(_) => {}
+            }
         }
     }
-    // TLS connections skip TCP-level check
+    
     Ok(())
 }
 
