@@ -676,19 +676,23 @@ impl ClientSession {
                 // 430 (No such article) and other 4xx errors are expected single-line responses
                 if let Some(code) = _response_code.status_code() {
                     if code >= 400 && code < 500 {
-                        format!("Client {} ARTICLE {} -> error response {} (single-line), writing {} bytes",
-                            self.client_addr, id, code, n)
+                        format!("Client {} ARTICLE {} → error {} (single-line), writing {}",
+                            self.client_addr, id, code,
+                            crate::formatting::format_bytes(n as u64))
                     } else {
-                        format!("Client {} ARTICLE {} -> UNUSUAL single-line response (status code: {:?}), writing {} bytes: {:02x?}",
-                            self.client_addr, id, _response_code.status_code(), n, &chunk[..n.min(50)])
+                        format!("Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
+                            self.client_addr, id, _response_code.status_code(),
+                            crate::formatting::format_bytes(n as u64), &chunk[..n.min(50)])
                     }
                 } else {
-                    format!("Client {} ARTICLE {} -> UNUSUAL single-line response (status code: {:?}), writing {} bytes: {:02x?}",
-                        self.client_addr, id, _response_code.status_code(), n, &chunk[..n.min(50)])
+                    format!("Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
+                        self.client_addr, id, _response_code.status_code(),
+                        crate::formatting::format_bytes(n as u64), &chunk[..n.min(50)])
                 }
             } else {
-                format!("Client {} command '{}' -> single-line response (status code: {:?}), writing {} bytes: {:02x?}",
-                    self.client_addr, command.trim(), _response_code.status_code(), n, &chunk[..n.min(50)])
+                format!("Client {} '{}' → single-line ({:?}), writing {}: {:02x?}",
+                    self.client_addr, command.trim(), _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64), &chunk[..n.min(50)])
             };
             
             // Only warn if it's truly unusual (not a 4xx/5xx error response)
