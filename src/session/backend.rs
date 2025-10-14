@@ -215,8 +215,8 @@ where
     T: AsyncReadExt + Unpin,
 {
     let mut chunks = Vec::with_capacity(4); // Pre-allocate for typical multiline response
-    let mut chunk1 = vec![0u8; STREAMING_CHUNK_SIZE];
-    let mut chunk2 = vec![0u8; STREAMING_CHUNK_SIZE];
+    let mut buffer_a = vec![0u8; STREAMING_CHUNK_SIZE];
+    let mut buffer_b = vec![0u8; STREAMING_CHUNK_SIZE];
 
     let mut tail: [u8; TERMINATOR_TAIL_SIZE] = [0; TERMINATOR_TAIL_SIZE];
     let mut tail_len: usize = 0;
@@ -231,8 +231,8 @@ where
         tail_len = first_len;
     }
 
-    let mut current_chunk = &mut chunk1;
-    let mut next_chunk = &mut chunk2;
+    let mut current_chunk = &mut buffer_a;
+    let mut next_chunk = &mut buffer_b;
 
     // Read next chunk
     let mut current_n = backend_conn.read(next_chunk).await?;

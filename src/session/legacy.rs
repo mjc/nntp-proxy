@@ -376,7 +376,6 @@ impl ClientSession {
                             };
                             client_write.write_all(response).await?;
                             backend_to_client_bytes += response.len() as u64;
-                            continue;
                         }
                         CommandAction::Reject(reason) => {
                             // In hybrid mode, stateful commands trigger a switch to stateful connection
@@ -409,7 +408,6 @@ impl ClientSession {
                                 .write_all(COMMAND_NOT_SUPPORTED_STATELESS)
                                 .await?;
                             backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
-                            continue;
                         }
                         CommandAction::ForwardStateless | CommandAction::ForwardHighThroughput => {
                             // Route this command to a backend
@@ -427,53 +425,12 @@ impl ClientSession {
                                 Err(e) => {
                                     // Provide detailed context for broken pipe errors
                                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                                        match io_err.kind() {
-                                            std::io::ErrorKind::BrokenPipe => {
-                                                warn!(
-                                                    "Client {} disconnected unexpectedly while routing command '{}' (broken pipe). \
-                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
-                                                     This usually indicates the client closed the connection before receiving the response.",
-                                                    self.client_addr,
-                                                    trimmed,
-                                                    client_to_backend_bytes,
-                                                    backend_to_client_bytes
-                                                );
-                                            }
-                                            std::io::ErrorKind::ConnectionReset => {
-                                                warn!(
-                                                    "Client {} connection reset while routing command '{}'. \
-                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
-                                                     This usually indicates a network issue or client crash.",
-                                                    self.client_addr,
-                                                    trimmed,
-                                                    client_to_backend_bytes,
-                                                    backend_to_client_bytes
-                                                );
-                                            }
-                                            std::io::ErrorKind::ConnectionAborted => {
-                                                warn!(
-                                                    "Client {} connection aborted while routing command '{}'. \
-                                                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
-                                                     This usually indicates the connection was terminated by the local system.",
-                                                    self.client_addr,
-                                                    trimmed,
-                                                    client_to_backend_bytes,
-                                                    backend_to_client_bytes
-                                                );
-                                            }
-                                            _ => {
-                                                error!(
-                                                    "I/O error routing command '{}' for client {}: {} (kind: {:?}). \
-                                                     Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                                    trimmed,
-                                                    self.client_addr,
-                                                    e,
-                                                    io_err.kind(),
-                                                    client_to_backend_bytes,
-                                                    backend_to_client_bytes
-                                                );
-                                            }
-                                        }
+                                        self.log_routing_error(
+                                            io_err,
+                                            &command,
+                                            client_to_backend_bytes,
+                                            backend_to_client_bytes,
+                                        );
                                     } else {
                                         error!(
                                             "Error routing command '{}' for client {}: {}. \
@@ -511,37 +468,7 @@ impl ClientSession {
                     }
                 }
                 Err(e) => {
-                    // Provide detailed context for client read errors
-                    match e.kind() {
-                        std::io::ErrorKind::UnexpectedEof => {
-                            debug!(
-                                "Client {} closed connection (EOF). Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
-                            );
-                        }
-                        std::io::ErrorKind::BrokenPipe => {
-                            debug!(
-                                "Client {} connection broken pipe while reading. Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
-                            );
-                        }
-                        std::io::ErrorKind::ConnectionReset => {
-                            warn!(
-                                "Client {} connection reset while reading. Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
-                            );
-                        }
-                        _ => {
-                            warn!(
-                                "Error reading from client {}: {} (kind: {:?}). Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                                self.client_addr,
-                                e,
-                                e.kind(),
-                                client_to_backend_bytes,
-                                backend_to_client_bytes
-                            );
-                        }
-                    }
+                    self.log_client_error(&e, client_to_backend_bytes, backend_to_client_bytes);
                     break;
                 }
             }
@@ -1054,6 +981,99 @@ impl ClientSession {
         *backend_to_client_bytes += total_bytes as u64;
 
         (Ok(()), got_backend_data)
+    }
+
+    /// Log client disconnect/error with appropriate log level and context
+    ///
+    /// Helps standardize error logging across different parts of the session handling
+    fn log_client_error(
+        &self,
+        error: &std::io::Error,
+        client_to_backend_bytes: u64,
+        backend_to_client_bytes: u64,
+    ) {
+        match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => {
+                debug!(
+                    "Client {} closed connection (EOF). Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                    self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+            std::io::ErrorKind::BrokenPipe => {
+                debug!(
+                    "Client {} connection broken pipe. Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                    self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+            std::io::ErrorKind::ConnectionReset => {
+                warn!(
+                    "Client {} connection reset. Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                    self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+            _ => {
+                warn!(
+                    "Error reading from client {}: {} (kind: {:?}). Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                    self.client_addr,
+                    error,
+                    error.kind(),
+                    client_to_backend_bytes,
+                    backend_to_client_bytes
+                );
+            }
+        }
+    }
+
+    /// Log routing command error with detailed context
+    ///
+    /// Provides specific error messages for different I/O error types during command routing
+    fn log_routing_error(
+        &self,
+        error: &std::io::Error,
+        command: &str,
+        client_to_backend_bytes: u64,
+        backend_to_client_bytes: u64,
+    ) {
+        let trimmed = command.trim();
+        match error.kind() {
+            std::io::ErrorKind::BrokenPipe => {
+                warn!(
+                    "Client {} disconnected unexpectedly while routing command '{}' (broken pipe). \
+                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                     This usually indicates the client closed the connection before receiving the response.",
+                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+            std::io::ErrorKind::ConnectionReset => {
+                warn!(
+                    "Client {} connection reset while routing command '{}'. \
+                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                     This usually indicates a network issue or client crash.",
+                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+            std::io::ErrorKind::ConnectionAborted => {
+                warn!(
+                    "Client {} connection aborted while routing command '{}'. \
+                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                     Check debug logs above for full command/response hex dumps.",
+                    self.client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+            _ => {
+                error!(
+                    "Client {} error while routing command '{}': {} (kind: {:?}). \
+                     Session stats: {} bytes sent to backend, {} bytes received from backend. \
+                     Check debug logs above for full command/response hex dumps.",
+                    self.client_addr,
+                    trimmed,
+                    error,
+                    error.kind(),
+                    client_to_backend_bytes,
+                    backend_to_client_bytes
+                );
+            }
+        }
     }
 }
 
