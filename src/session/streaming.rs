@@ -136,11 +136,9 @@ where
     // Main streaming loop - processes first chunk and all subsequent chunks uniformly
     loop {
         let data = &buffers[current_idx][..current_n];
-
         // Detect terminator location: within chunk or spanning boundary
         let status = tail.detect_terminator(data);
         let write_len = status.write_len(current_n);
-
         // Write current chunk (or portion up to terminator) to client
         if let Err(e) = client_write.write_all(&data[..write_len]).await {
             return Err(handle_client_write_error(
@@ -159,7 +157,6 @@ where
             .await);
         }
         total_bytes += write_len as u64;
-
         // If terminator found, we're done
         if status.is_found() {
             debug!(
@@ -169,10 +166,8 @@ where
             );
             break;
         }
-
         // Update tail for next iteration
         tail.update(&data[..write_len]);
-
         // Read next chunk into alternate buffer
         let next_idx = alternate_buffer_index(current_idx);
         let next_n = backend_read
@@ -187,7 +182,6 @@ where
             );
             break; // EOF
         }
-
         // Swap buffers for next iteration
         current_idx = next_idx;
         current_n = next_n;
