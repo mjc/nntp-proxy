@@ -1,12 +1,13 @@
 use super::*;
 use crate::protocol::QUIT;
+use crate::types::BufferSize;
 use std::net::{IpAddr, Ipv4Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn test_client_session_creation() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let session = ClientSession::new(addr, buffer_pool.clone());
 
     assert_eq!(session.client_addr.port(), 8080);
@@ -18,7 +19,7 @@ fn test_client_session_creation() {
 
 #[test]
 fn test_client_session_with_different_ports() {
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
 
     let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
     let session1 = ClientSession::new(addr1, buffer_pool.clone());
@@ -33,7 +34,7 @@ fn test_client_session_with_different_ports() {
 
 #[test]
 fn test_client_session_with_ipv6() {
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let addr = SocketAddr::new(IpAddr::V6("::1".parse().unwrap()), 8119);
     let session = ClientSession::new(addr, buffer_pool);
 
@@ -43,7 +44,7 @@ fn test_client_session_with_ipv6() {
 
 #[test]
 fn test_buffer_pool_cloning() {
-    let buffer_pool = BufferPool::new(8192, 10);
+    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);
     let buffer_pool_clone = buffer_pool.clone();
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 1234);
@@ -56,7 +57,7 @@ fn test_buffer_pool_cloning() {
 #[test]
 fn test_session_addr_formatting() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5555);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let session = ClientSession::new(addr, buffer_pool);
 
     let addr_str = format!("{}", session.client_addr);
@@ -66,7 +67,7 @@ fn test_session_addr_formatting() {
 
 #[test]
 fn test_multiple_sessions_same_buffer_pool() {
-    let buffer_pool = BufferPool::new(4096, 8);
+    let buffer_pool = BufferPool::new(BufferSize::new(4096).unwrap(), 8);
     let sessions: Vec<_> = (0..5)
         .map(|i| {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000 + i);
@@ -82,7 +83,7 @@ fn test_multiple_sessions_same_buffer_pool() {
 
 #[test]
 fn test_loopback_address() {
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
     let session = ClientSession::new(addr, buffer_pool);
 
@@ -91,7 +92,7 @@ fn test_loopback_address() {
 
 #[test]
 fn test_unspecified_address() {
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     let session = ClientSession::new(addr, buffer_pool);
 
@@ -102,7 +103,7 @@ fn test_unspecified_address() {
 #[test]
 fn test_session_without_router() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let session = ClientSession::new(addr, buffer_pool);
 
     assert!(!session.is_per_command_routing());
@@ -112,7 +113,7 @@ fn test_session_without_router() {
 #[test]
 fn test_session_with_router() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let router = Arc::new(BackendSelector::new());
     let session =
         ClientSession::new_with_router(addr, buffer_pool, router, RoutingMode::PerCommand);
@@ -124,7 +125,7 @@ fn test_session_with_router() {
 #[test]
 fn test_client_id_uniqueness() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
 
     let session1 = ClientSession::new(addr, buffer_pool.clone());
     let session2 = ClientSession::new(addr, buffer_pool);
@@ -177,7 +178,7 @@ async fn test_quit_command_per_command_routing() {
     let client_addr = client_listener.local_addr().unwrap();
 
     // Create session
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let session = ClientSession::new_with_router(
         client_addr,
         buffer_pool,
@@ -267,7 +268,7 @@ async fn test_quit_command_closes_connection_cleanly() {
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_addr = client_listener.local_addr().unwrap();
 
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let session = ClientSession::new_with_router(
         client_addr,
         buffer_pool,
@@ -323,7 +324,7 @@ fn test_session_mode_enum() {
 #[test]
 fn test_hybrid_session_creation() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let router = Arc::new(BackendSelector::new());
 
     // Test hybrid mode session creation
@@ -342,7 +343,7 @@ fn test_hybrid_session_creation() {
 #[test]
 fn test_routing_mode_configurations() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let router = Arc::new(BackendSelector::new());
 
     // Test Standard mode
@@ -383,7 +384,7 @@ fn test_routing_mode_configurations() {
 fn test_hybrid_mode_initial_state() {
     // Test that hybrid mode starts in per-command mode
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let router = Arc::new(BackendSelector::new());
 
     let session = ClientSession::new_with_router(addr, buffer_pool, router, RoutingMode::Hybrid);
@@ -397,7 +398,7 @@ fn test_hybrid_mode_initial_state() {
 #[test]
 fn test_is_per_command_routing_logic() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-    let buffer_pool = BufferPool::new(1024, 4);
+    let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
     let router = Arc::new(BackendSelector::new());
 
     // Standard mode has router capability (can do per-command routing)
