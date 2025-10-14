@@ -65,8 +65,18 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     // Create proxy configuration
     let config = Config {
         servers: vec![
-            create_test_server_config_with_max_connections("127.0.0.1", mock_port1, "Mock Server 1", 10),
-            create_test_server_config_with_max_connections("127.0.0.1", mock_port2, "Mock Server 2", 10),
+            create_test_server_config_with_max_connections(
+                "127.0.0.1",
+                mock_port1,
+                "Mock Server 1",
+                10,
+            ),
+            create_test_server_config_with_max_connections(
+                "127.0.0.1",
+                mock_port2,
+                "Mock Server 2",
+                10,
+            ),
         ],
         ..Default::default()
     };
@@ -191,8 +201,18 @@ async fn test_round_robin_distribution() -> Result<()> {
     // Create proxy configuration
     let config = Config {
         servers: vec![
-            create_test_server_config_with_max_connections("127.0.0.1", mock_port1, "Mock Server 1", 10),
-            create_test_server_config_with_max_connections("127.0.0.1", mock_port2, "Mock Server 2", 10),
+            create_test_server_config_with_max_connections(
+                "127.0.0.1",
+                mock_port1,
+                "Mock Server 1",
+                10,
+            ),
+            create_test_server_config_with_max_connections(
+                "127.0.0.1",
+                mock_port2,
+                "Mock Server 2",
+                10,
+            ),
         ],
         ..Default::default()
     };
@@ -274,9 +294,12 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
 
     // Create proxy configuration with a server that doesn't exist
     let config = Config {
-        servers: vec![
-            create_test_server_config_with_max_connections("127.0.0.1", nonexistent_port, "Nonexistent Server", 10),
-        ],
+        servers: vec![create_test_server_config_with_max_connections(
+            "127.0.0.1",
+            nonexistent_port,
+            "Nonexistent Server",
+            10,
+        )],
         ..Default::default()
     };
 
@@ -340,12 +363,11 @@ fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     Config {
         servers: server_ports
             .into_iter()
-            .map(|(port, name)| create_test_server_config(&"127.0.0.1", port, &name))
+            .map(|(port, name)| create_test_server_config("127.0.0.1", port, name))
             .collect(),
         ..Default::default()
     }
 }
-
 /// Test that responses are delivered promptly - simulates rapid article requests
 /// This test validates response delivery timing regardless of flush implementation.
 #[tokio::test]
@@ -775,9 +797,11 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
-        servers: vec![
-            create_test_server_config("127.0.0.1", mock_port, "Mock Server"),
-        ],
+        servers: vec![create_test_server_config(
+            "127.0.0.1",
+            mock_port,
+            "Mock Server",
+        )],
         ..Default::default()
     };
 
@@ -867,9 +891,12 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
-        servers: vec![
-            create_test_server_config_with_max_connections("127.0.0.1", mock_port, "Mock Server", 6),
-        ],
+        servers: vec![create_test_server_config_with_max_connections(
+            "127.0.0.1",
+            mock_port,
+            "Mock Server",
+            6,
+        )],
         ..Default::default()
     };
 

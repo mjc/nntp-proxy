@@ -41,6 +41,7 @@ async-trait = "0.1.89"
 memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
 moka = { version = "0.12", features = ["future", "atomic64"] }  # Async LRU cache with 64-bit atomic optimizations
+bytes = "1.0"  # Efficient byte buffer for zero-copy operations
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"] }  # TLS support for NNTP connections  
 rustls = { version = "0.23", features = ["ring", "std"], default-features = false }  # Pure Rust TLS implementation optimized for performance
 rustls-native-certs = "0.8"  # Load system CA certificates

@@ -12,9 +12,9 @@
 //! - **config**: Configuration loading and management
 //! - **pool**: Connection and buffer pooling for high performance
 //! - **protocol**: NNTP protocol constants and response parsing
-//! - **proxy**: Main proxy orchestration (NntpProxy struct)
+//! - **proxy**: Main proxy orchestration (`NntpProxy` struct)
 //! - **router**: Backend selection and load balancing
-//! - **types**: Core type definitions (ClientId, RequestId, BackendId)
+//! - **types**: Core type definitions (`ClientId`, `RequestId`, `BackendId`)
 //!
 //! ## Design Philosophy
 //!

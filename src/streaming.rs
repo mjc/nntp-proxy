@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn test_buffer_sizes() {
         // Verify we're using optimized buffer sizes
-        assert_eq!(HIGH_THROUGHPUT_BUFFER_SIZE, 262144); // 256KB
+        assert_eq!(HIGH_THROUGHPUT_BUFFER_SIZE, 262_144); // 256KB
         const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE > 8192); // Larger than default
         const _: () = assert!(HIGH_THROUGHPUT_BUFFER_SIZE.is_multiple_of(4096)); // Page-aligned
     }

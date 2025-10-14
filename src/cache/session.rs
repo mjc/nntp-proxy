@@ -71,9 +71,8 @@ impl CachingSession {
                                         client_write.write_all(&cached.response).await?;
                                         backend_to_client_bytes += cached.response.len() as u64;
                                         continue;
-                                    } else {
-                                        info!("Cache MISS for message-ID: {}", message_id);
                                     }
+                                    info!("Cache MISS for message-ID: {}", message_id);
                                 } else {
                                     debug!("No message-ID extracted from command: {}", line.trim());
                                 }
