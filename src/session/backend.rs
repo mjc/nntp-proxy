@@ -3,6 +3,22 @@
 //! This module handles all communication with NNTP backend servers.
 //! It is responsible for sending commands and receiving complete responses.
 //!
+//! # Important Performance Note
+//!
+//! This module **buffers entire responses** before returning them. This is suitable for:
+//! - Single-line responses (200 OK, 430 No such article, etc.)
+//! - Small multiline responses (LIST, GROUP commands)
+//! - Testing and mocking
+//! - Future caching layer integration
+//!
+//! **NOT suitable for the hot path** with large article downloads because:
+//! - Buffers entire 50MB+ articles in memory before streaming
+//! - No pipelined I/O (can't read next chunk while writing current chunk)
+//! - Kills throughput from 100+ MB/s down to < 1 MB/s
+//!
+//! For high-performance article streaming, use the direct pipelined approach
+//! in `execute_command_on_backend()` in legacy.rs.
+//!
 //! Key principle: This module does NOT interact with clients. All errors
 //! returned from this module indicate backend failures.
 

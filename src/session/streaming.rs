@@ -3,6 +3,18 @@
 //! This module handles streaming data to NNTP clients.
 //! It is responsible for taking response data and writing it to the client connection.
 //!
+//! # Important Performance Note
+//!
+//! This module operates on **complete BackendResponse** objects (already buffered).
+//! Suitable for the same use cases as backend.rs:
+//! - Small responses
+//! - Testing/mocking
+//! - Future features (caching, metrics, compression)
+//!
+//! **NOT suitable for the hot path** with large article downloads for the same
+//! reasons as backend.rs - it requires the entire response to be buffered first,
+//! preventing pipelined I/O that is critical for NNTP throughput.
+//!
 //! Key principle: This module does NOT interact with backends. All errors
 //! returned from this module indicate client failures.
 
