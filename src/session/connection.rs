@@ -12,9 +12,15 @@ use crate::pool::BufferPool;
 /// Result of bidirectional forwarding
 pub enum ForwardResult {
     /// Normal disconnection
-    NormalDisconnect { client_to_backend: u64, backend_to_client: u64 },
+    NormalDisconnect {
+        client_to_backend: u64,
+        backend_to_client: u64,
+    },
     /// Backend error - connection should be removed from pool
-    BackendError { client_to_backend: u64, backend_to_client: u64 },
+    BackendError {
+        client_to_backend: u64,
+        backend_to_client: u64,
+    },
 }
 
 /// Bidirectional forwarding between client and backend in stateful mode
@@ -131,30 +137,36 @@ pub fn log_client_error(
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => {
             debug!(
-                "Client {} closed connection (EOF). Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                client_addr, client_to_backend_bytes, backend_to_client_bytes
+                "Client {} closed connection (EOF) | ↑{} ↓{}",
+                client_addr,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
         std::io::ErrorKind::BrokenPipe => {
             debug!(
-                "Client {} connection broken pipe. Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                client_addr, client_to_backend_bytes, backend_to_client_bytes
+                "Client {} connection broken pipe | ↑{} ↓{}",
+                client_addr,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
         std::io::ErrorKind::ConnectionReset => {
             warn!(
-                "Client {} connection reset. Session stats: {} bytes sent to backend, {} bytes received from backend.",
-                client_addr, client_to_backend_bytes, backend_to_client_bytes
+                "Client {} connection reset | ↑{} ↓{}",
+                client_addr,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
         _ => {
             warn!(
-                "Error reading from client {}: {} (kind: {:?}). Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                "Error reading from client {}: {} ({:?}) | ↑{} ↓{}",
                 client_addr,
                 error,
                 error.kind(),
-                client_to_backend_bytes,
-                backend_to_client_bytes
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
     }
@@ -167,44 +179,50 @@ pub fn log_routing_error(
     command: &str,
     client_to_backend_bytes: u64,
     backend_to_client_bytes: u64,
+    backend_id: crate::types::BackendId,
 ) {
     let trimmed = command.trim();
     match error.kind() {
         std::io::ErrorKind::BrokenPipe => {
             warn!(
-                "Client {} disconnected unexpectedly while routing command '{}' (broken pipe). \
-                 Session stats: {} bytes sent to backend, {} bytes received from backend. \
-                 This usually indicates the client closed the connection before receiving the response.",
-                client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                "Client {} disconnected during '{}' → {:?} (broken pipe) | ↑{} ↓{} | Client closed connection early",
+                client_addr,
+                trimmed,
+                backend_id,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
         std::io::ErrorKind::ConnectionReset => {
             warn!(
-                "Client {} connection reset while routing command '{}'. \
-                 Session stats: {} bytes sent to backend, {} bytes received from backend. \
-                 This usually indicates a network issue or client crash.",
-                client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                "Client {} connection reset during '{}' → {:?} | ↑{} ↓{} | Network issue or client crash",
+                client_addr,
+                trimmed,
+                backend_id,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
         std::io::ErrorKind::ConnectionAborted => {
             warn!(
-                "Client {} connection aborted while routing command '{}'. \
-                 Session stats: {} bytes sent to backend, {} bytes received from backend. \
-                 Check debug logs above for full command/response hex dumps.",
-                client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                "Client {} connection aborted during '{}' → {:?} | ↑{} ↓{} | Check debug logs for details",
+                client_addr,
+                trimmed,
+                backend_id,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
         _ => {
             error!(
-                "Client {} error while routing command '{}': {} (kind: {:?}). \
-                 Session stats: {} bytes sent to backend, {} bytes received from backend. \
-                 Check debug logs above for full command/response hex dumps.",
+                "Client {} error during '{}' → {:?}: {} ({:?}) | ↑{} ↓{} | Check debug logs",
                 client_addr,
                 trimmed,
+                backend_id,
                 error,
                 error.kind(),
-                client_to_backend_bytes,
-                backend_to_client_bytes
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
     }

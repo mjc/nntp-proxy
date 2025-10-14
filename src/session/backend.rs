@@ -5,10 +5,10 @@
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::constants::buffer::STREAMING_CHUNK_SIZE;
-use crate::protocol::ResponseCode;
+use crate::protocol::{MIN_RESPONSE_LENGTH, ResponseCode};
 use crate::types::BackendId;
 
 /// Send command to backend and read first chunk
@@ -59,9 +59,43 @@ where
         String::from_utf8_lossy(&chunk[..n.min(100)])
     );
 
+    // Warn if response is too short to be valid
+    if n < MIN_RESPONSE_LENGTH {
+        warn!(
+            "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
+            client_addr,
+            backend_id,
+            n,
+            MIN_RESPONSE_LENGTH,
+            &chunk[..n]
+        );
+    }
+
     // Parse response code and check if multiline
     let response_code = ResponseCode::parse(&chunk[..n]);
     let is_multiline = response_code.is_multiline();
+
+    // Validate response code
+    if response_code == ResponseCode::Invalid {
+        warn!(
+            "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
+            client_addr,
+            backend_id,
+            n,
+            String::from_utf8_lossy(&chunk[..n.min(50)])
+        );
+    } else if let Some(code) = response_code.status_code() {
+        // Warn on unusual status codes
+        if code == 0 || code >= 600 {
+            warn!(
+                "Client {} got unusual status code {} from backend {:?}: {:?}",
+                client_addr,
+                code,
+                backend_id,
+                String::from_utf8_lossy(&chunk[..n.min(50)])
+            );
+        }
+    }
 
     // Log first line (best effort)
     if let Some(newline_pos) = chunk[..n].iter().position(|&b| b == b'\n')

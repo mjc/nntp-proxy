@@ -25,6 +25,13 @@ use crate::streaming::StreamHandler;
 
 use super::{backend, connection, streaming};
 
+/// Extract message-ID from NNTP command if present
+fn extract_message_id(command: &str) -> Option<&str> {
+    let start = command.find('<')?;
+    let end = command[start..].find('>')?;
+    Some(&command[start..start + end + 1])
+}
+
 impl ClientSession {
     /// Handle a client connection with a dedicated backend connection (standard 1:1 mode)
     pub async fn handle_with_pooled_backend<T>(
@@ -287,26 +294,34 @@ impl ClientSession {
                                 )
                                 .await
                             {
-                                Ok(()) => {}
+                                Ok(_backend_id) => {}
                                 Err(e) => {
-                                    // Provide detailed context for broken pipe errors
+                                    // Provide detailed context for errors
                                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                                        connection::log_routing_error(
+                                        warn!(
+                                            "Client {} error routing '{}': {} | ↑{} ↓{}",
                                             self.client_addr,
+                                            trimmed,
                                             io_err,
-                                            &command,
-                                            client_to_backend_bytes,
-                                            backend_to_client_bytes,
+                                            crate::formatting::format_bytes(
+                                                client_to_backend_bytes
+                                            ),
+                                            crate::formatting::format_bytes(
+                                                backend_to_client_bytes
+                                            )
                                         );
                                     } else {
                                         error!(
-                                            "Error routing command '{}' for client {}: {}. \
-                                             Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                            "Error routing '{}' for client {}: {} | ↑{} ↓{}",
                                             trimmed,
                                             self.client_addr,
                                             e,
-                                            client_to_backend_bytes,
-                                            backend_to_client_bytes
+                                            crate::formatting::format_bytes(
+                                                client_to_backend_bytes
+                                            ),
+                                            crate::formatting::format_bytes(
+                                                backend_to_client_bytes
+                                            )
                                         );
                                     }
 
@@ -349,11 +364,10 @@ impl ClientSession {
         // Log session summary for debugging, especially useful for test connections
         if client_to_backend_bytes + backend_to_client_bytes < 500 {
             debug!(
-                "SESSION SUMMARY for Client {}: Small transfer completed successfully. \
-                 {} bytes sent to backend, {} bytes received from backend. \
-                 This appears to be a short session (likely test connection). \
-                 Check debug logs above for individual command/response details.",
-                self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+                "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
+                self.client_addr,
+                crate::formatting::format_bytes(client_to_backend_bytes),
+                crate::formatting::format_bytes(backend_to_client_bytes)
             );
         }
 
@@ -484,8 +498,10 @@ impl ClientSession {
         }
 
         info!(
-            "Client {} stateful session ended: {} bytes sent, {} bytes received",
-            self.client_addr, client_to_backend_bytes, backend_to_client_bytes
+            "Stateful session ended {} | ↑{} ↓{}",
+            self.client_addr,
+            crate::formatting::format_bytes(client_to_backend_bytes),
+            crate::formatting::format_bytes(backend_to_client_bytes)
         );
 
         Ok((client_to_backend_bytes, backend_to_client_bytes))
@@ -499,7 +515,7 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut u64,
         backend_to_client_bytes: &mut u64,
-    ) -> Result<()> {
+    ) -> Result<crate::types::BackendId> {
         use crate::pool::{is_connection_error, remove_from_pool};
 
         // Route the command to get a backend (lock-free!)
@@ -552,7 +568,7 @@ impl ClientSession {
                 );
                 remove_from_pool(pooled_conn);
                 router.complete_command_sync(backend_id);
-                return result;
+                return result.map(|_| backend_id);
             } else if got_backend_data && is_connection_error(e) {
                 debug!(
                     "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
@@ -564,7 +580,7 @@ impl ClientSession {
         // Complete the request - decrement pending count (lock-free!)
         router.complete_command_sync(backend_id);
 
-        result
+        result.map(|_| backend_id)
     }
 
     /// Execute a command on a backend connection and stream the response to the client
@@ -617,14 +633,37 @@ impl ClientSession {
 
         *client_to_backend_bytes += command.len() as u64;
 
+        // Extract message-ID from command if present (for correlation with SABnzbd errors)
+        let msgid = extract_message_id(command);
+
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
+            let log_msg = if let Some(id) = msgid {
+                format!(
+                    "Client {} ARTICLE {} → multiline ({:?}), streaming {}",
+                    self.client_addr,
+                    id,
+                    _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64)
+                )
+            } else {
+                format!(
+                    "Client {} '{}' → multiline ({:?}), streaming {}",
+                    self.client_addr,
+                    command.trim(),
+                    _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64)
+                )
+            };
+            debug!("{}", log_msg);
+
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
                 &chunk,
                 n,
                 self.client_addr,
+                backend_id,
             )
             .await
             {
@@ -633,6 +672,61 @@ impl ClientSession {
             }
         } else {
             // Single-line response - just write the first chunk
+            let log_msg = if let Some(id) = msgid {
+                // 430 (No such article) and other 4xx errors are expected single-line responses
+                if let Some(code) = _response_code.status_code() {
+                    if (400..500).contains(&code) {
+                        format!(
+                            "Client {} ARTICLE {} → error {} (single-line), writing {}",
+                            self.client_addr,
+                            id,
+                            code,
+                            crate::formatting::format_bytes(n as u64)
+                        )
+                    } else {
+                        format!(
+                            "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
+                            self.client_addr,
+                            id,
+                            _response_code.status_code(),
+                            crate::formatting::format_bytes(n as u64),
+                            &chunk[..n.min(50)]
+                        )
+                    }
+                } else {
+                    format!(
+                        "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
+                        self.client_addr,
+                        id,
+                        _response_code.status_code(),
+                        crate::formatting::format_bytes(n as u64),
+                        &chunk[..n.min(50)]
+                    )
+                }
+            } else {
+                format!(
+                    "Client {} '{}' → single-line ({:?}), writing {}: {:02x?}",
+                    self.client_addr,
+                    command.trim(),
+                    _response_code.status_code(),
+                    crate::formatting::format_bytes(n as u64),
+                    &chunk[..n.min(50)]
+                )
+            };
+
+            // Only warn if it's truly unusual (not a 4xx/5xx error response)
+            if let Some(code) = _response_code.status_code() {
+                if code >= 400 {
+                    debug!("{}", log_msg); // Errors are expected, just debug
+                } else if msgid.is_some() {
+                    warn!("{}", log_msg); // ARTICLE with 2xx/3xx single-line is unusual
+                } else {
+                    debug!("{}", log_msg);
+                }
+            } else {
+                debug!("{}", log_msg);
+            }
+
             match client_write.write_all(&chunk[..n]).await {
                 Ok(_) => n as u64,
                 Err(e) => return (Err(e.into()), got_backend_data),
@@ -640,6 +734,13 @@ impl ClientSession {
         };
 
         *backend_to_client_bytes += bytes_written;
+
+        if let Some(id) = msgid {
+            debug!(
+                "Client {} ARTICLE {} completed: wrote {} bytes to client",
+                self.client_addr, id, bytes_written
+            );
+        }
 
         (Ok(()), got_backend_data)
     }

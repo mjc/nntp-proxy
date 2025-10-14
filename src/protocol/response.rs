@@ -106,21 +106,41 @@ impl NntpResponse {
     /// Check if data ends with the NNTP multiline terminator
     ///
     /// NNTP multiline responses end with "\r\n.\r\n" (RFC 3977)
-    /// Also accepts "\n.\n" for compatibility with some implementations
+    /// Strictly checks for the proper terminator at the end of data.
     #[inline]
     pub fn has_terminator_at_end(data: &[u8]) -> bool {
         let n = data.len();
-        if n >= 5 {
-            data[n - 5..n] == *b"\r\n.\r\n" || (n >= 3 && data[n - 3..n] == *b"\n.\n")
-        } else {
-            n >= 3 && data[..n] == *b"\n.\n"
+        // Only check for proper RFC 3977 terminator: \r\n.\r\n
+        n >= 5 && data[n - 5..n] == *b"\r\n.\r\n"
+    }
+
+    /// Find the position of the NNTP multiline terminator in data
+    ///
+    /// Returns the position AFTER the terminator (exclusive end), or None if not found.
+    /// This handles the case where extra data appears after the terminator in the same chunk.
+    /// Strictly follows RFC 3977: only matches "\r\n.\r\n" (CRLF, dot, CRLF).
+    #[inline]
+    pub fn find_terminator_end(data: &[u8]) -> Option<usize> {
+        let n = data.len();
+        if n < 5 {
+            return None;
         }
+
+        // Search for "\r\n.\r\n" (5 bytes) - RFC 3977 standard terminator
+        for i in 0..=(n - 5) {
+            if &data[i..i + 5] == b"\r\n.\r\n" {
+                return Some(i + 5);
+            }
+        }
+
+        None
     }
 
     /// Check if a terminator spans across a boundary between tail and current chunk
     ///
     /// This handles the case where a multiline terminator is split across two read chunks.
     /// For example: previous chunk ends with "\r\n." and current starts with "\r\n"
+    /// Strictly follows RFC 3977: only matches "\r\n.\r\n" (CRLF, dot, CRLF).
     #[inline]
     pub fn has_spanning_terminator(
         tail: &[u8],
@@ -140,8 +160,8 @@ impl NntpResponse {
         check_buf[tail_len..tail_len + curr_copy].copy_from_slice(&current[..curr_copy]);
         let total = tail_len + curr_copy;
 
-        (total >= 5 && check_buf[total - 5..total] == *b"\r\n.\r\n")
-            || (total >= 3 && check_buf[total - 3..total] == *b"\n.\n")
+        // RFC 3977 requires exactly \r\n.\r\n (5 bytes)
+        total >= 5 && check_buf[total - 5..total] == *b"\r\n.\r\n"
     }
 
     /// Check if response is a disconnect/goodbye (205)

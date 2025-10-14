@@ -14,5 +14,5 @@ pub use buffer::BufferPool;
 pub use connection_guard::{execute_with_guard, is_connection_error, remove_from_pool};
 pub use connection_trait::{ConnectionProvider, PoolStatus};
 pub use health_check::{HealthCheckError, HealthCheckMetrics};
-pub use provider::DeadpoolConnectionProvider;
 pub use prewarming::prewarm_pools;
+pub use provider::DeadpoolConnectionProvider;
