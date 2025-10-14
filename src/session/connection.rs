@@ -167,40 +167,42 @@ pub fn log_routing_error(
     command: &str,
     client_to_backend_bytes: u64,
     backend_to_client_bytes: u64,
+    backend_id: crate::types::BackendId,
 ) {
     let trimmed = command.trim();
     match error.kind() {
         std::io::ErrorKind::BrokenPipe => {
             warn!(
-                "Client {} disconnected unexpectedly while routing command '{}' (broken pipe). \
+                "Client {} disconnected unexpectedly while routing command '{}' to backend {:?} (broken pipe). \
                  Session stats: {} bytes sent to backend, {} bytes received from backend. \
                  This usually indicates the client closed the connection before receiving the response.",
-                client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                client_addr, trimmed, backend_id, client_to_backend_bytes, backend_to_client_bytes
             );
         }
         std::io::ErrorKind::ConnectionReset => {
             warn!(
-                "Client {} connection reset while routing command '{}'. \
+                "Client {} connection reset while routing command '{}' to backend {:?}. \
                  Session stats: {} bytes sent to backend, {} bytes received from backend. \
                  This usually indicates a network issue or client crash.",
-                client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                client_addr, trimmed, backend_id, client_to_backend_bytes, backend_to_client_bytes
             );
         }
         std::io::ErrorKind::ConnectionAborted => {
             warn!(
-                "Client {} connection aborted while routing command '{}'. \
+                "Client {} connection aborted while routing command '{}' to backend {:?}. \
                  Session stats: {} bytes sent to backend, {} bytes received from backend. \
                  Check debug logs above for full command/response hex dumps.",
-                client_addr, trimmed, client_to_backend_bytes, backend_to_client_bytes
+                client_addr, trimmed, backend_id, client_to_backend_bytes, backend_to_client_bytes
             );
         }
         _ => {
             error!(
-                "Client {} error while routing command '{}': {} (kind: {:?}). \
+                "Client {} error while routing command '{}' to backend {:?}: {} (kind: {:?}). \
                  Session stats: {} bytes sent to backend, {} bytes received from backend. \
                  Check debug logs above for full command/response hex dumps.",
                 client_addr,
                 trimmed,
+                backend_id,
                 error,
                 error.kind(),
                 client_to_backend_bytes,

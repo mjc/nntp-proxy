@@ -20,6 +20,7 @@ pub async fn stream_multiline_response<R, W>(
     first_chunk: &[u8],
     first_n: usize,
     client_addr: std::net::SocketAddr,
+    backend_id: crate::types::BackendId,
 ) -> Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -34,8 +35,8 @@ where
         if !has_terminator {
             use tracing::debug;
             debug!(
-                "Client {} disconnected on first chunk, draining remaining response from backend",
-                client_addr
+                "Client {} disconnected on first chunk, draining remaining response from backend {:?}",
+                client_addr, backend_id
             );
             
             // Drain the rest of the response
@@ -77,8 +78,8 @@ where
             }
             
             debug!(
-                "Client {} drained response from backend after first chunk disconnect",
-                client_addr
+                "Client {} drained response from backend {:?} after first chunk disconnect",
+                client_addr, backend_id
             );
         }
         return Err(e.into());
@@ -124,8 +125,8 @@ where
                 // Client disconnected - drain the rest from backend to keep connection clean
                 use tracing::debug;
                 debug!(
-                    "Client {} disconnected while streaming, draining remaining response from backend",
-                    client_addr
+                    "Client {} disconnected while streaming, draining remaining response from backend {:?}",
+                    client_addr, backend_id
                 );
                 
                 // Check if we've already seen the terminator in current chunk
@@ -165,8 +166,8 @@ where
                         }
                         
                         debug!(
-                            "Client {} drained remaining response from backend, connection is clean",
-                            client_addr
+                            "Client {} drained remaining response from backend {:?}, connection is clean",
+                            client_addr, backend_id
                         );
                     }
                 }

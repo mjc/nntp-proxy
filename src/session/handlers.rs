@@ -287,17 +287,34 @@ impl ClientSession {
                                 )
                                 .await
                             {
-                                Ok(()) => {}
+                                Ok(_backend_id) => {}
                                 Err(e) => {
+                                    // Extract backend_id from error context if possible
+                                    // Try to route the command again to get backend_id for logging
+                                    let backend_id = router.route_command_sync(self.client_id, &command).ok();
+                                    
                                     // Provide detailed context for broken pipe errors
                                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                                        connection::log_routing_error(
-                                            self.client_addr,
-                                            io_err,
-                                            &command,
-                                            client_to_backend_bytes,
-                                            backend_to_client_bytes,
-                                        );
+                                        if let Some(bid) = backend_id {
+                                            connection::log_routing_error(
+                                                self.client_addr,
+                                                io_err,
+                                                &command,
+                                                client_to_backend_bytes,
+                                                backend_to_client_bytes,
+                                                bid,
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Client {} error routing command '{}': {}. \
+                                                 Session stats: {} bytes sent to backend, {} bytes received from backend.",
+                                                self.client_addr,
+                                                trimmed,
+                                                io_err,
+                                                client_to_backend_bytes,
+                                                backend_to_client_bytes
+                                            );
+                                        }
                                     } else {
                                         error!(
                                             "Error routing command '{}' for client {}: {}. \
@@ -499,7 +516,7 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut u64,
         backend_to_client_bytes: &mut u64,
-    ) -> Result<()> {
+    ) -> Result<crate::types::BackendId> {
         use crate::pool::{is_connection_error, remove_from_pool};
 
         // Route the command to get a backend (lock-free!)
@@ -552,7 +569,7 @@ impl ClientSession {
                 );
                 remove_from_pool(pooled_conn);
                 router.complete_command_sync(backend_id);
-                return result;
+                return result.map(|_| backend_id);
             } else if got_backend_data && is_connection_error(e) {
                 debug!(
                     "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
@@ -564,7 +581,7 @@ impl ClientSession {
         // Complete the request - decrement pending count (lock-free!)
         router.complete_command_sync(backend_id);
 
-        result
+        result.map(|_| backend_id)
     }
 
     /// Execute a command on a backend connection and stream the response to the client
@@ -645,6 +662,7 @@ impl ClientSession {
                 &chunk,
                 n,
                 self.client_addr,
+                backend_id,
             )
             .await
             {
