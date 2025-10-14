@@ -22,6 +22,7 @@ use crate::protocol::{
 };
 use crate::router::BackendSelector;
 use crate::streaming::StreamHandler;
+use crate::types::{BytesTransferred, TransferMetrics};
 
 use super::{backend, connection, streaming};
 
@@ -173,8 +174,8 @@ impl ClientSession {
         let (client_read, mut client_write) = client_stream.split();
         let mut client_reader = BufReader::new(client_read);
 
-        let mut client_to_backend_bytes = 0u64;
-        let mut backend_to_client_bytes = 0u64;
+        let mut client_to_backend_bytes = BytesTransferred::zero();
+        let mut backend_to_client_bytes = BytesTransferred::zero();
 
         // Send initial greeting to client
         debug!(
@@ -194,7 +195,7 @@ impl ClientSession {
             );
             return Err(e.into());
         }
-        backend_to_client_bytes += PROXY_GREETING_PCR.len() as u64;
+        backend_to_client_bytes.add(PROXY_GREETING_PCR.len());
 
         debug!(
             "Client {} sent greeting successfully, entering command loop",
@@ -214,7 +215,7 @@ impl ClientSession {
                     break; // Client disconnected
                 }
                 Ok(n) => {
-                    client_to_backend_bytes += n as u64;
+                    client_to_backend_bytes.add(n);
                     let trimmed = command.trim();
 
                     debug!(
@@ -234,7 +235,7 @@ impl ClientSession {
                                 self.client_addr, e
                             );
                         }
-                        backend_to_client_bytes += CONNECTION_CLOSING.len() as u64;
+                        backend_to_client_bytes.add(CONNECTION_CLOSING.len());
                         debug!("Client {} sent QUIT, closing connection", self.client_addr);
                         break;
                     }
@@ -248,7 +249,7 @@ impl ClientSession {
                                 AuthAction::AcceptAuth => AuthHandler::pass_response(),
                             };
                             client_write.write_all(response).await?;
-                            backend_to_client_bytes += response.len() as u64;
+                            backend_to_client_bytes.add(response.len());
                         }
                         CommandAction::Reject(reason) => {
                             // In hybrid mode, stateful commands trigger a switch to stateful connection
@@ -280,7 +281,7 @@ impl ClientSession {
                             client_write
                                 .write_all(COMMAND_NOT_SUPPORTED_STATELESS)
                                 .await?;
-                            backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
+                            backend_to_client_bytes.add(COMMAND_NOT_SUPPORTED_STATELESS.len());
                         }
                         CommandAction::ForwardStateless | CommandAction::ForwardHighThroughput => {
                             // Route this command to a backend
@@ -304,10 +305,10 @@ impl ClientSession {
                                             trimmed,
                                             io_err,
                                             crate::formatting::format_bytes(
-                                                client_to_backend_bytes
+                                                client_to_backend_bytes.as_u64()
                                             ),
                                             crate::formatting::format_bytes(
-                                                backend_to_client_bytes
+                                                backend_to_client_bytes.as_u64()
                                             )
                                         );
                                     } else {
@@ -317,20 +318,20 @@ impl ClientSession {
                                             self.client_addr,
                                             e,
                                             crate::formatting::format_bytes(
-                                                client_to_backend_bytes
+                                                client_to_backend_bytes.as_u64()
                                             ),
                                             crate::formatting::format_bytes(
-                                                backend_to_client_bytes
+                                                backend_to_client_bytes.as_u64()
                                             )
                                         );
                                     }
 
                                     // Try to send error response, but don't log failure if client is gone
                                     let _ = client_write.write_all(BACKEND_ERROR).await;
-                                    backend_to_client_bytes += BACKEND_ERROR.len() as u64;
+                                    backend_to_client_bytes.add(BACKEND_ERROR.len());
 
                                     // For debugging test connections and small transfers, log detailed info
-                                    if client_to_backend_bytes + backend_to_client_bytes < 500 {
+                                    if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < 500 {
                                         debug!(
                                             "ERROR SUMMARY for small transfer - Client {}: \
                                              Command '{}' failed with {}. \
@@ -353,8 +354,10 @@ impl ClientSession {
                     connection::log_client_error(
                         self.client_addr,
                         &e,
-                        client_to_backend_bytes,
-                        backend_to_client_bytes,
+                        TransferMetrics {
+                            client_to_backend: client_to_backend_bytes,
+                            backend_to_client: backend_to_client_bytes,
+                        },
                     );
                     break;
                 }
@@ -362,16 +365,16 @@ impl ClientSession {
         }
 
         // Log session summary for debugging, especially useful for test connections
-        if client_to_backend_bytes + backend_to_client_bytes < 500 {
+        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < 500 {
             debug!(
                 "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
                 self.client_addr,
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
+                crate::formatting::format_bytes(backend_to_client_bytes.as_u64())
             );
         }
 
-        Ok((client_to_backend_bytes, backend_to_client_bytes))
+        Ok((client_to_backend_bytes.as_u64(), backend_to_client_bytes.as_u64()))
     }
 
     /// Switch from per-command routing to stateful mode with a dedicated backend connection
@@ -381,8 +384,8 @@ impl ClientSession {
         mut client_reader: tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
         mut client_write: tokio::net::tcp::WriteHalf<'_>,
         initial_command: &str,
-        mut client_to_backend_bytes: u64,
-        mut backend_to_client_bytes: u64,
+        client_to_backend_bytes: BytesTransferred,
+        backend_to_client_bytes: BytesTransferred,
     ) -> Result<(u64, u64)> {
         debug!(
             "Client {} acquiring dedicated backend connection for stateful mode",
@@ -397,6 +400,9 @@ impl ClientSession {
         // Get a backend for this session
         let backend_id = router.route_command_sync(self.client_id, initial_command)?;
 
+        let mut c2b = client_to_backend_bytes;
+        let mut b2c = backend_to_client_bytes;
+
         // Try to acquire a stateful slot (respects max_connections-1 limit)
         if !router.try_acquire_stateful(backend_id) {
             // All stateful slots are taken - reject this switch
@@ -407,10 +413,10 @@ impl ClientSession {
             const STATEFUL_SLOTS_ERROR: &[u8] =
                 b"503 All stateful connection slots are in use. Try again later.\r\n";
             client_write.write_all(STATEFUL_SLOTS_ERROR).await?;
-            backend_to_client_bytes += STATEFUL_SLOTS_ERROR.len() as u64;
+            b2c.add(STATEFUL_SLOTS_ERROR.len());
 
             // Continue in per-command mode
-            return Ok((client_to_backend_bytes, backend_to_client_bytes));
+            return Ok((c2b.as_u64(), b2c.as_u64()));
         }
 
         let provider = router.get_backend_provider(backend_id).ok_or_else(|| {
@@ -458,11 +464,11 @@ impl ClientSession {
                 }
             };
 
-        client_to_backend_bytes += initial_command.len() as u64;
+        c2b.add(initial_command.len());
 
         // Forward the initial response to client
         client_write.write_all(&chunk[..n]).await?;
-        backend_to_client_bytes += n as u64;
+        b2c.add(n);
 
         // Use connection helper for bidirectional forwarding
         let result = connection::bidirectional_forward(
@@ -471,40 +477,31 @@ impl ClientSession {
             &mut *pooled_conn,
             &self.buffer_pool,
             self.client_addr,
-            client_to_backend_bytes,
-            backend_to_client_bytes,
+            c2b,
+            b2c,
         )
         .await?;
 
         // Handle the result - remove from pool if backend error
         match result {
-            connection::ForwardResult::BackendError {
-                client_to_backend,
-                backend_to_client,
-            } => {
+            connection::ForwardResult::BackendError(metrics) => {
                 router.release_stateful(backend_id);
                 crate::pool::remove_from_pool(pooled_conn);
-                client_to_backend_bytes = client_to_backend;
-                backend_to_client_bytes = backend_to_client;
+                info!(
+                    "Client {} stateful session ended with backend error: {}",
+                    self.client_addr, metrics
+                );
+                Ok(metrics.as_tuple())
             }
-            connection::ForwardResult::NormalDisconnect {
-                client_to_backend,
-                backend_to_client,
-            } => {
+            connection::ForwardResult::NormalDisconnect(metrics) => {
                 router.release_stateful(backend_id);
-                client_to_backend_bytes = client_to_backend;
-                backend_to_client_bytes = backend_to_client;
+                info!(
+                    "Client {} stateful session ended: {}",
+                    self.client_addr, metrics
+                );
+                Ok(metrics.as_tuple())
             }
         }
-
-        info!(
-            "Stateful session ended {} | ↑{} ↓{}",
-            self.client_addr,
-            crate::formatting::format_bytes(client_to_backend_bytes),
-            crate::formatting::format_bytes(backend_to_client_bytes)
-        );
-
-        Ok((client_to_backend_bytes, backend_to_client_bytes))
     }
 
     /// Route a single command to a backend and execute it
@@ -513,8 +510,8 @@ impl ClientSession {
         router: &BackendSelector,
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        client_to_backend_bytes: &mut u64,
-        backend_to_client_bytes: &mut u64,
+        client_to_backend_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
         use crate::pool::{is_connection_error, remove_from_pool};
 
@@ -609,8 +606,8 @@ impl ClientSession {
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_id: crate::types::BackendId,
-        client_to_backend_bytes: &mut u64,
-        backend_to_client_bytes: &mut u64,
+        client_to_backend_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BytesTransferred,
     ) -> (Result<()>, bool) {
         let mut got_backend_data = false;
 
@@ -631,7 +628,7 @@ impl ClientSession {
                 Err(e) => return (Err(e), got_backend_data),
             };
 
-        *client_to_backend_bytes += command.len() as u64;
+        client_to_backend_bytes.add(command.len());
 
         // Extract message-ID from command if present (for correlation with SABnzbd errors)
         let msgid = extract_message_id(command);
@@ -733,7 +730,7 @@ impl ClientSession {
             }
         };
 
-        *backend_to_client_bytes += bytes_written;
+        backend_to_client_bytes.add(bytes_written as usize);
 
         if let Some(id) = msgid {
             debug!(

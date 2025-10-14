@@ -2,6 +2,12 @@
 //!
 //! This module provides unique identifiers used throughout the proxy.
 
+pub mod metrics;
+pub mod validated;
+
+pub use metrics::{BytesTransferred, TransferMetrics};
+pub use validated::{HostName, ServerName, ValidationError};
+
 use uuid::Uuid;
 
 /// Unique identifier for client connections
