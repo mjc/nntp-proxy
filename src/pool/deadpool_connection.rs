@@ -331,7 +331,7 @@ impl managed::Manager for TcpManager {
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<anyhow::Error> {
         // Only do fast TCP-level check on recycle
-        // Full health checks happen periodically via the keepalive mechanism
+        // Full health checks happen periodically via the periodic health checks
         check_tcp_alive(conn)?;
         Ok(())
     }
