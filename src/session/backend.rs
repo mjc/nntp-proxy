@@ -2,7 +2,7 @@
 //!
 //! This module handles all communication with NNTP backend servers.
 //! It is responsible for sending commands and receiving complete responses.
-//! 
+//!
 //! Key principle: This module does NOT interact with clients. All errors
 //! returned from this module indicate backend failures.
 
@@ -126,19 +126,19 @@ where
     let is_multiline = response_code.is_multiline();
 
     // Log first line (best effort)
-    if let Some(newline_pos) = chunk[..n].iter().position(|&b| b == b'\n') {
-        if let Ok(first_line_str) = std::str::from_utf8(&chunk[..newline_pos]) {
-            debug!(
-                "Client {} got first line from backend {:?}: {}",
-                client_addr,
-                backend_id,
-                first_line_str.trim()
-            );
-        }
+    if let Some(newline_pos) = chunk[..n].iter().position(|&b| b == b'\n')
+        && let Ok(first_line_str) = std::str::from_utf8(&chunk[..newline_pos])
+    {
+        debug!(
+            "Client {} got first line from backend {:?}: {}",
+            client_addr,
+            backend_id,
+            first_line_str.trim()
+        );
     }
 
-    // Store first chunk (only the valid bytes)
-    let mut chunks = vec![Bytes::copy_from_slice(&chunk[..n])];
+    // Pre-allocate chunks vector for typical response size
+    let mut chunks = Vec::with_capacity(4);
     let mut total_bytes = n as u64;
 
     // If multiline, read until terminator
@@ -147,21 +147,27 @@ where
         let has_terminator = NntpResponse::has_terminator_at_end(&chunk[..n]);
 
         if !has_terminator {
-            // Need to read more chunks
-            let additional = read_multiline_chunks(
-                backend_conn,
-                &chunk[..n],
-                backend_id,
-                client_addr,
-            )
-            .await?;
+            // Need to read more chunks - pass slice before consuming chunk
+            let additional =
+                read_multiline_chunks(backend_conn, &chunk[..n], backend_id, client_addr).await?;
 
             for chunk in &additional {
                 total_bytes += chunk.len() as u64;
             }
 
+            // Store first chunk (convert to Bytes without copying by taking ownership)
+            chunk.truncate(n);
+            chunks.push(Bytes::from(chunk));
             chunks.extend(additional);
+        } else {
+            // Terminator in first chunk - store it
+            chunk.truncate(n);
+            chunks.push(Bytes::from(chunk));
         }
+    } else {
+        // Single-line response - store first chunk
+        chunk.truncate(n);
+        chunks.push(Bytes::from(chunk));
     }
 
     debug!(
@@ -192,7 +198,7 @@ async fn read_multiline_chunks<T>(
 where
     T: AsyncReadExt + Unpin,
 {
-    let mut chunks = Vec::new();
+    let mut chunks = Vec::with_capacity(4); // Pre-allocate for typical multiline response
     let mut chunk1 = vec![0u8; STREAMING_CHUNK_SIZE];
     let mut chunk2 = vec![0u8; STREAMING_CHUNK_SIZE];
 
@@ -202,9 +208,7 @@ where
     // Initialize tail with last bytes of first chunk
     let first_len = first_chunk.len();
     if first_len >= TERMINATOR_TAIL_SIZE {
-        tail.copy_from_slice(
-            &first_chunk[first_len - TERMINATOR_TAIL_SIZE..first_len],
-        );
+        tail.copy_from_slice(&first_chunk[first_len - TERMINATOR_TAIL_SIZE..first_len]);
         tail_len = TERMINATOR_TAIL_SIZE;
     } else if first_len > 0 {
         tail[..first_len].copy_from_slice(&first_chunk[..first_len]);
@@ -231,32 +235,33 @@ where
 
             if has_term {
                 // Found terminator, this is the last chunk
-                chunks.push(Bytes::copy_from_slice(&current_chunk[..current_n]));
+                // Convert to Bytes without copying by taking ownership
+                let mut owned = std::mem::replace(current_chunk, vec![0u8; STREAMING_CHUNK_SIZE]);
+                owned.truncate(current_n);
+                chunks.push(Bytes::from(owned));
                 break;
             }
 
             // Check for spanning terminator
-            let has_spanning_term = NntpResponse::has_spanning_terminator(
-                &tail,
-                tail_len,
-                current_chunk,
-                current_n,
-            );
+            let has_spanning_term =
+                NntpResponse::has_spanning_terminator(&tail, tail_len, current_chunk, current_n);
 
             if has_spanning_term {
                 // Found spanning terminator, this is the last chunk
-                chunks.push(Bytes::copy_from_slice(&current_chunk[..current_n]));
+                let mut owned = std::mem::replace(current_chunk, vec![0u8; STREAMING_CHUNK_SIZE]);
+                owned.truncate(current_n);
+                chunks.push(Bytes::from(owned));
                 break;
             }
 
-            // Save chunk (only the valid bytes)
-            chunks.push(Bytes::copy_from_slice(&current_chunk[..current_n]));
+            // Save chunk (convert to Bytes without copying by taking ownership)
+            let mut owned = std::mem::replace(current_chunk, vec![0u8; STREAMING_CHUNK_SIZE]);
+            owned.truncate(current_n);
+            chunks.push(Bytes::from(owned));
 
             // Update tail for next iteration
             if current_n >= TERMINATOR_TAIL_SIZE {
-                tail.copy_from_slice(
-                    &current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n],
-                );
+                tail.copy_from_slice(&current_chunk[current_n - TERMINATOR_TAIL_SIZE..current_n]);
                 tail_len = TERMINATOR_TAIL_SIZE;
             } else if current_n > 0 {
                 tail[..current_n].copy_from_slice(&current_chunk[..current_n]);
@@ -290,12 +295,8 @@ mod tests {
             Bytes::from_static(b"line 2\r\n"),
         ];
 
-        let response = BackendResponse::new(
-            ResponseCode::parse(b"200 OK\r\n"),
-            true,
-            chunks.clone(),
-            24,
-        );
+        let response =
+            BackendResponse::new(ResponseCode::parse(b"200 OK\r\n"), true, chunks.clone(), 24);
 
         assert_eq!(response.chunk_count(), 3);
         assert_eq!(response.total_bytes, 24);
@@ -308,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_single_line_response() {
         let (mut client, mut server) = tokio::io::duplex(1024);
-        
+
         // Spawn task to simulate backend
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -337,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_multiline_response_with_terminator_in_first_chunk() {
         let (mut client, mut server) = tokio::io::duplex(1024);
-        
+
         // Spawn task to simulate backend
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -345,7 +346,10 @@ mod tests {
             let mut buf = [0u8; 128];
             let _ = server.read(&mut buf).await;
             // Send multiline response with terminator
-            server.write_all(b"215 list of newsgroups follows\r\ngroup1 0 0 y\r\n.\r\n").await.unwrap();
+            server
+                .write_all(b"215 list of newsgroups follows\r\ngroup1 0 0 y\r\n.\r\n")
+                .await
+                .unwrap();
         });
 
         let result = fetch_backend_response(
@@ -366,12 +370,12 @@ mod tests {
     #[tokio::test]
     async fn test_backend_connection_closed() {
         let (mut client, server) = tokio::io::duplex(1024);
-        
+
         // Spawn task that immediately closes connection
         tokio::spawn(async move {
             drop(server); // Close immediately
         });
-        
+
         // Give it a moment to close
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 

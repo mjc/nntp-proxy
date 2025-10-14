@@ -566,7 +566,10 @@ impl ClientSession {
         if let Err(e) = pooled_conn.write_all(initial_command.as_bytes()).await {
             let err: anyhow::Error = e.into();
             if crate::pool::is_connection_error(&err) {
-                debug!("Backend write error during stateful switch for client {} ({}), removing connection from pool", self.client_addr, err);
+                debug!(
+                    "Backend write error during stateful switch for client {} ({}), removing connection from pool",
+                    self.client_addr, err
+                );
                 router.release_stateful(backend_id);
                 crate::pool::remove_from_pool(pooled_conn);
                 return Err(err);
@@ -583,7 +586,10 @@ impl ClientSession {
             Err(e) => {
                 let err: anyhow::Error = e.into();
                 if crate::pool::is_connection_error(&err) {
-                    debug!("Backend read error during stateful switch for client {} ({}), removing connection from pool", self.client_addr, err);
+                    debug!(
+                        "Backend read error during stateful switch for client {} ({}), removing connection from pool",
+                        self.client_addr, err
+                    );
                     router.release_stateful(backend_id);
                     crate::pool::remove_from_pool(pooled_conn);
                     return Err(err);
@@ -722,7 +728,7 @@ impl ClientSession {
         );
 
         let mut pooled_conn = provider.get_pooled_connection().await?;
-        
+
         debug!(
             "Client {} got pooled connection for backend {:?}",
             self.client_addr, backend_id
@@ -730,14 +736,16 @@ impl ClientSession {
 
         // Execute the command - returns (result, got_backend_data)
         // If got_backend_data is true, we successfully communicated with backend
-        let (result, got_backend_data) = self.execute_command_on_backend(
-            &mut pooled_conn,
-            command,
-            client_write,
-            backend_id,
-            client_to_backend_bytes,
-            backend_to_client_bytes,
-        ).await;
+        let (result, got_backend_data) = self
+            .execute_command_on_backend(
+                &mut pooled_conn,
+                command,
+                client_write,
+                backend_id,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+            )
+            .await;
 
         // Only remove backend connection if error occurred AND we didn't get data from backend
         // If we got data from backend, then any error is from writing to client
@@ -811,7 +819,10 @@ impl ClientSession {
             Err(e) => return (Err(e.into()), got_backend_data),
         };
         if n == 0 {
-            return (Err(anyhow::anyhow!("Backend connection closed unexpectedly")), got_backend_data);
+            return (
+                Err(anyhow::anyhow!("Backend connection closed unexpectedly")),
+                got_backend_data,
+            );
         }
 
         // Successfully read from backend - any subsequent errors are client-side
@@ -901,7 +912,9 @@ impl ClientSession {
                                 String::from_utf8_lossy(&current_chunk[..current_n.min(100)]), // Show first 100 bytes max
                                 &current_chunk[..current_n.min(32)] // Show first 32 bytes in hex
                             );
-                            if let Err(e) = client_write.write_all(&current_chunk[..current_n]).await {
+                            if let Err(e) =
+                                client_write.write_all(&current_chunk[..current_n]).await
+                            {
                                 return (Err(e.into()), got_backend_data);
                             }
                             total_bytes += current_n;

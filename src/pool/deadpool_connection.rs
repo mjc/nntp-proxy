@@ -1,9 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::net::TcpStream;
-use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -372,8 +372,8 @@ impl DeadpoolConnectionProvider {
             .build()
             .expect("Failed to create connection pool");
 
-        Self { 
-            pool, 
+        Self {
+            pool,
             name,
             keepalive_interval: None,
             shutdown_tx: None,
@@ -398,8 +398,8 @@ impl DeadpoolConnectionProvider {
             .build()
             .expect("Failed to create connection pool");
 
-        Self { 
-            pool, 
+        Self {
+            pool,
             name,
             keepalive_interval: None,
             shutdown_tx: None,
@@ -417,40 +417,54 @@ impl DeadpoolConnectionProvider {
             tls_cert_path: server.tls_cert_path.clone(),
         };
 
-        let manager =
-            TcpManager::new_with_tls(server.host.clone(), server.port, server.name.clone(), server.username.clone(), server.password.clone(), tls_config);
+        let manager = TcpManager::new_with_tls(
+            server.host.clone(),
+            server.port,
+            server.name.clone(),
+            server.username.clone(),
+            server.password.clone(),
+            tls_config,
+        );
         let pool = Pool::builder(manager)
             .max_size(server.max_connections as usize)
             .build()
             .expect("Failed to create connection pool");
 
         let keepalive_interval = if server.connection_keepalive_secs > 0 {
-            Some(std::time::Duration::from_secs(server.connection_keepalive_secs))
+            Some(std::time::Duration::from_secs(
+                server.connection_keepalive_secs,
+            ))
         } else {
             None
         };
 
         // Create metrics and shutdown channel if keepalive is enabled
         let metrics = Arc::new(Mutex::new(HealthCheckMetrics::new()));
-        let shutdown_tx = if keepalive_interval.is_some() {
+        let shutdown_tx = if let Some(interval) = keepalive_interval {
             let (tx, rx) = broadcast::channel(1);
-            
+
             // Spawn background health check task
             let pool_clone = pool.clone();
             let name_clone = server.name.clone();
-            let interval = keepalive_interval.unwrap();
             let metrics_clone = metrics.clone();
             tokio::spawn(async move {
-                Self::run_periodic_health_checks(pool_clone, name_clone, interval, rx, metrics_clone).await;
+                Self::run_periodic_health_checks(
+                    pool_clone,
+                    name_clone,
+                    interval,
+                    rx,
+                    metrics_clone,
+                )
+                .await;
             });
-            
+
             Some(tx)
         } else {
             None
         };
 
-        Self { 
-            pool, 
+        Self {
+            pool,
             name: server.name.clone(),
             keepalive_interval,
             shutdown_tx,
@@ -505,7 +519,7 @@ impl DeadpoolConnectionProvider {
         use crate::constants::pool::{
             HEALTH_CHECK_POOL_TIMEOUT_MS, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE,
         };
-        use tokio::time::{sleep, Duration};
+        use tokio::time::{Duration, sleep};
         use tracing::{debug, info, warn};
 
         info!(
@@ -538,7 +552,8 @@ impl DeadpoolConnectionProvider {
             );
 
             // Check up to MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE idle connections per cycle
-            let check_count = std::cmp::min(status.available, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE);
+            let check_count =
+                std::cmp::min(status.available, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE);
             let mut checked = 0;
             let mut failed = 0;
 
@@ -548,7 +563,7 @@ impl DeadpoolConnectionProvider {
             for _ in 0..check_count {
                 if let Ok(mut conn_obj) = pool.timeout_get(&timeouts).await {
                     checked += 1;
-                    
+
                     // Perform DATE health check
                     if let Err(e) = check_date_response(&mut conn_obj).await {
                         failed += 1;
@@ -573,7 +588,7 @@ impl DeadpoolConnectionProvider {
                 if let Ok(mut m) = metrics.lock() {
                     m.record_cycle(checked, failed);
                 }
-                
+
                 debug!(
                     pool = %name,
                     checked = checked,
@@ -758,9 +773,7 @@ mod tests {
     }
 
     /// Test helper to run a DATE health check and return the result
-    async fn run_date_health_check(
-        conn: &mut ConnectionStream,
-    ) -> Result<(), HealthCheckError> {
+    async fn run_date_health_check(conn: &mut ConnectionStream) -> Result<(), HealthCheckError> {
         check_date_response(conn).await
     }
 
@@ -879,7 +892,9 @@ mod tests {
             None,
         );
 
-        let result = manager.recycle(&mut conn, &managed::Metrics::default()).await;
+        let result = manager
+            .recycle(&mut conn, &managed::Metrics::default())
+            .await;
 
         assert!(
             result.is_err(),
@@ -917,7 +932,7 @@ mod tests {
 
         // Create a mock server that will close connections after initial setup
         let server = MockNntpServer::new(MockServerBehavior::Healthy).await;
-        
+
         // Create a pool with short keepalive interval for testing
         let manager = server.create_manager();
         let pool = Pool::builder(manager)
@@ -931,10 +946,10 @@ mod tests {
             let conn = pool.get().await.unwrap();
             conns.push(conn);
         }
-        
+
         // Return all connections to make them idle
         drop(conns);
-        
+
         let status_before = pool.status();
         assert_eq!(status_before.available, 3, "Should have 3 idle connections");
 
@@ -942,23 +957,24 @@ mod tests {
         let pool_clone = pool.clone();
         let name = "test-pool".to_string();
         let interval = Duration::from_millis(500);
-        
+
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let metrics = Arc::new(Mutex::new(HealthCheckMetrics::new()));
-        
+
         let checker_handle = tokio::spawn(async move {
             DeadpoolConnectionProvider::run_periodic_health_checks(
-                pool_clone, 
-                name, 
+                pool_clone,
+                name,
                 interval,
                 shutdown_rx,
-                metrics
-            ).await;
+                metrics,
+            )
+            .await;
         });
 
         // Wait for one health check cycle to complete
         sleep(Duration::from_millis(600)).await;
-        
+
         // Stop the checker gracefully
         let _ = shutdown_tx.send(());
         let _ = checker_handle.await;
@@ -975,8 +991,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_periodic_health_check_runs_at_interval() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::sleep;
 
         let check_count = Arc::new(AtomicUsize::new(0));
@@ -998,16 +1014,16 @@ mod tests {
         // Spawn periodic checker with very short interval
         let pool_clone = pool.clone();
         let interval = Duration::from_millis(200);
-        
+
         let checker_handle = tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
             interval_timer.tick().await; // First tick completes immediately
-            
+
             // Run a few cycles manually
             for _ in 0..3 {
                 interval_timer.tick().await;
                 check_count_clone.fetch_add(1, Ordering::SeqCst);
-                
+
                 // Simulate health check work
                 if pool_clone.status().available > 0 {
                     let _conn = pool_clone.get().await;

@@ -40,7 +40,7 @@ pub fn remove_from_pool(conn: Object<TcpManager>) {
 /// use deadpool::managed::Object;
 /// use nntp_proxy::pool::deadpool_connection::TcpManager;
 /// use nntp_proxy::pool::execute_with_guard;
-/// 
+///
 /// async fn example(conn: Object<TcpManager>) -> Result<()> {
 ///     execute_with_guard(conn, |conn| async move {
 ///         // Do work with connection
@@ -61,11 +61,11 @@ where
     let result = f(&mut pooled_conn).await;
 
     // If there was a connection error, remove from pool
-    if let Err(ref e) = result {
-        if is_connection_error(e) {
-            remove_from_pool(pooled_conn);
-            return result;
-        }
+    if let Err(ref e) = result
+        && is_connection_error(e)
+    {
+        remove_from_pool(pooled_conn);
+        return result;
     }
 
     // Otherwise, connection will be returned to pool on drop

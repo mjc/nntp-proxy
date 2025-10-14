@@ -336,7 +336,9 @@ mod tests {
     use std::sync::Arc;
 
     fn create_test_config() -> Config {
-        use crate::config::{default_health_check_max_per_cycle, default_health_check_pool_timeout_ms};
+        use crate::config::{
+            default_health_check_max_per_cycle, default_health_check_pool_timeout_ms,
+        };
         Config {
             servers: vec![
                 ServerConfig {
