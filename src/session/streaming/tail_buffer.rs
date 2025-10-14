@@ -33,6 +33,7 @@ impl TerminatorStatus {
 /// Helper for tracking the last few bytes of streamed data
 /// 
 /// Used to detect terminators that span across chunk boundaries.
+#[derive(Default)]
 pub(super) struct TailBuffer {
     data: [u8; TERMINATOR_TAIL_SIZE],
     len: usize,
@@ -40,10 +41,7 @@ pub(super) struct TailBuffer {
 
 impl TailBuffer {
     pub(super) fn new() -> Self {
-        Self {
-            data: [0; TERMINATOR_TAIL_SIZE],
-            len: 0,
-        }
+        Self::default()
     }
     
     /// Update tail with the last bytes from a chunk
@@ -67,8 +65,17 @@ impl TailBuffer {
         self.len
     }
     
+    /// Returns true if the buffer is empty
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    
     /// Check if terminator spans the boundary between this tail and the given chunk
     pub(super) fn has_spanning_terminator(&self, chunk: &[u8]) -> bool {
+        // Early return if buffer is empty - no boundary to span
+        if self.is_empty() {
+            return false;
+        }
         NntpResponse::has_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
     }
     
