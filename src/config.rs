@@ -158,6 +158,24 @@ pub struct ServerConfig {
     /// Set to 0 to disable keep-alive (default)
     #[serde(default)]
     pub connection_keepalive_secs: u64,
+    /// Maximum number of connections to check per health check cycle
+    /// Lower values reduce pool contention but may take longer to detect all stale connections
+    #[serde(default = "default_health_check_max_per_cycle")]
+    pub health_check_max_per_cycle: usize,
+    /// Timeout in milliseconds when acquiring a connection for health checking
+    /// Short timeout prevents blocking if pool is busy
+    #[serde(default = "default_health_check_pool_timeout_ms")]
+    pub health_check_pool_timeout_ms: u64,
+}
+
+pub fn default_health_check_max_per_cycle() -> usize {
+    use crate::constants::pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE;
+    MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE
+}
+
+pub fn default_health_check_pool_timeout_ms() -> u64 {
+    use crate::constants::pool::HEALTH_CHECK_POOL_TIMEOUT_MS;
+    HEALTH_CHECK_POOL_TIMEOUT_MS
 }
 
 /// Default for TLS certificate verification (true for security)
@@ -313,6 +331,8 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
             tls_verify_cert: default_tls_verify_cert(),
             tls_cert_path: None,
             connection_keepalive_secs: 0,
+            health_check_max_per_cycle: default_health_check_max_per_cycle(),
+            health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
         });
 
         index += 1;
@@ -371,6 +391,8 @@ pub fn create_default_config() -> Config {
             tls_verify_cert: default_tls_verify_cert(),
             tls_cert_path: None,
             connection_keepalive_secs: 0,
+            health_check_max_per_cycle: default_health_check_max_per_cycle(),
+            health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
         }],
         ..Default::default()
     }
@@ -396,6 +418,8 @@ mod tests {
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -408,6 +432,8 @@ mod tests {
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
             ],
             ..Default::default()
@@ -427,6 +453,8 @@ mod tests {
             tls_verify_cert: default_tls_verify_cert(),
             tls_cert_path: None,
             connection_keepalive_secs: 0,
+            health_check_max_per_cycle: default_health_check_max_per_cycle(),
+            health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
         };
 
         assert_eq!(config.host, "news.example.com");
@@ -527,6 +555,8 @@ mod tests {
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
+                health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
             }],
             ..Default::default()
         };
@@ -580,6 +610,8 @@ max_connections = 5
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
+                health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
             }],
             ..Default::default()
         };
@@ -600,6 +632,8 @@ max_connections = 5
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
+                health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
             }],
             ..Default::default()
         };
@@ -625,6 +659,8 @@ max_connections = 5
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "server2.com".to_string(),
@@ -637,6 +673,8 @@ max_connections = 5
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "server3.com".to_string(),
@@ -649,6 +687,8 @@ max_connections = 5
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
             ],
             ..Default::default()
@@ -695,6 +735,8 @@ max_connections = 5
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
+                health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
             }],
             ..Default::default()
         };
@@ -727,6 +769,8 @@ max_connections = 5
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
+                health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
             }],
             ..Default::default()
         };
@@ -747,6 +791,8 @@ max_connections = 5
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
+                health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
             }],
             ..Default::default()
         };
@@ -772,6 +818,8 @@ max_connections = 5
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "::1".to_string(),
@@ -784,6 +832,8 @@ max_connections = 5
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "2001:db8::1".to_string(),
@@ -796,6 +846,8 @@ max_connections = 5
                     tls_verify_cert: default_tls_verify_cert(),
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
             ],
             ..Default::default()
@@ -825,6 +877,8 @@ max_connections = 5
                 tls_verify_cert: default_tls_verify_cert(),
                 tls_cert_path: None,
                 connection_keepalive_secs: 0,
+                health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
             }],
             ..Default::default()
         };

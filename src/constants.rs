@@ -108,6 +108,14 @@ pub mod pool {
     /// Maximum recommended keep-alive interval in seconds (5 minutes)
     /// Values above this may not detect stale connections quickly enough
     pub const MAX_RECOMMENDED_KEEPALIVE_SECS: u64 = 300;
+
+    /// Maximum number of idle connections to check per health check cycle
+    /// Checking too many at once can temporarily starve the pool
+    pub const MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE: usize = 5;
+
+    /// Timeout when attempting to get a connection for health checking (milliseconds)
+    /// Short timeout to avoid blocking if pool is busy
+    pub const HEALTH_CHECK_POOL_TIMEOUT_MS: u64 = 100;
 }
 
 /// Per-command routing constants

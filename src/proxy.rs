@@ -207,7 +207,7 @@ impl NntpProxy {
         // Complete the routing (decrement pending count)
         self.router.complete_command_sync(backend_id);
 
-        // Log session results
+        // Log session results and handle backend connection errors
         match copy_result {
             Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
                 info!(
@@ -216,6 +216,15 @@ impl NntpProxy {
                 );
             }
             Err(e) => {
+                // Check if this is a backend I/O error - if so, remove connection from pool
+                if crate::pool::is_connection_error(&e) {
+                    warn!(
+                        "Backend connection error for client {}: {} - removing connection from pool",
+                        client_addr, e
+                    );
+                    crate::pool::remove_from_pool(backend_conn);
+                    return Err(e);
+                }
                 warn!("Session error for client {}: {}", client_addr, e);
             }
         }
@@ -327,6 +336,7 @@ mod tests {
     use std::sync::Arc;
 
     fn create_test_config() -> Config {
+        use crate::config::{default_health_check_max_per_cycle, default_health_check_pool_timeout_ms};
         Config {
             servers: vec![
                 ServerConfig {
@@ -340,6 +350,8 @@ mod tests {
                     tls_verify_cert: true,
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "server2.example.com".to_string(),
@@ -352,6 +364,8 @@ mod tests {
                     tls_verify_cert: true,
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
                 ServerConfig {
                     host: "server3.example.com".to_string(),
@@ -364,6 +378,8 @@ mod tests {
                     tls_verify_cert: true,
                     tls_cert_path: None,
                     connection_keepalive_secs: 0,
+                    health_check_max_per_cycle: default_health_check_max_per_cycle(),
+                    health_check_pool_timeout_ms: default_health_check_pool_timeout_ms(),
                 },
             ],
             ..Default::default()

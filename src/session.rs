@@ -563,13 +563,34 @@ impl ClientSession {
         );
 
         // Forward the initial command that triggered the switch
-        pooled_conn.write_all(initial_command.as_bytes()).await?;
+        if let Err(e) = pooled_conn.write_all(initial_command.as_bytes()).await {
+            let err: anyhow::Error = e.into();
+            if crate::pool::is_connection_error(&err) {
+                debug!("Backend write error during stateful switch for client {} ({}), removing connection from pool", self.client_addr, err);
+                router.release_stateful(backend_id);
+                crate::pool::remove_from_pool(pooled_conn);
+                return Err(err);
+            }
+            return Err(err);
+        }
         // Only increment byte count after successful write
         client_to_backend_bytes += initial_command.len() as u64;
 
         // Read and forward the initial response chunk
         let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
-        let n = pooled_conn.read(&mut chunk).await?;
+        let n = match pooled_conn.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(e) => {
+                let err: anyhow::Error = e.into();
+                if crate::pool::is_connection_error(&err) {
+                    debug!("Backend read error during stateful switch for client {} ({}), removing connection from pool", self.client_addr, err);
+                    router.release_stateful(backend_id);
+                    crate::pool::remove_from_pool(pooled_conn);
+                    return Err(err);
+                }
+                return Err(err);
+            }
+        };
         if n == 0 {
             return Err(anyhow::anyhow!(
                 "Backend connection closed while reading initial response"
@@ -601,7 +622,16 @@ impl ClientSession {
                         }
                         Ok(n) => {
                             if let Err(e) = pooled_conn.write_all(command.as_bytes()).await {
-                                debug!("Backend write error for client {}: {}", self.client_addr, e);
+                                let err: anyhow::Error = e.into();
+                                if crate::pool::is_connection_error(&err) {
+                                    debug!("Backend write error for client {} ({}), removing connection from pool", self.client_addr, err);
+                                    self.buffer_pool.return_buffer(buffer_c2b).await;
+                                    self.buffer_pool.return_buffer(buffer_b2c).await;
+                                    router.release_stateful(backend_id);
+                                    crate::pool::remove_from_pool(pooled_conn);
+                                    return Ok((client_to_backend_bytes, backend_to_client_bytes));
+                                }
+                                debug!("Backend write error for client {}: {}", self.client_addr, err);
                                 break;
                             }
                             client_to_backend_bytes += n as u64;
@@ -629,7 +659,16 @@ impl ClientSession {
                             backend_to_client_bytes += n as u64;
                         }
                         Err(e) => {
-                            debug!("Backend read error for client {}: {}", self.client_addr, e);
+                            let err: anyhow::Error = e.into();
+                            if crate::pool::is_connection_error(&err) {
+                                debug!("Backend connection error for client {} ({}), removing from pool", self.client_addr, err);
+                                self.buffer_pool.return_buffer(buffer_c2b).await;
+                                self.buffer_pool.return_buffer(buffer_b2c).await;
+                                router.release_stateful(backend_id);
+                                crate::pool::remove_from_pool(pooled_conn);
+                                return Ok((client_to_backend_bytes, backend_to_client_bytes));
+                            }
+                            debug!("Backend read error for client {}: {}", self.client_addr, err);
                             break;
                         }
                     }
@@ -660,7 +699,7 @@ impl ClientSession {
         client_to_backend_bytes: &mut u64,
         backend_to_client_bytes: &mut u64,
     ) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
+        use crate::pool::{is_connection_error, remove_from_pool};
 
         // Route the command to get a backend (lock-free!)
         let backend_id = router.route_command_sync(self.client_id, command)?;
@@ -681,16 +720,63 @@ impl ClientSession {
             "Client {} getting pooled connection for backend {:?}",
             self.client_addr, backend_id
         );
-        // Use get_pooled_connection() to get a connection that auto-returns to pool
-        // The pool's recycle() method will health-check connections before reuse
-        // so we don't get stale connections that timed out on the backend
+
         let mut pooled_conn = provider.get_pooled_connection().await?;
+        
         debug!(
             "Client {} got pooled connection for backend {:?}",
             self.client_addr, backend_id
         );
 
-        // Connection from pool is already authenticated - no need to consume greeting or auth again
+        // Execute the command - returns (result, got_backend_data)
+        // If got_backend_data is true, we successfully communicated with backend
+        let (result, got_backend_data) = self.execute_command_on_backend(
+            &mut pooled_conn,
+            command,
+            client_write,
+            backend_id,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+        ).await;
+
+        // Only remove backend connection if error occurred AND we didn't get data from backend
+        // If we got data from backend, then any error is from writing to client
+        if let Err(ref e) = result {
+            if !got_backend_data && is_connection_error(e) {
+                warn!(
+                    "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
+                    self.client_addr, backend_id, e
+                );
+                remove_from_pool(pooled_conn);
+                router.complete_command_sync(backend_id);
+                return result;
+            } else if got_backend_data && is_connection_error(e) {
+                debug!(
+                    "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
+                    self.client_addr, backend_id
+                );
+            }
+        }
+
+        // Complete the request - decrement pending count (lock-free!)
+        router.complete_command_sync(backend_id);
+
+        result
+    }
+
+    /// Execute a command on a backend connection and stream the response to the client
+    async fn execute_command_on_backend(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_id: crate::types::BackendId,
+        client_to_backend_bytes: &mut u64,
+        backend_to_client_bytes: &mut u64,
+    ) -> (Result<()>, bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut got_backend_data = false;
 
         // Forward the command to the backend
         debug!(
@@ -701,7 +787,9 @@ impl ClientSession {
             command.trim(),
             command.as_bytes()
         );
-        pooled_conn.write_all(command.as_bytes()).await?;
+        if let Err(e) = pooled_conn.write_all(command.as_bytes()).await {
+            return (Err(e.into()), got_backend_data);
+        }
         *client_to_backend_bytes += command.len() as u64;
         debug!(
             "Client {} command sent to backend {:?}",
@@ -714,17 +802,20 @@ impl ClientSession {
             self.client_addr, backend_id
         );
 
-        // Use direct reading from backend - no split() to avoid mutex overhead
-        use tokio::io::AsyncReadExt;
-
         let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
         let mut total_bytes = 0;
 
         // Read first chunk to determine response type
-        let n = pooled_conn.read(&mut chunk).await?;
+        let n = match pooled_conn.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(e) => return (Err(e.into()), got_backend_data),
+        };
         if n == 0 {
-            return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
+            return (Err(anyhow::anyhow!("Backend connection closed unexpectedly")), got_backend_data);
         }
+
+        // Successfully read from backend - any subsequent errors are client-side
+        got_backend_data = true;
 
         debug!(
             "Client {} received backend response chunk ({} bytes): {} | hex: {:02x?}",
@@ -758,7 +849,9 @@ impl ClientSession {
             String::from_utf8_lossy(&chunk[..n.min(100)]), // Show first 100 bytes max
             &chunk[..n.min(32)]                            // Show first 32 bytes in hex
         );
-        client_write.write_all(&chunk[..n]).await?;
+        if let Err(e) = client_write.write_all(&chunk[..n]).await {
+            return (Err(e.into()), got_backend_data);
+        }
         total_bytes += n;
 
         if is_multiline {
@@ -792,7 +885,10 @@ impl ClientSession {
                     let mut next_chunk = &mut chunk2;
 
                     // Read next chunk and start loop
-                    let mut current_n = pooled_conn.read(next_chunk).await?;
+                    let mut current_n = match pooled_conn.read(next_chunk).await {
+                        Ok(n) => n,
+                        Err(e) => return (Err(e.into()), got_backend_data),
+                    };
                     if current_n > 0 {
                         std::mem::swap(&mut current_chunk, &mut next_chunk);
 
@@ -805,7 +901,9 @@ impl ClientSession {
                                 String::from_utf8_lossy(&current_chunk[..current_n.min(100)]), // Show first 100 bytes max
                                 &current_chunk[..current_n.min(32)] // Show first 32 bytes in hex
                             );
-                            client_write.write_all(&current_chunk[..current_n]).await?;
+                            if let Err(e) = client_write.write_all(&current_chunk[..current_n]).await {
+                                return (Err(e.into()), got_backend_data);
+                            }
                             total_bytes += current_n;
 
                             // Check terminator in chunk we just wrote
@@ -841,7 +939,10 @@ impl ClientSession {
                             }
 
                             // Read next chunk
-                            let next_n = pooled_conn.read(next_chunk).await?;
+                            let next_n = match pooled_conn.read(next_chunk).await {
+                                Ok(n) => n,
+                                Err(e) => return (Err(e.into()), got_backend_data),
+                            };
                             if next_n == 0 {
                                 break; // EOF
                             }
@@ -861,10 +962,7 @@ impl ClientSession {
         );
         *backend_to_client_bytes += total_bytes as u64;
 
-        // Complete the request - decrement pending count (lock-free!)
-        router.complete_command_sync(backend_id);
-
-        Ok(())
+        (Ok(()), got_backend_data)
     }
 }
 

@@ -15,6 +15,8 @@ pub fn create_test_server_config(host: &str, port: u16, name: &str) -> ServerCon
         tls_verify_cert: true,
         tls_cert_path: None,
         connection_keepalive_secs: 0,
+        health_check_max_per_cycle: nntp_proxy::config::default_health_check_max_per_cycle(),
+        health_check_pool_timeout_ms: nntp_proxy::config::default_health_check_pool_timeout_ms(),
     }
 }
 
@@ -37,6 +39,8 @@ pub fn create_test_server_config_with_auth(
         tls_verify_cert: true,
         tls_cert_path: None,
         connection_keepalive_secs: 0,
+        health_check_max_per_cycle: nntp_proxy::config::default_health_check_max_per_cycle(),
+        health_check_pool_timeout_ms: nntp_proxy::config::default_health_check_pool_timeout_ms(),
     }
 }
 
@@ -59,6 +63,8 @@ pub fn create_test_server_config_with_tls(
         tls_verify_cert,
         tls_cert_path,
         connection_keepalive_secs: 0,
+        health_check_max_per_cycle: nntp_proxy::config::default_health_check_max_per_cycle(),
+        health_check_pool_timeout_ms: nntp_proxy::config::default_health_check_pool_timeout_ms(),
     }
 }
 
@@ -80,6 +86,8 @@ pub fn create_test_server_config_with_max_connections(
         tls_verify_cert: true,
         tls_cert_path: None,
         connection_keepalive_secs: 0,
+        health_check_max_per_cycle: nntp_proxy::config::default_health_check_max_per_cycle(),
+        health_check_pool_timeout_ms: nntp_proxy::config::default_health_check_pool_timeout_ms(),
     }
 }
 
