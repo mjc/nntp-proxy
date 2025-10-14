@@ -26,16 +26,25 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let mut total_bytes = first_n as u64;
+    let mut total_bytes = 0u64;
 
-    // Write first chunk to client
-    if let Err(e) = client_write.write_all(&first_chunk[..first_n]).await {
+    // Check if terminator is in first chunk (could be at end or in middle)
+    let first_write_len = if let Some(term_end) = NntpResponse::find_terminator_end(&first_chunk[..first_n]) {
+        // Terminator found in first chunk! Only write up to and including it
+        term_end
+    } else {
+        // No terminator in first chunk, write all of it
+        first_n
+    };
+
+    // Write first chunk (or portion up to terminator) to client
+    if let Err(e) = client_write.write_all(&first_chunk[..first_write_len]).await {
         // Client disconnected on first chunk - need to drain if multiline and no terminator yet
-        let has_terminator = NntpResponse::has_terminator_at_end(&first_chunk[..first_n]);
+        let has_terminator = first_write_len < first_n || NntpResponse::has_terminator_at_end(&first_chunk[..first_write_len]);
         use tracing::warn;
         warn!(
-            "Client {} disconnected on first chunk write ({} bytes, terminator={}) → backend {:?}",
-            client_addr, first_n, has_terminator, backend_id
+            "Client {} disconnected on first chunk write ({} bytes of {}, terminator={}) → backend {:?}",
+            client_addr, first_write_len, first_n, has_terminator, backend_id
         );
         if !has_terminator {
             use tracing::debug;
@@ -89,9 +98,20 @@ where
         }
         return Err(e.into());
     }
+    total_bytes += first_write_len as u64;
 
-    // Check if terminator is in first chunk
-    let has_terminator = NntpResponse::has_terminator_at_end(&first_chunk[..first_n]);
+    // Check if we found and wrote the terminator in first chunk
+    if first_write_len < first_n {
+        // Terminator was in middle of first chunk, we only wrote up to it
+        debug!(
+            "Client {} multiline response complete in first chunk ({} bytes, terminator at position {})",
+            client_addr, total_bytes, first_write_len
+        );
+        return Ok(total_bytes);
+    }
+
+    // Check if terminator is at end of first chunk
+    let has_terminator = NntpResponse::has_terminator_at_end(&first_chunk[..first_write_len]);
     if has_terminator {
         debug!(
             "Client {} multiline response complete in first chunk ({} bytes)",
@@ -107,13 +127,13 @@ where
     let mut tail: [u8; TERMINATOR_TAIL_SIZE] = [0; TERMINATOR_TAIL_SIZE];
     let mut tail_len: usize = 0;
 
-    // Initialize tail with last bytes of first chunk
-    if first_n >= TERMINATOR_TAIL_SIZE {
-        tail.copy_from_slice(&first_chunk[first_n - TERMINATOR_TAIL_SIZE..first_n]);
+    // Initialize tail with last bytes of first chunk (what we actually wrote)
+    if first_write_len >= TERMINATOR_TAIL_SIZE {
+        tail.copy_from_slice(&first_chunk[first_write_len - TERMINATOR_TAIL_SIZE..first_write_len]);
         tail_len = TERMINATOR_TAIL_SIZE;
-    } else if first_n > 0 {
-        tail[..first_n].copy_from_slice(&first_chunk[..first_n]);
-        tail_len = first_n;
+    } else if first_write_len > 0 {
+        tail[..first_write_len].copy_from_slice(&first_chunk[..first_write_len]);
+        tail_len = first_write_len;
     }
 
     let mut current_chunk = &mut chunk1;
