@@ -1,5 +1,7 @@
 //! NNTP response parsing and handling
 
+use crate::types::MessageId;
+
 /// Categorized NNTP response code for type-safe handling
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseCode {
@@ -175,7 +177,7 @@ impl NntpResponse {
     /// Message-IDs are ASCII and must be in the format <...@...>
     /// See RFC 5536 Section 3.1.3: https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3
     #[inline]
-    pub fn extract_message_id(command: &str) -> Option<String> {
+    pub fn extract_message_id(command: &str) -> Option<MessageId> {
         let trimmed = command.trim();
         let bytes = trimmed.as_bytes();
 
@@ -189,7 +191,7 @@ impl NntpResponse {
 
         // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
         // We already know msgid_end is valid since memchr found '>' at that position
-        Some(trimmed[start..msgid_end].to_string())
+        MessageId::new(trimmed[start..msgid_end].to_string()).ok()
     }
 
     /// Validate message-ID format according to RFC 5536 Section 3.1.3
@@ -701,13 +703,15 @@ mod tests {
     fn test_extract_message_id() {
         // Standard message-ID
         assert_eq!(
-            NntpResponse::extract_message_id("ARTICLE <test@example.com>"),
+            NntpResponse::extract_message_id("ARTICLE <test@example.com>")
+                .map(|id| id.as_str().to_string()),
             Some("<test@example.com>".to_string())
         );
 
         // With extra whitespace
         assert_eq!(
-            NntpResponse::extract_message_id("  BODY  <msg123@news.com>  "),
+            NntpResponse::extract_message_id("  BODY  <msg123@news.com>  ")
+                .map(|id| id.as_str().to_string()),
             Some("<msg123@news.com>".to_string())
         );
 
@@ -722,7 +726,8 @@ mod tests {
 
         // Multiple message-IDs (returns first)
         assert_eq!(
-            NntpResponse::extract_message_id("TEST <first@example.com> <second@example.com>"),
+            NntpResponse::extract_message_id("TEST <first@example.com> <second@example.com>")
+                .map(|id| id.as_str().to_string()),
             Some("<first@example.com>".to_string())
         );
     }

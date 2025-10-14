@@ -1,3 +1,4 @@
+use crate::types::BufferSize;
 use crossbeam::queue::SegQueue;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +9,7 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct BufferPool {
     pool: Arc<SegQueue<Vec<u8>>>,
-    buffer_size: usize,
+    buffer_size: BufferSize,
     max_pool_size: usize,
     pool_size: Arc<AtomicUsize>,
 }
@@ -29,12 +30,12 @@ impl BufferPool {
     /// Create a new buffer pool with pre-allocated buffers
     ///
     /// # Arguments
-    /// * `buffer_size` - Size of each buffer in bytes
+    /// * `buffer_size` - Size of each buffer in bytes (must be non-zero)
     /// * `max_pool_size` - Maximum number of buffers to pool
     ///
     /// All buffers are pre-allocated at creation time for optimal performance.
     #[must_use]
-    pub fn new(buffer_size: usize, max_pool_size: usize) -> Self {
+    pub fn new(buffer_size: BufferSize, max_pool_size: usize) -> Self {
         let pool = Arc::new(SegQueue::new());
         let pool_size = Arc::new(AtomicUsize::new(0));
 
@@ -42,12 +43,12 @@ impl BufferPool {
         info!(
             "Pre-allocating {} buffers of {}KB each ({}MB total)",
             max_pool_size,
-            buffer_size / 1024,
-            (max_pool_size * buffer_size) / (1024 * 1024)
+            buffer_size.get() / 1024,
+            (max_pool_size * buffer_size.get()) / (1024 * 1024)
         );
 
         for _ in 0..max_pool_size {
-            let buffer = Self::create_aligned_buffer(buffer_size);
+            let buffer = Self::create_aligned_buffer(buffer_size.get());
             pool.push(buffer);
             pool_size.fetch_add(1, Ordering::Relaxed);
         }
@@ -68,17 +69,17 @@ impl BufferPool {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
             // Reuse existing buffer, clear it first
             buffer.clear();
-            buffer.resize(self.buffer_size, 0);
+            buffer.resize(self.buffer_size.get(), 0);
             buffer
         } else {
             // Create new page-aligned buffer for better DMA performance
-            Self::create_aligned_buffer(self.buffer_size)
+            Self::create_aligned_buffer(self.buffer_size.get())
         }
     }
 
     /// Return a buffer to the pool (lock-free)
     pub async fn return_buffer(&self, buffer: Vec<u8>) {
-        if buffer.len() == self.buffer_size {
+        if buffer.len() == self.buffer_size.get() {
             let current_size = self.pool_size.load(Ordering::Relaxed);
             if current_size < self.max_pool_size {
                 self.pool.push(buffer);
@@ -95,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_creation() {
-        let pool = BufferPool::new(8192, 10);
+        let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);
 
         // Pool should pre-allocate buffers
         let buffer1 = pool.get_buffer().await;
@@ -106,7 +107,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_get_and_return() {
-        let pool = BufferPool::new(4096, 5);
+        let pool = BufferPool::new(BufferSize::new(4096).unwrap(), 5);
 
         // Get a buffer
         let buffer = pool.get_buffer().await;
@@ -125,7 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_exhaustion() {
-        let pool = BufferPool::new(1024, 2);
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
 
         // Get all pre-allocated buffers
         let buf1 = pool.get_buffer().await;
@@ -143,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_concurrent_access() {
-        let pool = BufferPool::new(2048, 10);
+        let pool = BufferPool::new(BufferSize::new(2048).unwrap(), 10);
 
         // Spawn multiple tasks accessing the pool concurrently
         let mut handles = vec![];
@@ -168,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_alignment() {
-        let pool = BufferPool::new(8192, 1);
+        let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 1);
         let buffer = pool.get_buffer().await;
 
         // Buffer capacity should be aligned to page boundaries (4KB)
@@ -181,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_clear_and_resize() {
-        let pool = BufferPool::new(1024, 2);
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
 
         let mut buffer = pool.get_buffer().await;
 
@@ -202,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_max_size_enforcement() {
-        let pool = BufferPool::new(512, 3);
+        let pool = BufferPool::new(BufferSize::new(512).unwrap(), 3);
 
         // Get all buffers
         let buf1 = pool.get_buffer().await;
@@ -224,7 +225,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_wrong_size_not_returned() {
-        let pool = BufferPool::new(1024, 2);
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
 
         let buffer = pool.get_buffer().await;
         assert_eq!(buffer.len(), 1024);
@@ -241,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_multiple_get_return_cycles() {
-        let pool = BufferPool::new(4096, 5);
+        let pool = BufferPool::new(BufferSize::new(4096).unwrap(), 5);
 
         // Do multiple get/return cycles
         for i in 0..20 {
@@ -257,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_clone() {
-        let pool1 = BufferPool::new(1024, 5);
+        let pool1 = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
         let _pool2 = pool1.clone();
 
         // Both should share the same underlying pool
@@ -266,9 +267,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_different_buffer_sizes() {
-        let small_pool = BufferPool::new(1024, 5);
-        let medium_pool = BufferPool::new(8192, 5);
-        let large_pool = BufferPool::new(65536, 5);
+        let small_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let medium_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 5);
+        let large_pool = BufferPool::new(BufferSize::new(65536).unwrap(), 5);
 
         let small_buf = small_pool.get_buffer().await;
         let medium_buf = medium_pool.get_buffer().await;
@@ -285,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_stress() {
-        let pool = BufferPool::new(4096, 10);
+        let pool = BufferPool::new(BufferSize::new(4096).unwrap(), 10);
 
         // Stress test with many concurrent operations
         let mut handles = vec![];

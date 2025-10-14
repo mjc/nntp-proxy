@@ -17,7 +17,7 @@ use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, pr
 use crate::protocol::BACKEND_UNAVAILABLE;
 use crate::router;
 use crate::session::ClientSession;
-use crate::types;
+use crate::types::{self, BufferSize};
 
 #[derive(Debug, Clone)]
 pub struct NntpProxy {
@@ -51,7 +51,10 @@ impl NntpProxy {
             })
             .collect();
 
-        let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
+        let buffer_pool = BufferPool::new(
+            BufferSize::new(BUFFER_SIZE).expect("BUFFER_SIZE is non-zero"),
+            BUFFER_POOL_SIZE,
+        );
 
         let servers = Arc::new(config.servers);
 

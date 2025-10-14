@@ -18,6 +18,9 @@ pub enum ValidationError {
 
     #[error("port cannot be 0")]
     InvalidPort,
+
+    #[error("invalid message ID: {0}")]
+    InvalidMessageId(String),
 }
 
 /// A validated hostname that cannot be empty or whitespace-only
@@ -365,13 +368,19 @@ mod tests {
     #[test]
     fn test_validation_error_display_hostname() {
         let error = ValidationError::EmptyHostName;
-        assert_eq!(format!("{}", error), "hostname cannot be empty or whitespace");
+        assert_eq!(
+            format!("{}", error),
+            "hostname cannot be empty or whitespace"
+        );
     }
 
     #[test]
     fn test_validation_error_display_servername() {
         let error = ValidationError::EmptyServerName;
-        assert_eq!(format!("{}", error), "server name cannot be empty or whitespace");
+        assert_eq!(
+            format!("{}", error),
+            "server name cannot be empty or whitespace"
+        );
     }
 
     #[test]

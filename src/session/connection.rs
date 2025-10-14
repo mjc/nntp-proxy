@@ -123,12 +123,10 @@ where
     buffer_pool.return_buffer(buffer_c2b).await;
     buffer_pool.return_buffer(buffer_b2c).await;
 
-    Ok(ForwardResult::NormalDisconnect(
-        TransferMetrics {
-            client_to_backend: c2b,
-            backend_to_client: b2c,
-        }
-    ))
+    Ok(ForwardResult::NormalDisconnect(TransferMetrics {
+        client_to_backend: c2b,
+        backend_to_client: b2c,
+    }))
 }
 
 /// Log client disconnect/error with appropriate log level and context

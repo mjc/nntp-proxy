@@ -4,13 +4,15 @@
 
 pub mod config;
 pub mod metrics;
+pub mod protocol;
 pub mod validated;
 
 pub use config::{
-    duration_serde, option_duration_serde, CacheCapacity, MaxConnections, MaxErrors, Port,
-    WindowSize,
+    BufferSize, CacheCapacity, MaxConnections, MaxErrors, Port, WindowSize, duration_serde,
+    option_duration_serde,
 };
 pub use metrics::{BytesTransferred, TransferMetrics};
+pub use protocol::MessageId;
 pub use validated::{HostName, ServerName, ValidationError};
 
 use uuid::Uuid;

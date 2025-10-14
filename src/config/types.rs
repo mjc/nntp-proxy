@@ -3,8 +3,8 @@
 //! This module contains all the core configuration structures used by the proxy.
 
 use crate::types::{
-    duration_serde, option_duration_serde, CacheCapacity, HostName, MaxConnections, MaxErrors,
-    Port, ServerName,
+    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, duration_serde,
+    option_duration_serde,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -82,10 +82,16 @@ impl Default for CacheConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HealthCheckConfig {
     /// Interval between health checks
-    #[serde(with = "duration_serde", default = "super::defaults::health_check_interval")]
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::health_check_interval"
+    )]
     pub interval: Duration,
     /// Timeout for each health check
-    #[serde(with = "duration_serde", default = "super::defaults::health_check_timeout")]
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::health_check_timeout"
+    )]
     pub timeout: Duration,
     /// Number of consecutive failures before marking unhealthy
     #[serde(default = "super::defaults::unhealthy_threshold")]

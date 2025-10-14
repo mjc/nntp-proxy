@@ -95,8 +95,16 @@ pub async fn prewarm_pools(
         total_expected += server.max_connections.get();
         match task.await {
             Ok(Ok(created)) => total_created += created,
-            Ok(Err(e)) => warn!("Failed to prewarm pool for '{}': {}", server.name.as_str(), e),
-            Err(e) => warn!("Prewarming task panicked for '{}': {}", server.name.as_str(), e),
+            Ok(Err(e)) => warn!(
+                "Failed to prewarm pool for '{}': {}",
+                server.name.as_str(),
+                e
+            ),
+            Err(e) => warn!(
+                "Prewarming task panicked for '{}': {}",
+                server.name.as_str(),
+                e
+            ),
         }
     }
 

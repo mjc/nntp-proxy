@@ -29,11 +29,11 @@ impl Port {
         self.0.get()
     }
 
-    /// Standard NNTP port (119)
-    pub const NNTP: Self = unsafe { Self(NonZeroU16::new_unchecked(119)) };
+    /// NNTP port (119)
+    pub const NNTP: Self = Self(NonZeroU16::new(119).unwrap());
 
-    /// Standard NNTPS (NNTP over TLS/SSL) port (563)
-    pub const NNTPS: Self = unsafe { Self(NonZeroU16::new_unchecked(563)) };
+    /// NNTPS port (563)
+    pub const NNTPS: Self = Self(NonZeroU16::new(563).unwrap());
 }
 
 impl fmt::Display for Port {
@@ -97,8 +97,8 @@ impl MaxConnections {
         self.0.get()
     }
 
-    /// Default maximum connections (typically 10)
-    pub const DEFAULT: Self = unsafe { Self(NonZeroUsize::new_unchecked(10)) };
+    /// Default maximum connections per backend
+    pub const DEFAULT: Self = Self(NonZeroUsize::new(10).unwrap());
 }
 
 impl fmt::Display for MaxConnections {
@@ -154,8 +154,8 @@ impl CacheCapacity {
         self.0.get()
     }
 
-    /// Default cache capacity (typically 1000)
-    pub const DEFAULT: Self = unsafe { Self(NonZeroUsize::new_unchecked(1000)) };
+    /// Default pool size
+    pub const DEFAULT: Self = Self(NonZeroUsize::new(1000).unwrap());
 }
 
 impl fmt::Display for CacheCapacity {
@@ -211,8 +211,8 @@ impl MaxErrors {
         self.0.get()
     }
 
-    /// Default max errors (typically 3)
-    pub const DEFAULT: Self = unsafe { Self(NonZeroU32::new_unchecked(3)) };
+    /// Default retry attempts
+    pub const DEFAULT: Self = Self(NonZeroU32::new(3).unwrap());
 }
 
 impl fmt::Display for MaxErrors {
@@ -269,7 +269,7 @@ impl WindowSize {
     }
 
     /// Default window size (typically 100)
-    pub const DEFAULT: Self = unsafe { Self(NonZeroU64::new_unchecked(100)) };
+    pub const DEFAULT: Self = Self(NonZeroU64::new(100).unwrap());
 }
 
 impl fmt::Display for WindowSize {
@@ -300,6 +300,72 @@ impl<'de> Deserialize<'de> for WindowSize {
     {
         let value = u64::deserialize(deserializer)?;
         Self::new(value).ok_or_else(|| serde::de::Error::custom("window_size cannot be 0"))
+    }
+}
+
+/// A non-zero buffer size
+///
+/// Ensures buffers always have at least 1 byte
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferSize(NonZeroUsize);
+
+impl BufferSize {
+    /// Create a new BufferSize, returning None if value is 0
+    #[must_use]
+    pub const fn new(value: usize) -> Option<Self> {
+        match NonZeroUsize::new(value) {
+            Some(nz) => Some(Self(nz)),
+            None => None,
+        }
+    }
+
+    /// Get the value as usize
+    #[must_use]
+    pub const fn get(&self) -> usize {
+        self.0.get()
+    }
+
+    /// Standard NNTP command buffer (512 bytes)
+    pub const COMMAND: Self = Self(NonZeroUsize::new(512).unwrap());
+
+    /// Default buffer size (8KB)
+    pub const DEFAULT: Self = Self(NonZeroUsize::new(8192).unwrap());
+
+    /// Medium buffer size (256KB)
+    pub const MEDIUM: Self = Self(NonZeroUsize::new(256 * 1024).unwrap());
+
+    /// Large buffer size (4MB)
+    pub const LARGE: Self = Self(NonZeroUsize::new(4 * 1024 * 1024).unwrap());
+}
+
+impl fmt::Display for BufferSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+impl From<BufferSize> for usize {
+    fn from(size: BufferSize) -> Self {
+        size.get()
+    }
+}
+
+impl Serialize for BufferSize {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.get() as u64)
+    }
+}
+
+impl<'de> Deserialize<'de> for BufferSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = usize::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("buffer size cannot be 0"))
     }
 }
 
@@ -617,6 +683,56 @@ mod tests {
     fn test_window_size_serde_zero_rejected() {
         let json = "0";
         let result: Result<WindowSize, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // BufferSize tests
+    #[test]
+    fn test_buffer_size_valid() {
+        let size = BufferSize::new(8192).unwrap();
+        assert_eq!(size.get(), 8192);
+    }
+
+    #[test]
+    fn test_buffer_size_zero_rejected() {
+        assert!(BufferSize::new(0).is_none());
+    }
+
+    #[test]
+    fn test_buffer_size_constants() {
+        assert_eq!(BufferSize::COMMAND.get(), 512);
+        assert_eq!(BufferSize::DEFAULT.get(), 8192);
+        assert_eq!(BufferSize::MEDIUM.get(), 256 * 1024);
+        assert_eq!(BufferSize::LARGE.get(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_buffer_size_display() {
+        let size = BufferSize::new(1024).unwrap();
+        assert_eq!(format!("{}", size), "1024");
+    }
+
+    #[test]
+    fn test_buffer_size_into_usize() {
+        let size = BufferSize::new(2048).unwrap();
+        let value: usize = size.into();
+        assert_eq!(value, 2048);
+    }
+
+    #[test]
+    fn test_buffer_size_serde() {
+        let size = BufferSize::new(4096).unwrap();
+        let json = serde_json::to_string(&size).unwrap();
+        assert_eq!(json, "4096");
+
+        let deserialized: BufferSize = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, size);
+    }
+
+    #[test]
+    fn test_buffer_size_serde_zero_rejected() {
+        let json = "0";
+        let result: Result<BufferSize, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 

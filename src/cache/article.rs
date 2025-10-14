@@ -1,5 +1,6 @@
 //! Article caching implementation using LRU cache with TTL
 
+use crate::types::MessageId;
 use moka::future::Cache;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ pub struct CachedArticle {
 /// Article cache using LRU eviction with TTL
 #[derive(Clone)]
 pub struct ArticleCache {
-    cache: Arc<Cache<String, CachedArticle>>,
+    cache: Arc<Cache<MessageId, CachedArticle>>,
 }
 
 impl ArticleCache {
@@ -36,12 +37,12 @@ impl ArticleCache {
     }
 
     /// Get an article from the cache
-    pub async fn get(&self, message_id: &str) -> Option<CachedArticle> {
+    pub async fn get(&self, message_id: &MessageId) -> Option<CachedArticle> {
         self.cache.get(message_id).await
     }
 
     /// Store an article in the cache
-    pub async fn insert(&self, message_id: String, article: CachedArticle) {
+    pub async fn insert(&self, message_id: MessageId, article: CachedArticle) {
         self.cache.insert(message_id, article).await;
     }
 

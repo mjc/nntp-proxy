@@ -331,7 +331,9 @@ impl ClientSession {
                                     backend_to_client_bytes.add(BACKEND_ERROR.len());
 
                                     // For debugging test connections and small transfers, log detailed info
-                                    if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < 500 {
+                                    if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
+                                        < 500
+                                    {
                                         debug!(
                                             "ERROR SUMMARY for small transfer - Client {}: \
                                              Command '{}' failed with {}. \
@@ -374,7 +376,10 @@ impl ClientSession {
             );
         }
 
-        Ok((client_to_backend_bytes.as_u64(), backend_to_client_bytes.as_u64()))
+        Ok((
+            client_to_backend_bytes.as_u64(),
+            backend_to_client_bytes.as_u64(),
+        ))
     }
 
     /// Switch from per-command routing to stateful mode with a dedicated backend connection
