@@ -8,40 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::constants::buffer::STREAMING_CHUNK_SIZE;
-use crate::protocol::{NntpResponse, TERMINATOR_TAIL_SIZE};
 
-/// Helper for tracking the last few bytes of streamed data
-/// 
-/// Used to detect terminators that span across chunk boundaries.
-struct TailBuffer {
-    data: [u8; TERMINATOR_TAIL_SIZE],
-    len: usize,
-}
-
-impl TailBuffer {
-    fn new() -> Self {
-        Self {
-            data: [0; TERMINATOR_TAIL_SIZE],
-            len: 0,
-        }
-    }
-    
-    /// Update tail with the last bytes from a chunk
-    fn update(&mut self, chunk: &[u8]) {
-        if chunk.len() >= TERMINATOR_TAIL_SIZE {
-            self.data.copy_from_slice(&chunk[chunk.len() - TERMINATOR_TAIL_SIZE..]);
-            self.len = TERMINATOR_TAIL_SIZE;
-        } else if !chunk.is_empty() {
-            self.data[..chunk.len()].copy_from_slice(chunk);
-            self.len = chunk.len();
-        }
-    }
-    
-    /// Get the tail data as a slice
-    fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
-    }
-}
+mod tail_buffer;
+use tail_buffer::TailBuffer;
 
 /// Drain remaining response from backend until terminator is found
 ///
@@ -67,9 +36,7 @@ where
         }
         
         let data = &chunk[..n];
-        if NntpResponse::has_terminator_at_end(data) 
-            || NntpResponse::has_spanning_terminator(tail.as_slice(), tail.len, data, n) 
-        {
+        if tail.detect_terminator(data).is_found() {
             break;
         }
         
@@ -115,21 +82,11 @@ where
     
     // Main streaming loop - processes first chunk and all subsequent chunks uniformly
     loop {
-        let current_chunk = &buffers[current_idx];
-        let data = &current_chunk[..current_n];
+        let data = &buffers[current_idx][..current_n];
         
         // Detect terminator location: within chunk or spanning boundary
-        let (write_len, terminator_found) = 
-            if let Some(term_end) = NntpResponse::find_terminator_end(data) {
-                // Complete terminator found within chunk (middle or end)
-                (term_end, true)
-            } else if NntpResponse::has_spanning_terminator(tail.as_slice(), tail.len, data, current_n) {
-                // Terminator spans across chunk boundary
-                (current_n, true)
-            } else {
-                // No terminator yet, write entire chunk
-                (current_n, false)
-            };
+        let status = tail.detect_terminator(data);
+        let write_len = status.write_len(current_n);
         
         // Write current chunk (or portion up to terminator) to client
         if let Err(e) = client_write.write_all(&data[..write_len]).await {
@@ -139,7 +96,7 @@ where
                 client_addr, write_len, current_n, total_bytes, backend_id
             );
             
-            if !terminator_found {
+            if !status.is_found() {
                 // Need to drain the rest to keep connection clean
                 drain_until_terminator(
                     backend_read,
@@ -155,7 +112,7 @@ where
         total_bytes += write_len as u64;
         
         // If terminator found, we're done
-        if terminator_found {
+        if status.is_found() {
             debug!(
                 "Client {} multiline response complete ({} bytes)",
                 client_addr, total_bytes
