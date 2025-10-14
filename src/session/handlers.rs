@@ -619,6 +619,13 @@ impl ClientSession {
 
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
+            debug!(
+                "Client {} command '{}' -> multiline response (status code: {:?}), streaming {} bytes",
+                self.client_addr,
+                command.trim(),
+                _response_code.status_code(),
+                n
+            );
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
@@ -633,6 +640,13 @@ impl ClientSession {
             }
         } else {
             // Single-line response - just write the first chunk
+            debug!(
+                "Client {} command '{}' -> single-line response (status code: {:?}), writing {} bytes",
+                self.client_addr,
+                command.trim(),
+                _response_code.status_code(),
+                n
+            );
             match client_write.write_all(&chunk[..n]).await {
                 Ok(_) => n as u64,
                 Err(e) => return (Err(e.into()), got_backend_data),
@@ -640,6 +654,15 @@ impl ClientSession {
         };
 
         *backend_to_client_bytes += bytes_written;
+
+        debug!(
+            "Client {} command '{}' completed: wrote {} bytes to client (total session: {}→{} bytes)",
+            self.client_addr,
+            command.trim(),
+            bytes_written,
+            client_to_backend_bytes,
+            backend_to_client_bytes
+        );
 
         (Ok(()), got_backend_data)
     }
