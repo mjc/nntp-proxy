@@ -2,6 +2,42 @@
 //!
 //! This module handles the lifecycle of a client connection, including
 //! command processing, authentication interception, and data transfer.
+//!
+//! # Architecture Overview
+//!
+//! ## Three Operating Modes
+//!
+//! 1. **Standard (1:1) Mode** - `handle_with_pooled_backend()`
+//!    - One client maps to one backend connection for entire session
+//!    - Lowest latency, simplest model
+//!    - Used when routing_mode = Standard
+//!
+//! 2. **Per-Command Mode** - `handle_per_command_routing()`
+//!    - Each command is independently routed to potentially different backends
+//!    - Enables load balancing across multiple backend servers
+//!    - Rejects stateful commands (MODE READER, etc.)
+//!    - Used when routing_mode = PerCommand
+//!
+//! 3. **Hybrid Mode** - `handle_per_command_routing()` + dynamic switching
+//!    - Starts in per-command mode for load balancing
+//!    - Automatically switches to stateful mode when stateful command detected
+//!    - Best of both worlds: load balancing + stateful command support
+//!    - Used when routing_mode = Hybrid
+//!
+//! ## Key Functions
+//!
+//! - `execute_command_on_backend()` - **PERFORMANCE CRITICAL HOT PATH**
+//!   - Pipelined streaming with double-buffering for 100x+ throughput
+//!   - DO NOT refactor to buffer entire responses
+//!
+//! - `switch_to_stateful_mode()` - Hybrid mode transition
+//!   - Acquires dedicated backend connection
+//!   - Transitions from per-command to 1:1 mapping
+//!
+//! - `route_and_execute_command()` - Per-command orchestration
+//!   - Routes command to backend
+//!   - Handles connection pool management
+//!   - Distinguishes backend errors from client disconnects
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -24,11 +60,34 @@ use crate::streaming::StreamHandler;
 use crate::types::ClientId;
 
 /// Session mode for hybrid routing
+///
+/// In hybrid mode, sessions can dynamically transition between per-command
+/// and stateful modes. This allows load balancing for stateless commands
+/// while supporting stateful commands by switching to dedicated connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionMode {
     /// Per-command routing mode - each command can use a different backend
+    ///
+    /// Benefits:
+    /// - Load balancing across multiple backend servers
+    /// - Better resource utilization
+    /// - Fault tolerance (can route around failed backends)
+    ///
+    /// Limitations:
+    /// - Cannot support stateful commands (MODE READER, GROUP, etc.)
+    /// - Slightly higher latency (connection pool overhead)
     PerCommand,
+
     /// Stateful mode - using a dedicated backend connection
+    ///
+    /// Benefits:
+    /// - Lowest latency (no pool overhead)
+    /// - Supports stateful commands
+    /// - Simple 1:1 client-to-backend mapping
+    ///
+    /// Limitations:
+    /// - No load balancing (one backend per client)
+    /// - Less efficient resource usage
     Stateful,
 }
 
