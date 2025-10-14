@@ -129,14 +129,16 @@ impl NntpResponse {
         }
 
         // Search for "\r\n.\r\n" (5 bytes)
-        for i in 0..=n.saturating_sub(5) {
-            if &data[i..i + 5] == b"\r\n.\r\n" {
-                return Some(i + 5);
+        if n >= 5 {
+            for i in 0..=(n - 5) {
+                if &data[i..i + 5] == b"\r\n.\r\n" {
+                    return Some(i + 5);
+                }
             }
         }
 
         // Also search for "\n.\n" (3 bytes) for compatibility
-        for i in 0..=n.saturating_sub(3) {
+        for i in 0..=(n - 3) {
             if &data[i..i + 3] == b"\n.\n" {
                 return Some(i + 3);
             }
