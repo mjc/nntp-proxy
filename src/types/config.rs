@@ -10,6 +10,23 @@ use super::ValidationError;
 ///
 /// This type ensures at compile time that port numbers are always valid (1-65535).
 /// Port 0 is reserved and cannot be used for actual network communication.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::Port;
+///
+/// let port = Port::new(119).unwrap();
+/// assert_eq!(port.get(), 119);
+///
+/// // Port 0 is invalid
+/// assert!(Port::new(0).is_none());
+///
+/// // Standard NNTP port
+/// let nntp = Port::NNTP;
+/// assert_eq!(nntp.get(), 119);
+/// ```
+#[doc(alias = "port_number")]
+#[doc(alias = "tcp_port")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Port(NonZeroU16);
 
@@ -80,7 +97,20 @@ impl<'de> Deserialize<'de> for Port {
 
 /// A non-zero maximum connections limit
 ///
-/// Ensures connection pools always have at least 1 connection allowed
+/// Ensures connection pools always have at least 1 connection allowed.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::MaxConnections;
+///
+/// let max = MaxConnections::new(10).unwrap();
+/// assert_eq!(max.get(), 10);
+///
+/// // Zero connections is invalid
+/// assert!(MaxConnections::new(0).is_none());
+/// ```
+#[doc(alias = "pool_size")]
+#[doc(alias = "connection_limit")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaxConnections(NonZeroUsize);
 

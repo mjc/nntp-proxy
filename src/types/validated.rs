@@ -28,6 +28,20 @@ pub enum ValidationError {
 ///
 /// This type enforces at compile time that a hostname is always valid,
 /// eliminating the need for runtime validation checks.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::HostName;
+///
+/// let host = HostName::new("news.example.com".to_string()).unwrap();
+/// assert_eq!(host.as_str(), "news.example.com");
+///
+/// // Empty strings are rejected
+/// assert!(HostName::new("".to_string()).is_err());
+/// assert!(HostName::new("   ".to_string()).is_err());
+/// ```
+#[doc(alias = "host")]
+#[doc(alias = "domain")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct HostName(String);

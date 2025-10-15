@@ -21,6 +21,13 @@ use super::ValidationError;
 /// Uses `Cow<'a, str>` to support both zero-copy parsing (borrowed) and owned storage.
 /// - Parser creates `MessageId<'a>` with `Cow::Borrowed` for zero-copy performance
 /// - Cache/storage converts to `MessageId<'static>` with `Cow::Owned` for persistence
+///
+/// # See Also
+/// - [`from_borrowed`](Self::from_borrowed) for zero-copy parsing
+/// - [`extract_from_command`](Self::extract_from_command) for parsing from NNTP commands
+#[doc(alias = "msgid")]
+#[doc(alias = "article_id")]
+#[doc(alias = "message_identifier")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId<'a>(Cow<'a, str>);
 
