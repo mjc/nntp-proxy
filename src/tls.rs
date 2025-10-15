@@ -172,8 +172,10 @@ impl TlsManager {
         hostname: &str,
         backend_name: &str,
     ) -> Result<TlsStream<TcpStream>, anyhow::Error> {
+        use anyhow::Context;
+        
         let domain = rustls_pki_types::ServerName::try_from(hostname)
-            .map_err(|e| anyhow::anyhow!("Invalid hostname for TLS: {}", e))?
+            .context("Invalid hostname for TLS")?
             .to_owned();
 
         debug!("TLS: Connecting to {} with cached config", hostname);
@@ -230,18 +232,19 @@ impl TlsManager {
         root_store: &mut RootCertStore,
         cert_path: &str,
     ) -> Result<(), anyhow::Error> {
-        let cert_data = std::fs::read(cert_path).map_err(|e| {
-            anyhow::anyhow!("Failed to read TLS certificate from {}: {}", cert_path, e)
-        })?;
+        use anyhow::Context;
+        
+        let cert_data = std::fs::read(cert_path)
+            .with_context(|| format!("Failed to read TLS certificate from {}", cert_path))?;
 
         let certs = rustls_pemfile::certs(&mut cert_data.as_slice())
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse TLS certificate: {}", e))?;
+            .context("Failed to parse TLS certificate")?;
 
         for cert in certs {
             root_store
                 .add(cert)
-                .map_err(|e| anyhow::anyhow!("Failed to add custom certificate to store: {}", e))?;
+                .context("Failed to add custom certificate to store")?;
         }
 
         Ok(())
@@ -273,13 +276,13 @@ impl TlsManager {
         root_store: RootCertStore,
         config: &TlsConfig,
     ) -> Result<ClientConfig, anyhow::Error> {
+        use anyhow::Context;
+        
         let mut client_config = if config.tls_verify_cert {
             debug!("TLS: Certificate verification enabled with ring crypto provider");
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to create TLS config with ring provider: {}", e)
-                })?
+                .context("Failed to create TLS config with ring provider")?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         } else {
@@ -289,9 +292,7 @@ impl TlsManager {
             // Use custom verifier that accepts all certificates
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to create TLS config with ring provider: {}", e)
-                })?
+                .context("Failed to create TLS config with ring provider")?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
                 .with_no_client_auth()

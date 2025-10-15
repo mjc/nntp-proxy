@@ -93,11 +93,13 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
 /// This allows Docker/container deployments to override servers without
 /// modifying the config file.
 pub fn load_config(config_path: &str) -> Result<Config> {
+    use anyhow::Context;
+    
     let config_content = std::fs::read_to_string(config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", config_path, e))?;
+        .with_context(|| format!("Failed to read config file '{}'", config_path))?;
 
     let mut config: Config = toml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", config_path, e))?;
+        .with_context(|| format!("Failed to parse config file '{}'", config_path))?;
 
     // Check for environment variable server overrides
     if let Some(env_servers) = load_servers_from_env() {
