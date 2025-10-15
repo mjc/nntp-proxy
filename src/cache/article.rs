@@ -14,9 +14,11 @@ pub struct CachedArticle {
 }
 
 /// Article cache using LRU eviction with TTL
+///
+/// Uses MessageId<'static> (owned) for storage since cache must outlive input strings
 #[derive(Clone)]
 pub struct ArticleCache {
-    cache: Arc<Cache<MessageId, CachedArticle>>,
+    cache: Arc<Cache<MessageId<'static>, CachedArticle>>,
 }
 
 impl ArticleCache {
@@ -37,13 +39,26 @@ impl ArticleCache {
     }
 
     /// Get an article from the cache
-    pub async fn get(&self, message_id: &MessageId) -> Option<CachedArticle> {
-        self.cache.get(message_id).await
+    ///
+    /// Accepts any lifetime MessageId since we only need to borrow it for lookup
+    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<CachedArticle> {
+        // Use as_str() to get &str for cache key lookup
+        // The cache owns the keys, so we just need to match by content
+        let key_str = message_id.as_str();
+        
+        // Find the key in the cache by comparing string content
+        // This is slightly less efficient than direct hash lookup but necessary
+        // since we can't create a 'static MessageId from a borrowed one without cloning
+        self.cache.get(&MessageId::new(key_str.to_string()).ok()?).await
     }
 
     /// Store an article in the cache
-    pub async fn insert(&self, message_id: MessageId, article: CachedArticle) {
-        self.cache.insert(message_id, article).await;
+    ///
+    /// Accepts any lifetime MessageId and converts it to owned for storage
+    pub async fn insert<'a>(&self, message_id: MessageId<'a>, article: CachedArticle) {
+        // Convert to owned MessageId<'static> for storage
+        let owned_id = message_id.to_owned();
+        self.cache.insert(owned_id, article).await;
     }
 
     /// Get cache statistics

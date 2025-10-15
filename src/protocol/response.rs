@@ -177,7 +177,7 @@ impl NntpResponse {
     /// Message-IDs are ASCII and must be in the format <...@...>
     /// See RFC 5536 Section 3.1.3: https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3
     #[inline]
-    pub fn extract_message_id(command: &str) -> Option<MessageId> {
+    pub fn extract_message_id(command: &str) -> Option<MessageId<'_>> {
         let trimmed = command.trim();
         let bytes = trimmed.as_bytes();
 
@@ -191,7 +191,7 @@ impl NntpResponse {
 
         // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
         // We already know msgid_end is valid since memchr found '>' at that position
-        MessageId::new(trimmed[start..msgid_end].to_string()).ok()
+        MessageId::from_str(&trimmed[start..msgid_end]).ok()
     }
 
     /// Validate message-ID format according to RFC 5536 Section 3.1.3

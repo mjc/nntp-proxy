@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 mod commands;
-mod parser;
+pub mod parser;
 mod response;
 mod responses;
 

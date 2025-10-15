@@ -4,7 +4,7 @@
 //! It provides a clean abstraction for parsing and validating commands
 //! without coupling to the proxy implementation.
 
-mod classifier;
+pub mod classifier;
 mod handler;
 
 pub use classifier::NntpCommand;

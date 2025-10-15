@@ -55,6 +55,11 @@ nom = "8.0.0"
 tempfile = "3.23"
 serial_test = "3.2"
 serde_json = "1.0"  # For testing serde implementations
+divan = "0.1"  # Modern benchmarking framework
+
+[[bench]]
+name = "command_parsing"
+harness = false
 
 
 [profile.release]
