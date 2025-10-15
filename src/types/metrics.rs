@@ -7,6 +7,7 @@ use std::ops::{Add, AddAssign};
 ///
 /// Provides compile-time safety for byte counting operations,
 /// preventing accidental mixing of different metric types.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct BytesTransferred(u64);
 

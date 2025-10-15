@@ -27,6 +27,7 @@ use super::ValidationError;
 /// ```
 #[doc(alias = "port_number")]
 #[doc(alias = "tcp_port")]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Port(NonZeroU16);
 
@@ -111,6 +112,7 @@ impl<'de> Deserialize<'de> for Port {
 /// ```
 #[doc(alias = "pool_size")]
 #[doc(alias = "connection_limit")]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaxConnections(NonZeroUsize);
 
@@ -169,6 +171,7 @@ impl<'de> Deserialize<'de> for MaxConnections {
 /// A non-zero cache capacity
 ///
 /// Ensures caches always have at least 1 slot available
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheCapacity(NonZeroUsize);
 
@@ -227,6 +230,7 @@ impl<'de> Deserialize<'de> for CacheCapacity {
 /// A non-zero maximum errors threshold
 ///
 /// Ensures health check thresholds are meaningful (at least 1 error required)
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaxErrors(NonZeroU32);
 
@@ -285,6 +289,7 @@ impl<'de> Deserialize<'de> for MaxErrors {
 /// A non-zero window size for health check tracking
 ///
 /// Ensures health check windows track at least 1 request
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowSize(NonZeroU64);
 
@@ -342,6 +347,7 @@ impl<'de> Deserialize<'de> for WindowSize {
 /// A non-zero buffer size
 ///
 /// Ensures buffers always have at least 1 byte
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferSize(NonZeroUsize);
 
