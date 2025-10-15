@@ -43,7 +43,7 @@ mod status_code_parsing {
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn old_utf8(bencher: Bencher) {
-        bencher.bench_local(|| {
+        bencher.bench(|| {
             for response in RESPONSES {
                 black_box(parse_status_code_old(black_box(*response)));
             }
@@ -52,7 +52,7 @@ mod status_code_parsing {
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn new_optimized(bencher: Bencher) {
-        bencher.bench_local(|| {
+        bencher.bench(|| {
             for response in RESPONSES {
                 black_box(parse_status_code_new(black_box(*response)));
             }
@@ -119,28 +119,28 @@ mod terminator_finding {
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn old_small(bencher: Bencher) {
-        bencher.bench_local(|| {
+        bencher.bench(|| {
             black_box(find_terminator_old(black_box(SMALL_RESPONSE)))
         });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn new_small(bencher: Bencher) {
-        bencher.bench_local(|| {
+        bencher.bench(|| {
             black_box(find_terminator_new(black_box(SMALL_RESPONSE)))
         });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn old_medium(bencher: Bencher) {
-        bencher.bench_local(|| {
+        bencher.bench(|| {
             black_box(find_terminator_old(black_box(MEDIUM_RESPONSE)))
         });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn new_medium(bencher: Bencher) {
-        bencher.bench_local(|| {
+        bencher.bench(|| {
             black_box(find_terminator_new(black_box(MEDIUM_RESPONSE)))
         });
     }

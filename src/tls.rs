@@ -114,7 +114,10 @@ impl ServerCertVerifier for NoVerifier {
 /// during initialization and reused for all connections.
 pub struct TlsManager {
     config: TlsConfig,
-    /// Cached TLS connector with pre-loaded certificates (avoids base64 decode overhead)
+    /// Cached TLS connector with pre-loaded certificates
+    /// 
+    /// Avoids expensive certificate parsing overhead (DER parsing, X.509 validation,
+    /// signature verification) on every connection by loading certificates once at init.
     cached_connector: Arc<TlsConnector>,
 }
 
@@ -140,7 +143,8 @@ impl TlsManager {
     /// Create a new TLS manager with the given configuration
     ///
     /// **Performance**: Loads and parses certificates once during initialization
-    /// instead of on every connection, eliminating base64 decode overhead.
+    /// instead of on every connection, eliminating certificate parsing overhead
+    /// (DER parsing, X.509 validation, signature verification).
     pub fn new(config: TlsConfig) -> Result<Self, anyhow::Error> {
         // Load certificates once during initialization
         let cert_result = Self::load_certificates_sync(&config)?;
