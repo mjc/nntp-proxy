@@ -17,7 +17,7 @@ use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, pr
 use crate::protocol::BACKEND_UNAVAILABLE;
 use crate::router;
 use crate::session::ClientSession;
-use crate::types;
+use crate::types::{self, BufferSize};
 
 #[derive(Debug, Clone)]
 pub struct NntpProxy {
@@ -51,7 +51,10 @@ impl NntpProxy {
             })
             .collect();
 
-        let buffer_pool = BufferPool::new(BUFFER_SIZE, BUFFER_POOL_SIZE);
+        let buffer_pool = BufferPool::new(
+            BufferSize::new(BUFFER_SIZE).expect("BUFFER_SIZE is non-zero"),
+            BUFFER_POOL_SIZE,
+        );
 
         let servers = Arc::new(config.servers);
 
@@ -62,7 +65,11 @@ impl NntpProxy {
                 router::BackendSelector::new(),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
+                    r.add_backend(
+                        backend_id,
+                        servers[idx].name.as_str().to_string(),
+                        provider.clone(),
+                    );
                     r
                 },
             )
@@ -326,50 +333,51 @@ mod tests {
     use std::sync::Arc;
 
     fn create_test_config() -> Config {
-        use crate::config::{health_check_max_per_cycle, health_check_pool_timeout_ms};
+        use crate::config::{health_check_max_per_cycle, health_check_pool_timeout};
+        use crate::types::{HostName, MaxConnections, Port, ServerName};
         Config {
             servers: vec![
                 ServerConfig {
-                    host: "server1.example.com".to_string(),
-                    port: 119,
-                    name: "Test Server 1".to_string(),
+                    host: HostName::new("server1.example.com".to_string()).unwrap(),
+                    port: Port::new(119).unwrap(),
+                    name: ServerName::new("Test Server 1".to_string()).unwrap(),
                     username: None,
                     password: None,
-                    max_connections: 5,
+                    max_connections: MaxConnections::new(5).unwrap(),
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
-                    connection_keepalive_secs: 0,
+                    connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
-                    health_check_pool_timeout_ms: health_check_pool_timeout_ms(),
+                    health_check_pool_timeout: health_check_pool_timeout(),
                 },
                 ServerConfig {
-                    host: "server2.example.com".to_string(),
-                    port: 119,
-                    name: "Test Server 2".to_string(),
+                    host: HostName::new("server2.example.com".to_string()).unwrap(),
+                    port: Port::new(119).unwrap(),
+                    name: ServerName::new("Test Server 2".to_string()).unwrap(),
                     username: None,
                     password: None,
-                    max_connections: 8,
+                    max_connections: MaxConnections::new(8).unwrap(),
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
-                    connection_keepalive_secs: 0,
+                    connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
-                    health_check_pool_timeout_ms: health_check_pool_timeout_ms(),
+                    health_check_pool_timeout: health_check_pool_timeout(),
                 },
                 ServerConfig {
-                    host: "server3.example.com".to_string(),
-                    port: 119,
-                    name: "Test Server 3".to_string(),
+                    host: HostName::new("server3.example.com".to_string()).unwrap(),
+                    port: Port::new(119).unwrap(),
+                    name: ServerName::new("Test Server 3".to_string()).unwrap(),
                     username: None,
                     password: None,
-                    max_connections: 12,
+                    max_connections: MaxConnections::new(12).unwrap(),
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
-                    connection_keepalive_secs: 0,
+                    connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
-                    health_check_pool_timeout_ms: health_check_pool_timeout_ms(),
+                    health_check_pool_timeout: health_check_pool_timeout(),
                 },
             ],
             ..Default::default()
@@ -384,7 +392,7 @@ mod tests {
         );
 
         assert_eq!(proxy.servers().len(), 3);
-        assert_eq!(proxy.servers()[0].name, "Test Server 1");
+        assert_eq!(proxy.servers()[0].name.as_str(), "Test Server 1");
     }
 
     #[test]

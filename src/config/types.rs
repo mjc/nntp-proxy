@@ -2,7 +2,12 @@
 //!
 //! This module contains all the core configuration structures used by the proxy.
 
+use crate::types::{
+    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, duration_serde,
+    option_duration_serde,
+};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Routing mode for the proxy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,17 +63,17 @@ pub struct Config {
 pub struct CacheConfig {
     /// Maximum number of articles to cache
     #[serde(default = "super::defaults::cache_max_capacity")]
-    pub max_capacity: u64,
-    /// Time-to-live for cached articles in seconds
-    #[serde(default = "super::defaults::cache_ttl_secs")]
-    pub ttl_secs: u64,
+    pub max_capacity: CacheCapacity,
+    /// Time-to-live for cached articles
+    #[serde(with = "duration_serde", default = "super::defaults::cache_ttl")]
+    pub ttl: Duration,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_capacity: super::defaults::cache_max_capacity(),
-            ttl_secs: super::defaults::cache_ttl_secs(),
+            ttl: super::defaults::cache_ttl(),
         }
     }
 }
@@ -76,22 +81,28 @@ impl Default for CacheConfig {
 /// Health check configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HealthCheckConfig {
-    /// Interval between health checks in seconds
-    #[serde(default = "super::defaults::health_check_interval")]
-    pub interval_secs: u64,
-    /// Timeout for each health check in seconds
-    #[serde(default = "super::defaults::health_check_timeout")]
-    pub timeout_secs: u64,
+    /// Interval between health checks
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::health_check_interval"
+    )]
+    pub interval: Duration,
+    /// Timeout for each health check
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::health_check_timeout"
+    )]
+    pub timeout: Duration,
     /// Number of consecutive failures before marking unhealthy
     #[serde(default = "super::defaults::unhealthy_threshold")]
-    pub unhealthy_threshold: u32,
+    pub unhealthy_threshold: MaxErrors,
 }
 
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
-            interval_secs: super::defaults::health_check_interval(),
-            timeout_secs: super::defaults::health_check_timeout(),
+            interval: super::defaults::health_check_interval(),
+            timeout: super::defaults::health_check_timeout(),
             unhealthy_threshold: super::defaults::unhealthy_threshold(),
         }
     }
@@ -100,16 +111,16 @@ impl Default for HealthCheckConfig {
 /// Configuration for a single backend server
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerConfig {
-    pub host: String,
-    pub port: u16,
-    pub name: String,
+    pub host: HostName,
+    pub port: Port,
+    pub name: ServerName,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Maximum number of concurrent connections to this server
     #[serde(default = "super::defaults::max_connections")]
-    pub max_connections: u32,
+    pub max_connections: MaxConnections,
 
     /// Enable TLS/SSL for this backend connection
     #[serde(default)]
@@ -120,16 +131,23 @@ pub struct ServerConfig {
     /// Optional path to custom CA certificate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_cert_path: Option<String>,
-    /// Interval in seconds to send keep-alive commands (DATE) on idle connections
-    /// Set to 0 to disable keep-alive (default)
-    #[serde(default)]
-    pub connection_keepalive_secs: u64,
+    /// Interval to send keep-alive commands (DATE) on idle connections
+    /// None disables keep-alive (default)
+    #[serde(
+        with = "option_duration_serde",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub connection_keepalive: Option<Duration>,
     /// Maximum number of connections to check per health check cycle
     /// Lower values reduce pool contention but may take longer to detect all stale connections
     #[serde(default = "super::defaults::health_check_max_per_cycle")]
     pub health_check_max_per_cycle: usize,
-    /// Timeout in milliseconds when acquiring a connection for health checking
+    /// Timeout when acquiring a connection for health checking
     /// Short timeout prevents blocking if pool is busy
-    #[serde(default = "super::defaults::health_check_pool_timeout_ms")]
-    pub health_check_pool_timeout_ms: u64,
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::health_check_pool_timeout"
+    )]
+    pub health_check_pool_timeout: Duration,
 }

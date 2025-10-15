@@ -54,22 +54,23 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
         let max_conn_key = format!("NNTP_SERVER_{}_MAX_CONNECTIONS", index);
         let max_connections = std::env::var(&max_conn_key)
             .ok()
-            .and_then(|m| m.parse::<u32>().ok())
+            .and_then(|m| m.parse::<usize>().ok())
+            .and_then(crate::types::MaxConnections::new)
             .unwrap_or_else(defaults::max_connections);
 
         servers.push(ServerConfig {
-            host,
-            port,
-            name,
+            host: crate::types::HostName::new(host).expect("Valid hostname from env"),
+            port: crate::types::Port::new(port).expect("Valid port from env"),
+            name: crate::types::ServerName::new(name).expect("Valid server name from env"),
             username,
             password,
             max_connections,
             use_tls: false,
             tls_verify_cert: defaults::tls_verify_cert(),
             tls_cert_path: None,
-            connection_keepalive_secs: 0,
+            connection_keepalive: None,
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
-            health_check_pool_timeout_ms: defaults::health_check_pool_timeout_ms(),
+            health_check_pool_timeout: defaults::health_check_pool_timeout(),
         });
 
         index += 1;
@@ -118,18 +119,20 @@ pub fn load_config(config_path: &str) -> Result<Config> {
 pub fn create_default_config() -> Config {
     Config {
         servers: vec![ServerConfig {
-            host: "news.example.com".to_string(),
-            port: 119,
-            name: "Example News Server".to_string(),
+            host: crate::types::HostName::new("news.example.com".to_string())
+                .expect("Valid hostname"),
+            port: crate::types::Port::new(119).expect("Valid port"),
+            name: crate::types::ServerName::new("Example News Server".to_string())
+                .expect("Valid server name"),
             username: None,
             password: None,
             max_connections: defaults::max_connections(),
             use_tls: false,
             tls_verify_cert: defaults::tls_verify_cert(),
             tls_cert_path: None,
-            connection_keepalive_secs: 0,
+            connection_keepalive: None,
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
-            health_check_pool_timeout_ms: defaults::health_check_pool_timeout_ms(),
+            health_check_pool_timeout: defaults::health_check_pool_timeout(),
         }],
         ..Default::default()
     }

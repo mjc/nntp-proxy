@@ -97,25 +97,19 @@ impl DeadpoolConnectionProvider {
         };
 
         let manager = TcpManager::new_with_tls(
-            server.host.clone(),
-            server.port,
-            server.name.clone(),
+            server.host.as_str().to_string(),
+            server.port.get(),
+            server.name.as_str().to_string(),
             server.username.clone(),
             server.password.clone(),
             tls_config,
         );
         let pool = Pool::builder(manager)
-            .max_size(server.max_connections as usize)
+            .max_size(server.max_connections.get())
             .build()
             .expect("Failed to create connection pool");
 
-        let keepalive_interval = if server.connection_keepalive_secs > 0 {
-            Some(std::time::Duration::from_secs(
-                server.connection_keepalive_secs,
-            ))
-        } else {
-            None
-        };
+        let keepalive_interval = server.connection_keepalive;
 
         // Create metrics and shutdown channel if keepalive is enabled
         let metrics = Arc::new(Mutex::new(HealthCheckMetrics::new()));
@@ -124,7 +118,7 @@ impl DeadpoolConnectionProvider {
 
             // Spawn background health check task
             let pool_clone = pool.clone();
-            let name_clone = server.name.clone();
+            let name_clone = server.name.as_str().to_string();
             let metrics_clone = metrics.clone();
             tokio::spawn(async move {
                 Self::run_periodic_health_checks(
@@ -144,7 +138,7 @@ impl DeadpoolConnectionProvider {
 
         Self {
             pool,
-            name: server.name.clone(),
+            name: server.name.as_str().to_string(),
             keepalive_interval,
             shutdown_tx,
             health_check_metrics: metrics,

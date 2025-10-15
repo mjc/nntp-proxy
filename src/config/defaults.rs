@@ -2,34 +2,37 @@
 //!
 //! This module centralizes all default value functions used in serde deserialization.
 
+use crate::types::{CacheCapacity, MaxConnections, MaxErrors};
+use std::time::Duration;
+
 /// Default maximum connections per server
-pub fn max_connections() -> u32 {
-    10
+pub fn max_connections() -> MaxConnections {
+    MaxConnections::new(10).expect("10 is non-zero")
 }
 
-/// Default health check interval in seconds
-pub fn health_check_interval() -> u64 {
-    30
+/// Default health check interval
+pub fn health_check_interval() -> Duration {
+    Duration::from_secs(30)
 }
 
-/// Default health check timeout in seconds
-pub fn health_check_timeout() -> u64 {
-    5
+/// Default health check timeout
+pub fn health_check_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// Default unhealthy threshold
-pub fn unhealthy_threshold() -> u32 {
-    3
+pub fn unhealthy_threshold() -> MaxErrors {
+    MaxErrors::new(3).expect("3 is non-zero")
 }
 
 /// Default cache max capacity (number of articles)
-pub fn cache_max_capacity() -> u64 {
-    10000
+pub fn cache_max_capacity() -> CacheCapacity {
+    CacheCapacity::new(10000).expect("10000 is non-zero")
 }
 
-/// Default cache TTL in seconds (1 hour)
-pub fn cache_ttl_secs() -> u64 {
-    3600
+/// Default cache TTL (1 hour)
+pub fn cache_ttl() -> Duration {
+    Duration::from_secs(3600)
 }
 
 /// Default for TLS certificate verification (true for security)
@@ -43,8 +46,8 @@ pub fn health_check_max_per_cycle() -> usize {
     MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE
 }
 
-/// Default timeout in milliseconds when acquiring a connection for health checking
-pub fn health_check_pool_timeout_ms() -> u64 {
+/// Default timeout when acquiring a connection for health checking
+pub fn health_check_pool_timeout() -> Duration {
     use crate::constants::pool::HEALTH_CHECK_POOL_TIMEOUT_MS;
-    HEALTH_CHECK_POOL_TIMEOUT_MS
+    Duration::from_millis(HEALTH_CHECK_POOL_TIMEOUT_MS)
 }

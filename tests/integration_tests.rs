@@ -279,10 +279,10 @@ name = "Test Server 2"
     let config = load_config(temp_file.path().to_str().unwrap())?;
 
     assert_eq!(config.servers.len(), 2);
-    assert_eq!(config.servers[0].host, "test1.example.com");
-    assert_eq!(config.servers[0].port, 119);
-    assert_eq!(config.servers[1].host, "test2.example.com");
-    assert_eq!(config.servers[1].port, 563);
+    assert_eq!(config.servers[0].host.as_str(), "test1.example.com");
+    assert_eq!(config.servers[0].port.get(), 119);
+    assert_eq!(config.servers[1].host.as_str(), "test2.example.com");
+    assert_eq!(config.servers[1].port.get(), 563);
 
     Ok(())
 }

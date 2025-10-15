@@ -8,19 +8,14 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::COMMAND_SIZE;
 use crate::pool::BufferPool;
+use crate::types::{BytesTransferred, TransferMetrics};
 
 /// Result of bidirectional forwarding
 pub enum ForwardResult {
     /// Normal disconnection
-    NormalDisconnect {
-        client_to_backend: u64,
-        backend_to_client: u64,
-    },
+    NormalDisconnect(TransferMetrics),
     /// Backend error - connection should be removed from pool
-    BackendError {
-        client_to_backend: u64,
-        backend_to_client: u64,
-    },
+    BackendError(TransferMetrics),
 }
 
 /// Bidirectional forwarding between client and backend in stateful mode
@@ -34,8 +29,8 @@ pub async fn bidirectional_forward<R, W, B>(
     pooled_conn: &mut B,
     buffer_pool: &BufferPool,
     client_addr: std::net::SocketAddr,
-    mut client_to_backend_bytes: u64,
-    mut backend_to_client_bytes: u64,
+    client_to_backend_bytes: BytesTransferred,
+    backend_to_client_bytes: BytesTransferred,
 ) -> Result<ForwardResult>
 where
     R: AsyncBufReadExt + Unpin,
@@ -50,6 +45,9 @@ where
     let buffer_c2b = buffer_pool.get_buffer().await;
     let mut buffer_b2c = buffer_pool.get_buffer().await;
     let mut command = String::with_capacity(COMMAND_SIZE);
+
+    let mut c2b = client_to_backend_bytes;
+    let mut b2c = backend_to_client_bytes;
 
     loop {
         tokio::select! {
@@ -67,15 +65,17 @@ where
                                 debug!("Backend write error for client {} ({}), removing connection from pool", client_addr, err);
                                 buffer_pool.return_buffer(buffer_c2b).await;
                                 buffer_pool.return_buffer(buffer_b2c).await;
-                                return Ok(ForwardResult::BackendError {
-                                    client_to_backend: client_to_backend_bytes,
-                                    backend_to_client: backend_to_client_bytes,
-                                });
+                                return Ok(ForwardResult::BackendError(
+                                    TransferMetrics {
+                                        client_to_backend: c2b,
+                                        backend_to_client: b2c,
+                                    }
+                                ));
                             }
                             debug!("Backend write error for client {}: {}", client_addr, err);
                             break;
                         }
-                        client_to_backend_bytes += n as u64;
+                        c2b.add(n);
                         command.clear();
                     }
                     Err(e) => {
@@ -97,7 +97,7 @@ where
                             debug!("Client write error for {}: {}", client_addr, e);
                             break;
                         }
-                        backend_to_client_bytes += n as u64;
+                        b2c.add(n);
                     }
                     Err(e) => {
                         let err: anyhow::Error = e.into();
@@ -105,10 +105,12 @@ where
                             debug!("Backend connection error for client {} ({}), removing from pool", client_addr, err);
                             buffer_pool.return_buffer(buffer_c2b).await;
                             buffer_pool.return_buffer(buffer_b2c).await;
-                            return Ok(ForwardResult::BackendError {
-                                client_to_backend: client_to_backend_bytes,
-                                backend_to_client: backend_to_client_bytes,
-                            });
+                            return Ok(ForwardResult::BackendError(
+                                TransferMetrics {
+                                    client_to_backend: c2b,
+                                    backend_to_client: b2c,
+                                }
+                            ));
                         }
                         debug!("Backend read error for client {}: {}", client_addr, err);
                         break;
@@ -121,42 +123,42 @@ where
     buffer_pool.return_buffer(buffer_c2b).await;
     buffer_pool.return_buffer(buffer_b2c).await;
 
-    Ok(ForwardResult::NormalDisconnect {
-        client_to_backend: client_to_backend_bytes,
-        backend_to_client: backend_to_client_bytes,
-    })
+    Ok(ForwardResult::NormalDisconnect(TransferMetrics {
+        client_to_backend: c2b,
+        backend_to_client: b2c,
+    }))
 }
 
 /// Log client disconnect/error with appropriate log level and context
 pub fn log_client_error(
     client_addr: std::net::SocketAddr,
     error: &std::io::Error,
-    client_to_backend_bytes: u64,
-    backend_to_client_bytes: u64,
+    metrics: TransferMetrics,
 ) {
+    let (c2b, b2c) = metrics.as_tuple();
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => {
             debug!(
                 "Client {} closed connection (EOF) | ↑{} ↓{}",
                 client_addr,
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::BrokenPipe => {
             debug!(
                 "Client {} connection broken pipe | ↑{} ↓{}",
                 client_addr,
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::ConnectionReset => {
             warn!(
                 "Client {} connection reset | ↑{} ↓{}",
                 client_addr,
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
         _ => {
@@ -165,8 +167,8 @@ pub fn log_client_error(
                 client_addr,
                 error,
                 error.kind(),
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
     }
@@ -177,10 +179,10 @@ pub fn log_routing_error(
     client_addr: std::net::SocketAddr,
     error: &std::io::Error,
     command: &str,
-    client_to_backend_bytes: u64,
-    backend_to_client_bytes: u64,
+    metrics: TransferMetrics,
     backend_id: crate::types::BackendId,
 ) {
+    let (c2b, b2c) = metrics.as_tuple();
     let trimmed = command.trim();
     match error.kind() {
         std::io::ErrorKind::BrokenPipe => {
@@ -189,8 +191,8 @@ pub fn log_routing_error(
                 client_addr,
                 trimmed,
                 backend_id,
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::ConnectionReset => {
@@ -199,8 +201,8 @@ pub fn log_routing_error(
                 client_addr,
                 trimmed,
                 backend_id,
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::ConnectionAborted => {
@@ -209,8 +211,8 @@ pub fn log_routing_error(
                 client_addr,
                 trimmed,
                 backend_id,
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
         _ => {
@@ -221,8 +223,8 @@ pub fn log_routing_error(
                 backend_id,
                 error,
                 error.kind(),
-                crate::formatting::format_bytes(client_to_backend_bytes),
-                crate::formatting::format_bytes(backend_to_client_bytes)
+                crate::formatting::format_bytes(c2b),
+                crate::formatting::format_bytes(b2c)
             );
         }
     }

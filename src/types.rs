@@ -2,6 +2,19 @@
 //!
 //! This module provides unique identifiers used throughout the proxy.
 
+pub mod config;
+pub mod metrics;
+pub mod protocol;
+pub mod validated;
+
+pub use config::{
+    BufferSize, CacheCapacity, MaxConnections, MaxErrors, Port, WindowSize, duration_serde,
+    option_duration_serde,
+};
+pub use metrics::{BytesTransferred, TransferMetrics};
+pub use protocol::MessageId;
+pub use validated::{HostName, ServerName, ValidationError};
+
 use uuid::Uuid;
 
 /// Unique identifier for client connections
