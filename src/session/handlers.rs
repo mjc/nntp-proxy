@@ -31,6 +31,7 @@ use super::{backend, connection, streaming};
 const SMALL_TRANSFER_THRESHOLD: u64 = 500;
 
 /// Extract message-ID from NNTP command if present
+#[inline]
 fn extract_message_id(command: &str) -> Option<&str> {
     let start = command.find('<')?;
     let end = command[start..].find('>')?;

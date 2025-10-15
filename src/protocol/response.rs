@@ -330,7 +330,7 @@ impl NntpResponse {
 
         // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
         // We already know msgid_end is valid since memchr found '>' at that position
-        MessageId::from_str(&trimmed[start..msgid_end]).ok()
+        MessageId::from_borrowed(&trimmed[start..msgid_end]).ok()
     }
 
     /// Validate message-ID format according to [RFC 5536 §3.1.3](https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3)
@@ -391,24 +391,28 @@ pub struct ResponseParser;
 
 impl ResponseParser {
     /// Check if a response starts with a success code (2xx or 3xx)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
         ResponseCode::parse(data).is_success()
     }
 
     /// Check if response is a greeting (200 or 201)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
         matches!(ResponseCode::parse(data), ResponseCode::Greeting(_))
     }
 
     /// Check if response indicates authentication is required (381 or 480)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
         matches!(ResponseCode::parse(data), ResponseCode::AuthRequired(_))
     }
 
     /// Check if response indicates successful authentication (281)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
         matches!(ResponseCode::parse(data), ResponseCode::AuthSuccess)
@@ -418,6 +422,7 @@ impl ResponseParser {
     ///
     /// This is useful for checking specific response codes like 111 (DATE response),
     /// or any other specific code that doesn't have a dedicated helper.
+    #[inline]
     pub fn is_response_code(data: &[u8], code: u16) -> bool {
         NntpResponse::parse_status_code(data) == Some(code)
     }

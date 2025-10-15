@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::{Borrow, Cow};
 use std::fmt;
+use std::str::FromStr;
 
 use super::ValidationError;
 
@@ -63,11 +64,11 @@ impl<'a> MessageId<'a> {
     /// ```
     /// use nntp_proxy::types::MessageId;
     ///
-    /// let msgid = MessageId::from_str("<12345@example.com>").unwrap();
+    /// let msgid = MessageId::from_borrowed("<12345@example.com>").unwrap();
     /// assert_eq!(msgid.as_str(), "<12345@example.com>");
     /// ```
     #[inline]
-    pub fn from_str(s: &'a str) -> Result<Self, ValidationError> {
+    pub fn from_borrowed(s: &'a str) -> Result<Self, ValidationError> {
         if s.len() < 3 {
             return Err(ValidationError::InvalidMessageId(
                 "Message ID too short (minimum 3 characters)".to_string(),
@@ -188,6 +189,14 @@ impl<'a> MessageId<'a> {
     /// this is a cheap clone. Otherwise, it allocates and copies the data.
     pub fn to_owned(&self) -> MessageId<'static> {
         MessageId(Cow::Owned(self.0.clone().into_owned()))
+    }
+}
+
+impl FromStr for MessageId<'static> {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MessageId::new(s.to_string())
     }
 }
 

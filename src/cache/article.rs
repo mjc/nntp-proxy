@@ -89,7 +89,7 @@ mod tests {
         let cache = ArticleCache::new(100, Duration::from_secs(300));
 
         // Create a MessageId and insert an article
-        let msgid = MessageId::from_str("<test123@example.com>").unwrap();
+        let msgid = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let article = CachedArticle {
             response: Arc::new(b"220 0 0 <test123@example.com>\r\ntest body\r\n.\r\n".to_vec()),
         };
@@ -98,7 +98,7 @@ mod tests {
 
         // Verify we can retrieve using a different MessageId instance (borrowed)
         // This demonstrates that Arc<str> supports Borrow<str> lookups via &str
-        let msgid2 = MessageId::from_str("<test123@example.com>").unwrap();
+        let msgid2 = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let retrieved = cache.get(&msgid2).await;
 
         assert!(
@@ -116,7 +116,7 @@ mod tests {
     async fn test_cache_miss() {
         let cache = ArticleCache::new(100, Duration::from_secs(300));
 
-        let msgid = MessageId::from_str("<nonexistent@example.com>").unwrap();
+        let msgid = MessageId::from_borrowed("<nonexistent@example.com>").unwrap();
         let result = cache.get(&msgid).await;
 
         assert!(

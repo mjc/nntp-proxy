@@ -9,6 +9,7 @@ use std::io::ErrorKind;
 use crate::pool::deadpool_connection::TcpManager;
 
 /// Check if an error should cause the connection to be removed from the pool
+#[inline]
 pub fn is_connection_error(e: &anyhow::Error) -> bool {
     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
         matches!(
@@ -27,6 +28,7 @@ pub fn is_connection_error(e: &anyhow::Error) -> bool {
 ///
 /// This should be called when a connection encounters an error that indicates
 /// it's broken and should not be reused.
+#[inline]
 pub fn remove_from_pool(conn: Object<TcpManager>) {
     drop(Object::take(conn));
 }

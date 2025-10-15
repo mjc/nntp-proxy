@@ -68,7 +68,7 @@ impl HealthChecker {
                 // Check each backend
                 for (i, provider) in providers.iter().enumerate() {
                     let backend_id = BackendId::from_index(i);
-                    self.check_backend(provider.clone(), backend_id).await;
+                    self.clone().check_backend(provider.clone(), backend_id).await;
                 }
             }
         });
