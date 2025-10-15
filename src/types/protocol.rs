@@ -170,18 +170,20 @@ impl<'a> MessageId<'a> {
         MessageId::new(command[start..=start + end].to_string()).ok()
     }
 
-    /// Convert to an owned MessageId (allocates if currently borrowed)
+    /// Converts this `MessageId` into an owned `MessageId<'static>`, consuming `self`.
     ///
-    /// This is useful when you need to store a MessageId beyond the lifetime of the input string.
-    /// If the MessageId is already owned, this is a no-op clone.
+    /// This method is useful when you need to store a `MessageId` beyond the lifetime of the input string.
+    /// 
+    /// Consumes `self` and always returns an owned `MessageId<'static>`. If the underlying data is already owned,
+    /// this will not allocate, but will still call `into_owned()` on the inner `Cow`.
     pub fn into_owned(self) -> MessageId<'static> {
         MessageId(Cow::Owned(self.0.into_owned()))
     }
 
-    /// Convert to an owned MessageId (allocates if currently borrowed)
+    /// Creates an owned `MessageId<'static>` by cloning the data if necessary.
     ///
-    /// This is useful when you need to store a MessageId beyond the lifetime of the input string.
-    /// If the MessageId is already owned, this is a cheap clone.
+    /// This method borrows `self` and returns an owned `MessageId<'static>`. If the underlying data is already owned,
+    /// this is a cheap clone. Otherwise, it allocates and copies the data.
     pub fn to_owned(&self) -> MessageId<'static> {
         MessageId(Cow::Owned(self.0.clone().into_owned()))
     }

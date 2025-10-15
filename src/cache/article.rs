@@ -40,16 +40,16 @@ impl ArticleCache {
 
     /// Get an article from the cache
     ///
-    /// Accepts any lifetime MessageId since we only need to borrow it for lookup
+    /// Accepts any lifetime MessageId since we only need to borrow it for lookup.
+    /// 
+    /// Note: moka::Cache doesn't support borrowed key lookups, so we must convert
+    /// the MessageId to owned form for the lookup. This is a necessary allocation
+    /// but only happens on cache access, not during parsing.
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<CachedArticle> {
-        // Use as_str() to get &str for cache key lookup
-        // The cache owns the keys, so we just need to match by content
-        let key_str = message_id.as_str();
-        
-        // Find the key in the cache by comparing string content
-        // This is slightly less efficient than direct hash lookup but necessary
-        // since we can't create a 'static MessageId from a borrowed one without cloning
-        self.cache.get(&MessageId::new(key_str.to_string()).ok()?).await
+        // Convert to owned MessageId for cache lookup
+        // This is necessary because moka::Cache requires owned keys for get()
+        let owned_id = message_id.to_owned();
+        self.cache.get(&owned_id).await
     }
 
     /// Store an article in the cache

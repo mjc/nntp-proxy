@@ -249,22 +249,17 @@ impl NntpResponse {
             return None;
         }
 
-        let mut pos = 0;
-        while let Some(r_pos) = memchr::memchr(b'\r', &data[pos..]) {
-            let abs_pos = pos + r_pos;
-            
+        // Use memchr::Memchr iterator to avoid repeated slice creation
+        for r_pos in memchr::memchr_iter(b'\r', data) {
             // Not enough space for full terminator
-            if abs_pos + 5 > n {
+            if r_pos + 5 > n {
                 return None;
             }
             
             // Check for full terminator pattern
-            if &data[abs_pos..abs_pos + 5] == b"\r\n.\r\n" {
-                return Some(abs_pos + 5);
+            if &data[r_pos..r_pos + 5] == b"\r\n.\r\n" {
+                return Some(r_pos + 5);
             }
-            
-            // Move past this '\r' and continue searching
-            pos = abs_pos + 1;
         }
 
         None
