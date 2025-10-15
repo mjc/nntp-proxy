@@ -52,29 +52,29 @@ pub enum ResponseCode {
     /// - 200: Posting allowed
     /// - 201: No posting allowed
     Greeting(u16),
-    
+
     /// Disconnect/goodbye - [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4)
     /// - 205: Connection closing
     Disconnect,
-    
+
     /// Authentication required - [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
     /// - 381: Password required
     /// - 480: Authentication required
     AuthRequired(u16),
-    
+
     /// Authentication successful - [RFC 4643 §2.5.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.5.1)
     /// - 281: Authentication accepted
     AuthSuccess,
-    
+
     /// Multiline data response
     /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
     /// - All 1xx codes (100-199)
     /// - Specific 2xx codes: 215, 220, 221, 222, 224, 225, 230, 231, 282
     MultilineData(u16),
-    
+
     /// Single-line response (everything else)
     SingleLine(u16),
-    
+
     /// Invalid or unparseable response
     Invalid,
 }
@@ -96,22 +96,22 @@ impl ResponseCode {
         match code {
             // [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
             200 | 201 => Self::Greeting(code),
-            
+
             // [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4)
             205 => Self::Disconnect,
-            
+
             // [RFC 4643 §2.5.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.5.1)
             281 => Self::AuthSuccess,
-            
+
             // [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
             381 | 480 => Self::AuthRequired(code),
-            
+
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
             // All 1xx are informational multiline
             100..=199 => Self::MultilineData(code),
             // Specific 2xx multiline responses
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
-            
+
             // Everything else is a single-line response
             _ => Self::SingleLine(code),
         }
@@ -254,7 +254,7 @@ impl NntpResponse {
             if r_pos + 5 > n {
                 return None;
             }
-            
+
             // Check for full terminator pattern
             if &data[r_pos..r_pos + 5] == b"\r\n.\r\n" {
                 return Some(r_pos + 5);

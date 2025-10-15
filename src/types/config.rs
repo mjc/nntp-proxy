@@ -25,6 +25,7 @@ impl Port {
 
     /// Get the port number as u16
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> u16 {
         self.0.get()
     }
@@ -95,6 +96,7 @@ impl MaxConnections {
 
     /// Get the value as usize
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> usize {
         self.0.get()
     }
@@ -152,6 +154,7 @@ impl CacheCapacity {
 
     /// Get the value as usize
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> usize {
         self.0.get()
     }
@@ -209,6 +212,7 @@ impl MaxErrors {
 
     /// Get the value as u32
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> u32 {
         self.0.get()
     }

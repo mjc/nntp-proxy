@@ -131,6 +131,7 @@ impl<'a> MessageId<'a> {
 
     /// Get the message ID as a string slice
     #[must_use]
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -145,6 +146,7 @@ impl<'a> MessageId<'a> {
     /// assert_eq!(msgid.without_brackets(), "12345@example.com");
     /// ```
     #[must_use]
+    #[inline]
     pub fn without_brackets(&self) -> &str {
         let s: &str = &self.0;
         &s[1..s.len() - 1]
@@ -173,7 +175,7 @@ impl<'a> MessageId<'a> {
     /// Converts this `MessageId` into an owned `MessageId<'static>`, consuming `self`.
     ///
     /// This method is useful when you need to store a `MessageId` beyond the lifetime of the input string.
-    /// 
+    ///
     /// Consumes `self` and always returns an owned `MessageId<'static>`. If the underlying data is already owned,
     /// this will not allocate, but will still call `into_owned()` on the inner `Cow`.
     pub fn into_owned(self) -> MessageId<'static> {

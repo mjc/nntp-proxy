@@ -135,7 +135,7 @@ const NEWNEWS_CASES: &[&[u8]; 3] = &[b"NEWNEWS", b"newnews", b"Newnews"];
 // =============================================================================
 
 /// Check if command matches any of 3 case variations (UPPER, lower, Title)
-/// 
+///
 /// Per [RFC 3977 §3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.1),
 /// NNTP commands are case-insensitive. This function checks all three common
 /// case variations used by different NNTP clients.
@@ -179,12 +179,12 @@ fn matches_any(cmd: &[u8], cases: &[&[u8]; 3]) -> bool {
 #[inline(always)]
 fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
     let len = bytes.len();
-    
+
     // Minimum valid command: "BODY <x>" = 7 bytes
     if len < 7 {
         return false;
     }
-    
+
     // Fast path for 4-letter commands: BODY, HEAD, STAT (5 bytes + '<')
     // Compiler will use SIMD (SSE/AVX) for these byte comparisons on x86_64
     if len >= 6 {
@@ -199,7 +199,7 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
         if bytes[0..5] == *b"STAT " && bytes[5] == b'<' {
             return true;
         }
-        
+
         // Lowercase/Titlecase (rare, ~5% of traffic)
         if (bytes[0..5] == *b"body " || bytes[0..5] == *b"Body ") && bytes[5] == b'<' {
             return true;
@@ -211,7 +211,7 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
             return true;
         }
     }
-    
+
     // Check for "ARTICLE <" (8 bytes + '<' = 9 bytes minimum)
     // Compiler will vectorize 8-byte comparison
     if len >= 9 {
@@ -219,13 +219,13 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
         if bytes[0..8] == *b"ARTICLE " && bytes[8] == b'<' {
             return true;
         }
-        
+
         // lowercase/Titlecase (rare)
         if (bytes[0..8] == *b"article " || bytes[0..8] == *b"Article ") && bytes[8] == b'<' {
             return true;
         }
     }
-    
+
     false
 }
 
@@ -265,24 +265,24 @@ pub enum NntpCommand {
     /// Authentication: AUTHINFO USER
     /// [RFC 4643 §2.3.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.1)
     AuthUser,
-    
+
     /// Authentication: AUTHINFO PASS
     /// [RFC 4643 §2.3.2](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.2)
     AuthPass,
-    
+
     /// Commands requiring GROUP context: article-by-number, NEXT, LAST, XOVER, etc.
     /// [RFC 3977 §6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1)
     Stateful,
-    
+
     /// Commands that cannot work with multiplexing: POST, IHAVE, NEWGROUPS, NEWNEWS
     /// [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3),
     /// [RFC 3977 §7.3-7.4](https://datatracker.ietf.org/doc/html/rfc3977#section-7.3)
     NonRoutable,
-    
+
     /// Safe to proxy without state: LIST, DATE, CAPABILITIES, HELP, QUIT, etc.
     /// [RFC 3977 §7](https://datatracker.ietf.org/doc/html/rfc3977#section-7)
     Stateless,
-    
+
     /// Article retrieval by message-ID: ARTICLE/BODY/HEAD/STAT <msgid> (70%+ of traffic)
     /// [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2)
     ArticleByMessageId,
@@ -343,7 +343,7 @@ impl NntpCommand {
         // ═════════════════════════════════════════════════════════════════
         // Standard path: Parse command word and classify
         // ═════════════════════════════════════════════════════════════════
-        
+
         // Split on first space to separate command from arguments
         // Per [RFC 3977 §3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.1):
         // "Commands consist of a keyword possibly followed by arguments, separated by space"

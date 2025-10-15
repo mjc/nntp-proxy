@@ -115,7 +115,7 @@ impl ServerCertVerifier for NoVerifier {
 pub struct TlsManager {
     config: TlsConfig,
     /// Cached TLS connector with pre-loaded certificates
-    /// 
+    ///
     /// Avoids expensive certificate parsing overhead (DER parsing, X.509 validation,
     /// signature verification) on every connection by loading certificates once at init.
     cached_connector: Arc<TlsConnector>,
@@ -177,14 +177,17 @@ impl TlsManager {
             .to_owned();
 
         debug!("TLS: Connecting to {} with cached config", hostname);
-        
-        self.cached_connector.connect(domain, stream).await.map_err(|e| {
-            ConnectionError::TlsHandshake {
-                backend: backend_name.to_string(),
-                source: Box::new(e),
-            }
-            .into()
-        })
+
+        self.cached_connector
+            .connect(domain, stream)
+            .await
+            .map_err(|e| {
+                ConnectionError::TlsHandshake {
+                    backend: backend_name.to_string(),
+                    source: Box::new(e),
+                }
+                .into()
+            })
     }
 
     /// Load certificates from various sources with fallback chain (synchronous for init)
@@ -325,7 +328,7 @@ mod tests {
     #[test]
     fn test_certificate_loading() {
         let config = TlsConfig::default();
-        
+
         let result = TlsManager::load_certificates_sync(&config).unwrap();
         assert!(!result.root_store.is_empty());
         // Should have at least one source (system certificates or Mozilla CA bundle)

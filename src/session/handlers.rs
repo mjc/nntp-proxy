@@ -371,8 +371,7 @@ impl ClientSession {
         }
 
         // Log session summary for debugging, especially useful for test connections
-        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < SMALL_TRANSFER_THRESHOLD
-        {
+        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < SMALL_TRANSFER_THRESHOLD {
             debug!(
                 "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
                 self.client_addr,

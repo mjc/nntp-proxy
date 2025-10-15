@@ -43,12 +43,14 @@ impl BytesTransferred {
 }
 
 impl From<u64> for BytesTransferred {
+    #[inline]
     fn from(bytes: u64) -> Self {
         Self(bytes)
     }
 }
 
 impl From<BytesTransferred> for u64 {
+    #[inline]
     fn from(bytes: BytesTransferred) -> Self {
         bytes.0
     }
@@ -57,12 +59,14 @@ impl From<BytesTransferred> for u64 {
 impl Add for BytesTransferred {
     type Output = Self;
 
+    #[inline]
     fn add(self, other: Self) -> Self {
         Self(self.0 + other.0)
     }
 }
 
 impl AddAssign for BytesTransferred {
+    #[inline]
     fn add_assign(&mut self, other: Self) {
         self.0 += other.0;
     }
