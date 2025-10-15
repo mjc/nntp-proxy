@@ -50,7 +50,7 @@ impl NntpProxy {
                 DeadpoolConnectionProvider::from_server_config(server)
             })
             .collect();
-        
+
         let connection_providers = connection_providers?;
 
         let buffer_pool = BufferPool::new(
@@ -293,14 +293,14 @@ impl NntpProxy {
             }
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
-                let is_broken_pipe = if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    matches!(
-                        io_err.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                    )
-                } else {
-                    false
-                };
+                let is_broken_pipe = e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_err| {
+                        matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        )
+                    });
 
                 if is_broken_pipe {
                     debug!(

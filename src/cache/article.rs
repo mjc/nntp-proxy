@@ -42,7 +42,7 @@ impl ArticleCache {
     /// Get an article from the cache
     ///
     /// Accepts any lifetime MessageId and uses the string content (without brackets) as key.
-    /// 
+    ///
     /// **Zero-allocation**: `without_brackets()` returns `&str`, which moka accepts directly
     /// for `Arc<str>` keys via the `Borrow<str>` trait. This avoids allocating a new `Arc<str>`
     /// for every cache lookup. See `test_arc_str_borrow_lookup` test for verification.
@@ -89,19 +89,22 @@ mod tests {
         let cache = ArticleCache::new(100, Duration::from_secs(300));
 
         // Create a MessageId and insert an article
-        let msgid = MessageId::from_str("<test123@example.com>").unwrap();
+        let msgid = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let article = CachedArticle {
             response: Arc::new(b"220 0 0 <test123@example.com>\r\ntest body\r\n.\r\n".to_vec()),
         };
-        
+
         cache.insert(msgid.clone(), article.clone()).await;
 
         // Verify we can retrieve using a different MessageId instance (borrowed)
         // This demonstrates that Arc<str> supports Borrow<str> lookups via &str
-        let msgid2 = MessageId::from_str("<test123@example.com>").unwrap();
+        let msgid2 = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let retrieved = cache.get(&msgid2).await;
-        
-        assert!(retrieved.is_some(), "Arc<str> cache should support Borrow<str> lookups");
+
+        assert!(
+            retrieved.is_some(),
+            "Arc<str> cache should support Borrow<str> lookups"
+        );
         assert_eq!(
             retrieved.unwrap().response.as_ref(),
             article.response.as_ref(),
@@ -112,10 +115,13 @@ mod tests {
     #[tokio::test]
     async fn test_cache_miss() {
         let cache = ArticleCache::new(100, Duration::from_secs(300));
-        
-        let msgid = MessageId::from_str("<nonexistent@example.com>").unwrap();
+
+        let msgid = MessageId::from_borrowed("<nonexistent@example.com>").unwrap();
         let result = cache.get(&msgid).await;
-        
-        assert!(result.is_none(), "Cache lookup for non-existent key should return None");
+
+        assert!(
+            result.is_none(),
+            "Cache lookup for non-existent key should return None"
+        );
     }
 }

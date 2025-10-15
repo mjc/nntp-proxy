@@ -60,11 +60,13 @@ impl BackendHealth {
     }
 
     /// Check if the backend needs a health check
+    #[must_use]
     pub fn needs_check(&self, interval: Duration) -> bool {
         self.last_check.elapsed() >= interval
     }
 
     /// Get time since last successful health check
+    #[must_use]
     pub fn time_since_healthy(&self) -> Option<Duration> {
         self.last_healthy.map(|t| t.elapsed())
     }

@@ -10,6 +10,24 @@ use super::ValidationError;
 ///
 /// This type ensures at compile time that port numbers are always valid (1-65535).
 /// Port 0 is reserved and cannot be used for actual network communication.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::Port;
+///
+/// let port = Port::new(119).unwrap();
+/// assert_eq!(port.get(), 119);
+///
+/// // Port 0 is invalid
+/// assert!(Port::new(0).is_none());
+///
+/// // Standard NNTP port
+/// let nntp = Port::NNTP;
+/// assert_eq!(nntp.get(), 119);
+/// ```
+#[doc(alias = "port_number")]
+#[doc(alias = "tcp_port")]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Port(NonZeroU16);
 
@@ -25,6 +43,7 @@ impl Port {
 
     /// Get the port number as u16
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> u16 {
         self.0.get()
     }
@@ -79,7 +98,21 @@ impl<'de> Deserialize<'de> for Port {
 
 /// A non-zero maximum connections limit
 ///
-/// Ensures connection pools always have at least 1 connection allowed
+/// Ensures connection pools always have at least 1 connection allowed.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::MaxConnections;
+///
+/// let max = MaxConnections::new(10).unwrap();
+/// assert_eq!(max.get(), 10);
+///
+/// // Zero connections is invalid
+/// assert!(MaxConnections::new(0).is_none());
+/// ```
+#[doc(alias = "pool_size")]
+#[doc(alias = "connection_limit")]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaxConnections(NonZeroUsize);
 
@@ -95,6 +128,7 @@ impl MaxConnections {
 
     /// Get the value as usize
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> usize {
         self.0.get()
     }
@@ -137,6 +171,7 @@ impl<'de> Deserialize<'de> for MaxConnections {
 /// A non-zero cache capacity
 ///
 /// Ensures caches always have at least 1 slot available
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheCapacity(NonZeroUsize);
 
@@ -152,6 +187,7 @@ impl CacheCapacity {
 
     /// Get the value as usize
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> usize {
         self.0.get()
     }
@@ -194,6 +230,7 @@ impl<'de> Deserialize<'de> for CacheCapacity {
 /// A non-zero maximum errors threshold
 ///
 /// Ensures health check thresholds are meaningful (at least 1 error required)
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaxErrors(NonZeroU32);
 
@@ -209,6 +246,7 @@ impl MaxErrors {
 
     /// Get the value as u32
     #[must_use]
+    #[inline]
     pub const fn get(&self) -> u32 {
         self.0.get()
     }
@@ -251,6 +289,7 @@ impl<'de> Deserialize<'de> for MaxErrors {
 /// A non-zero window size for health check tracking
 ///
 /// Ensures health check windows track at least 1 request
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowSize(NonZeroU64);
 
@@ -308,6 +347,7 @@ impl<'de> Deserialize<'de> for WindowSize {
 /// A non-zero buffer size
 ///
 /// Ensures buffers always have at least 1 byte
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferSize(NonZeroUsize);
 

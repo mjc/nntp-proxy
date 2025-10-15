@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Validation errors for string types
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ValidationError {
     #[error("hostname cannot be empty or whitespace")]
     EmptyHostName,
@@ -27,6 +28,20 @@ pub enum ValidationError {
 ///
 /// This type enforces at compile time that a hostname is always valid,
 /// eliminating the need for runtime validation checks.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::HostName;
+///
+/// let host = HostName::new("news.example.com".to_string()).unwrap();
+/// assert_eq!(host.as_str(), "news.example.com");
+///
+/// // Empty strings are rejected
+/// assert!(HostName::new("".to_string()).is_err());
+/// assert!(HostName::new("   ".to_string()).is_err());
+/// ```
+#[doc(alias = "host")]
+#[doc(alias = "domain")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct HostName(String);
@@ -43,13 +58,24 @@ impl HostName {
 
     /// Get the hostname as a string slice
     #[must_use]
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 impl AsRef<str> for HostName {
+    #[inline]
     fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for HostName {
+    type Target = str;
+    
+    #[inline]
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
@@ -95,6 +121,7 @@ impl ServerName {
 
     /// Get the server name as a string slice
     #[must_use]
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -102,6 +129,15 @@ impl ServerName {
 
 impl AsRef<str> for ServerName {
     fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ServerName {
+    type Target = str;
+    
+    #[inline]
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }

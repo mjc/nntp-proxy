@@ -31,6 +31,7 @@ use super::{backend, connection, streaming};
 const SMALL_TRANSFER_THRESHOLD: u64 = 500;
 
 /// Extract message-ID from NNTP command if present
+#[inline]
 fn extract_message_id(command: &str) -> Option<&str> {
     let start = command.find('<')?;
     let end = command[start..].find('>')?;
@@ -371,8 +372,7 @@ impl ClientSession {
         }
 
         // Log session summary for debugging, especially useful for test connections
-        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < SMALL_TRANSFER_THRESHOLD
-        {
+        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < SMALL_TRANSFER_THRESHOLD {
             debug!(
                 "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
                 self.client_addr,

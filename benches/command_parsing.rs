@@ -9,7 +9,7 @@
 //!
 //! Run with: cargo bench --bench command_parsing
 
-use divan::{black_box, Bencher};
+use divan::{Bencher, black_box};
 use nntp_proxy::command::classifier::NntpCommand;
 
 fn main() {
@@ -25,9 +25,7 @@ macro_rules! bench_command {
 
             #[divan::bench(name = "classifier", sample_count = 1000, sample_size = 100)]
             fn classifier(bencher: Bencher) {
-                bencher.bench(|| {
-                    black_box(NntpCommand::classify(black_box($command)))
-                });
+                bencher.bench(|| black_box(NntpCommand::classify(black_box($command))));
             }
         }
     };

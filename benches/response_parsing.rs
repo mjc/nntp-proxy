@@ -1,6 +1,6 @@
 //! Benchmarks for NNTP response parsing optimization
 
-use divan::{black_box, Bencher};
+use divan::{Bencher, black_box};
 
 fn main() {
     divan::main();
@@ -89,22 +89,23 @@ mod terminator_finding {
         let mut pos = 0;
         while let Some(r_pos) = memchr::memchr(b'\r', &data[pos..]) {
             let abs_pos = pos + r_pos;
-            
+
             if abs_pos + 5 > n {
                 return None;
             }
-            
+
             if &data[abs_pos..abs_pos + 5] == b"\r\n.\r\n" {
                 return Some(abs_pos + 5);
             }
-            
+
             pos = abs_pos + 1;
         }
 
         None
     }
 
-    const SMALL_RESPONSE: &[u8] = b"220 0 12345 <msgid@example.com>\r\nArticle content here\r\nMore lines\r\n.\r\n";
+    const SMALL_RESPONSE: &[u8] =
+        b"220 0 12345 <msgid@example.com>\r\nArticle content here\r\nMore lines\r\n.\r\n";
 
     const MEDIUM_RESPONSE: &[u8] = b"220 0 12345 <msgid@example.com>\r\n\
         Header: value\r\n\
@@ -119,29 +120,21 @@ mod terminator_finding {
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn old_small(bencher: Bencher) {
-        bencher.bench(|| {
-            black_box(find_terminator_old(black_box(SMALL_RESPONSE)))
-        });
+        bencher.bench(|| black_box(find_terminator_old(black_box(SMALL_RESPONSE))));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn new_small(bencher: Bencher) {
-        bencher.bench(|| {
-            black_box(find_terminator_new(black_box(SMALL_RESPONSE)))
-        });
+        bencher.bench(|| black_box(find_terminator_new(black_box(SMALL_RESPONSE))));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn old_medium(bencher: Bencher) {
-        bencher.bench(|| {
-            black_box(find_terminator_old(black_box(MEDIUM_RESPONSE)))
-        });
+        bencher.bench(|| black_box(find_terminator_old(black_box(MEDIUM_RESPONSE))));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn new_medium(bencher: Bencher) {
-        bencher.bench(|| {
-            black_box(find_terminator_new(black_box(MEDIUM_RESPONSE)))
-        });
+        bencher.bench(|| black_box(find_terminator_new(black_box(MEDIUM_RESPONSE))));
     }
 }

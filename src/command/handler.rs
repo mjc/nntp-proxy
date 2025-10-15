@@ -8,6 +8,7 @@ use super::classifier::NntpCommand;
 
 /// Action to take in response to a command
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CommandAction {
     /// Intercept and send authentication response to client
     InterceptAuth(AuthAction),
@@ -21,6 +22,7 @@ pub enum CommandAction {
 
 /// Specific authentication action
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AuthAction {
     /// Send password required response
     RequestPassword,

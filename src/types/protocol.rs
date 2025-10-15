@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::{Borrow, Cow};
 use std::fmt;
+use std::str::FromStr;
 
 use super::ValidationError;
 
@@ -20,6 +21,13 @@ use super::ValidationError;
 /// Uses `Cow<'a, str>` to support both zero-copy parsing (borrowed) and owned storage.
 /// - Parser creates `MessageId<'a>` with `Cow::Borrowed` for zero-copy performance
 /// - Cache/storage converts to `MessageId<'static>` with `Cow::Owned` for persistence
+///
+/// # See Also
+/// - [`from_borrowed`](Self::from_borrowed) for zero-copy parsing
+/// - [`extract_from_command`](Self::extract_from_command) for parsing from NNTP commands
+#[doc(alias = "msgid")]
+#[doc(alias = "article_id")]
+#[doc(alias = "message_identifier")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId<'a>(Cow<'a, str>);
 
@@ -63,11 +71,11 @@ impl<'a> MessageId<'a> {
     /// ```
     /// use nntp_proxy::types::MessageId;
     ///
-    /// let msgid = MessageId::from_str("<12345@example.com>").unwrap();
+    /// let msgid = MessageId::from_borrowed("<12345@example.com>").unwrap();
     /// assert_eq!(msgid.as_str(), "<12345@example.com>");
     /// ```
     #[inline]
-    pub fn from_str(s: &'a str) -> Result<Self, ValidationError> {
+    pub fn from_borrowed(s: &'a str) -> Result<Self, ValidationError> {
         if s.len() < 3 {
             return Err(ValidationError::InvalidMessageId(
                 "Message ID too short (minimum 3 characters)".to_string(),
@@ -131,6 +139,7 @@ impl<'a> MessageId<'a> {
 
     /// Get the message ID as a string slice
     #[must_use]
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -145,6 +154,7 @@ impl<'a> MessageId<'a> {
     /// assert_eq!(msgid.without_brackets(), "12345@example.com");
     /// ```
     #[must_use]
+    #[inline]
     pub fn without_brackets(&self) -> &str {
         let s: &str = &self.0;
         &s[1..s.len() - 1]
@@ -173,7 +183,7 @@ impl<'a> MessageId<'a> {
     /// Converts this `MessageId` into an owned `MessageId<'static>`, consuming `self`.
     ///
     /// This method is useful when you need to store a `MessageId` beyond the lifetime of the input string.
-    /// 
+    ///
     /// Consumes `self` and always returns an owned `MessageId<'static>`. If the underlying data is already owned,
     /// this will not allocate, but will still call `into_owned()` on the inner `Cow`.
     pub fn into_owned(self) -> MessageId<'static> {
@@ -189,8 +199,25 @@ impl<'a> MessageId<'a> {
     }
 }
 
+impl FromStr for MessageId<'static> {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MessageId::new(s.to_string())
+    }
+}
+
 impl<'a> AsRef<str> for MessageId<'a> {
     fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'a> std::ops::Deref for MessageId<'a> {
+    type Target = str;
+    
+    #[inline]
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }

@@ -7,6 +7,7 @@ use std::fmt;
 
 /// Errors that can occur during connection management
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConnectionError {
     /// TCP connection failed
     TcpConnect {

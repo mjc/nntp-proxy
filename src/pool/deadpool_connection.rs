@@ -117,10 +117,11 @@ impl TcpManager {
         // Perform TLS handshake if enabled
         if self.tls_config.use_tls {
             // Use cached TLS manager to avoid re-parsing certificates
-            let tls_manager = self.tls_manager.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("TLS enabled but TLS manager not initialized")
-            })?;
-            
+            let tls_manager = self
+                .tls_manager
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("TLS enabled but TLS manager not initialized"))?;
+
             let tls_stream = tls_manager
                 .handshake(tcp_stream, &self.host, &self.name)
                 .await?;

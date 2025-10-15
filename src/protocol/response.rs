@@ -52,29 +52,29 @@ pub enum ResponseCode {
     /// - 200: Posting allowed
     /// - 201: No posting allowed
     Greeting(u16),
-    
+
     /// Disconnect/goodbye - [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4)
     /// - 205: Connection closing
     Disconnect,
-    
+
     /// Authentication required - [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
     /// - 381: Password required
     /// - 480: Authentication required
     AuthRequired(u16),
-    
+
     /// Authentication successful - [RFC 4643 §2.5.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.5.1)
     /// - 281: Authentication accepted
     AuthSuccess,
-    
+
     /// Multiline data response
     /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
     /// - All 1xx codes (100-199)
     /// - Specific 2xx codes: 215, 220, 221, 222, 224, 225, 230, 231, 282
     MultilineData(u16),
-    
+
     /// Single-line response (everything else)
     SingleLine(u16),
-    
+
     /// Invalid or unparseable response
     Invalid,
 }
@@ -96,22 +96,22 @@ impl ResponseCode {
         match code {
             // [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
             200 | 201 => Self::Greeting(code),
-            
+
             // [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4)
             205 => Self::Disconnect,
-            
+
             // [RFC 4643 §2.5.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.5.1)
             281 => Self::AuthSuccess,
-            
+
             // [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
             381 | 480 => Self::AuthRequired(code),
-            
+
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
             // All 1xx are informational multiline
             100..=199 => Self::MultilineData(code),
             // Specific 2xx multiline responses
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
-            
+
             // Everything else is a single-line response
             _ => Self::SingleLine(code),
         }
@@ -254,7 +254,7 @@ impl NntpResponse {
             if r_pos + 5 > n {
                 return None;
             }
-            
+
             // Check for full terminator pattern
             if &data[r_pos..r_pos + 5] == b"\r\n.\r\n" {
                 return Some(r_pos + 5);
@@ -330,7 +330,7 @@ impl NntpResponse {
 
         // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
         // We already know msgid_end is valid since memchr found '>' at that position
-        MessageId::from_str(&trimmed[start..msgid_end]).ok()
+        MessageId::from_borrowed(&trimmed[start..msgid_end]).ok()
     }
 
     /// Validate message-ID format according to [RFC 5536 §3.1.3](https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3)
@@ -391,24 +391,28 @@ pub struct ResponseParser;
 
 impl ResponseParser {
     /// Check if a response starts with a success code (2xx or 3xx)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
         ResponseCode::parse(data).is_success()
     }
 
     /// Check if response is a greeting (200 or 201)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
         matches!(ResponseCode::parse(data), ResponseCode::Greeting(_))
     }
 
     /// Check if response indicates authentication is required (381 or 480)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
         matches!(ResponseCode::parse(data), ResponseCode::AuthRequired(_))
     }
 
     /// Check if response indicates successful authentication (281)
+    #[inline]
     #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
         matches!(ResponseCode::parse(data), ResponseCode::AuthSuccess)
@@ -418,6 +422,7 @@ impl ResponseParser {
     ///
     /// This is useful for checking specific response codes like 111 (DATE response),
     /// or any other specific code that doesn't have a dedicated helper.
+    #[inline]
     pub fn is_response_code(data: &[u8], code: u16) -> bool {
         NntpResponse::parse_status_code(data) == Some(code)
     }
