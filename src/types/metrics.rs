@@ -29,9 +29,16 @@ impl BytesTransferred {
         self.0
     }
 
-    /// Add bytes to the counter
+    /// Add bytes to the counter (for usize values)
+    #[inline]
     pub fn add(&mut self, bytes: usize) {
         self.0 += bytes as u64;
+    }
+
+    /// Add bytes to the counter (for u64 values)
+    #[inline]
+    pub fn add_u64(&mut self, bytes: u64) {
+        self.0 += bytes;
     }
 }
 

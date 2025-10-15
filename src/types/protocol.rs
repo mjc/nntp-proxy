@@ -108,9 +108,10 @@ impl MessageId {
     /// ```
     pub fn extract_from_command(command: &str) -> Option<Self> {
         let start = command.find('<')?;
-        // Search for '>' only after the '<' position
+        // Search for '>' only after the '<' position (end is relative to slice start)
         let end = command[start..].find('>')?;
-        Self::new(command[start..start + end + 1].to_string()).ok()
+        // Include the '>' character: start + end gives position of '>', +1 for exclusive end
+        Self::new(command[start..=start + end].to_string()).ok()
     }
 }
 
