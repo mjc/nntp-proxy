@@ -15,10 +15,11 @@ pub struct CachedArticle {
 
 /// Article cache using LRU eviction with TTL
 ///
-/// Uses MessageId<'static> (owned) for storage since cache must outlive input strings
+/// Uses Arc<str> (message ID content without brackets) as key for zero-allocation lookups.
+/// Arc<str> implements Borrow<str>, allowing cache.get(&str) without allocation.
 #[derive(Clone)]
 pub struct ArticleCache {
-    cache: Arc<Cache<MessageId<'static>, CachedArticle>>,
+    cache: Arc<Cache<Arc<str>, CachedArticle>>,
 }
 
 impl ArticleCache {
@@ -40,25 +41,23 @@ impl ArticleCache {
 
     /// Get an article from the cache
     ///
-    /// Accepts any lifetime MessageId since we only need to borrow it for lookup.
+    /// Accepts any lifetime MessageId and uses the string content (without brackets) as key.
     /// 
-    /// Note: moka::Cache doesn't support borrowed key lookups, so we must convert
-    /// the MessageId to owned form for the lookup. This is a necessary allocation
-    /// but only happens on cache access, not during parsing.
+    /// **Zero-allocation**: Uses `without_brackets()` to get &str for direct lookup.
+    /// This avoids allocating an owned MessageId for every cache access.
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<CachedArticle> {
-        // Convert to owned MessageId for cache lookup
-        // This is necessary because moka::Cache requires owned keys for get()
-        let owned_id = message_id.to_owned();
-        self.cache.get(&owned_id).await
+        // Use without_brackets() to get the ID content as &str
+        // moka::Cache supports &str lookups for String keys (via Borrow<str>)
+        self.cache.get(message_id.without_brackets()).await
     }
 
     /// Store an article in the cache
     ///
-    /// Accepts any lifetime MessageId and converts it to owned for storage
+    /// Accepts any lifetime MessageId and stores using the ID content (without brackets) as key.
     pub async fn insert<'a>(&self, message_id: MessageId<'a>, article: CachedArticle) {
-        // Convert to owned MessageId<'static> for storage
-        let owned_id = message_id.to_owned();
-        self.cache.insert(owned_id, article).await;
+        // Store using the message ID content without brackets as Arc<str>
+        let key: Arc<str> = message_id.without_brackets().into();
+        self.cache.insert(key, article).await;
     }
 
     /// Get cache statistics
