@@ -48,7 +48,6 @@ rustls-native-certs = "0.8"  # Load system CA certificates
 rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
 rustls-pki-types = "1.8"  # PKI types for rustls
 webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
-nom = "8.0.0"
 
 
 [dev-dependencies]
@@ -59,6 +58,10 @@ divan = "0.1"  # Modern benchmarking framework
 
 [[bench]]
 name = "command_parsing"
+harness = false
+
+[[bench]]
+name = "response_parsing"
 harness = false
 
 
