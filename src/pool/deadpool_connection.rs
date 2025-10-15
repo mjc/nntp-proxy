@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use deadpool::managed;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
@@ -14,8 +15,8 @@ use crate::tls::{TlsConfig, TlsManager};
 /// Type alias for the deadpool connection pool
 pub type Pool = managed::Pool<TcpManager>;
 
-/// TCP connection manager for deadpool
-#[derive(Debug)]
+/// TCP connection manager for deadpool with cached TLS config
+#[derive(Debug, Clone)]
 pub struct TcpManager {
     pub(crate) host: String,
     pub(crate) port: u16,
@@ -23,6 +24,8 @@ pub struct TcpManager {
     pub(crate) username: Option<String>,
     pub(crate) password: Option<String>,
     pub(crate) tls_config: TlsConfig,
+    /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
+    pub(crate) tls_manager: Option<Arc<TlsManager>>,
 }
 
 impl TcpManager {
@@ -40,6 +43,7 @@ impl TcpManager {
             username,
             password,
             tls_config: TlsConfig::default(),
+            tls_manager: None,
         }
     }
 
@@ -51,15 +55,23 @@ impl TcpManager {
         username: Option<String>,
         password: Option<String>,
         tls_config: TlsConfig,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        // Pre-initialize TLS manager if TLS is enabled
+        let tls_manager = if tls_config.use_tls {
+            Some(Arc::new(TlsManager::new(tls_config.clone())?))
+        } else {
+            None
+        };
+
+        Ok(Self {
             host,
             port,
             name,
             username,
             password,
             tls_config,
-        }
+            tls_manager,
+        })
     }
 
     /// Create an optimized connection (TCP or TLS)
@@ -104,7 +116,11 @@ impl TcpManager {
 
         // Perform TLS handshake if enabled
         if self.tls_config.use_tls {
-            let tls_manager = TlsManager::new(self.tls_config.clone());
+            // Use cached TLS manager to avoid re-parsing certificates
+            let tls_manager = self.tls_manager.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("TLS enabled but TLS manager not initialized")
+            })?;
+            
             let tls_stream = tls_manager
                 .handshake(tcp_stream, &self.host, &self.name)
                 .await?;

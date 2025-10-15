@@ -107,39 +107,74 @@ impl ServerCertVerifier for NoVerifier {
     }
 }
 
-/// High-performance TLS connector with optimized configuration
+/// High-performance TLS connector with cached configuration
+///
+/// Caches the parsed TLS configuration including certificates to avoid
+/// expensive re-parsing on every connection. Certificates are loaded once
+/// during initialization and reused for all connections.
 pub struct TlsManager {
     config: TlsConfig,
+    /// Cached TLS connector with pre-loaded certificates (avoids base64 decode overhead)
+    cached_connector: Arc<TlsConnector>,
+}
+
+impl std::fmt::Debug for TlsManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsManager")
+            .field("config", &self.config)
+            .field("cached_connector", &"<TlsConnector>")
+            .finish()
+    }
+}
+
+impl Clone for TlsManager {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            cached_connector: Arc::clone(&self.cached_connector),
+        }
+    }
 }
 
 impl TlsManager {
     /// Create a new TLS manager with the given configuration
-    pub fn new(config: TlsConfig) -> Self {
-        Self { config }
+    ///
+    /// **Performance**: Loads and parses certificates once during initialization
+    /// instead of on every connection, eliminating base64 decode overhead.
+    pub fn new(config: TlsConfig) -> Result<Self, anyhow::Error> {
+        // Load certificates once during initialization
+        let cert_result = Self::load_certificates_sync(&config)?;
+        let client_config = Self::create_optimized_config_inner(cert_result.root_store, &config)?;
+
+        debug!(
+            "TLS: Initialized with certificate sources: {}",
+            cert_result.sources.join(", ")
+        );
+
+        let cached_connector = Arc::new(TlsConnector::from(Arc::new(client_config)));
+
+        Ok(Self {
+            config,
+            cached_connector,
+        })
     }
 
     /// Perform TLS handshake with optimizations for maximum performance
+    ///
+    /// **Performance**: Uses pre-loaded certificates from cache, no parsing overhead.
     pub async fn handshake(
         &self,
         stream: TcpStream,
         hostname: &str,
         backend_name: &str,
     ) -> Result<TlsStream<TcpStream>, anyhow::Error> {
-        let cert_result = self.load_certificates().await?;
-        let client_config = self.create_optimized_config(cert_result.root_store)?;
-
-        debug!(
-            "TLS: Certificate sources: {}",
-            cert_result.sources.join(", ")
-        );
-
-        let connector = TlsConnector::from(Arc::new(client_config));
         let domain = rustls_pki_types::ServerName::try_from(hostname)
             .map_err(|e| anyhow::anyhow!("Invalid hostname for TLS: {}", e))?
             .to_owned();
 
-        debug!("TLS: Connecting to {} with rustls", hostname);
-        connector.connect(domain, stream).await.map_err(|e| {
+        debug!("TLS: Connecting to {} with cached config", hostname);
+        
+        self.cached_connector.connect(domain, stream).await.map_err(|e| {
             ConnectionError::TlsHandshake {
                 backend: backend_name.to_string(),
                 source: Box::new(e),
@@ -148,20 +183,20 @@ impl TlsManager {
         })
     }
 
-    /// Load certificates from various sources with fallback chain
-    async fn load_certificates(&self) -> Result<CertificateLoadResult, anyhow::Error> {
+    /// Load certificates from various sources with fallback chain (synchronous for init)
+    fn load_certificates_sync(config: &TlsConfig) -> Result<CertificateLoadResult, anyhow::Error> {
         let mut root_store = RootCertStore::empty();
         let mut sources = Vec::new();
 
         // 1. Load custom CA certificate if provided
-        if let Some(cert_path) = &self.config.tls_cert_path {
+        if let Some(cert_path) = &config.tls_cert_path {
             debug!("TLS: Loading custom CA certificate from: {}", cert_path);
-            self.load_custom_certificate(&mut root_store, cert_path)?;
+            Self::load_custom_certificate_sync(&mut root_store, cert_path)?;
             sources.push("custom certificate".to_string());
         }
 
         // 2. Try to load system certificates
-        let system_count = self.load_system_certificates(&mut root_store)?;
+        let system_count = Self::load_system_certificates_sync(&mut root_store)?;
         if system_count > 0 {
             debug!(
                 "TLS: Loaded {} certificates from system store",
@@ -184,8 +219,7 @@ impl TlsManager {
     }
 
     /// Load custom certificate from file
-    fn load_custom_certificate(
-        &self,
+    fn load_custom_certificate_sync(
         root_store: &mut RootCertStore,
         cert_path: &str,
     ) -> Result<(), anyhow::Error> {
@@ -207,8 +241,7 @@ impl TlsManager {
     }
 
     /// Load system certificates, returning count of successfully loaded certificates
-    fn load_system_certificates(
-        &self,
+    fn load_system_certificates_sync(
         root_store: &mut RootCertStore,
     ) -> Result<usize, anyhow::Error> {
         let cert_result = rustls_native_certs::load_native_certs();
@@ -229,11 +262,11 @@ impl TlsManager {
     }
 
     /// Create optimized client configuration using ring crypto provider
-    fn create_optimized_config(
-        &self,
+    fn create_optimized_config_inner(
         root_store: RootCertStore,
+        config: &TlsConfig,
     ) -> Result<ClientConfig, anyhow::Error> {
-        let mut config = if self.config.tls_verify_cert {
+        let mut client_config = if config.tls_verify_cert {
             debug!("TLS: Certificate verification enabled with ring crypto provider");
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
@@ -258,10 +291,10 @@ impl TlsManager {
         };
 
         // Performance optimizations
-        config.enable_early_data = true; // Enable TLS 1.3 0-RTT for faster reconnections
-        config.resumption = rustls::client::Resumption::default(); // Enable session resumption
+        client_config.enable_early_data = true; // Enable TLS 1.3 0-RTT for faster reconnections
+        client_config.resumption = rustls::client::Resumption::default(); // Enable session resumption
 
-        Ok(config)
+        Ok(client_config)
     }
 }
 
@@ -280,15 +313,16 @@ mod tests {
     #[test]
     fn test_tls_manager_creation() {
         let config = TlsConfig::default();
-        let _manager = TlsManager::new(config);
+        let manager = TlsManager::new(config).unwrap();
+        // Manager should successfully initialize with cached config
+        assert!(Arc::strong_count(&manager.cached_connector) >= 1);
     }
 
-    #[tokio::test]
-    async fn test_certificate_loading() {
+    #[test]
+    fn test_certificate_loading() {
         let config = TlsConfig::default();
-        let manager = TlsManager::new(config);
-
-        let result = manager.load_certificates().await.unwrap();
+        
+        let result = TlsManager::load_certificates_sync(&config).unwrap();
         assert!(!result.root_store.is_empty());
         // Should have at least one source (system certificates or Mozilla CA bundle)
         assert!(!result.sources.is_empty());
