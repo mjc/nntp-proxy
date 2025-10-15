@@ -39,7 +39,7 @@ impl NntpProxy {
         }
 
         // Create deadpool connection providers for each server
-        let connection_providers: Vec<DeadpoolConnectionProvider> = config
+        let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = config
             .servers
             .iter()
             .map(|server| {
@@ -50,6 +50,8 @@ impl NntpProxy {
                 DeadpoolConnectionProvider::from_server_config(server)
             })
             .collect();
+        
+        let connection_providers = connection_providers?;
 
         let buffer_pool = BufferPool::new(
             BufferSize::new(BUFFER_SIZE).expect("BUFFER_SIZE is non-zero"),

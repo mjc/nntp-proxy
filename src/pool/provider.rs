@@ -69,27 +69,27 @@ impl DeadpoolConnectionProvider {
         username: Option<String>,
         password: Option<String>,
         tls_config: TlsConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         let manager =
-            TcpManager::new_with_tls(host, port, name.clone(), username, password, tls_config);
+            TcpManager::new_with_tls(host, port, name.clone(), username, password, tls_config)?;
         let pool = Pool::builder(manager)
             .max_size(max_size)
             .build()
             .expect("Failed to create connection pool");
 
-        Self {
+        Ok(Self {
             pool,
             name,
             keepalive_interval: None,
             shutdown_tx: None,
             health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
-        }
+        })
     }
 
     /// Create a connection provider from a server configuration
     ///
     /// This avoids unnecessary cloning of individual fields.
-    pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+    pub fn from_server_config(server: &crate::config::ServerConfig) -> Result<Self> {
         let tls_config = TlsConfig {
             use_tls: server.use_tls,
             tls_verify_cert: server.tls_verify_cert,
@@ -103,7 +103,7 @@ impl DeadpoolConnectionProvider {
             server.username.clone(),
             server.password.clone(),
             tls_config,
-        );
+        )?;
         let pool = Pool::builder(manager)
             .max_size(server.max_connections.get())
             .build()
@@ -136,13 +136,13 @@ impl DeadpoolConnectionProvider {
             None
         };
 
-        Self {
+        Ok(Self {
             pool,
             name: server.name.as_str().to_string(),
             keepalive_interval,
             shutdown_tx,
             health_check_metrics: metrics,
-        }
+        })
     }
 
     /// Get a connection from the pool (automatically returned when dropped)

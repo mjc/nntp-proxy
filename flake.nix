@@ -101,6 +101,8 @@
           echo ""
         '';
 
+        GH_PAGER = "cat";
+
         # Environment variables for building with OpenSSL
         OPENSSL_DIR = "${pkgs.openssl.dev}";
         OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";

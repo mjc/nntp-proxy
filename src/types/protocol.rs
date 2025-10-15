@@ -1,7 +1,7 @@
 //! Protocol-related type-safe wrappers for NNTP primitives
 
 use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt;
 
 use super::ValidationError;
@@ -15,11 +15,16 @@ use super::ValidationError;
 /// - Must start with '<' and end with '>'
 /// - Cannot be empty (must contain at least 3 characters: `<x>`)
 /// - Example: `<12345@example.com>`
+///
+/// # Performance
+/// Uses `Cow<'a, str>` to support both zero-copy parsing (borrowed) and owned storage.
+/// - Parser creates `MessageId<'a>` with `Cow::Borrowed` for zero-copy performance
+/// - Cache/storage converts to `MessageId<'static>` with `Cow::Owned` for persistence
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MessageId(String);
+pub struct MessageId<'a>(Cow<'a, str>);
 
-impl MessageId {
-    /// Create a new MessageId from a string, validating the format
+impl<'a> MessageId<'a> {
+    /// Create a new owned MessageId from a String, validating the format
     ///
     /// # Examples
     /// ```
@@ -42,10 +47,60 @@ impl MessageId {
                 "Message ID must be enclosed in angle brackets".to_string(),
             ));
         }
-        Ok(Self(s))
+        Ok(Self(Cow::Owned(s)))
     }
 
-    /// Create a MessageId from a string, automatically adding angle brackets if needed
+    /// Create a borrowed MessageId from a string slice, validating the format (zero-copy).
+    ///
+    /// This is the fastest way to create a MessageId when you have a borrowed string.
+    /// No allocation occurs - the MessageId borrows from the input.
+    ///
+    /// # Performance
+    /// **Zero-copy**: This method does NOT allocate. The returned MessageId borrows from `s`.
+    /// Use this in parsers for maximum performance.
+    ///
+    /// # Examples
+    /// ```
+    /// use nntp_proxy::types::MessageId;
+    ///
+    /// let msgid = MessageId::from_str("<12345@example.com>").unwrap();
+    /// assert_eq!(msgid.as_str(), "<12345@example.com>");
+    /// ```
+    #[inline]
+    pub fn from_str(s: &'a str) -> Result<Self, ValidationError> {
+        if s.len() < 3 {
+            return Err(ValidationError::InvalidMessageId(
+                "Message ID too short (minimum 3 characters)".to_string(),
+            ));
+        }
+        if !s.starts_with('<') || !s.ends_with('>') {
+            return Err(ValidationError::InvalidMessageId(
+                "Message ID must be enclosed in angle brackets".to_string(),
+            ));
+        }
+        Ok(Self(Cow::Borrowed(s)))
+    }
+
+    /// Create a borrowed MessageId from a pre-validated string slice (zero-copy, unchecked).
+    ///
+    /// # Safety
+    /// The caller MUST ensure that:
+    /// - `s.len() >= 3`
+    /// - `s.starts_with('<')`
+    /// - `s.ends_with('>')`
+    ///
+    /// This is used by the parser after it has already validated these conditions
+    /// to avoid redundant checks.
+    ///
+    /// # Performance
+    /// **Zero-copy**: This is the absolute fastest way to create a MessageId.
+    /// No allocation, no validation overhead.
+    #[inline(always)]
+    pub unsafe fn from_str_unchecked(s: &'a str) -> Self {
+        Self(Cow::Borrowed(s))
+    }
+
+    /// Create an owned MessageId from a string, automatically adding angle brackets if needed
     ///
     /// # Examples
     /// ```
@@ -57,7 +112,7 @@ impl MessageId {
     /// let msgid2 = MessageId::from_str_or_wrap("<12345@example.com>").unwrap();
     /// assert_eq!(msgid2.as_str(), "<12345@example.com>");
     /// ```
-    pub fn from_str_or_wrap(s: impl AsRef<str>) -> Result<Self, ValidationError> {
+    pub fn from_str_or_wrap(s: impl AsRef<str>) -> Result<MessageId<'static>, ValidationError> {
         let s = s.as_ref();
         if s.is_empty() {
             return Err(ValidationError::InvalidMessageId(
@@ -71,7 +126,7 @@ impl MessageId {
             format!("<{}>", s)
         };
 
-        Self::new(wrapped)
+        MessageId::new(wrapped)
     }
 
     /// Get the message ID as a string slice
@@ -91,10 +146,11 @@ impl MessageId {
     /// ```
     #[must_use]
     pub fn without_brackets(&self) -> &str {
-        &self.0[1..self.0.len() - 1]
+        let s: &str = &self.0;
+        &s[1..s.len() - 1]
     }
 
-    /// Extract a message ID from an NNTP command line
+    /// Extract a message ID from an NNTP command line (returns owned MessageId)
     ///
     /// Looks for a message ID (text enclosed in angle brackets) in the command.
     /// Ensures '<' comes before '>' to form a proper pair.
@@ -106,48 +162,66 @@ impl MessageId {
     /// let msgid = MessageId::extract_from_command("ARTICLE <12345@example.com>").unwrap();
     /// assert_eq!(msgid.as_str(), "<12345@example.com>");
     /// ```
-    pub fn extract_from_command(command: &str) -> Option<Self> {
+    pub fn extract_from_command(command: &str) -> Option<MessageId<'static>> {
         let start = command.find('<')?;
         // Search for '>' only after the '<' position (end is relative to slice start)
         let end = command[start..].find('>')?;
         // Include the '>' character: start + end gives position of '>', +1 for exclusive end
-        Self::new(command[start..=start + end].to_string()).ok()
+        MessageId::new(command[start..=start + end].to_string()).ok()
+    }
+
+    /// Converts this `MessageId` into an owned `MessageId<'static>`, consuming `self`.
+    ///
+    /// This method is useful when you need to store a `MessageId` beyond the lifetime of the input string.
+    /// 
+    /// Consumes `self` and always returns an owned `MessageId<'static>`. If the underlying data is already owned,
+    /// this will not allocate, but will still call `into_owned()` on the inner `Cow`.
+    pub fn into_owned(self) -> MessageId<'static> {
+        MessageId(Cow::Owned(self.0.into_owned()))
+    }
+
+    /// Creates an owned `MessageId<'static>` by cloning the data if necessary.
+    ///
+    /// This method borrows `self` and returns an owned `MessageId<'static>`. If the underlying data is already owned,
+    /// this is a cheap clone. Otherwise, it allocates and copies the data.
+    pub fn to_owned(&self) -> MessageId<'static> {
+        MessageId(Cow::Owned(self.0.clone().into_owned()))
     }
 }
 
-impl AsRef<str> for MessageId {
+impl<'a> AsRef<str> for MessageId<'a> {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-impl Borrow<str> for MessageId {
+impl<'a> Borrow<str> for MessageId<'a> {
     fn borrow(&self) -> &str {
         &self.0
     }
 }
 
-impl fmt::Display for MessageId {
+impl<'a> fmt::Display for MessageId<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl TryFrom<String> for MessageId {
+impl TryFrom<String> for MessageId<'static> {
     type Error = ValidationError;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::new(s)
+        MessageId::new(s)
     }
 }
 
-impl From<MessageId> for String {
-    fn from(msgid: MessageId) -> Self {
-        msgid.0
+impl<'a> From<MessageId<'a>> for String {
+    fn from(msgid: MessageId<'a>) -> Self {
+        msgid.0.into_owned()
     }
 }
 
-impl Serialize for MessageId {
+impl<'a> Serialize for MessageId<'a> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -156,13 +230,13 @@ impl Serialize for MessageId {
     }
 }
 
-impl<'de> Deserialize<'de> for MessageId {
+impl<'de> Deserialize<'de> for MessageId<'static> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Self::new(s).map_err(serde::de::Error::custom)
+        MessageId::new(s).map_err(serde::de::Error::custom)
     }
 }
 

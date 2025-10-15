@@ -14,9 +14,12 @@ pub struct CachedArticle {
 }
 
 /// Article cache using LRU eviction with TTL
+///
+/// Uses Arc<str> (message ID content without brackets) as key for zero-allocation lookups.
+/// Arc<str> implements Borrow<str>, allowing cache.get(&str) without allocation.
 #[derive(Clone)]
 pub struct ArticleCache {
-    cache: Arc<Cache<MessageId, CachedArticle>>,
+    cache: Arc<Cache<Arc<str>, CachedArticle>>,
 }
 
 impl ArticleCache {
@@ -37,13 +40,25 @@ impl ArticleCache {
     }
 
     /// Get an article from the cache
-    pub async fn get(&self, message_id: &MessageId) -> Option<CachedArticle> {
-        self.cache.get(message_id).await
+    ///
+    /// Accepts any lifetime MessageId and uses the string content (without brackets) as key.
+    /// 
+    /// **Zero-allocation**: `without_brackets()` returns `&str`, which moka accepts directly
+    /// for `Arc<str>` keys via the `Borrow<str>` trait. This avoids allocating a new `Arc<str>`
+    /// for every cache lookup. See `test_arc_str_borrow_lookup` test for verification.
+    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<CachedArticle> {
+        // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
+        // This is zero-allocation: no Arc<str> is created for the lookup
+        self.cache.get(message_id.without_brackets()).await
     }
 
     /// Store an article in the cache
-    pub async fn insert(&self, message_id: MessageId, article: CachedArticle) {
-        self.cache.insert(message_id, article).await;
+    ///
+    /// Accepts any lifetime MessageId and stores using the ID content (without brackets) as key.
+    pub async fn insert<'a>(&self, message_id: MessageId<'a>, article: CachedArticle) {
+        // Store using the message ID content without brackets as Arc<str>
+        let key: Arc<str> = message_id.without_brackets().into();
+        self.cache.insert(key, article).await;
     }
 
     /// Get cache statistics
@@ -60,4 +75,47 @@ impl ArticleCache {
 pub struct CacheStats {
     pub entry_count: u64,
     pub weighted_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MessageId;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_arc_str_borrow_lookup() {
+        // Create cache with Arc<str> keys
+        let cache = ArticleCache::new(100, Duration::from_secs(300));
+
+        // Create a MessageId and insert an article
+        let msgid = MessageId::from_str("<test123@example.com>").unwrap();
+        let article = CachedArticle {
+            response: Arc::new(b"220 0 0 <test123@example.com>\r\ntest body\r\n.\r\n".to_vec()),
+        };
+        
+        cache.insert(msgid.clone(), article.clone()).await;
+
+        // Verify we can retrieve using a different MessageId instance (borrowed)
+        // This demonstrates that Arc<str> supports Borrow<str> lookups via &str
+        let msgid2 = MessageId::from_str("<test123@example.com>").unwrap();
+        let retrieved = cache.get(&msgid2).await;
+        
+        assert!(retrieved.is_some(), "Arc<str> cache should support Borrow<str> lookups");
+        assert_eq!(
+            retrieved.unwrap().response.as_ref(),
+            article.response.as_ref(),
+            "Retrieved article should match inserted article"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_miss() {
+        let cache = ArticleCache::new(100, Duration::from_secs(300));
+        
+        let msgid = MessageId::from_str("<nonexistent@example.com>").unwrap();
+        let result = cache.get(&msgid).await;
+        
+        assert!(result.is_none(), "Cache lookup for non-existent key should return None");
+    }
 }
