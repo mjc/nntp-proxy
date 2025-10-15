@@ -9,9 +9,11 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 mod commands;
+mod parser;
 mod response;
 mod responses;
 
+pub use parser::{parse_command, ArticleRange, ArticleSpec, AuthInfo, Command, ListGroupSpec};
 pub use response::ResponseParser;
 
 // Re-export for future use
