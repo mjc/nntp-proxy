@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-use crate::constants::buffer::STREAMING_CHUNK_SIZE;
+use crate::constants::buffer::STREAM_CHUNK;
 
 mod tail_buffer;
 use tail_buffer::TailBuffer;
@@ -81,7 +81,7 @@ async fn drain_until_terminator<R>(
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
+    let mut chunk = vec![0u8; STREAM_CHUNK];
     let mut tail = TailBuffer::default();
     tail.update(initial_tail);
     loop {
@@ -124,8 +124,8 @@ where
     let mut total_bytes = 0u64;
     // Prepare double buffering for pipelined streaming
     let mut buffers = [
-        vec![0u8; STREAMING_CHUNK_SIZE].into_boxed_slice(),
-        vec![0u8; STREAMING_CHUNK_SIZE].into_boxed_slice(),
+        vec![0u8; STREAM_CHUNK].into_boxed_slice(),
+        vec![0u8; STREAM_CHUNK].into_boxed_slice(),
     ];
     let mut current_idx = 0;
     // Copy first chunk into buffer

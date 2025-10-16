@@ -7,7 +7,7 @@ use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-use crate::constants::buffer::STREAMING_CHUNK_SIZE;
+use crate::constants::buffer::STREAM_CHUNK;
 use crate::protocol::{MIN_RESPONSE_LENGTH, ResponseCode};
 use crate::types::BackendId;
 
@@ -45,7 +45,7 @@ where
         client_addr, backend_id
     );
 
-    let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
+    let mut chunk = vec![0u8; STREAM_CHUNK];
     let n = backend_conn.read(&mut chunk).await?;
 
     if n == 0 {

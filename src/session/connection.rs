@@ -6,7 +6,7 @@ use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, warn};
 
-use crate::constants::buffer::COMMAND_SIZE;
+use crate::constants::buffer::COMMAND;
 use crate::pool::BufferPool;
 use crate::types::{BytesTransferred, TransferMetrics};
 
@@ -44,7 +44,7 @@ where
 
     let buffer_c2b = buffer_pool.get_buffer().await;
     let mut buffer_b2c = buffer_pool.get_buffer().await;
-    let mut command = String::with_capacity(COMMAND_SIZE);
+    let mut command = String::with_capacity(COMMAND);
 
     let mut c2b = client_to_backend_bytes;
     let mut b2c = backend_to_client_bytes;

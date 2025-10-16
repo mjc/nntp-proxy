@@ -16,12 +16,11 @@ use tracing::{debug, error, info, warn};
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
-use crate::constants::buffer::COMMAND_SIZE;
+use crate::constants::buffer::COMMAND;
 use crate::protocol::{
     BACKEND_ERROR, COMMAND_NOT_SUPPORTED_STATELESS, CONNECTION_CLOSING, PROXY_GREETING_PCR,
 };
 use crate::router::BackendSelector;
-use crate::streaming::StreamHandler;
 use crate::types::{BytesTransferred, TransferMetrics};
 
 use super::{backend, connection, streaming};
@@ -59,7 +58,7 @@ impl ClientSession {
         let mut backend_to_client_bytes = 0u64;
 
         // Reuse line buffer to avoid per-iteration allocations
-        let mut line = String::with_capacity(COMMAND_SIZE);
+        let mut line = String::with_capacity(COMMAND);
 
         debug!("Client {} session loop starting", self.client_addr);
 
@@ -97,25 +96,6 @@ impl ClientSession {
                                     warn!("Rejecting command from client {}: {}", self.client_addr, trimmed);
                                     client_write.write_all(COMMAND_NOT_SUPPORTED_STATELESS).await?;
                                     backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
-                                }
-                                CommandAction::ForwardHighThroughput => {
-                                    // Forward article retrieval by message-ID to backend
-                                    backend_write.write_all(line.as_bytes()).await?;
-                                    client_to_backend_bytes += line.len() as u64;
-                                    debug!("Client {} switching to high-throughput mode", self.client_addr);
-
-                                    // Return the buffer before transitioning
-                                    self.buffer_pool.return_buffer(buffer).await;
-
-                                    // For high-throughput data transfer, use optimized handler
-                                    return StreamHandler::high_throughput_transfer(
-                                        client_reader,
-                                        client_write,
-                                        backend_read,
-                                        backend_write,
-                                        client_to_backend_bytes,
-                                        backend_to_client_bytes,
-                                    ).await;
                                 }
                                 CommandAction::ForwardStateless => {
                                     // Forward stateless commands to backend
@@ -208,7 +188,7 @@ impl ClientSession {
         );
 
         // Reuse command buffer to avoid allocations per command
-        let mut command = String::with_capacity(COMMAND_SIZE);
+        let mut command = String::with_capacity(COMMAND);
 
         // Process commands one at a time
         loop {
@@ -288,7 +268,7 @@ impl ClientSession {
                                 .await?;
                             backend_to_client_bytes.add(COMMAND_NOT_SUPPORTED_STATELESS.len());
                         }
-                        CommandAction::ForwardStateless | CommandAction::ForwardHighThroughput => {
+                        CommandAction::ForwardStateless => {
                             // Route this command to a backend
                             match self
                                 .route_and_execute_command(

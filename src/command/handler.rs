@@ -16,8 +16,6 @@ pub enum CommandAction {
     Reject(&'static str),
     /// Forward the command to backend (stateless)
     ForwardStateless,
-    /// Forward the command and switch to high-throughput mode (article by message-ID)
-    ForwardHighThroughput,
 }
 
 /// Specific authentication action
@@ -45,7 +43,7 @@ impl CommandHandler {
             NntpCommand::NonRoutable => CommandAction::Reject(
                 "Command not supported by this proxy (per-command routing mode)",
             ),
-            NntpCommand::ArticleByMessageId => CommandAction::ForwardHighThroughput,
+            NntpCommand::ArticleByMessageId => CommandAction::ForwardStateless,
             NntpCommand::Stateless => CommandAction::ForwardStateless,
         }
     }
@@ -82,7 +80,7 @@ mod tests {
     #[test]
     fn test_article_by_message_id() {
         let action = CommandHandler::handle_command("ARTICLE <test@example.com>");
-        assert_eq!(action, CommandAction::ForwardHighThroughput);
+        assert_eq!(action, CommandAction::ForwardStateless);
     }
 
     #[test]
@@ -120,8 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn test_all_article_by_msgid_as_high_throughput() {
-        // All message-ID based article commands should be high-throughput
+    fn test_all_article_by_msgid_forwarded() {
+        // All message-ID based article commands should be forwarded as stateless
         let msgid_commands = vec![
             "ARTICLE <test@example.com>",
             "BODY <msg@server.org>",
@@ -132,8 +130,8 @@ mod tests {
         for cmd in msgid_commands {
             assert_eq!(
                 CommandHandler::handle_command(cmd),
-                CommandAction::ForwardHighThroughput,
-                "Command '{}' should be high-throughput",
+                CommandAction::ForwardStateless,
+                "Command '{}' should be forwarded as stateless",
                 cmd
             );
         }
@@ -232,7 +230,7 @@ mod tests {
     fn test_article_commands_with_newlines() {
         // Command with CRLF
         let action = CommandHandler::handle_command("ARTICLE <msg@test.com>\r\n");
-        assert_eq!(action, CommandAction::ForwardHighThroughput);
+        assert_eq!(action, CommandAction::ForwardStateless);
 
         // Command with just LF
         let action = CommandHandler::handle_command("LIST\n");
@@ -262,19 +260,11 @@ mod tests {
             CommandAction::ForwardStateless
         );
         assert_eq!(
-            CommandAction::ForwardHighThroughput,
-            CommandAction::ForwardHighThroughput
-        );
-        assert_eq!(
             CommandAction::InterceptAuth(AuthAction::RequestPassword),
             CommandAction::InterceptAuth(AuthAction::RequestPassword)
         );
 
         // Test inequality
-        assert_ne!(
-            CommandAction::ForwardStateless,
-            CommandAction::ForwardHighThroughput
-        );
         assert_ne!(
             CommandAction::InterceptAuth(AuthAction::RequestPassword),
             CommandAction::InterceptAuth(AuthAction::AcceptAuth)

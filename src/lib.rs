@@ -39,7 +39,6 @@ pub mod network;
 pub mod protocol;
 mod proxy;
 pub mod stream;
-mod streaming;
 
 // Public modules for integration tests
 pub mod cache;
