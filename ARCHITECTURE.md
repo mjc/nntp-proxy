@@ -206,21 +206,19 @@ command/classifier/
 └── capabilities.rs     # CAPABILITIES, HELP, DATE, etc.
 ```
 
-#### C. `types/config.rs` (849 lines)
-**Current:** All config newtypes in one file  
-**Issues:**
-- Multiple unrelated types mixed together
-- Serde implementations make it verbose
-- Hard to find specific types
+#### C. `types/config.rs` ✓ (Completed - Split into 849 → ~400 lines total)
+**Status:** DONE - Split into focused submodules  
+**Result:** Cleaner organization, easier navigation
 
-**Recommendation:** Split into:
+**Implemented structure:**
 ```
 types/config/
-├── mod.rs              # Re-exports
-├── limits.rs           # MaxConnections, MaxErrors, etc.
-├── network.rs          # Port, BufferSize, WindowSize
-├── cache.rs            # CacheCapacity
-└── duration.rs         # Duration serialization helpers
+├── mod.rs              # Re-exports and tests (414 lines)
+├── network.rs          # Port (97 lines)
+├── limits.rs           # MaxConnections, MaxErrors (142 lines)
+├── buffer.rs           # BufferSize, WindowSize (134 lines)
+├── cache.rs            # CacheCapacity (66 lines)
+└── duration.rs         # Duration serialization helpers (53 lines)
 ```
 
 #### D. `session/handlers.rs` (754 lines)
