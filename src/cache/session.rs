@@ -38,11 +38,11 @@ impl CachingSession {
         let (client_read, mut client_write) = client_stream.split();
         let (backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::new(client_read);
-        let mut backend_reader = BufReader::with_capacity(buffer::MEDIUM_BUFFER_SIZE, backend_read);
+        let mut backend_reader = BufReader::with_capacity(buffer::POOL, backend_read);
 
         let mut client_to_backend_bytes = 0u64;
         let mut backend_to_client_bytes = 0u64;
-        let mut line = String::with_capacity(buffer::COMMAND_SIZE);
+        let mut line = String::with_capacity(buffer::COMMAND);
         // Pre-allocate with typical NNTP response line size (most are < 512 bytes)
         // Reduces reallocations during line reading
         let mut first_line = Vec::with_capacity(512);
@@ -95,57 +95,7 @@ impl CachingSession {
                                     backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
                                 }
                                 CommandAction::ForwardStateless => {
-                                    // Forward stateless commands to backend
-                                    backend_write.write_all(line.as_bytes()).await?;
-                                    client_to_backend_bytes += line.len() as u64;
-
-                                    // Read response using read_until for efficiency
-                                    first_line.clear();
-                                    backend_reader.read_until(b'\n', &mut first_line).await?;
-
-                                    if first_line.is_empty() {
-                                        debug!("Backend {} closed connection", self.client_addr);
-                                        break;
-                                    }
-
-                                    // Use mem::take to transfer ownership from first_line to response_buffer
-                                    // More idiomatic than swap - explicitly shows we're taking the value and leaving default
-                                    let mut response_buffer = std::mem::take(&mut first_line);
-
-                                    // Check for backend disconnect (205 status)
-                                    if NntpResponse::is_disconnect(&response_buffer) {
-                                        debug!("Backend {} sent disconnect: {}", self.client_addr, String::from_utf8_lossy(&response_buffer));
-                                        client_write.write_all(&response_buffer).await?;
-                                        backend_to_client_bytes += response_buffer.len() as u64;
-                                        break;
-                                    }
-
-                                    // Parse response code once and reuse it
-                                    let response_code = ResponseCode::parse(&response_buffer);
-                                    let is_multiline = response_code.is_multiline();
-
-                                    if is_multiline {
-                                        loop {
-                                            let start_pos = response_buffer.len();
-                                            backend_reader.read_until(b'\n', &mut response_buffer).await?;
-
-                                            if response_buffer.len() == start_pos {
-                                                break;
-                                            }
-
-                                            // Check for end marker by examining just the new data
-                                            let new_data = &response_buffer[start_pos..];
-                                            if new_data == b".\r\n" || new_data == b".\n" {
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    client_write.write_all(&response_buffer).await?;
-                                    backend_to_client_bytes += response_buffer.len() as u64;
-                                }
-                                CommandAction::ForwardHighThroughput => {
-                                    // Forward to backend
+                                    // Forward commands to backend
                                     backend_write.write_all(line.as_bytes()).await?;
                                     client_to_backend_bytes += line.len() as u64;
 
