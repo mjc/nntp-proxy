@@ -356,17 +356,21 @@ types/
 - Use `pub(crate)` more aggressively
 - Consider sealed traits for extension points
 
-**B. Missing Builder Patterns**
-- Complex types constructed directly
-- No validation at construction time
+**B. Builder Patterns ✓ (Implemented)**
+- ✅ `NntpProxyBuilder` with fluent API
+- ✅ Optional configuration overrides (buffer pool size/count)
+- ✅ Backward compatibility maintained (`NntpProxy::new()` still works)
 
-**Recommendation:** Add builders for complex types:
+**Implemented API:**
 ```rust
-ProxyBuilder::new()
-    .with_config(config)
+NntpProxy::builder(config)
     .with_routing_mode(RoutingMode::Hybrid)
+    .with_buffer_pool_size(512 * 1024)
+    .with_buffer_pool_count(64)
     .build()?
 ```
+
+**Future consideration:** Config builder for validation at construction time
 
 ### 6. 🔧 Code Quality
 
