@@ -6,40 +6,41 @@
 use std::time::Duration;
 
 /// Buffer size constants
+///
+/// All buffer sizes are carefully chosen for NNTP workloads:
+/// - Commands are small (< 512 bytes)
+/// - Articles range from 1KB to 100KB typically
+/// - Pooled buffers (256KB) handle most articles in one read
 pub mod buffer {
-    /// Default buffer size for general I/O operations
-    pub const DEFAULT_SIZE: usize = 8192;
-
-    /// Large buffer size for high-throughput reading (4MB)
-    /// Used for BufReader when reading large responses
-    /// Covers most Usenet articles in a single buffer
-    pub const LARGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-
-    /// Medium buffer size for pooled connections (256KB)
-    /// Balances performance with memory usage when many connections are active
-    pub const MEDIUM_BUFFER_SIZE: usize = 256 * 1024;
-
-    /// Buffer size for reading commands from clients
-    pub const COMMAND_SIZE: usize = 512;
-
-    /// Maximum size for a single response (prevents memory exhaustion)
-    pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
-
-    /// Initial capacity for response accumulation buffers
-    pub const RESPONSE_INITIAL_CAPACITY: usize = 8192;
-
-    /// Buffer size for high throughput operations (256KB)
-    /// Used by BufferPool for pooled buffers
-    pub const BUFFER_SIZE: usize = 256 * 1024;
-
+    // Buffer pool configuration
+    
+    /// Size of each pooled buffer (256KB)
+    /// Large enough to handle most Usenet articles in a single read
+    pub const POOL: usize = 256 * 1024;
+    
     /// Number of buffers in the buffer pool
-    pub const BUFFER_POOL_SIZE: usize = 32;
-
-    /// Buffer size for direct allocation in high-throughput scenarios (256KB)
-    pub const HIGH_THROUGHPUT_BUFFER_SIZE: usize = 256 * 1024;
-
+    /// Sized for ~32 concurrent connections with one buffer each
+    pub const POOL_COUNT: usize = 32;
+    
+    // Command and response limits
+    
+    /// Maximum command line size (512 bytes)
+    /// NNTP commands are typically small: "ARTICLE <msgid@example.com>"
+    pub const COMMAND: usize = 512;
+    
+    /// Maximum size for a single response (1MB)
+    /// Prevents memory exhaustion from malicious/malformed responses
+    pub const RESPONSE_MAX: usize = 1024 * 1024;
+    
+    /// Initial capacity for response accumulation buffers (8KB)
+    /// Sized for typical status lines and small responses
+    pub const RESPONSE_INITIAL: usize = 8192;
+    
+    // Streaming configuration
+    
     /// Chunk size for streaming responses (64KB)
-    pub const STREAMING_CHUNK_SIZE: usize = 65536;
+    /// Balance between latency and throughput
+    pub const STREAM_CHUNK: usize = 65536;
 }
 
 /// Socket buffer size constants
@@ -144,9 +145,10 @@ mod tests {
 
     #[test]
     fn test_buffer_sizes() {
-        // Compile-time assertions
-        const _: () = assert!(buffer::DEFAULT_SIZE >= buffer::COMMAND_SIZE);
-        const _: () = assert!(buffer::MAX_RESPONSE_SIZE > buffer::DEFAULT_SIZE);
+        // Compile-time assertions for buffer size relationships
+        const _: () = assert!(buffer::RESPONSE_INITIAL >= buffer::COMMAND);
+        const _: () = assert!(buffer::RESPONSE_MAX > buffer::RESPONSE_INITIAL);
+        const _: () = assert!(buffer::POOL >= buffer::STREAM_CHUNK);
     }
 
     #[test]

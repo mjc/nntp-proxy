@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, RoutingMode, ServerConfig};
-use crate::constants::buffer::{BUFFER_POOL_SIZE, BUFFER_SIZE};
+use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
 use crate::protocol::BACKEND_UNAVAILABLE;
@@ -54,8 +54,8 @@ impl NntpProxy {
         let connection_providers = connection_providers?;
 
         let buffer_pool = BufferPool::new(
-            BufferSize::new(BUFFER_SIZE).expect("BUFFER_SIZE is non-zero"),
-            BUFFER_POOL_SIZE,
+            BufferSize::new(POOL).expect("POOL is non-zero"),
+            POOL_COUNT,
         );
 
         let servers = Arc::new(config.servers);
