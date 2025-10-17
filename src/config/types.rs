@@ -151,3 +151,211 @@ pub struct ServerConfig {
     )]
     pub health_check_pool_timeout: Duration,
 }
+
+/// Builder for constructing `ServerConfig` instances
+///
+/// Provides a fluent API for creating server configurations, especially useful in tests
+/// where creating ServerConfig with all 11+ fields is verbose.
+///
+/// # Examples
+///
+/// ```
+/// use nntp_proxy::config::ServerConfig;
+///
+/// // Minimal configuration
+/// let config = ServerConfig::builder("news.example.com", 119)
+///     .build()
+///     .unwrap();
+///
+/// // With authentication and TLS
+/// let config = ServerConfig::builder("secure.example.com", 563)
+///     .name("Secure Server")
+///     .username("user")
+///     .password("pass")
+///     .max_connections(20)
+///     .use_tls(true)
+///     .build()
+///     .unwrap();
+/// ```
+pub struct ServerConfigBuilder {
+    host: String,
+    port: u16,
+    name: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    max_connections: Option<usize>,
+    use_tls: bool,
+    tls_verify_cert: bool,
+    tls_cert_path: Option<String>,
+    connection_keepalive: Option<Duration>,
+    health_check_max_per_cycle: Option<usize>,
+    health_check_pool_timeout: Option<Duration>,
+}
+
+impl ServerConfigBuilder {
+    /// Create a new builder with required parameters
+    ///
+    /// # Arguments
+    /// * `host` - Backend server hostname or IP address
+    /// * `port` - Backend server port number
+    #[must_use]
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            name: None,
+            username: None,
+            password: None,
+            max_connections: None,
+            use_tls: false,
+            tls_verify_cert: true, // Secure by default
+            tls_cert_path: None,
+            connection_keepalive: None,
+            health_check_max_per_cycle: None,
+            health_check_pool_timeout: None,
+        }
+    }
+
+    /// Set a friendly name for logging (defaults to "host:port")
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Set authentication username
+    #[must_use]
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    /// Set authentication password
+    #[must_use]
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Set maximum number of concurrent connections
+    #[must_use]
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
+    /// Enable TLS/SSL for this backend connection
+    #[must_use]
+    pub fn use_tls(mut self, enabled: bool) -> Self {
+        self.use_tls = enabled;
+        self
+    }
+
+    /// Set whether to verify TLS certificates
+    #[must_use]
+    pub fn tls_verify_cert(mut self, verify: bool) -> Self {
+        self.tls_verify_cert = verify;
+        self
+    }
+
+    /// Set path to custom CA certificate
+    #[must_use]
+    pub fn tls_cert_path(mut self, path: impl Into<String>) -> Self {
+        self.tls_cert_path = Some(path.into());
+        self
+    }
+
+    /// Set keep-alive interval for idle connections
+    #[must_use]
+    pub fn connection_keepalive(mut self, interval: Duration) -> Self {
+        self.connection_keepalive = Some(interval);
+        self
+    }
+
+    /// Set maximum connections to check per health check cycle
+    #[must_use]
+    pub fn health_check_max_per_cycle(mut self, max: usize) -> Self {
+        self.health_check_max_per_cycle = Some(max);
+        self
+    }
+
+    /// Set timeout for acquiring connections during health checks
+    #[must_use]
+    pub fn health_check_pool_timeout(mut self, timeout: Duration) -> Self {
+        self.health_check_pool_timeout = Some(timeout);
+        self
+    }
+
+    /// Build the ServerConfig
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Host is empty or invalid
+    /// - Port is 0
+    /// - Name is empty (when explicitly set)
+    /// - Max connections is 0 (when explicitly set)
+    pub fn build(self) -> Result<ServerConfig, anyhow::Error> {
+        use crate::types::{HostName, MaxConnections, Port, ServerName};
+
+        let host = HostName::new(self.host.clone())?;
+
+        let port = Port::new(self.port)
+            .ok_or_else(|| anyhow::anyhow!("Invalid port: {} (must be 1-65535)", self.port))?;
+
+        let name_str = self
+            .name
+            .unwrap_or_else(|| format!("{}:{}", self.host, self.port));
+        let name = ServerName::new(name_str)?;
+
+        let max_connections = if let Some(max) = self.max_connections {
+            MaxConnections::new(max)
+                .ok_or_else(|| anyhow::anyhow!("Invalid max_connections: {} (must be > 0)", max))?
+        } else {
+            super::defaults::max_connections()
+        };
+
+        let health_check_max_per_cycle = self
+            .health_check_max_per_cycle
+            .unwrap_or_else(super::defaults::health_check_max_per_cycle);
+
+        let health_check_pool_timeout = self
+            .health_check_pool_timeout
+            .unwrap_or_else(super::defaults::health_check_pool_timeout);
+
+        Ok(ServerConfig {
+            host,
+            port,
+            name,
+            username: self.username,
+            password: self.password,
+            max_connections,
+            use_tls: self.use_tls,
+            tls_verify_cert: self.tls_verify_cert,
+            tls_cert_path: self.tls_cert_path,
+            connection_keepalive: self.connection_keepalive,
+            health_check_max_per_cycle,
+            health_check_pool_timeout,
+        })
+    }
+}
+
+impl ServerConfig {
+    /// Create a builder for constructing a ServerConfig
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nntp_proxy::config::ServerConfig;
+    ///
+    /// let config = ServerConfig::builder("news.example.com", 119)
+    ///     .name("Example Server")
+    ///     .max_connections(15)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn builder(host: impl Into<String>, port: u16) -> ServerConfigBuilder {
+        ServerConfigBuilder::new(host, port)
+    }
+}
