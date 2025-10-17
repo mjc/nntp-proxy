@@ -78,7 +78,20 @@ impl<'de> Deserialize<'de> for MaxConnections {
 
 /// A non-zero maximum errors threshold
 ///
-/// Used for health checks and retry logic
+/// Ensures health check thresholds are meaningful (at least 1 error required).
+///
+/// Used for health checks and retry logic.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::MaxErrors;
+///
+/// let max = MaxErrors::new(3).unwrap();
+/// assert_eq!(max.get(), 3);
+///
+/// // Zero errors is invalid
+/// assert!(MaxErrors::new(0).is_none());
+/// ```
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MaxErrors(NonZeroU32);

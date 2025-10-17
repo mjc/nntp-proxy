@@ -252,6 +252,17 @@ impl ClientSession {
     }
 
     /// Route a single command to a backend and execute it
+    ///
+    /// # Visibility
+    /// This function is marked as `pub(super)` to allow access from the parent module,
+    /// enabling other handler modules to reuse the core per-command routing and execution logic.
+    /// This is necessary for sharing command routing functionality between different session
+    /// handling strategies (e.g., for tests or alternative routing modes) without duplicating code.
+    ///
+    /// # Usage
+    /// Other handler modules should call this function when they need to route and execute
+    /// a single NNTP command using the per-command routing logic. It should not be used
+    /// for batch processing or outside the context of a client session.
     pub(super) async fn route_and_execute_command(
         &self,
         router: &BackendSelector,
@@ -347,6 +358,14 @@ impl ClientSession {
     /// Returns `(Result<()>, got_backend_data)` where:
     /// - `got_backend_data = true` means we successfully read from backend before any error
     /// - This distinguishes backend failures (remove from pool) from client disconnects (keep backend)
+    ///
+    /// # Visibility
+    ///
+    /// This function is `pub(super)` to allow the parent module to invoke high-performance
+    /// backend command execution from multiple handler modules that require direct access
+    /// to the pipelined streaming logic. Only handler modules within the parent module
+    /// should call this function directly. External modules should use higher-level
+    /// abstractions or routing interfaces.
     pub(super) async fn execute_command_on_backend(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
