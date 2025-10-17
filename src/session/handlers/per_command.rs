@@ -254,7 +254,7 @@ impl ClientSession {
     /// Route a single command to a backend and execute it
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
-    /// (such as `hybrid.rs`) that also need to route commands, not just the parent module.
+    /// (such as `hybrid.rs`) that also need to route commands.
     pub(super) async fn route_and_execute_command(
         &self,
         router: &BackendSelector,
@@ -351,7 +351,7 @@ impl ClientSession {
     /// - `got_backend_data = true` means we successfully read from backend before any error
     /// - This distinguishes backend failures (remove from pool) from client disconnects (keep backend)
     ///
-    /// This function is `pub(super)` and intended for use by handler modules within the parent module.
+    /// This function is `pub(super)` and is intended for use by `hybrid.rs` for stateful mode command execution.
     pub(super) async fn execute_command_on_backend(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
