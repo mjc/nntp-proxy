@@ -7,6 +7,7 @@
 //! - Periodic health checks for idle connections
 //! - Graceful shutdown with QUIT commands
 
+use super::connection_pool::ConnectionPool;
 use super::connection_trait::ConnectionProvider;
 use super::deadpool_connection::{Pool, TcpManager};
 use super::health_check::{HealthCheckMetrics, check_date_response};
@@ -483,5 +484,38 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
             max_size: status.max_size,
             created: status.size,
         }
+    }
+}
+
+#[async_trait]
+impl ConnectionPool for DeadpoolConnectionProvider {
+    async fn get(&self) -> Result<crate::stream::ConnectionStream> {
+        let conn = self.get_pooled_connection().await?;
+
+        // Extract the ConnectionStream from the deadpool Object
+        // The connection will be returned to the pool when the Object is dropped
+        let stream = deadpool::managed::Object::take(conn);
+        Ok(stream)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn status(&self) -> PoolStatus {
+        let status = self.pool.status();
+        PoolStatus {
+            available: status.available,
+            max_size: status.max_size,
+            created: status.size,
+        }
+    }
+
+    fn host(&self) -> &str {
+        &self.pool.manager().host
+    }
+
+    fn port(&self) -> u16 {
+        self.pool.manager().port
     }
 }
