@@ -73,7 +73,7 @@ impl AsRef<str> for HostName {
 
 impl std::ops::Deref for HostName {
     type Target = str;
-    
+
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -135,7 +135,7 @@ impl AsRef<str> for ServerName {
 
 impl std::ops::Deref for ServerName {
     type Target = str;
-    
+
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0

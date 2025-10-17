@@ -171,9 +171,7 @@ impl ClientSessionBuilder {
                 (SessionMode::PerCommand, self.routing_mode)
             }
             // If router is provided but mode is Standard, default to PerCommand
-            (Some(_), RoutingMode::Standard) => {
-                (SessionMode::PerCommand, RoutingMode::PerCommand)
-            }
+            (Some(_), RoutingMode::Standard) => (SessionMode::PerCommand, RoutingMode::PerCommand),
             // No router means Standard mode
             (None, _) => (SessionMode::Stateful, RoutingMode::Standard),
         };

@@ -436,14 +436,12 @@ impl NntpProxy {
             }
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
-                let is_broken_pipe = e
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io_err| {
-                        matches!(
-                            io_err.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        )
-                    });
+                let is_broken_pipe = e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+                    matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
+                });
 
                 if is_broken_pipe {
                     debug!(

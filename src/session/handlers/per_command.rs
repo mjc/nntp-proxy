@@ -4,8 +4,8 @@
 //! can be routed to a different backend. It includes the core command execution
 //! logic used by all routing modes.
 
-use super::common::{extract_message_id, SMALL_TRANSFER_THRESHOLD};
-use crate::session::{backend, connection, streaming, ClientSession};
+use super::common::{SMALL_TRANSFER_THRESHOLD, extract_message_id};
+use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;

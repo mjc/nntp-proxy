@@ -173,7 +173,7 @@ impl TlsManager {
         backend_name: &str,
     ) -> Result<TlsStream<TcpStream>, anyhow::Error> {
         use anyhow::Context;
-        
+
         let domain = rustls_pki_types::ServerName::try_from(hostname)
             .context("Invalid hostname for TLS")?
             .to_owned();
@@ -233,7 +233,7 @@ impl TlsManager {
         cert_path: &str,
     ) -> Result<(), anyhow::Error> {
         use anyhow::Context;
-        
+
         let cert_data = std::fs::read(cert_path)
             .with_context(|| format!("Failed to read TLS certificate from {}", cert_path))?;
 
@@ -277,7 +277,7 @@ impl TlsManager {
         config: &TlsConfig,
     ) -> Result<ClientConfig, anyhow::Error> {
         use anyhow::Context;
-        
+
         let mut client_config = if config.tls_verify_cert {
             debug!("TLS: Certificate verification enabled with ring crypto provider");
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))

@@ -215,7 +215,7 @@ impl<'a> AsRef<str> for MessageId<'a> {
 
 impl<'a> std::ops::Deref for MessageId<'a> {
     type Target = str;
-    
+
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0

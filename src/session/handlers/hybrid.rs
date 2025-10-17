@@ -108,20 +108,14 @@ impl ClientSession {
 
             match client_reader.read_line(&mut command).await {
                 Ok(0) => {
-                    debug!(
-                        "Client {} disconnected in stateful mode",
-                        self.client_addr
-                    );
+                    debug!("Client {} disconnected in stateful mode", self.client_addr);
                     break;
                 }
                 Ok(n) => {
                     client_to_backend += n as u64;
                     let trimmed = command.trim();
 
-                    debug!(
-                        "Client {} stateful command: {}",
-                        self.client_addr, trimmed
-                    );
+                    debug!("Client {} stateful command: {}", self.client_addr, trimmed);
 
                     // Handle QUIT locally
                     if trimmed.eq_ignore_ascii_case("QUIT") {
@@ -145,7 +139,7 @@ impl ClientSession {
                     let mut cmd_bytes = BytesTransferred::zero();
                     let mut resp_bytes = BytesTransferred::zero();
                     cmd_bytes.add(command.len());
-                    
+
                     let (result, _got_backend_data) = self
                         .execute_command_on_backend(
                             &mut pooled_conn,
@@ -156,7 +150,7 @@ impl ClientSession {
                             &mut resp_bytes,
                         )
                         .await;
-                    
+
                     client_to_backend += cmd_bytes.as_u64();
                     backend_to_client += resp_bytes.as_u64();
 
@@ -176,7 +170,7 @@ impl ClientSession {
                     let mut b2c = BytesTransferred::zero();
                     c2b.add(client_to_backend as usize);
                     b2c.add(backend_to_client as usize);
-                    
+
                     connection::log_client_error(
                         self.client_addr,
                         &e,

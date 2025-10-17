@@ -347,9 +347,7 @@ mod tests {
 
         let config = Config {
             timeout: Duration::from_secs(30),
-        }
-
-;
+        };
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("30"));

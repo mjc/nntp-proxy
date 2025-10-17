@@ -59,7 +59,7 @@ impl From<BytesTransferred> for u64 {
 
 impl std::ops::Deref for BytesTransferred {
     type Target = u64;
-    
+
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
