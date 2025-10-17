@@ -76,11 +76,15 @@ impl<'de> Deserialize<'de> for MaxConnections {
     }
 }
 
-/// A non-zero maximum errors threshold
+/// A non-zero maximum errors threshold.
 ///
-/// Ensures health check thresholds are meaningful (at least 1 error required).
+/// Used to specify the maximum number of errors allowed before taking action.
 ///
-/// Used for health checks and retry logic.
+/// This type is used in two primary contexts:
+/// - **Health check error thresholds:** Ensures that health checks require at least one error before marking a service as unhealthy.
+/// - **Retry logic:** Specifies the maximum number of retry attempts after errors.
+///
+/// By enforcing a non-zero value, this type ensures that both health check and retry thresholds are always meaningful (at least 1 error required).
 ///
 /// # Examples
 /// ```
