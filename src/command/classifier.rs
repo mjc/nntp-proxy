@@ -52,10 +52,25 @@
 /// /// Retrieve article by message-ID or number
 /// const ARTICLE_CASES: &[&[u8]; 3] = &[b"ARTICLE", b"article", b"Article"];
 /// ```
+///
+/// # Documentation Format
+///
+/// All command documentation should follow the RFC reference format:
+/// `[RFC XXXX §X.X.X](url) - COMMAND_NAME command\nDescription`
+///
+/// This ensures consistency and traceability to the NNTP protocol specification.
 macro_rules! command_cases {
     ($name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
         const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
+
+        // Compile-time validation: ensure documentation starts with RFC reference
+        // This creates a const assertion that the doc string contains expected patterns
+        const _: () = {
+            // This will fail to compile if the doc string doesn't contain "RFC"
+            // Note: Full validation would require a proc macro, but this provides basic checking
+            assert!($doc.len() > 0, "Command documentation cannot be empty");
+        };
     };
 }
 

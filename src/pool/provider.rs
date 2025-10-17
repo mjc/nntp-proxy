@@ -261,13 +261,16 @@ impl DeadpoolConnectionProvider {
     ///
     /// This avoids unnecessary cloning of individual fields.
     pub fn from_server_config(server: &crate::config::ServerConfig) -> Result<Self> {
-        let mut tls_builder = TlsConfig::builder()
+        let tls_builder = TlsConfig::builder()
             .enabled(server.use_tls)
             .verify_cert(server.tls_verify_cert);
 
-        if let Some(ref cert_path) = server.tls_cert_path {
-            tls_builder = tls_builder.cert_path(cert_path.as_str());
-        }
+        // Use functional approach to conditionally add cert_path
+        let tls_builder = server
+            .tls_cert_path
+            .as_ref()
+            .map(|cert_path| tls_builder.clone().cert_path(cert_path.as_str()))
+            .unwrap_or(tls_builder);
 
         let tls_config = tls_builder.build();
 

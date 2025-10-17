@@ -92,7 +92,7 @@ impl TlsConfig {
 ///     .verify_cert(false)
 ///     .build();
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlsConfigBuilder {
     use_tls: bool,
     tls_verify_cert: bool,
