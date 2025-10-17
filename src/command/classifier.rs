@@ -35,100 +35,239 @@
 // **Ordering**: [UPPERCASE, lowercase, Titlecase]
 // UPPERCASE is checked first as it represents 95% of real NNTP traffic.
 
-// **Ordering**: [UPPERCASE, lowercase, Titlecase]
-// UPPERCASE is checked first as it represents 95% of real NNTP traffic.
+/// Macro to generate case-insensitive command matching arrays
+///
+/// Generates a const array containing 3 byte string literals representing
+/// the UPPERCASE, lowercase, and Titlecase variations of an NNTP command.
+///
+/// # Example
+/// ```ignore
+/// command_cases!(ARTICLE, "ARTICLE", "article", "Article",
+///     "RFC 3977 §6.2.1 - ARTICLE command\nRetrieve article by message-ID or number");
+/// ```
+///
+/// Expands to:
+/// ```ignore
+/// /// RFC 3977 §6.2.1 - ARTICLE command
+/// /// Retrieve article by message-ID or number
+/// const ARTICLE_CASES: &[&[u8]; 3] = &[b"ARTICLE", b"article", b"Article"];
+/// ```
+macro_rules! command_cases {
+    ($name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
+        #[doc = $doc]
+        const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
+    };
+}
 
-/// [RFC 3977 §6.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.1) - ARTICLE command
-/// Retrieve article by message-ID or number
-const ARTICLE_CASES: &[&[u8]; 3] = &[b"ARTICLE", b"article", b"Article"];
+// Generate command case arrays using the macro
+// Each command is documented with its RFC reference for traceability
 
-/// [RFC 3977 §6.2.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.3) - BODY command
-/// Retrieve article body by message-ID or number
-const BODY_CASES: &[&[u8]; 3] = &[b"BODY", b"body", b"Body"];
+command_cases!(
+    ARTICLE_CASES,
+    "ARTICLE",
+    "article",
+    "Article",
+    "[RFC 3977 §6.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.1) - ARTICLE command\n\
+     Retrieve article by message-ID or number"
+);
 
-/// [RFC 3977 §6.2.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.2) - HEAD command
-/// Retrieve article headers by message-ID or number
-const HEAD_CASES: &[&[u8]; 3] = &[b"HEAD", b"head", b"Head"];
+command_cases!(
+    BODY_CASES,
+    "BODY",
+    "body",
+    "Body",
+    "[RFC 3977 §6.2.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.3) - BODY command\n\
+     Retrieve article body by message-ID or number"
+);
 
-/// [RFC 3977 §6.2.4](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.4) - STAT command
-/// Check article existence by message-ID or number (no body transfer)
-const STAT_CASES: &[&[u8]; 3] = &[b"STAT", b"stat", b"Stat"];
+command_cases!(
+    HEAD_CASES,
+    "HEAD",
+    "head",
+    "Head",
+    "[RFC 3977 §6.2.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.2) - HEAD command\n\
+     Retrieve article headers by message-ID or number"
+);
 
-/// [RFC 3977 §6.1.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.1) - GROUP command
-/// Select a newsgroup and set current article pointer
-const GROUP_CASES: &[&[u8]; 3] = &[b"GROUP", b"group", b"Group"];
+command_cases!(
+    STAT_CASES,
+    "STAT",
+    "stat",
+    "Stat",
+    "[RFC 3977 §6.2.4](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.4) - STAT command\n\
+     Check article existence by message-ID or number (no body transfer)"
+);
 
-/// [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3) - AUTHINFO command
-/// Authentication mechanism (AUTHINFO USER/PASS, AUTHINFO SASL, etc.)
-const AUTHINFO_CASES: &[&[u8]; 3] = &[b"AUTHINFO", b"authinfo", b"Authinfo"];
+command_cases!(
+    GROUP_CASES,
+    "GROUP",
+    "group",
+    "Group",
+    "[RFC 3977 §6.1.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.1) - GROUP command\n\
+     Select a newsgroup and set current article pointer"
+);
 
-/// [RFC 3977 §7.6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-7.6.1) - LIST command
-/// List newsgroups, active groups, overview format, etc.
-const LIST_CASES: &[&[u8]; 3] = &[b"LIST", b"list", b"List"];
+command_cases!(
+    AUTHINFO_CASES,
+    "AUTHINFO",
+    "authinfo",
+    "Authinfo",
+    "[RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3) - AUTHINFO command\n\
+     Authentication mechanism (AUTHINFO USER/PASS, AUTHINFO SASL, etc.)"
+);
 
-/// [RFC 3977 §7.1](https://datatracker.ietf.org/doc/html/rfc3977#section-7.1) - DATE command
-/// Get server's current UTC date/time
-const DATE_CASES: &[&[u8]; 3] = &[b"DATE", b"date", b"Date"];
+command_cases!(
+    LIST_CASES,
+    "LIST",
+    "list",
+    "List",
+    "[RFC 3977 §7.6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-7.6.1) - LIST command\n\
+     List newsgroups, active groups, overview format, etc."
+);
 
-/// [RFC 3977 §5.2](https://datatracker.ietf.org/doc/html/rfc3977#section-5.2) - CAPABILITIES command
-/// Report server capabilities and extensions
-const CAPABILITIES_CASES: &[&[u8]; 3] = &[b"CAPABILITIES", b"capabilities", b"Capabilities"];
+command_cases!(
+    DATE_CASES,
+    "DATE",
+    "date",
+    "Date",
+    "[RFC 3977 §7.1](https://datatracker.ietf.org/doc/html/rfc3977#section-7.1) - DATE command\n\
+     Get server's current UTC date/time"
+);
 
-/// [RFC 3977 §5.3](https://datatracker.ietf.org/doc/html/rfc3977#section-5.3) - MODE READER command
-/// Indicate client is a news reader (vs transit agent)
-const MODE_CASES: &[&[u8]; 3] = &[b"MODE", b"mode", b"Mode"];
+command_cases!(
+    CAPABILITIES_CASES,
+    "CAPABILITIES",
+    "capabilities",
+    "Capabilities",
+    "[RFC 3977 §5.2](https://datatracker.ietf.org/doc/html/rfc3977#section-5.2) - CAPABILITIES command\n\
+     Report server capabilities and extensions"
+);
 
-/// [RFC 3977 §7.2](https://datatracker.ietf.org/doc/html/rfc3977#section-7.2) - HELP command
-/// Get server help text
-const HELP_CASES: &[&[u8]; 3] = &[b"HELP", b"help", b"Help"];
+command_cases!(
+    MODE_CASES,
+    "MODE",
+    "mode",
+    "Mode",
+    "[RFC 3977 §5.3](https://datatracker.ietf.org/doc/html/rfc3977#section-5.3) - MODE READER command\n\
+     Indicate client is a news reader (vs transit agent)"
+);
 
-/// [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4) - QUIT command
-/// Close connection gracefully
-const QUIT_CASES: &[&[u8]; 3] = &[b"QUIT", b"quit", b"Quit"];
+command_cases!(
+    HELP_CASES,
+    "HELP",
+    "help",
+    "Help",
+    "[RFC 3977 §7.2](https://datatracker.ietf.org/doc/html/rfc3977#section-7.2) - HELP command\n\
+     Get server help text"
+);
 
-/// [RFC 2980 §2.8](https://datatracker.ietf.org/doc/html/rfc2980#section-2.8) - XOVER command (legacy)
-/// Retrieve overview information (superseded by OVER in RFC 3977)
-const XOVER_CASES: &[&[u8]; 3] = &[b"XOVER", b"xover", b"Xover"];
+command_cases!(
+    QUIT_CASES,
+    "QUIT",
+    "quit",
+    "Quit",
+    "[RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4) - QUIT command\n\
+     Close connection gracefully"
+);
 
-/// [RFC 3977 §8.3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-8.3.2) - OVER command
-/// Retrieve overview information for article range
-const OVER_CASES: &[&[u8]; 3] = &[b"OVER", b"over", b"Over"];
+command_cases!(
+    XOVER_CASES,
+    "XOVER",
+    "xover",
+    "Xover",
+    "[RFC 2980 §2.8](https://datatracker.ietf.org/doc/html/rfc2980#section-2.8) - XOVER command (legacy)\n\
+     Retrieve overview information (superseded by OVER in RFC 3977)"
+);
 
-/// [RFC 2980 §2.6](https://datatracker.ietf.org/doc/html/rfc2980#section-2.6) - XHDR command (legacy)
-/// Retrieve specific header fields (superseded by HDR in RFC 3977)
-const XHDR_CASES: &[&[u8]; 3] = &[b"XHDR", b"xhdr", b"Xhdr"];
+command_cases!(
+    OVER_CASES,
+    "OVER",
+    "over",
+    "Over",
+    "[RFC 3977 §8.3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-8.3.2) - OVER command\n\
+     Retrieve overview information for article range"
+);
 
-/// [RFC 3977 §8.5](https://datatracker.ietf.org/doc/html/rfc3977#section-8.5) - HDR command
-/// Retrieve header field for article range
-const HDR_CASES: &[&[u8]; 3] = &[b"HDR", b"hdr", b"Hdr"];
+command_cases!(
+    XHDR_CASES,
+    "XHDR",
+    "xhdr",
+    "Xhdr",
+    "[RFC 2980 §2.6](https://datatracker.ietf.org/doc/html/rfc2980#section-2.6) - XHDR command (legacy)\n\
+     Retrieve specific header fields (superseded by HDR in RFC 3977)"
+);
 
-/// [RFC 3977 §6.1.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.3) - NEXT command
-/// Advance to next article in current group
-const NEXT_CASES: &[&[u8]; 3] = &[b"NEXT", b"next", b"Next"];
+command_cases!(
+    HDR_CASES,
+    "HDR",
+    "hdr",
+    "Hdr",
+    "[RFC 3977 §8.5](https://datatracker.ietf.org/doc/html/rfc3977#section-8.5) - HDR command\n\
+     Retrieve header field for article range"
+);
 
-/// [RFC 3977 §6.1.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.2) - LAST command
-/// Move to previous article in current group
-const LAST_CASES: &[&[u8]; 3] = &[b"LAST", b"last", b"Last"];
+command_cases!(
+    NEXT_CASES,
+    "NEXT",
+    "next",
+    "Next",
+    "[RFC 3977 §6.1.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.3) - NEXT command\n\
+     Advance to next article in current group"
+);
 
-/// [RFC 3977 §6.1.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.2) - LISTGROUP command
-/// List article numbers in a newsgroup
-const LISTGROUP_CASES: &[&[u8]; 3] = &[b"LISTGROUP", b"listgroup", b"Listgroup"];
+command_cases!(
+    LAST_CASES,
+    "LAST",
+    "last",
+    "Last",
+    "[RFC 3977 §6.1.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.2) - LAST command\n\
+     Move to previous article in current group"
+);
 
-/// [RFC 3977 §6.3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.1) - POST command
-/// Post a new article (requires multiline input)
-const POST_CASES: &[&[u8]; 3] = &[b"POST", b"post", b"Post"];
+command_cases!(
+    LISTGROUP_CASES,
+    "LISTGROUP",
+    "listgroup",
+    "Listgroup",
+    "[RFC 3977 §6.1.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.2) - LISTGROUP command\n\
+     List article numbers in a newsgroup"
+);
 
-/// [RFC 3977 §6.3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.2) - IHAVE command
-/// Offer article for transfer (transit/peering)
-const IHAVE_CASES: &[&[u8]; 3] = &[b"IHAVE", b"ihave", b"Ihave"];
+command_cases!(
+    POST_CASES,
+    "POST",
+    "post",
+    "Post",
+    "[RFC 3977 §6.3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.1) - POST command\n\
+     Post a new article (requires multiline input)"
+);
 
-/// [RFC 3977 §7.3](https://datatracker.ietf.org/doc/html/rfc3977#section-7.3) - NEWGROUPS command
-/// List new newsgroups since date/time
-const NEWGROUPS_CASES: &[&[u8]; 3] = &[b"NEWGROUPS", b"newgroups", b"Newgroups"];
+command_cases!(
+    IHAVE_CASES,
+    "IHAVE",
+    "ihave",
+    "Ihave",
+    "[RFC 3977 §6.3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.2) - IHAVE command\n\
+     Offer article for transfer (transit/peering)"
+);
 
-/// [RFC 3977 §7.4](https://datatracker.ietf.org/doc/html/rfc3977#section-7.4) - NEWNEWS command
-/// List new article message-IDs since date/time
-const NEWNEWS_CASES: &[&[u8]; 3] = &[b"NEWNEWS", b"newnews", b"Newnews"];
+command_cases!(
+    NEWGROUPS_CASES,
+    "NEWGROUPS",
+    "newgroups",
+    "Newgroups",
+    "[RFC 3977 §7.3](https://datatracker.ietf.org/doc/html/rfc3977#section-7.3) - NEWGROUPS command\n\
+     List new newsgroups since date/time"
+);
+
+command_cases!(
+    NEWNEWS_CASES,
+    "NEWNEWS",
+    "newnews",
+    "Newnews",
+    "[RFC 3977 §7.4](https://datatracker.ietf.org/doc/html/rfc3977#section-7.4) - NEWNEWS command\n\
+     List new article message-IDs since date/time"
+);
 
 // =============================================================================
 // Fast-path matchers for hot commands (40Gbit optimization)

@@ -53,11 +53,10 @@ pub struct DeadpoolConnectionProvider {
 ///     .unwrap();
 ///
 /// // Provider with TLS and authentication
-/// let tls_config = TlsConfig {
-///     use_tls: true,
-///     tls_verify_cert: true,
-///     tls_cert_path: None,
-/// };
+/// let tls_config = TlsConfig::builder()
+///     .enabled(true)
+///     .verify_cert(true)
+///     .build();
 ///
 /// let provider = DeadpoolConnectionProvider::builder("secure.example.com", 563)
 ///     .name("Secure Server")
@@ -261,11 +260,15 @@ impl DeadpoolConnectionProvider {
     ///
     /// This avoids unnecessary cloning of individual fields.
     pub fn from_server_config(server: &crate::config::ServerConfig) -> Result<Self> {
-        let tls_config = TlsConfig {
-            use_tls: server.use_tls,
-            tls_verify_cert: server.tls_verify_cert,
-            tls_cert_path: server.tls_cert_path.clone(),
-        };
+        let mut tls_builder = TlsConfig::builder()
+            .enabled(server.use_tls)
+            .verify_cert(server.tls_verify_cert);
+
+        if let Some(ref cert_path) = server.tls_cert_path {
+            tls_builder = tls_builder.cert_path(cert_path.as_str());
+        }
+
+        let tls_config = tls_builder.build();
 
         let manager = TcpManager::new_with_tls(
             server.host.as_str().to_string(),

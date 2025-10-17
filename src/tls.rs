@@ -39,6 +39,114 @@ impl Default for TlsConfig {
     }
 }
 
+impl TlsConfig {
+    /// Create a builder for TlsConfig
+    ///
+    /// # Example
+    /// ```
+    /// use nntp_proxy::tls::TlsConfig;
+    ///
+    /// let config = TlsConfig::builder()
+    ///     .enabled(true)
+    ///     .verify_cert(true)
+    ///     .build();
+    /// ```
+    pub fn builder() -> TlsConfigBuilder {
+        TlsConfigBuilder::default()
+    }
+}
+
+/// Builder for type-safe TLS configuration
+///
+/// Provides a fluent API for constructing TLS configurations with sensible defaults.
+///
+/// # Examples
+///
+/// Basic TLS with verification:
+/// ```
+/// use nntp_proxy::tls::TlsConfig;
+///
+/// let config = TlsConfig::builder()
+///     .enabled(true)
+///     .verify_cert(true)
+///     .build();
+/// ```
+///
+/// TLS with custom CA certificate:
+/// ```
+/// use nntp_proxy::tls::TlsConfig;
+///
+/// let config = TlsConfig::builder()
+///     .enabled(true)
+///     .verify_cert(true)
+///     .cert_path("/path/to/ca.pem")
+///     .build();
+/// ```
+///
+/// Insecure TLS (for testing only):
+/// ```
+/// use nntp_proxy::tls::TlsConfig;
+///
+/// let config = TlsConfig::builder()
+///     .enabled(true)
+///     .verify_cert(false)
+///     .build();
+/// ```
+#[derive(Debug)]
+pub struct TlsConfigBuilder {
+    use_tls: bool,
+    tls_verify_cert: bool,
+    tls_cert_path: Option<String>,
+}
+
+impl Default for TlsConfigBuilder {
+    fn default() -> Self {
+        Self {
+            use_tls: false,
+            tls_verify_cert: true, // Secure by default
+            tls_cert_path: None,
+        }
+    }
+}
+
+impl TlsConfigBuilder {
+    /// Enable or disable TLS
+    ///
+    /// Default: `false`
+    pub fn enabled(mut self, use_tls: bool) -> Self {
+        self.use_tls = use_tls;
+        self
+    }
+
+    /// Enable or disable certificate verification
+    ///
+    /// **WARNING**: Disabling certificate verification is insecure and should only
+    /// be used for testing or with trusted private networks.
+    ///
+    /// Default: `true`
+    pub fn verify_cert(mut self, verify: bool) -> Self {
+        self.tls_verify_cert = verify;
+        self
+    }
+
+    /// Set path to custom CA certificate file
+    ///
+    /// The certificate should be in PEM format.
+    pub fn cert_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.tls_cert_path = Some(path.into());
+        self
+    }
+
+    /// Build the TlsConfig
+    pub fn build(self) -> TlsConfig {
+        TlsConfig {
+            use_tls: self.use_tls,
+            tls_verify_cert: self.tls_verify_cert,
+            tls_cert_path: self.tls_cert_path,
+        }
+    }
+}
+
 /// Certificate loading results
 #[derive(Debug)]
 pub struct CertificateLoadResult {
@@ -316,6 +424,57 @@ mod tests {
         assert!(!config.use_tls);
         assert!(config.tls_verify_cert);
         assert!(config.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn test_tls_config_builder_default() {
+        let config = TlsConfig::builder().build();
+        assert!(!config.use_tls);
+        assert!(config.tls_verify_cert); // Secure by default
+        assert!(config.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn test_tls_config_builder_enabled() {
+        let config = TlsConfig::builder().enabled(true).verify_cert(true).build();
+        assert!(config.use_tls);
+        assert!(config.tls_verify_cert);
+        assert!(config.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn test_tls_config_builder_with_cert_path() {
+        let config = TlsConfig::builder()
+            .enabled(true)
+            .verify_cert(true)
+            .cert_path("/path/to/cert.pem")
+            .build();
+        assert!(config.use_tls);
+        assert!(config.tls_verify_cert);
+        assert_eq!(config.tls_cert_path, Some("/path/to/cert.pem".to_string()));
+    }
+
+    #[test]
+    fn test_tls_config_builder_insecure() {
+        let config = TlsConfig::builder()
+            .enabled(true)
+            .verify_cert(false)
+            .build();
+        assert!(config.use_tls);
+        assert!(!config.tls_verify_cert);
+        assert!(config.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn test_tls_config_builder_fluent_api() {
+        let config = TlsConfig::builder()
+            .enabled(true)
+            .verify_cert(true)
+            .cert_path("/custom/ca.pem".to_string())
+            .build();
+        assert!(config.use_tls);
+        assert!(config.tls_verify_cert);
+        assert_eq!(config.tls_cert_path, Some("/custom/ca.pem".to_string()));
     }
 
     #[test]
