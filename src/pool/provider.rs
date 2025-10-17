@@ -7,6 +7,7 @@
 //! - Periodic health checks for idle connections
 //! - Graceful shutdown with QUIT commands
 
+use super::connection_pool::ConnectionPool;
 use super::connection_trait::ConnectionProvider;
 use super::deadpool_connection::{Pool, TcpManager};
 use super::health_check::{HealthCheckMetrics, check_date_response};
@@ -53,11 +54,10 @@ pub struct DeadpoolConnectionProvider {
 ///     .unwrap();
 ///
 /// // Provider with TLS and authentication
-/// let tls_config = TlsConfig {
-///     use_tls: true,
-///     tls_verify_cert: true,
-///     tls_cert_path: None,
-/// };
+/// let tls_config = TlsConfig::builder()
+///     .enabled(true)
+///     .verify_cert(true)
+///     .build();
 ///
 /// let provider = DeadpoolConnectionProvider::builder("secure.example.com", 563)
 ///     .name("Secure Server")
@@ -261,11 +261,18 @@ impl DeadpoolConnectionProvider {
     ///
     /// This avoids unnecessary cloning of individual fields.
     pub fn from_server_config(server: &crate::config::ServerConfig) -> Result<Self> {
-        let tls_config = TlsConfig {
-            use_tls: server.use_tls,
-            tls_verify_cert: server.tls_verify_cert,
-            tls_cert_path: server.tls_cert_path.clone(),
-        };
+        let tls_builder = TlsConfig::builder()
+            .enabled(server.use_tls)
+            .verify_cert(server.tls_verify_cert);
+
+        // Use functional approach to conditionally add cert_path
+        let tls_builder = server
+            .tls_cert_path
+            .as_ref()
+            .map(|cert_path| tls_builder.clone().cert_path(cert_path.as_str()))
+            .unwrap_or(tls_builder);
+
+        let tls_config = tls_builder.build();
 
         let manager = TcpManager::new_with_tls(
             server.host.as_str().to_string(),
@@ -480,5 +487,44 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
             max_size: status.max_size,
             created: status.size,
         }
+    }
+}
+
+#[async_trait]
+impl ConnectionPool for DeadpoolConnectionProvider {
+    async fn get(&self) -> Result<crate::stream::ConnectionStream> {
+        let conn = self.get_pooled_connection().await?;
+
+        // Extract the ConnectionStream from the deadpool Object wrapper.
+        //
+        // IMPORTANT: Object::take() consumes the wrapper and returns the inner stream.
+        // This removes the connection from the pool permanently - it will NOT be
+        // automatically returned when dropped. This is intentional for the ConnectionPool
+        // trait which provides raw streams that the caller is responsible for managing.
+        //
+        // For automatic pool return, use get_pooled_connection() instead, which returns
+        // a managed::Object that auto-returns to the pool on drop.
+        let stream = deadpool::managed::Object::take(conn);
+        Ok(stream)
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn status(&self) -> PoolStatus {
+        let status = self.pool.status();
+        PoolStatus {
+            available: status.available,
+            max_size: status.max_size,
+            created: status.size,
+        }
+    }
+
+    fn host(&self) -> &str {
+        &self.pool.manager().host
+    }
+
+    fn port(&self) -> u16 {
+        self.pool.manager().port
     }
 }
