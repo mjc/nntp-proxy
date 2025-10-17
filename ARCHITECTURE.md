@@ -395,7 +395,8 @@ NntpProxy::builder(config)
 ### Phase 1: File Splits ✓ (Completed)
 - [x] Split protocol/response.rs → protocol/response/
 - [x] Split command/classifier.rs → command/classifier/
-- [x] Split types/config.rs → types/config/
+- [x] Split types/config.rs → types/config/ (6 focused files, ~100-150 lines each)
+- [x] Split session/handlers.rs → session/handlers/ (5 focused files by routing mode)
 - [x] Update imports and tests
 
 ### Phase 2: Module Reorganization ✓ (Completed)
