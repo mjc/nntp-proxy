@@ -253,7 +253,8 @@ impl ClientSession {
 
     /// Route a single command to a backend and execute it
     ///
-    /// This function is `pub(super)` to allow reuse of per-command routing logic within the parent module.
+    /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
+    /// (such as `hybrid.rs`) that also need to route commands, not just the parent module.
     pub(super) async fn route_and_execute_command(
         &self,
         router: &BackendSelector,
