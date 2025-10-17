@@ -13,31 +13,31 @@ use std::time::Duration;
 /// - Pooled buffers (256KB) handle most articles in one read
 pub mod buffer {
     // Buffer pool configuration
-    
+
     /// Size of each pooled buffer (256KB)
     /// Large enough to handle most Usenet articles in a single read
     pub const POOL: usize = 256 * 1024;
-    
+
     /// Number of buffers in the buffer pool
     /// Sized for ~32 concurrent connections with one buffer each
     pub const POOL_COUNT: usize = 32;
-    
+
     // Command and response limits
-    
+
     /// Maximum command line size (512 bytes)
     /// NNTP commands are typically small: "ARTICLE <msgid@example.com>"
     pub const COMMAND: usize = 512;
-    
+
     /// Maximum size for a single response (1MB)
     /// Prevents memory exhaustion from malicious/malformed responses
     pub const RESPONSE_MAX: usize = 1024 * 1024;
-    
+
     /// Initial capacity for response accumulation buffers (8KB)
     /// Sized for typical status lines and small responses
     pub const RESPONSE_INITIAL: usize = 8192;
-    
+
     // Streaming configuration
-    
+
     /// Chunk size for streaming responses (64KB)
     /// Balance between latency and throughput
     pub const STREAM_CHUNK: usize = 65536;

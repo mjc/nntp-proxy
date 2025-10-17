@@ -771,9 +771,27 @@ Contributions welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch
-3. Make your changes with tests
-4. Ensure all tests pass: `cargo test`
-5. Submit a pull request
+3. Install git hooks: `./scripts/install-git-hooks.sh`
+4. Make your changes with tests
+5. Ensure all checks pass:
+   - `cargo test` - Run all tests
+   - `cargo clippy --all-targets --all-features` - Run linter
+   - `cargo fmt` - Format code
+6. Submit a pull request
+
+### Development Setup
+
+After cloning the repository, install git hooks to automatically run code quality checks:
+
+```bash
+./scripts/install-git-hooks.sh
+```
+
+The pre-commit hook will automatically run:
+- `cargo fmt --check` - Verify code formatting
+- `cargo clippy --all-targets --all-features` - Check for lint warnings
+
+To bypass the hook temporarily (not recommended): `git commit --no-verify`
 
 ## License
 

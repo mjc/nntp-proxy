@@ -100,6 +100,93 @@ pub struct ClientSession {
     routing_mode: RoutingMode,
 }
 
+/// Builder for constructing `ClientSession` instances
+///
+/// Provides a fluent API for creating client sessions with different routing modes.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::SocketAddr;
+/// use std::sync::Arc;
+/// use nntp_proxy::session::ClientSession;
+/// use nntp_proxy::pool::BufferPool;
+/// use nntp_proxy::router::BackendSelector;
+/// use nntp_proxy::config::RoutingMode;
+/// use nntp_proxy::types::BufferSize;
+///
+/// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+/// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+///
+/// // Standard 1:1 routing mode
+/// let session = ClientSession::builder(addr, buffer_pool.clone())
+///     .build();
+///
+/// // Per-command routing mode
+/// let router = Arc::new(BackendSelector::new());
+/// let session = ClientSession::builder(addr, buffer_pool.clone())
+///     .with_router(router)
+///     .with_routing_mode(RoutingMode::PerCommand)
+///     .build();
+/// ```
+pub struct ClientSessionBuilder {
+    client_addr: SocketAddr,
+    buffer_pool: BufferPool,
+    router: Option<Arc<BackendSelector>>,
+    routing_mode: RoutingMode,
+}
+
+impl ClientSessionBuilder {
+    /// Configure the session to use per-command routing with a backend router
+    ///
+    /// When a router is provided, the session will route each command independently
+    /// to potentially different backend servers.
+    #[must_use]
+    pub fn with_router(mut self, router: Arc<BackendSelector>) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    /// Set the routing mode for this session
+    ///
+    /// # Arguments
+    /// * `mode` - The routing mode (Standard, PerCommand, or Hybrid)
+    ///
+    /// Note: If you use `with_router()`, you typically want PerCommand or Hybrid mode.
+    #[must_use]
+    pub fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
+        self.routing_mode = mode;
+        self
+    }
+
+    /// Build the client session
+    ///
+    /// Creates a new `ClientSession` with a unique client ID and the configured
+    /// routing mode.
+    #[must_use]
+    pub fn build(self) -> ClientSession {
+        let (mode, routing_mode) = match (&self.router, self.routing_mode) {
+            // If router is provided, start in per-command mode
+            (Some(_), RoutingMode::PerCommand | RoutingMode::Hybrid) => {
+                (SessionMode::PerCommand, self.routing_mode)
+            }
+            // If router is provided but mode is Standard, default to PerCommand
+            (Some(_), RoutingMode::Standard) => (SessionMode::PerCommand, RoutingMode::PerCommand),
+            // No router means Standard mode
+            (None, _) => (SessionMode::Stateful, RoutingMode::Standard),
+        };
+
+        ClientSession {
+            client_addr: self.client_addr,
+            buffer_pool: self.buffer_pool,
+            client_id: ClientId::new(),
+            router: self.router,
+            mode,
+            routing_mode,
+        }
+    }
+}
+
 impl ClientSession {
     /// Create a new client session for 1:1 backend mapping
     #[must_use]
@@ -129,6 +216,35 @@ impl ClientSession {
             router: Some(router),
             mode: SessionMode::PerCommand, // Starts in per-command mode
             routing_mode,
+        }
+    }
+
+    /// Create a builder for constructing a client session
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::SocketAddr;
+    /// use nntp_proxy::session::ClientSession;
+    /// use nntp_proxy::pool::BufferPool;
+    /// use nntp_proxy::types::BufferSize;
+    ///
+    /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+    ///
+    /// // Standard 1:1 routing mode
+    /// let session = ClientSession::builder(addr, buffer_pool.clone())
+    ///     .build();
+    ///
+    /// assert!(!session.is_per_command_routing());
+    /// ```
+    #[must_use]
+    pub fn builder(client_addr: SocketAddr, buffer_pool: BufferPool) -> ClientSessionBuilder {
+        ClientSessionBuilder {
+            client_addr,
+            buffer_pool,
+            router: None,
+            routing_mode: RoutingMode::Standard,
         }
     }
 

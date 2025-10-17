@@ -35,7 +35,178 @@ pub struct DeadpoolConnectionProvider {
     pub health_check_metrics: Arc<Mutex<HealthCheckMetrics>>,
 }
 
+/// Builder for constructing `DeadpoolConnectionProvider` instances
+///
+/// Provides a fluent API for creating connection providers with optional TLS configuration.
+///
+/// # Examples
+///
+/// ```no_run
+/// use nntp_proxy::pool::DeadpoolConnectionProvider;
+/// use nntp_proxy::tls::TlsConfig;
+///
+/// // Basic provider without TLS
+/// let provider = DeadpoolConnectionProvider::builder("news.example.com", 119)
+///     .name("Example Server")
+///     .max_connections(10)
+///     .build()
+///     .unwrap();
+///
+/// // Provider with TLS and authentication
+/// let tls_config = TlsConfig {
+///     use_tls: true,
+///     tls_verify_cert: true,
+///     tls_cert_path: None,
+/// };
+///
+/// let provider = DeadpoolConnectionProvider::builder("secure.example.com", 563)
+///     .name("Secure Server")
+///     .max_connections(20)
+///     .username("user")
+///     .password("pass")
+///     .tls_config(tls_config)
+///     .build()
+///     .unwrap();
+/// ```
+pub struct DeadpoolConnectionProviderBuilder {
+    host: String,
+    port: u16,
+    name: Option<String>,
+    max_size: usize,
+    username: Option<String>,
+    password: Option<String>,
+    tls_config: Option<TlsConfig>,
+}
+
+impl DeadpoolConnectionProviderBuilder {
+    /// Create a new builder with required connection parameters
+    ///
+    /// # Arguments
+    /// * `host` - Backend server hostname or IP address
+    /// * `port` - Backend server port number
+    #[must_use]
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            name: None,
+            max_size: 10, // Default max connections
+            username: None,
+            password: None,
+            tls_config: None,
+        }
+    }
+
+    /// Set a friendly name for logging (defaults to "host:port")
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Set the maximum number of concurrent connections in the pool
+    #[must_use]
+    pub fn max_connections(mut self, max_size: usize) -> Self {
+        self.max_size = max_size;
+        self
+    }
+
+    /// Set authentication username
+    #[must_use]
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    /// Set authentication password
+    #[must_use]
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Configure TLS settings for secure connections
+    #[must_use]
+    pub fn tls_config(mut self, config: TlsConfig) -> Self {
+        self.tls_config = Some(config);
+        self
+    }
+
+    /// Build the connection provider
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS initialization fails when TLS is enabled
+    pub fn build(self) -> Result<DeadpoolConnectionProvider> {
+        let name = self
+            .name
+            .unwrap_or_else(|| format!("{}:{}", self.host, self.port));
+
+        if let Some(tls_config) = self.tls_config {
+            // Build with TLS
+            let manager = TcpManager::new_with_tls(
+                self.host,
+                self.port,
+                name.clone(),
+                self.username,
+                self.password,
+                tls_config,
+            )?;
+            let pool = Pool::builder(manager)
+                .max_size(self.max_size)
+                .build()
+                .expect("Failed to create connection pool");
+
+            Ok(DeadpoolConnectionProvider {
+                pool,
+                name,
+                keepalive_interval: None,
+                shutdown_tx: None,
+                health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+            })
+        } else {
+            // Build without TLS
+            let manager = TcpManager::new(
+                self.host,
+                self.port,
+                name.clone(),
+                self.username,
+                self.password,
+            );
+            let pool = Pool::builder(manager)
+                .max_size(self.max_size)
+                .build()
+                .expect("Failed to create connection pool");
+
+            Ok(DeadpoolConnectionProvider {
+                pool,
+                name,
+                keepalive_interval: None,
+                shutdown_tx: None,
+                health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+            })
+        }
+    }
+}
+
 impl DeadpoolConnectionProvider {
+    /// Create a builder for constructing a connection provider
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::builder("news.example.com", 119)
+    ///     .name("Example")
+    ///     .max_connections(15)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn builder(host: impl Into<String>, port: u16) -> DeadpoolConnectionProviderBuilder {
+        DeadpoolConnectionProviderBuilder::new(host, port)
+    }
     /// Create a new connection provider
     pub fn new(
         host: String,

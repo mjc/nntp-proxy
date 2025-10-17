@@ -1,24 +1,16 @@
 //! Test configuration helpers to reduce boilerplate and improve maintainability
+//!
+//! These helpers use the ServerConfig builder pattern for cleaner, more maintainable test code.
 
 use nntp_proxy::config::ServerConfig;
-use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
 
 /// Create a basic server configuration for testing (no TLS)
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> ServerConfig {
-    ServerConfig {
-        host: HostName::new(host.to_string()).expect("Valid hostname"),
-        port: Port::new(port).expect("Valid port"),
-        name: ServerName::new(name.to_string()).expect("Valid server name"),
-        username: None,
-        password: None,
-        max_connections: MaxConnections::new(5).unwrap(),
-        use_tls: false,
-        tls_verify_cert: true,
-        tls_cert_path: None,
-        connection_keepalive: None,
-        health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
-    }
+    ServerConfig::builder(host, port)
+        .name(name)
+        .max_connections(5)
+        .build()
+        .expect("Valid server config")
 }
 
 /// Create a server configuration with authentication
@@ -29,20 +21,13 @@ pub fn create_test_server_config_with_auth(
     username: &str,
     password: &str,
 ) -> ServerConfig {
-    ServerConfig {
-        host: HostName::new(host.to_string()).expect("Valid hostname"),
-        port: Port::new(port).expect("Valid port"),
-        name: ServerName::new(name.to_string()).expect("Valid server name"),
-        username: Some(username.to_string()),
-        password: Some(password.to_string()),
-        max_connections: MaxConnections::new(5).unwrap(),
-        use_tls: false,
-        tls_verify_cert: true,
-        tls_cert_path: None,
-        connection_keepalive: None,
-        health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
-    }
+    ServerConfig::builder(host, port)
+        .name(name)
+        .username(username)
+        .password(password)
+        .max_connections(5)
+        .build()
+        .expect("Valid server config")
 }
 
 /// Create a TLS-enabled server configuration
@@ -53,20 +38,17 @@ pub fn create_test_server_config_with_tls(
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
 ) -> ServerConfig {
-    ServerConfig {
-        host: HostName::new(host.to_string()).expect("Valid hostname"),
-        port: Port::new(port).expect("Valid port"),
-        name: ServerName::new(name.to_string()).expect("Valid server name"),
-        username: None,
-        password: None,
-        max_connections: MaxConnections::new(5).unwrap(),
-        use_tls: true,
-        tls_verify_cert,
-        tls_cert_path,
-        connection_keepalive: None,
-        health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
+    let mut builder = ServerConfig::builder(host, port)
+        .name(name)
+        .max_connections(5)
+        .use_tls(true)
+        .tls_verify_cert(tls_verify_cert);
+
+    if let Some(path) = tls_cert_path {
+        builder = builder.tls_cert_path(path);
     }
+
+    builder.build().expect("Valid server config")
 }
 
 /// Create a server configuration with custom max_connections
@@ -76,20 +58,11 @@ pub fn create_test_server_config_with_max_connections(
     name: &str,
     max_connections: usize,
 ) -> ServerConfig {
-    ServerConfig {
-        host: HostName::new(host.to_string()).expect("Valid hostname"),
-        port: Port::new(port).expect("Valid port"),
-        name: ServerName::new(name.to_string()).expect("Valid server name"),
-        username: None,
-        password: None,
-        max_connections: MaxConnections::new(max_connections).unwrap(),
-        use_tls: false,
-        tls_verify_cert: true,
-        tls_cert_path: None,
-        connection_keepalive: None,
-        health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-        health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
-    }
+    ServerConfig::builder(host, port)
+        .name(name)
+        .max_connections(max_connections)
+        .build()
+        .expect("Valid server config")
 }
 
 #[cfg(test)]

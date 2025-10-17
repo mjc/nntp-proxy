@@ -45,7 +45,9 @@ impl CachingSession {
         let mut line = String::with_capacity(buffer::COMMAND);
         // Pre-allocate with typical NNTP response line size (most are < 512 bytes)
         // Reduces reallocations during line reading
-        let mut first_line = Vec::with_capacity(512);
+        // `first_line` is a Vec<u8> because it is used for reading raw bytes from the backend,
+        // which may not always be valid UTF-8, whereas `line` is a String for text-based client input.
+        let mut first_line = Vec::with_capacity(buffer::COMMAND);
 
         debug!("Caching session for client {} starting", self.client_addr);
 

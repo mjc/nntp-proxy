@@ -19,27 +19,111 @@ use crate::router;
 use crate::session::ClientSession;
 use crate::types::{self, BufferSize};
 
-#[derive(Debug, Clone)]
-pub struct NntpProxy {
-    servers: Arc<Vec<ServerConfig>>,
-    /// Backend selector for round-robin load balancing
-    router: Arc<router::BackendSelector>,
-    /// Connection providers per server - easily swappable implementation
-    connection_providers: Vec<DeadpoolConnectionProvider>,
-    /// Buffer pool for I/O operations
-    buffer_pool: BufferPool,
-    /// Routing mode (Standard, PerCommand, or Hybrid)
+/// Builder for constructing an `NntpProxy` with optional configuration overrides
+///
+/// # Examples
+///
+/// Basic usage with defaults:
+/// ```no_run
+/// # use nntp_proxy::{NntpProxyBuilder, Config, RoutingMode};
+/// # use nntp_proxy::config::load_config;
+/// # fn main() -> anyhow::Result<()> {
+/// let config = load_config("config.toml")?;
+/// let proxy = NntpProxyBuilder::new(config)
+///     .with_routing_mode(RoutingMode::Hybrid)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// With custom buffer pool size:
+/// ```no_run
+/// # use nntp_proxy::{NntpProxyBuilder, Config, RoutingMode};
+/// # use nntp_proxy::config::load_config;
+/// # fn main() -> anyhow::Result<()> {
+/// let config = load_config("config.toml")?;
+/// let proxy = NntpProxyBuilder::new(config)
+///     .with_routing_mode(RoutingMode::PerCommand)
+///     .with_buffer_pool_size(512 * 1024)  // 512KB buffers
+///     .with_buffer_pool_count(64)         // 64 buffers
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct NntpProxyBuilder {
+    config: Config,
     routing_mode: RoutingMode,
+    buffer_size: Option<usize>,
+    buffer_count: Option<usize>,
 }
 
-impl NntpProxy {
-    pub fn new(config: Config, routing_mode: RoutingMode) -> Result<Self> {
-        if config.servers.is_empty() {
+impl NntpProxyBuilder {
+    /// Create a new builder with the given configuration
+    ///
+    /// The routing mode defaults to `Standard` (1:1) mode.
+    #[must_use]
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            routing_mode: RoutingMode::Standard,
+            buffer_size: None,
+            buffer_count: None,
+        }
+    }
+
+    /// Set the routing mode
+    ///
+    /// Available modes:
+    /// - `Standard`: 1:1 client-to-backend mapping (default)
+    /// - `PerCommand`: Each command routes to a different backend
+    /// - `Hybrid`: Starts in per-command mode, switches to stateful when needed
+    #[must_use]
+    pub fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
+        self.routing_mode = mode;
+        self
+    }
+
+    /// Override the default buffer pool size (256KB)
+    ///
+    /// This affects the size of each buffer in the pool. Larger buffers
+    /// can improve throughput for large article transfers but use more memory.
+    #[must_use]
+    pub fn with_buffer_pool_size(mut self, size: usize) -> Self {
+        self.buffer_size = Some(size);
+        self
+    }
+
+    /// Override the default buffer pool count (32)
+    ///
+    /// This affects how many buffers are pre-allocated. Should roughly match
+    /// the expected number of concurrent connections.
+    #[must_use]
+    pub fn with_buffer_pool_count(mut self, count: usize) -> Self {
+        self.buffer_count = Some(count);
+        self
+    }
+
+    /// Build the `NntpProxy` instance
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No servers are configured
+    /// - Connection providers cannot be created
+    /// - Buffer size is zero
+    pub fn build(self) -> Result<NntpProxy> {
+        if self.config.servers.is_empty() {
             anyhow::bail!("No servers configured in configuration");
         }
 
+        // Use provided values or defaults
+        let buffer_size = self.buffer_size.unwrap_or(POOL);
+        let buffer_count = self.buffer_count.unwrap_or(POOL_COUNT);
+
         // Create deadpool connection providers for each server
-        let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = config
+        let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = self
+            .config
             .servers
             .iter()
             .map(|server| {
@@ -54,11 +138,12 @@ impl NntpProxy {
         let connection_providers = connection_providers?;
 
         let buffer_pool = BufferPool::new(
-            BufferSize::new(POOL).expect("POOL is non-zero"),
-            POOL_COUNT,
+            BufferSize::new(buffer_size)
+                .ok_or_else(|| anyhow::anyhow!("Buffer size must be non-zero"))?,
+            buffer_count,
         );
 
-        let servers = Arc::new(config.servers);
+        let servers = Arc::new(self.config.servers);
 
         // Create backend selector and add all backends
         let router = Arc::new({
@@ -77,13 +162,71 @@ impl NntpProxy {
             )
         });
 
-        Ok(Self {
+        Ok(NntpProxy {
             servers,
             router,
             connection_providers,
             buffer_pool,
-            routing_mode,
+            routing_mode: self.routing_mode,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NntpProxy {
+    servers: Arc<Vec<ServerConfig>>,
+    /// Backend selector for round-robin load balancing
+    router: Arc<router::BackendSelector>,
+    /// Connection providers per server - easily swappable implementation
+    connection_providers: Vec<DeadpoolConnectionProvider>,
+    /// Buffer pool for I/O operations
+    buffer_pool: BufferPool,
+    /// Routing mode (Standard, PerCommand, or Hybrid)
+    routing_mode: RoutingMode,
+}
+
+impl NntpProxy {
+    /// Create a new `NntpProxy` with the given configuration and routing mode
+    ///
+    /// This is a convenience method that uses the builder internally.
+    /// For more control over configuration, use [`NntpProxy::builder`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use nntp_proxy::{NntpProxy, Config, RoutingMode};
+    /// # use nntp_proxy::config::load_config;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let config = load_config("config.toml")?;
+    /// let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(config: Config, routing_mode: RoutingMode) -> Result<Self> {
+        NntpProxyBuilder::new(config)
+            .with_routing_mode(routing_mode)
+            .build()
+    }
+
+    /// Create a builder for more fine-grained control over proxy configuration
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use nntp_proxy::{NntpProxy, Config, RoutingMode};
+    /// # use nntp_proxy::config::load_config;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let config = load_config("config.toml")?;
+    /// let proxy = NntpProxy::builder(config)
+    ///     .with_routing_mode(RoutingMode::Hybrid)
+    ///     .with_buffer_pool_size(512 * 1024)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn builder(config: Config) -> NntpProxyBuilder {
+        NntpProxyBuilder::new(config)
     }
 
     /// Prewarm all connection pools before accepting clients
@@ -293,14 +436,12 @@ impl NntpProxy {
             }
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
-                let is_broken_pipe = e
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io_err| {
-                        matches!(
-                            io_err.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        )
-                    });
+                let is_broken_pipe = e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+                    matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
+                });
 
                 if is_broken_pipe {
                     debug!(
@@ -422,6 +563,83 @@ mod tests {
         );
 
         // Proxy should have a router with backends
+        assert_eq!(proxy.router.backend_count(), 3);
+    }
+
+    #[test]
+    fn test_builder_basic_usage() {
+        let config = create_test_config();
+        let proxy = NntpProxy::builder(config)
+            .build()
+            .expect("Failed to build proxy");
+
+        assert_eq!(proxy.servers().len(), 3);
+        assert_eq!(proxy.router.backend_count(), 3);
+    }
+
+    #[test]
+    fn test_builder_with_routing_mode() {
+        let config = create_test_config();
+        let proxy = NntpProxy::builder(config)
+            .with_routing_mode(RoutingMode::PerCommand)
+            .build()
+            .expect("Failed to build proxy");
+
+        assert_eq!(proxy.servers().len(), 3);
+    }
+
+    #[test]
+    fn test_builder_with_custom_buffer_pool() {
+        let config = create_test_config();
+        let proxy = NntpProxy::builder(config)
+            .with_buffer_pool_size(512 * 1024)
+            .with_buffer_pool_count(64)
+            .build()
+            .expect("Failed to build proxy");
+
+        assert_eq!(proxy.servers().len(), 3);
+        // Pool size and count are used internally but not exposed for verification
+    }
+
+    #[test]
+    fn test_builder_with_all_options() {
+        let config = create_test_config();
+        let proxy = NntpProxy::builder(config)
+            .with_routing_mode(RoutingMode::Hybrid)
+            .with_buffer_pool_size(1024 * 1024)
+            .with_buffer_pool_count(16)
+            .build()
+            .expect("Failed to build proxy");
+
+        assert_eq!(proxy.servers().len(), 3);
+        assert_eq!(proxy.router.backend_count(), 3);
+    }
+
+    #[test]
+    fn test_builder_empty_servers_error() {
+        let config = Config {
+            servers: vec![],
+            ..Default::default()
+        };
+        let result = NntpProxy::builder(config).build();
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No servers configured")
+        );
+    }
+
+    #[test]
+    fn test_backward_compatibility_new() {
+        // Ensure NntpProxy::new() still works (it uses builder internally)
+        let config = create_test_config();
+        let proxy = NntpProxy::new(config, RoutingMode::Standard)
+            .expect("Failed to create proxy with new()");
+
+        assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.router.backend_count(), 3);
     }
 }

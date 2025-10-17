@@ -1,15 +1,13 @@
-//! Session handler implementations
+//! Per-command routing mode handler and command execution
 //!
-//! This module contains the main session handling methods split from mod.rs:
-//! - handle_with_pooled_backend: Standard 1:1 mode
-//! - handle_per_command_routing: Per-command and hybrid routing modes
-//! - switch_to_stateful_mode: Hybrid mode transition to stateful
-//! - route_and_execute_command: Single command routing
-//! - execute_command_on_backend: Command execution with pipelined streaming
+//! This module implements independent per-command routing where each command
+//! can be routed to a different backend. It includes the core command execution
+//! logic used by all routing modes.
 
-use super::ClientSession;
+use super::common::{SMALL_TRANSFER_THRESHOLD, extract_message_id};
+use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
@@ -23,121 +21,7 @@ use crate::protocol::{
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
 
-use super::{backend, connection, streaming};
-
-/// Threshold for logging detailed transfer info (bytes)
-/// Transfers under this size are considered "small" (test connections, etc.)
-const SMALL_TRANSFER_THRESHOLD: u64 = 500;
-
-/// Extract message-ID from NNTP command if present
-#[inline]
-fn extract_message_id(command: &str) -> Option<&str> {
-    let start = command.find('<')?;
-    let end = command[start..].find('>')?;
-    Some(&command[start..start + end + 1])
-}
-
 impl ClientSession {
-    /// Handle a client connection with a dedicated backend connection (standard 1:1 mode)
-    pub async fn handle_with_pooled_backend<T>(
-        &self,
-        mut client_stream: TcpStream,
-        backend_conn: T,
-    ) -> Result<(u64, u64)>
-    where
-        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        use tokio::io::BufReader;
-
-        // Split streams for independent read/write
-        let (client_read, mut client_write) = client_stream.split();
-        let (mut backend_read, mut backend_write) = tokio::io::split(backend_conn);
-        let mut client_reader = BufReader::new(client_read);
-
-        let mut client_to_backend_bytes = 0u64;
-        let mut backend_to_client_bytes = 0u64;
-
-        // Reuse line buffer to avoid per-iteration allocations
-        let mut line = String::with_capacity(COMMAND);
-
-        debug!("Client {} session loop starting", self.client_addr);
-
-        // Handle the initial command/response phase where we intercept auth
-        loop {
-            line.clear();
-            let mut buffer = self.buffer_pool.get_buffer().await;
-
-            tokio::select! {
-                // Read command from client
-                result = client_reader.read_line(&mut line) => {
-                    match result {
-                        Ok(0) => {
-                            debug!("Client {} disconnected (0 bytes read)", self.client_addr);
-                            self.buffer_pool.return_buffer(buffer).await;
-                            break; // Client disconnected
-                        }
-                        Ok(n) => {
-                            debug!("Client {} sent {} bytes: {:?}", self.client_addr, n, line.trim());
-                            let trimmed = line.trim();
-                            debug!("Client {} command: {}", self.client_addr, trimmed);
-
-                            // Handle command using CommandHandler
-                            match CommandHandler::handle_command(&line) {
-                                CommandAction::InterceptAuth(auth_action) => {
-                                    let response = match auth_action {
-                                        AuthAction::RequestPassword => AuthHandler::user_response(),
-                                        AuthAction::AcceptAuth => AuthHandler::pass_response(),
-                                    };
-                                    client_write.write_all(response).await?;
-                                    backend_to_client_bytes += response.len() as u64;
-                                    debug!("Intercepted auth command for client {}", self.client_addr);
-                                }
-                                CommandAction::Reject(_reason) => {
-                                    warn!("Rejecting command from client {}: {}", self.client_addr, trimmed);
-                                    client_write.write_all(COMMAND_NOT_SUPPORTED_STATELESS).await?;
-                                    backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
-                                }
-                                CommandAction::ForwardStateless => {
-                                    // Forward stateless commands to backend
-                                    backend_write.write_all(line.as_bytes()).await?;
-                                    client_to_backend_bytes += line.len() as u64;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Error reading from client {}: {}", self.client_addr, e);
-                            self.buffer_pool.return_buffer(buffer).await;
-                            break;
-                        }
-                    }
-                }
-
-                // Read response from backend and forward to client (for non-auth commands)
-                result = backend_read.read(&mut buffer) => {
-                    match result {
-                        Ok(0) => {
-                            self.buffer_pool.return_buffer(buffer).await;
-                            break; // Backend disconnected
-                        }
-                        Ok(n) => {
-                            client_write.write_all(&buffer[..n]).await?;
-                            backend_to_client_bytes += n as u64;
-                        }
-                        Err(e) => {
-                            warn!("Error reading from backend for client {}: {}", self.client_addr, e);
-                            self.buffer_pool.return_buffer(buffer).await;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            self.buffer_pool.return_buffer(buffer).await;
-        }
-
-        Ok((client_to_backend_bytes, backend_to_client_bytes))
-    }
-
     /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
     pub async fn handle_per_command_routing(
@@ -367,135 +251,11 @@ impl ClientSession {
         ))
     }
 
-    /// Switch from per-command routing to stateful mode with a dedicated backend connection
-    /// This is called in hybrid mode when a stateful command is detected
-    async fn switch_to_stateful_mode(
-        &self,
-        mut client_reader: tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
-        mut client_write: tokio::net::tcp::WriteHalf<'_>,
-        initial_command: &str,
-        client_to_backend_bytes: BytesTransferred,
-        backend_to_client_bytes: BytesTransferred,
-    ) -> Result<(u64, u64)> {
-        debug!(
-            "Client {} acquiring dedicated backend connection for stateful mode",
-            self.client_addr
-        );
-
-        let router = self
-            .router
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Router not available"))?;
-
-        // Get a backend for this session
-        let backend_id = router.route_command_sync(self.client_id, initial_command)?;
-
-        let mut c2b = client_to_backend_bytes;
-        let mut b2c = backend_to_client_bytes;
-
-        // Try to acquire a stateful slot (respects max_connections-1 limit)
-        if !router.try_acquire_stateful(backend_id) {
-            // All stateful slots are taken - reject this switch
-            warn!(
-                "Client {} cannot switch to stateful mode: backend {:?} stateful limit reached",
-                self.client_addr, backend_id
-            );
-            const STATEFUL_SLOTS_ERROR: &[u8] =
-                b"503 All stateful connection slots are in use. Try again later.\r\n";
-            client_write.write_all(STATEFUL_SLOTS_ERROR).await?;
-            b2c.add(STATEFUL_SLOTS_ERROR.len());
-
-            // Continue in per-command mode
-            return Ok((c2b.as_u64(), b2c.as_u64()));
-        }
-
-        let provider = router.get_backend_provider(backend_id).ok_or_else(|| {
-            // Release the slot if provider lookup fails
-            router.release_stateful(backend_id);
-            anyhow::anyhow!("Backend {:?} not found", backend_id)
-        })?;
-
-        // Acquire a dedicated connection from the pool
-        let mut pooled_conn = match provider.get_pooled_connection().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                // Release the stateful slot on connection failure
-                router.release_stateful(backend_id);
-                return Err(e);
-            }
-        };
-
-        info!(
-            "Client {} switched to stateful mode with backend {:?}",
-            self.client_addr, backend_id
-        );
-
-        // Use backend helper to send command and read first chunk
-        let (chunk, n, _response_code, _is_multiline) =
-            match backend::send_command_and_read_first_chunk(
-                &mut *pooled_conn,
-                initial_command,
-                backend_id,
-                self.client_addr,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    if crate::pool::is_connection_error(&e) {
-                        debug!(
-                            "Backend error during stateful switch for client {} ({}), removing connection from pool",
-                            self.client_addr, e
-                        );
-                        router.release_stateful(backend_id);
-                        crate::pool::remove_from_pool(pooled_conn);
-                    }
-                    return Err(e);
-                }
-            };
-
-        c2b.add(initial_command.len());
-
-        // Forward the initial response to client
-        client_write.write_all(&chunk[..n]).await?;
-        b2c.add(n);
-
-        // Use connection helper for bidirectional forwarding
-        let result = connection::bidirectional_forward(
-            &mut client_reader,
-            &mut client_write,
-            &mut *pooled_conn,
-            &self.buffer_pool,
-            self.client_addr,
-            c2b,
-            b2c,
-        )
-        .await?;
-
-        // Handle the result - remove from pool if backend error
-        match result {
-            connection::ForwardResult::BackendError(metrics) => {
-                router.release_stateful(backend_id);
-                crate::pool::remove_from_pool(pooled_conn);
-                info!(
-                    "Client {} stateful session ended with backend error: {}",
-                    self.client_addr, metrics
-                );
-                Ok(metrics.as_tuple())
-            }
-            connection::ForwardResult::NormalDisconnect(metrics) => {
-                router.release_stateful(backend_id);
-                info!(
-                    "Client {} stateful session ended: {}",
-                    self.client_addr, metrics
-                );
-                Ok(metrics.as_tuple())
-            }
-        }
-    }
-
     /// Route a single command to a backend and execute it
-    async fn route_and_execute_command(
+    ///
+    /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
+    /// (such as `hybrid.rs`) that also need to route commands.
+    pub(super) async fn route_and_execute_command(
         &self,
         router: &BackendSelector,
         command: &str,
@@ -590,7 +350,9 @@ impl ClientSession {
     /// Returns `(Result<()>, got_backend_data)` where:
     /// - `got_backend_data = true` means we successfully read from backend before any error
     /// - This distinguishes backend failures (remove from pool) from client disconnects (keep backend)
-    async fn execute_command_on_backend(
+    ///
+    /// This function is `pub(super)` and is intended for use by `hybrid.rs` for stateful mode command execution.
+    pub(super) async fn execute_command_on_backend(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         command: &str,

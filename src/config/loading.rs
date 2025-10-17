@@ -94,7 +94,7 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
 /// modifying the config file.
 pub fn load_config(config_path: &str) -> Result<Config> {
     use anyhow::Context;
-    
+
     let config_content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file '{}'", config_path))?;
 

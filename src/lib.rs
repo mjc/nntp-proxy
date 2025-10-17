@@ -57,4 +57,4 @@ pub use config::{
     CacheConfig, Config, RoutingMode, ServerConfig, create_default_config, load_config,
 };
 pub use network::SocketOptimizer;
-pub use proxy::NntpProxy;
+pub use proxy::{NntpProxy, NntpProxyBuilder};
