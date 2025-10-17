@@ -492,12 +492,18 @@ impl ConnectionPool for DeadpoolConnectionProvider {
     async fn get(&self) -> Result<crate::stream::ConnectionStream> {
         let conn = self.get_pooled_connection().await?;
 
-        // Extract the ConnectionStream from the deadpool Object
-        // The connection will be returned to the pool when the Object is dropped
+        // Extract the ConnectionStream from the deadpool Object wrapper.
+        //
+        // IMPORTANT: Object::take() consumes the wrapper and returns the inner stream.
+        // This removes the connection from the pool permanently - it will NOT be
+        // automatically returned when dropped. This is intentional for the ConnectionPool
+        // trait which provides raw streams that the caller is responsible for managing.
+        //
+        // For automatic pool return, use get_pooled_connection() instead, which returns
+        // a managed::Object that auto-returns to the pool on drop.
         let stream = deadpool::managed::Object::take(conn);
         Ok(stream)
     }
-
     fn name(&self) -> &str {
         &self.name
     }
