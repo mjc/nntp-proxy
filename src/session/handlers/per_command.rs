@@ -203,7 +203,7 @@ impl ClientSession {
                                             tracing::Level::WARN => warn!("{}", message),
                                             tracing::Level::INFO => info!("{}", message),
                                             tracing::Level::DEBUG => debug!("{}", message),
-                                            tracing::Level::TRACE => tracing::trace!("{}", message),
+                                            _ => debug!("{}", message), // Future-proof for TRACE or other levels
                                         }
 
                                         // Try to send error response

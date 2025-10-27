@@ -142,10 +142,12 @@ impl ConnectionError {
 
     /// Get the appropriate log level for this error
     #[must_use]
-    pub const fn log_level(&self) -> tracing::Level {
+    pub fn log_level(&self) -> tracing::Level {
         match self {
-            // Client disconnects are normal
-            Self::IoError(_) => tracing::Level::DEBUG,
+            // Client disconnects (broken pipe) are normal
+            Self::IoError(e) if e.kind() == std::io::ErrorKind::BrokenPipe => tracing::Level::DEBUG,
+            // Other IO errors are warnings
+            Self::IoError(_) => tracing::Level::WARN,
             // Authentication and configuration errors need attention
             Self::AuthenticationFailed { .. }
             | Self::InvalidGreeting { .. }
@@ -273,7 +275,7 @@ mod tests {
         };
         assert!(err.is_authentication_error());
 
-        let err = ConnectionError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let err = ConnectionError::IoError(std::io::Error::other("test"));
         assert!(!err.is_authentication_error());
     }
 
