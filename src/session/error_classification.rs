@@ -134,4 +134,53 @@ mod tests {
             &other_err
         ));
     }
+
+    #[test]
+    fn test_client_disconnect_classification() {
+        // Verify broken pipe is detected as client disconnect
+        let broken_pipe = std::io::Error::new(ErrorKind::BrokenPipe, "pipe");
+        let err: anyhow::Error = broken_pipe.into();
+        assert!(ErrorClassifier::is_client_disconnect(&err));
+        assert!(ErrorClassifier::should_skip_client_error_response(&err));
+
+        // Verify other errors are NOT client disconnects
+        let reset = std::io::Error::new(ErrorKind::ConnectionReset, "reset");
+        let err: anyhow::Error = reset.into();
+        assert!(!ErrorClassifier::is_client_disconnect(&err));
+        assert!(!ErrorClassifier::should_skip_client_error_response(&err));
+    }
+
+    #[test]
+    fn test_error_classification_layering() {
+        // Test that we can distinguish between different error types
+        // for proper logging at different levels
+
+        // 1. Client disconnect (broken pipe) - should be DEBUG in streaming layer
+        let broken_pipe = std::io::Error::new(ErrorKind::BrokenPipe, "pipe");
+        let err: anyhow::Error = broken_pipe.into();
+        assert!(ErrorClassifier::is_client_disconnect(&err));
+        assert!(!ErrorClassifier::is_authentication_error(&err));
+        assert!(!ErrorClassifier::is_network_error(&err));
+
+        // 2. Auth failure - should be ERROR
+        let auth_fail = ConnectionError::AuthenticationFailed {
+            backend: "test".to_string(),
+            response: "nope".to_string(),
+        };
+        let err: anyhow::Error = auth_fail.into();
+        assert!(!ErrorClassifier::is_client_disconnect(&err));
+        assert!(ErrorClassifier::is_authentication_error(&err));
+        assert!(!ErrorClassifier::is_network_error(&err));
+
+        // 3. Network error - should be WARN
+        let net_err = ConnectionError::TcpConnect {
+            host: "test".to_string(),
+            port: 119,
+            source: std::io::Error::new(ErrorKind::ConnectionRefused, "refused"),
+        };
+        let err: anyhow::Error = net_err.into();
+        assert!(!ErrorClassifier::is_client_disconnect(&err));
+        assert!(!ErrorClassifier::is_authentication_error(&err));
+        assert!(ErrorClassifier::is_network_error(&err));
+    }
 }

@@ -168,11 +168,12 @@ impl ClientSession {
                                 Err(e) => {
                                     use crate::session::error_classification::ErrorClassifier;
 
-                                    // Classify error and handle appropriately
-                                    if ErrorClassifier::should_skip_client_error_response(&e) {
-                                        // Client disconnected - this is normal for downloads that complete
+                                    // Client disconnects during streaming are already logged in streaming.rs
+                                    // with the right context (complete vs incomplete). Don't double-log them here.
+                                    if ErrorClassifier::is_client_disconnect(&e) {
+                                        // Streaming already logged this with proper DEBUG/WARN level
                                         debug!(
-                                            "Client {} disconnected after '{}' | ↑{} ↓{}",
+                                            "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
                                             self.client_addr,
                                             trimmed,
                                             crate::formatting::format_bytes(
@@ -182,11 +183,10 @@ impl ClientSession {
                                                 backend_to_client_bytes.as_u64()
                                             )
                                         );
-                                    } else {
-                                        // Log based on error classification
-                                        let log_level = ErrorClassifier::log_level(&e);
-                                        let message = format!(
-                                            "Client {} error routing '{}': {} | ↑{} ↓{}",
+                                    } else if ErrorClassifier::is_authentication_error(&e) {
+                                        // Auth errors are critical and need immediate attention
+                                        error!(
+                                            "Client {} authentication failed for '{}': {} | ↑{} ↓{}",
                                             self.client_addr,
                                             trimmed,
                                             e,
@@ -198,13 +198,23 @@ impl ClientSession {
                                             )
                                         );
 
-                                        match log_level {
-                                            tracing::Level::ERROR => error!("{}", message),
-                                            tracing::Level::WARN => warn!("{}", message),
-                                            tracing::Level::INFO => info!("{}", message),
-                                            tracing::Level::DEBUG => debug!("{}", message),
-                                            _ => debug!("{}", message), // Future-proof for TRACE or other levels
-                                        }
+                                        // Try to send error response
+                                        let _ = client_write.write_all(BACKEND_ERROR).await;
+                                        backend_to_client_bytes.add(BACKEND_ERROR.len());
+                                    } else {
+                                        // Other errors (network issues, etc.) are warnings
+                                        warn!(
+                                            "Client {} error routing '{}': {} | ↑{} ↓{}",
+                                            self.client_addr,
+                                            trimmed,
+                                            e,
+                                            crate::formatting::format_bytes(
+                                                client_to_backend_bytes.as_u64()
+                                            ),
+                                            crate::formatting::format_bytes(
+                                                backend_to_client_bytes.as_u64()
+                                            )
+                                        );
 
                                         // Try to send error response
                                         let _ = client_write.write_all(BACKEND_ERROR).await;
