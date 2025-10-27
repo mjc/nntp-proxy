@@ -48,6 +48,7 @@ impl<'a> TcpOptimizer<'a> {
 impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
     fn optimize(&self) -> Result<(), io::Error> {
         use socket2::SockRef;
+        use std::time::Duration;
 
         let sock_ref = SockRef::from(self.stream);
 
@@ -55,9 +56,48 @@ impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
         sock_ref.set_recv_buffer_size(self.recv_buffer_size)?;
         sock_ref.set_send_buffer_size(self.send_buffer_size)?;
 
+        // Prevent indefinite blocking on close with pending data
+        // Works on: Linux, macOS, Windows
+        sock_ref.set_linger(Some(Duration::from_secs(5)))?;
+
+        // Linux-specific optimizations
+        #[cfg(target_os = "linux")]
+        {
+            // Faster dead connection detection - abort if no ACK for 30 seconds
+            // instead of default ~15 minutes
+            if let Err(e) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+                debug!("Failed to set TCP_USER_TIMEOUT: {}", e);
+            }
+
+            // QoS marking - optimize for throughput
+            // Most networks ignore this, but no harm in setting
+            // Note: IPv4 only, IPv6 uses set_tos_v6
+            if let Err(e) = sock_ref.set_tos_v4(0x08) {
+                debug!("Failed to set IP_TOS: {}", e);
+            }
+        }
+
+        // Windows-specific optimizations
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, we might want to disable SIO_LOOPBACK_FAST_PATH for localhost
+            // but socket2 doesn't expose this, so we'll skip it for now
+        }
+
         debug!(
-            "Applied TCP optimizations: recv_buffer={}, send_buffer={}",
-            self.recv_buffer_size, self.send_buffer_size
+            "Applied TCP optimizations: recv_buffer={}, send_buffer={}, linger=5s{}{}",
+            self.recv_buffer_size,
+            self.send_buffer_size,
+            if cfg!(target_os = "linux") {
+                ", tcp_user_timeout=30s, tos=0x08"
+            } else {
+                ""
+            },
+            if cfg!(target_os = "windows") {
+                " (Windows)"
+            } else {
+                ""
+            }
         );
 
         Ok(())
@@ -102,6 +142,7 @@ impl<'a> TlsOptimizer<'a> {
 impl<'a> NetworkOptimizer for TlsOptimizer<'a> {
     fn optimize(&self) -> Result<(), io::Error> {
         use socket2::SockRef;
+        use std::time::Duration;
 
         // Get the underlying TCP stream for optimization
         let tcp_stream = self.stream.get_ref().0;
@@ -111,9 +152,33 @@ impl<'a> NetworkOptimizer for TlsOptimizer<'a> {
         sock_ref.set_recv_buffer_size(self.recv_buffer_size)?;
         sock_ref.set_send_buffer_size(self.send_buffer_size)?;
 
+        // Prevent indefinite blocking on close with pending data
+        // Works on: Linux, macOS, Windows
+        sock_ref.set_linger(Some(Duration::from_secs(5)))?;
+
+        // Linux-specific optimizations
+        #[cfg(target_os = "linux")]
+        {
+            // Faster dead connection detection
+            if let Err(e) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+                debug!("Failed to set TCP_USER_TIMEOUT on TLS stream: {}", e);
+            }
+
+            // QoS marking (IPv4 only)
+            if let Err(e) = sock_ref.set_tos_v4(0x08) {
+                debug!("Failed to set IP_TOS on TLS stream: {}", e);
+            }
+        }
+
         debug!(
-            "Applied TLS optimizations to underlying TCP stream: recv_buffer={}, send_buffer={}",
-            self.recv_buffer_size, self.send_buffer_size
+            "Applied TLS optimizations to underlying TCP stream: recv_buffer={}, send_buffer={}, linger=5s{}",
+            self.recv_buffer_size,
+            self.send_buffer_size,
+            if cfg!(target_os = "linux") {
+                ", tcp_user_timeout=30s, tos=0x08"
+            } else {
+                ""
+            }
         );
 
         Ok(())
