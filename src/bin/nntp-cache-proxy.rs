@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
