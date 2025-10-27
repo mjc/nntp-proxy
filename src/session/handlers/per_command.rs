@@ -78,149 +78,12 @@ impl ClientSession {
         loop {
             command.clear();
 
-            match client_reader.read_line(&mut command).await {
+            let n = match client_reader.read_line(&mut command).await {
                 Ok(0) => {
                     debug!("Client {} disconnected", self.client_addr);
-                    break; // Client disconnected
+                    break;
                 }
-                Ok(n) => {
-                    client_to_backend_bytes.add(n);
-                    let trimmed = command.trim();
-
-                    debug!(
-                        "Client {} received command ({} bytes): {} | hex: {:02x?}",
-                        self.client_addr,
-                        n,
-                        trimmed,
-                        command.as_bytes()
-                    );
-
-                    // Handle QUIT locally
-                    if trimmed.eq_ignore_ascii_case("QUIT") {
-                        // Send closing message - ignore errors if client already disconnected, but log for debugging
-                        if let Err(e) = client_write.write_all(CONNECTION_CLOSING).await {
-                            debug!(
-                                "Failed to write CONNECTION_CLOSING to client {}: {}",
-                                self.client_addr, e
-                            );
-                        }
-                        backend_to_client_bytes.add(CONNECTION_CLOSING.len());
-                        debug!("Client {} sent QUIT, closing connection", self.client_addr);
-                        break;
-                    }
-
-                    // Check if command should be rejected or if we need to switch modes in hybrid routing
-                    match CommandHandler::handle_command(&command) {
-                        CommandAction::InterceptAuth(auth_action) => {
-                            // Handle authentication locally
-                            let response = match auth_action {
-                                AuthAction::RequestPassword => AuthHandler::user_response(),
-                                AuthAction::AcceptAuth => AuthHandler::pass_response(),
-                            };
-                            client_write.write_all(response).await?;
-                            backend_to_client_bytes.add(response.len());
-                        }
-                        CommandAction::Reject(reason) => {
-                            // In hybrid mode, stateful commands trigger a switch to stateful connection
-                            if self.routing_mode == RoutingMode::Hybrid
-                                && NntpCommand::classify(&command).is_stateful()
-                            {
-                                info!(
-                                    "Client {} switching to stateful mode (command: {})",
-                                    self.client_addr, trimmed
-                                );
-
-                                // Switch to stateful mode - acquire a dedicated backend connection
-                                return self
-                                    .switch_to_stateful_mode(
-                                        client_reader,
-                                        client_write,
-                                        &command,
-                                        client_to_backend_bytes,
-                                        backend_to_client_bytes,
-                                    )
-                                    .await;
-                            }
-
-                            // In non-hybrid per-command mode, reject stateful commands
-                            warn!(
-                                "Rejecting command from client {}: {} ({})",
-                                self.client_addr, trimmed, reason
-                            );
-                            client_write
-                                .write_all(COMMAND_NOT_SUPPORTED_STATELESS)
-                                .await?;
-                            backend_to_client_bytes.add(COMMAND_NOT_SUPPORTED_STATELESS.len());
-                        }
-                        CommandAction::ForwardStateless => {
-                            // Route this command to a backend
-                            match self
-                                .route_and_execute_command(
-                                    router,
-                                    &command,
-                                    &mut client_write,
-                                    &mut client_to_backend_bytes,
-                                    &mut backend_to_client_bytes,
-                                )
-                                .await
-                            {
-                                Ok(_backend_id) => {}
-                                Err(e) => {
-                                    // Provide detailed context for errors
-                                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                                        warn!(
-                                            "Client {} error routing '{}': {} | ↑{} ↓{}",
-                                            self.client_addr,
-                                            trimmed,
-                                            io_err,
-                                            crate::formatting::format_bytes(
-                                                client_to_backend_bytes.as_u64()
-                                            ),
-                                            crate::formatting::format_bytes(
-                                                backend_to_client_bytes.as_u64()
-                                            )
-                                        );
-                                    } else {
-                                        error!(
-                                            "Error routing '{}' for client {}: {} | ↑{} ↓{}",
-                                            trimmed,
-                                            self.client_addr,
-                                            e,
-                                            crate::formatting::format_bytes(
-                                                client_to_backend_bytes.as_u64()
-                                            ),
-                                            crate::formatting::format_bytes(
-                                                backend_to_client_bytes.as_u64()
-                                            )
-                                        );
-                                    }
-
-                                    // Try to send error response, but don't log failure if client is gone
-                                    let _ = client_write.write_all(BACKEND_ERROR).await;
-                                    backend_to_client_bytes.add(BACKEND_ERROR.len());
-
-                                    // For debugging test connections and small transfers, log detailed info
-                                    if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
-                                        < SMALL_TRANSFER_THRESHOLD
-                                    {
-                                        debug!(
-                                            "ERROR SUMMARY for small transfer - Client {}: \
-                                             Command '{}' failed with {}. \
-                                             Total session: {} bytes to backend, {} bytes from backend. \
-                                             This appears to be a short session (test connection?). \
-                                             Check debug logs above for full command/response hex dumps.",
-                                            self.client_addr,
-                                            trimmed,
-                                            e,
-                                            client_to_backend_bytes,
-                                            backend_to_client_bytes
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                Ok(n) => n,
                 Err(e) => {
                     connection::log_client_error(
                         self.client_addr,
@@ -231,6 +94,134 @@ impl ClientSession {
                         },
                     );
                     break;
+                }
+            };
+
+            client_to_backend_bytes.add(n);
+            let trimmed = command.trim();
+
+            debug!(
+                "Client {} received command ({} bytes): {} | hex: {:02x?}",
+                self.client_addr,
+                n,
+                trimmed,
+                command.as_bytes()
+            );
+
+            // Handle QUIT locally
+            if trimmed.eq_ignore_ascii_case("QUIT") {
+                let _ = client_write
+                    .write_all(CONNECTION_CLOSING)
+                    .await
+                    .inspect_err(|e| {
+                        debug!(
+                            "Failed to write CONNECTION_CLOSING to client {}: {}",
+                            self.client_addr, e
+                        );
+                    });
+                backend_to_client_bytes.add(CONNECTION_CLOSING.len());
+                debug!("Client {} sent QUIT, closing connection", self.client_addr);
+                break;
+            }
+
+            let action = CommandHandler::handle_command(&command);
+
+            // In hybrid mode, stateful commands trigger a switch to stateful connection
+            if self.routing_mode == RoutingMode::Hybrid
+                && matches!(action, CommandAction::Reject(_))
+                && NntpCommand::classify(&command).is_stateful()
+            {
+                info!(
+                    "Client {} switching to stateful mode (command: {})",
+                    self.client_addr, trimmed
+                );
+                return self
+                    .switch_to_stateful_mode(
+                        client_reader,
+                        client_write,
+                        &command,
+                        client_to_backend_bytes,
+                        backend_to_client_bytes,
+                    )
+                    .await;
+            }
+
+            // Handle the command based on its action
+            match action {
+                CommandAction::InterceptAuth(auth_action) => {
+                    let response = match auth_action {
+                        AuthAction::RequestPassword => AuthHandler::user_response(),
+                        AuthAction::AcceptAuth => AuthHandler::pass_response(),
+                    };
+                    client_write.write_all(response).await?;
+                    backend_to_client_bytes.add(response.len());
+                }
+                CommandAction::Reject(reason) => {
+                    warn!(
+                        "Rejecting command from client {}: {} ({})",
+                        self.client_addr, trimmed, reason
+                    );
+                    client_write
+                        .write_all(COMMAND_NOT_SUPPORTED_STATELESS)
+                        .await?;
+                    backend_to_client_bytes.add(COMMAND_NOT_SUPPORTED_STATELESS.len());
+                }
+                CommandAction::ForwardStateless => {
+                    if let Err(e) = self
+                        .route_and_execute_command(
+                            router,
+                            &command,
+                            &mut client_write,
+                            &mut client_to_backend_bytes,
+                            &mut backend_to_client_bytes,
+                        )
+                        .await
+                    {
+                        use crate::session::error_classification::ErrorClassifier;
+                        let (up, down) = (
+                            crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
+                            crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
+                        );
+
+                        // Log based on error type, send error response if client still connected
+                        if ErrorClassifier::is_client_disconnect(&e) {
+                            debug!(
+                                "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
+                                self.client_addr, trimmed, up, down
+                            );
+                        } else {
+                            if ErrorClassifier::is_authentication_error(&e) {
+                                error!(
+                                    "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
+                                    self.client_addr, trimmed, e, up, down
+                                );
+                            } else {
+                                warn!(
+                                    "Client {} error routing '{}': {} | ↑{} ↓{}",
+                                    self.client_addr, trimmed, e, up, down
+                                );
+                            }
+                            let _ = client_write.write_all(BACKEND_ERROR).await;
+                            backend_to_client_bytes.add(BACKEND_ERROR.len());
+                        }
+
+                        // Debug logging for small transfers
+                        if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
+                            < SMALL_TRANSFER_THRESHOLD
+                        {
+                            debug!(
+                                "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
+                                 Total session: {} bytes to backend, {} bytes from backend. \
+                                 This appears to be a short session (test connection?). \
+                                 Check debug logs above for full command/response hex dumps.",
+                                self.client_addr,
+                                trimmed,
+                                e,
+                                client_to_backend_bytes,
+                                backend_to_client_bytes
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -307,22 +298,24 @@ impl ClientSession {
 
         // Only remove backend connection if error occurred AND we didn't get data from backend
         // If we got data from backend, then any error is from writing to client
-        if let Err(ref e) = result {
-            if !got_backend_data && is_connection_error(e) {
-                warn!(
-                    "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
-                    self.client_addr, backend_id, e
-                );
-                remove_from_pool(pooled_conn);
-                router.complete_command_sync(backend_id);
-                return result.map(|_| backend_id);
-            } else if got_backend_data && is_connection_error(e) {
-                debug!(
-                    "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
-                    self.client_addr, backend_id
-                );
-            }
-        }
+        let _ = result
+            .as_ref()
+            .err()
+            .filter(|e| is_connection_error(e))
+            .inspect(|e| {
+                match got_backend_data {
+                    true => debug!(
+                        "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
+                        self.client_addr, backend_id
+                    ),
+                    false => warn!(
+                        "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
+                        self.client_addr, backend_id, e
+                    ),
+                }
+            })
+            .filter(|_| !got_backend_data)
+            .is_some_and(|_| { remove_from_pool(pooled_conn); true });
 
         // Complete the request - decrement pending count (lock-free!)
         router.complete_command_sync(backend_id);
@@ -492,5 +485,80 @@ impl ClientSession {
         }
 
         (Ok(()), got_backend_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_message_id_valid() {
+        let command = "BODY <test@example.com>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_article_command() {
+        let command = "ARTICLE <1234@news.server>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<1234@news.server>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_head_command() {
+        let command = "HEAD <article@host.domain>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<article@host.domain>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_stat_command() {
+        let command = "STAT <msg@example.org>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<msg@example.org>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_no_brackets() {
+        let command = "GROUP comp.lang.rust";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, None);
+    }
+
+    #[test]
+    fn test_extract_message_id_malformed() {
+        let command = "BODY <incomplete";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, None);
+    }
+
+    #[test]
+    fn test_extract_message_id_with_extra_text() {
+        let command = "BODY <msg@host> extra stuff";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<msg@host>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_empty_brackets() {
+        let command = "BODY <>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_lowercase_command() {
+        let command = "body <test@example.com>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_mixed_case() {
+        let command = "BoDy <TeSt@ExAmPlE.cOm>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<TeSt@ExAmPlE.cOm>"));
     }
 }

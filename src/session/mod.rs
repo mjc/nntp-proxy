@@ -43,6 +43,7 @@
 
 pub mod backend;
 pub mod connection;
+pub mod error_classification;
 pub mod handlers;
 pub mod streaming;
 

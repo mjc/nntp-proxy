@@ -41,30 +41,44 @@ async fn handle_client_write_error<R>(
 where
     R: AsyncReadExt + Unpin,
 {
-    warn!(
-        "Client {} disconnected while streaming ({} of {}, total {} so far) → backend {:?}",
-        ctx.client_addr,
-        crate::formatting::format_bytes(ctx.write_len as u64),
-        crate::formatting::format_bytes(ctx.current_n as u64),
-        crate::formatting::format_bytes(ctx.total_bytes),
-        ctx.backend_id
-    );
-    if !ctx.terminator_found {
-        // Need to drain the rest to keep connection clean
-        if let Err(drain_err) = drain_until_terminator(
+    // Determine if client received all the data before disconnecting
+    let received_complete_chunk = ctx.write_len == ctx.current_n;
+
+    // Log appropriately based on whether disconnect was expected
+    if received_complete_chunk {
+        debug!(
+            "Client {} disconnected after receiving complete data ({} total) → backend {:?}",
+            ctx.client_addr,
+            crate::formatting::format_bytes(ctx.total_bytes),
+            ctx.backend_id
+        );
+    } else {
+        warn!(
+            "Client {} disconnected mid-chunk while streaming ({} of {}, total {} so far) → backend {:?}",
+            ctx.client_addr,
+            crate::formatting::format_bytes(ctx.write_len as u64),
+            crate::formatting::format_bytes(ctx.current_n as u64),
+            crate::formatting::format_bytes(ctx.total_bytes),
+            ctx.backend_id
+        );
+    }
+
+    // Drain backend if terminator not yet found to keep connection clean
+    if !ctx.terminator_found
+        && let Err(drain_err) = drain_until_terminator(
             backend_read,
             ctx.partial_data,
             ctx.client_addr,
             ctx.backend_id,
         )
         .await
-        {
-            warn!(
-                "Client {} failed to drain backend {:?} after disconnect: {}",
-                ctx.client_addr, ctx.backend_id, drain_err
-            );
-        }
+    {
+        warn!(
+            "Client {} failed to drain backend {:?} after disconnect: {}",
+            ctx.client_addr, ctx.backend_id, drain_err
+        );
     }
+
     error.into()
 }
 
@@ -346,5 +360,77 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), full_response.len() as u64);
         assert_eq!(&writer[..], &full_response[..]);
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_write_error_complete_chunk() {
+        // Test that client disconnect after complete chunk logs at debug level
+        let mut backend = Cursor::new(b"");
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let backend_id = crate::types::BackendId::from_index(1);
+
+        let ctx = ClientWriteErrorContext {
+            write_len: 100,
+            current_n: 100, // Same as write_len = complete chunk
+            total_bytes: 100,
+            partial_data: b"test",
+            terminator_found: true,
+            client_addr,
+            backend_id,
+        };
+
+        let result = handle_client_write_error(error, &mut backend, ctx).await;
+        // Should return the error
+        assert!(result.to_string().contains("broken pipe"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_write_error_incomplete_chunk() {
+        // Test that client disconnect mid-chunk logs at warn level
+        let mut backend = Cursor::new(b"remaining data\r\n.\r\n");
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let backend_id = crate::types::BackendId::from_index(1);
+
+        let ctx = ClientWriteErrorContext {
+            write_len: 50,
+            current_n: 100, // Different from write_len = incomplete
+            total_bytes: 500,
+            partial_data: b"",
+            terminator_found: false, // Need to drain
+            client_addr,
+            backend_id,
+        };
+
+        let result = handle_client_write_error(error, &mut backend, ctx).await;
+        assert!(result.to_string().contains("broken pipe"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_write_error_with_draining() {
+        // Test that backend is drained when terminator not found
+        let remaining_data = b"more data\r\neven more\r\n.\r\n";
+        let mut backend = Cursor::new(remaining_data);
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let backend_id = crate::types::BackendId::from_index(1);
+
+        let ctx = ClientWriteErrorContext {
+            write_len: 10,
+            current_n: 10,
+            total_bytes: 10,
+            partial_data: b"",
+            terminator_found: false,
+            client_addr,
+            backend_id,
+        };
+
+        let result = handle_client_write_error(error, &mut backend, ctx).await;
+        assert!(result.to_string().contains("broken pipe"));
+
+        // Verify backend was drained (cursor should be at or near end)
+        let pos = backend.position();
+        assert!(pos >= remaining_data.len() as u64 - 5); // Near end after draining
     }
 }

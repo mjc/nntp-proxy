@@ -187,7 +187,27 @@ impl managed::Manager for TcpManager {
                 let response_str = String::from_utf8_lossy(response);
 
                 if !crate::protocol::ResponseParser::is_auth_success(response) {
-                    return Err(anyhow::anyhow!("Auth failed: {}", response_str.trim()));
+                    tracing::error!(
+                        "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
+                        self.name,
+                        self.host,
+                        self.port,
+                        response_str.trim(),
+                        username
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Auth failed for {} - Server said: {}",
+                        self.name,
+                        response_str.trim()
+                    ));
+                } else {
+                    tracing::debug!(
+                        "Successfully authenticated to {} ({}:{}) as {}",
+                        self.name,
+                        self.host,
+                        self.port,
+                        username
+                    );
                 }
             } else if !crate::protocol::ResponseParser::is_auth_success(response) {
                 return Err(anyhow::anyhow!(
