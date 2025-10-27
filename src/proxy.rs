@@ -391,7 +391,7 @@ impl NntpProxy {
     /// to be routed to different backends based on load balancing.
     pub async fn handle_client_per_command_routing(
         &self,
-        mut client_stream: TcpStream,
+        client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
         debug!(
@@ -402,9 +402,9 @@ impl NntpProxy {
         // Enable TCP_NODELAY for low latency
         let _ = client_stream.set_nodelay(true);
 
-        // Setup connection (prewarm and greeting)
-        self.setup_client_connection(&mut client_stream, client_addr)
-            .await?;
+        // NOTE: Don't call setup_client_connection here because handle_per_command_routing
+        // sends its own greeting ("200 NNTP Proxy Ready (Per-Command Routing)")
+        // Calling setup_client_connection would send a duplicate greeting
 
         // Create session with router for per-command routing
         let session = ClientSession::new_with_router(
