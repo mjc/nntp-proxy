@@ -42,8 +42,19 @@ memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with sy
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
 moka = { version = "0.12", features = ["future", "atomic64"] }  # Async LRU cache with 64-bit atomic optimizations
 bytes = "1.0"  # Efficient byte buffer for zero-copy operations
-tokio-rustls = { version = "0.26", features = ["early-data", "ring"] }  # TLS support for NNTP connections  
-rustls = { version = "0.23", features = ["ring", "std"], default-features = false }  # Pure Rust TLS implementation optimized for performance
+
+# TLS dependencies - use ring-only on Windows to avoid aws-lc-sys CMAKE issues with cargo-zigbuild
+[target.'cfg(not(windows))'.dependencies]
+tokio-rustls = { version = "0.26", features = ["early-data"] }  # TLS support (aws-lc-rs default)
+rustls = "0.23"  # Pure Rust TLS implementation with aws-lc-rs
+rustls-native-certs = "0.8"  # Load system CA certificates
+rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
+rustls-pki-types = "1.8"  # PKI types for rustls
+webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
+
+[target.'cfg(windows)'.dependencies]
+tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
+rustls = { version = "0.23", features = ["ring", "std"], default-features = false }  # Pure Rust TLS with ring only
 rustls-native-certs = "0.8"  # Load system CA certificates
 rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
 rustls-pki-types = "1.8"  # PKI types for rustls
