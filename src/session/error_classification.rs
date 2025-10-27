@@ -44,27 +44,6 @@ impl ErrorClassifier {
         false
     }
 
-    /// Get appropriate log level for error
-    pub fn log_level(error: &anyhow::Error) -> tracing::Level {
-        if let Some(conn_err) = error.downcast_ref::<ConnectionError>() {
-            return conn_err.log_level();
-        }
-
-        // Check IO errors
-        if let Some(io_err) = error.downcast_ref::<std::io::Error>() {
-            return match io_err.kind() {
-                ErrorKind::BrokenPipe => tracing::Level::DEBUG,
-                ErrorKind::ConnectionRefused
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted => tracing::Level::WARN,
-                _ => tracing::Level::ERROR,
-            };
-        }
-
-        // Default to ERROR for unknown errors
-        tracing::Level::ERROR
-    }
-
     /// Check if we should skip sending error response to client
     pub fn should_skip_client_error_response(error: &anyhow::Error) -> bool {
         Self::is_client_disconnect(error)
@@ -104,23 +83,6 @@ mod tests {
     fn test_is_authentication_error_with_message() {
         let err = anyhow::anyhow!("Auth failed: invalid credentials");
         assert!(ErrorClassifier::is_authentication_error(&err));
-    }
-
-    #[test]
-    fn test_log_level_client_disconnect() {
-        let io_err = std::io::Error::new(ErrorKind::BrokenPipe, "broken");
-        let err: anyhow::Error = io_err.into();
-        assert_eq!(ErrorClassifier::log_level(&err), tracing::Level::DEBUG);
-    }
-
-    #[test]
-    fn test_log_level_auth_error() {
-        let conn_err = ConnectionError::AuthenticationFailed {
-            backend: "test".to_string(),
-            response: "failed".to_string(),
-        };
-        let err: anyhow::Error = conn_err.into();
-        assert_eq!(ErrorClassifier::log_level(&err), tracing::Level::ERROR);
     }
 
     #[test]

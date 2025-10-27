@@ -139,25 +139,6 @@ impl ConnectionError {
     pub const fn is_network_error(&self) -> bool {
         matches!(self, Self::TcpConnect { .. } | Self::DnsResolution { .. })
     }
-
-    /// Get the appropriate log level for this error
-    #[must_use]
-    pub fn log_level(&self) -> tracing::Level {
-        match self {
-            // Client disconnects (broken pipe) are normal
-            Self::IoError(e) if e.kind() == std::io::ErrorKind::BrokenPipe => tracing::Level::DEBUG,
-            // Other IO errors are warnings
-            Self::IoError(_) => tracing::Level::WARN,
-            // Authentication and configuration errors need attention
-            Self::AuthenticationFailed { .. }
-            | Self::InvalidGreeting { .. }
-            | Self::CertificateVerification { .. } => tracing::Level::ERROR,
-            // Network errors might be transient
-            Self::TcpConnect { .. } | Self::DnsResolution { .. } => tracing::Level::WARN,
-            // Everything else is a warning
-            _ => tracing::Level::WARN,
-        }
-    }
 }
 
 impl From<std::io::Error> for ConnectionError {
@@ -299,27 +280,5 @@ mod tests {
             response: "failed".to_string(),
         };
         assert!(!err.is_network_error());
-    }
-
-    #[test]
-    fn test_log_level() {
-        let io_err = ConnectionError::IoError(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "broken",
-        ));
-        assert_eq!(io_err.log_level(), tracing::Level::DEBUG);
-
-        let auth_err = ConnectionError::AuthenticationFailed {
-            backend: "test".to_string(),
-            response: "failed".to_string(),
-        };
-        assert_eq!(auth_err.log_level(), tracing::Level::ERROR);
-
-        let tcp_err = ConnectionError::TcpConnect {
-            host: "test.com".to_string(),
-            port: 119,
-            source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-        };
-        assert_eq!(tcp_err.log_level(), tracing::Level::WARN);
     }
 }

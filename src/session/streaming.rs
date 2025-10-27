@@ -64,20 +64,19 @@ where
     }
 
     // Drain backend if terminator not yet found to keep connection clean
-    if !ctx.terminator_found {
-        drain_until_terminator(
+    if !ctx.terminator_found
+        && let Err(drain_err) = drain_until_terminator(
             backend_read,
             ctx.partial_data,
             ctx.client_addr,
             ctx.backend_id,
         )
         .await
-        .unwrap_or_else(|drain_err| {
-            warn!(
-                "Client {} failed to drain backend {:?} after disconnect: {}",
-                ctx.client_addr, ctx.backend_id, drain_err
-            );
-        });
+    {
+        warn!(
+            "Client {} failed to drain backend {:?} after disconnect: {}",
+            ctx.client_addr, ctx.backend_id, drain_err
+        );
     }
 
     error.into()

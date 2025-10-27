@@ -186,7 +186,7 @@ impl ClientSession {
                                     } else if ErrorClassifier::is_authentication_error(&e) {
                                         // Auth errors are critical and need immediate attention
                                         error!(
-                                            "Client {} authentication failed for '{}': {} | ↑{} ↓{}",
+                                            "Client {} command '{}' failed due to authentication error: {} | ↑{} ↓{}",
                                             self.client_addr,
                                             trimmed,
                                             e,
