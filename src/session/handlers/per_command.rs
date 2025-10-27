@@ -329,21 +329,27 @@ impl ClientSession {
 
         // Only remove backend connection if error occurred AND we didn't get data from backend
         // If we got data from backend, then any error is from writing to client
-        if let Err(ref e) = result {
-            if !got_backend_data && is_connection_error(e) {
-                warn!(
-                    "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
-                    self.client_addr, backend_id, e
-                );
-                remove_from_pool(pooled_conn);
-                router.complete_command_sync(backend_id);
-                return result.map(|_| backend_id);
-            } else if got_backend_data && is_connection_error(e) {
-                debug!(
-                    "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
-                    self.client_addr, backend_id
-                );
-            }
+        let should_remove = result
+            .as_ref()
+            .inspect_err(|e| {
+                if is_connection_error(e) {
+                    if got_backend_data {
+                        debug!(
+                            "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
+                            self.client_addr, backend_id
+                        );
+                    } else {
+                        warn!(
+                            "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
+                            self.client_addr, backend_id, e
+                        );
+                    }
+                }
+            })
+            .is_err_and(|e| !got_backend_data && is_connection_error(e));
+
+        if should_remove {
+            remove_from_pool(pooled_conn);
         }
 
         // Complete the request - decrement pending count (lock-free!)
