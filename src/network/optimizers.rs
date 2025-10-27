@@ -4,8 +4,8 @@
 //! allowing different optimization strategies for TCP and TLS connections.
 
 use crate::stream::ConnectionStream;
+use anyhow::{Context, Result};
 use socket2::SockRef;
-use std::io;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -23,7 +23,7 @@ const TOS_THROUGHPUT: u32 = 0x08;
 /// Trait for network optimization strategies
 pub trait NetworkOptimizer {
     /// Apply optimizations to improve network performance
-    fn optimize(&self) -> Result<(), io::Error>;
+    fn optimize(&self) -> Result<()>;
 
     /// Get a description of the optimization strategy
     fn description(&self) -> &'static str;
@@ -34,10 +34,19 @@ fn apply_core_optimizations(
     sock_ref: &SockRef,
     recv_buffer_size: usize,
     send_buffer_size: usize,
-) -> Result<(), io::Error> {
-    sock_ref.set_recv_buffer_size(recv_buffer_size)?;
-    sock_ref.set_send_buffer_size(send_buffer_size)?;
-    sock_ref.set_linger(Some(LINGER_TIMEOUT))?;
+) -> Result<()> {
+    sock_ref
+        .set_recv_buffer_size(recv_buffer_size)
+        .context("Failed to set TCP receive buffer size")?;
+
+    sock_ref
+        .set_send_buffer_size(send_buffer_size)
+        .context("Failed to set TCP send buffer size")?;
+
+    sock_ref
+        .set_linger(Some(LINGER_TIMEOUT))
+        .context("Failed to set SO_LINGER timeout")?;
+
     Ok(())
 }
 
@@ -102,11 +111,12 @@ impl<'a> TcpOptimizer<'a> {
 }
 
 impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
-    fn optimize(&self) -> Result<(), io::Error> {
+    fn optimize(&self) -> Result<()> {
         let sock_ref = SockRef::from(self.stream);
 
         // Core optimizations (required)
-        apply_core_optimizations(&sock_ref, self.recv_buffer_size, self.send_buffer_size)?;
+        apply_core_optimizations(&sock_ref, self.recv_buffer_size, self.send_buffer_size)
+            .context("Failed to apply core TCP optimizations")?;
 
         // Platform-specific optimizations (best-effort)
         #[cfg(target_os = "linux")]
@@ -160,13 +170,14 @@ impl<'a> TlsOptimizer<'a> {
 }
 
 impl<'a> NetworkOptimizer for TlsOptimizer<'a> {
-    fn optimize(&self) -> Result<(), io::Error> {
+    fn optimize(&self) -> Result<()> {
         // Get the underlying TCP stream for optimization
         let tcp_stream = self.stream.get_ref().0;
         let sock_ref = SockRef::from(tcp_stream);
 
         // Core optimizations (required)
-        apply_core_optimizations(&sock_ref, self.recv_buffer_size, self.send_buffer_size)?;
+        apply_core_optimizations(&sock_ref, self.recv_buffer_size, self.send_buffer_size)
+            .context("Failed to apply core TCP optimizations to TLS stream")?;
 
         // Platform-specific optimizations (best-effort)
         #[cfg(target_os = "linux")]
@@ -220,9 +231,9 @@ impl<'a> ConnectionOptimizer<'a> {
 }
 
 impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
-    fn optimize(&self) -> Result<(), io::Error> {
+    fn optimize(&self) -> Result<()> {
         // Use functional pattern matching to create and optimize in one step
-        let optimize_fn = |desc: &str, result: Result<(), io::Error>| {
+        let optimize_fn = |desc: &str, result: Result<()>| {
             debug!("Using {}", desc);
             result
         };

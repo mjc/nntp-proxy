@@ -43,7 +43,7 @@ impl SocketOptimizer {
     pub fn apply_to_connection_streams(
         client_stream: &ConnectionStream,
         backend_stream: &ConnectionStream,
-    ) -> Result<(), io::Error> {
+    ) -> anyhow::Result<()> {
         debug!("Applying connection optimizations with trait-based approach");
 
         let client_optimizer = ConnectionOptimizer::new(client_stream);
