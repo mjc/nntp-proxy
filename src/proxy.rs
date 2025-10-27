@@ -3,7 +3,7 @@
 //! This module contains the main `NntpProxy` struct which orchestrates
 //! connection handling, routing, and resource management.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -391,7 +391,7 @@ impl NntpProxy {
     /// to be routed to different backends based on load balancing.
     pub async fn handle_client_per_command_routing(
         &self,
-        mut client_stream: TcpStream,
+        client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
         debug!(
@@ -400,11 +400,13 @@ impl NntpProxy {
         );
 
         // Enable TCP_NODELAY for low latency
-        let _ = client_stream.set_nodelay(true);
+        if let Err(e) = client_stream.set_nodelay(true) {
+            debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
+        }
 
-        // Setup connection (prewarm and greeting)
-        self.setup_client_connection(&mut client_stream, client_addr)
-            .await?;
+        // NOTE: Don't call setup_client_connection here because handle_per_command_routing
+        // sends its own greeting ("200 NNTP Proxy Ready (Per-Command Routing)")
+        // Calling setup_client_connection would send a duplicate greeting
 
         // Create session with router for per-command routing
         let session = ClientSession::new_with_router(
@@ -414,14 +416,23 @@ impl NntpProxy {
             self.routing_mode,
         );
 
+        let session_id = crate::formatting::short_id(session.client_id().as_uuid());
+
         info!(
-            "Client {} (ID: {}) connected in per-command routing mode",
-            client_addr,
-            session.client_id()
+            "Client {} [{}] connected in per-command routing mode",
+            client_addr, session_id
         );
 
         // Handle the session with per-command routing
-        let result = session.handle_per_command_routing(client_stream).await;
+        let result = session
+            .handle_per_command_routing(client_stream)
+            .await
+            .with_context(|| {
+                format!(
+                    "Per-command routing session failed for {} [{}]",
+                    client_addr, session_id
+                )
+            });
 
         // Log session results
         match result {
@@ -429,7 +440,7 @@ impl NntpProxy {
                 info!(
                     "Session closed {} [{}] ↑{} ↓{}",
                     client_addr,
-                    crate::formatting::short_id(session.client_id().as_uuid()),
+                    session_id,
                     crate::formatting::format_bytes(client_to_backend),
                     crate::formatting::format_bytes(backend_to_client)
                 );
@@ -446,17 +457,10 @@ impl NntpProxy {
                 if is_broken_pipe {
                     debug!(
                         "Client {} [{}] disconnected: {} (normal for test connections)",
-                        client_addr,
-                        crate::formatting::short_id(session.client_id().as_uuid()),
-                        e
+                        client_addr, session_id, e
                     );
                 } else {
-                    warn!(
-                        "Session error {} [{}]: {}",
-                        client_addr,
-                        crate::formatting::short_id(session.client_id().as_uuid()),
-                        e
-                    );
+                    warn!("Session error {} [{}]: {}", client_addr, session_id, e);
                 }
             }
         }
