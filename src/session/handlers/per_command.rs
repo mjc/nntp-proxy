@@ -166,13 +166,15 @@ impl ClientSession {
                             {
                                 Ok(_backend_id) => {}
                                 Err(e) => {
-                                    // Provide detailed context for errors
-                                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                                        warn!(
-                                            "Client {} error routing '{}': {} | ↑{} ↓{}",
+                                    use crate::session::error_classification::ErrorClassifier;
+
+                                    // Classify error and handle appropriately
+                                    if ErrorClassifier::should_skip_client_error_response(&e) {
+                                        // Client disconnected - this is normal for downloads that complete
+                                        debug!(
+                                            "Client {} disconnected after '{}' | ↑{} ↓{}",
                                             self.client_addr,
                                             trimmed,
-                                            io_err,
                                             crate::formatting::format_bytes(
                                                 client_to_backend_bytes.as_u64()
                                             ),
@@ -181,10 +183,12 @@ impl ClientSession {
                                             )
                                         );
                                     } else {
-                                        error!(
-                                            "Error routing '{}' for client {}: {} | ↑{} ↓{}",
-                                            trimmed,
+                                        // Log based on error classification
+                                        let log_level = ErrorClassifier::log_level(&e);
+                                        let message = format!(
+                                            "Client {} error routing '{}': {} | ↑{} ↓{}",
                                             self.client_addr,
+                                            trimmed,
                                             e,
                                             crate::formatting::format_bytes(
                                                 client_to_backend_bytes.as_u64()
@@ -193,11 +197,19 @@ impl ClientSession {
                                                 backend_to_client_bytes.as_u64()
                                             )
                                         );
-                                    }
 
-                                    // Try to send error response, but don't log failure if client is gone
-                                    let _ = client_write.write_all(BACKEND_ERROR).await;
-                                    backend_to_client_bytes.add(BACKEND_ERROR.len());
+                                        match log_level {
+                                            tracing::Level::ERROR => error!("{}", message),
+                                            tracing::Level::WARN => warn!("{}", message),
+                                            tracing::Level::INFO => info!("{}", message),
+                                            tracing::Level::DEBUG => debug!("{}", message),
+                                            tracing::Level::TRACE => tracing::trace!("{}", message),
+                                        }
+
+                                        // Try to send error response
+                                        let _ = client_write.write_all(BACKEND_ERROR).await;
+                                        backend_to_client_bytes.add(BACKEND_ERROR.len());
+                                    }
 
                                     // For debugging test connections and small transfers, log detailed info
                                     if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
@@ -492,5 +504,80 @@ impl ClientSession {
         }
 
         (Ok(()), got_backend_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_message_id_valid() {
+        let command = "BODY <test@example.com>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_article_command() {
+        let command = "ARTICLE <1234@news.server>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<1234@news.server>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_head_command() {
+        let command = "HEAD <article@host.domain>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<article@host.domain>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_stat_command() {
+        let command = "STAT <msg@example.org>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<msg@example.org>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_no_brackets() {
+        let command = "GROUP comp.lang.rust";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, None);
+    }
+
+    #[test]
+    fn test_extract_message_id_malformed() {
+        let command = "BODY <incomplete";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, None);
+    }
+
+    #[test]
+    fn test_extract_message_id_with_extra_text() {
+        let command = "BODY <msg@host> extra stuff";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<msg@host>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_empty_brackets() {
+        let command = "BODY <>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_lowercase_command() {
+        let command = "body <test@example.com>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_mixed_case() {
+        let command = "BoDy <TeSt@ExAmPlE.cOm>";
+        let msgid = extract_message_id(command);
+        assert_eq!(msgid, Some("<TeSt@ExAmPlE.cOm>"));
     }
 }
