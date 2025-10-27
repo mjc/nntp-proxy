@@ -4,18 +4,79 @@
 //! allowing different optimization strategies for TCP and TLS connections.
 
 use crate::stream::ConnectionStream;
-use std::io;
+use anyhow::{Context, Result};
+use socket2::SockRef;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
 
+/// SO_LINGER timeout - prevents indefinite blocking on socket close
+const LINGER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP_USER_TIMEOUT - faster dead connection detection on Linux
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// IP_TOS value for throughput optimization
+const TOS_THROUGHPUT: u32 = 0x08;
+
 /// Trait for network optimization strategies
 pub trait NetworkOptimizer {
     /// Apply optimizations to improve network performance
-    fn optimize(&self) -> Result<(), io::Error>;
+    fn optimize(&self) -> Result<()>;
 
     /// Get a description of the optimization strategy
     fn description(&self) -> &'static str;
+}
+
+/// Apply core TCP optimizations to a socket reference
+fn apply_core_optimizations(
+    sock_ref: &SockRef,
+    recv_buffer_size: usize,
+    send_buffer_size: usize,
+) -> Result<()> {
+    sock_ref
+        .set_recv_buffer_size(recv_buffer_size)
+        .context("Failed to set TCP receive buffer size")?;
+
+    sock_ref
+        .set_send_buffer_size(send_buffer_size)
+        .context("Failed to set TCP send buffer size")?;
+
+    sock_ref
+        .set_linger(Some(LINGER_TIMEOUT))
+        .context("Failed to set SO_LINGER timeout")?;
+
+    Ok(())
+}
+
+/// Apply Linux-specific TCP optimizations (best-effort)
+#[cfg(target_os = "linux")]
+fn apply_linux_optimizations(sock_ref: &SockRef, context: &str) {
+    [
+        (
+            "TCP_USER_TIMEOUT",
+            sock_ref.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT)),
+        ),
+        ("IP_TOS", sock_ref.set_tos_v4(TOS_THROUGHPUT)),
+    ]
+    .into_iter()
+    .filter_map(|(name, result)| result.err().map(|e| (name, e)))
+    .for_each(|(name, err)| {
+        debug!("Failed to set {} on {}: {}", name, context, err);
+    });
+}
+
+/// Get platform-specific optimization description
+const fn platform_optimization_desc() -> &'static str {
+    match () {
+        #[cfg(target_os = "linux")]
+        () => ", tcp_user_timeout=30s, tos=0x08",
+        #[cfg(target_os = "windows")]
+        () => " (Windows)",
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        () => "",
+    }
 }
 
 /// TCP-specific optimizations for high-throughput scenarios
@@ -35,8 +96,12 @@ impl<'a> TcpOptimizer<'a> {
         }
     }
 
-    /// Create a TCP optimizer with custom buffer sizes
-    pub fn with_buffer_sizes(stream: &'a TcpStream, recv_size: usize, send_size: usize) -> Self {
+    /// Create optimizer with custom buffer sizes using builder pattern
+    pub const fn with_buffer_sizes(
+        stream: &'a TcpStream,
+        recv_size: usize,
+        send_size: usize,
+    ) -> Self {
         Self {
             stream,
             recv_buffer_size: recv_size,
@@ -46,18 +111,23 @@ impl<'a> TcpOptimizer<'a> {
 }
 
 impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
-    fn optimize(&self) -> Result<(), io::Error> {
-        use socket2::SockRef;
-
+    fn optimize(&self) -> Result<()> {
         let sock_ref = SockRef::from(self.stream);
 
-        // Set larger buffer sizes for high throughput
-        sock_ref.set_recv_buffer_size(self.recv_buffer_size)?;
-        sock_ref.set_send_buffer_size(self.send_buffer_size)?;
+        // Core optimizations (required)
+        apply_core_optimizations(&sock_ref, self.recv_buffer_size, self.send_buffer_size)
+            .context("Failed to apply core TCP optimizations")?;
+
+        // Platform-specific optimizations (best-effort)
+        #[cfg(target_os = "linux")]
+        apply_linux_optimizations(&sock_ref, "TCP stream");
 
         debug!(
-            "Applied TCP optimizations: recv_buffer={}, send_buffer={}",
-            self.recv_buffer_size, self.send_buffer_size
+            "Applied TCP optimizations: recv_buffer={}, send_buffer={}, linger={}s{}",
+            self.recv_buffer_size,
+            self.send_buffer_size,
+            LINGER_TIMEOUT.as_secs(),
+            platform_optimization_desc()
         );
 
         Ok(())
@@ -85,8 +155,8 @@ impl<'a> TlsOptimizer<'a> {
         }
     }
 
-    /// Create a TLS optimizer with custom buffer sizes
-    pub fn with_buffer_sizes(
+    /// Create optimizer with custom buffer sizes using builder pattern
+    pub const fn with_buffer_sizes(
         stream: &'a TlsStream<TcpStream>,
         recv_size: usize,
         send_size: usize,
@@ -100,20 +170,25 @@ impl<'a> TlsOptimizer<'a> {
 }
 
 impl<'a> NetworkOptimizer for TlsOptimizer<'a> {
-    fn optimize(&self) -> Result<(), io::Error> {
-        use socket2::SockRef;
-
+    fn optimize(&self) -> Result<()> {
         // Get the underlying TCP stream for optimization
         let tcp_stream = self.stream.get_ref().0;
         let sock_ref = SockRef::from(tcp_stream);
 
-        // Apply TCP-level optimizations to the underlying stream
-        sock_ref.set_recv_buffer_size(self.recv_buffer_size)?;
-        sock_ref.set_send_buffer_size(self.send_buffer_size)?;
+        // Core optimizations (required)
+        apply_core_optimizations(&sock_ref, self.recv_buffer_size, self.send_buffer_size)
+            .context("Failed to apply core TCP optimizations to TLS stream")?;
+
+        // Platform-specific optimizations (best-effort)
+        #[cfg(target_os = "linux")]
+        apply_linux_optimizations(&sock_ref, "TLS stream");
 
         debug!(
-            "Applied TLS optimizations to underlying TCP stream: recv_buffer={}, send_buffer={}",
-            self.recv_buffer_size, self.send_buffer_size
+            "Applied TLS optimizations to underlying TCP stream: recv_buffer={}, send_buffer={}, linger={}s{}",
+            self.recv_buffer_size,
+            self.send_buffer_size,
+            LINGER_TIMEOUT.as_secs(),
+            platform_optimization_desc()
         );
 
         Ok(())
@@ -156,38 +231,32 @@ impl<'a> ConnectionOptimizer<'a> {
 }
 
 impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
-    fn optimize(&self) -> Result<(), io::Error> {
-        match (self.recv_buffer_size, self.send_buffer_size) {
-            (Some(recv), Some(send)) => {
-                // Use custom buffer sizes
-                match self.stream {
-                    ConnectionStream::Plain(tcp) => {
-                        let optimizer = TcpOptimizer::with_buffer_sizes(tcp, recv, send);
-                        debug!("Using {} with custom buffers", optimizer.description());
-                        optimizer.optimize()
-                    }
-                    ConnectionStream::Tls(tls) => {
-                        let optimizer = TlsOptimizer::with_buffer_sizes(tls.as_ref(), recv, send);
-                        debug!("Using {} with custom buffers", optimizer.description());
-                        optimizer.optimize()
-                    }
-                }
-            }
-            _ => {
-                // Use default buffer sizes
-                match self.stream {
-                    ConnectionStream::Plain(tcp) => {
-                        let optimizer = TcpOptimizer::new(tcp);
-                        debug!("Using {}", optimizer.description());
-                        optimizer.optimize()
-                    }
-                    ConnectionStream::Tls(tls) => {
-                        let optimizer = TlsOptimizer::new(tls.as_ref());
-                        debug!("Using {}", optimizer.description());
-                        optimizer.optimize()
-                    }
-                }
-            }
+    fn optimize(&self) -> Result<()> {
+        // Use functional pattern matching to create and optimize in one step
+        let optimize_fn = |desc: &str, result: Result<()>| {
+            debug!("Using {}", desc);
+            result
+        };
+
+        match (self.recv_buffer_size, self.send_buffer_size, self.stream) {
+            // Custom buffer sizes
+            (Some(recv), Some(send), ConnectionStream::Plain(tcp)) => optimize_fn(
+                "TCP high-throughput optimization with custom buffers",
+                TcpOptimizer::with_buffer_sizes(tcp, recv, send).optimize(),
+            ),
+            (Some(recv), Some(send), ConnectionStream::Tls(tls)) => optimize_fn(
+                "TLS optimization via underlying TCP stream with custom buffers",
+                TlsOptimizer::with_buffer_sizes(tls.as_ref(), recv, send).optimize(),
+            ),
+            // Default buffer sizes
+            (_, _, ConnectionStream::Plain(tcp)) => optimize_fn(
+                "TCP high-throughput optimization",
+                TcpOptimizer::new(tcp).optimize(),
+            ),
+            (_, _, ConnectionStream::Tls(tls)) => optimize_fn(
+                "TLS optimization via underlying TCP stream",
+                TlsOptimizer::new(tls.as_ref()).optimize(),
+            ),
         }
     }
 
