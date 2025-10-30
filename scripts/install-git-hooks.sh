@@ -21,9 +21,6 @@ cat > "$HOOK_FILE" << 'EOF'
 
 set -e
 
-# Unset cross-compilation env vars that might interfere
-unset CC CXX AR
-
 echo "Running cargo fmt..."
 cargo fmt --check
 if [ $? -ne 0 ]; then
