@@ -1,7 +1,7 @@
 //! TLS configuration and handshake management for NNTP connections
 //!
 //! This module provides high-performance TLS support using rustls with optimizations:
-//! - aws-lc-rs (non-Windows) or ring (Windows) crypto providers for fastest operations
+//! - Ring crypto provider for pure Rust crypto operations
 //! - TLS 1.3 early data (0-RTT) enabled for faster reconnections
 //! - Session resumption enabled to avoid full handshakes
 //! - Pure Rust implementation (memory safe, no C dependencies)
@@ -397,55 +397,23 @@ impl TlsManager {
         use rustls_backend::NoVerifier;
 
         let mut client_config = if config.tls_verify_cert {
-            #[cfg(not(windows))]
-            {
-                debug!("TLS: Certificate verification enabled with aws-lc-rs crypto provider");
-                ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::aws_lc_rs::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .context("Failed to create TLS config with aws-lc-rs provider")?
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-            }
-            #[cfg(windows)]
-            {
-                debug!("TLS: Certificate verification enabled with ring crypto provider");
-                ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
+            debug!("TLS: Certificate verification enabled with ring crypto provider");
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .context("Failed to create TLS config with ring provider")?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
-            }
         } else {
             warn!(
                 "TLS: Certificate verification DISABLED - this is insecure and should only be used for testing!"
             );
             // Use custom verifier that accepts all certificates
-            #[cfg(not(windows))]
-            {
-                ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::aws_lc_rs::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .context("Failed to create TLS config with aws-lc-rs provider")?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth()
-            }
-            #[cfg(windows)]
-            {
-                ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .context("Failed to create TLS config with ring provider")?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
                 .with_no_client_auth()
-            }
         };
 
         // Performance optimizations

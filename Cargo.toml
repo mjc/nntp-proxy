@@ -26,33 +26,24 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["net", "rt-multi-thread", "io-util", "time", "macros", "signal"] }
-clap = { version = "4.0", features = ["derive", "env"] }
+clap = { version = "4.0", features = ["derive", "env", "std"], default-features = false }
 serde = { version = "1.0", features = ["derive", "rc"] }
 toml = "0.9"
-tracing = { version = "0.1", features = ["std", "release_max_level_info"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "ansi"] }
+tracing = { version = "0.1", features = ["std"], default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"], default-features = false }
 anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
-crossbeam = { version = "0.8", features = ["nightly"] }  # Lock-free data structures with nightly optimizations
+crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data structures with minimal features
 nix = { version = "0.30", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.12.3"
 async-trait = "0.1.89"
 memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
-moka = { version = "0.12", features = ["future", "atomic64"] }  # Async LRU cache with 64-bit atomic optimizations
+moka = { version = "0.12", features = ["future"], default-features = false }  # Async LRU cache, minimal features
 bytes = "1.0"  # Efficient byte buffer for zero-copy operations
 
-# TLS dependencies - use ring-only on Windows to avoid aws-lc-sys CMAKE issues with cargo-zigbuild
-[target.'cfg(not(windows))'.dependencies]
-tokio-rustls = { version = "0.26", features = ["early-data"] }  # TLS support (aws-lc-rs default)
-rustls = "0.23"  # Pure Rust TLS implementation with aws-lc-rs
-rustls-native-certs = "0.8"  # Load system CA certificates
-rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
-rustls-pki-types = "1.8"  # PKI types for rustls
-webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
-
-[target.'cfg(windows)'.dependencies]
+# TLS dependencies - use ring for smaller binaries (pure Rust, no C dependencies)
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
 rustls = { version = "0.23", features = ["ring", "std"], default-features = false }  # Pure Rust TLS with ring only
 rustls-native-certs = "0.8"  # Load system CA certificates
@@ -77,4 +68,10 @@ harness = false
 
 
 [profile.release]
-debug = true
+debug = false          # No debug symbols for smaller binaries
+strip = true          # Strip symbols for even smaller size  
+lto = true            # Link-time optimization for better performance
+codegen-units = 1     # Single codegen unit for better optimization
+panic = "abort"       # Abort on panic for smaller binaries (no unwinding)
+opt-level = "z"       # Optimize for size instead of speed
+overflow-checks = true  # Keep overflow checks for safety with untrusted network data

@@ -83,6 +83,10 @@
         zig
         cmake
         nasm
+        # Build script dependencies
+        jq # JSON parsing for version detection
+        zip # Windows release archives
+        # tar is already available in most shells
         # Windows cross-compilation - we need binutils (dlltool) but not the full mingw CC/CXX
         pkgsCross.mingwW64.buildPackages.binutils
       ];
