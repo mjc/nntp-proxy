@@ -20,8 +20,22 @@ set -euo pipefail
 #   - macOS: aws-lc-rs (native builds work fine)
 # ============================================================================
 
+# Check for jq if version argument is not provided
+if [ -z "$1" ]; then
+    if ! command -v jq &> /dev/null; then
+        echo "Error: jq is required but not installed. Please install jq to continue." >&2
+        exit 1
+    fi
+fi
+
 # Determine version from argument or Cargo.toml
 VERSION=${1:-$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')}
+
+# Validate VERSION to prevent directory traversal attacks
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9._-]+)?$ ]]; then
+    echo "Error: Invalid version format '$VERSION'. Expected semver format (e.g., 1.0.0)." >&2
+    exit 1
+fi
 
 # Detect host platform
 HOST_OS=$(uname -s | tr '[:upper:]' '[:lower:]')

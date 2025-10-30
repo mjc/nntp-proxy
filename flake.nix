@@ -160,7 +160,7 @@
 
           # Add nightly toolchain to PATH for cross-compilation
           export PATH="${rustNightlyToolchain}/bin:$PATH"
-          export RUSTUP_TOOLCHAIN="${rustNightlyToolchain}"
+          export RUSTUP_TOOLCHAIN="nightly"
 
           # Ensure no CC/CXX pollution - cargo-zigbuild uses Zig as linker
           unset CC
