@@ -26,43 +26,75 @@
         extensions = ["rust-src" "rust-analyzer"];
       };
 
-      nativeBuildInputs = with pkgs; [
-        rustToolchain
-        pkg-config
+      # Nightly toolchain with all cross-compilation targets for releases
+      rustNightlyToolchain = pkgs.rust-bin.nightly.latest.default.override {
+        extensions = ["rust-src"];
+        targets =
+          [
+            # Always include these common targets
+            "x86_64-unknown-linux-gnu"
+            "aarch64-unknown-linux-gnu"
+            "x86_64-pc-windows-gnu"
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            # Only include Apple targets on macOS hosts where they can be built
+            "x86_64-apple-darwin"
+            "aarch64-apple-darwin"
+          ]
+          ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+            # Add additional Windows target for Linux hosts
+            "aarch64-pc-windows-msvc"
+          ];
+      };
 
-        # Performance profiling
-        cargo-flamegraph
-        linuxPackages.perf
+      # Basic development dependencies (no cross-compilation pollution)
+      basicNativeBuildInputs = with pkgs;
+        [
+          rustToolchain
+          pkg-config
 
-        # Code quality & linting
-        cargo-deny
-        cargo-audit
+          # Code quality & linting
+          cargo-deny
+          cargo-audit
 
-        # Testing & coverage
-        cargo-tarpaulin
-        cargo-nextest
-        cargo-mutants
+          # Testing & coverage
+          cargo-tarpaulin
+          cargo-nextest
+          cargo-mutants
 
-        # Build & dependencies
-        cargo-outdated
-        cargo-bloat
+          # Build & dependencies
+          cargo-outdated
+          cargo-bloat
 
-        # Utilities
-        gh
+          # Utilities
+          gh
+
+          # Performance profiling
+          cargo-flamegraph
+        ]
+        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          perf
+        ];
+
+      # Cross-compilation tools (separate to avoid environment pollution)
+      crossCompilationTools = with pkgs; [
+        rustNightlyToolchain # For cross-compilation builds
+        cargo-zigbuild
+        zig
+        cmake
+        nasm
+        # Windows cross-compilation - we need binutils (dlltool) but not the full mingw CC/CXX
+        pkgsCross.mingwW64.buildPackages.binutils
       ];
 
-      buildInputs = with pkgs;
-        [
-          openssl
-          zlib
-        ]
-        ++ lib.optionals stdenv.isDarwin [
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
-        ];
+      buildInputs = with pkgs; [
+        openssl
+        zlib
+      ];
     in {
       devShells.default = pkgs.mkShell {
-        inherit nativeBuildInputs buildInputs;
+        nativeBuildInputs = basicNativeBuildInputs;
+        inherit buildInputs;
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
@@ -73,12 +105,15 @@
           echo "   Cargo version: $(cargo --version)"
           echo "   OpenSSL version: ${pkgs.openssl.version}"
           echo ""
+          echo "🔧 Cross-compilation: Use './scripts/build-release.sh <version>' with nightly toolchain"
+          echo ""
           echo "📦 Available commands:"
           echo "   cargo build       - Build the project"
           echo "   cargo run         - Run the NNTP proxy"
           echo "   cargo test        - Run tests"
           echo "   cargo clippy      - Run linter"
           echo "   cargo fmt         - Format code"
+          echo "   ./scripts/build-release.sh <version> - Build all release binaries"
           echo ""
           echo "🔍 Code quality:"
           echo "   cargo deny check  - Check dependencies for security/licenses"
@@ -92,7 +127,9 @@
           echo "⚡ Performance:"
           echo "   cargo flamegraph  - Generate performance flamegraph"
           echo "   cargo bench       - Run benchmarks"
-          echo "   perf              - Linux performance analysis tools"
+          ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            echo "   perf              - Linux performance analysis tools"
+          ''}
           echo ""
           echo "📊 Dependencies:"
           echo "   cargo outdated    - Check for outdated dependencies"
@@ -109,6 +146,38 @@
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
       };
 
+      # Cross-compilation shell with all the tooling
+      # NOTE: We use cargo-zigbuild which uses Zig as the linker for cross-compilation.
+      # We do NOT need pkgsCross.mingwW64 tools as they pollute CC/CXX environment variables
+      # and cause conflicts with CMAKE builds. Zig handles all cross-compilation itself.
+      devShells.cross = pkgs.mkShell {
+        nativeBuildInputs = basicNativeBuildInputs ++ crossCompilationTools;
+        inherit buildInputs;
+
+        shellHook = ''
+          export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
+          export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
+
+          # Add nightly toolchain to PATH for cross-compilation
+          export PATH="${rustNightlyToolchain}/bin:$PATH"
+          export RUSTUP_TOOLCHAIN="nightly"
+
+          # Ensure no CC/CXX pollution - cargo-zigbuild uses Zig as linker
+          unset CC
+          unset CXX
+          unset AR
+          unset RANLIB
+
+          echo "🦀 Cross-compilation environment loaded!"
+          echo "   Nightly toolchain: ${rustNightlyToolchain}/bin/rustc"
+          echo "   Using cargo-zigbuild with Zig as linker (no mingw pollution)"
+          echo ""
+        '';
+
+        OPENSSL_DIR = "${pkgs.openssl.dev}";
+        OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
+        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
+      };
       packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "nntp-proxy";
         version = "0.1.0";
@@ -118,7 +187,8 @@
           lockFile = ./Cargo.lock;
         };
 
-        inherit nativeBuildInputs buildInputs;
+        nativeBuildInputs = basicNativeBuildInputs;
+        inherit buildInputs;
 
         # Environment variables for building with OpenSSL
         OPENSSL_DIR = "${pkgs.openssl.dev}";

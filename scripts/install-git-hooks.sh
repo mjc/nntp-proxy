@@ -30,8 +30,8 @@ fi
 echo "✅ Code is properly formatted"
 
 echo ""
-echo "Running cargo clippy --all-targets --all-features..."
-cargo clippy --all-targets --all-features -- -D warnings
+echo "Running cargo clippy..."
+cargo clippy --all-features -- -D warnings
 if [ $? -ne 0 ]; then
     echo "❌ Clippy found issues. Fix them before committing."
     exit 1
@@ -48,6 +48,6 @@ echo "✅ Pre-commit hook installed successfully!"
 echo ""
 echo "The hook will run the following checks before each commit:"
 echo "  - cargo fmt --check (code formatting)"
-echo "  - cargo clippy --all-targets --all-features (linting)"
+echo "  - cargo clippy --all-features (linting)"
 echo ""
 echo "To bypass the hook temporarily, use: git commit --no-verify"

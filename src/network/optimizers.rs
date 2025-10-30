@@ -4,11 +4,11 @@
 //! allowing different optimization strategies for TCP and TLS connections.
 
 use crate::stream::ConnectionStream;
+use crate::tls::TlsStream;
 use anyhow::{Context, Result};
 use socket2::SockRef;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
 use tracing::debug;
 
 /// SO_LINGER timeout - prevents indefinite blocking on socket close

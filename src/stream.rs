@@ -3,12 +3,12 @@
 //! This module provides abstractions for handling different stream types (TCP, TLS, etc.)
 //! in a unified way. This is preparation for adding SSL/TLS support to backend connections.
 
+use crate::tls::TlsStream;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
 
 /// Trait for async streams that can be used for NNTP connections
 ///

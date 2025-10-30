@@ -25,3 +25,6 @@ config.toml
 flamegraph.svg
 perf.data*
 cache-config.toml
+
+# Release binaries
+/release/
