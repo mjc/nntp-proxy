@@ -1,7 +1,7 @@
 //! TLS configuration and handshake management for NNTP connections
 //!
 //! This module provides high-performance TLS support using rustls with optimizations:
-//! - Ring crypto provider for fastest cryptographic operations
+//! - aws-lc-rs (non-Windows) or ring (Windows) crypto providers for fastest operations
 //! - TLS 1.3 early data (0-RTT) enabled for faster reconnections
 //! - Session resumption enabled to avoid full handshakes
 //! - Pure Rust implementation (memory safe, no C dependencies)
