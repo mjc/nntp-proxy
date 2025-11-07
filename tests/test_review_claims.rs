@@ -238,7 +238,13 @@ async fn test_auth_attempts_are_serialized_per_connection() {
 /// the number of bytes read.
 #[tokio::test]
 async fn test_uninit_buffer_pattern_is_safe() {
-    // This is the exact pattern used in buffer pool
+    /// This is the exact pattern used in buffer pool
+    ///
+    /// # Safety
+    ///
+    /// The returned buffer contains uninitialized memory and must only be used with
+    /// `AsyncRead`/`AsyncWrite` operations that initialize bytes before reading them.
+    /// Only access `&buf[..n]` where `n` is the number of bytes actually written.
     fn create_buffer(size: usize) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(size);
         unsafe {

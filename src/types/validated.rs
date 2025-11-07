@@ -66,8 +66,7 @@ macro_rules! validated_string {
         impl $name {
             #[doc = concat!("Create a new ", stringify!($name), " after validation")]
             pub fn new($s_param: String) -> Result<Self, ValidationError> {
-                let validate = || $validation;
-                validate()?;
+                $validation?;
                 Ok(Self($s_param))
             }
 
