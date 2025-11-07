@@ -279,7 +279,7 @@ impl NntpResponse {
         current_len: usize,
     ) -> bool {
         // Only check if we have a tail and current chunk is small enough for spanning
-        if tail_len < 2 || !(1..=4).contains(&current_len) {
+        if tail_len < 1 || !(1..=4).contains(&current_len) {
             return false;
         }
 
