@@ -190,10 +190,11 @@ async fn test_auth_handler_debug_redacts_credentials() {
 
     let debug_output = format!("{:?}", handler);
 
+    // Credentials should not appear in debug output
     assert!(!debug_output.contains("supersecret"));
     assert!(!debug_output.contains("topsecretpassword"));
-    assert!(debug_output.contains("<redacted>"));
     assert!(debug_output.contains("AuthHandler"));
+    assert!(debug_output.contains("enabled: true"));
 }
 
 #[tokio::test]
@@ -203,7 +204,7 @@ async fn test_auth_handler_debug_when_disabled() {
     let debug_output = format!("{:?}", handler);
 
     assert!(debug_output.contains("AuthHandler"));
-    assert!(debug_output.contains("None"));
+    assert!(debug_output.contains("enabled: false"));
 }
 
 #[tokio::test]
