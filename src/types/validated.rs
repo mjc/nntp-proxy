@@ -66,7 +66,7 @@ macro_rules! validated_string {
         $vis struct $name(String);
 
         impl $name {
-            #[doc = concat!("Create a new ", stringify!($name), ", validating that it's not empty")]
+            #[doc = concat!("Create a new ", stringify!($name), " after validation")]
             pub fn new($s_param: String) -> Result<Self, ValidationError> {
                 let validate = || $validation;
                 validate()?;

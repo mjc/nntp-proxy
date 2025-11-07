@@ -83,6 +83,14 @@ impl BufferPool {
     ///
     /// Returns a raw Vec<u8> that will be wrapped in PooledBuffer by get_buffer().
     /// The buffer is NOT zero-initialized for performance.
+    ///
+    /// # Safety
+    ///
+    /// The returned buffer contains uninitialized memory. Callers must ensure that the buffer
+    /// is only used with `AsyncRead`/`AsyncWrite` operations that fully initialize the bytes
+    /// before they are read. Only the initialized portion of the buffer (`&buf[..n]`, where `n`
+    /// is the number of bytes read or written) may be accessed. Accessing uninitialized bytes
+    /// is undefined behavior.
     #[allow(clippy::uninit_vec)]
     fn create_aligned_buffer(size: usize) -> Vec<u8> {
         // Align to page boundaries (4KB) for better memory performance
