@@ -482,6 +482,7 @@ impl ClientSession {
                 n,
                 self.client_addr,
                 backend_id,
+                &self.buffer_pool,
             )
             .await
             {
