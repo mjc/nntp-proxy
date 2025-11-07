@@ -1,54 +1,26 @@
-# Build stage
-FROM rust:1.80-slim as builder
-
+# Stage 1: build the Rust binary using nightly
+FROM rust:nightly-slim AS builder
 WORKDIR /usr/src/app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy manifest files
-COPY Cargo.toml Cargo.lock ./
+# Install dependencies for building
+RUN apt-get update && apt-get install -y pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Copy source code
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
-# Build the application
+# Build release
 RUN cargo build --release
 
-# Runtime stage
+# Stage 2: final lightweight image
 FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash nntp-proxy
-
-# Create directories
-RUN mkdir -p /etc/nntp-proxy /var/log/nntp-proxy
-RUN chown nntp-proxy:nntp-proxy /var/log/nntp-proxy
-
-# Copy the binary from builder stage
+# Copy binary from builder
 COPY --from=builder /usr/src/app/target/release/nntp-proxy /usr/local/bin/nntp-proxy
 
-# Copy default config
-COPY config.toml /etc/nntp-proxy/config.toml
-RUN chown -R nntp-proxy:nntp-proxy /etc/nntp-proxy
+# Working directory for mounted config
+WORKDIR /config
 
-# Switch to non-root user
-USER nntp-proxy
-
-# Expose port
-EXPOSE 8119
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD nc -z localhost 8119 || exit 1
-
-# Run the application
-CMD ["/usr/local/bin/nntp-proxy", "--config", "/etc/nntp-proxy/config.toml"]
+# Run nntp-proxy
+CMD ["nntp-proxy", "-c", "/config/config.toml"]
