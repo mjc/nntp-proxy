@@ -58,14 +58,6 @@ serial_test = "3.2"
 serde_json = "1.0"  # For testing serde implementations
 divan = "0.1"  # Modern benchmarking framework
 
-[[bench]]
-name = "command_parsing"
-harness = false
-
-[[bench]]
-name = "response_parsing"
-harness = false
-
 
 [profile.release]
 debug = false          # No debug symbols for smaller binaries

@@ -6,11 +6,11 @@ WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Copy source code
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src/ src/
 
 # Build release
-RUN cargo build --release
+RUN cargo build --release --bins
 
 # Stage 2: final lightweight image
 FROM debian:bookworm-slim
