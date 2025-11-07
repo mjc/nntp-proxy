@@ -3,6 +3,19 @@
 //! This module provides a CommandHandler that processes NNTP commands
 //! and returns actions to be taken, separating command interpretation
 //! from command execution.
+//!
+//! # NNTP Response Codes
+//!
+//! Response codes follow RFC 3977 Section 3.2:
+//! <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2>
+//!
+//! ## Codes Used
+//!
+//! - `480` Authentication required
+//!   <https://www.rfc-editor.org/rfc/rfc4643.html#section-2.4.1>
+//! - `502` Command not implemented  
+//!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
+//!   Used when a command is recognized but not supported by this server
 
 use super::classifier::NntpCommand;
 
@@ -12,7 +25,7 @@ use super::classifier::NntpCommand;
 pub enum CommandAction {
     /// Intercept and send authentication response to client
     InterceptAuth(AuthAction),
-    /// Reject the command with an error message
+    /// Reject the command with an error message (NNTP response format with CRLF)
     Reject(&'static str),
     /// Forward the command to backend (stateless)
     ForwardStateless,
@@ -58,11 +71,15 @@ impl CommandHandler {
                 CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
             }
             NntpCommand::Stateful => {
-                CommandAction::Reject("Command not supported by this proxy (stateless proxy mode)")
+                // RFC 3977 Section 3.2.1: 502 Command not implemented
+                // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
+                CommandAction::Reject("502 Command not implemented in stateless proxy mode\r\n")
             }
-            NntpCommand::NonRoutable => CommandAction::Reject(
-                "Command not supported by this proxy (per-command routing mode)",
-            ),
+            NntpCommand::NonRoutable => {
+                // RFC 3977 Section 3.2.1: 502 Command not implemented
+                // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
+                CommandAction::Reject("502 Command not implemented in per-command routing mode\r\n")
+            }
             NntpCommand::ArticleByMessageId => CommandAction::ForwardStateless,
             NntpCommand::Stateless => CommandAction::ForwardStateless,
         }
@@ -381,5 +398,136 @@ mod tests {
         assert!(stateful_reject.contains("stateless"));
         assert!(routing_reject.contains("routing"));
         assert_ne!(stateful_reject, routing_reject);
+    }
+
+    #[test]
+    fn test_reject_response_format() {
+        // RFC 3977 Section 3.1: Response format is "xyz text\r\n"
+        // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.1
+
+        let CommandAction::Reject(response) = CommandHandler::handle_command("GROUP alt.test")
+        else {
+            panic!("Expected Reject")
+        };
+
+        // Must start with 3-digit status code
+        assert!(response.len() >= 3, "Response too short");
+        assert!(
+            response[0..3].chars().all(|c| c.is_ascii_digit()),
+            "First 3 chars must be digits, got: {}",
+            &response[0..3]
+        );
+
+        // Must have space after status code
+        assert_eq!(&response[3..4], " ", "Must have space after status code");
+
+        // Must end with CRLF
+        assert!(response.ends_with("\r\n"), "Response must end with CRLF");
+
+        // Status code must be 502 (Command not implemented)
+        // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
+        assert!(
+            response.starts_with("502 "),
+            "Expected 502 status code, got: {}",
+            response
+        );
+    }
+
+    #[test]
+    fn test_all_reject_responses_are_valid_nntp() {
+        // Test all commands that produce Reject responses
+        let reject_commands = vec![
+            "GROUP alt.test",
+            "NEXT",
+            "LAST",
+            "POST",
+            "IHAVE <test@example.com>",
+            "NEWGROUPS 20240101 000000 GMT",
+        ];
+
+        for cmd in reject_commands {
+            let CommandAction::Reject(response) = CommandHandler::handle_command(cmd) else {
+                panic!("Expected Reject for command: {}", cmd);
+            };
+
+            // All must be valid NNTP format
+            assert!(
+                response.len() >= 5,
+                "Response too short for {}: {}",
+                cmd,
+                response
+            );
+            assert!(
+                response.starts_with(|c: char| c.is_ascii_digit()),
+                "Must start with digit for {}: {}",
+                cmd,
+                response
+            );
+            assert!(
+                response.ends_with("\r\n"),
+                "Must end with CRLF for {}: {}",
+                cmd,
+                response
+            );
+            assert!(
+                response.contains(' '),
+                "Must have space separator for {}: {}",
+                cmd,
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn test_502_status_code_usage() {
+        // RFC 3977 Section 3.2.1: 502 is "Command not implemented"
+        // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
+        // "The command is not presently implemented by the server, although
+        //  it may be implemented in the future."
+
+        // Stateful commands in stateless mode
+        let CommandAction::Reject(response) = CommandHandler::handle_command("GROUP alt.test")
+        else {
+            panic!("Expected Reject");
+        };
+        assert!(
+            response.starts_with("502 "),
+            "Stateful commands should return 502, got: {}",
+            response
+        );
+
+        // Non-routable commands in routing mode
+        let CommandAction::Reject(response) = CommandHandler::handle_command("POST") else {
+            panic!("Expected Reject");
+        };
+        assert!(
+            response.starts_with("502 "),
+            "Non-routable commands should return 502, got: {}",
+            response
+        );
+    }
+
+    #[test]
+    fn test_response_messages_are_descriptive() {
+        // Responses should explain why the command is rejected
+        let CommandAction::Reject(stateful) = CommandHandler::handle_command("GROUP alt.test")
+        else {
+            panic!("Expected Reject");
+        };
+        assert!(
+            stateful.to_lowercase().contains("stateless")
+                || stateful.to_lowercase().contains("mode"),
+            "Should explain stateless mode restriction: {}",
+            stateful
+        );
+
+        let CommandAction::Reject(routing) = CommandHandler::handle_command("POST") else {
+            panic!("Expected Reject");
+        };
+        assert!(
+            routing.to_lowercase().contains("routing") || routing.to_lowercase().contains("mode"),
+            "Should explain routing mode restriction: {}",
+            routing
+        );
     }
 }

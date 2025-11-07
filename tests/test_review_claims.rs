@@ -302,7 +302,7 @@ async fn test_buffer_pool_safety_across_cycles() {
     {
         let mut buffer = pool.get_buffer().await;
         let test_data = b"First use";
-        buffer[..test_data.len()].copy_from_slice(test_data);
+        buffer.copy_from_slice(test_data);
         assert_eq!(&buffer[..test_data.len()], test_data);
         // buffer auto-returns to pool on drop
     }
@@ -314,7 +314,7 @@ async fn test_buffer_pool_safety_across_cycles() {
         // 1. We'll overwrite it with new data via AsyncRead
         // 2. We only access buf[..n] where n is bytes actually read
         let new_data = b"Second use";
-        buffer[..new_data.len()].copy_from_slice(new_data);
+        buffer.copy_from_slice(new_data);
         assert_eq!(&buffer[..new_data.len()], new_data);
     }
 
