@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2025-11-07
+
+### Added
+- **Client Authentication System**
+  - Config-file based client authentication support
+  - Credential validation against configured users
+  - Authentication caching for improved performance
+  - RFC-compliant NNTP response codes (480, 481, 482)
+  - Comprehensive authentication security tests (bypass prevention, integration, security)
+  
+### Changed
+- **Performance Optimizations**
+  - Introduced `PooledBuffer` type to eliminate repeated 64KB Vec allocations
+  - Optimized authentication hot path to restore 80MB/s throughput
+  - Eliminated Vec allocations in streaming functions
+  - Reduced buffer allocation overhead with smarter initialization tracking
+  
+- **Code Quality**
+  - Made `AuthHandler` more idiomatic Rust
+  - Extracted `route_command_with_error_handling` helper to reduce duplication
+  - Simplified `PooledBuffer` API to prevent undefined behavior
+  - Removed unused macro parameters from `validated_string!`
+  
+### Fixed
+- **Response Parsing**
+  - Fixed bug in `has_spanning_terminator` with comprehensive test coverage
+  - Proper tracking of initialized bytes in `PooledBuffer` to prevent reading uninitialized memory
+  
+### Improved
+- **Test Coverage**
+  - Added comprehensive authentication tests (bypass prevention, integration, security scenarios)
+  - Added tests for RFC-compliant response codes
+  - Added tests proving authentication design correctness
+  - Overall test suite expanded significantly for authentication features
+
 ## [0.2.1] - 2025-10-27
 
 ### Fixed
@@ -150,6 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Docker support
   - Development documentation
 
+[0.2.2]: https://github.com/mjc/nntp-proxy/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/mjc/nntp-proxy/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mjc/nntp-proxy/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mjc/nntp-proxy/releases/tag/v0.1.0
