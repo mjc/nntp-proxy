@@ -56,6 +56,9 @@ pub struct Config {
     /// Cache configuration (optional, for caching proxy)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheConfig>,
+    /// Client authentication configuration
+    #[serde(default)]
+    pub client_auth: ClientAuthConfig,
 }
 
 /// Cache configuration for article caching
@@ -105,6 +108,27 @@ impl Default for HealthCheckConfig {
             timeout: super::defaults::health_check_timeout(),
             unhealthy_threshold: super::defaults::unhealthy_threshold(),
         }
+    }
+}
+
+/// Client authentication configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ClientAuthConfig {
+    /// Required username for client authentication (if set, auth is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Required password for client authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Optional custom greeting message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub greeting: Option<String>,
+}
+
+impl ClientAuthConfig {
+    /// Check if authentication is enabled
+    pub fn is_enabled(&self) -> bool {
+        self.username.is_some() && self.password.is_some()
     }
 }
 

@@ -6,10 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use crate::auth::AuthHandler;
-use crate::command::{AuthAction, CommandAction, CommandHandler};
+use crate::command::CommandHandler;
 use crate::constants::buffer::COMMAND;
-use crate::protocol::COMMAND_NOT_SUPPORTED_STATELESS;
+use crate::types::BytesTransferred;
 
 impl ClientSession {
     /// Handle a client connection with a dedicated backend connection (standard 1:1 mode)
@@ -28,8 +27,8 @@ impl ClientSession {
         let (mut backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::new(client_read);
 
-        let mut client_to_backend_bytes = 0u64;
-        let mut backend_to_client_bytes = 0u64;
+        let mut client_to_backend_bytes = BytesTransferred::zero();
+        let mut backend_to_client_bytes = BytesTransferred::zero();
 
         // Reuse line buffer to avoid per-iteration allocations
         let mut line = String::with_capacity(COMMAND);
@@ -55,26 +54,25 @@ impl ClientSession {
                             let trimmed = line.trim();
                             debug!("Client {} command: {}", self.client_addr, trimmed);
 
-                            // Handle command using CommandHandler
-                            match CommandHandler::handle_command(&line) {
-                                CommandAction::InterceptAuth(auth_action) => {
-                                    let response = match auth_action {
-                                        AuthAction::RequestPassword => AuthHandler::user_response(),
-                                        AuthAction::AcceptAuth => AuthHandler::pass_response(),
-                                    };
-                                    client_write.write_all(response).await?;
-                                    backend_to_client_bytes += response.len() as u64;
-                                    debug!("Intercepted auth command for client {}", self.client_addr);
+                            // Handle command using centralized auth/reject logic
+                            let action = CommandHandler::handle_command(&line);
+                            match crate::session::forwarding::handle_intercepted_command(
+                                action,
+                                &line,
+                                &mut client_write,
+                                &self.auth_handler,
+                                &self.client_addr,
+                            )
+                            .await?
+                            {
+                                Some(bytes) => {
+                                    // Command was intercepted (auth or reject)
+                                    backend_to_client_bytes.add(bytes);
                                 }
-                                CommandAction::Reject(_reason) => {
-                                    warn!("Rejecting command from client {}: {}", self.client_addr, trimmed);
-                                    client_write.write_all(COMMAND_NOT_SUPPORTED_STATELESS).await?;
-                                    backend_to_client_bytes += COMMAND_NOT_SUPPORTED_STATELESS.len() as u64;
-                                }
-                                CommandAction::ForwardStateless => {
+                                None => {
                                     // Forward stateless commands to backend
                                     backend_write.write_all(line.as_bytes()).await?;
-                                    client_to_backend_bytes += line.len() as u64;
+                                    client_to_backend_bytes.add(line.len());
                                 }
                             }
                         }
@@ -95,7 +93,7 @@ impl ClientSession {
                         }
                         Ok(n) => {
                             client_write.write_all(&buffer[..n]).await?;
-                            backend_to_client_bytes += n as u64;
+                            backend_to_client_bytes.add(n);
                         }
                         Err(e) => {
                             warn!("Error reading from backend for client {}: {}", self.client_addr, e);
@@ -109,6 +107,9 @@ impl ClientSession {
             self.buffer_pool.return_buffer(buffer).await;
         }
 
-        Ok((client_to_backend_bytes, backend_to_client_bytes))
+        Ok((
+            client_to_backend_bytes.as_u64(),
+            backend_to_client_bytes.as_u64(),
+        ))
     }
 }

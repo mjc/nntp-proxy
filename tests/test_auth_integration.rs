@@ -1,0 +1,396 @@
+//! End-to-end integration tests for client authentication
+//!
+//! These tests verify the complete authentication flow with real TCP connections:
+//! - Client connects to proxy
+//! - Proxy requires authentication
+//! - Client sends AUTHINFO USER/PASS
+//! - Proxy validates and forwards to backend
+//! - Full command flow after authentication
+
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+mod test_helpers;
+use test_helpers::wait_for_server;
+
+#[tokio::test]
+async fn test_auth_flow_complete_with_valid_credentials() {
+    // Use a specific port for testing
+    let backend_port = 19119;
+
+    // Start mock backend
+    let _backend_handle = test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+        .await
+        .unwrap();
+
+    // Create config with auth
+    use nntp_proxy::config::ClientAuthConfig;
+    use test_helpers::create_test_config;
+
+    let mut config = create_test_config(vec![(backend_port, "backend-1")]);
+    config.client_auth = ClientAuthConfig {
+        username: Some("testuser".to_string()),
+        password: Some("testpass".to_string()),
+        greeting: None,
+    };
+
+    // Start proxy
+    let proxy = Arc::new(
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+    );
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    // Spawn proxy handler
+    let proxy_clone = proxy.clone();
+    tokio::spawn(async move {
+        if let Ok((stream, addr)) = proxy_listener.accept().await {
+            let _ = proxy_clone.handle_client(stream, addr).await;
+        }
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Connect as client
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    // Read proxy greeting
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    // Send AUTHINFO USER
+    writer
+        .write_all(b"AUTHINFO USER testuser\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("381")); // Password required
+
+    // Send AUTHINFO PASS
+    writer
+        .write_all(b"AUTHINFO PASS testpass\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("281")); // Authentication accepted
+
+    // Now send a regular command - should work
+    writer.write_all(b"CAPABILITIES\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    // Should get response from backend (not auth related)
+    assert!(!line.starts_with("381"));
+    assert!(!line.starts_with("481"));
+}
+
+#[tokio::test]
+async fn test_auth_disabled_allows_immediate_commands() {
+    let backend_port = 19120;
+
+    // Start mock backend
+    let _backend_handle = test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+        .await
+        .unwrap();
+
+    // Create config WITHOUT auth
+    use test_helpers::create_test_config;
+    let config = create_test_config(vec![(backend_port, "backend-1")]);
+
+    // Ensure auth is disabled
+    assert!(!config.client_auth.is_enabled());
+
+    // Start proxy
+    let proxy = Arc::new(
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+    );
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let proxy_clone = proxy.clone();
+    tokio::spawn(async move {
+        if let Ok((stream, addr)) = proxy_listener.accept().await {
+            let _ = proxy_clone.handle_client(stream, addr).await;
+        }
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Connect and immediately send command (no auth needed)
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    // Read greeting
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    // Send command immediately (no AUTHINFO needed)
+    writer.write_all(b"CAPABILITIES\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    // Should get backend response
+    assert!(!line.starts_with("381")); // Not asking for auth
+    assert!(!line.starts_with("481")); // Not auth failure
+}
+
+#[tokio::test]
+async fn test_auth_command_intercepted_not_sent_to_backend() {
+    let backend_port = 19121;
+
+    // Start mock backend that would fail if it receives AUTHINFO
+    let _backend_handle = test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+        .await
+        .unwrap();
+
+    use nntp_proxy::config::ClientAuthConfig;
+    use test_helpers::create_test_config;
+
+    let mut config = create_test_config(vec![(backend_port, "backend-1")]);
+    config.client_auth = ClientAuthConfig {
+        username: Some("user".to_string()),
+        password: Some("pass".to_string()),
+        greeting: None,
+    };
+
+    let proxy = Arc::new(
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+    );
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let proxy_clone = proxy.clone();
+    tokio::spawn(async move {
+        if let Ok((stream, addr)) = proxy_listener.accept().await {
+            let _ = proxy_clone.handle_client(stream, addr).await;
+        }
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    // Read greeting
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+
+    // Send AUTHINFO - should be intercepted by proxy, not forwarded to backend
+    writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("381")); // Proxy responds directly
+
+    writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("281")); // Proxy responds directly
+
+    // If backend received AUTHINFO, it would respond with an error
+    // But we get success, proving proxy intercepted it
+}
+
+#[tokio::test]
+async fn test_multiple_clients_with_auth() {
+    let backend_port = 19122;
+
+    use nntp_proxy::config::ClientAuthConfig;
+    use test_helpers::create_test_config;
+    use tokio::task::JoinSet;
+
+    // Start mock backend
+    let _backend_handle = test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+        .await
+        .unwrap();
+
+    let mut config = create_test_config(vec![(backend_port, "backend-1")]);
+    config.client_auth = ClientAuthConfig {
+        username: Some("user".to_string()),
+        password: Some("pass".to_string()),
+        greeting: None,
+    };
+
+    let proxy = Arc::new(
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+    );
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    // Spawn proxy to handle multiple clients - simplified version
+    let proxy_clone = proxy.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, addr)) = proxy_listener.accept().await {
+            let p = proxy_clone.clone();
+            tokio::spawn(async move {
+                let _ = p.handle_client(stream, addr).await;
+            });
+        }
+    });
+
+    // Actually, let me simplify - the mock server handles multiple connections
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let mut set = JoinSet::new();
+
+    // Spawn 5 concurrent clients
+    for i in 0..5 {
+        set.spawn(async move {
+            let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+            let (reader, mut writer) = client.split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+
+            // Read greeting
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("200"), "Client {} got greeting", i);
+
+            // Auth
+            writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("381"), "Client {} got password request", i);
+
+            writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("281"), "Client {} authenticated", i);
+
+            i
+        });
+    }
+
+    // All clients should authenticate successfully
+    let mut count = 0;
+    while let Some(result) = set.join_next().await {
+        result.unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 5);
+}
+
+#[tokio::test]
+async fn test_auth_handler_in_cache_session() {
+    use nntp_proxy::auth::AuthHandler;
+    use nntp_proxy::cache::{ArticleCache, CachingSession};
+    use std::time::Duration;
+
+    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600)));
+    let auth_handler = Arc::new(AuthHandler::new(
+        Some("cacheuser".to_string()),
+        Some("cachepass".to_string()),
+    ));
+
+    let addr = "127.0.0.1:9999".parse().unwrap();
+    let _session = CachingSession::new(addr, cache, auth_handler.clone());
+
+    // Verify auth handler is configured
+    assert!(auth_handler.is_enabled());
+    assert!(auth_handler.validate("cacheuser", "cachepass"));
+}
+
+#[tokio::test]
+async fn test_session_forwarding_integration() {
+    use nntp_proxy::auth::AuthHandler;
+    use nntp_proxy::command::{AuthAction, CommandAction};
+    use nntp_proxy::session::forwarding::handle_intercepted_command;
+    use std::net::SocketAddr;
+
+    let handler = Arc::new(AuthHandler::new(
+        Some("alice".to_string()),
+        Some("secret".to_string()),
+    ));
+    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+    // Test all three action types
+    let mut output = Vec::new();
+
+    // 1. ForwardStateless - returns None
+    let result = handle_intercepted_command(
+        CommandAction::ForwardStateless,
+        "LIST\r\n",
+        &mut output,
+        &handler,
+        &addr,
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert!(output.is_empty());
+
+    // 2. InterceptAuth - returns bytes
+    output.clear();
+    let result = handle_intercepted_command(
+        CommandAction::InterceptAuth(AuthAction::RequestPassword),
+        "AUTHINFO USER alice\r\n",
+        &mut output,
+        &handler,
+        &addr,
+    )
+    .await
+    .unwrap();
+    assert!(result.is_some());
+    assert!(!output.is_empty());
+
+    // 3. Reject - returns bytes
+    output.clear();
+    let result = handle_intercepted_command(
+        CommandAction::Reject("stateful"),
+        "GROUP misc.test\r\n",
+        &mut output,
+        &handler,
+        &addr,
+    )
+    .await
+    .unwrap();
+    assert!(result.is_some());
+    assert!(!output.is_empty());
+}
+
+#[tokio::test]
+async fn test_config_auth_round_trip() {
+    use nntp_proxy::config::{ClientAuthConfig, Config};
+
+    // Create config with auth
+    let config = Config {
+        servers: vec![],
+        health_check: Default::default(),
+        cache: None,
+        client_auth: ClientAuthConfig {
+            username: Some("testuser".to_string()),
+            password: Some("testpass".to_string()),
+            greeting: Some("Custom Auth Required".to_string()),
+        },
+    };
+
+    // Verify config
+    assert!(config.client_auth.is_enabled());
+    assert_eq!(config.client_auth.username.as_deref(), Some("testuser"));
+    assert_eq!(config.client_auth.password.as_deref(), Some("testpass"));
+    assert_eq!(
+        config.client_auth.greeting.as_deref(),
+        Some("Custom Auth Required")
+    );
+
+    // Serialize to TOML
+    let toml = toml::to_string(&config).unwrap();
+    assert!(toml.contains("[client_auth]"));
+    assert!(toml.contains("username"));
+    assert!(toml.contains("password"));
+
+    // Deserialize back
+    let config2: Config = toml::from_str(&toml).unwrap();
+    assert_eq!(config.client_auth.username, config2.client_auth.username);
+    assert_eq!(config.client_auth.password, config2.client_auth.password);
+    assert_eq!(config.client_auth.greeting, config2.client_auth.greeting);
+}

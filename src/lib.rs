@@ -32,7 +32,7 @@
 //!   but commands are still processed serially (NNTP is synchronous)
 
 // Module declarations
-mod auth;
+pub mod auth;
 pub mod connection_error;
 mod formatting;
 pub mod network;

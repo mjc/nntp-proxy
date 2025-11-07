@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
+use crate::auth::AuthHandler;
 use crate::config::{Config, RoutingMode, ServerConfig};
 use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
@@ -162,12 +163,19 @@ impl NntpProxyBuilder {
             )
         });
 
+        // Create auth handler from config
+        let auth_handler = Arc::new(AuthHandler::new(
+            self.config.client_auth.username.clone(),
+            self.config.client_auth.password.clone(),
+        ));
+
         Ok(NntpProxy {
             servers,
             router,
             connection_providers,
             buffer_pool,
             routing_mode: self.routing_mode,
+            auth_handler,
         })
     }
 }
@@ -183,6 +191,8 @@ pub struct NntpProxy {
     buffer_pool: BufferPool,
     /// Routing mode (Standard, PerCommand, or Hybrid)
     routing_mode: RoutingMode,
+    /// Authentication handler for client auth interception
+    auth_handler: Arc<AuthHandler>,
 }
 
 impl NntpProxy {
@@ -347,7 +357,11 @@ impl NntpProxy {
         }
 
         // Create session and handle connection
-        let session = ClientSession::new(client_addr, self.buffer_pool.clone());
+        let session = ClientSession::new(
+            client_addr,
+            self.buffer_pool.clone(),
+            self.auth_handler.clone(),
+        );
         debug!("Starting session for client {}", client_addr);
 
         let copy_result = session
@@ -414,6 +428,7 @@ impl NntpProxy {
             self.buffer_pool.clone(),
             self.router.clone(),
             self.routing_mode,
+            self.auth_handler.clone(),
         );
 
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());

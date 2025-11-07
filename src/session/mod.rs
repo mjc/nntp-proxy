@@ -44,12 +44,14 @@
 pub mod backend;
 pub mod connection;
 pub mod error_classification;
+pub mod forwarding;
 pub mod handlers;
 pub mod streaming;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::auth::AuthHandler;
 use crate::config::RoutingMode;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
@@ -99,6 +101,8 @@ pub struct ClientSession {
     mode: SessionMode,
     /// Routing mode configuration (Standard, PerCommand, or Hybrid)
     routing_mode: RoutingMode,
+    /// Authentication handler
+    auth_handler: Arc<AuthHandler>,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -115,17 +119,19 @@ pub struct ClientSession {
 /// use nntp_proxy::router::BackendSelector;
 /// use nntp_proxy::config::RoutingMode;
 /// use nntp_proxy::types::BufferSize;
+/// use nntp_proxy::auth::AuthHandler;
 ///
 /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+/// let auth_handler = Arc::new(AuthHandler::new(None, None));
 ///
 /// // Standard 1:1 routing mode
-/// let session = ClientSession::builder(addr, buffer_pool.clone())
+/// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone())
 ///     .build();
 ///
 /// // Per-command routing mode
 /// let router = Arc::new(BackendSelector::new());
-/// let session = ClientSession::builder(addr, buffer_pool.clone())
+/// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
 ///     .with_router(router)
 ///     .with_routing_mode(RoutingMode::PerCommand)
 ///     .build();
@@ -135,6 +141,7 @@ pub struct ClientSessionBuilder {
     buffer_pool: BufferPool,
     router: Option<Arc<BackendSelector>>,
     routing_mode: RoutingMode,
+    auth_handler: Arc<AuthHandler>,
 }
 
 impl ClientSessionBuilder {
@@ -157,6 +164,13 @@ impl ClientSessionBuilder {
     #[must_use]
     pub fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
         self.routing_mode = mode;
+        self
+    }
+
+    /// Set the authentication handler
+    #[must_use]
+    pub fn with_auth_handler(mut self, auth_handler: Arc<AuthHandler>) -> Self {
+        self.auth_handler = auth_handler;
         self
     }
 
@@ -184,6 +198,7 @@ impl ClientSessionBuilder {
             router: self.router,
             mode,
             routing_mode,
+            auth_handler: self.auth_handler,
         }
     }
 }
@@ -191,7 +206,11 @@ impl ClientSessionBuilder {
 impl ClientSession {
     /// Create a new client session for 1:1 backend mapping
     #[must_use]
-    pub fn new(client_addr: SocketAddr, buffer_pool: BufferPool) -> Self {
+    pub fn new(
+        client_addr: SocketAddr,
+        buffer_pool: BufferPool,
+        auth_handler: Arc<AuthHandler>,
+    ) -> Self {
         Self {
             client_addr,
             buffer_pool,
@@ -199,6 +218,7 @@ impl ClientSession {
             router: None,
             mode: SessionMode::Stateful, // 1:1 mode is always stateful
             routing_mode: RoutingMode::Standard,
+            auth_handler,
         }
     }
 
@@ -209,6 +229,7 @@ impl ClientSession {
         buffer_pool: BufferPool,
         router: Arc<BackendSelector>,
         routing_mode: RoutingMode,
+        auth_handler: Arc<AuthHandler>,
     ) -> Self {
         Self {
             client_addr,
@@ -217,6 +238,7 @@ impl ClientSession {
             router: Some(router),
             mode: SessionMode::PerCommand, // Starts in per-command mode
             routing_mode,
+            auth_handler,
         }
     }
 
@@ -226,26 +248,34 @@ impl ClientSession {
     ///
     /// ```
     /// use std::net::SocketAddr;
+    /// use std::sync::Arc;
     /// use nntp_proxy::session::ClientSession;
     /// use nntp_proxy::pool::BufferPool;
     /// use nntp_proxy::types::BufferSize;
+    /// use nntp_proxy::auth::AuthHandler;
     ///
     /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+    /// let auth_handler = Arc::new(AuthHandler::new(None, None));
     ///
     /// // Standard 1:1 routing mode
-    /// let session = ClientSession::builder(addr, buffer_pool.clone())
+    /// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
     ///     .build();
     ///
     /// assert!(!session.is_per_command_routing());
     /// ```
     #[must_use]
-    pub fn builder(client_addr: SocketAddr, buffer_pool: BufferPool) -> ClientSessionBuilder {
+    pub fn builder(
+        client_addr: SocketAddr,
+        buffer_pool: BufferPool,
+        auth_handler: Arc<AuthHandler>,
+    ) -> ClientSessionBuilder {
         ClientSessionBuilder {
             client_addr,
             buffer_pool,
             router: None,
             routing_mode: RoutingMode::Standard,
+            auth_handler,
         }
     }
 

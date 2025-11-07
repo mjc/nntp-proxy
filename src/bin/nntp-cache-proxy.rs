@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
 
+use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::CacheConfig;
@@ -188,7 +189,16 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     }
 
     // Create proxy (cache proxy always uses Standard/1:1 mode)
-    let proxy = Arc::new(NntpProxy::new(config, nntp_proxy::RoutingMode::Standard)?);
+    let proxy = Arc::new(NntpProxy::new(
+        config.clone(),
+        nntp_proxy::RoutingMode::Standard,
+    )?);
+
+    // Create auth handler from config
+    let auth_handler = Arc::new(AuthHandler::new(
+        config.client_auth.username.clone(),
+        config.client_auth.password.clone(),
+    ));
 
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port);
@@ -227,10 +237,17 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
                 let cache_clone = cache.clone();
+                let auth_handler_clone = auth_handler.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_caching_client(proxy_clone, cache_clone, stream, addr).await
+                    if let Err(e) = handle_caching_client(
+                        proxy_clone,
+                        cache_clone,
+                        auth_handler_clone,
+                        stream,
+                        addr,
+                    )
+                    .await
                     {
                         error!("Error handling client {}: {}", addr, e);
                     }
@@ -246,6 +263,7 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
 async fn handle_caching_client(
     proxy: Arc<NntpProxy>,
     cache: Arc<ArticleCache>,
+    auth_handler: Arc<AuthHandler>,
     mut client_stream: tokio::net::TcpStream,
     client_addr: std::net::SocketAddr,
 ) -> Result<()> {
@@ -297,7 +315,7 @@ async fn handle_caching_client(
     }
 
     // Create caching session and handle connection
-    let session = CachingSession::new(client_addr, cache);
+    let session = CachingSession::new(client_addr, cache, auth_handler);
 
     debug!("Starting caching session for client {}", client_addr);
 

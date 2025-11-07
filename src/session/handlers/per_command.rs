@@ -11,13 +11,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::AuthHandler;
-use crate::command::{AuthAction, CommandAction, CommandHandler, NntpCommand};
+use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::COMMAND;
-use crate::protocol::{
-    BACKEND_ERROR, COMMAND_NOT_SUPPORTED_STATELESS, CONNECTION_CLOSING, PROXY_GREETING_PCR,
-};
+use crate::protocol::{BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR};
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
 
@@ -146,27 +143,22 @@ impl ClientSession {
                     .await;
             }
 
-            // Handle the command based on its action
-            match action {
-                CommandAction::InterceptAuth(auth_action) => {
-                    let response = match auth_action {
-                        AuthAction::RequestPassword => AuthHandler::user_response(),
-                        AuthAction::AcceptAuth => AuthHandler::pass_response(),
-                    };
-                    client_write.write_all(response).await?;
-                    backend_to_client_bytes.add(response.len());
+            // Handle the command using centralized auth/reject logic
+            match crate::session::forwarding::handle_intercepted_command(
+                action,
+                &command,
+                &mut client_write,
+                &self.auth_handler,
+                &self.client_addr,
+            )
+            .await?
+            {
+                Some(bytes) => {
+                    // Command was intercepted (auth or reject)
+                    backend_to_client_bytes.add(bytes);
                 }
-                CommandAction::Reject(reason) => {
-                    warn!(
-                        "Rejecting command from client {}: {} ({})",
-                        self.client_addr, trimmed, reason
-                    );
-                    client_write
-                        .write_all(COMMAND_NOT_SUPPORTED_STATELESS)
-                        .await?;
-                    backend_to_client_bytes.add(COMMAND_NOT_SUPPORTED_STATELESS.len());
-                }
-                CommandAction::ForwardStateless => {
+                None => {
+                    // Forward to backend via router
                     if let Err(e) = self
                         .route_and_execute_command(
                             router,

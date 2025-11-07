@@ -1,3 +1,9 @@
+[client_auth]
+username = "clientusername"
+password = "client password"
+# Optional custom greeting message
+greeting = "200 Hold On To Your Butts"
+
 [[servers]]
 host = "news.example.com"
 port = 119
