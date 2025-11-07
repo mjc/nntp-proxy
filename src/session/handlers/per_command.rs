@@ -74,6 +74,10 @@ impl ClientSession {
         // Reuse command buffer to avoid allocations per command
         let mut command = String::with_capacity(COMMAND);
 
+        // PERFORMANCE: Cache authenticated state to avoid atomic loads after auth succeeds
+        // If auth is disabled, skip checks from the start
+        let mut skip_auth_check = !self.auth_handler.is_enabled();
+
         // Process commands one at a time
         loop {
             command.clear();
@@ -126,12 +130,48 @@ impl ClientSession {
 
             let action = CommandHandler::handle_command(&command);
 
+            // ALWAYS intercept auth commands, even when auth is disabled
+            // Auth commands must NEVER be forwarded to backend
+            if matches!(action, CommandAction::InterceptAuth(_)) {
+                match action {
+                    CommandAction::InterceptAuth(auth_action) => {
+                        // Store username if this is AUTHINFO USER
+                        if let crate::command::AuthAction::RequestPassword(ref username) =
+                            auth_action
+                        {
+                            auth_username = Some(username.clone());
+                        }
+
+                        // Handle auth and validate
+                        let (bytes, auth_success) = self
+                            .auth_handler
+                            .handle_auth_command(
+                                auth_action,
+                                &mut client_write,
+                                auth_username.as_deref(),
+                            )
+                            .await?;
+                        backend_to_client_bytes.add(bytes);
+
+                        if auth_success {
+                            skip_auth_check = true;
+                            self.authenticated
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                continue;
+            }
+
             // PERFORMANCE OPTIMIZATION: Fast path after authentication
             // Once authenticated, skip classification (just route everything)
-            if self
-                .authenticated
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            // Cache check to avoid atomic load on hot path
+            skip_auth_check = skip_auth_check
+                || self
+                    .authenticated
+                    .load(std::sync::atomic::Ordering::Acquire);
+            if skip_auth_check {
                 // Already authenticated - just route the command (HOT PATH after auth)
                 if let Err(e) = self
                     .route_and_execute_command(
@@ -281,32 +321,14 @@ impl ClientSession {
                         }
                     }
                 }
-                CommandAction::InterceptAuth(auth_action) => {
-                    // Store username if this is AUTHINFO USER
-                    if let crate::command::AuthAction::RequestPassword(ref username) = auth_action {
-                        auth_username = Some(username.clone());
-                    }
-
-                    // Handle auth and validate
-                    let (bytes, auth_success) = self
-                        .auth_handler
-                        .handle_auth_command(
-                            auth_action,
-                            &mut client_write,
-                            auth_username.as_deref(),
-                        )
-                        .await?;
-                    backend_to_client_bytes.add(bytes);
-
-                    if auth_success {
-                        self.authenticated
-                            .store(true, std::sync::atomic::Ordering::Release);
-                    }
-                }
                 CommandAction::Reject(response) => {
                     // Send rejection response inline
                     client_write.write_all(response.as_bytes()).await?;
                     backend_to_client_bytes.add(response.len());
+                }
+                CommandAction::InterceptAuth(_) => {
+                    // Already handled above before fast path check
+                    unreachable!("Auth commands should be handled before reaching here");
                 }
             }
         }

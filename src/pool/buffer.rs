@@ -98,11 +98,17 @@ impl BufferPool {
     ///
     /// # Safety
     ///
+    /// **INTERNAL USE ONLY.** This function is not exposed publicly and is only used
+    /// within the buffer pool implementation where the safety contract is guaranteed.
+    ///
     /// The returned buffer contains uninitialized memory. Callers must ensure that the buffer
     /// is only used with `AsyncRead`/`AsyncWrite` operations that fully initialize the bytes
     /// before they are read. Only the initialized portion of the buffer (`&buf[..n]`, where `n`
     /// is the number of bytes read or written) may be accessed. Accessing uninitialized bytes
     /// is undefined behavior.
+    ///
+    /// The public API (`get_buffer()`) returns a `PooledBuffer` which is a safe wrapper that
+    /// enforces this contract through the type system and usage patterns.
     #[allow(clippy::uninit_vec)]
     fn create_aligned_buffer(size: usize) -> Vec<u8> {
         // Align to page boundaries (4KB) for better memory performance

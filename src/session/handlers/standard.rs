@@ -36,6 +36,10 @@ impl ClientSession {
         // Auth state: username from AUTHINFO USER command
         let mut auth_username: Option<String> = None;
 
+        // PERFORMANCE: Cache authenticated state to avoid atomic loads after auth succeeds
+        // Auth is disabled or auth happens once, then we skip checks for rest of session
+        let mut skip_auth_check = !self.auth_handler.is_enabled();
+
         debug!("Client {} session loop starting", self.client_addr);
 
         // Handle the initial command/response phase where we intercept auth
@@ -58,8 +62,12 @@ impl ClientSession {
 
                             // PERFORMANCE OPTIMIZATION: Skip auth checking after first auth
                             // Auth happens ONCE per session, then thousands of ARTICLE commands follow
-                            if self.authenticated.load(std::sync::atomic::Ordering::Acquire) || !self.auth_handler.is_enabled() {
-                                // Already authenticated OR auth disabled - just forward everything (HOT PATH)
+                            //
+                            // Cache the authenticated state to avoid atomic loads on every command.
+                            // Once authenticated, we never go back, so caching is safe.
+                            skip_auth_check = skip_auth_check || self.authenticated.load(std::sync::atomic::Ordering::Acquire);
+                            if skip_auth_check {
+                                // Already authenticated - just forward everything (HOT PATH)
                                 backend_write.write_all(line.as_bytes()).await?;
                                 client_to_backend_bytes.add(line.len());
                             } else {
