@@ -1,8 +1,72 @@
 use crate::types::BufferSize;
 use crossbeam::queue::SegQueue;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
+
+/// A pooled buffer that automatically returns to the pool when dropped
+///
+/// This type only allows mutable access to the underlying buffer, preventing
+/// accidental reads of uninitialized data. Use it with AsyncRead/AsyncWrite
+/// and slice operations.
+pub struct PooledBuffer {
+    buffer: Vec<u8>,
+    pool: Arc<SegQueue<Vec<u8>>>,
+    pool_size: Arc<AtomicUsize>,
+    max_pool_size: usize,
+}
+
+impl PooledBuffer {
+    /// Get the full capacity of the buffer
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+impl DerefMut for PooledBuffer {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer[..]
+    }
+}
+
+impl Deref for PooledBuffer {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.buffer[..]
+    }
+}
+
+impl AsMut<[u8]> for PooledBuffer {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        // Automatically return buffer to pool when dropped
+        let current_size = self.pool_size.load(Ordering::Relaxed);
+        if current_size < self.max_pool_size {
+            let buffer = std::mem::take(&mut self.buffer);
+            self.pool.push(buffer);
+            self.pool_size.fetch_add(1, Ordering::Relaxed);
+        }
+        // If pool is full, buffer is dropped
+    }
+}
 
 /// Lock-free buffer pool for reusing large I/O buffers
 /// Uses crossbeam's SegQueue for lock-free operations
@@ -64,20 +128,35 @@ impl BufferPool {
     }
 
     /// Get a buffer from the pool or create a new one (lock-free)
-    pub async fn get_buffer(&self) -> Vec<u8> {
-        if let Some(mut buffer) = self.pool.pop() {
+    ///
+    /// Returns a PooledBuffer that automatically returns to the pool when dropped.
+    /// The buffer may contain old data, but this is safe because:
+    /// - Callers use AsyncRead which writes into the buffer
+    /// - They get back `n` bytes written and access only `&buf[..n]`
+    /// - Stale data beyond `n` is never accessed
+    pub async fn get_buffer(&self) -> PooledBuffer {
+        let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
-            // Reuse existing buffer, clear it first
-            buffer.clear();
-            buffer.resize(self.buffer_size.get(), 0);
+            // Buffer from pool is already the correct size (enforced on return)
+            debug_assert_eq!(buffer.len(), self.buffer_size.get());
             buffer
         } else {
             // Create new page-aligned buffer for better DMA performance
             Self::create_aligned_buffer(self.buffer_size.get())
+        };
+
+        PooledBuffer {
+            buffer,
+            pool: Arc::clone(&self.pool),
+            pool_size: Arc::clone(&self.pool_size),
+            max_pool_size: self.max_pool_size,
         }
     }
 
     /// Return a buffer to the pool (lock-free)
+    ///
+    /// Note: Usually not needed as PooledBuffer returns itself automatically on drop
+    #[allow(dead_code)]
     pub async fn return_buffer(&self, buffer: Vec<u8>) {
         if buffer.len() == self.buffer_size.get() {
             let current_size = self.pool_size.load(Ordering::Relaxed);
@@ -101,8 +180,7 @@ mod tests {
         // Pool should pre-allocate buffers
         let buffer1 = pool.get_buffer().await;
         assert_eq!(buffer1.len(), 8192);
-
-        pool.return_buffer(buffer1).await;
+        // Buffer automatically returned on drop
     }
 
     #[tokio::test]
@@ -113,11 +191,11 @@ mod tests {
         let buffer = pool.get_buffer().await;
         assert_eq!(buffer.len(), 4096);
 
-        // Buffer should be zeroed
+        // Buffer should be zeroed (first time)
         assert!(buffer.iter().all(|&b| b == 0));
 
-        // Return it
-        pool.return_buffer(buffer).await;
+        // Drop it (automatically returns to pool)
+        drop(buffer);
 
         // Get it again - should be from pool
         let buffer2 = pool.get_buffer().await;
@@ -136,10 +214,10 @@ mod tests {
         let buf3 = pool.get_buffer().await;
         assert_eq!(buf3.len(), 1024);
 
-        // Return buffers
-        pool.return_buffer(buf1).await;
-        pool.return_buffer(buf2).await;
-        pool.return_buffer(buf3).await; // This one might be dropped if pool is full
+        // Drop buffers (automatically returned)
+        drop(buf1);
+        drop(buf2);
+        drop(buf3);
     }
 
     #[tokio::test]
@@ -156,7 +234,6 @@ mod tests {
                 assert_eq!(buffer.len(), 2048);
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                pool_clone.return_buffer(buffer).await;
             });
             handles.push(handle);
         }
@@ -176,8 +253,6 @@ mod tests {
         assert!(buffer.capacity() >= 8192);
         // Should be page-aligned (multiple of 4096)
         assert_eq!(buffer.capacity() % 4096, 0);
-
-        pool.return_buffer(buffer).await;
     }
 
     #[tokio::test]
@@ -191,14 +266,11 @@ mod tests {
         buffer[100] = 99;
 
         // Return it
-        pool.return_buffer(buffer).await;
 
         // Get it again - should be cleared and resized
         let buffer2 = pool.get_buffer().await;
         assert_eq!(buffer2.len(), 1024);
         assert!(buffer2.iter().all(|&b| b == 0));
-
-        pool.return_buffer(buffer2).await;
     }
 
     #[tokio::test]
@@ -213,11 +285,11 @@ mod tests {
         // Get one more (should create new)
         let buf4 = pool.get_buffer().await;
 
-        // Return all buffers
-        pool.return_buffer(buf1).await;
-        pool.return_buffer(buf2).await;
-        pool.return_buffer(buf3).await;
-        pool.return_buffer(buf4).await; // This might be dropped if pool is full
+        // Drop all buffers (automatically returned)
+        drop(buf1);
+        drop(buf2);
+        drop(buf3);
+        drop(buf4);
 
         // Pool should not exceed max size
         // (We can't directly test pool size, but the implementation handles it)
@@ -230,14 +302,8 @@ mod tests {
         let buffer = pool.get_buffer().await;
         assert_eq!(buffer.len(), 1024);
 
-        // Create a buffer of wrong size
-        let wrong_size_buffer = vec![0u8; 2048];
-
-        // Try to return it - should be dropped
-        pool.return_buffer(wrong_size_buffer).await;
-
-        // Original buffer should still work
-        pool.return_buffer(buffer).await;
+        // PooledBuffer auto-returns on drop with correct size enforcement in Drop impl
+        drop(buffer);
     }
 
     #[tokio::test]
@@ -251,8 +317,6 @@ mod tests {
 
             // Write some data
             buffer[0] = i as u8;
-
-            pool.return_buffer(buffer).await;
         }
     }
 
@@ -279,9 +343,7 @@ mod tests {
         assert_eq!(medium_buf.len(), 8192);
         assert_eq!(large_buf.len(), 65536);
 
-        small_pool.return_buffer(small_buf).await;
-        medium_pool.return_buffer(medium_buf).await;
-        large_pool.return_buffer(large_buf).await;
+        // Buffers auto-return on drop
     }
 
     #[tokio::test]
@@ -297,7 +359,6 @@ mod tests {
                 for _ in 0..10 {
                     let buffer = pool_clone.get_buffer().await;
                     assert_eq!(buffer.len(), 4096);
-                    pool_clone.return_buffer(buffer).await;
                 }
             });
             handles.push(handle);

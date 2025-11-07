@@ -369,7 +369,6 @@ impl ClientSession {
             .await;
 
         // Return buffer to pool before handling result
-        self.buffer_pool.return_buffer(buffer).await;
 
         // Only remove backend connection if error occurred AND we didn't get data from backend
         // If we got data from backend, then any error is from writing to client

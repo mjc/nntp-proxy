@@ -42,7 +42,6 @@ where
         client_addr
     );
 
-    let buffer_c2b = buffer_pool.get_buffer().await;
     let mut buffer_b2c = buffer_pool.get_buffer().await;
     let mut command = String::with_capacity(COMMAND);
 
@@ -63,8 +62,6 @@ where
                             let err: anyhow::Error = e.into();
                             if crate::pool::is_connection_error(&err) {
                                 debug!("Backend write error for client {} ({}), removing connection from pool", client_addr, err);
-                                buffer_pool.return_buffer(buffer_c2b).await;
-                                buffer_pool.return_buffer(buffer_b2c).await;
                                 return Ok(ForwardResult::BackendError(
                                     TransferMetrics {
                                         client_to_backend: c2b,
@@ -103,8 +100,6 @@ where
                         let err: anyhow::Error = e.into();
                         if crate::pool::is_connection_error(&err) {
                             debug!("Backend connection error for client {} ({}), removing from pool", client_addr, err);
-                            buffer_pool.return_buffer(buffer_c2b).await;
-                            buffer_pool.return_buffer(buffer_b2c).await;
                             return Ok(ForwardResult::BackendError(
                                 TransferMetrics {
                                     client_to_backend: c2b,
@@ -119,9 +114,6 @@ where
             }
         }
     }
-
-    buffer_pool.return_buffer(buffer_c2b).await;
-    buffer_pool.return_buffer(buffer_b2c).await;
 
     Ok(ForwardResult::NormalDisconnect(TransferMetrics {
         client_to_backend: c2b,

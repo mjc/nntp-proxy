@@ -283,15 +283,41 @@ impl NntpResponse {
             return false;
         }
 
-        // Build combined view: tail + start of current chunk
-        let mut check_buf = [0u8; 9]; // max: 4 tail + 5 current bytes
-        check_buf[..tail_len].copy_from_slice(&tail[..tail_len]);
-        let curr_copy = current_len.min(5);
-        check_buf[tail_len..tail_len + curr_copy].copy_from_slice(&current[..curr_copy]);
-        let total = tail_len + curr_copy;
+        // Check all possible split positions of the 5-byte terminator "\r\n.\r\n"
+        // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n"
+        if tail_len >= 1
+            && current_len >= 4
+            && tail[tail_len - 1] == b'\r'
+            && current[..4] == *b"\n.\r\n"
+        {
+            return true;
+        }
+        // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n"
+        if tail_len >= 2
+            && current_len >= 3
+            && tail[tail_len - 2..tail_len] == *b"\r\n"
+            && current[..3] == *b".\r\n"
+        {
+            return true;
+        }
+        // Split after byte 3: tail ends with "\r\n.", current starts with "\r\n"
+        if tail_len >= 3
+            && current_len >= 2
+            && tail[tail_len - 3..tail_len] == *b"\r\n."
+            && current[..2] == *b"\r\n"
+        {
+            return true;
+        }
+        // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n"
+        if tail_len >= 4
+            && current_len >= 1
+            && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
+            && current[0] == b'\n'
+        {
+            return true;
+        }
 
-        // RFC 3977 requires exactly \r\n.\r\n (5 bytes)
-        total >= 5 && check_buf[total - 5..total] == *b"\r\n.\r\n"
+        false
     }
 
     /// Check if response is a disconnect/goodbye (205)

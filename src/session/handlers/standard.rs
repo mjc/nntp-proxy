@@ -38,7 +38,7 @@ impl ClientSession {
         // Handle the initial command/response phase where we intercept auth
         loop {
             line.clear();
-            let mut buffer: Vec<u8> = self.buffer_pool.get_buffer().await;
+            let mut buffer = self.buffer_pool.get_buffer().await;
 
             tokio::select! {
                 // Read command from client
@@ -46,7 +46,6 @@ impl ClientSession {
                     match result {
                         Ok(0) => {
                             debug!("Client {} disconnected (0 bytes read)", self.client_addr);
-                            self.buffer_pool.return_buffer(buffer).await;
                             break; // Client disconnected
                         }
                         Ok(n) => {
@@ -92,7 +91,6 @@ impl ClientSession {
                         }
                         Err(e) => {
                             warn!("Error reading from client {}: {}", self.client_addr, e);
-                            self.buffer_pool.return_buffer(buffer).await;
                             break;
                         }
                     }
@@ -102,7 +100,6 @@ impl ClientSession {
                 result = backend_read.read(&mut buffer) => {
                     match result {
                         Ok(0) => {
-                            self.buffer_pool.return_buffer(buffer).await;
                             break; // Backend disconnected
                         }
                         Ok(n) => {
@@ -111,14 +108,11 @@ impl ClientSession {
                         }
                         Err(e) => {
                             warn!("Error reading from backend for client {}: {}", self.client_addr, e);
-                            self.buffer_pool.return_buffer(buffer).await;
                             break;
                         }
                     }
                 }
             }
-
-            self.buffer_pool.return_buffer(buffer).await;
         }
 
         Ok((
