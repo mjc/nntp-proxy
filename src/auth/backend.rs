@@ -181,12 +181,12 @@ mod tests {
         let buffer1 = buffer_pool.get_buffer().await;
         let buffer2 = buffer_pool.get_buffer().await;
 
-        assert_eq!(buffer1.len(), 8192);
-        assert_eq!(buffer2.len(), 8192);
+        assert_eq!(buffer1.capacity(), 8192);
+        assert_eq!(buffer2.capacity(), 8192);
 
         // Should be able to get them again
         let buffer3 = buffer_pool.get_buffer().await;
-        assert_eq!(buffer3.len(), 8192);
+        assert_eq!(buffer3.capacity(), 8192);
     }
 
     /// Test authentication command formatting

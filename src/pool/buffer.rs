@@ -7,11 +7,34 @@ use tracing::info;
 
 /// A pooled buffer that automatically returns to the pool when dropped
 ///
-/// This type only allows mutable access to the underlying buffer, preventing
-/// accidental reads of uninitialized data. Use it with AsyncRead/AsyncWrite
-/// and slice operations.
+/// # Safety and Uninitialized Memory
+///
+/// **CRITICAL:** Buffers from this pool contain **uninitialized memory** for performance.
+/// This type tracks the number of initialized bytes and only exposes that range through
+/// `Deref`, preventing undefined behavior from reading uninitialized memory.
+///
+/// ## Safe Usage Pattern
+/// ```ignore
+/// let mut buffer = pool.get_buffer().await;
+/// let n = stream.read(&mut buffer).await?;  // AsyncRead initializes bytes
+/// buffer.set_initialized(n);                 // Track initialized length
+/// process(&*buffer);                         // Deref returns &buffer[..n] safely
+/// ```
+///
+/// ## How It Works
+/// - `DerefMut` returns mutable access to the full buffer (for writes)
+/// - `Deref` returns immutable access to ONLY the initialized portion
+/// - Callers must call `set_initialized(n)` after writing `n` bytes
+/// - Default initialized length is 0, making empty derefs safe
+///
+/// ## Performance Justification
+/// Using uninitialized buffers eliminates zeroing overhead:
+/// - 64KB buffer: ~50-100µs saved per allocation
+/// - High-throughput proxy: thousands of allocations/sec → significant savings
+/// - See `tests/test_review_claims.rs::test_performance_uninit_vs_zeroed` for benchmarks
 pub struct PooledBuffer {
     buffer: Vec<u8>,
+    initialized: usize,
     pool: Arc<SegQueue<Vec<u8>>>,
     pool_size: Arc<AtomicUsize>,
     max_pool_size: usize,
@@ -23,11 +46,34 @@ impl PooledBuffer {
     pub fn capacity(&self) -> usize {
         self.buffer.len()
     }
+
+    /// Set the number of initialized bytes in the buffer
+    ///
+    /// This controls what range is accessible through `Deref`.
+    /// Call this after writing data to mark those bytes as safe to read.
+    ///
+    /// # Panics
+    /// Panics if `len` exceeds the buffer capacity
+    #[inline]
+    pub fn set_initialized(&mut self, len: usize) {
+        assert!(
+            len <= self.buffer.len(),
+            "initialized length exceeds buffer capacity"
+        );
+        self.initialized = len;
+    }
+
+    /// Get the number of initialized bytes
+    #[inline]
+    pub fn initialized(&self) -> usize {
+        self.initialized
+    }
 }
 
 impl DerefMut for PooledBuffer {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // Mutable access gives the full buffer for writes
         &mut self.buffer[..]
     }
 }
@@ -37,7 +83,8 @@ impl Deref for PooledBuffer {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.buffer[..]
+        // Immutable access only returns the initialized portion
+        &self.buffer[..self.initialized]
     }
 }
 
@@ -51,7 +98,8 @@ impl AsMut<[u8]> for PooledBuffer {
 impl AsRef<[u8]> for PooledBuffer {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        &self.buffer
+        // Only return initialized portion
+        &self.buffer[..self.initialized]
     }
 }
 
@@ -185,6 +233,7 @@ impl BufferPool {
 
         PooledBuffer {
             buffer,
+            initialized: 0, // Start with 0 bytes safe to read
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
@@ -217,7 +266,8 @@ mod tests {
 
         // Pool should pre-allocate buffers
         let buffer1 = pool.get_buffer().await;
-        assert_eq!(buffer1.len(), 8192);
+        assert_eq!(buffer1.capacity(), 8192);
+        assert_eq!(buffer1.initialized(), 0); // No bytes initialized yet
         // Buffer automatically returned on drop
     }
 
@@ -227,9 +277,10 @@ mod tests {
 
         // Get a buffer
         let buffer = pool.get_buffer().await;
-        assert_eq!(buffer.len(), 4096);
+        assert_eq!(buffer.capacity(), 4096);
+        assert_eq!(buffer.initialized(), 0);
 
-        // Buffer may contain uninitialized data - this is intentional for performance
+        // Buffer contains uninitialized data - this is intentional for performance
         // Callers will write to it via AsyncRead before accessing
 
         // Drop it (automatically returns to pool)
@@ -237,7 +288,7 @@ mod tests {
 
         // Get it again - should be from pool
         let buffer2 = pool.get_buffer().await;
-        assert_eq!(buffer2.len(), 4096);
+        assert_eq!(buffer2.capacity(), 4096);
     }
 
     #[tokio::test]
@@ -250,7 +301,7 @@ mod tests {
 
         // Pool is exhausted, should create new buffer
         let buf3 = pool.get_buffer().await;
-        assert_eq!(buf3.len(), 1024);
+        assert_eq!(buf3.capacity(), 1024);
 
         // Drop buffers (automatically returned)
         drop(buf1);
@@ -269,7 +320,7 @@ mod tests {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
                 let buffer = pool_clone.get_buffer().await;
-                assert_eq!(buffer.len(), 2048);
+                assert_eq!(buffer.capacity(), 2048);
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
             });
@@ -308,7 +359,7 @@ mod tests {
 
         // Get it again - may contain old data (performance optimization)
         let buffer2 = pool.get_buffer().await;
-        assert_eq!(buffer2.len(), 1024);
+        assert_eq!(buffer2.capacity(), 1024);
         // Note: buffer may contain previous data - callers must use &buf[..n] pattern
     }
 
@@ -339,7 +390,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
 
         let buffer = pool.get_buffer().await;
-        assert_eq!(buffer.len(), 1024);
+        assert_eq!(buffer.capacity(), 1024);
 
         // PooledBuffer auto-returns on drop with correct size enforcement in Drop impl
         drop(buffer);
@@ -352,7 +403,7 @@ mod tests {
         // Do multiple get/return cycles
         for i in 0..20 {
             let mut buffer = pool.get_buffer().await;
-            assert_eq!(buffer.len(), 4096);
+            assert_eq!(buffer.capacity(), 4096);
 
             // Write some data
             buffer[0] = i as u8;
@@ -378,9 +429,9 @@ mod tests {
         let medium_buf = medium_pool.get_buffer().await;
         let large_buf = large_pool.get_buffer().await;
 
-        assert_eq!(small_buf.len(), 1024);
-        assert_eq!(medium_buf.len(), 8192);
-        assert_eq!(large_buf.len(), 65536);
+        assert_eq!(small_buf.capacity(), 1024);
+        assert_eq!(medium_buf.capacity(), 8192);
+        assert_eq!(large_buf.capacity(), 65536);
 
         // Buffers auto-return on drop
     }
@@ -397,7 +448,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 for _ in 0..10 {
                     let buffer = pool_clone.get_buffer().await;
-                    assert_eq!(buffer.len(), 4096);
+                    assert_eq!(buffer.capacity(), 4096);
                 }
             });
             handles.push(handle);

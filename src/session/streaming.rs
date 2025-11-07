@@ -107,6 +107,7 @@ where
         if n == 0 {
             break; // EOF
         }
+        chunk.set_initialized(n); // Mark bytes as initialized
         let data = &chunk[..n];
         if tail.detect_terminator(data).is_found() {
             break;
