@@ -300,60 +300,43 @@ async fn test_auth_handler_in_cache_session() {
 }
 
 #[tokio::test]
-async fn test_session_forwarding_integration() {
+async fn test_auth_handler_integration() {
     use nntp_proxy::auth::AuthHandler;
-    use nntp_proxy::command::{AuthAction, CommandAction};
-    use nntp_proxy::session::forwarding::handle_intercepted_command;
-    use std::net::SocketAddr;
+    use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 
     let handler = Arc::new(AuthHandler::new(
         Some("alice".to_string()),
         Some("secret".to_string()),
     ));
-    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
-    // Test all three action types
+    // Test command classification
+    let action = CommandHandler::handle_command("LIST\r\n");
+    assert_eq!(action, CommandAction::ForwardStateless);
+
+    let action = CommandHandler::handle_command("AUTHINFO USER alice\r\n");
+    assert!(matches!(
+        action,
+        CommandAction::InterceptAuth(AuthAction::RequestPassword)
+    ));
+
+    let action = CommandHandler::handle_command("GROUP misc.test\r\n");
+    assert!(matches!(action, CommandAction::Reject(_)));
+
+    // Test auth handler responses
     let mut output = Vec::new();
-
-    // 1. ForwardStateless - returns None
-    let result = handle_intercepted_command(
-        CommandAction::ForwardStateless,
-        "LIST\r\n",
-        &mut output,
-        &handler,
-        &addr,
-    )
-    .await
-    .unwrap();
-    assert!(result.is_none());
-    assert!(output.is_empty());
-
-    // 2. InterceptAuth - returns bytes
-    output.clear();
-    let result = handle_intercepted_command(
-        CommandAction::InterceptAuth(AuthAction::RequestPassword),
-        "AUTHINFO USER alice\r\n",
-        &mut output,
-        &handler,
-        &addr,
-    )
-    .await
-    .unwrap();
-    assert!(result.is_some());
+    let bytes = handler
+        .handle_auth_command(AuthAction::RequestPassword, &mut output)
+        .await
+        .unwrap();
+    assert!(bytes > 0);
     assert!(!output.is_empty());
 
-    // 3. Reject - returns bytes
     output.clear();
-    let result = handle_intercepted_command(
-        CommandAction::Reject("stateful"),
-        "GROUP misc.test\r\n",
-        &mut output,
-        &handler,
-        &addr,
-    )
-    .await
-    .unwrap();
-    assert!(result.is_some());
+    let bytes = handler
+        .handle_auth_command(AuthAction::AcceptAuth, &mut output)
+        .await
+        .unwrap();
+    assert!(bytes > 0);
     assert!(!output.is_empty());
 }
 

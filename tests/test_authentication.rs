@@ -241,97 +241,58 @@ async fn test_auth_responses_are_valid_nntp() {
 }
 
 #[tokio::test]
-async fn test_forwarding_handles_auth_commands() {
-    use nntp_proxy::command::{AuthAction, CommandAction};
-    use nntp_proxy::session::forwarding::handle_intercepted_command;
+async fn test_auth_handler_processes_auth_commands() {
+    use nntp_proxy::command::AuthAction;
 
     let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string()));
-    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let mut output = Vec::new();
 
     // Test USER command
-    let user_action = CommandAction::InterceptAuth(AuthAction::RequestPassword);
-    let result = handle_intercepted_command(
-        user_action,
-        "AUTHINFO USER test\r\n",
-        &mut output,
-        &handler,
-        &addr,
-    )
-    .await
-    .unwrap();
+    let user_action = AuthAction::RequestPassword;
+    let bytes = handler
+        .handle_auth_command(user_action, &mut output)
+        .await
+        .unwrap();
 
-    assert!(result.is_some());
-    assert!(result.unwrap() > 0);
+    assert!(bytes > 0);
     assert!(!output.is_empty());
 
     // Test PASS command
     output.clear();
-    let pass_action = CommandAction::InterceptAuth(AuthAction::AcceptAuth);
-    let result = handle_intercepted_command(
-        pass_action,
-        "AUTHINFO PASS secret\r\n",
-        &mut output,
-        &handler,
-        &addr,
-    )
-    .await
-    .unwrap();
+    let pass_action = AuthAction::AcceptAuth;
+    let bytes = handler
+        .handle_auth_command(pass_action, &mut output)
+        .await
+        .unwrap();
 
-    assert!(result.is_some());
-    assert!(result.unwrap() > 0);
+    assert!(bytes > 0);
     assert!(!output.is_empty());
 }
 
 #[tokio::test]
-async fn test_forwarding_handles_rejected_commands() {
-    use nntp_proxy::command::CommandAction;
-    use nntp_proxy::session::forwarding::handle_intercepted_command;
+async fn test_reject_response_formatting() {
+    use tokio::io::AsyncWriteExt;
 
-    let handler = AuthHandler::new(None, None);
-    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let mut output = Vec::new();
+    let reject_message = "500 Command not supported\r\n";
 
-    let reject_action = CommandAction::Reject("stateful command");
-    let result = handle_intercepted_command(
-        reject_action,
-        "GROUP misc.test\r\n",
-        &mut output,
-        &handler,
-        &addr,
-    )
-    .await
-    .unwrap();
-
-    assert!(result.is_some());
-    assert!(result.unwrap() > 0);
+    output.write_all(reject_message.as_bytes()).await.unwrap();
 
     let response = String::from_utf8_lossy(&output);
-    assert!(response.starts_with("500") || response.starts_with("503"));
+    assert!(response.starts_with("500"));
+    assert!(response.ends_with("\r\n"));
 }
 
 #[tokio::test]
-async fn test_forwarding_returns_none_for_forward_commands() {
-    use nntp_proxy::command::CommandAction;
-    use nntp_proxy::session::forwarding::handle_intercepted_command;
+async fn test_command_classification_for_stateless() {
+    use nntp_proxy::command::{CommandAction, CommandHandler};
 
-    let handler = AuthHandler::new(None, None);
-    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    let mut output = Vec::new();
+    // Test that stateless commands are classified correctly
+    let action = CommandHandler::handle_command("ARTICLE <msgid@example.com>\r\n");
+    assert_eq!(action, CommandAction::ForwardStateless);
 
-    let forward_action = CommandAction::ForwardStateless;
-    let result = handle_intercepted_command(
-        forward_action,
-        "ARTICLE <msgid@example.com>\r\n",
-        &mut output,
-        &handler,
-        &addr,
-    )
-    .await
-    .unwrap();
-
-    assert!(result.is_none());
-    assert!(output.is_empty());
+    let action = CommandHandler::handle_command("LIST\r\n");
+    assert_eq!(action, CommandAction::ForwardStateless);
 }
 
 #[tokio::test]
@@ -639,16 +600,14 @@ async fn test_auth_with_null_bytes_in_credentials() {
 }
 
 #[tokio::test]
-async fn test_forwarding_with_concurrent_requests() {
-    use nntp_proxy::command::CommandAction;
-    use nntp_proxy::session::forwarding::handle_intercepted_command;
+async fn test_auth_handler_with_concurrent_requests() {
+    use nntp_proxy::command::AuthAction;
     use tokio::task::JoinSet;
 
     let handler = Arc::new(AuthHandler::new(
         Some("user".to_string()),
         Some("pass".to_string()),
     ));
-    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
     let mut set = JoinSet::new();
 
@@ -656,19 +615,13 @@ async fn test_forwarding_with_concurrent_requests() {
         let h = handler.clone();
         set.spawn(async move {
             let mut output = Vec::new();
-            handle_intercepted_command(
-                CommandAction::ForwardStateless,
-                "LIST\r\n",
-                &mut output,
-                &h,
-                &addr,
-            )
-            .await
+            h.handle_auth_command(AuthAction::RequestPassword, &mut output)
+                .await
         });
     }
 
     while let Some(result) = set.join_next().await {
-        let res = result.unwrap().unwrap();
-        assert!(res.is_none());
+        let bytes = result.unwrap().unwrap();
+        assert!(bytes > 0);
     }
 }

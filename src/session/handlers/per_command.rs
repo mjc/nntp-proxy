@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
-use crate::command::{CommandAction, CommandHandler, NntpCommand};
+use crate::command::{CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::COMMAND;
 use crate::protocol::{BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR};
@@ -123,6 +123,71 @@ impl ClientSession {
 
             let action = CommandHandler::handle_command(&command);
 
+            // PERFORMANCE OPTIMIZATION: Fast path after authentication
+            // Once authenticated, skip classification (just route everything)
+            if self
+                .authenticated
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Already authenticated - just route the command (HOT PATH after auth)
+                if let Err(e) = self
+                    .route_and_execute_command(
+                        router,
+                        &command,
+                        &mut client_write,
+                        &mut client_to_backend_bytes,
+                        &mut backend_to_client_bytes,
+                    )
+                    .await
+                {
+                    use crate::session::error_classification::ErrorClassifier;
+                    let (up, down) = (
+                        crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
+                        crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
+                    );
+
+                    if ErrorClassifier::is_client_disconnect(&e) {
+                        debug!(
+                            "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
+                            self.client_addr, trimmed, up, down
+                        );
+                    } else {
+                        if ErrorClassifier::is_authentication_error(&e) {
+                            error!(
+                                "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
+                                self.client_addr, trimmed, e, up, down
+                            );
+                        } else {
+                            warn!(
+                                "Client {} error routing '{}': {} | ↑{} ↓{}",
+                                self.client_addr, trimmed, e, up, down
+                            );
+                        }
+                        let _ = client_write.write_all(BACKEND_ERROR).await;
+                        backend_to_client_bytes.add(BACKEND_ERROR.len());
+                    }
+
+                    if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
+                        < SMALL_TRANSFER_THRESHOLD
+                    {
+                        debug!(
+                            "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
+                             Total session: {} bytes to backend, {} bytes from backend. \
+                             This appears to be a short session (test connection?). \
+                             Check debug logs above for full command/response hex dumps.",
+                            self.client_addr,
+                            trimmed,
+                            e,
+                            client_to_backend_bytes,
+                            backend_to_client_bytes
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // Not yet authenticated - need to check for auth/stateful commands
+
             // In hybrid mode, stateful commands trigger a switch to stateful connection
             if self.routing_mode == RoutingMode::Hybrid
                 && matches!(action, CommandAction::Reject(_))
@@ -143,22 +208,12 @@ impl ClientSession {
                     .await;
             }
 
-            // Handle the command using centralized auth/reject logic
-            match crate::session::forwarding::handle_intercepted_command(
-                action,
-                &command,
-                &mut client_write,
-                &self.auth_handler,
-                &self.client_addr,
-            )
-            .await?
-            {
-                Some(bytes) => {
-                    // Command was intercepted (auth or reject)
-                    backend_to_client_bytes.add(bytes);
-                }
-                None => {
-                    // Forward to backend via router
+            // Handle the command - inline for performance
+            // Check ForwardStateless FIRST (70%+ of traffic)
+            use crate::command::CommandAction;
+            match action {
+                CommandAction::ForwardStateless => {
+                    // Forward to backend via router (HOT PATH - 70%+ of commands)
                     if let Err(e) = self
                         .route_and_execute_command(
                             router,
@@ -214,6 +269,27 @@ impl ClientSession {
                             );
                         }
                     }
+                }
+                CommandAction::InterceptAuth(auth_action) => {
+                    // Mark as authenticated after AUTHINFO PASS (before consuming auth_action)
+                    let is_pass = matches!(auth_action, crate::command::AuthAction::AcceptAuth);
+
+                    // Handle auth commands inline
+                    let bytes = self
+                        .auth_handler
+                        .handle_auth_command(auth_action, &mut client_write)
+                        .await?;
+                    backend_to_client_bytes.add(bytes);
+
+                    if is_pass {
+                        self.authenticated
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                CommandAction::Reject(response) => {
+                    // Send rejection response inline
+                    client_write.write_all(response.as_bytes()).await?;
+                    backend_to_client_bytes.add(response.len());
                 }
             }
         }

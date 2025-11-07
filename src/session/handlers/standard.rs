@@ -54,25 +54,39 @@ impl ClientSession {
                             let trimmed = line.trim();
                             debug!("Client {} command: {}", self.client_addr, trimmed);
 
-                            // Handle command using centralized auth/reject logic
-                            let action = CommandHandler::handle_command(&line);
-                            match crate::session::forwarding::handle_intercepted_command(
-                                action,
-                                &line,
-                                &mut client_write,
-                                &self.auth_handler,
-                                &self.client_addr,
-                            )
-                            .await?
-                            {
-                                Some(bytes) => {
-                                    // Command was intercepted (auth or reject)
-                                    backend_to_client_bytes.add(bytes);
-                                }
-                                None => {
-                                    // Forward stateless commands to backend
-                                    backend_write.write_all(line.as_bytes()).await?;
-                                    client_to_backend_bytes.add(line.len());
+                            // PERFORMANCE OPTIMIZATION: Skip auth checking after first auth
+                            // Auth happens ONCE per session, then thousands of ARTICLE commands follow
+                            if self.authenticated.load(std::sync::atomic::Ordering::Relaxed) || !self.auth_handler.is_enabled() {
+                                // Already authenticated OR auth disabled - just forward everything (HOT PATH)
+                                backend_write.write_all(line.as_bytes()).await?;
+                                client_to_backend_bytes.add(line.len());
+                            } else {
+                                // Not yet authenticated and auth is enabled - check for auth commands
+                                use crate::command::CommandAction;
+                                let action = CommandHandler::handle_command(&line);
+                                match action {
+                                    CommandAction::ForwardStateless => {
+                                        // Forward to backend
+                                        backend_write.write_all(line.as_bytes()).await?;
+                                        client_to_backend_bytes.add(line.len());
+                                    }
+                                    CommandAction::InterceptAuth(auth_action) => {
+                                        // Mark as authenticated after AUTHINFO PASS (before consuming auth_action)
+                                        let is_pass = matches!(auth_action, crate::command::AuthAction::AcceptAuth);
+
+                                        // Handle auth commands inline
+                                        let bytes = self.auth_handler.handle_auth_command(auth_action, &mut client_write).await?;
+                                        backend_to_client_bytes.add(bytes);
+
+                                        if is_pass {
+                                            self.authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                    CommandAction::Reject(response) => {
+                                        // Send rejection response inline
+                                        client_write.write_all(response.as_bytes()).await?;
+                                        backend_to_client_bytes.add(response.len());
+                                    }
                                 }
                             }
                         }

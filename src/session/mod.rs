@@ -44,7 +44,6 @@
 pub mod backend;
 pub mod connection;
 pub mod error_classification;
-pub mod forwarding;
 pub mod handlers;
 pub mod streaming;
 
@@ -103,6 +102,8 @@ pub struct ClientSession {
     routing_mode: RoutingMode,
     /// Authentication handler
     auth_handler: Arc<AuthHandler>,
+    /// Whether client has authenticated (starts false, set true after successful auth)
+    authenticated: std::sync::atomic::AtomicBool,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -199,6 +200,7 @@ impl ClientSessionBuilder {
             mode,
             routing_mode,
             auth_handler: self.auth_handler,
+            authenticated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -219,6 +221,7 @@ impl ClientSession {
             mode: SessionMode::Stateful, // 1:1 mode is always stateful
             routing_mode: RoutingMode::Standard,
             auth_handler,
+            authenticated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -239,6 +242,7 @@ impl ClientSession {
             mode: SessionMode::PerCommand, // Starts in per-command mode
             routing_mode,
             auth_handler,
+            authenticated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
