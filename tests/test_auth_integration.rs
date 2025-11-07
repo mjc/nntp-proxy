@@ -316,7 +316,7 @@ async fn test_auth_handler_integration() {
     let action = CommandHandler::handle_command("AUTHINFO USER alice\r\n");
     assert!(matches!(
         action,
-        CommandAction::InterceptAuth(AuthAction::RequestPassword)
+        CommandAction::InterceptAuth(AuthAction::RequestPassword(_))
     ));
 
     let action = CommandHandler::handle_command("GROUP misc.test\r\n");
@@ -324,20 +324,31 @@ async fn test_auth_handler_integration() {
 
     // Test auth handler responses
     let mut output = Vec::new();
-    let bytes = handler
-        .handle_auth_command(AuthAction::RequestPassword, &mut output)
+    let (bytes, _) = handler
+        .handle_auth_command(
+            AuthAction::RequestPassword("alice".to_string()),
+            &mut output,
+            None,
+        )
         .await
         .unwrap();
     assert!(bytes > 0);
     assert!(!output.is_empty());
 
     output.clear();
-    let bytes = handler
-        .handle_auth_command(AuthAction::AcceptAuth, &mut output)
+    let (bytes, auth_success) = handler
+        .handle_auth_command(
+            AuthAction::ValidateAndRespond {
+                password: "secret".to_string(),
+            },
+            &mut output,
+            Some("alice"),
+        )
         .await
         .unwrap();
     assert!(bytes > 0);
     assert!(!output.is_empty());
+    assert!(auth_success); // Valid credentials
 }
 
 #[tokio::test]

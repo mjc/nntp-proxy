@@ -215,14 +215,14 @@ async fn test_auth_command_sequence_valid() {
     let user_action = CommandHandler::handle_command("AUTHINFO USER alice\r\n");
     assert!(matches!(
         user_action,
-        CommandAction::InterceptAuth(AuthAction::RequestPassword)
+        CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) if u == "alice"
     ));
 
-    // AUTHINFO PASS should accept auth
+    // AUTHINFO PASS should validate and respond
     let pass_action = CommandHandler::handle_command("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         pass_action,
-        CommandAction::InterceptAuth(AuthAction::AcceptAuth)
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password == "secret"
     ));
 }
 
@@ -249,25 +249,29 @@ async fn test_auth_handler_processes_auth_commands() {
     let mut output = Vec::new();
 
     // Test USER command
-    let user_action = AuthAction::RequestPassword;
-    let bytes = handler
-        .handle_auth_command(user_action, &mut output)
+    let user_action = AuthAction::RequestPassword("testuser".to_string());
+    let (bytes, auth_success) = handler
+        .handle_auth_command(user_action, &mut output, None)
         .await
         .unwrap();
 
     assert!(bytes > 0);
     assert!(!output.is_empty());
+    assert!(!auth_success); // USER doesn't authenticate
 
-    // Test PASS command
+    // Test PASS command with validation
     output.clear();
-    let pass_action = AuthAction::AcceptAuth;
-    let bytes = handler
-        .handle_auth_command(pass_action, &mut output)
+    let pass_action = AuthAction::ValidateAndRespond {
+        password: "pass".to_string(),
+    };
+    let (bytes, auth_success) = handler
+        .handle_auth_command(pass_action, &mut output, Some("user"))
         .await
         .unwrap();
 
     assert!(bytes > 0);
     assert!(!output.is_empty());
+    assert!(auth_success); // Correct credentials
 }
 
 #[tokio::test]
@@ -489,7 +493,7 @@ async fn test_auth_case_variations() {
     assert!(
         matches!(
             upper,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword)
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(_))
         ),
         "Upper case AUTHINFO USER should be intercepted"
     );
@@ -499,7 +503,7 @@ async fn test_auth_case_variations() {
     assert!(
         matches!(
             lower,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword)
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(_))
         ),
         "Lower case authinfo user should be intercepted"
     );
@@ -509,7 +513,7 @@ async fn test_auth_case_variations() {
     assert!(
         matches!(
             title,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword)
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(_))
         ),
         "Titlecase Authinfo user should be intercepted"
     );
@@ -518,13 +522,13 @@ async fn test_auth_case_variations() {
     let upper_pass = CommandHandler::handle_command("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         upper_pass,
-        CommandAction::InterceptAuth(AuthAction::AcceptAuth)
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. })
     ));
 
     let lower_pass = CommandHandler::handle_command("authinfo pass secret\r\n");
     assert!(matches!(
         lower_pass,
-        CommandAction::InterceptAuth(AuthAction::AcceptAuth)
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. })
     ));
 }
 
@@ -616,13 +620,17 @@ async fn test_auth_handler_with_concurrent_requests() {
         let h = handler.clone();
         set.spawn(async move {
             let mut output = Vec::new();
-            h.handle_auth_command(AuthAction::RequestPassword, &mut output)
-                .await
+            h.handle_auth_command(
+                AuthAction::RequestPassword("test".to_string()),
+                &mut output,
+                None,
+            )
+            .await
         });
     }
 
     while let Some(result) = set.join_next().await {
-        let bytes = result.unwrap().unwrap();
+        let (bytes, _) = result.unwrap().unwrap();
         assert!(bytes > 0);
     }
 }

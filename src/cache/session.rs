@@ -62,6 +62,9 @@ impl CachingSession {
         // which may not always be valid UTF-8, whereas `line` is a String for text-based client input.
         let mut first_line = Vec::with_capacity(buffer::COMMAND);
 
+        // Auth state: username from AUTHINFO USER command
+        let mut auth_username: Option<String> = None;
+
         debug!("Caching session for client {} starting", self.client_addr);
 
         loop {
@@ -78,7 +81,7 @@ impl CachingSession {
                             debug!("Client {} sent command: {}", self.client_addr, line.trim());
 
                             // PERFORMANCE OPTIMIZATION: Fast path after authentication
-                            if self.authenticated.load(std::sync::atomic::Ordering::Relaxed) || !self.auth_handler.is_enabled() {
+                            if self.authenticated.load(std::sync::atomic::Ordering::Acquire) || !self.auth_handler.is_enabled() {
                                 // Already authenticated OR auth disabled - process normally (HOT PATH)
 
                                 // Check if this is a cacheable command (article by message-ID)
@@ -208,15 +211,20 @@ impl CachingSession {
                                         backend_to_client_bytes.add(response_buffer.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        // Mark as authenticated after AUTHINFO PASS (before consuming auth_action)
-                                        let is_pass = matches!(auth_action, crate::command::AuthAction::AcceptAuth);
+                                        // Store username if this is AUTHINFO USER
+                                        if let crate::command::AuthAction::RequestPassword(ref username) = auth_action {
+                                            auth_username = Some(username.clone());
+                                        }
 
-                                        // Handle auth commands inline
-                                        let bytes = self.auth_handler.handle_auth_command(auth_action, &mut client_write).await?;
+                                        // Handle auth and validate
+                                        let (bytes, auth_success) = self
+                                            .auth_handler
+                                            .handle_auth_command(auth_action, &mut client_write, auth_username.as_deref())
+                                            .await?;
                                         backend_to_client_bytes.add(bytes);
 
-                                        if is_pass {
-                                            self.authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        if auth_success {
+                                            self.authenticated.store(true, std::sync::atomic::Ordering::Release);
                                         }
                                     }
                                     CommandAction::Reject(response) => {

@@ -43,6 +43,9 @@ impl ClientSession {
         let mut client_to_backend_bytes = BytesTransferred::zero();
         let mut backend_to_client_bytes = BytesTransferred::zero();
 
+        // Auth state: username from AUTHINFO USER command
+        let mut auth_username: Option<String> = None;
+
         // Send initial greeting to client
         debug!(
             "Client {} sending greeting: {} | hex: {:02x?}",
@@ -127,7 +130,7 @@ impl ClientSession {
             // Once authenticated, skip classification (just route everything)
             if self
                 .authenticated
-                .load(std::sync::atomic::Ordering::Relaxed)
+                .load(std::sync::atomic::Ordering::Acquire)
             {
                 // Already authenticated - just route the command (HOT PATH after auth)
                 if let Err(e) = self
@@ -271,19 +274,25 @@ impl ClientSession {
                     }
                 }
                 CommandAction::InterceptAuth(auth_action) => {
-                    // Mark as authenticated after AUTHINFO PASS (before consuming auth_action)
-                    let is_pass = matches!(auth_action, crate::command::AuthAction::AcceptAuth);
+                    // Store username if this is AUTHINFO USER
+                    if let crate::command::AuthAction::RequestPassword(ref username) = auth_action {
+                        auth_username = Some(username.clone());
+                    }
 
-                    // Handle auth commands inline
-                    let bytes = self
+                    // Handle auth and validate
+                    let (bytes, auth_success) = self
                         .auth_handler
-                        .handle_auth_command(auth_action, &mut client_write)
+                        .handle_auth_command(
+                            auth_action,
+                            &mut client_write,
+                            auth_username.as_deref(),
+                        )
                         .await?;
                     backend_to_client_bytes.add(bytes);
 
-                    if is_pass {
+                    if auth_success {
                         self.authenticated
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
                 CommandAction::Reject(response) => {

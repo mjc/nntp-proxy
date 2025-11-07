@@ -22,10 +22,10 @@ pub enum CommandAction {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AuthAction {
-    /// Send password required response
-    RequestPassword,
-    /// Send authentication accepted response
-    AcceptAuth,
+    /// Send password required response (username provided)
+    RequestPassword(String),
+    /// Validate credentials and send appropriate response
+    ValidateAndRespond { password: String },
 }
 
 /// Handler for processing commands and determining actions
@@ -35,8 +35,28 @@ impl CommandHandler {
     /// Process a command and return the action to take
     pub fn handle_command(command: &str) -> CommandAction {
         match NntpCommand::classify(command) {
-            NntpCommand::AuthUser => CommandAction::InterceptAuth(AuthAction::RequestPassword),
-            NntpCommand::AuthPass => CommandAction::InterceptAuth(AuthAction::AcceptAuth),
+            NntpCommand::AuthUser => {
+                // Extract username from "AUTHINFO USER <username>"
+                let username = command
+                    .trim()
+                    .strip_prefix("AUTHINFO USER")
+                    .or_else(|| command.trim().strip_prefix("authinfo user"))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
+            }
+            NntpCommand::AuthPass => {
+                // Extract password from "AUTHINFO PASS <password>"
+                let password = command
+                    .trim()
+                    .strip_prefix("AUTHINFO PASS")
+                    .or_else(|| command.trim().strip_prefix("authinfo pass"))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
+            }
             NntpCommand::Stateful => {
                 CommandAction::Reject("Command not supported by this proxy (stateless proxy mode)")
             }
@@ -56,16 +76,19 @@ mod tests {
     #[test]
     fn test_auth_user_command() {
         let action = CommandHandler::handle_command("AUTHINFO USER test");
-        assert_eq!(
+        assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword)
-        );
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(ref username)) if username == "test"
+        ));
     }
 
     #[test]
     fn test_auth_pass_command() {
         let action = CommandHandler::handle_command("AUTHINFO PASS secret");
-        assert_eq!(action, CommandAction::InterceptAuth(AuthAction::AcceptAuth));
+        assert!(matches!(
+            action,
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password == "secret"
+        ));
     }
 
     #[test]
@@ -195,10 +218,10 @@ mod tests {
 
         // Auth command with extra whitespace
         let action = CommandHandler::handle_command("  AUTHINFO USER test  ");
-        assert_eq!(
+        assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword)
-        );
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(ref username)) if username == "test"
+        ));
     }
 
     #[test]
@@ -214,16 +237,19 @@ mod tests {
 
     #[test]
     fn test_auth_commands_without_arguments() {
-        // AUTHINFO USER without username (still intercept)
+        // AUTHINFO USER without username (still intercept, empty username)
         let action = CommandHandler::handle_command("AUTHINFO USER");
-        assert_eq!(
+        assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword)
-        );
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(ref username)) if username.is_empty()
+        ));
 
-        // AUTHINFO PASS without password (still intercept)
+        // AUTHINFO PASS without password (still intercept, empty password)
         let action = CommandHandler::handle_command("AUTHINFO PASS");
-        assert_eq!(action, CommandAction::InterceptAuth(AuthAction::AcceptAuth));
+        assert!(matches!(
+            action,
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password.is_empty()
+        ));
     }
 
     #[test]
@@ -260,14 +286,16 @@ mod tests {
             CommandAction::ForwardStateless
         );
         assert_eq!(
-            CommandAction::InterceptAuth(AuthAction::RequestPassword),
-            CommandAction::InterceptAuth(AuthAction::RequestPassword)
+            CommandAction::InterceptAuth(AuthAction::RequestPassword("test".to_string())),
+            CommandAction::InterceptAuth(AuthAction::RequestPassword("test".to_string()))
         );
 
         // Test inequality
         assert_ne!(
-            CommandAction::InterceptAuth(AuthAction::RequestPassword),
-            CommandAction::InterceptAuth(AuthAction::AcceptAuth)
+            CommandAction::InterceptAuth(AuthAction::RequestPassword("user1".to_string())),
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond {
+                password: "pass1".to_string()
+            })
         );
     }
 

@@ -33,6 +33,9 @@ impl ClientSession {
         // Reuse line buffer to avoid per-iteration allocations
         let mut line = String::with_capacity(COMMAND);
 
+        // Auth state: username from AUTHINFO USER command
+        let mut auth_username: Option<String> = None;
+
         debug!("Client {} session loop starting", self.client_addr);
 
         // Handle the initial command/response phase where we intercept auth
@@ -55,7 +58,7 @@ impl ClientSession {
 
                             // PERFORMANCE OPTIMIZATION: Skip auth checking after first auth
                             // Auth happens ONCE per session, then thousands of ARTICLE commands follow
-                            if self.authenticated.load(std::sync::atomic::Ordering::Relaxed) || !self.auth_handler.is_enabled() {
+                            if self.authenticated.load(std::sync::atomic::Ordering::Acquire) || !self.auth_handler.is_enabled() {
                                 // Already authenticated OR auth disabled - just forward everything (HOT PATH)
                                 backend_write.write_all(line.as_bytes()).await?;
                                 client_to_backend_bytes.add(line.len());
@@ -70,15 +73,20 @@ impl ClientSession {
                                         client_to_backend_bytes.add(line.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        // Mark as authenticated after AUTHINFO PASS (before consuming auth_action)
-                                        let is_pass = matches!(auth_action, crate::command::AuthAction::AcceptAuth);
+                                        // Store username if this is AUTHINFO USER
+                                        if let crate::command::AuthAction::RequestPassword(ref username) = auth_action {
+                                            auth_username = Some(username.clone());
+                                        }
 
-                                        // Handle auth commands inline
-                                        let bytes = self.auth_handler.handle_auth_command(auth_action, &mut client_write).await?;
+                                        // Handle auth and validate
+                                        let (bytes, auth_success) = self
+                                            .auth_handler
+                                            .handle_auth_command(auth_action, &mut client_write, auth_username.as_deref())
+                                            .await?;
                                         backend_to_client_bytes.add(bytes);
 
-                                        if is_pass {
-                                            self.authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        if auth_success {
+                                            self.authenticated.store(true, std::sync::atomic::Ordering::Release);
                                         }
                                     }
                                     CommandAction::Reject(response) => {

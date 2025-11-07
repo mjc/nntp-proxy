@@ -59,22 +59,41 @@ impl AuthHandler {
         }
     }
 
-    /// Handle an auth command - writes response to client
+    /// Handle an auth command - writes response to client and returns (bytes_written, auth_success)
     /// This is the ONE place where auth interception happens
     pub async fn handle_auth_command<W>(
         &self,
         auth_action: AuthAction,
         writer: &mut W,
-    ) -> std::io::Result<usize>
+        stored_username: Option<&str>,
+    ) -> std::io::Result<(usize, bool)>
     where
         W: AsyncWriteExt + Unpin,
     {
-        let response = match auth_action {
-            AuthAction::RequestPassword => AUTH_REQUIRED,
-            AuthAction::AcceptAuth => AUTH_ACCEPTED,
-        };
-        writer.write_all(response).await?;
-        Ok(response.len())
+        match auth_action {
+            AuthAction::RequestPassword(_username) => {
+                // Always respond with password required
+                writer.write_all(AUTH_REQUIRED).await?;
+                Ok((AUTH_REQUIRED.len(), false))
+            }
+            AuthAction::ValidateAndRespond { password } => {
+                // Validate credentials
+                let auth_success = if let Some(username) = stored_username {
+                    self.validate(username, &password)
+                } else {
+                    // No username was stored (client sent AUTHINFO PASS without USER)
+                    false
+                };
+
+                let response = if auth_success {
+                    AUTH_ACCEPTED
+                } else {
+                    b"481 Authentication failed\r\n" as &[u8]
+                };
+                writer.write_all(response).await?;
+                Ok((response.len(), auth_success))
+            }
+        }
     }
 
     /// Get the AUTHINFO USER response
