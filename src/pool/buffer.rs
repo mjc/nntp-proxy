@@ -1,6 +1,6 @@
 use crate::types::BufferSize;
 use crossbeam::queue::SegQueue;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
@@ -9,29 +9,15 @@ use tracing::info;
 ///
 /// # Safety and Uninitialized Memory
 ///
-/// **CRITICAL:** Buffers from this pool contain **uninitialized memory** for performance.
-/// This type tracks the number of initialized bytes and only exposes that range through
-/// `Deref`, preventing undefined behavior from reading uninitialized memory.
+/// Buffers contain **uninitialized memory** for performance (no zeroing overhead).
+/// The type tracks initialized bytes and only exposes that portion, preventing UB.
 ///
-/// ## Safe Usage Pattern
+/// ## Usage
 /// ```ignore
 /// let mut buffer = pool.get_buffer().await;
-/// let n = stream.read(&mut buffer).await?;  // AsyncRead initializes bytes
-/// buffer.set_initialized(n);                 // Track initialized length
-/// process(&*buffer);                         // Deref returns &buffer[..n] safely
+/// let n = buffer.read_from(&mut stream).await?;  // Automatic tracking
+/// process(&*buffer);  // Deref returns only &buffer[..n]
 /// ```
-///
-/// ## How It Works
-/// - `DerefMut` returns mutable access to the full buffer (for writes)
-/// - `Deref` returns immutable access to ONLY the initialized portion
-/// - Callers must call `set_initialized(n)` after writing `n` bytes
-/// - Default initialized length is 0, making empty derefs safe
-///
-/// ## Performance Justification
-/// Using uninitialized buffers eliminates zeroing overhead:
-/// - 64KB buffer: ~50-100µs saved per allocation
-/// - High-throughput proxy: thousands of allocations/sec → significant savings
-/// - See `tests/test_review_claims.rs::test_performance_uninit_vs_zeroed` for benchmarks
 pub struct PooledBuffer {
     buffer: Vec<u8>,
     initialized: usize,
@@ -47,34 +33,34 @@ impl PooledBuffer {
         self.buffer.len()
     }
 
-    /// Set the number of initialized bytes in the buffer
-    ///
-    /// This controls what range is accessible through `Deref`.
-    /// Call this after writing data to mark those bytes as safe to read.
-    ///
-    /// # Panics
-    /// Panics if `len` exceeds the buffer capacity
-    #[inline]
-    pub fn set_initialized(&mut self, len: usize) {
-        assert!(
-            len <= self.buffer.len(),
-            "initialized length exceeds buffer capacity"
-        );
-        self.initialized = len;
-    }
-
     /// Get the number of initialized bytes
     #[inline]
     pub fn initialized(&self) -> usize {
         self.initialized
     }
-}
 
-impl DerefMut for PooledBuffer {
+    /// Read from an AsyncRead source, automatically tracking initialized bytes
+    pub async fn read_from<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
+    where
+        R: tokio::io::AsyncReadExt + Unpin,
+    {
+        let n = reader.read(&mut self.buffer[..]).await?;
+        self.initialized = n;
+        Ok(n)
+    }
+
+    /// Copy data into buffer and mark as initialized
+    ///
+    /// # Panics
+    /// Panics if data.len() > capacity
     #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // Mutable access gives the full buffer for writes
-        &mut self.buffer[..]
+    pub fn copy_from_slice(&mut self, data: &[u8]) {
+        assert!(
+            data.len() <= self.buffer.len(),
+            "data exceeds buffer capacity"
+        );
+        self.buffer[..data.len()].copy_from_slice(data);
+        self.initialized = data.len();
     }
 }
 
@@ -88,12 +74,7 @@ impl Deref for PooledBuffer {
     }
 }
 
-impl AsMut<[u8]> for PooledBuffer {
-    #[inline]
-    fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.buffer
-    }
-}
+// Intentionally NO DerefMut or AsMut - forces explicit use of read_from() or as_mut_slice()
 
 impl AsRef<[u8]> for PooledBuffer {
     #[inline]
@@ -350,9 +331,10 @@ mod tests {
 
         let mut buffer = pool.get_buffer().await;
 
-        // Modify the buffer
-        buffer[0] = 42;
-        buffer[100] = 99;
+        // Write data using copy_from_slice
+        let data = vec![42u8; 101];
+        buffer.copy_from_slice(&data);
+        assert_eq!(buffer.initialized(), 101);
 
         // Drop returns it to pool
         drop(buffer);
@@ -405,8 +387,10 @@ mod tests {
             let mut buffer = pool.get_buffer().await;
             assert_eq!(buffer.capacity(), 4096);
 
-            // Write some data
-            buffer[0] = i as u8;
+            // Write some data using copy_from_slice
+            let data = vec![i as u8; 1];
+            buffer.copy_from_slice(&data);
+            assert_eq!(buffer.initialized(), 1);
         }
     }
 

@@ -10,12 +10,6 @@ use tracing::{debug, warn};
 mod tail_buffer;
 use tail_buffer::TailBuffer;
 
-/// Swap between two buffer indices (0 <-> 1)
-#[inline]
-const fn alternate_buffer_index(current: usize) -> usize {
-    1 - current
-}
-
 /// Context for handling client write errors during streaming
 struct ClientWriteErrorContext<'a> {
     write_len: usize,
@@ -100,14 +94,13 @@ where
     let mut tail = TailBuffer::default();
     tail.update(initial_tail);
     loop {
-        let n = backend_read
-            .read(&mut chunk)
+        let n = chunk
+            .read_from(backend_read)
             .await
             .context("Failed to read from backend while draining response")?;
         if n == 0 {
             break; // EOF
         }
-        chunk.set_initialized(n); // Mark bytes as initialized
         let data = &chunk[..n];
         if tail.detect_terminator(data).is_found() {
             break;
@@ -142,16 +135,23 @@ where
     // Prepare double buffering for pipelined streaming using buffer pool
     let mut buffer1 = buffer_pool.get_buffer().await;
     let mut buffer2 = buffer_pool.get_buffer().await;
-    let buffers = [&mut buffer1[..], &mut buffer2[..]];
-    let mut current_idx = 0;
-    // Copy first chunk into buffer
-    buffers[0][..first_n].copy_from_slice(&first_chunk[..first_n]);
+
+    // Copy first chunk into buffer1 and mark it initialized
+    buffer1.copy_from_slice(&first_chunk[..first_n]);
+
     let mut current_n = first_n;
+    let mut use_buffer1 = true; // Track which buffer is current
+
     // Track tail for spanning terminator detection
     let mut tail = TailBuffer::default();
     // Main streaming loop - processes first chunk and all subsequent chunks uniformly
     loop {
-        let data = &buffers[current_idx][..current_n];
+        let data = if use_buffer1 {
+            &buffer1[..current_n]
+        } else {
+            &buffer2[..current_n]
+        };
+
         // Detect terminator location: within chunk or spanning boundary
         let status = tail.detect_terminator(data);
         let write_len = status.write_len(current_n);
@@ -185,12 +185,21 @@ where
         }
         // Update tail for next iteration
         tail.update(&data[..write_len]);
+
         // Read next chunk into alternate buffer
-        let next_idx = alternate_buffer_index(current_idx);
-        let next_n = backend_read
-            .read(buffers[next_idx])
-            .await
-            .context("Failed to read next chunk from backend")?;
+        use_buffer1 = !use_buffer1;
+        let next_n = if use_buffer1 {
+            buffer1
+                .read_from(backend_read)
+                .await
+                .context("Failed to read next chunk from backend")?
+        } else {
+            buffer2
+                .read_from(backend_read)
+                .await
+                .context("Failed to read next chunk from backend")?
+        };
+
         if next_n == 0 {
             debug!(
                 "Client {} multiline streaming complete ({}, EOF)",
@@ -199,8 +208,7 @@ where
             );
             break; // EOF
         }
-        // Swap buffers for next iteration
-        current_idx = next_idx;
+        // Swap to current buffer for next iteration
         current_n = next_n;
     }
 
@@ -211,12 +219,6 @@ where
 mod tests {
     use super::*;
     use std::io::Cursor;
-
-    #[test]
-    fn test_alternate_buffer_index() {
-        assert_eq!(alternate_buffer_index(0), 1);
-        assert_eq!(alternate_buffer_index(1), 0);
-    }
 
     #[tokio::test]
     async fn test_drain_until_terminator_immediate() {

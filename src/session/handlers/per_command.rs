@@ -5,6 +5,7 @@
 //! logic used by all routing modes.
 
 use super::common::{SMALL_TRANSFER_THRESHOLD, extract_message_id};
+use crate::pool::PooledBuffer;
 use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -377,7 +378,7 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
-        chunk_buffer: &mut [u8], // Reusable buffer from pool
+        chunk_buffer: &mut PooledBuffer, // Reusable buffer from pool
     ) -> (Result<()>, bool) {
         let mut got_backend_data = false;
 
@@ -387,7 +388,7 @@ impl ClientSession {
             command,
             backend_id,
             self.client_addr,
-            chunk_buffer, // Use caller's buffer instead of allocating
+            chunk_buffer,
         )
         .await
         {

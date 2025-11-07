@@ -83,8 +83,8 @@ where
             }
 
             // Read from backend and forward to client
-            result = pooled_conn.read(&mut buffer_b2c) => {
-                match result {
+            n = buffer_b2c.read_from(pooled_conn) => {
+                match n {
                     Ok(0) => {
                         debug!("Backend disconnected while in stateful mode for client {}", client_addr);
                         break;

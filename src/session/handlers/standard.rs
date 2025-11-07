@@ -2,7 +2,7 @@
 
 use crate::session::ClientSession;
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
@@ -114,8 +114,8 @@ impl ClientSession {
                 }
 
                 // Read response from backend and forward to client (for non-auth commands)
-                result = backend_read.read(&mut buffer) => {
-                    match result {
+                n = buffer.read_from(&mut backend_read) => {
+                    match n {
                         Ok(0) => {
                             break; // Backend disconnected
                         }

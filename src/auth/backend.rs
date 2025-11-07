@@ -30,7 +30,7 @@ impl BackendAuthenticator {
             .await?;
 
         // Read response
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
         debug!("AUTHINFO USER response: {}", response.trim());
 
@@ -49,7 +49,7 @@ impl BackendAuthenticator {
             .await?;
 
         // Read final response
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
         debug!("AUTHINFO PASS response: {}", response.trim());
 
@@ -78,7 +78,7 @@ impl BackendAuthenticator {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
         debug!("Backend greeting: {}", greeting_str.trim());
@@ -113,7 +113,7 @@ impl BackendAuthenticator {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting first and forward it
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
         debug!("Backend greeting: {}", greeting_str.trim());

@@ -7,6 +7,7 @@ use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
+use crate::pool::PooledBuffer;
 use crate::protocol::{MIN_RESPONSE_LENGTH, ResponseCode};
 use crate::types::BackendId;
 
@@ -19,7 +20,7 @@ pub async fn send_command_and_read_first_chunk<T>(
     command: &str,
     backend_id: BackendId,
     client_addr: std::net::SocketAddr,
-    chunk: &mut [u8],
+    chunk: &mut PooledBuffer,
 ) -> Result<(usize, ResponseCode, bool)>
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -46,7 +47,7 @@ where
         client_addr, backend_id
     );
 
-    let n = backend_conn.read(chunk).await?;
+    let n = chunk.read_from(backend_conn).await?;
 
     if n == 0 {
         return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
