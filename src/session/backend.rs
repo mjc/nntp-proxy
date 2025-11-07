@@ -7,19 +7,20 @@ use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-use crate::constants::buffer::STREAM_CHUNK;
 use crate::protocol::{MIN_RESPONSE_LENGTH, ResponseCode};
 use crate::types::BackendId;
 
 /// Send command to backend and read first chunk
 ///
-/// Returns (first_chunk, bytes_read, response_code, is_multiline)
+/// Returns (bytes_read, response_code, is_multiline)
+/// The first chunk is written into the provided buffer.
 pub async fn send_command_and_read_first_chunk<T>(
     backend_conn: &mut T,
     command: &str,
     backend_id: BackendId,
     client_addr: std::net::SocketAddr,
-) -> Result<(Vec<u8>, usize, ResponseCode, bool)>
+    chunk: &mut [u8],
+) -> Result<(usize, ResponseCode, bool)>
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -45,8 +46,7 @@ where
         client_addr, backend_id
     );
 
-    let mut chunk = vec![0u8; STREAM_CHUNK];
-    let n = backend_conn.read(&mut chunk).await?;
+    let n = backend_conn.read(chunk).await?;
 
     if n == 0 {
         return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
@@ -109,5 +109,5 @@ where
         );
     }
 
-    Ok((chunk, n, response_code, is_multiline))
+    Ok((n, response_code, is_multiline))
 }

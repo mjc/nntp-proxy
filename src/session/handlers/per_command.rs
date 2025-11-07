@@ -324,6 +324,9 @@ impl ClientSession {
     ) -> Result<crate::types::BackendId> {
         use crate::pool::{is_connection_error, remove_from_pool};
 
+        // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
+        let mut buffer = self.buffer_pool.get_buffer().await;
+
         // Route the command to get a backend (lock-free!)
         let backend_id = router.route_command_sync(self.client_id, command)?;
 
@@ -361,8 +364,12 @@ impl ClientSession {
                 backend_id,
                 client_to_backend_bytes,
                 backend_to_client_bytes,
+                &mut buffer, // Pass reusable buffer
             )
             .await;
+
+        // Return buffer to pool before handling result
+        self.buffer_pool.return_buffer(buffer).await;
 
         // Only remove backend connection if error occurred AND we didn't get data from backend
         // If we got data from backend, then any error is from writing to client
@@ -413,6 +420,7 @@ impl ClientSession {
     /// - This distinguishes backend failures (remove from pool) from client disconnects (keep backend)
     ///
     /// This function is `pub(super)` and is intended for use by `hybrid.rs` for stateful mode command execution.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_command_on_backend(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
@@ -421,25 +429,26 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
+        chunk_buffer: &mut [u8], // Reusable buffer from pool
     ) -> (Result<()>, bool) {
         let mut got_backend_data = false;
 
-        // Send command and read first chunk
-        let (chunk, n, _response_code, is_multiline) =
-            match backend::send_command_and_read_first_chunk(
-                &mut **pooled_conn,
-                command,
-                backend_id,
-                self.client_addr,
-            )
-            .await
-            {
-                Ok(result) => {
-                    got_backend_data = true;
-                    result
-                }
-                Err(e) => return (Err(e), got_backend_data),
-            };
+        // Send command and read first chunk into reusable buffer
+        let (n, _response_code, is_multiline) = match backend::send_command_and_read_first_chunk(
+            &mut **pooled_conn,
+            command,
+            backend_id,
+            self.client_addr,
+            chunk_buffer, // Use caller's buffer instead of allocating
+        )
+        .await
+        {
+            Ok(result) => {
+                got_backend_data = true;
+                result
+            }
+            Err(e) => return (Err(e), got_backend_data),
+        };
 
         client_to_backend_bytes.add(command.len());
 
@@ -470,7 +479,7 @@ impl ClientSession {
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
-                &chunk,
+                &chunk_buffer[..n], // Use buffer slice instead of owned Vec
                 n,
                 self.client_addr,
                 backend_id,
@@ -500,7 +509,7 @@ impl ClientSession {
                             id,
                             _response_code.status_code(),
                             crate::formatting::format_bytes(n as u64),
-                            &chunk[..n.min(50)]
+                            &chunk_buffer[..n.min(50)]
                         )
                     }
                 } else {
@@ -510,7 +519,7 @@ impl ClientSession {
                         id,
                         _response_code.status_code(),
                         crate::formatting::format_bytes(n as u64),
-                        &chunk[..n.min(50)]
+                        &chunk_buffer[..n.min(50)]
                     )
                 }
             } else {
@@ -520,7 +529,7 @@ impl ClientSession {
                     command.trim(),
                     _response_code.status_code(),
                     crate::formatting::format_bytes(n as u64),
-                    &chunk[..n.min(50)]
+                    &chunk_buffer[..n.min(50)]
                 )
             };
 
@@ -537,7 +546,7 @@ impl ClientSession {
                 debug!("{}", log_msg);
             }
 
-            match client_write.write_all(&chunk[..n]).await {
+            match client_write.write_all(&chunk_buffer[..n]).await {
                 Ok(_) => n as u64,
                 Err(e) => return (Err(e.into()), got_backend_data),
             }
