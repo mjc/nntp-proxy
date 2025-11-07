@@ -68,9 +68,10 @@ impl ClientSession {
                                 let action = CommandHandler::handle_command(&line);
                                 match action {
                                     CommandAction::ForwardStateless => {
-                                        // Forward to backend
-                                        backend_write.write_all(line.as_bytes()).await?;
-                                        client_to_backend_bytes.add(line.len());
+                                        // Reject all non-auth commands before authentication
+                                        let response = b"480 Authentication required\r\n";
+                                        client_write.write_all(response).await?;
+                                        backend_to_client_bytes.add(response.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
                                         // Store username if this is AUTHINFO USER

@@ -57,12 +57,24 @@ impl AsRef<[u8]> for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        // Automatically return buffer to pool when dropped
-        let current_size = self.pool_size.load(Ordering::Relaxed);
-        if current_size < self.max_pool_size {
-            let buffer = std::mem::take(&mut self.buffer);
-            self.pool.push(buffer);
-            self.pool_size.fetch_add(1, Ordering::Relaxed);
+        // Atomically return buffer to pool if pool is not full
+        let mut current_size = self.pool_size.load(Ordering::Relaxed);
+        while current_size < self.max_pool_size {
+            match self.pool_size.compare_exchange_weak(
+                current_size,
+                current_size + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let buffer = std::mem::take(&mut self.buffer);
+                    self.pool.push(buffer);
+                    return;
+                }
+                Err(new_size) => {
+                    current_size = new_size;
+                }
+            }
         }
         // If pool is full, buffer is dropped
     }

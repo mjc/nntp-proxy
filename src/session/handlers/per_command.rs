@@ -216,60 +216,68 @@ impl ClientSession {
             use crate::command::CommandAction;
             match action {
                 CommandAction::ForwardStateless => {
-                    // Forward to backend via router (HOT PATH - 70%+ of commands)
-                    if let Err(e) = self
-                        .route_and_execute_command(
-                            router,
-                            &command,
-                            &mut client_write,
-                            &mut client_to_backend_bytes,
-                            &mut backend_to_client_bytes,
-                        )
-                        .await
-                    {
-                        use crate::session::error_classification::ErrorClassifier;
-                        let (up, down) = (
-                            crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
-                            crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
-                        );
-
-                        // Log based on error type, send error response if client still connected
-                        if ErrorClassifier::is_client_disconnect(&e) {
-                            debug!(
-                                "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
-                                self.client_addr, trimmed, up, down
+                    // Check if auth is required but not completed
+                    if self.auth_handler.is_enabled() {
+                        // Reject all non-auth commands before authentication
+                        let response = b"480 Authentication required\r\n";
+                        client_write.write_all(response).await?;
+                        backend_to_client_bytes.add(response.len());
+                    } else {
+                        // Auth disabled - forward to backend via router (HOT PATH - 70%+ of commands)
+                        if let Err(e) = self
+                            .route_and_execute_command(
+                                router,
+                                &command,
+                                &mut client_write,
+                                &mut client_to_backend_bytes,
+                                &mut backend_to_client_bytes,
+                            )
+                            .await
+                        {
+                            use crate::session::error_classification::ErrorClassifier;
+                            let (up, down) = (
+                                crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
+                                crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
                             );
-                        } else {
-                            if ErrorClassifier::is_authentication_error(&e) {
-                                error!(
-                                    "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
-                                    self.client_addr, trimmed, e, up, down
+
+                            // Log based on error type, send error response if client still connected
+                            if ErrorClassifier::is_client_disconnect(&e) {
+                                debug!(
+                                    "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
+                                    self.client_addr, trimmed, up, down
                                 );
                             } else {
-                                warn!(
-                                    "Client {} error routing '{}': {} | ↑{} ↓{}",
-                                    self.client_addr, trimmed, e, up, down
-                                );
+                                if ErrorClassifier::is_authentication_error(&e) {
+                                    error!(
+                                        "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
+                                        self.client_addr, trimmed, e, up, down
+                                    );
+                                } else {
+                                    warn!(
+                                        "Client {} error routing '{}': {} | ↑{} ↓{}",
+                                        self.client_addr, trimmed, e, up, down
+                                    );
+                                }
+                                let _ = client_write.write_all(BACKEND_ERROR).await;
+                                backend_to_client_bytes.add(BACKEND_ERROR.len());
                             }
-                            let _ = client_write.write_all(BACKEND_ERROR).await;
-                            backend_to_client_bytes.add(BACKEND_ERROR.len());
-                        }
 
-                        // Debug logging for small transfers
-                        if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
-                            < SMALL_TRANSFER_THRESHOLD
-                        {
-                            debug!(
-                                "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
+                            // Debug logging for small transfers
+                            if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
+                                < SMALL_TRANSFER_THRESHOLD
+                            {
+                                debug!(
+                                    "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
                                  Total session: {} bytes to backend, {} bytes from backend. \
                                  This appears to be a short session (test connection?). \
                                  Check debug logs above for full command/response hex dumps.",
-                                self.client_addr,
-                                trimmed,
-                                e,
-                                client_to_backend_bytes,
-                                backend_to_client_bytes
-                            );
+                                    self.client_addr,
+                                    trimmed,
+                                    e,
+                                    client_to_backend_bytes,
+                                    backend_to_client_bytes
+                                );
+                            }
                         }
                     }
                 }

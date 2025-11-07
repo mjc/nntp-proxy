@@ -170,45 +170,10 @@ impl CachingSession {
                                 let action = CommandHandler::handle_command(&line);
                                 match action {
                                     CommandAction::ForwardStateless => {
-                                        // Forward to backend (same as above, just don't cache yet)
-                                        backend_write.write_all(line.as_bytes()).await?;
-                                        client_to_backend_bytes.add(line.len());
-
-                                        first_line.clear();
-                                        backend_reader.read_until(b'\n', &mut first_line).await?;
-
-                                        if first_line.is_empty() {
-                                            debug!("Backend {} closed connection", self.client_addr);
-                                            break;
-                                        }
-
-                                        let mut response_buffer = std::mem::take(&mut first_line);
-
-                                        if NntpResponse::is_disconnect(&response_buffer) {
-                                            client_write.write_all(&response_buffer).await?;
-                                            backend_to_client_bytes.add(response_buffer.len());
-                                            break;
-                                        }
-
-                                        let response_code = ResponseCode::parse(&response_buffer);
-                                        if response_code.is_multiline() {
-                                            loop {
-                                                let start_pos = response_buffer.len();
-                                                backend_reader.read_until(b'\n', &mut response_buffer).await?;
-
-                                                if response_buffer.len() == start_pos {
-                                                    break;
-                                                }
-
-                                                let new_data = &response_buffer[start_pos..];
-                                                if new_data == b".\r\n" || new_data == b".\n" {
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        client_write.write_all(&response_buffer).await?;
-                                        backend_to_client_bytes.add(response_buffer.len());
+                                        // Reject all non-auth commands before authentication
+                                        let response = b"480 Authentication required\r\n";
+                                        client_write.write_all(response).await?;
+                                        backend_to_client_bytes.add(response.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
                                         // Store username if this is AUTHINFO USER

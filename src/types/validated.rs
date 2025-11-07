@@ -56,8 +56,6 @@ macro_rules! validated_string {
         $(#[$meta:meta])*
         $vis:vis struct $name:ident(String) {
             validation: |$s_param:ident| $validation:expr,
-            error_variant: $error_variant:ident,
-            error_message: $error_msg:literal,
         }
     ) => {
         $(#[$meta])*
@@ -152,8 +150,6 @@ validated_string! {
                 Ok(())
             }
         },
-        error_variant: EmptyHostName,
-        error_message: "hostname cannot be empty or whitespace",
     }
 }
 
@@ -167,8 +163,6 @@ validated_string! {
                 Ok(())
             }
         },
-        error_variant: EmptyServerName,
-        error_message: "server name cannot be empty or whitespace",
     }
 }
 
