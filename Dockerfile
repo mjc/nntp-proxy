@@ -1,5 +1,5 @@
 # Stage 1: build the Rust binary using nightly
-FROM rust:nightly-slim AS builder
+FROM rustlang/rust:nightly AS builder
 WORKDIR /usr/src/app
 
 # Install dependencies for building
