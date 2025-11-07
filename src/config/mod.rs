@@ -10,7 +10,9 @@ mod validation;
 
 // Re-export public types
 pub use loading::{create_default_config, load_config};
-pub use types::{CacheConfig, Config, HealthCheckConfig, RoutingMode, ServerConfig};
+pub use types::{
+    CacheConfig, ClientAuthConfig, Config, HealthCheckConfig, RoutingMode, ServerConfig,
+};
 
 // Re-export default functions for use in tests and other modules
 pub use defaults::{

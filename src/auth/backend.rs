@@ -30,18 +30,16 @@ impl BackendAuthenticator {
             .await?;
 
         // Read response
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
         debug!("AUTHINFO USER response: {}", response.trim());
 
         // Should get 381 (password required) or 281 (authenticated)
         if ResponseParser::is_auth_success(&buffer[..n]) {
             // Already authenticated with just username
-            buffer_pool.return_buffer(buffer).await;
             return Ok(());
         } else if !ResponseParser::is_auth_required(&buffer[..n]) {
             let error = format!("Unexpected response to AUTHINFO USER: {}", response.trim());
-            buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(error));
         }
 
@@ -51,23 +49,19 @@ impl BackendAuthenticator {
             .await?;
 
         // Read final response
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
         debug!("AUTHINFO PASS response: {}", response.trim());
 
         // Should get 281 (authenticated)
-        let result = if ResponseParser::is_auth_success(&buffer[..n]) {
+        if ResponseParser::is_auth_success(&buffer[..n]) {
             Ok(())
         } else {
             Err(anyhow::anyhow!(
                 "Authentication failed: {}",
                 response.trim()
             ))
-        };
-
-        // Return buffer to pool
-        buffer_pool.return_buffer(buffer).await;
-        result
+        }
     }
 
     /// Read and forward the backend server's greeting to the client - generic over stream types
@@ -84,7 +78,7 @@ impl BackendAuthenticator {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
         debug!("Backend greeting: {}", greeting_str.trim());
@@ -94,14 +88,12 @@ impl BackendAuthenticator {
                 "Server returned non-success greeting: {}",
                 greeting_str.trim()
             );
-            buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(error));
         }
 
         // Forward greeting to client
         client_stream.write_all(greeting).await?;
 
-        buffer_pool.return_buffer(buffer).await;
         Ok(())
     }
 
@@ -121,7 +113,7 @@ impl BackendAuthenticator {
         let mut buffer = buffer_pool.get_buffer().await;
 
         // Read the server greeting first and forward it
-        let n = backend_stream.read(&mut buffer).await?;
+        let n = buffer.read_from(backend_stream).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
         debug!("Backend greeting: {}", greeting_str.trim());
@@ -131,7 +123,6 @@ impl BackendAuthenticator {
                 "Server returned non-success greeting: {}",
                 greeting_str.trim()
             );
-            buffer_pool.return_buffer(buffer).await;
             return Err(anyhow::anyhow!(error));
         }
 
@@ -139,7 +130,6 @@ impl BackendAuthenticator {
         client_stream.write_all(greeting).await?;
 
         // Return buffer before calling authenticate
-        buffer_pool.return_buffer(buffer).await;
 
         // Now perform authentication on backend
         Self::authenticate(backend_stream, username, password, buffer_pool).await
@@ -191,16 +181,12 @@ mod tests {
         let buffer1 = buffer_pool.get_buffer().await;
         let buffer2 = buffer_pool.get_buffer().await;
 
-        assert_eq!(buffer1.len(), 8192);
-        assert_eq!(buffer2.len(), 8192);
-
-        buffer_pool.return_buffer(buffer1).await;
-        buffer_pool.return_buffer(buffer2).await;
+        assert_eq!(buffer1.capacity(), 8192);
+        assert_eq!(buffer2.capacity(), 8192);
 
         // Should be able to get them again
         let buffer3 = buffer_pool.get_buffer().await;
-        assert_eq!(buffer3.len(), 8192);
-        buffer_pool.return_buffer(buffer3).await;
+        assert_eq!(buffer3.capacity(), 8192);
     }
 
     /// Test authentication command formatting

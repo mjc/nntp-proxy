@@ -5,19 +5,17 @@
 //! logic used by all routing modes.
 
 use super::common::{SMALL_TRANSFER_THRESHOLD, extract_message_id};
+use crate::pool::PooledBuffer;
 use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::AuthHandler;
-use crate::command::{AuthAction, CommandAction, CommandHandler, NntpCommand};
+use crate::command::{CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::COMMAND;
-use crate::protocol::{
-    BACKEND_ERROR, COMMAND_NOT_SUPPORTED_STATELESS, CONNECTION_CLOSING, PROXY_GREETING_PCR,
-};
+use crate::protocol::{BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR};
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
 
@@ -46,6 +44,9 @@ impl ClientSession {
         let mut client_to_backend_bytes = BytesTransferred::zero();
         let mut backend_to_client_bytes = BytesTransferred::zero();
 
+        // Auth state: username from AUTHINFO USER command
+        let mut auth_username: Option<String> = None;
+
         // Send initial greeting to client
         debug!(
             "Client {} sending greeting: {} | hex: {:02x?}",
@@ -73,6 +74,10 @@ impl ClientSession {
 
         // Reuse command buffer to avoid allocations per command
         let mut command = String::with_capacity(COMMAND);
+
+        // PERFORMANCE: Cache authenticated state to avoid atomic loads after auth succeeds
+        // If auth is disabled, skip checks from the start
+        let mut skip_auth_check = !self.auth_handler.is_enabled();
 
         // Process commands one at a time
         loop {
@@ -126,6 +131,63 @@ impl ClientSession {
 
             let action = CommandHandler::handle_command(&command);
 
+            // ALWAYS intercept auth commands, even when auth is disabled
+            // Auth commands must NEVER be forwarded to backend
+            if matches!(action, CommandAction::InterceptAuth(_)) {
+                match action {
+                    CommandAction::InterceptAuth(auth_action) => {
+                        // Store username if this is AUTHINFO USER
+                        if let crate::command::AuthAction::RequestPassword(ref username) =
+                            auth_action
+                        {
+                            auth_username = Some(username.clone());
+                        }
+
+                        // Handle auth and validate
+                        let (bytes, auth_success) = self
+                            .auth_handler
+                            .handle_auth_command(
+                                auth_action,
+                                &mut client_write,
+                                auth_username.as_deref(),
+                            )
+                            .await?;
+                        backend_to_client_bytes.add(bytes);
+
+                        if auth_success {
+                            skip_auth_check = true;
+                            self.authenticated
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                continue;
+            }
+
+            // PERFORMANCE OPTIMIZATION: Fast path after authentication
+            // Once authenticated, skip classification (just route everything)
+            // Cache check to avoid atomic load on hot path
+            skip_auth_check = skip_auth_check
+                || self
+                    .authenticated
+                    .load(std::sync::atomic::Ordering::Acquire);
+            if skip_auth_check {
+                // Already authenticated - just route the command (HOT PATH after auth)
+                self.route_command_with_error_handling(
+                    router,
+                    &command,
+                    &mut client_write,
+                    &mut client_to_backend_bytes,
+                    &mut backend_to_client_bytes,
+                    trimmed,
+                )
+                .await?;
+                continue;
+            }
+
+            // Not yet authenticated - need to check for auth/stateful commands
+
             // In hybrid mode, stateful commands trigger a switch to stateful connection
             if self.routing_mode == RoutingMode::Hybrid
                 && matches!(action, CommandAction::Reject(_))
@@ -146,82 +208,38 @@ impl ClientSession {
                     .await;
             }
 
-            // Handle the command based on its action
+            // Handle the command - inline for performance
+            // Check ForwardStateless FIRST (70%+ of traffic)
+            use crate::command::CommandAction;
             match action {
-                CommandAction::InterceptAuth(auth_action) => {
-                    let response = match auth_action {
-                        AuthAction::RequestPassword => AuthHandler::user_response(),
-                        AuthAction::AcceptAuth => AuthHandler::pass_response(),
-                    };
-                    client_write.write_all(response).await?;
-                    backend_to_client_bytes.add(response.len());
-                }
-                CommandAction::Reject(reason) => {
-                    warn!(
-                        "Rejecting command from client {}: {} ({})",
-                        self.client_addr, trimmed, reason
-                    );
-                    client_write
-                        .write_all(COMMAND_NOT_SUPPORTED_STATELESS)
-                        .await?;
-                    backend_to_client_bytes.add(COMMAND_NOT_SUPPORTED_STATELESS.len());
-                }
                 CommandAction::ForwardStateless => {
-                    if let Err(e) = self
-                        .route_and_execute_command(
+                    // Check if auth is required but not completed
+                    if self.auth_handler.is_enabled() {
+                        // Reject all non-auth commands before authentication
+                        let response = b"480 Authentication required\r\n";
+                        client_write.write_all(response).await?;
+                        backend_to_client_bytes.add(response.len());
+                    } else {
+                        // Auth disabled - forward to backend via router (HOT PATH - 70%+ of commands)
+                        self.route_command_with_error_handling(
                             router,
                             &command,
                             &mut client_write,
                             &mut client_to_backend_bytes,
                             &mut backend_to_client_bytes,
+                            trimmed,
                         )
-                        .await
-                    {
-                        use crate::session::error_classification::ErrorClassifier;
-                        let (up, down) = (
-                            crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
-                            crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
-                        );
-
-                        // Log based on error type, send error response if client still connected
-                        if ErrorClassifier::is_client_disconnect(&e) {
-                            debug!(
-                                "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
-                                self.client_addr, trimmed, up, down
-                            );
-                        } else {
-                            if ErrorClassifier::is_authentication_error(&e) {
-                                error!(
-                                    "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
-                                    self.client_addr, trimmed, e, up, down
-                                );
-                            } else {
-                                warn!(
-                                    "Client {} error routing '{}': {} | ↑{} ↓{}",
-                                    self.client_addr, trimmed, e, up, down
-                                );
-                            }
-                            let _ = client_write.write_all(BACKEND_ERROR).await;
-                            backend_to_client_bytes.add(BACKEND_ERROR.len());
-                        }
-
-                        // Debug logging for small transfers
-                        if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
-                            < SMALL_TRANSFER_THRESHOLD
-                        {
-                            debug!(
-                                "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
-                                 Total session: {} bytes to backend, {} bytes from backend. \
-                                 This appears to be a short session (test connection?). \
-                                 Check debug logs above for full command/response hex dumps.",
-                                self.client_addr,
-                                trimmed,
-                                e,
-                                client_to_backend_bytes,
-                                backend_to_client_bytes
-                            );
-                        }
+                        .await?;
                     }
+                }
+                CommandAction::Reject(response) => {
+                    // Send rejection response inline
+                    client_write.write_all(response.as_bytes()).await?;
+                    backend_to_client_bytes.add(response.len());
+                }
+                CommandAction::InterceptAuth(_) => {
+                    // Already handled above before fast path check
+                    unreachable!("Auth commands should be handled before reaching here");
                 }
             }
         }
@@ -255,6 +273,9 @@ impl ClientSession {
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
         use crate::pool::{is_connection_error, remove_from_pool};
+
+        // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
+        let mut buffer = self.buffer_pool.get_buffer().await;
 
         // Route the command to get a backend (lock-free!)
         let backend_id = router.route_command_sync(self.client_id, command)?;
@@ -293,8 +314,11 @@ impl ClientSession {
                 backend_id,
                 client_to_backend_bytes,
                 backend_to_client_bytes,
+                &mut buffer, // Pass reusable buffer
             )
             .await;
+
+        // Return buffer to pool before handling result
 
         // Only remove backend connection if error occurred AND we didn't get data from backend
         // If we got data from backend, then any error is from writing to client
@@ -345,6 +369,7 @@ impl ClientSession {
     /// - This distinguishes backend failures (remove from pool) from client disconnects (keep backend)
     ///
     /// This function is `pub(super)` and is intended for use by `hybrid.rs` for stateful mode command execution.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_command_on_backend(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
@@ -353,25 +378,26 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
+        chunk_buffer: &mut PooledBuffer, // Reusable buffer from pool
     ) -> (Result<()>, bool) {
         let mut got_backend_data = false;
 
-        // Send command and read first chunk
-        let (chunk, n, _response_code, is_multiline) =
-            match backend::send_command_and_read_first_chunk(
-                &mut **pooled_conn,
-                command,
-                backend_id,
-                self.client_addr,
-            )
-            .await
-            {
-                Ok(result) => {
-                    got_backend_data = true;
-                    result
-                }
-                Err(e) => return (Err(e), got_backend_data),
-            };
+        // Send command and read first chunk into reusable buffer
+        let (n, _response_code, is_multiline) = match backend::send_command_and_read_first_chunk(
+            &mut **pooled_conn,
+            command,
+            backend_id,
+            self.client_addr,
+            chunk_buffer,
+        )
+        .await
+        {
+            Ok(result) => {
+                got_backend_data = true;
+                result
+            }
+            Err(e) => return (Err(e), got_backend_data),
+        };
 
         client_to_backend_bytes.add(command.len());
 
@@ -402,10 +428,11 @@ impl ClientSession {
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
-                &chunk,
+                &chunk_buffer[..n], // Use buffer slice instead of owned Vec
                 n,
                 self.client_addr,
                 backend_id,
+                &self.buffer_pool,
             )
             .await
             {
@@ -432,7 +459,7 @@ impl ClientSession {
                             id,
                             _response_code.status_code(),
                             crate::formatting::format_bytes(n as u64),
-                            &chunk[..n.min(50)]
+                            &chunk_buffer[..n.min(50)]
                         )
                     }
                 } else {
@@ -442,7 +469,7 @@ impl ClientSession {
                         id,
                         _response_code.status_code(),
                         crate::formatting::format_bytes(n as u64),
-                        &chunk[..n.min(50)]
+                        &chunk_buffer[..n.min(50)]
                     )
                 }
             } else {
@@ -452,7 +479,7 @@ impl ClientSession {
                     command.trim(),
                     _response_code.status_code(),
                     crate::formatting::format_bytes(n as u64),
-                    &chunk[..n.min(50)]
+                    &chunk_buffer[..n.min(50)]
                 )
             };
 
@@ -469,7 +496,7 @@ impl ClientSession {
                 debug!("{}", log_msg);
             }
 
-            match client_write.write_all(&chunk[..n]).await {
+            match client_write.write_all(&chunk_buffer[..n]).await {
                 Ok(_) => n as u64,
                 Err(e) => return (Err(e.into()), got_backend_data),
             }
@@ -485,6 +512,79 @@ impl ClientSession {
         }
 
         (Ok(()), got_backend_data)
+    }
+
+    /// Route a command and handle any errors with appropriate logging and client responses
+    ///
+    /// This helper consolidates the error handling logic that was duplicated in multiple places.
+    /// It routes the command via the router, and if an error occurs, it:
+    /// - Classifies the error (client disconnect vs auth error vs other)
+    /// - Logs appropriately based on error type
+    /// - Sends BACKEND_ERROR response to client (if not disconnected)
+    /// - Includes debug logging for small transfers
+    async fn route_command_with_error_handling(
+        &self,
+        router: &BackendSelector,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_to_backend_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BytesTransferred,
+        trimmed: &str,
+    ) -> Result<()> {
+        if let Err(e) = self
+            .route_and_execute_command(
+                router,
+                command,
+                client_write,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+            )
+            .await
+        {
+            use crate::session::error_classification::ErrorClassifier;
+            let (up, down) = (
+                crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
+                crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
+            );
+
+            // Log based on error type, send error response if client still connected
+            if ErrorClassifier::is_client_disconnect(&e) {
+                debug!(
+                    "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
+                    self.client_addr, trimmed, up, down
+                );
+            } else {
+                if ErrorClassifier::is_authentication_error(&e) {
+                    error!(
+                        "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
+                        self.client_addr, trimmed, e, up, down
+                    );
+                } else {
+                    warn!(
+                        "Client {} error routing '{}': {} | ↑{} ↓{}",
+                        self.client_addr, trimmed, e, up, down
+                    );
+                }
+                let _ = client_write.write_all(BACKEND_ERROR).await;
+                backend_to_client_bytes.add(BACKEND_ERROR.len());
+            }
+
+            // Debug logging for small transfers
+            if (*client_to_backend_bytes + *backend_to_client_bytes).as_u64()
+                < SMALL_TRANSFER_THRESHOLD
+            {
+                debug!(
+                    "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
+                     Total session: {} bytes to backend, {} bytes from backend. \
+                     This appears to be a short session (test connection?). \
+                     Check debug logs above for full command/response hex dumps.",
+                    self.client_addr, trimmed, e, client_to_backend_bytes, backend_to_client_bytes
+                );
+            }
+
+            return Err(e);
+        }
+        Ok(())
     }
 }
 

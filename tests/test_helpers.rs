@@ -68,6 +68,7 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
 ///
 /// # Returns
 /// Handle to the background task running the mock server
+#[allow(dead_code)]
 pub fn spawn_mock_server_with_auth(
     port: u16,
     expected_user: &str,
@@ -155,6 +156,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
             .collect(),
         health_check: Default::default(),
         cache: Default::default(),
+        client_auth: Default::default(),
     }
 }
 
@@ -165,6 +167,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 ///
 /// # Returns
 /// Configuration object ready for use in tests
+#[allow(dead_code)]
 pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) -> Config {
     use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
     Config {
@@ -187,6 +190,7 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
             .collect(),
         health_check: Default::default(),
         cache: None,
+        client_auth: Default::default(),
     }
 }
 
@@ -227,6 +231,7 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
 ///
 /// # Returns
 /// Number of bytes read
+#[allow(dead_code)]
 pub async fn read_response(
     stream: &mut tokio::net::TcpStream,
     buffer: &mut [u8],

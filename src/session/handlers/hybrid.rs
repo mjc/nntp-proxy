@@ -50,6 +50,9 @@ impl ClientSession {
             self.client_addr, backend_id
         );
 
+        // Get buffer from pool for command execution
+        let mut buffer = self.buffer_pool.get_buffer().await;
+
         // Execute the initial command that triggered the switch
         let (result, got_backend_data) = self
             .execute_command_on_backend(
@@ -59,6 +62,7 @@ impl ClientSession {
                 backend_id,
                 &mut client_to_backend_bytes.clone(),
                 &mut backend_to_client_bytes.clone(),
+                &mut buffer,
             )
             .await;
 
@@ -101,6 +105,8 @@ impl ClientSession {
 
         // Reuse command buffer for remaining session
         let mut command = String::with_capacity(COMMAND);
+
+        // Reuse the buffer we already got for remaining commands
 
         // Process remaining commands on this dedicated connection
         loop {
@@ -148,6 +154,7 @@ impl ClientSession {
                             backend_id,
                             &mut cmd_bytes,
                             &mut resp_bytes,
+                            &mut buffer,
                         )
                         .await;
 

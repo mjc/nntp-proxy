@@ -5,9 +5,37 @@
 //! handle_per_command_routing() were sending greetings.
 
 use anyhow::Result;
+use nntp_proxy::{Config, NntpProxy, RoutingMode};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
+
+mod config_helpers;
+use config_helpers::*;
+
+/// Helper function to find an available port
+async fn find_available_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    addr.port()
+}
+
+/// Spawn a test proxy in the background
+async fn spawn_test_proxy(proxy: NntpProxy, port: u16, _with_auth: bool) {
+    tokio::spawn(async move {
+        let addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&addr).await.unwrap();
+
+        while let Ok((stream, addr)) = listener.accept().await {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                let _ = proxy.handle_client(stream, addr).await;
+            });
+        }
+    });
+}
 
 /// Test that per-command routing mode sends exactly one greeting
 #[test]
@@ -82,58 +110,69 @@ fn test_single_greeting_per_command_mode() -> Result<()> {
 }
 
 /// Test that we can fetch an article without corruption
-#[test]
-fn test_article_fetch_no_corruption() -> Result<()> {
-    let addr = "127.0.0.1:8121";
+#[tokio::test]
+async fn test_article_fetch_no_corruption() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
-    let mut stream =
-        match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2)) {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("Skipping test - proxy not running on {}", addr);
-                return Ok(());
+    // Start mock backend server
+    let mock_port = find_available_port().await;
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", mock_port))
+            .await
+            .unwrap();
+        if let Ok((mut stream, _)) = listener.accept().await {
+            stream.write_all(b"200 Mock Server Ready\r\n").await.ok();
+
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = stream.read(&mut buf).await
+                && buf[..n].starts_with(b"ARTICLE")
+            {
+                stream
+                    .write_all(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n")
+                    .await
+                    .ok();
             }
-        };
+        }
+    });
 
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut reader = BufReader::new(stream.try_clone()?);
+    // Start proxy
+    let proxy_port = find_available_port().await;
+    let config = Config {
+        servers: vec![create_test_server_config(
+            "127.0.0.1",
+            mock_port,
+            "TestServer",
+        )],
+        ..Default::default()
+    };
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+    spawn_test_proxy(proxy, proxy_port, false).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connect to proxy
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
 
     // Read greeting
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    reader.read_line(&mut line).await?;
     assert!(
         line.starts_with("200"),
         "Expected 200 greeting, got: {}",
         line.trim()
     );
 
-    // Count how many 200 responses we get before the article response
-    let mut greeting_count = 1; // Already got one
+    // Send ARTICLE command
+    writer.write_all(b"ARTICLE <test@example.com>\r\n").await?;
+    writer.flush().await?;
+
+    // Read response - should be 220 (article follows)
     line.clear();
-
-    // Check for duplicate greeting
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    if let Ok(n) = reader.read_line(&mut line)
-        && n > 0
-        && line.starts_with("200")
-    {
-        greeting_count += 1;
-        line.clear();
-    }
-
-    // Reset timeout for actual command
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-
-    // Send ARTICLE command (using a test article ID that might exist)
-    writeln!(stream, "ARTICLE <6b1945c100bd4cf68c865ad90bc2f05c@ngPost>")?;
-    stream.flush()?;
-
-    // Read response - should be 220 (article follows) or 430 (no such article)
-    // NOT another 200 greeting
-    line.clear();
-    reader.read_line(&mut line)?;
+    reader.read_line(&mut line).await?;
 
     // Verify we don't get a stray 200 in the article response
     assert!(
@@ -149,15 +188,8 @@ fn test_article_fetch_no_corruption() -> Result<()> {
         line.trim()
     );
 
-    // We should have seen exactly 1 greeting total
-    assert_eq!(
-        greeting_count, 1,
-        "Expected exactly 1 greeting before article command, got {}",
-        greeting_count
-    );
-
     // Clean up
-    let _ = writeln!(stream, "QUIT");
+    writer.write_all(b"QUIT\r\n").await.ok();
 
     Ok(())
 }
