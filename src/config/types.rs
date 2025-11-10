@@ -33,13 +33,13 @@ impl Default for RoutingMode {
 impl RoutingMode {
     /// Check if this mode supports per-command routing
     #[must_use]
-    pub fn supports_per_command_routing(&self) -> bool {
+    pub const fn supports_per_command_routing(&self) -> bool {
         matches!(self, Self::PerCommand | Self::Hybrid)
     }
 
     /// Check if this mode can handle stateful commands
     #[must_use]
-    pub fn supports_stateful_commands(&self) -> bool {
+    pub const fn supports_stateful_commands(&self) -> bool {
         matches!(self, Self::Standard | Self::Hybrid)
     }
 

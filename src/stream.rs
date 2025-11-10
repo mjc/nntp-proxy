@@ -53,12 +53,16 @@ impl ConnectionStream {
     }
 
     /// Returns true if this connection uses encryption (TLS/SSL)
-    pub fn is_encrypted(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
         matches!(self, Self::Tls(_))
     }
 
     /// Returns true if this connection is unencrypted (plain TCP)
-    pub fn is_unencrypted(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_unencrypted(&self) -> bool {
         matches!(self, Self::Plain(_))
     }
 

@@ -6,15 +6,13 @@ use crate::protocol::response::*;
 fn test_extract_message_id() {
     // Standard message-ID
     assert_eq!(
-        NntpResponse::extract_message_id("ARTICLE <test@example.com>")
-            .map(|id| id.as_str().to_string()),
+        NntpResponse::extract_message_id("ARTICLE <test@example.com>").map(|id| id.to_string()),
         Some("<test@example.com>".to_string())
     );
 
     // With extra whitespace
     assert_eq!(
-        NntpResponse::extract_message_id("  BODY  <msg123@news.com>  ")
-            .map(|id| id.as_str().to_string()),
+        NntpResponse::extract_message_id("  BODY  <msg123@news.com>  ").map(|id| id.to_string()),
         Some("<msg123@news.com>".to_string())
     );
 
@@ -30,7 +28,7 @@ fn test_extract_message_id() {
     // Multiple message-IDs (returns first)
     assert_eq!(
         NntpResponse::extract_message_id("TEST <first@example.com> <second@example.com>")
-            .map(|id| id.as_str().to_string()),
+            .map(|id| id.to_string()),
         Some("<first@example.com>".to_string())
     );
 }

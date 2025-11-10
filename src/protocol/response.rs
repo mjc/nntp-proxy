@@ -122,13 +122,15 @@ impl ResponseCode {
     /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
     /// multiline responses require special handling with terminator detection.
     #[inline]
-    pub fn is_multiline(&self) -> bool {
+    #[must_use]
+    pub const fn is_multiline(&self) -> bool {
         matches!(self, Self::MultilineData(_))
     }
 
     /// Get the numeric status code if available
     #[inline]
-    pub fn status_code(&self) -> Option<u16> {
+    #[must_use]
+    pub const fn status_code(&self) -> Option<u16> {
         match self {
             Self::Greeting(c)
             | Self::AuthRequired(c)
@@ -146,6 +148,7 @@ impl ResponseCode {
     /// - 2xx: Success
     /// - 3xx: Success so far, send more input
     #[inline]
+    #[must_use]
     pub fn is_success(&self) -> bool {
         self.status_code()
             .is_some_and(|code| (200..400).contains(&code))
