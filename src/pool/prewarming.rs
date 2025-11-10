@@ -190,9 +190,9 @@ mod tests {
             .iter()
             .map(|s| {
                 crate::pool::DeadpoolConnectionProvider::new(
-                    s.host.as_str().to_string(),
+                    s.host.to_string(),
                     s.port.get(),
-                    s.name.as_str().to_string(),
+                    s.name.to_string(),
                     s.max_connections.get(),
                     s.username.clone(),
                     s.password.clone(),
