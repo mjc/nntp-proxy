@@ -91,28 +91,32 @@ async fn test_auth_handler_enabled_with_credentials() {
 
 #[tokio::test]
 async fn test_auth_handler_validates_correct_credentials() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(handler.validate("alice", "secret123"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_rejects_wrong_password() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(!handler.validate("alice", "wrongpass"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_rejects_wrong_username() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(!handler.validate("bob", "secret123"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_rejects_both_wrong() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(!handler.validate("bob", "wrongpass"));
 }
@@ -159,7 +163,8 @@ async fn test_auth_handler_case_sensitive() {
 
 #[tokio::test]
 async fn test_auth_handler_whitespace_in_credentials() {
-    let handler = AuthHandler::new(Some("user name".to_string()), Some("pass word".to_string())).unwrap();
+    let handler =
+        AuthHandler::new(Some("user name".to_string()), Some("pass word".to_string())).unwrap();
 
     assert!(handler.validate("user name", "pass word"));
     assert!(!handler.validate("username", "password"));
@@ -170,7 +175,8 @@ async fn test_auth_handler_special_characters() {
     let handler = AuthHandler::new(
         Some("user@example.com".to_string()),
         Some("p@$$w0rd!#%".to_string()),
-    ).unwrap();
+    )
+    .unwrap();
 
     assert!(handler.validate("user@example.com", "p@$$w0rd!#%"));
 }
@@ -188,7 +194,8 @@ async fn test_auth_handler_debug_redacts_credentials() {
     let handler = AuthHandler::new(
         Some("supersecret".to_string()),
         Some("topsecretpassword".to_string()),
-    ).unwrap();
+    )
+    .unwrap();
 
     let debug_output = format!("{:?}", handler);
 
@@ -305,10 +312,9 @@ async fn test_command_classification_for_stateless() {
 async fn test_session_with_auth_handler() {
     let (_backend_port, _handle) = spawn_mock_backend().await;
     let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("testuser".to_string()),
-        Some("testpass".to_string()),
-    ).unwrap());
+    let auth_handler = Arc::new(
+        AuthHandler::new(Some("testuser".to_string()), Some("testpass".to_string())).unwrap(),
+    );
 
     let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
     let _session = ClientSession::new(addr, buffer_pool, auth_handler);
@@ -414,10 +420,8 @@ async fn test_multiple_auth_handlers_independent() {
 
 #[tokio::test]
 async fn test_auth_handler_clone_via_arc() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
     let handler_clone = handler.clone();
 
     assert!(handler.validate("user", "pass"));
@@ -428,10 +432,8 @@ async fn test_auth_handler_clone_via_arc() {
 #[tokio::test]
 async fn test_session_builder_with_auth_handler() {
     let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let auth_handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
     let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
     let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone()).build();
@@ -442,10 +444,8 @@ async fn test_session_builder_with_auth_handler() {
 #[tokio::test]
 async fn test_session_builder_with_router_and_auth() {
     let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let auth_handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
     let router = Arc::new(BackendSelector::new());
     let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
@@ -538,10 +538,9 @@ async fn test_concurrent_auth_handlers() {
     use std::sync::Arc;
     use tokio::task::JoinSet;
 
-    let handler = Arc::new(AuthHandler::new(
-        Some("shared".to_string()),
-        Some("password".to_string()),
-    ).unwrap());
+    let handler = Arc::new(
+        AuthHandler::new(Some("shared".to_string()), Some("password".to_string())).unwrap(),
+    );
 
     let mut set = JoinSet::new();
 
@@ -588,7 +587,8 @@ async fn test_auth_with_newlines_in_credentials() {
     let handler = AuthHandler::new(
         Some("user\nname".to_string()),
         Some("pass\nword".to_string()),
-    ).unwrap();
+    )
+    .unwrap();
 
     assert!(handler.validate("user\nname", "pass\nword"));
     assert!(!handler.validate("username", "password"));
@@ -600,7 +600,8 @@ async fn test_auth_with_null_bytes_in_credentials() {
     let handler = AuthHandler::new(
         Some("user\0name".to_string()),
         Some("pass\0word".to_string()),
-    ).unwrap();
+    )
+    .unwrap();
 
     assert!(handler.validate("user\0name", "pass\0word"));
 }
@@ -610,10 +611,8 @@ async fn test_auth_handler_with_concurrent_requests() {
     use nntp_proxy::command::AuthAction;
     use tokio::task::JoinSet;
 
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
     let mut set = JoinSet::new();
 

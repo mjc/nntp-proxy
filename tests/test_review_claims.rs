@@ -20,10 +20,8 @@ use tokio::io::AsyncReadExt;
 /// command is still subject to the same authentication check. No bypass occurs.
 #[tokio::test]
 async fn test_reject_commands_dont_bypass_authentication() {
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let auth_handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
     // Simulate what happens in the session handler
     let mut authenticated = false;
@@ -127,10 +125,8 @@ async fn test_no_auth_username_race_condition() {
         }
     }
 
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("alice".to_string()),
-        Some("secret".to_string()),
-    ).unwrap());  // Unwrap the Result to get AuthHandler
+    let auth_handler =
+        Arc::new(AuthHandler::new(Some("alice".to_string()), Some("secret".to_string())).unwrap()); // Unwrap the Result to get AuthHandler
 
     // Session 1: alice's connection
     let session1 = SessionHandler::new(auth_handler.clone());
@@ -166,10 +162,8 @@ async fn test_no_auth_username_race_condition() {
 /// the username from the most recent AUTHINFO USER command, which is correct behavior.
 #[tokio::test]
 async fn test_auth_attempts_are_serialized_per_connection() {
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let auth_handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
     // Simulate sequential auth attempts from one connection
     // AUTHINFO USER user

@@ -10,10 +10,13 @@ use std::sync::Arc;
 /// Test that invalid credentials are NEVER accepted
 #[tokio::test]
 async fn test_invalid_credentials_rejected() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("correctuser".to_string()),
-        Some("correctpass".to_string()),
-    ).unwrap());
+    let handler = Arc::new(
+        AuthHandler::new(
+            Some("correctuser".to_string()),
+            Some("correctpass".to_string()),
+        )
+        .unwrap(),
+    );
 
     // Test wrong username
     let mut output = Vec::new();
@@ -61,10 +64,13 @@ async fn test_invalid_credentials_rejected() {
 /// Test that valid credentials are accepted
 #[tokio::test]
 async fn test_valid_credentials_accepted() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("correctuser".to_string()),
-        Some("correctpass".to_string()),
-    ).unwrap());
+    let handler = Arc::new(
+        AuthHandler::new(
+            Some("correctuser".to_string()),
+            Some("correctpass".to_string()),
+        )
+        .unwrap(),
+    );
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
@@ -83,10 +89,8 @@ async fn test_valid_credentials_accepted() {
 /// Test that AUTHINFO PASS without prior AUTHINFO USER is rejected
 #[tokio::test]
 async fn test_password_without_username_rejected() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
@@ -108,10 +112,8 @@ async fn test_password_without_username_rejected() {
 /// Test that authentication is case-sensitive
 #[tokio::test]
 async fn test_credentials_case_sensitive() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("User".to_string()),
-        Some("Pass".to_string()),
-    ).unwrap());
+    let handler =
+        Arc::new(AuthHandler::new(Some("User".to_string()), Some("Pass".to_string())).unwrap());
 
     // Wrong case username
     let mut output = Vec::new();
@@ -159,10 +161,8 @@ async fn test_credentials_case_sensitive() {
 /// Test that empty credentials don't bypass authentication
 #[tokio::test]
 async fn test_empty_credentials_rejected() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
     // Empty username
     let mut output = Vec::new();
@@ -206,10 +206,13 @@ async fn test_auth_success_flag_reliability() {
     ];
 
     for (username, password, expected_success) in test_cases {
-        let handler = Arc::new(AuthHandler::new(
-            Some("correctuser".to_string()),
-            Some("correctpass".to_string()),
-        ).unwrap());
+        let handler = Arc::new(
+            AuthHandler::new(
+                Some("correctuser".to_string()),
+                Some("correctpass".to_string()),
+            )
+            .unwrap(),
+        );
 
         let mut output = Vec::new();
         let stored_username = if username.is_empty() {
@@ -240,10 +243,8 @@ async fn test_auth_success_flag_reliability() {
 /// Test that RequestPassword never returns auth_success=true
 #[tokio::test]
 async fn test_request_password_never_authenticates() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
@@ -284,10 +285,8 @@ async fn test_disabled_auth_accepts_all() {
 /// Test that validate() method matches handle_auth_command behavior
 #[tokio::test]
 async fn test_validate_matches_handle_auth_command() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ).unwrap());
+    let handler =
+        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
     let test_cases = vec![
         ("user", "pass", true),
@@ -334,10 +333,13 @@ async fn test_validate_matches_handle_auth_command() {
 /// Test special characters in credentials
 #[tokio::test]
 async fn test_special_characters_in_credentials() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("user@host.com".to_string()),
-        Some("p@ss!w0rd#$%".to_string()),
-    ).unwrap());
+    let handler = Arc::new(
+        AuthHandler::new(
+            Some("user@host.com".to_string()),
+            Some("p@ss!w0rd#$%".to_string()),
+        )
+        .unwrap(),
+    );
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
@@ -372,10 +374,9 @@ async fn test_special_characters_in_credentials() {
 /// Property: auth_success=true MUST mean valid credentials
 #[tokio::test]
 async fn property_auth_success_implies_valid_credentials() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("validuser".to_string()),
-        Some("validpass".to_string()),
-    ).unwrap());
+    let handler = Arc::new(
+        AuthHandler::new(Some("validuser".to_string()), Some("validpass".to_string())).unwrap(),
+    );
 
     // If auth_success is true, credentials MUST be valid
     let mut output = Vec::new();
@@ -402,10 +403,9 @@ async fn property_auth_success_implies_valid_credentials() {
 /// Property: invalid credentials MUST result in auth_success=false
 #[tokio::test]
 async fn property_invalid_credentials_implies_no_auth_success() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("validuser".to_string()),
-        Some("validpass".to_string()),
-    ).unwrap());
+    let handler = Arc::new(
+        AuthHandler::new(Some("validuser".to_string()), Some("validpass".to_string())).unwrap(),
+    );
 
     let invalid_cases = vec![
         ("invaliduser", "validpass"),

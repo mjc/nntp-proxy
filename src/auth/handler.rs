@@ -276,7 +276,8 @@ mod tests {
 
         #[test]
         fn test_new_with_both_credentials() {
-            let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap();
+            let handler =
+                AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap();
             assert!(handler.is_enabled());
         }
 
@@ -313,13 +314,19 @@ mod tests {
         #[test]
         fn test_new_with_whitespace_username_fails() {
             let result = AuthHandler::new(Some("   ".to_string()), Some("pass".to_string()));
-            assert!(result.is_err(), "Whitespace-only username should return error");
+            assert!(
+                result.is_err(),
+                "Whitespace-only username should return error"
+            );
         }
 
         #[test]
         fn test_new_with_whitespace_password_fails() {
             let result = AuthHandler::new(Some("user".to_string()), Some("   ".to_string()));
-            assert!(result.is_err(), "Whitespace-only password should return error");
+            assert!(
+                result.is_err(),
+                "Whitespace-only password should return error"
+            );
         }
 
         #[test]
@@ -332,7 +339,8 @@ mod tests {
 
         #[test]
         fn test_validate_when_enabled() {
-            let handler = AuthHandler::new(Some("alice".to_string()), Some("secret".to_string())).unwrap();
+            let handler =
+                AuthHandler::new(Some("alice".to_string()), Some("secret".to_string())).unwrap();
             assert!(handler.validate("alice", "secret"));
             assert!(!handler.validate("alice", "wrong"));
             assert!(!handler.validate("bob", "secret"));
@@ -424,7 +432,8 @@ mod tests {
 
     #[test]
     fn test_auth_enabled_with_credentials() {
-        let handler = AuthHandler::new(Some("mjc".to_string()), Some("nntp1337".to_string())).unwrap();
+        let handler =
+            AuthHandler::new(Some("mjc".to_string()), Some("nntp1337".to_string())).unwrap();
         assert!(handler.is_enabled());
         assert!(handler.validate("mjc", "nntp1337"));
         assert!(!handler.validate("mjc", "wrong"));
