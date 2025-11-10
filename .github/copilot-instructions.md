@@ -1331,6 +1331,14 @@ sudo systemctl status nntp-proxy
 3. **Benchmarks** - Profile before and after optimization
 4. **Documentation** - Update docs with code changes
 5. **Coverage** - Maintain 74%+ test coverage
+6. **Pre-commit checks** - Always run before committing:
+   ```bash
+   cargo fmt
+   cargo clippy --all-targets --all-features
+   cargo test
+   ```
+
+**Note:** This project has Git pre-commit hooks that automatically run `cargo fmt` and `cargo clippy --all-targets --all-features`. If clippy finds issues or formatting is incorrect, the commit will be rejected. Fix all issues before committing.
 
 ### NixOS Development Environment
 
