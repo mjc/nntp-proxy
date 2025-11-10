@@ -1,5 +1,11 @@
 //! Common utilities shared across handler modules
 
+use crate::auth::AuthHandler;
+use crate::command::AuthAction;
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+
 /// Threshold for logging detailed transfer info (bytes)
 /// Transfers under this size are considered "small" (test connections, etc.)
 pub(super) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
@@ -10,4 +16,81 @@ pub(super) fn extract_message_id(command: &str) -> Option<&str> {
     let start = command.find('<')?;
     let end = command[start..].find('>')?;
     Some(&command[start..start + end + 1])
+}
+
+/// Handle AUTHINFO command and update auth state
+///
+/// This function encapsulates the common auth handling logic used across
+/// all routing modes. It:
+/// 1. Stores username if AUTHINFO USER command
+/// 2. Calls the auth handler to process the command
+/// 3. Updates the authenticated flag on success
+/// 4. Returns bytes written and success status
+///
+/// # Arguments
+///
+/// * `auth_handler` - The authentication handler to use
+/// * `auth_action` - The parsed auth action from command classification
+/// * `client_write` - Write half of client connection for responses
+/// * `auth_username` - Mutable reference to Option<String> that stores username between USER and PASS
+/// * `authenticated` - AtomicBool flag to set when auth succeeds
+///
+/// # Returns
+///
+/// `(bytes_written, auth_success)` tuple where auth_success is true if authentication completed successfully
+pub(super) async fn handle_auth_command<W>(
+    auth_handler: &Arc<AuthHandler>,
+    auth_action: AuthAction,
+    client_write: &mut W,
+    auth_username: &mut Option<String>,
+    authenticated: &std::sync::atomic::AtomicBool,
+) -> Result<(usize, bool)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Store username if this is AUTHINFO USER
+    if let AuthAction::RequestPassword(ref username) = auth_action {
+        *auth_username = Some(username.clone());
+    }
+
+    // Handle auth and validate
+    let (bytes, auth_success) = auth_handler
+        .handle_auth_command(auth_action, client_write, auth_username.as_deref())
+        .await?;
+
+    if auth_success {
+        authenticated.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    Ok((bytes, auth_success))
+}
+
+/// Check if command is QUIT and send closing response if so
+///
+/// # Returns
+///
+/// `Ok(Some(bytes_written))` if QUIT was detected and response sent
+/// `Ok(None)` if not a QUIT command
+/// `Err` if failed to write response
+pub(super) async fn handle_quit_command<W>(
+    command: &str,
+    client_write: &mut W,
+) -> Result<Option<usize>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if command.trim().eq_ignore_ascii_case("QUIT") {
+        use crate::protocol::CONNECTION_CLOSING;
+
+        client_write
+            .write_all(CONNECTION_CLOSING)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!("Failed to write CONNECTION_CLOSING: {}", e);
+            })?;
+
+        Ok(Some(CONNECTION_CLOSING.len()))
+    } else {
+        Ok(None)
+    }
 }

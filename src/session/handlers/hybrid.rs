@@ -3,9 +3,10 @@
 //! This module implements the transition from per-command routing to stateful
 //! routing when a stateful command is encountered in hybrid mode.
 
+use super::common;
 use crate::session::ClientSession;
 use anyhow::Result;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{debug, error, info, warn};
 
@@ -124,16 +125,10 @@ impl ClientSession {
                     debug!("Client {} stateful command: {}", self.client_addr, trimmed);
 
                     // Handle QUIT locally
-                    if trimmed.eq_ignore_ascii_case("QUIT") {
-                        use crate::protocol::CONNECTION_CLOSING;
-
-                        if let Err(e) = client_write.write_all(CONNECTION_CLOSING).await {
-                            debug!(
-                                "Failed to write CONNECTION_CLOSING to client {}: {}",
-                                self.client_addr, e
-                            );
-                        }
-                        backend_to_client += CONNECTION_CLOSING.len() as u64;
+                    if let Some(bytes) =
+                        common::handle_quit_command(&command, &mut client_write).await?
+                    {
+                        backend_to_client += bytes as u64;
                         debug!(
                             "Client {} sent QUIT in stateful mode, closing",
                             self.client_addr

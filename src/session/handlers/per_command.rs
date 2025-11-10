@@ -4,7 +4,7 @@
 //! can be routed to a different backend. It includes the core command execution
 //! logic used by all routing modes.
 
-use super::common::{SMALL_TRANSFER_THRESHOLD, extract_message_id};
+use super::common;
 use crate::pool::PooledBuffer;
 use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use crate::command::{CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::COMMAND;
-use crate::protocol::{BACKEND_ERROR, CONNECTION_CLOSING, PROXY_GREETING_PCR};
+use crate::protocol::{BACKEND_ERROR, PROXY_GREETING_PCR};
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
 
@@ -114,17 +114,8 @@ impl ClientSession {
             );
 
             // Handle QUIT locally
-            if trimmed.eq_ignore_ascii_case("QUIT") {
-                let _ = client_write
-                    .write_all(CONNECTION_CLOSING)
-                    .await
-                    .inspect_err(|e| {
-                        debug!(
-                            "Failed to write CONNECTION_CLOSING to client {}: {}",
-                            self.client_addr, e
-                        );
-                    });
-                backend_to_client_bytes.add(CONNECTION_CLOSING.len());
+            if let Some(bytes) = common::handle_quit_command(&command, &mut client_write).await? {
+                backend_to_client_bytes.add(bytes);
                 debug!("Client {} sent QUIT, closing connection", self.client_addr);
                 break;
             }
@@ -136,28 +127,18 @@ impl ClientSession {
             if matches!(action, CommandAction::InterceptAuth(_)) {
                 match action {
                     CommandAction::InterceptAuth(auth_action) => {
-                        // Store username if this is AUTHINFO USER
-                        if let crate::command::AuthAction::RequestPassword(ref username) =
-                            auth_action
-                        {
-                            auth_username = Some(username.clone());
-                        }
+                        let (bytes, auth_success) = common::handle_auth_command(
+                            &self.auth_handler,
+                            auth_action,
+                            &mut client_write,
+                            &mut auth_username,
+                            &self.authenticated,
+                        )
+                        .await?;
 
-                        // Handle auth and validate
-                        let (bytes, auth_success) = self
-                            .auth_handler
-                            .handle_auth_command(
-                                auth_action,
-                                &mut client_write,
-                                auth_username.as_deref(),
-                            )
-                            .await?;
                         backend_to_client_bytes.add(bytes);
-
                         if auth_success {
                             skip_auth_check = true;
-                            self.authenticated
-                                .store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
                     _ => unreachable!(),
@@ -245,7 +226,9 @@ impl ClientSession {
         }
 
         // Log session summary for debugging, especially useful for test connections
-        if (client_to_backend_bytes + backend_to_client_bytes).as_u64() < SMALL_TRANSFER_THRESHOLD {
+        if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
+            < common::SMALL_TRANSFER_THRESHOLD
+        {
             debug!(
                 "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
                 self.client_addr,
@@ -402,7 +385,7 @@ impl ClientSession {
         client_to_backend_bytes.add(command.len());
 
         // Extract message-ID from command if present (for correlation with SABnzbd errors)
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
 
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
@@ -571,7 +554,7 @@ impl ClientSession {
 
             // Debug logging for small transfers
             if (*client_to_backend_bytes + *backend_to_client_bytes).as_u64()
-                < SMALL_TRANSFER_THRESHOLD
+                < common::SMALL_TRANSFER_THRESHOLD
             {
                 debug!(
                     "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
@@ -595,70 +578,70 @@ mod tests {
     #[test]
     fn test_extract_message_id_valid() {
         let command = "BODY <test@example.com>";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<test@example.com>"));
     }
 
     #[test]
     fn test_extract_message_id_article_command() {
         let command = "ARTICLE <1234@news.server>";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<1234@news.server>"));
     }
 
     #[test]
     fn test_extract_message_id_head_command() {
         let command = "HEAD <article@host.domain>";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<article@host.domain>"));
     }
 
     #[test]
     fn test_extract_message_id_stat_command() {
         let command = "STAT <msg@example.org>";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<msg@example.org>"));
     }
 
     #[test]
     fn test_extract_message_id_no_brackets() {
         let command = "GROUP comp.lang.rust";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, None);
     }
 
     #[test]
     fn test_extract_message_id_malformed() {
         let command = "BODY <incomplete";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, None);
     }
 
     #[test]
     fn test_extract_message_id_with_extra_text() {
         let command = "BODY <msg@host> extra stuff";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<msg@host>"));
     }
 
     #[test]
     fn test_extract_message_id_empty_brackets() {
         let command = "BODY <>";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<>"));
     }
 
     #[test]
     fn test_extract_message_id_lowercase_command() {
         let command = "body <test@example.com>";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<test@example.com>"));
     }
 
     #[test]
     fn test_extract_message_id_mixed_case() {
         let command = "BoDy <TeSt@ExAmPlE.cOm>";
-        let msgid = extract_message_id(command);
+        let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<TeSt@ExAmPlE.cOm>"));
     }
 }

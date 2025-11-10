@@ -82,20 +82,18 @@ impl ClientSession {
                                         backend_to_client_bytes.add(response.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        // Store username if this is AUTHINFO USER
-                                        if let crate::command::AuthAction::RequestPassword(ref username) = auth_action {
-                                            auth_username = Some(username.clone());
-                                        }
+                                        let (bytes, auth_success) = super::common::handle_auth_command(
+                                            &self.auth_handler,
+                                            auth_action,
+                                            &mut client_write,
+                                            &mut auth_username,
+                                            &self.authenticated,
+                                        )
+                                        .await?;
 
-                                        // Handle auth and validate
-                                        let (bytes, auth_success) = self
-                                            .auth_handler
-                                            .handle_auth_command(auth_action, &mut client_write, auth_username.as_deref())
-                                            .await?;
                                         backend_to_client_bytes.add(bytes);
-
                                         if auth_success {
-                                            self.authenticated.store(true, std::sync::atomic::Ordering::Release);
+                                            skip_auth_check = true;
                                         }
                                     }
                                     CommandAction::Reject(response) => {
