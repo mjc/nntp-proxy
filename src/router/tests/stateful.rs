@@ -1,6 +1,7 @@
 //! Stateful connection reservation tests
 
 use super::*;
+use crate::types::ServerName;
 use std::sync::Arc;
 
 #[test]
@@ -18,7 +19,11 @@ fn test_stateful_connection_reservation() {
         None,
     );
 
-    router.add_backend(backend_id, "test-backend".to_string(), provider);
+    router.add_backend(
+        backend_id,
+        ServerName::new("test-backend".to_string()).unwrap(),
+        provider,
+    );
 
     // Should be able to acquire 2 stateful connections
     assert!(router.try_acquire_stateful(backend_id));
@@ -45,7 +50,7 @@ fn test_stateful_connection_concurrent_access() {
 
     router.add_backend(
         backend_id,
-        "test-backend".to_string(),
+        ServerName::new("test-backend".to_string()).unwrap(),
         create_test_provider(),
     );
 
@@ -102,8 +107,16 @@ fn test_stateful_connection_multiple_backends() {
         None,
     );
 
-    router.add_backend(backend1, "backend-1".to_string(), provider1);
-    router.add_backend(backend2, "backend-2".to_string(), provider2);
+    router.add_backend(
+        backend1,
+        ServerName::new("backend-1".to_string()).unwrap(),
+        provider1,
+    );
+    router.add_backend(
+        backend2,
+        ServerName::new("backend-2".to_string()).unwrap(),
+        provider2,
+    );
 
     // Each backend should have independent stateful counters
     assert!(router.try_acquire_stateful(backend1));
@@ -155,7 +168,11 @@ fn test_stateful_reservation_edge_cases() {
         None,
     );
 
-    router.add_backend(backend_id, "test-backend".to_string(), provider);
+    router.add_backend(
+        backend_id,
+        ServerName::new("test-backend".to_string()).unwrap(),
+        provider,
+    );
 
     // Test multiple releases (should not go negative)
     router.release_stateful(backend_id);

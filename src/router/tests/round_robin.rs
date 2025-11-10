@@ -1,6 +1,7 @@
 //! Round-robin selection strategy tests
 
 use super::*;
+use crate::types::ServerName;
 
 #[test]
 fn test_round_robin_selection() {
@@ -11,7 +12,11 @@ fn test_round_robin_selection() {
     for i in 0..3 {
         let backend_id = BackendId::from_index(i);
         let provider = create_test_provider();
-        router.add_backend(backend_id, format!("backend-{}", i), provider);
+        router.add_backend(
+            backend_id,
+            ServerName::new(format!("backend-{}", i)).unwrap(),
+            provider,
+        );
     }
 
     // Route 6 commands and verify round-robin
@@ -40,7 +45,7 @@ fn test_load_balancing_fairness() {
     for i in 0..3 {
         router.add_backend(
             BackendId::from_index(i),
-            format!("backend-{}", i),
+            ServerName::new(format!("backend-{}", i)).unwrap(),
             create_test_provider(),
         );
     }

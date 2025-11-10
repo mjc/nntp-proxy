@@ -1,6 +1,7 @@
 //! Load tracking and monitoring tests
 
 use super::*;
+use crate::types::ServerName;
 
 #[test]
 fn test_backend_load_tracking() {
@@ -9,7 +10,11 @@ fn test_backend_load_tracking() {
     let backend_id = BackendId::from_index(0);
     let provider = create_test_provider();
 
-    router.add_backend(backend_id, "test".to_string(), provider);
+    router.add_backend(
+        backend_id,
+        ServerName::new("test".to_string()).unwrap(),
+        provider,
+    );
 
     // Initially no load
     assert_eq!(router.backend_load(backend_id), Some(0));

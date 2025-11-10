@@ -153,11 +153,7 @@ impl NntpProxyBuilder {
                 router::BackendSelector::new(),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    r.add_backend(
-                        backend_id,
-                        servers[idx].name.as_str().to_string(),
-                        provider.clone(),
-                    );
+                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
                     r
                 },
             )

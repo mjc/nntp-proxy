@@ -1,7 +1,7 @@
 use super::*;
 use crate::auth::AuthHandler;
 use crate::protocol::QUIT;
-use crate::types::BufferSize;
+use crate::types::{BufferSize, ServerName};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -181,7 +181,7 @@ async fn test_quit_command_per_command_routing() {
     );
     router.add_backend(
         crate::types::BackendId::from_index(0),
-        "test-backend".to_string(),
+        ServerName::new("test-backend".to_string()).unwrap(),
         provider,
     );
 
@@ -273,7 +273,7 @@ async fn test_quit_command_closes_connection_cleanly() {
     );
     router.add_backend(
         crate::types::BackendId::from_index(0),
-        "test".to_string(),
+        ServerName::new("test".to_string()).unwrap(),
         provider,
     );
 

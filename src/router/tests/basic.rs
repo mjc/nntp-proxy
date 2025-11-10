@@ -1,6 +1,7 @@
 //! Basic router functionality tests
 
 use super::*;
+use crate::types::ServerName;
 
 #[test]
 fn test_router_creation() {
@@ -14,7 +15,11 @@ fn test_add_backend() {
     let backend_id = BackendId::from_index(0);
     let provider = create_test_provider();
 
-    router.add_backend(backend_id, "test-backend".to_string(), provider);
+    router.add_backend(
+        backend_id,
+        ServerName::new("test-backend".to_string()).unwrap(),
+        provider,
+    );
 
     assert_eq!(router.backend_count(), 1);
 }
@@ -26,7 +31,11 @@ fn test_add_multiple_backends() {
     for i in 0..3 {
         let backend_id = BackendId::from_index(i);
         let provider = create_test_provider();
-        router.add_backend(backend_id, format!("backend-{}", i), provider);
+        router.add_backend(
+            backend_id,
+            ServerName::new(format!("backend-{}", i)).unwrap(),
+            provider,
+        );
     }
 
     assert_eq!(router.backend_count(), 3);
@@ -47,7 +56,11 @@ fn test_get_backend_provider() {
     let backend_id = BackendId::from_index(0);
     let provider = create_test_provider();
 
-    router.add_backend(backend_id, "test".to_string(), provider);
+    router.add_backend(
+        backend_id,
+        ServerName::new("test".to_string()).unwrap(),
+        provider,
+    );
 
     let retrieved = router.get_backend_provider(backend_id);
     assert!(retrieved.is_some());

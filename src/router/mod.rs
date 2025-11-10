@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info};
 
 use crate::pool::DeadpoolConnectionProvider;
-use crate::types::{BackendId, ClientId};
+use crate::types::{BackendId, ClientId, ServerName};
 
 /// Backend connection information
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ struct BackendInfo {
     /// Backend identifier
     id: BackendId,
     /// Server name for logging
-    name: String,
+    name: ServerName,
     /// Connection provider for this backend
     provider: DeadpoolConnectionProvider,
     /// Number of pending requests on this backend (for load balancing)
@@ -117,7 +117,7 @@ impl BackendSelector {
     pub fn add_backend(
         &mut self,
         backend_id: BackendId,
-        name: String,
+        name: ServerName,
         provider: DeadpoolConnectionProvider,
     ) {
         info!("Added backend {:?} ({})", backend_id, name);
