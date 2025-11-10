@@ -289,7 +289,7 @@ async fn test_auth_handler_in_cache_session() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("cacheuser".to_string()),
         Some("cachepass".to_string()),
-    ));
+    ).unwrap());
 
     let addr = "127.0.0.1:9999".parse().unwrap();
     let _session = CachingSession::new(addr, cache, auth_handler.clone());
@@ -307,7 +307,7 @@ async fn test_auth_handler_integration() {
     let handler = Arc::new(AuthHandler::new(
         Some("alice".to_string()),
         Some("secret".to_string()),
-    ));
+    ).unwrap());
 
     // Test command classification
     let action = CommandHandler::handle_command("LIST\r\n");

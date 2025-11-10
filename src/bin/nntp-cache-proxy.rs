@@ -190,10 +190,20 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     )?);
 
     // Create auth handler from config
-    let auth_handler = Arc::new(AuthHandler::new(
-        config.client_auth.username.clone(),
-        config.client_auth.password.clone(),
-    ));
+    let auth_handler = Arc::new(
+        AuthHandler::new(
+            config.client_auth.username.clone(),
+            config.client_auth.password.clone(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid authentication configuration: {}. \
+                 If you set username/password in config, they cannot be empty. \
+                 Remove them entirely to disable authentication.",
+                e
+            )
+        })?,
+    );
 
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port.get());

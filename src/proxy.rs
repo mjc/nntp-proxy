@@ -160,10 +160,20 @@ impl NntpProxyBuilder {
         });
 
         // Create auth handler from config
-        let auth_handler = Arc::new(AuthHandler::new(
-            self.config.client_auth.username.clone(),
-            self.config.client_auth.password.clone(),
-        ));
+        let auth_handler = Arc::new(
+            AuthHandler::new(
+                self.config.client_auth.username.clone(),
+                self.config.client_auth.password.clone(),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Invalid authentication configuration: {}. \
+                     If you set username/password in config, they cannot be empty. \
+                     Remove them entirely to disable authentication.",
+                    e
+                )
+            })?,
+        );
 
         Ok(NntpProxy {
             servers,

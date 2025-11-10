@@ -7,8 +7,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Helper to create a default AuthHandler for tests (no auth)
+fn create_test_auth_handler() -> Arc<AuthHandler> {
+    Arc::new(AuthHandler::new(None, None).unwrap())
+}
+
+/// Alias for compatibility
 fn test_auth_handler() -> Arc<AuthHandler> {
-    Arc::new(AuthHandler::new(None, None))
+    create_test_auth_handler()
 }
 
 #[test]

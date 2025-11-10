@@ -1016,6 +1016,15 @@ cargo bench
 
 ## Common Tasks
 
+### Important note about editing files
+
+Do NOT use `sed`, `python`, or `perl` one-liners or scripts to modify repository files.
+These line-oriented or regex-driven edits are error-prone and have repeatedly caused
+incorrect substitutions and broken builds during refactors. Instead, use repository-aware
+tools (for example, apply_patch, editor-based changes, or proper git commands) and open
+a pull request so changes can be reviewed. This preserves context and prevents unsafe edits.
+
+
 ### 1. Adding a New Backend Server
 
 **In `config.toml`:**

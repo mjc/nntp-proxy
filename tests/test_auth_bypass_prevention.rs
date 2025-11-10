@@ -14,7 +14,7 @@ async fn test_standard_handler_validates_credentials() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("testuser".to_string()),
         Some("testpass".to_string()),
-    ));
+    ).unwrap());
 
     // Simulate the authentication flow
     let authenticated = Arc::new(AtomicBool::new(false));
@@ -100,7 +100,7 @@ async fn test_pass_before_user_rejected() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("testuser".to_string()),
         Some("testpass".to_string()),
-    ));
+    ).unwrap());
 
     // Try to send AUTHINFO PASS without first sending USER
     let action = CommandHandler::handle_command("AUTHINFO PASS testpass\r\n");
@@ -134,7 +134,7 @@ async fn test_auth_state_isolation() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("user1".to_string()),
         Some("pass1".to_string()),
-    ));
+    ).unwrap());
 
     // Session 1 authenticates with correct credentials
     let session1_authenticated = Arc::new(AtomicBool::new(false));
@@ -184,7 +184,7 @@ async fn test_repeated_failures_dont_succeed() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("user".to_string()),
         Some("pass".to_string()),
-    ));
+    ).unwrap());
 
     let authenticated = Arc::new(AtomicBool::new(false));
 
@@ -220,7 +220,7 @@ async fn test_auth_success_is_only_path_to_authentication() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("user".to_string()),
         Some("pass".to_string()),
-    ));
+    ).unwrap());
 
     // This simulates what session handlers do
     let authenticated = Arc::new(AtomicBool::new(false));
@@ -280,7 +280,7 @@ async fn test_concurrent_auth_attempts() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("user".to_string()),
         Some("pass".to_string()),
-    ));
+    ).unwrap());
 
     let mut set = JoinSet::new();
 
@@ -355,7 +355,7 @@ async fn test_session_handler_respects_auth_success() {
     let auth_handler = Arc::new(AuthHandler::new(
         Some("user".to_string()),
         Some("pass".to_string()),
-    ));
+    ).unwrap());
 
     // Simulate session handler behavior
     let mut auth_username: Option<String> = None;
