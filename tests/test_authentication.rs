@@ -139,10 +139,16 @@ async fn test_auth_handler_partial_config_disabled() {
 
 #[tokio::test]
 async fn test_auth_handler_empty_string_credentials() {
+    // Empty credentials should be rejected (auth disabled)
     let handler = AuthHandler::new(Some("".to_string()), Some("".to_string()));
-    assert!(handler.is_enabled());
+    assert!(
+        !handler.is_enabled(),
+        "Empty credentials should disable auth"
+    );
+
+    // When auth is disabled, all requests are accepted
     assert!(handler.validate("", ""));
-    assert!(!handler.validate("nonempty", ""));
+    assert!(handler.validate("nonempty", "anything"));
 }
 
 #[tokio::test]

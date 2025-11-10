@@ -13,7 +13,7 @@ pub use config::{
 };
 pub use metrics::{BytesTransferred, TransferMetrics};
 pub use protocol::MessageId;
-pub use validated::{ConfigPath, HostName, ServerName, ValidationError};
+pub use validated::{ConfigPath, HostName, Password, ServerName, Username, ValidationError};
 
 use uuid::Uuid;
 

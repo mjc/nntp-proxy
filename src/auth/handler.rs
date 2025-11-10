@@ -2,22 +2,23 @@
 
 use crate::command::AuthAction;
 use crate::protocol::{AUTH_ACCEPTED, AUTH_REQUIRED};
+use crate::types::{Password, Username};
 use tokio::io::AsyncWriteExt;
 
 /// Client credentials for authentication
 #[derive(Clone)]
 struct Credentials {
-    username: String,
-    password: String,
+    username: Username,
+    password: Password,
 }
 
 impl Credentials {
-    fn new(username: String, password: String) -> Self {
+    fn new(username: Username, password: Password) -> Self {
         Self { username, password }
     }
 
     fn validate(&self, username: &str, password: &str) -> bool {
-        self.username == username && self.password == password
+        self.username.as_str() == username && self.password.as_str() == password
     }
 }
 
@@ -37,9 +38,19 @@ impl std::fmt::Debug for AuthHandler {
 
 impl AuthHandler {
     /// Create a new auth handler with optional credentials
+    ///
+    /// Both username and password must be provided together and must be non-empty.
+    /// Empty or whitespace-only credentials are rejected at construction time.
     pub fn new(username: Option<String>, password: Option<String>) -> Self {
         let credentials = match (username, password) {
-            (Some(u), Some(p)) => Some(Credentials::new(u, p)),
+            (Some(u), Some(p)) => {
+                // Try to create validated Username and Password
+                // If either is empty/whitespace, validation fails and auth is disabled
+                match (Username::new(u), Password::new(p)) {
+                    (Ok(username), Ok(password)) => Some(Credentials::new(username, password)),
+                    _ => None, // Empty credentials = auth disabled
+                }
+            }
             _ => None,
         };
         Self { credentials }
@@ -122,46 +133,65 @@ mod tests {
 
         #[test]
         fn test_new() {
-            let creds = Credentials::new("user".to_string(), "pass".to_string());
-            assert_eq!(creds.username, "user");
-            assert_eq!(creds.password, "pass");
+            let creds = Credentials::new(
+                Username::new("user".to_string()).unwrap(),
+                Password::new("pass".to_string()).unwrap(),
+            );
+            assert_eq!(creds.username.as_str(), "user");
+            assert_eq!(creds.password.as_str(), "pass");
         }
 
         #[test]
         fn test_validate_correct() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(creds.validate("alice", "secret123"));
         }
 
         #[test]
         fn test_validate_wrong_username() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(!creds.validate("bob", "secret123"));
         }
 
         #[test]
         fn test_validate_wrong_password() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(!creds.validate("alice", "wrong"));
         }
 
         #[test]
         fn test_validate_both_wrong() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(!creds.validate("bob", "wrong"));
         }
 
         #[test]
-        fn test_validate_empty_strings() {
-            let creds = Credentials::new("".to_string(), "".to_string());
-            assert!(creds.validate("", ""));
-            assert!(!creds.validate("user", ""));
-            assert!(!creds.validate("", "pass"));
+        fn test_validate_empty_strings_rejected() {
+            // Empty strings should fail validation
+            assert!(Username::new("".to_string()).is_err());
+            assert!(Password::new("".to_string()).is_err());
+            assert!(Username::new("   ".to_string()).is_err());
+            assert!(Password::new("   ".to_string()).is_err());
         }
 
         #[test]
         fn test_validate_case_sensitive() {
-            let creds = Credentials::new("Alice".to_string(), "Secret".to_string());
+            let creds = Credentials::new(
+                Username::new("Alice".to_string()).unwrap(),
+                Password::new("Secret".to_string()).unwrap(),
+            );
             assert!(creds.validate("Alice", "Secret"));
             assert!(!creds.validate("alice", "Secret"));
             assert!(!creds.validate("Alice", "secret"));
@@ -170,29 +200,40 @@ mod tests {
 
         #[test]
         fn test_validate_with_spaces() {
-            let creds = Credentials::new("user name".to_string(), "pass word".to_string());
+            let creds = Credentials::new(
+                Username::new("user name".to_string()).unwrap(),
+                Password::new("pass word".to_string()).unwrap(),
+            );
             assert!(creds.validate("user name", "pass word"));
             assert!(!creds.validate("username", "password"));
         }
 
         #[test]
         fn test_validate_unicode() {
-            let creds = Credentials::new("用户".to_string(), "密码".to_string());
+            let creds = Credentials::new(
+                Username::new("用户".to_string()).unwrap(),
+                Password::new("密码".to_string()).unwrap(),
+            );
             assert!(creds.validate("用户", "密码"));
             assert!(!creds.validate("user", "pass"));
         }
 
         #[test]
         fn test_validate_special_chars() {
-            let creds =
-                Credentials::new("user@example.com".to_string(), "p@ss!w0rd#123".to_string());
+            let creds = Credentials::new(
+                Username::new("user@example.com".to_string()).unwrap(),
+                Password::new("p@ss!w0rd#123".to_string()).unwrap(),
+            );
             assert!(creds.validate("user@example.com", "p@ss!w0rd#123"));
             assert!(!creds.validate("user", "p@ss!w0rd#123"));
         }
 
         #[test]
         fn test_clone() {
-            let creds1 = Credentials::new("user".to_string(), "pass".to_string());
+            let creds1 = Credentials::new(
+                Username::new("user".to_string()).unwrap(),
+                Password::new("pass".to_string()).unwrap(),
+            );
             let creds2 = creds1.clone();
             assert_eq!(creds1.username, creds2.username);
             assert_eq!(creds1.password, creds2.password);
@@ -203,7 +244,10 @@ mod tests {
         fn test_very_long_credentials() {
             let long_user = "u".repeat(1000);
             let long_pass = "p".repeat(1000);
-            let creds = Credentials::new(long_user.clone(), long_pass.clone());
+            let creds = Credentials::new(
+                Username::new(long_user.clone()).unwrap(),
+                Password::new(long_pass.clone()).unwrap(),
+            );
             assert!(creds.validate(&long_user, &long_pass));
             assert!(!creds.validate(&long_user, "wrong"));
         }

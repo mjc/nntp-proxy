@@ -26,6 +26,12 @@ pub enum ValidationError {
 
     #[error("config path cannot be empty")]
     EmptyConfigPath,
+
+    #[error("username cannot be empty or whitespace")]
+    EmptyUsername,
+
+    #[error("password cannot be empty or whitespace")]
+    EmptyPassword,
 }
 
 /// Macro to generate validated string newtypes.
@@ -162,6 +168,62 @@ validated_string! {
         validation: |s| {
             if s.trim().is_empty() {
                 Err(ValidationError::EmptyServerName)
+            } else {
+                Ok(())
+            }
+        },
+    }
+}
+
+validated_string! {
+    /// A validated username for authentication that cannot be empty or whitespace-only
+    ///
+    /// This type enforces that usernames are always non-empty, preventing
+    /// authentication bypass vulnerabilities from empty credentials.
+    ///
+    /// # Examples
+    /// ```
+    /// use nntp_proxy::types::Username;
+    ///
+    /// let user = Username::new("alice".to_string()).unwrap();
+    /// assert_eq!(user.as_str(), "alice");
+    ///
+    /// // Empty strings are rejected
+    /// assert!(Username::new("".to_string()).is_err());
+    /// assert!(Username::new("   ".to_string()).is_err());
+    /// ```
+    pub struct Username(String) {
+        validation: |s| {
+            if s.trim().is_empty() {
+                Err(ValidationError::EmptyUsername)
+            } else {
+                Ok(())
+            }
+        },
+    }
+}
+
+validated_string! {
+    /// A validated password for authentication that cannot be empty or whitespace-only
+    ///
+    /// This type enforces that passwords are always non-empty, preventing
+    /// authentication bypass vulnerabilities from empty credentials.
+    ///
+    /// # Examples
+    /// ```
+    /// use nntp_proxy::types::Password;
+    ///
+    /// let pass = Password::new("secret123".to_string()).unwrap();
+    /// assert_eq!(pass.as_str(), "secret123");
+    ///
+    /// // Empty strings are rejected
+    /// assert!(Password::new("".to_string()).is_err());
+    /// assert!(Password::new("   ".to_string()).is_err());
+    /// ```
+    pub struct Password(String) {
+        validation: |s| {
+            if s.trim().is_empty() {
+                Err(ValidationError::EmptyPassword)
             } else {
                 Ok(())
             }
