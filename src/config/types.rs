@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Routing mode for the proxy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutingMode {
     /// Standard 1:1 mode - each client gets a dedicated backend connection
@@ -41,6 +41,22 @@ impl RoutingMode {
     #[must_use]
     pub fn supports_stateful_commands(&self) -> bool {
         matches!(self, Self::Standard | Self::Hybrid)
+    }
+
+    /// Get a human-readable description of this routing mode
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Standard => "standard 1:1 mode",
+            Self::PerCommand => "per-command routing mode",
+            Self::Hybrid => "hybrid routing mode",
+        }
+    }
+}
+
+impl std::fmt::Display for RoutingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

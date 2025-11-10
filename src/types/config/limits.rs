@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::str::FromStr;
+
+use crate::types::ValidationError;
 
 /// A non-zero maximum connections limit
 ///
@@ -149,5 +152,84 @@ impl<'de> Deserialize<'de> for MaxErrors {
     {
         let value = u32::deserialize(deserializer)?;
         Self::new(value).ok_or_else(|| serde::de::Error::custom("max_errors cannot be 0"))
+    }
+}
+
+/// A non-zero thread count for worker threads
+///
+/// Ensures that at least one worker thread is specified.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::ThreadCount;
+///
+/// let threads = ThreadCount::new(4).unwrap();
+/// assert_eq!(threads.get(), 4);
+///
+/// // Zero threads is invalid
+/// assert!(ThreadCount::new(0).is_none());
+/// ```
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadCount(NonZeroUsize);
+
+impl ThreadCount {
+    /// Create a new ThreadCount, returning None if value is 0
+    #[must_use]
+    pub const fn new(value: usize) -> Option<Self> {
+        match NonZeroUsize::new(value) {
+            Some(nz) => Some(Self(nz)),
+            None => None,
+        }
+    }
+
+    /// Get the value as usize
+    #[must_use]
+    #[inline]
+    pub const fn get(&self) -> usize {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for ThreadCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+impl FromStr for ThreadCount {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s.parse::<usize>().map_err(|_| {
+            ValidationError::InvalidHostName(format!("invalid thread count: {}", s))
+        })?;
+        Self::new(value)
+            .ok_or_else(|| ValidationError::InvalidHostName("thread count cannot be 0".to_string()))
+    }
+}
+
+impl From<ThreadCount> for usize {
+    fn from(threads: ThreadCount) -> Self {
+        threads.get()
+    }
+}
+
+impl Serialize for ThreadCount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.get() as u64)
+    }
+}
+
+impl<'de> Deserialize<'de> for ThreadCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = usize::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("thread_count cannot be 0"))
     }
 }

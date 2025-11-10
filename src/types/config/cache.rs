@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::str::FromStr;
+
+use crate::types::ValidationError;
 
 /// A non-zero cache capacity
 ///
@@ -35,6 +38,19 @@ impl CacheCapacity {
 impl fmt::Display for CacheCapacity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.get())
+    }
+}
+
+impl FromStr for CacheCapacity {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s.parse::<usize>().map_err(|_| {
+            ValidationError::InvalidHostName(format!("invalid cache capacity: {}", s))
+        })?;
+        Self::new(value).ok_or_else(|| {
+            ValidationError::InvalidHostName("cache capacity cannot be 0".to_string())
+        })
     }
 }
 

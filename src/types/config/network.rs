@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::NonZeroU16;
+use std::str::FromStr;
 
 use crate::types::ValidationError;
 
@@ -60,6 +61,17 @@ impl Port {
 impl fmt::Display for Port {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.get())
+    }
+}
+
+impl FromStr for Port {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let port = s
+            .parse::<u16>()
+            .map_err(|_| ValidationError::InvalidHostName(format!("invalid port number: {}", s)))?;
+        Self::new(port).ok_or(ValidationError::InvalidPort)
     }
 }
 

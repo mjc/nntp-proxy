@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Validation errors for string types
@@ -22,6 +23,9 @@ pub enum ValidationError {
 
     #[error("invalid message ID: {0}")]
     InvalidMessageId(String),
+
+    #[error("config path cannot be empty")]
+    EmptyConfigPath,
 }
 
 /// Macro to generate validated string newtypes.
@@ -162,6 +166,109 @@ validated_string! {
                 Ok(())
             }
         },
+    }
+}
+
+/// A validated configuration file path
+///
+/// This type ensures that the path is not empty or whitespace-only.
+/// It does not validate that the file exists, as that is a runtime concern.
+///
+/// # Examples
+/// ```
+/// use nntp_proxy::types::ConfigPath;
+///
+/// let path = ConfigPath::new("config.toml").unwrap();
+/// assert_eq!(path.as_str(), "config.toml");
+///
+/// // Empty paths are rejected
+/// assert!(ConfigPath::new("").is_err());
+/// assert!(ConfigPath::new("   ").is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConfigPath(PathBuf);
+
+impl ConfigPath {
+    /// Create a new ConfigPath from a string-like value
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, ValidationError> {
+        let path_ref = path.as_ref();
+        let path_str = path_ref.to_str().ok_or(ValidationError::EmptyConfigPath)?;
+
+        if path_str.trim().is_empty() {
+            return Err(ValidationError::EmptyConfigPath);
+        }
+
+        Ok(Self(path_ref.to_path_buf()))
+    }
+
+    /// Get the path as a &Path
+    #[must_use]
+    #[inline]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Get the path as a string slice
+    #[must_use]
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self.0.to_str().unwrap_or("")
+    }
+}
+
+impl AsRef<Path> for ConfigPath {
+    #[inline]
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Display for ConfigPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
+impl std::str::FromStr for ConfigPath {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<String> for ConfigPath {
+    type Error = ValidationError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<&str> for ConfigPath {
+    type Error = ValidationError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::new(s)
+    }
+}
+
+impl Serialize for ConfigPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(s).map_err(serde::de::Error::custom)
     }
 }
 
