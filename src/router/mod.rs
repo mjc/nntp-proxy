@@ -13,14 +13,18 @@
 //!
 //! ```no_run
 //! use nntp_proxy::router::BackendSelector;
-//! use nntp_proxy::types::{BackendId, ClientId};
+//! use nntp_proxy::types::{BackendId, ClientId, ServerName};
 //! # use nntp_proxy::pool::DeadpoolConnectionProvider;
 //!
 //! let mut selector = BackendSelector::new();
 //! # let provider = DeadpoolConnectionProvider::new(
 //! #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
 //! # );
-//! selector.add_backend(BackendId::from_index(0), "server1".to_string(), provider);
+//! selector.add_backend(
+//!     BackendId::from_index(0),
+//!     ServerName::new("server1".to_string()).unwrap(),
+//!     provider,
+//! );
 //!
 //! // Route a command
 //! let client_id = ClientId::new();
@@ -71,7 +75,7 @@ struct BackendInfo {
 ///
 /// ```no_run
 /// # use nntp_proxy::router::BackendSelector;
-/// # use nntp_proxy::types::{BackendId, ClientId};
+/// # use nntp_proxy::types::{BackendId, ClientId, ServerName};
 /// # use nntp_proxy::pool::DeadpoolConnectionProvider;
 /// let mut selector = BackendSelector::new();
 ///
@@ -80,7 +84,7 @@ struct BackendInfo {
 /// # );
 /// selector.add_backend(
 ///     BackendId::from_index(0),
-///     "backend-1".to_string(),
+///     ServerName::new("backend-1".to_string()).unwrap(),
 ///     provider,
 /// );
 ///
