@@ -7,7 +7,7 @@ use anyhow::Result;
 use nntp_proxy::config::{Config, ServerConfig};
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::AbortHandle;
 
@@ -206,7 +206,7 @@ impl MockNntpServer {
 /// Returns an AbortHandle that automatically cancels the server when dropped.
 /// This ensures fast test cleanup without waiting for graceful shutdown.
 pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
-    MockServerBuilder::new(port, server_name).spawn()
+    MockNntpServer::new(port).with_name(server_name).spawn()
 }
 
 /// Spawn a mock NNTP server that requires authentication
@@ -231,7 +231,8 @@ pub fn spawn_mock_server_with_auth(
     username: &str,
     password: &str,
 ) -> AbortHandle {
-    MockServerBuilder::new(port, server_name)
+    MockNntpServer::new(port)
+        .with_name(server_name)
         .with_auth(username, password)
         .spawn()
 }

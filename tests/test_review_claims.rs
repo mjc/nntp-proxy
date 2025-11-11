@@ -320,7 +320,11 @@ async fn test_buffer_pool_safety_across_cycles() {
 }
 
 /// Test that proves the review claim about "resize(size, 0)" would destroy performance.
+///
+/// This is a performance benchmark that takes ~8 seconds to run.
+/// Use `cargo test test_uninit_vs_zeroed_performance_difference -- --ignored` to run it.
 #[test]
+#[ignore = "slow performance benchmark - run explicitly with --ignored"]
 fn test_uninit_vs_zeroed_performance_difference() {
     use std::time::Instant;
 
