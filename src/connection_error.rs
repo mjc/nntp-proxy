@@ -1,124 +1,57 @@
 //! Connection error types for the NNTP proxy
-//!
-//! This module provides detailed error types for connection management,
-//! making it easier to diagnose and handle different failure scenarios.
 
-use std::fmt;
+use thiserror::Error;
 
 /// Errors that can occur during connection management
-#[derive(Debug)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConnectionError {
-    /// TCP connection failed
+    #[error("Failed to connect to {host}:{port}: {source}")]
     TcpConnect {
         host: String,
         port: u16,
+        #[source]
         source: std::io::Error,
     },
 
-    /// DNS resolution failed
+    #[error("Failed to resolve DNS for {address}: {source}")]
     DnsResolution {
         address: String,
+        #[source]
         source: std::io::Error,
     },
 
-    /// Socket configuration failed (buffer sizes, keepalive, etc.)
+    #[error("Failed to configure socket ({operation}): {source}")]
     SocketConfig {
         operation: String,
+        #[source]
         source: std::io::Error,
     },
 
-    /// Backend authentication failed
+    #[error("Authentication failed for backend '{backend}': {response}")]
     AuthenticationFailed { backend: String, response: String },
 
-    /// Invalid or unexpected greeting from backend
+    #[error("Invalid greeting from backend '{backend}': {greeting}")]
     InvalidGreeting { backend: String, greeting: String },
 
-    /// Connection pool exhausted
+    #[error("Connection pool exhausted for backend '{backend}' (max size: {max_size})")]
     PoolExhausted { backend: String, max_size: usize },
 
-    /// Connection is stale or broken
+    #[error("Stale connection to backend '{backend}': {reason}")]
     StaleConnection { backend: String, reason: String },
 
-    /// I/O error during communication
-    IoError(std::io::Error),
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
 
-    /// TLS handshake failed
+    #[error("TLS handshake failed for backend '{backend}': {source}")]
     TlsHandshake {
         backend: String,
+        #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// Certificate verification failed
+    #[error("Certificate verification failed for backend '{backend}': {reason}")]
     CertificateVerification { backend: String, reason: String },
-}
-
-impl fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TcpConnect { host, port, source } => {
-                write!(f, "Failed to connect to {}:{}: {}", host, port, source)
-            }
-            Self::DnsResolution { address, source } => {
-                write!(f, "Failed to resolve DNS for {}: {}", address, source)
-            }
-            Self::SocketConfig { operation, source } => {
-                write!(f, "Failed to configure socket ({}): {}", operation, source)
-            }
-            Self::AuthenticationFailed { backend, response } => {
-                write!(
-                    f,
-                    "Authentication failed for backend '{}': {}",
-                    backend, response
-                )
-            }
-            Self::InvalidGreeting { backend, greeting } => {
-                write!(
-                    f,
-                    "Invalid greeting from backend '{}': {}",
-                    backend, greeting
-                )
-            }
-            Self::PoolExhausted { backend, max_size } => {
-                write!(
-                    f,
-                    "Connection pool exhausted for backend '{}' (max size: {})",
-                    backend, max_size
-                )
-            }
-            Self::StaleConnection { backend, reason } => {
-                write!(f, "Stale connection to backend '{}': {}", backend, reason)
-            }
-            Self::IoError(e) => write!(f, "I/O error: {}", e),
-            Self::TlsHandshake { backend, source } => {
-                write!(
-                    f,
-                    "TLS handshake failed for backend '{}': {}",
-                    backend, source
-                )
-            }
-            Self::CertificateVerification { backend, reason } => {
-                write!(
-                    f,
-                    "Certificate verification failed for backend '{}': {}",
-                    backend, reason
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConnectionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::TcpConnect { source, .. } => Some(source),
-            Self::DnsResolution { source, .. } => Some(source),
-            Self::SocketConfig { source, .. } => Some(source),
-            Self::IoError(e) => Some(e),
-            Self::TlsHandshake { source, .. } => Some(source.as_ref()),
-            _ => None,
-        }
-    }
 }
 
 impl ConnectionError {
@@ -140,15 +73,6 @@ impl ConnectionError {
         matches!(self, Self::TcpConnect { .. } | Self::DnsResolution { .. })
     }
 }
-
-impl From<std::io::Error> for ConnectionError {
-    fn from(err: std::io::Error) -> Self {
-        Self::IoError(err)
-    }
-}
-
-// Note: No need for From<ConnectionError> for anyhow::Error
-// anyhow has a blanket impl for all types implementing std::error::Error
 
 #[cfg(test)]
 mod tests {
