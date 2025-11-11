@@ -249,24 +249,27 @@ services:
       NNTP_PROXY_ROUTING_MODE: hybrid
       RUST_LOG: info
       
+      # ⚠️ SECURITY: Never hardcode credentials in compose files. Use environment variable substitution.
+      # Copy .env.example to .env and fill in your credentials, then reference them here.
+      
       # Three backends for round-robin load balancing
       NNTP_SERVER_0_HOST: news1.example.com
       NNTP_SERVER_0_PORT: 119
       NNTP_SERVER_0_NAME: "Server 1"
-      NNTP_SERVER_0_USERNAME: user1
-      NNTP_SERVER_0_PASSWORD: pass1
+      NNTP_SERVER_0_USERNAME: ${BACKEND_USER_0}
+      NNTP_SERVER_0_PASSWORD: ${BACKEND_PASS_0}
       
       NNTP_SERVER_1_HOST: news2.example.com
       NNTP_SERVER_1_PORT: 119
       NNTP_SERVER_1_NAME: "Server 2"
-      NNTP_SERVER_1_USERNAME: user2
-      NNTP_SERVER_1_PASSWORD: pass2
+      NNTP_SERVER_1_USERNAME: ${BACKEND_USER_1}
+      NNTP_SERVER_1_PASSWORD: ${BACKEND_PASS_1}
       
       NNTP_SERVER_2_HOST: news3.example.com
       NNTP_SERVER_2_PORT: 119
       NNTP_SERVER_2_NAME: "Server 3"
-      NNTP_SERVER_2_USERNAME: user3
-      NNTP_SERVER_2_PASSWORD: pass3
+      NNTP_SERVER_2_USERNAME: ${BACKEND_USER_2}
+      NNTP_SERVER_2_PASSWORD: ${BACKEND_PASS_2}
     restart: unless-stopped
 ```
 

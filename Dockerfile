@@ -66,9 +66,9 @@ ENV NNTP_PROXY_PORT=8119 \
 # ENV NNTP_SERVER_1_PASSWORD=""
 # ENV NNTP_SERVER_1_MAX_CONNECTIONS=10
 
-# Health check using netcat
+# Health check: Verify proxy is listening on configured port
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD sh -c "nc -z localhost ${NNTP_PROXY_PORT} || exit 1"
+    CMD ["/bin/sh", "-c", "nc -z localhost ${NNTP_PROXY_PORT} || exit 1"]
 
 # Run the application
 CMD ["/usr/local/bin/nntp-proxy"]
