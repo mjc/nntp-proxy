@@ -110,8 +110,8 @@ impl MockNntpServer {
                 let credentials = credentials.clone();
                 let handlers = command_handlers.clone();
 
-                // Spawn per-connection handler (fire and forget)
-                let _ = tokio::spawn(async move {
+                // Spawn per-connection handler (explicitly drop handle)
+                drop(tokio::spawn(async move {
                     // Send greeting
                     let greeting = if require_auth {
                         format!("200 {} Ready (auth required)\r\n", name)
@@ -184,7 +184,7 @@ impl MockNntpServer {
                             let _ = stream.write_all(b"200 OK\r\n").await;
                         }
                     }
-                });
+                }));
             }
         })
         .abort_handle()

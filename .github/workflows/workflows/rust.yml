@@ -27,23 +27,6 @@ jobs:
         shared-key: "test"
         cache-on-failure: true
 
-    - name: Cache par2cmdline
-      id: cache-par2
-      uses: actions/cache@v4
-      with:
-        path: ~/bin/par2
-        key: ${{ runner.os }}-par2cmdline
-
-    - name: Install par2cmdline
-      if: steps.cache-par2.outputs.cache-hit != 'true'
-      run: |
-        sudo apt-get update && sudo apt-get install -y par2
-        mkdir -p ~/bin
-        cp /usr/bin/par2 ~/bin/par2
-
-    - name: Add par2 to PATH
-      run: echo "$HOME/bin" >> $GITHUB_PATH
-
     - name: Install cargo-nextest
       uses: taiki-e/install-action@v2
       with:
@@ -68,23 +51,6 @@ jobs:
       with:
         shared-key: "coverage"
         cache-on-failure: true
-
-    - name: Cache par2cmdline
-      id: cache-par2-coverage
-      uses: actions/cache@v4
-      with:
-        path: ~/bin/par2
-        key: ${{ runner.os }}-par2cmdline
-
-    - name: Install par2cmdline
-      if: steps.cache-par2-coverage.outputs.cache-hit != 'true'
-      run: |
-        sudo apt-get update && sudo apt-get install -y par2
-        mkdir -p ~/bin
-        cp /usr/bin/par2 ~/bin/par2
-
-    - name: Add par2 to PATH
-      run: echo "$HOME/bin" >> $GITHUB_PATH
 
     - name: Cache cargo-llvm-cov binary
       uses: actions/cache@v4
