@@ -82,7 +82,7 @@ impl ClientSession {
                                         backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        let result = super::common::handle_auth_command(
+                                        let result = crate::session::common::handle_auth_command(
                                             &self.auth_handler,
                                             auth_action,
                                             &mut client_write,

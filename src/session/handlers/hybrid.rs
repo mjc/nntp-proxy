@@ -3,7 +3,7 @@
 //! This module implements the transition from per-command routing to stateful
 //! routing when a stateful command is encountered in hybrid mode.
 
-use super::common;
+use crate::session::common;
 use crate::session::ClientSession;
 use anyhow::Result;
 use tokio::io::BufReader;

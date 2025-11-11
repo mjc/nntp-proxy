@@ -4,7 +4,7 @@
 //! can be routed to a different backend. It includes the core command execution
 //! logic used by all routing modes.
 
-use super::common;
+use crate::session::common;
 use crate::pool::PooledBuffer;
 use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;

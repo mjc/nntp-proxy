@@ -9,11 +9,11 @@ use tokio::io::AsyncWriteExt;
 
 /// Threshold for logging detailed transfer info (bytes)
 /// Transfers under this size are considered "small" (test connections, etc.)
-pub(super) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
+pub(crate) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
 
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct AuthResult {
+pub(crate) struct AuthResult {
     /// Number of bytes written to client
     pub bytes_written: BytesTransferred,
     /// Whether authentication succeeded
@@ -33,7 +33,7 @@ impl AuthResult {
 
 /// Result of checking for QUIT command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum QuitStatus {
+pub(crate) enum QuitStatus {
     /// QUIT command was detected and response sent (contains bytes written)
     Quit(BytesTransferred),
     /// Not a QUIT command
@@ -42,7 +42,7 @@ pub(super) enum QuitStatus {
 
 /// Extract message-ID from NNTP command if present
 #[inline]
-pub(super) fn extract_message_id(command: &str) -> Option<&str> {
+pub(crate) fn extract_message_id(command: &str) -> Option<&str> {
     let start = command.find('<')?;
     let end = command[start..].find('>')?;
     Some(&command[start..start + end + 1])
@@ -68,7 +68,7 @@ pub(super) fn extract_message_id(command: &str) -> Option<&str> {
 /// # Returns
 ///
 /// `AuthResult` containing bytes written and whether authentication succeeded
-pub(super) async fn handle_auth_command<W>(
+pub(crate) async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction,
     client_write: &mut W,
@@ -104,7 +104,7 @@ where
 ///
 /// `QuitStatus::Quit(bytes)` if QUIT was detected and response sent
 /// `QuitStatus::Continue` if not a QUIT command
-pub(super) async fn handle_quit_command<W>(
+pub(crate) async fn handle_quit_command<W>(
     command: &str,
     client_write: &mut W,
 ) -> Result<QuitStatus>

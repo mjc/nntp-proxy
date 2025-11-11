@@ -4,12 +4,12 @@
 //! - `standard`: Standard 1:1 routing with dedicated backend connection
 //! - `per_command`: Per-command routing where each command can go to a different backend
 //! - `hybrid`: Hybrid mode that starts with per-command routing and switches to stateful
-//! - `common`: Shared utilities and constants
+//!
+//! Shared utilities are in the parent `session::common` module.
 //!
 //! All handler functions are implemented as methods on `ClientSession` in their
 //! respective modules. No need to re-export since they're all impl blocks.
 
-mod common;
 mod hybrid;
 mod per_command;
 mod standard;

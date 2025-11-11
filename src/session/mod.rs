@@ -42,6 +42,7 @@
 //!   - Distinguishes backend errors from client disconnects
 
 pub mod backend;
+pub(crate) mod common;
 pub mod connection;
 pub mod error_classification;
 pub mod handlers;
