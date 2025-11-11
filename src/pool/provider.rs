@@ -481,11 +481,12 @@ impl DeadpoolConnectionProvider {
 #[async_trait]
 impl ConnectionProvider for DeadpoolConnectionProvider {
     fn status(&self) -> PoolStatus {
+        use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
         let status = self.pool.status();
         PoolStatus {
-            available: status.available,
-            max_size: status.max_size,
-            created: status.size,
+            available: AvailableConnections::new(status.available),
+            max_size: MaxPoolSize::new(status.max_size),
+            created: CreatedConnections::new(status.size),
         }
     }
 }
@@ -512,11 +513,12 @@ impl ConnectionPool for DeadpoolConnectionProvider {
     }
 
     fn status(&self) -> PoolStatus {
+        use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
         let status = self.pool.status();
         PoolStatus {
-            available: status.available,
-            max_size: status.max_size,
-            created: status.size,
+            available: AvailableConnections::new(status.available),
+            max_size: MaxPoolSize::new(status.max_size),
+            created: CreatedConnections::new(status.size),
         }
     }
 
