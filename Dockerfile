@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
 # Copy everything and build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 
 # Build the application
 RUN cargo build --release --bin nntp-proxy
@@ -46,7 +47,6 @@ EXPOSE 8119
 ENV NNTP_PROXY_PORT=8119 \
     NNTP_PROXY_ROUTING_MODE=hybrid \
     NNTP_PROXY_CONFIG=/etc/nntp-proxy/config.toml \
-    NNTP_PROXY_THREADS="" \
     RUST_LOG=info
 
 # Backend server configuration (example - override these)
