@@ -10,7 +10,7 @@ use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{debug, error, info, warn};
 
-use crate::types::BytesTransferred;
+use crate::types::{BytesTransferred, TransferMetrics};
 
 impl ClientSession {
     /// Switch from per-command routing to stateful mode by acquiring a dedicated backend connection
@@ -21,7 +21,7 @@ impl ClientSession {
         initial_command: &str,
         client_to_backend_bytes: BytesTransferred,
         backend_to_client_bytes: BytesTransferred,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<TransferMetrics> {
         use tokio::io::AsyncBufReadExt;
 
         // Get router to select backend for stateful session
@@ -74,11 +74,9 @@ impl ClientSession {
                     e
                 );
                 router.complete_command_sync(backend_id);
-                return result.map(|_| {
-                    (
-                        client_to_backend_bytes.as_u64(),
-                        backend_to_client_bytes.as_u64(),
-                    )
+                return result.map(|_| TransferMetrics {
+                    client_to_backend: client_to_backend_bytes,
+                    backend_to_client: backend_to_client_bytes,
                 });
             } else {
                 // Client disconnected while receiving data, backend is healthy
@@ -189,6 +187,14 @@ impl ClientSession {
             }
         }
 
-        Ok((client_to_backend, backend_to_client))
+        let mut c2b = BytesTransferred::zero();
+        let mut b2c = BytesTransferred::zero();
+        c2b.add_u64(client_to_backend);
+        b2c.add_u64(backend_to_client);
+
+        Ok(TransferMetrics {
+            client_to_backend: c2b,
+            backend_to_client: b2c,
+        })
     }
 }

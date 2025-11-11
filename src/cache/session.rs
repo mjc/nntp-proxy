@@ -12,7 +12,7 @@ use crate::cache::article::{ArticleCache, CachedArticle};
 use crate::command::{CommandHandler, NntpCommand};
 use crate::constants::buffer;
 use crate::protocol::{NntpResponse, ResponseCode};
-use crate::types::BytesTransferred;
+use crate::types::{BytesTransferred, TransferMetrics};
 
 /// Caching session that wraps standard session with article cache
 pub struct CachingSession {
@@ -42,7 +42,7 @@ impl CachingSession {
         &self,
         mut client_stream: TcpStream,
         backend_conn: T,
-    ) -> Result<(u64, u64)>
+    ) -> Result<TransferMetrics>
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -209,9 +209,9 @@ impl CachingSession {
             }
         }
 
-        Ok((
-            client_to_backend_bytes.as_u64(),
-            backend_to_client_bytes.as_u64(),
-        ))
+        Ok(TransferMetrics {
+            client_to_backend: client_to_backend_bytes,
+            backend_to_client: backend_to_client_bytes,
+        })
     }
 }

@@ -25,7 +25,7 @@ impl ClientSession {
     pub async fn handle_per_command_routing(
         &self,
         mut client_stream: TcpStream,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<TransferMetrics> {
         use tokio::io::BufReader;
 
         debug!(
@@ -242,10 +242,10 @@ impl ClientSession {
             );
         }
 
-        Ok((
-            client_to_backend_bytes.as_u64(),
-            backend_to_client_bytes.as_u64(),
-        ))
+        Ok(TransferMetrics {
+            client_to_backend: client_to_backend_bytes,
+            backend_to_client: backend_to_client_bytes,
+        })
     }
 
     /// Route a single command to a backend and execute it

@@ -381,10 +381,12 @@ impl NntpProxy {
 
         // Log session results and handle backend connection errors
         match copy_result {
-            Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
+            Ok(metrics) => {
                 info!(
                     "Connection closed for client {}: {} bytes sent, {} bytes received",
-                    client_addr, client_to_backend_bytes, backend_to_client_bytes
+                    client_addr,
+                    metrics.client_to_backend.as_u64(),
+                    metrics.backend_to_client.as_u64()
                 );
             }
             Err(e) => {
@@ -457,13 +459,13 @@ impl NntpProxy {
 
         // Log session results
         match result {
-            Ok((client_to_backend, backend_to_client)) => {
+            Ok(metrics) => {
                 info!(
                     "Session closed {} [{}] ↑{} ↓{}",
                     client_addr,
                     session_id,
-                    crate::formatting::format_bytes(client_to_backend),
-                    crate::formatting::format_bytes(backend_to_client)
+                    crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
+                    crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
                 );
             }
             Err(e) => {

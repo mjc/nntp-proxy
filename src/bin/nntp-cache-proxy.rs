@@ -335,10 +335,12 @@ async fn handle_caching_client(
 
     // Log session results
     match copy_result {
-        Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
+        Ok(metrics) => {
             info!(
                 "Connection closed for client {}: {} bytes sent, {} bytes received",
-                client_addr, client_to_backend_bytes, backend_to_client_bytes
+                client_addr,
+                metrics.client_to_backend.as_u64(),
+                metrics.backend_to_client.as_u64()
             );
         }
         Err(e) => {

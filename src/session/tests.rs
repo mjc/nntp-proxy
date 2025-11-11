@@ -237,11 +237,17 @@ async fn test_quit_command_per_command_routing() {
         result
     );
 
-    if let Ok((sent, received)) = result {
+    if let Ok(metrics) = result {
         // Should have sent QUIT command
-        assert!(sent > 0, "Should have sent bytes (QUIT command)");
+        assert!(
+            metrics.client_to_backend.as_u64() > 0,
+            "Should have sent bytes (QUIT command)"
+        );
         // Should have received greeting and possibly closing message
-        assert!(received > 0, "Should have received bytes (greeting)");
+        assert!(
+            metrics.backend_to_client.as_u64() > 0,
+            "Should have received bytes (greeting)"
+        );
     }
 
     // Wait for client to finish
