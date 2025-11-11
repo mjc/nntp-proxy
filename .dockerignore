@@ -7,7 +7,6 @@ target/
 
 # Test and coverage artifacts
 tests/
-benches/
 coverage/
 *.profdata
 *.profraw

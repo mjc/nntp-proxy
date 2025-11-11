@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.85-slim as builder
+FROM rust:1.85-slim AS builder
 
 WORKDIR /usr/src/app
 
@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy manifest files first for better layer caching
 COPY Cargo.toml Cargo.lock ./
+COPY benches/ benches/
 
 # Create dummy source to build dependencies only
 RUN mkdir -p src/bin && \
