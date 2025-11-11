@@ -42,7 +42,6 @@ impl ClientSession {
 
         debug!("Client {} session loop starting", self.client_addr);
 
-        // Handle the initial command/response phase where we intercept auth
         loop {
             line.clear();
             let mut buffer = self.buffer_pool.get_buffer().await;

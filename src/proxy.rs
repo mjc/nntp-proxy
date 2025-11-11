@@ -287,13 +287,17 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
-    /// Common setup for client connections (greeting only, prewarming done at startup)
+    /// Common setup for client connections
+    ///
+    /// Sends the proxy's greeting immediately to the client.
+    /// Backend greetings are consumed when connections are created in the pool.
     async fn setup_client_connection(
         &self,
         client_stream: &mut TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        // Send proxy greeting
+        // Send proxy greeting immediately
+        // (Backend greetings already consumed during connection creation)
         crate::protocol::send_proxy_greeting(client_stream, client_addr).await
     }
 
@@ -427,9 +431,9 @@ impl NntpProxy {
             debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
         }
 
-        // NOTE: Don't call setup_client_connection here because handle_per_command_routing
-        // sends its own greeting ("200 NNTP Proxy Ready (Per-Command Routing)")
-        // Calling setup_client_connection would send a duplicate greeting
+        // NOTE: handle_per_command_routing sends its own greeting immediately
+        // ("200 NNTP Proxy Ready (Per-Command Routing)")
+        // All backend greetings are consumed when connections are created
 
         // Create session with router for per-command routing
         let session = ClientSession::new_with_router(
