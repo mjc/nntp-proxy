@@ -33,6 +33,61 @@
 
 use crate::types::MessageId;
 
+/// Raw NNTP status code (3-digit number)
+///
+/// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
+/// all NNTP responses start with a 3-digit status code (100-599).
+///
+/// This newtype ensures type safety and prevents mixing status codes with other integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StatusCode(u16);
+
+impl StatusCode {
+    /// Create a new status code (unchecked - for internal use)
+    #[inline]
+    pub const fn new(code: u16) -> Self {
+        Self(code)
+    }
+
+    /// Get the raw numeric value
+    #[inline]
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Check if this is a success code (2xx or 3xx)
+    ///
+    /// Per [RFC 3977 §3.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2.1):
+    /// - 2xx: Success
+    /// - 3xx: Success so far, send more input
+    #[inline]
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        self.0 >= 200 && self.0 < 400
+    }
+
+    /// Check if this is an error code (4xx or 5xx)
+    #[inline]
+    #[must_use]
+    pub const fn is_error(self) -> bool {
+        self.0 >= 400 && self.0 < 600
+    }
+
+    /// Check if this is an informational code (1xx)
+    #[inline]
+    #[must_use]
+    pub const fn is_informational(self) -> bool {
+        self.0 >= 100 && self.0 < 200
+    }
+}
+
+impl std::fmt::Display for StatusCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Categorized NNTP response code for type-safe handling
 ///
 /// This enum categorizes NNTP response codes based on their semantics and
@@ -51,7 +106,7 @@ pub enum ResponseCode {
     /// Server greeting - [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
     /// - 200: Posting allowed
     /// - 201: No posting allowed
-    Greeting(u16),
+    Greeting(StatusCode),
 
     /// Disconnect/goodbye - [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4)
     /// - 205: Connection closing
@@ -60,7 +115,7 @@ pub enum ResponseCode {
     /// Authentication required - [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
     /// - 381: Password required
     /// - 480: Authentication required
-    AuthRequired(u16),
+    AuthRequired(StatusCode),
 
     /// Authentication successful - [RFC 4643 §2.5.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.5.1)
     /// - 281: Authentication accepted
@@ -70,10 +125,10 @@ pub enum ResponseCode {
     /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
     /// - All 1xx codes (100-199)
     /// - Specific 2xx codes: 215, 220, 221, 222, 224, 225, 230, 231, 282
-    MultilineData(u16),
+    MultilineData(StatusCode),
 
     /// Single-line response (everything else)
-    SingleLine(u16),
+    SingleLine(StatusCode),
 
     /// Invalid or unparseable response
     Invalid,
@@ -93,7 +148,7 @@ impl ResponseCode {
             None => return Self::Invalid,
         };
 
-        match code {
+        match code.as_u16() {
             // [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
             200 | 201 => Self::Greeting(code),
 
@@ -130,14 +185,14 @@ impl ResponseCode {
     /// Get the numeric status code if available
     #[inline]
     #[must_use]
-    pub const fn status_code(&self) -> Option<u16> {
+    pub const fn status_code(&self) -> Option<StatusCode> {
         match self {
             Self::Greeting(c)
             | Self::AuthRequired(c)
             | Self::MultilineData(c)
             | Self::SingleLine(c) => Some(*c),
-            Self::Disconnect => Some(205),
-            Self::AuthSuccess => Some(281),
+            Self::Disconnect => Some(StatusCode::new(205)),
+            Self::AuthSuccess => Some(StatusCode::new(281)),
             Self::Invalid => None,
         }
     }
@@ -150,8 +205,7 @@ impl ResponseCode {
     #[inline]
     #[must_use]
     pub fn is_success(&self) -> bool {
-        self.status_code()
-            .is_some_and(|code| (200..400).contains(&code))
+        self.status_code().is_some_and(|code| code.is_success())
     }
 }
 
@@ -159,7 +213,7 @@ impl ResponseCode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NntpResponse {
     /// Status code (e.g., 200, 381, 500)
-    pub status_code: u16,
+    pub status_code: StatusCode,
     /// Whether this is a multiline response
     pub is_multiline: bool,
     /// Complete response data including status line
@@ -175,7 +229,7 @@ impl NntpResponse {
     /// **Optimization**: Direct byte-to-digit conversion without UTF-8 validation.
     /// Status codes are guaranteed to be ASCII digits per the RFC.
     #[inline]
-    pub fn parse_status_code(data: &[u8]) -> Option<u16> {
+    pub fn parse_status_code(data: &[u8]) -> Option<StatusCode> {
         if data.len() < 3 {
             return None;
         }
@@ -192,7 +246,8 @@ impl NntpResponse {
         }
 
         // Combine into u16: d0*100 + d1*10 + d2
-        Some((d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16))
+        let code = (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16);
+        Some(StatusCode::new(code))
     }
 
     /// Check if a response indicates a multiline response
@@ -204,8 +259,9 @@ impl NntpResponse {
     /// - **1xx**: All informational responses (100-199)
     /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
     #[inline]
-    pub fn is_multiline_response(status_code: u16) -> bool {
-        match status_code {
+    pub fn is_multiline_response(status_code: StatusCode) -> bool {
+        let code = status_code.as_u16();
+        match code {
             100..=199 => true, // All 1xx are multiline
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
             _ => false,
@@ -453,7 +509,7 @@ impl ResponseParser {
     /// or any other specific code that doesn't have a dedicated helper.
     #[inline]
     pub fn is_response_code(data: &[u8], code: u16) -> bool {
-        NntpResponse::parse_status_code(data) == Some(code)
+        NntpResponse::parse_status_code(data).is_some_and(|c| c.as_u16() == code)
     }
 }
 

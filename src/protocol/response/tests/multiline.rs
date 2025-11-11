@@ -4,14 +4,14 @@ use crate::protocol::response::*;
 
 #[test]
 fn test_is_multiline_response() {
-    assert!(NntpResponse::is_multiline_response(100));
-    assert!(NntpResponse::is_multiline_response(215)); // LIST
-    assert!(NntpResponse::is_multiline_response(220)); // ARTICLE
-    assert!(NntpResponse::is_multiline_response(221)); // HEAD
-    assert!(NntpResponse::is_multiline_response(222)); // BODY
-    assert!(!NntpResponse::is_multiline_response(200)); // Greeting
-    assert!(!NntpResponse::is_multiline_response(381)); // Auth required
-    assert!(!NntpResponse::is_multiline_response(500)); // Error
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(100)));
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(215))); // LIST
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(220))); // ARTICLE
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(221))); // HEAD
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(222))); // BODY
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(200))); // Greeting
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(381))); // Auth required
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(500))); // Error
 }
 
 #[test]
@@ -58,30 +58,30 @@ fn test_multiline_terminator_variations() {
 #[test]
 fn test_multiline_response_categories() {
     // 1xx informational (all multiline)
-    assert!(NntpResponse::is_multiline_response(100));
-    assert!(NntpResponse::is_multiline_response(150));
-    assert!(NntpResponse::is_multiline_response(199));
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(100)));
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(150)));
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(199)));
 
     // 2xx specific multiline codes
-    assert!(NntpResponse::is_multiline_response(215)); // LIST
-    assert!(NntpResponse::is_multiline_response(220)); // ARTICLE
-    assert!(NntpResponse::is_multiline_response(221)); // HEAD
-    assert!(NntpResponse::is_multiline_response(222)); // BODY
-    assert!(NntpResponse::is_multiline_response(224)); // OVER
-    assert!(NntpResponse::is_multiline_response(225)); // HDR
-    assert!(NntpResponse::is_multiline_response(230)); // NEWNEWS
-    assert!(NntpResponse::is_multiline_response(231)); // NEWGROUPS
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(215))); // LIST
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(220))); // ARTICLE
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(221))); // HEAD
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(222))); // BODY
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(224))); // OVER
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(225))); // HDR
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(230))); // NEWNEWS
+    assert!(NntpResponse::is_multiline_response(StatusCode::new(231))); // NEWGROUPS
 
     // 2xx non-multiline codes
-    assert!(!NntpResponse::is_multiline_response(200)); // Greeting
-    assert!(!NntpResponse::is_multiline_response(205)); // Goodbye
-    assert!(!NntpResponse::is_multiline_response(211)); // Group selected
-    assert!(!NntpResponse::is_multiline_response(281)); // Auth accepted
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(200))); // Greeting
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(205))); // Goodbye
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(211))); // Group selected
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(281))); // Auth accepted
 
     // 3xx, 4xx, 5xx are not multiline
-    assert!(!NntpResponse::is_multiline_response(381));
-    assert!(!NntpResponse::is_multiline_response(430));
-    assert!(!NntpResponse::is_multiline_response(500));
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(381)));
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(430)));
+    assert!(!NntpResponse::is_multiline_response(StatusCode::new(500)));
 }
 
 #[test]

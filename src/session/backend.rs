@@ -87,7 +87,8 @@ where
         );
     } else if let Some(code) = response_code.status_code() {
         // Warn on unusual status codes
-        if code == 0 || code >= 600 {
+        let raw_code = code.as_u16();
+        if raw_code == 0 || raw_code >= 600 {
             warn!(
                 "Client {} got unusual status code {} from backend {:?}: {:?}",
                 client_addr,

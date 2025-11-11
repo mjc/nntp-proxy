@@ -16,7 +16,7 @@ pub use response::ResponseParser;
 
 // Re-export for future use
 #[allow(unused_imports)]
-pub use response::{NntpResponse, ResponseCode};
+pub use response::{NntpResponse, ResponseCode, StatusCode};
 
 // Re-export command construction helpers
 pub use commands::{
