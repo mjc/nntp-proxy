@@ -3,7 +3,8 @@
 //! These tests verify that session handlers properly validate credentials
 //! before marking a session as authenticated.
 
-use nntp_proxy::auth::AuthHandler;
+mod test_helpers;
+
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,9 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Test that StandardHandler requires valid credentials
 #[tokio::test]
 async fn test_standard_handler_validates_credentials() {
-    let auth_handler = Arc::new(
-        AuthHandler::new(Some("testuser".to_string()), Some("testpass".to_string())).unwrap(),
-    );
+    use test_helpers::create_test_auth_handler_with;
+
+    let auth_handler = create_test_auth_handler_with("testuser", "testpass");
 
     // Simulate the authentication flow
     let authenticated = Arc::new(AtomicBool::new(false));
@@ -96,9 +97,9 @@ async fn test_standard_handler_validates_credentials() {
 /// Test that authentication cannot be bypassed with PASS before USER
 #[tokio::test]
 async fn test_pass_before_user_rejected() {
-    let auth_handler = Arc::new(
-        AuthHandler::new(Some("testuser".to_string()), Some("testpass".to_string())).unwrap(),
-    );
+    use test_helpers::create_test_auth_handler_with;
+
+    let auth_handler = create_test_auth_handler_with("testuser", "testpass");
 
     // Try to send AUTHINFO PASS without first sending USER
     let action = CommandHandler::handle_command("AUTHINFO PASS testpass\r\n");
@@ -129,8 +130,9 @@ async fn test_pass_before_user_rejected() {
 /// Test that authentication state is properly isolated
 #[tokio::test]
 async fn test_auth_state_isolation() {
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user1".to_string()), Some("pass1".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler_with;
+
+    let auth_handler = create_test_auth_handler_with("user1", "pass1");
 
     // Session 1 authenticates with correct credentials
     let session1_authenticated = Arc::new(AtomicBool::new(false));
@@ -177,8 +179,9 @@ async fn test_auth_state_isolation() {
 /// Test multiple failed auth attempts don't eventually succeed
 #[tokio::test]
 async fn test_repeated_failures_dont_succeed() {
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let auth_handler = create_test_auth_handler();
 
     let authenticated = Arc::new(AtomicBool::new(false));
 
@@ -211,8 +214,9 @@ async fn test_repeated_failures_dont_succeed() {
 /// Test that auth_success flag is the ONLY way to authenticate
 #[tokio::test]
 async fn test_auth_success_is_only_path_to_authentication() {
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let auth_handler = create_test_auth_handler();
 
     // This simulates what session handlers do
     let authenticated = Arc::new(AtomicBool::new(false));
@@ -267,10 +271,10 @@ async fn test_auth_success_is_only_path_to_authentication() {
 /// Test concurrent authentication attempts
 #[tokio::test]
 async fn test_concurrent_auth_attempts() {
+    use test_helpers::create_test_auth_handler;
     use tokio::task::JoinSet;
 
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    let auth_handler = create_test_auth_handler();
 
     let mut set = JoinSet::new();
 
@@ -340,10 +344,11 @@ async fn test_concurrent_auth_attempts() {
 /// Test that session handlers respect auth_success flag
 #[tokio::test]
 async fn test_session_handler_respects_auth_success() {
+    use test_helpers::create_test_auth_handler;
+
     // This test documents the expected behavior of session handlers
 
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    let auth_handler = create_test_auth_handler();
 
     // Simulate session handler behavior
     let mut auth_username: Option<String> = None;

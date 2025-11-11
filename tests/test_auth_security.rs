@@ -3,6 +3,8 @@
 //! These tests verify that authentication cannot be bypassed and that
 //! invalid credentials never result in authenticated state.
 
+mod test_helpers;
+
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::AuthAction;
 use std::sync::Arc;
@@ -10,13 +12,9 @@ use std::sync::Arc;
 /// Test that invalid credentials are NEVER accepted
 #[tokio::test]
 async fn test_invalid_credentials_rejected() {
-    let handler = Arc::new(
-        AuthHandler::new(
-            Some("correctuser".to_string()),
-            Some("correctpass".to_string()),
-        )
-        .unwrap(),
-    );
+    use test_helpers::create_test_auth_handler_with;
+
+    let handler = create_test_auth_handler_with("correctuser", "correctpass");
 
     // Test wrong username
     let mut output = Vec::new();
@@ -89,8 +87,9 @@ async fn test_valid_credentials_accepted() {
 /// Test that AUTHINFO PASS without prior AUTHINFO USER is rejected
 #[tokio::test]
 async fn test_password_without_username_rejected() {
-    let handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let handler = create_test_auth_handler();
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
@@ -112,8 +111,9 @@ async fn test_password_without_username_rejected() {
 /// Test that authentication is case-sensitive
 #[tokio::test]
 async fn test_credentials_case_sensitive() {
-    let handler =
-        Arc::new(AuthHandler::new(Some("User".to_string()), Some("Pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler_with;
+
+    let handler = create_test_auth_handler_with("User", "Pass");
 
     // Wrong case username
     let mut output = Vec::new();
@@ -161,8 +161,9 @@ async fn test_credentials_case_sensitive() {
 /// Test that empty credentials don't bypass authentication
 #[tokio::test]
 async fn test_empty_credentials_rejected() {
-    let handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let handler = create_test_auth_handler();
 
     // Empty username
     let mut output = Vec::new();
@@ -243,8 +244,9 @@ async fn test_auth_success_flag_reliability() {
 /// Test that RequestPassword never returns auth_success=true
 #[tokio::test]
 async fn test_request_password_never_authenticates() {
-    let handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let handler = create_test_auth_handler();
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
@@ -265,7 +267,9 @@ async fn test_request_password_never_authenticates() {
 /// Test disabled auth accepts anything
 #[tokio::test]
 async fn test_disabled_auth_accepts_all() {
-    let handler = Arc::new(AuthHandler::new(None, None).unwrap());
+    use test_helpers::create_test_auth_handler_disabled;
+
+    let handler = create_test_auth_handler_disabled();
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
@@ -285,8 +289,9 @@ async fn test_disabled_auth_accepts_all() {
 /// Test that validate() method matches handle_auth_command behavior
 #[tokio::test]
 async fn test_validate_matches_handle_auth_command() {
-    let handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let handler = create_test_auth_handler();
 
     let test_cases = vec![
         ("user", "pass", true),

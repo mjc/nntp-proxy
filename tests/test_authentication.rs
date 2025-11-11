@@ -8,21 +8,17 @@
 //! - Edge cases and error conditions
 //! - Security (credential redaction)
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 mod config_helpers;
 mod test_helpers;
 use config_helpers::create_test_server_config;
+use test_helpers::MockNntpServer;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::config::{Config, RoutingMode};
-use nntp_proxy::pool::BufferPool;
-use nntp_proxy::router::BackendSelector;
 use nntp_proxy::session::ClientSession;
-use nntp_proxy::types::BufferSize;
-use test_helpers::MockNntpServer;
 
 /// Create test config with client auth enabled
 fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
@@ -288,13 +284,13 @@ async fn test_command_classification_for_stateless() {
 
 #[tokio::test]
 async fn test_session_with_auth_handler() {
+    use test_helpers::{create_test_addr, create_test_auth_handler_with, create_test_buffer_pool};
+    
     let (_backend_port, _handle) = spawn_mock_backend().await;
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(
-        AuthHandler::new(Some("testuser".to_string()), Some("testpass".to_string())).unwrap(),
-    );
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler_with("testuser", "testpass");
 
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    let addr = create_test_addr();
     let _session = ClientSession::new(addr, buffer_pool, auth_handler);
 
     // Session should be created successfully with auth handler
@@ -302,11 +298,15 @@ async fn test_session_with_auth_handler() {
 
 #[tokio::test]
 async fn test_session_with_disabled_auth() {
+    use test_helpers::{
+        create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
+    };
+    
     let (_backend_port, _handle) = spawn_mock_backend().await;
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler_disabled();
 
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    let addr = create_test_addr();
     let _session = ClientSession::new(addr, buffer_pool, auth_handler.clone());
 
     assert!(!auth_handler.is_enabled());
@@ -398,8 +398,9 @@ async fn test_multiple_auth_handlers_independent() {
 
 #[tokio::test]
 async fn test_auth_handler_clone_via_arc() {
-    let handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+    
+    let handler = create_test_auth_handler();
     let handler_clone = handler.clone();
 
     assert!(handler.validate("user", "pass"));
@@ -409,10 +410,11 @@ async fn test_auth_handler_clone_via_arc() {
 
 #[tokio::test]
 async fn test_session_builder_with_auth_handler() {
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    use test_helpers::{create_test_addr, create_test_auth_handler, create_test_buffer_pool};
+    
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler();
+    let addr = create_test_addr();
 
     let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone()).build();
 
@@ -421,11 +423,14 @@ async fn test_session_builder_with_auth_handler() {
 
 #[tokio::test]
 async fn test_session_builder_with_router_and_auth() {
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
-    let router = Arc::new(BackendSelector::new());
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    use test_helpers::{
+        create_test_addr, create_test_auth_handler, create_test_buffer_pool, create_test_router,
+    };
+    
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler();
+    let router = create_test_router();
+    let addr = create_test_addr();
 
     let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
         .with_router(router)
@@ -513,12 +518,10 @@ async fn test_auth_case_variations() {
 
 #[tokio::test]
 async fn test_concurrent_auth_handlers() {
-    use std::sync::Arc;
+    use test_helpers::create_test_auth_handler_with;
     use tokio::task::JoinSet;
 
-    let handler = Arc::new(
-        AuthHandler::new(Some("shared".to_string()), Some("password".to_string())).unwrap(),
-    );
+    let handler = create_test_auth_handler_with("shared", "password");
 
     let mut set = JoinSet::new();
 
@@ -587,10 +590,10 @@ async fn test_auth_with_null_bytes_in_credentials() {
 #[tokio::test]
 async fn test_auth_handler_with_concurrent_requests() {
     use nntp_proxy::command::AuthAction;
+    use test_helpers::create_test_auth_handler;
     use tokio::task::JoinSet;
 
-    let handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    let handler = create_test_auth_handler();
 
     let mut set = JoinSet::new();
 

@@ -300,11 +300,10 @@ async fn test_auth_handler_in_cache_session() {
 
 #[tokio::test]
 async fn test_auth_handler_integration() {
-    use nntp_proxy::auth::AuthHandler;
     use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+    use test_helpers::create_test_auth_handler_with;
 
-    let handler =
-        Arc::new(AuthHandler::new(Some("alice".to_string()), Some("secret".to_string())).unwrap());
+    let handler = create_test_auth_handler_with("alice", "secret");
 
     // Test command classification
     let action = CommandHandler::handle_command("LIST\r\n");

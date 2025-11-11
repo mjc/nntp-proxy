@@ -332,6 +332,107 @@ pub async fn read_response(
         .map_err(Into::into)
 }
 
+// ============================================================================
+// Test Factory Functions
+// ============================================================================
+//
+// These factory functions eliminate boilerplate when creating common test
+// objects with standard/default configurations.
+
+/// Create a standard test buffer pool (8KB, 4 buffers)
+///
+/// This is the most common buffer pool configuration used across tests.
+/// Use this instead of repeating `BufferPool::new(BufferSize::new(8192).unwrap(), 4)`.
+///
+/// # Examples
+/// ```ignore
+/// let pool = create_test_buffer_pool();
+/// let session = ClientSession::new(addr, pool, auth_handler);
+/// ```
+pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
+    use nntp_proxy::pool::BufferPool;
+    use nntp_proxy::types::BufferSize;
+    
+    BufferPool::new(BufferSize::new(8192).unwrap(), 4)
+}
+
+/// Create a test auth handler with standard credentials (user/pass)
+///
+/// Use this instead of repeating `Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap())`.
+///
+/// # Examples
+/// ```ignore
+/// let auth = create_test_auth_handler();
+/// let session = ClientSession::new(addr, pool, auth);
+/// ```
+pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
+    use nntp_proxy::auth::AuthHandler;
+    use std::sync::Arc;
+    
+    Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap())
+}
+
+/// Create a test auth handler with custom credentials
+///
+/// # Examples
+/// ```ignore
+/// let auth = create_test_auth_handler_with("alice", "secret123");
+/// ```
+pub fn create_test_auth_handler_with(
+    username: &str,
+    password: &str,
+) -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
+    use nntp_proxy::auth::AuthHandler;
+    use std::sync::Arc;
+    
+    Arc::new(AuthHandler::new(Some(username.to_string()), Some(password.to_string())).unwrap())
+}
+
+/// Create a disabled (no-auth) test auth handler
+///
+/// Use this instead of repeating `Arc::new(AuthHandler::new(None, None).unwrap())`.
+///
+/// # Examples
+/// ```ignore
+/// let auth = create_test_auth_handler_disabled();
+/// let session = ClientSession::new(addr, pool, auth);
+/// ```
+pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
+    use nntp_proxy::auth::AuthHandler;
+    use std::sync::Arc;
+    
+    Arc::new(AuthHandler::new(None, None).unwrap())
+}
+
+/// Create a test backend selector (router)
+///
+/// Use this instead of repeating `Arc::new(BackendSelector::new())`.
+///
+/// # Examples
+/// ```ignore
+/// let router = create_test_router();
+/// router.add_backend(...);
+/// ```
+pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelector> {
+    use nntp_proxy::router::BackendSelector;
+    use std::sync::Arc;
+    
+    Arc::new(BackendSelector::new())
+}
+
+/// Create a test socket address (127.0.0.1:9999)
+///
+/// Standard test address for creating ClientSession instances.
+///
+/// # Examples
+/// ```ignore
+/// let addr = create_test_addr();
+/// let session = ClientSession::new(addr, pool, auth);
+/// ```
+pub fn create_test_addr() -> std::net::SocketAddr {
+    "127.0.0.1:9999".parse().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,7 +539,7 @@ mod tests {
         let mut buffer = [0; 1024];
 
         // Read greeting
-        stream.read(&mut buffer).await.unwrap();
+        let _ = stream.read(&mut buffer).await.unwrap();
 
         // Test custom LIST handler
         stream.write_all(b"LIST\r\n").await.unwrap();
@@ -471,5 +572,50 @@ mod tests {
 
         let result = wait_for_server(&format!("127.0.0.1:{}", port), 20).await;
         assert!(result.is_ok());
+    }
+
+    // Factory function tests
+    #[test]
+    fn test_create_test_buffer_pool() {
+        // Just verify it was created successfully
+        let _pool = create_test_buffer_pool();
+        // BufferPool is opaque, no public inspection API
+    }
+
+    #[test]
+    fn test_create_test_auth_handler() {
+        let auth = create_test_auth_handler();
+        assert!(auth.is_enabled());
+        assert!(auth.validate("user", "pass"));
+        assert!(!auth.validate("wrong", "credentials"));
+    }
+
+    #[test]
+    fn test_create_test_auth_handler_with() {
+        let auth = create_test_auth_handler_with("alice", "secret123");
+        assert!(auth.is_enabled());
+        assert!(auth.validate("alice", "secret123"));
+        assert!(!auth.validate("alice", "wrong"));
+    }
+
+    #[test]
+    fn test_create_test_auth_handler_disabled() {
+        let auth = create_test_auth_handler_disabled();
+        assert!(!auth.is_enabled());
+        // Disabled auth accepts anything
+        assert!(auth.validate("any", "thing"));
+    }
+
+    #[test]
+    fn test_create_test_router() {
+        let router = create_test_router();
+        assert_eq!(router.backend_count(), 0);
+    }
+
+    #[test]
+    fn test_create_test_addr() {
+        let addr = create_test_addr();
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(addr.port(), 9999);
     }
 }

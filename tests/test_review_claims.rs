@@ -5,6 +5,8 @@
 //! 2. There's no race condition in auth_username (each session has its own)
 //! 3. Uninit buffers with set_len are safe when used with AsyncRead/AsyncWrite
 
+mod test_helpers;
+
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 use std::sync::Arc;
@@ -20,8 +22,9 @@ use tokio::io::AsyncReadExt;
 /// command is still subject to the same authentication check. No bypass occurs.
 #[tokio::test]
 async fn test_reject_commands_dont_bypass_authentication() {
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let auth_handler = create_test_auth_handler();
 
     // Simulate what happens in the session handler
     let mut authenticated = false;
@@ -125,8 +128,9 @@ async fn test_no_auth_username_race_condition() {
         }
     }
 
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("alice".to_string()), Some("secret".to_string())).unwrap()); // Unwrap the Result to get AuthHandler
+    use test_helpers::create_test_auth_handler_with;
+
+    let auth_handler = create_test_auth_handler_with("alice", "secret");
 
     // Session 1: alice's connection
     let session1 = SessionHandler::new(auth_handler.clone());
@@ -162,8 +166,9 @@ async fn test_no_auth_username_race_condition() {
 /// the username from the most recent AUTHINFO USER command, which is correct behavior.
 #[tokio::test]
 async fn test_auth_attempts_are_serialized_per_connection() {
-    let auth_handler =
-        Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
+    use test_helpers::create_test_auth_handler;
+
+    let auth_handler = create_test_auth_handler();
 
     // Simulate sequential auth attempts from one connection
     // AUTHINFO USER user
@@ -287,10 +292,9 @@ async fn test_uninit_buffer_pattern_is_safe() {
 /// Test that the buffer pool pattern is sound even with multiple get/return cycles.
 #[tokio::test]
 async fn test_buffer_pool_safety_across_cycles() {
-    use nntp_proxy::pool::BufferPool;
-    use nntp_proxy::types::BufferSize;
+    use test_helpers::create_test_buffer_pool;
 
-    let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
+    let pool = create_test_buffer_pool();
 
     // Get buffer, use it, return it
     {
