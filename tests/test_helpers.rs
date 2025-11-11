@@ -453,7 +453,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_mock_server() {
-        let port = 19001;
+        // Use port 0 to let OS assign a random available port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Release port for mock server
+
         let _handle = spawn_mock_server(port, "TestServer");
 
         // Give server time to start
@@ -474,7 +478,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_basic() {
-        let port = 19005;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
         let _handle = MockNntpServer::new(port).with_name("BuilderTest").spawn();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -493,7 +500,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_with_auth() {
-        let port = 19006;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
         let _handle = MockNntpServer::new(port)
             .with_auth("testuser", "testpass")
             .spawn();
@@ -538,7 +548,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_custom_commands() {
-        let port = 19007;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
         let _handle = MockNntpServer::new(port)
             .on_command("LIST", "215 list follows\r\n.\r\n")
             .on_command("GROUP", "211 100 1 100 alt.test\r\n")
@@ -581,7 +594,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_server() {
-        let port = 19004;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
         let _handle = spawn_mock_server(port, "WaitTest");
 
         let result = wait_for_server(&format!("127.0.0.1:{}", port), 20).await;

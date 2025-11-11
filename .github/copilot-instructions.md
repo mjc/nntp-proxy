@@ -807,17 +807,17 @@ async fn test_proxy_routing() -> Result<()> {
 
 ```rust
 /// Create a mock NNTP server for testing
-pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-        // ... mock server implementation
-    })
+/// Returns AbortHandle for automatic cleanup when dropped
+pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
+    MockNntpServer::new(port).with_name(server_name).spawn()
 }
 
-/// Find an available port for testing
-pub async fn find_available_port() -> u16 {
+/// Get a random available port for testing (parallel execution safe)
+pub async fn get_random_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    let port = listener.local_addr().unwrap().port();
+    drop(listener); // Release port for mock server
+    port
 }
 
 /// Create test configuration
@@ -835,6 +835,8 @@ pub fn create_test_config() -> Config {
     }
 }
 ```
+
+**Important:** Always use random ports (port 0) in tests to avoid conflicts during parallel execution with `cargo nextest run`. Never hardcode port numbers.
 
 ### Testing Patterns
 
@@ -968,21 +970,29 @@ pub async fn create_smart_mock_server(port: u16, name: &str) -> JoinHandle<()> {
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (slower, serial execution per test file)
 cargo test
+
+# Run with nextest for 7x faster parallel execution
+cargo nextest run
 
 # Run with output
 cargo test -- --nocapture
+cargo nextest run --no-capture
 
 # Run specific test
 cargo test test_hybrid_mode
+cargo nextest run -E 'test(hybrid_mode)'
 
 # Run integration tests only
 cargo test --test integration_tests
+cargo nextest run --test integration_tests
 
 # Run with coverage (requires cargo-llvm-cov)
 cargo llvm-cov --html
 ```
+
+**Performance Note:** Use `cargo nextest run` for development - it's ~7x faster than `cargo test` due to parallel execution. All tests use random ports to avoid conflicts during parallel runs.
 
 ### Benchmarking
 
