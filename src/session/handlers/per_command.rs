@@ -114,10 +114,15 @@ impl ClientSession {
             );
 
             // Handle QUIT locally
-            if let Some(bytes) = common::handle_quit_command(&command, &mut client_write).await? {
-                backend_to_client_bytes.add(bytes);
-                debug!("Client {} sent QUIT, closing connection", self.client_addr);
-                break;
+            match common::handle_quit_command(&command, &mut client_write).await? {
+                common::QuitStatus::Quit(bytes) => {
+                    backend_to_client_bytes += bytes;
+                    debug!("Client {} sent QUIT, closing connection", self.client_addr);
+                    break;
+                }
+                common::QuitStatus::Continue => {
+                    // Not a QUIT, continue processing
+                }
             }
 
             let action = CommandHandler::handle_command(&command);
@@ -127,7 +132,7 @@ impl ClientSession {
             if matches!(action, CommandAction::InterceptAuth(_)) {
                 match action {
                     CommandAction::InterceptAuth(auth_action) => {
-                        let (bytes, auth_success) = common::handle_auth_command(
+                        let result = common::handle_auth_command(
                             &self.auth_handler,
                             auth_action,
                             &mut client_write,
@@ -136,8 +141,8 @@ impl ClientSession {
                         )
                         .await?;
 
-                        backend_to_client_bytes.add(bytes);
-                        if auth_success {
+                        backend_to_client_bytes += result.bytes_written;
+                        if result.authenticated {
                             skip_auth_check = true;
                         }
                     }

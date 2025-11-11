@@ -2,6 +2,7 @@
 
 use crate::auth::AuthHandler;
 use crate::command::AuthAction;
+use crate::types::BytesTransferred;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -9,6 +10,35 @@ use tokio::io::AsyncWriteExt;
 /// Threshold for logging detailed transfer info (bytes)
 /// Transfers under this size are considered "small" (test connections, etc.)
 pub(super) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
+
+/// Result of handling an auth command
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AuthResult {
+    /// Number of bytes written to client
+    pub bytes_written: BytesTransferred,
+    /// Whether authentication succeeded
+    pub authenticated: bool,
+}
+
+impl AuthResult {
+    /// Create a new auth result
+    #[inline]
+    pub const fn new(bytes_written: BytesTransferred, authenticated: bool) -> Self {
+        Self {
+            bytes_written,
+            authenticated,
+        }
+    }
+}
+
+/// Result of checking for QUIT command
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuitStatus {
+    /// QUIT command was detected and response sent (contains bytes written)
+    Quit(BytesTransferred),
+    /// Not a QUIT command
+    Continue,
+}
 
 /// Extract message-ID from NNTP command if present
 #[inline]
@@ -37,14 +67,14 @@ pub(super) fn extract_message_id(command: &str) -> Option<&str> {
 ///
 /// # Returns
 ///
-/// `(bytes_written, auth_success)` tuple where auth_success is true if authentication completed successfully
+/// `AuthResult` containing bytes written and whether authentication succeeded
 pub(super) async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction,
     client_write: &mut W,
     auth_username: &mut Option<String>,
     authenticated: &std::sync::atomic::AtomicBool,
-) -> Result<(usize, bool)>
+) -> Result<AuthResult>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -62,20 +92,22 @@ where
         authenticated.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    Ok((bytes, auth_success))
+    let mut bytes_written = BytesTransferred::zero();
+    bytes_written.add(bytes);
+
+    Ok(AuthResult::new(bytes_written, auth_success))
 }
 
 /// Check if command is QUIT and send closing response if so
 ///
 /// # Returns
 ///
-/// `Ok(Some(bytes_written))` if QUIT was detected and response sent
-/// `Ok(None)` if not a QUIT command
-/// `Err` if failed to write response
+/// `QuitStatus::Quit(bytes)` if QUIT was detected and response sent
+/// `QuitStatus::Continue` if not a QUIT command
 pub(super) async fn handle_quit_command<W>(
     command: &str,
     client_write: &mut W,
-) -> Result<Option<usize>>
+) -> Result<QuitStatus>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -89,8 +121,10 @@ where
                 tracing::debug!("Failed to write CONNECTION_CLOSING: {}", e);
             })?;
 
-        Ok(Some(CONNECTION_CLOSING.len()))
+        let mut bytes = BytesTransferred::zero();
+        bytes.add(CONNECTION_CLOSING.len());
+        Ok(QuitStatus::Quit(bytes))
     } else {
-        Ok(None)
+        Ok(QuitStatus::Continue)
     }
 }

@@ -82,7 +82,7 @@ impl ClientSession {
                                         backend_to_client_bytes.add(response.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        let (bytes, auth_success) = super::common::handle_auth_command(
+                                        let result = super::common::handle_auth_command(
                                             &self.auth_handler,
                                             auth_action,
                                             &mut client_write,
@@ -91,8 +91,8 @@ impl ClientSession {
                                         )
                                         .await?;
 
-                                        backend_to_client_bytes.add(bytes);
-                                        if auth_success {
+                                        backend_to_client_bytes += result.bytes_written;
+                                        if result.authenticated {
                                             skip_auth_check = true;
                                         }
                                     }

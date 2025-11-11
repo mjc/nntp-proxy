@@ -125,15 +125,18 @@ impl ClientSession {
                     debug!("Client {} stateful command: {}", self.client_addr, trimmed);
 
                     // Handle QUIT locally
-                    if let Some(bytes) =
-                        common::handle_quit_command(&command, &mut client_write).await?
-                    {
-                        backend_to_client += bytes as u64;
-                        debug!(
-                            "Client {} sent QUIT in stateful mode, closing",
-                            self.client_addr
-                        );
-                        break;
+                    match common::handle_quit_command(&command, &mut client_write).await? {
+                        common::QuitStatus::Quit(bytes) => {
+                            backend_to_client += bytes.as_u64();
+                            debug!(
+                                "Client {} sent QUIT in stateful mode, closing",
+                                self.client_addr
+                            );
+                            break;
+                        }
+                        common::QuitStatus::Continue => {
+                            // Not a QUIT, continue processing
+                        }
                     }
 
                     // Execute on dedicated backend connection
