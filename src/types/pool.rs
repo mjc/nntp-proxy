@@ -1,168 +1,87 @@
 //! Connection pool metric newtypes
-//!
-//! This module provides type-safe wrappers for connection pool metrics
-//! to prevent accidentally mixing different pool statistics.
 
 use std::fmt;
 
-/// Number of available connections in the pool
-///
-/// Represents connections that are idle and ready to be used.
-/// This value should always be ≤ MaxPoolSize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AvailableConnections(usize);
+/// Macro to generate simple usize newtype wrappers
+macro_rules! usize_newtype {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident;
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        $vis struct $name(usize);
 
-impl AvailableConnections {
-    /// Create a new available connections count
-    #[inline]
-    pub const fn new(count: usize) -> Self {
-        Self(count)
-    }
+        impl $name {
+            #[inline]
+            pub const fn new(count: usize) -> Self {
+                Self(count)
+            }
 
-    /// Get the raw value
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
-    }
+            #[inline]
+            #[must_use]
+            pub const fn get(self) -> usize {
+                self.0
+            }
 
-    /// Create zero available connections
-    #[inline]
-    pub const fn zero() -> Self {
-        Self(0)
-    }
+            #[inline]
+            pub const fn zero() -> Self {
+                Self(0)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl From<usize> for $name {
+            fn from(value: usize) -> Self {
+                Self(value)
+            }
+        }
+    };
 }
 
-impl fmt::Display for AvailableConnections {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+usize_newtype! {
+    /// Number of available connections in the pool
+    ///
+    /// Represents connections that are idle and ready to be used.
+    /// This value should always be ≤ MaxPoolSize.
+    pub struct AvailableConnections;
 }
 
-impl From<usize> for AvailableConnections {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
+usize_newtype! {
+    /// Maximum size of the connection pool
+    ///
+    /// Represents the configured maximum number of connections
+    /// that can exist in the pool simultaneously.
+    pub struct MaxPoolSize;
 }
 
-/// Maximum size of the connection pool
-///
-/// Represents the configured maximum number of connections
-/// that can exist in the pool simultaneously.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MaxPoolSize(usize);
-
-impl MaxPoolSize {
-    /// Create a new maximum pool size
-    #[inline]
-    pub const fn new(size: usize) -> Self {
-        Self(size)
-    }
-
-    /// Get the raw value
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
-    }
+usize_newtype! {
+    /// Total number of connections created in the pool's lifetime
+    ///
+    /// This is a monotonically increasing counter that tracks all connections
+    /// created since the pool was initialized. Useful for monitoring connection
+    /// churn and pool efficiency.
+    pub struct CreatedConnections;
 }
 
-impl fmt::Display for MaxPoolSize {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+usize_newtype! {
+    /// Number of connections currently in use
+    ///
+    /// Calculated as: max_size - available
+    /// Represents connections that are actively being used by clients.
+    pub struct InUseConnections;
 }
-
-impl From<usize> for MaxPoolSize {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-/// Total number of connections created in the pool's lifetime
-///
-/// This is a monotonically increasing counter that tracks all connections
-/// created since the pool was initialized. Useful for monitoring connection
-/// churn and pool efficiency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CreatedConnections(usize);
-
-impl CreatedConnections {
-    /// Create a new created connections count
-    #[inline]
-    pub const fn new(count: usize) -> Self {
-        Self(count)
-    }
-
-    /// Get the raw value
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-
-    /// Create zero created connections (initial state)
-    #[inline]
-    pub const fn zero() -> Self {
-        Self(0)
-    }
-}
-
-impl fmt::Display for CreatedConnections {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<usize> for CreatedConnections {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-/// Number of connections currently in use
-///
-/// Calculated as: max_size - available
-/// Represents connections that are actively being used by clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InUseConnections(usize);
 
 impl InUseConnections {
-    /// Create a new in-use connections count
-    #[inline]
-    pub const fn new(count: usize) -> Self {
-        Self(count)
-    }
-
-    /// Get the raw value
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-
     /// Calculate from pool capacity and availability
     #[inline]
     pub fn from_pool_stats(max: MaxPoolSize, available: AvailableConnections) -> Self {
         Self(max.get().saturating_sub(available.get()))
-    }
-
-    /// Create zero in-use connections
-    #[inline]
-    pub const fn zero() -> Self {
-        Self(0)
-    }
-}
-
-impl fmt::Display for InUseConnections {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<usize> for InUseConnections {
-    fn from(value: usize) -> Self {
-        Self(value)
     }
 }
 
@@ -201,28 +120,24 @@ impl PoolUtilization {
         Self(utilization)
     }
 
-    /// Get the percentage value
     #[inline]
     #[must_use]
     pub fn as_percentage(self) -> f64 {
         self.0
     }
 
-    /// Check if pool is fully utilized (100%)
     #[inline]
     #[must_use]
     pub fn is_full(self) -> bool {
         self.0 >= 100.0
     }
 
-    /// Check if pool is empty (0% utilization)
     #[inline]
     #[must_use]
     pub fn is_empty(self) -> bool {
         self.0 == 0.0
     }
 
-    /// Check if pool is under high load (>= 80%)
     #[inline]
     #[must_use]
     pub fn is_high_load(self) -> bool {
@@ -277,7 +192,6 @@ mod tests {
 
     #[test]
     fn test_in_use_saturating() {
-        // Test saturating_sub when available > max (shouldn't happen but handles it gracefully)
         let max = MaxPoolSize::new(5);
         let available = AvailableConnections::new(10);
         let in_use = InUseConnections::from_pool_stats(max, available);
@@ -324,7 +238,6 @@ mod tests {
 
     #[test]
     fn test_pool_utilization_zero_max() {
-        // Edge case: zero-sized pool
         let max = MaxPoolSize::new(0);
         let available = AvailableConnections::new(0);
         let utilization = PoolUtilization::from_pool_stats(max, available);
