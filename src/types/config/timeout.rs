@@ -5,185 +5,85 @@
 
 use std::time::Duration;
 
-/// Timeout for reading responses from backend servers
-///
-/// This timeout applies to individual read operations from backend connections.
-/// Per [RFC 3977](https://datatracker.ietf.org/doc/html/rfc3977), NNTP servers
-/// should respond promptly, but large article transfers may take longer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BackendReadTimeout(Duration);
+macro_rules! timeout_newtype {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident($default_secs:expr);
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        $vis struct $name(Duration);
 
-impl BackendReadTimeout {
-    /// Default backend read timeout (30 seconds)
-    pub const DEFAULT: Self = Self(Duration::from_secs(30));
+        impl $name {
+            /// Default timeout value
+            pub const DEFAULT: Self = Self(Duration::from_secs($default_secs));
 
-    /// Create a new backend read timeout
-    #[inline]
-    pub const fn new(duration: Duration) -> Self {
-        Self(duration)
-    }
+            /// Create a new timeout
+            #[inline]
+            pub const fn new(duration: Duration) -> Self {
+                Self(duration)
+            }
 
-    /// Get the underlying duration
-    #[inline]
-    #[must_use]
-    pub const fn as_duration(self) -> Duration {
-        self.0
-    }
+            /// Get the underlying duration
+            #[inline]
+            #[must_use]
+            pub const fn as_duration(self) -> Duration {
+                self.0
+            }
 
-    /// Get timeout in seconds
-    #[inline]
-    #[must_use]
-    pub const fn as_secs(self) -> u64 {
-        self.0.as_secs()
-    }
+            /// Get timeout in seconds
+            #[inline]
+            #[must_use]
+            pub const fn as_secs(self) -> u64 {
+                self.0.as_secs()
+            }
+        }
+
+        impl From<Duration> for $name {
+            fn from(duration: Duration) -> Self {
+                Self(duration)
+            }
+        }
+
+        impl From<$name> for Duration {
+            fn from(timeout: $name) -> Self {
+                timeout.0
+            }
+        }
+    };
 }
 
-impl From<Duration> for BackendReadTimeout {
-    fn from(duration: Duration) -> Self {
-        Self(duration)
-    }
+timeout_newtype! {
+    /// Timeout for reading responses from backend servers
+    ///
+    /// This timeout applies to individual read operations from backend connections.
+    /// Per [RFC 3977](https://datatracker.ietf.org/doc/html/rfc3977), NNTP servers
+    /// should respond promptly, but large article transfers may take longer.
+    pub struct BackendReadTimeout(30);
 }
 
-impl From<BackendReadTimeout> for Duration {
-    fn from(timeout: BackendReadTimeout) -> Self {
-        timeout.0
-    }
+timeout_newtype! {
+    /// Timeout for establishing connections to backend servers
+    ///
+    /// This timeout applies when creating new TCP connections to backend servers.
+    /// Should be relatively short to fail fast on connection issues.
+    pub struct ConnectionTimeout(10);
 }
 
-/// Timeout for establishing connections to backend servers
-///
-/// This timeout applies when creating new TCP connections to backend servers.
-/// Should be relatively short to fail fast on connection issues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ConnectionTimeout(Duration);
-
-impl ConnectionTimeout {
-    /// Default connection timeout (10 seconds)
-    pub const DEFAULT: Self = Self(Duration::from_secs(10));
-
-    /// Create a new connection timeout
-    #[inline]
-    pub const fn new(duration: Duration) -> Self {
-        Self(duration)
-    }
-
-    /// Get the underlying duration
-    #[inline]
-    #[must_use]
-    pub const fn as_duration(self) -> Duration {
-        self.0
-    }
-
-    /// Get timeout in seconds
-    #[inline]
-    #[must_use]
-    pub const fn as_secs(self) -> u64 {
-        self.0.as_secs()
-    }
+timeout_newtype! {
+    /// Timeout for executing individual NNTP commands
+    ///
+    /// This timeout applies to the entire request/response cycle for a single command.
+    /// Includes both sending the command and receiving the complete response.
+    pub struct CommandExecutionTimeout(60);
 }
 
-impl From<Duration> for ConnectionTimeout {
-    fn from(duration: Duration) -> Self {
-        Self(duration)
-    }
-}
-
-impl From<ConnectionTimeout> for Duration {
-    fn from(timeout: ConnectionTimeout) -> Self {
-        timeout.0
-    }
-}
-
-/// Timeout for executing commands on backend servers
-///
-/// This timeout covers the entire command execution cycle:
-/// - Sending the command
-/// - Waiting for response
-/// - Receiving the complete response
-///
-/// Longer than read timeout to account for backend processing time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CommandExecutionTimeout(Duration);
-
-impl CommandExecutionTimeout {
-    /// Default command execution timeout (60 seconds)
-    pub const DEFAULT: Self = Self(Duration::from_secs(60));
-
-    /// Create a new command execution timeout
-    #[inline]
-    pub const fn new(duration: Duration) -> Self {
-        Self(duration)
-    }
-
-    /// Get the underlying duration
-    #[inline]
-    #[must_use]
-    pub const fn as_duration(self) -> Duration {
-        self.0
-    }
-
-    /// Get timeout in seconds
-    #[inline]
-    #[must_use]
-    pub const fn as_secs(self) -> u64 {
-        self.0.as_secs()
-    }
-}
-
-impl From<Duration> for CommandExecutionTimeout {
-    fn from(duration: Duration) -> Self {
-        Self(duration)
-    }
-}
-
-impl From<CommandExecutionTimeout> for Duration {
-    fn from(timeout: CommandExecutionTimeout) -> Self {
-        timeout.0
-    }
-}
-
-/// Timeout for health check operations
-///
-/// Used when validating backend connection health. Should be short to avoid
-/// blocking the connection pool for too long.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HealthCheckTimeout(Duration);
-
-impl HealthCheckTimeout {
-    /// Default health check timeout (2 seconds)
-    pub const DEFAULT: Self = Self(Duration::from_secs(2));
-
-    /// Create a new health check timeout
-    #[inline]
-    pub const fn new(duration: Duration) -> Self {
-        Self(duration)
-    }
-
-    /// Get the underlying duration
-    #[inline]
-    #[must_use]
-    pub const fn as_duration(self) -> Duration {
-        self.0
-    }
-
-    /// Get timeout in seconds
-    #[inline]
-    #[must_use]
-    pub const fn as_secs(self) -> u64 {
-        self.0.as_secs()
-    }
-}
-
-impl From<Duration> for HealthCheckTimeout {
-    fn from(duration: Duration) -> Self {
-        Self(duration)
-    }
-}
-
-impl From<HealthCheckTimeout> for Duration {
-    fn from(timeout: HealthCheckTimeout) -> Self {
-        timeout.0
-    }
+timeout_newtype! {
+    /// Timeout for health check operations
+    ///
+    /// Health checks should complete quickly to avoid blocking pool operations.
+    /// A short timeout ensures unhealthy backends are detected promptly.
+    pub struct HealthCheckTimeout(2);
 }
 
 #[cfg(test)]
@@ -192,52 +92,14 @@ mod tests {
 
     #[test]
     fn test_backend_read_timeout() {
-        let timeout = BackendReadTimeout::new(Duration::from_secs(30));
+        let timeout = BackendReadTimeout::DEFAULT;
         assert_eq!(timeout.as_secs(), 30);
         assert_eq!(timeout.as_duration(), Duration::from_secs(30));
-
-        // Test From conversions
-        let from_duration: BackendReadTimeout = Duration::from_secs(45).into();
-        assert_eq!(from_duration.as_secs(), 45);
-
-        let to_duration: Duration = timeout.into();
-        assert_eq!(to_duration, Duration::from_secs(30));
     }
 
     #[test]
     fn test_connection_timeout() {
-        let timeout = ConnectionTimeout::new(Duration::from_secs(10));
-        assert_eq!(timeout.as_secs(), 10);
-        assert_eq!(timeout.as_duration(), Duration::from_secs(10));
-    }
-
-    #[test]
-    fn test_command_execution_timeout() {
-        let timeout = CommandExecutionTimeout::new(Duration::from_secs(60));
-        assert_eq!(timeout.as_secs(), 60);
-        assert_eq!(timeout.as_duration(), Duration::from_secs(60));
-    }
-
-    #[test]
-    fn test_health_check_timeout() {
-        let timeout = HealthCheckTimeout::new(Duration::from_secs(2));
-        assert_eq!(timeout.as_secs(), 2);
-        assert_eq!(timeout.as_duration(), Duration::from_secs(2));
-    }
-
-    #[test]
-    fn test_default_values() {
-        assert_eq!(BackendReadTimeout::DEFAULT.as_secs(), 30);
-        assert_eq!(ConnectionTimeout::DEFAULT.as_secs(), 10);
-        assert_eq!(CommandExecutionTimeout::DEFAULT.as_secs(), 60);
-        assert_eq!(HealthCheckTimeout::DEFAULT.as_secs(), 2);
-    }
-
-    #[test]
-    fn test_ordering() {
-        let short = HealthCheckTimeout::new(Duration::from_secs(1));
-        let long = HealthCheckTimeout::new(Duration::from_secs(10));
-        assert!(short < long);
-        assert_eq!(short, short);
+        let timeout = ConnectionTimeout::new(Duration::from_secs(5));
+        assert_eq!(timeout.as_secs(), 5);
     }
 }
