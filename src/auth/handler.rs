@@ -1,7 +1,7 @@
 //! Client authentication handling
 
 use crate::command::AuthAction;
-use crate::protocol::{AUTH_ACCEPTED, AUTH_REQUIRED};
+use crate::protocol::{AUTH_ACCEPTED, AUTH_FAILED, AUTH_REQUIRED};
 use crate::types::{Password, Username, ValidationError};
 use tokio::io::AsyncWriteExt;
 
@@ -111,7 +111,7 @@ impl AuthHandler {
                 let response = if auth_success {
                     AUTH_ACCEPTED
                 } else {
-                    b"481 Authentication failed\r\n" as &[u8]
+                    AUTH_FAILED
                 };
                 writer.write_all(response).await?;
                 Ok((response.len(), auth_success))

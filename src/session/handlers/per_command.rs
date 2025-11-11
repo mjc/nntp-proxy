@@ -201,9 +201,9 @@ impl ClientSession {
                     // Check if auth is required but not completed
                     if self.auth_handler.is_enabled() {
                         // Reject all non-auth commands before authentication
-                        let response = b"480 Authentication required\r\n";
-                        client_write.write_all(response).await?;
-                        backend_to_client_bytes.add(response.len());
+                        use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+                        client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                     } else {
                         // Auth disabled - forward to backend via router (HOT PATH - 70%+ of commands)
                         self.route_command_with_error_handling(

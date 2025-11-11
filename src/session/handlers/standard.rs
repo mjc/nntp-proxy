@@ -77,9 +77,9 @@ impl ClientSession {
                                 match action {
                                     CommandAction::ForwardStateless => {
                                         // Reject all non-auth commands before authentication
-                                        let response = b"480 Authentication required\r\n";
-                                        client_write.write_all(response).await?;
-                                        backend_to_client_bytes.add(response.len());
+                                        use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+                                        client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+                                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
                                         let result = super::common::handle_auth_command(
