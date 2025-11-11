@@ -39,7 +39,7 @@ services:
     
     # Health check
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "8119"]
+      test: ["CMD", "sh", "-c", "nc -z localhost $$NNTP_PROXY_PORT || exit 1"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -105,6 +105,14 @@ services:
       NNTP_SERVER_2_NAME: "News Server 3"
       NNTP_SERVER_2_USERNAME: ${BACKEND_USER_2:-user3}
       NNTP_SERVER_2_PASSWORD: ${BACKEND_PASS_2:-pass3}
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost $$NNTP_PROXY_PORT || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     
     restart: unless-stopped
     profiles:

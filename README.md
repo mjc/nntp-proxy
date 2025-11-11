@@ -224,9 +224,11 @@ NNTP_SERVER_1_NAME="Secondary Server"
 
 **Configuration Priority:**
 
-1. If config file exists → load it, then override servers with env vars if present
+1. If config file exists → load it, then override servers with `NNTP_SERVER_*` env vars if present
 2. Else if `NNTP_SERVER_*` environment variables are set → use env vars only
 3. Else → create default config file
+
+**Note:** Command-line arguments (like `--port`) always take precedence over both config file and environment variables.
 
 This allows you to:
 - Use pure environment variable configuration in containers (recommended)
