@@ -28,3 +28,4 @@ cache-config.toml
 
 # Release binaries
 /release/
+.env

@@ -80,24 +80,31 @@ services:
       NNTP_PROXY_ROUTING_MODE: hybrid
       RUST_LOG: info
       
+      # -----------------------------------------------------------------------------
+      # SECURITY WARNING: Never commit real credentials to version control!
+      # Use a .env file (which should be in .gitignore) or environment variables.
+      # Example: Copy .env.example to .env and fill in your actual credentials.
+      # Then use: ${BACKEND_USER_0} and ${BACKEND_PASS_0} below.
+      # -----------------------------------------------------------------------------
+      
       # Three backend servers for round-robin load balancing
       NNTP_SERVER_0_HOST: news1.example.com
       NNTP_SERVER_0_PORT: 119
       NNTP_SERVER_0_NAME: "News Server 1"
-      NNTP_SERVER_0_USERNAME: user1
-      NNTP_SERVER_0_PASSWORD: pass1
+      NNTP_SERVER_0_USERNAME: ${BACKEND_USER_0:-user1}
+      NNTP_SERVER_0_PASSWORD: ${BACKEND_PASS_0:-pass1}
       
       NNTP_SERVER_1_HOST: news2.example.com
       NNTP_SERVER_1_PORT: 119
       NNTP_SERVER_1_NAME: "News Server 2"
-      NNTP_SERVER_1_USERNAME: user2
-      NNTP_SERVER_1_PASSWORD: pass2
+      NNTP_SERVER_1_USERNAME: ${BACKEND_USER_1:-user2}
+      NNTP_SERVER_1_PASSWORD: ${BACKEND_PASS_1:-pass2}
       
       NNTP_SERVER_2_HOST: news3.example.com
       NNTP_SERVER_2_PORT: 119
       NNTP_SERVER_2_NAME: "News Server 3"
-      NNTP_SERVER_2_USERNAME: user3
-      NNTP_SERVER_2_PASSWORD: pass3
+      NNTP_SERVER_2_USERNAME: ${BACKEND_USER_2:-user3}
+      NNTP_SERVER_2_PASSWORD: ${BACKEND_PASS_2:-pass3}
     
     restart: unless-stopped
     profiles:

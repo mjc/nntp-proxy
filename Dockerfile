@@ -11,7 +11,6 @@ RUN apt-get update && apt-get install -y \
 
 # Copy everything and build
 COPY Cargo.toml Cargo.lock ./
-COPY benches/ benches/
 COPY src/ src/
 
 # Build the application
@@ -58,12 +57,6 @@ ENV NNTP_PROXY_PORT=8119 \
 # ENV NNTP_SERVER_0_USERNAME=""
 # ENV NNTP_SERVER_0_PASSWORD=""
 # ENV NNTP_SERVER_0_MAX_CONNECTIONS=10
-# ENV NNTP_SERVER_0_USE_TLS=false
-# ENV NNTP_SERVER_0_TLS_VERIFY_CERT=true
-# ENV NNTP_SERVER_0_TLS_CERT_PATH=""
-# ENV NNTP_SERVER_0_CONNECTION_KEEPALIVE=""
-# ENV NNTP_SERVER_0_HEALTH_CHECK_MAX_PER_CYCLE=5
-# ENV NNTP_SERVER_0_HEALTH_CHECK_POOL_TIMEOUT=100
 
 # Server 1 (optional - for load balancing)
 # ENV NNTP_SERVER_1_HOST=news2.example.com
@@ -75,7 +68,7 @@ ENV NNTP_PROXY_PORT=8119 \
 
 # Health check using netcat
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD nc -z localhost ${NNTP_PROXY_PORT} || exit 1
+    CMD sh -c "nc -z localhost ${NNTP_PROXY_PORT} || exit 1"
 
 # Run the application
 CMD ["/usr/local/bin/nntp-proxy"]

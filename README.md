@@ -224,13 +224,13 @@ NNTP_SERVER_1_NAME="Secondary Server"
 
 **Configuration Priority:**
 
-1. If `NNTP_SERVER_*` environment variables are set → use env vars (ignore config file if it exists)
-2. Else if config file exists → use config file
+1. If config file exists → load it, then override servers with env vars if present
+2. Else if `NNTP_SERVER_*` environment variables are set → use env vars only
 3. Else → create default config file
 
 This allows you to:
 - Use pure environment variable configuration in containers (recommended)
-- Override servers in config file with environment variables
+- Override backend servers via environment variables while keeping other config file settings
 - Mount a config file for complex configurations
 
 #### Example: Load Balanced Setup
