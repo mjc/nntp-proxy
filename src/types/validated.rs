@@ -11,76 +11,39 @@ use thiserror::Error;
 pub enum ValidationError {
     #[error("hostname cannot be empty or whitespace")]
     EmptyHostName,
-
     #[error("server name cannot be empty or whitespace")]
     EmptyServerName,
-
     #[error("invalid hostname: {0}")]
     InvalidHostName(String),
-
     #[error("port cannot be 0")]
     InvalidPort,
-
     #[error("invalid message ID: {0}")]
     InvalidMessageId(String),
-
     #[error("config path cannot be empty")]
     EmptyConfigPath,
-
     #[error("username cannot be empty or whitespace")]
     EmptyUsername,
-
     #[error("password cannot be empty or whitespace")]
     EmptyPassword,
 }
 
-/// Macro to generate validated string newtypes.
-///
-/// This macro eliminates boilerplate by generating all the standard implementations
-/// for validated string types. Each type gets:
-/// - A `new()` constructor that validates
-/// - `as_str()` getter
-/// - `AsRef<str>`, `Deref`, `Display`, `TryFrom<String>` impls
-/// - Serde `Serialize` and `Deserialize` with validation
-///
-/// # Example
-///
-/// ```ignore
-/// validated_string! {
-///     /// A validated username
-///     pub struct UserName(String) {
-///         validation: |s| {
-///             if s.trim().is_empty() {
-///                 Err(ValidationError::EmptyUserName)
-///             } else {
-///                 Ok(())
-///             }
-///         },
-///         error_variant: EmptyUserName,
-///         error_message: "username cannot be empty",
-///     }
-/// }
-/// ```
+/// Generate validated non-empty string newtypes
 macro_rules! validated_string {
-    (
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident(String) {
-            validation: |$s_param:ident| $validation:expr,
-        }
-    ) => {
+    ($(#[$meta:meta])* $vis:vis struct $name:ident($err:path);) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
         #[serde(transparent)]
         $vis struct $name(String);
 
         impl $name {
-            #[doc = concat!("Create a new ", stringify!($name), " after validation")]
-            pub fn new($s_param: String) -> Result<Self, ValidationError> {
-                $validation?;
-                Ok(Self($s_param))
+            pub fn new(s: String) -> Result<Self, ValidationError> {
+                if s.trim().is_empty() {
+                    Err($err)
+                } else {
+                    Ok(Self(s))
+                }
             }
 
-            #[doc = concat!("Get the ", stringify!($name), " as a string slice")]
             #[must_use]
             #[inline]
             pub fn as_str(&self) -> &str {
@@ -97,7 +60,6 @@ macro_rules! validated_string {
 
         impl std::ops::Deref for $name {
             type Target = str;
-
             #[inline]
             fn deref(&self) -> &Self::Target {
                 &self.0
@@ -106,15 +68,14 @@ macro_rules! validated_string {
 
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.0)
+                f.write_str(&self.0)
             }
         }
 
         impl TryFrom<String> for $name {
             type Error = ValidationError;
-
-            fn try_from($s_param: String) -> Result<Self, Self::Error> {
-                Self::new($s_param)
+            fn try_from(s: String) -> Result<Self, Self::Error> {
+                Self::new(s)
             }
         }
 
@@ -130,147 +91,46 @@ macro_rules! validated_string {
     };
 }
 
-// Now use the macro to generate the types
-
 validated_string! {
-    /// A validated hostname that cannot be empty or whitespace-only
-    ///
-    /// This type enforces at compile time that a hostname is always valid,
-    /// eliminating the need for runtime validation checks.
-    ///
-    /// # Examples
-    /// ```
-    /// use nntp_proxy::types::HostName;
-    ///
-    /// let host = HostName::new("news.example.com".to_string()).unwrap();
-    /// assert_eq!(host.as_str(), "news.example.com");
-    ///
-    /// // Empty strings are rejected
-    /// assert!(HostName::new("".to_string()).is_err());
-    /// assert!(HostName::new("   ".to_string()).is_err());
-    /// ```
-    #[doc(alias = "host")]
-    #[doc(alias = "domain")]
-    pub struct HostName(String) {
-        validation: |s| {
-            if s.trim().is_empty() {
-                Err(ValidationError::EmptyHostName)
-            } else {
-                Ok(())
-            }
-        },
-    }
+    /// Validated hostname (non-empty, non-whitespace)
+    pub struct HostName(ValidationError::EmptyHostName);
 }
 
 validated_string! {
-    /// A validated server name that cannot be empty or whitespace-only
-    pub struct ServerName(String) {
-        validation: |s| {
-            if s.trim().is_empty() {
-                Err(ValidationError::EmptyServerName)
-            } else {
-                Ok(())
-            }
-        },
-    }
+    /// Validated server name (non-empty, non-whitespace)
+    pub struct ServerName(ValidationError::EmptyServerName);
 }
 
 validated_string! {
-    /// A validated username for authentication that cannot be empty or whitespace-only
-    ///
-    /// This type enforces that usernames are always non-empty, preventing
-    /// authentication bypass vulnerabilities from empty credentials.
-    ///
-    /// # Examples
-    /// ```
-    /// use nntp_proxy::types::Username;
-    ///
-    /// let user = Username::new("alice".to_string()).unwrap();
-    /// assert_eq!(user.as_str(), "alice");
-    ///
-    /// // Empty strings are rejected
-    /// assert!(Username::new("".to_string()).is_err());
-    /// assert!(Username::new("   ".to_string()).is_err());
-    /// ```
-    pub struct Username(String) {
-        validation: |s| {
-            if s.trim().is_empty() {
-                Err(ValidationError::EmptyUsername)
-            } else {
-                Ok(())
-            }
-        },
-    }
+    /// Validated username (non-empty, non-whitespace)
+    pub struct Username(ValidationError::EmptyUsername);
 }
 
 validated_string! {
-    /// A validated password for authentication that cannot be empty or whitespace-only
-    ///
-    /// This type enforces that passwords are always non-empty, preventing
-    /// authentication bypass vulnerabilities from empty credentials.
-    ///
-    /// # Examples
-    /// ```
-    /// use nntp_proxy::types::Password;
-    ///
-    /// let pass = Password::new("secret123".to_string()).unwrap();
-    /// assert_eq!(pass.as_str(), "secret123");
-    ///
-    /// // Empty strings are rejected
-    /// assert!(Password::new("".to_string()).is_err());
-    /// assert!(Password::new("   ".to_string()).is_err());
-    /// ```
-    pub struct Password(String) {
-        validation: |s| {
-            if s.trim().is_empty() {
-                Err(ValidationError::EmptyPassword)
-            } else {
-                Ok(())
-            }
-        },
-    }
+    /// Validated password (non-empty, non-whitespace)
+    pub struct Password(ValidationError::EmptyPassword);
 }
 
-/// A validated configuration file path
-///
-/// This type ensures that the path is not empty or whitespace-only.
-/// It does not validate that the file exists, as that is a runtime concern.
-///
-/// # Examples
-/// ```
-/// use nntp_proxy::types::ConfigPath;
-///
-/// let path = ConfigPath::new("config.toml").unwrap();
-/// assert_eq!(path.as_str(), "config.toml");
-///
-/// // Empty paths are rejected
-/// assert!(ConfigPath::new("").is_err());
-/// assert!(ConfigPath::new("   ").is_err());
-/// ```
+/// Validated configuration file path (non-empty, non-whitespace)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConfigPath(PathBuf);
 
 impl ConfigPath {
-    /// Create a new ConfigPath from a string-like value
     pub fn new(path: impl AsRef<Path>) -> Result<Self, ValidationError> {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_str().ok_or(ValidationError::EmptyConfigPath)?;
-
         if path_str.trim().is_empty() {
             return Err(ValidationError::EmptyConfigPath);
         }
-
         Ok(Self(path_ref.to_path_buf()))
     }
 
-    /// Get the path as a &Path
     #[must_use]
     #[inline]
     pub fn as_path(&self) -> &Path {
         &self.0
     }
 
-    /// Get the path as a string slice
     #[must_use]
     #[inline]
     pub fn as_str(&self) -> &str {
@@ -293,7 +153,6 @@ impl fmt::Display for ConfigPath {
 
 impl std::str::FromStr for ConfigPath {
     type Err = ValidationError;
-
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
     }
@@ -301,7 +160,6 @@ impl std::str::FromStr for ConfigPath {
 
 impl TryFrom<String> for ConfigPath {
     type Error = ValidationError;
-
     fn try_from(s: String) -> Result<Self, Self::Error> {
         Self::new(s)
     }
@@ -309,7 +167,6 @@ impl TryFrom<String> for ConfigPath {
 
 impl TryFrom<&str> for ConfigPath {
     type Error = ValidationError;
-
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         Self::new(s)
     }
@@ -338,7 +195,6 @@ impl<'de> Deserialize<'de> for ConfigPath {
 mod tests {
     use super::*;
 
-    // Test the macro-generated validation - only need one test per type for the core logic
     #[test]
     fn test_hostname_validation() {
         assert!(HostName::new("example.com".to_string()).is_ok());
