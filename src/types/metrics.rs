@@ -105,11 +105,13 @@ impl TransferMetrics {
     }
 
     #[must_use]
+    #[inline]
     pub fn total(&self) -> BytesTransferred {
         self.client_to_backend + self.backend_to_client
     }
 
     #[must_use]
+    #[inline]
     pub fn as_tuple(&self) -> (u64, u64) {
         (self.client_to_backend.0, self.backend_to_client.0)
     }

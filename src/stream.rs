@@ -45,6 +45,7 @@ impl ConnectionStream {
     }
 
     /// Returns the connection type as a string for logging/debugging
+    #[must_use]
     pub fn connection_type(&self) -> &'static str {
         match self {
             Self::Plain(_) => "TCP",
@@ -70,6 +71,7 @@ impl ConnectionStream {
     ///
     /// Returns None for TLS streams, as the TCP stream is wrapped.
     /// Useful for socket optimization that requires direct TCP access.
+    #[must_use]
     pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match self {
             Self::Plain(tcp) => Some(tcp),
@@ -86,6 +88,7 @@ impl ConnectionStream {
     }
 
     /// Get a reference to the TLS stream (if TLS connection)
+    #[must_use]
     pub fn as_tls_stream(&self) -> Option<&TlsStream<TcpStream>> {
         match self {
             Self::Tls(tls) => Some(tls.as_ref()),
@@ -105,6 +108,7 @@ impl ConnectionStream {
     ///
     /// For plain TCP, returns the stream directly.
     /// For TLS, returns the underlying TCP stream within the TLS wrapper.
+    #[must_use]
     pub fn underlying_tcp_stream(&self) -> &TcpStream {
         match self {
             Self::Plain(tcp) => tcp,

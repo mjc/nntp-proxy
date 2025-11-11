@@ -28,12 +28,14 @@ pub struct PooledBuffer {
 
 impl PooledBuffer {
     /// Get the full capacity of the buffer
+    #[must_use]
     #[inline]
     pub fn capacity(&self) -> usize {
         self.buffer.len()
     }
 
     /// Get the number of initialized bytes
+    #[must_use]
     #[inline]
     pub fn initialized(&self) -> usize {
         self.initialized
