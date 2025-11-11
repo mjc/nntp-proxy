@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  nntp-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nntp-proxy
+    ports:
+      - "8119:8119"
+    environment:
+      # Proxy configuration (these match the CLI env vars in src/bin/nntp-proxy.rs)
+      NNTP_PROXY_PORT: 8119
+      NNTP_PROXY_ROUTING_MODE: hybrid  # Options: standard, per-command, hybrid
+      # NNTP_PROXY_THREADS: 4  # Optional: number of worker threads (default: number of CPUs)
+      RUST_LOG: info  # Log level: trace, debug, info, warn, error
+      
+      # Backend server 0 (required - at least one server must be configured)
+      NNTP_SERVER_0_HOST: news.example.com
+      NNTP_SERVER_0_PORT: 119
+      NNTP_SERVER_0_NAME: "Primary News Server"
+      # NNTP_SERVER_0_USERNAME: your_username  # Optional: backend authentication
+      # NNTP_SERVER_0_PASSWORD: your_password  # Optional: backend authentication
+      # NNTP_SERVER_0_MAX_CONNECTIONS: 10      # Optional: max connections (default: 10)
+      
+      # Backend server 1 (optional - for load balancing)
+      # NNTP_SERVER_1_HOST: news2.example.com
+      # NNTP_SERVER_1_PORT: 119
+      # NNTP_SERVER_1_NAME: "Secondary News Server"
+      # NNTP_SERVER_1_MAX_CONNECTIONS: 10
+      
+      # Backend server 2 (optional)
+      # NNTP_SERVER_2_HOST: news3.example.com
+      # NNTP_SERVER_2_PORT: 119
+      # NNTP_SERVER_2_NAME: "Tertiary News Server"
+      # NNTP_SERVER_2_MAX_CONNECTIONS: 10
+    
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8119"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '1'
+          memory: 256M
+    
+    # Optional: Mount config file instead of using env vars
+    # If you prefer TOML configuration, uncomment this and comment out NNTP_SERVER_* env vars above
+    # volumes:
+    #   - ./config.toml:/etc/nntp-proxy/config.toml:ro
+    
+    # Optional: Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Example: Multiple backend servers with load balancing
+  nntp-proxy-loadbalanced:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nntp-proxy-lb
+    ports:
+      - "8120:8119"
+    environment:
+      NNTP_PROXY_PORT: 8119
+      NNTP_PROXY_ROUTING_MODE: hybrid
+      RUST_LOG: info
+      
+      # Three backend servers for round-robin load balancing
+      NNTP_SERVER_0_HOST: news1.example.com
+      NNTP_SERVER_0_PORT: 119
+      NNTP_SERVER_0_NAME: "News Server 1"
+      NNTP_SERVER_0_USERNAME: user1
+      NNTP_SERVER_0_PASSWORD: pass1
+      
+      NNTP_SERVER_1_HOST: news2.example.com
+      NNTP_SERVER_1_PORT: 119
+      NNTP_SERVER_1_NAME: "News Server 2"
+      NNTP_SERVER_1_USERNAME: user2
+      NNTP_SERVER_1_PASSWORD: pass2
+      
+      NNTP_SERVER_2_HOST: news3.example.com
+      NNTP_SERVER_2_PORT: 119
+      NNTP_SERVER_2_NAME: "News Server 3"
+      NNTP_SERVER_2_USERNAME: user3
+      NNTP_SERVER_2_PASSWORD: pass3
+    
+    restart: unless-stopped
+    profiles:
+      - loadbalanced

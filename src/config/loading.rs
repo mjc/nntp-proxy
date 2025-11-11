@@ -83,6 +83,37 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
     }
 }
 
+/// Check if any backend server environment variables are set
+///
+/// Returns true if at least NNTP_SERVER_0_HOST is set
+pub fn has_server_env_vars() -> bool {
+    std::env::var("NNTP_SERVER_0_HOST").is_ok()
+}
+
+/// Load configuration from environment variables only
+///
+/// Used when no config file is present. Requires at least NNTP_SERVER_0_HOST to be set.
+///
+/// # Errors
+///
+/// Returns an error if no backend servers are configured via environment variables.
+pub fn load_config_from_env() -> Result<Config> {
+    use anyhow::Context;
+
+    let servers = load_servers_from_env()
+        .context("No backend servers configured via environment variables. Set NNTP_SERVER_0_HOST, NNTP_SERVER_0_PORT, etc.")?;
+
+    let config = Config {
+        servers,
+        ..Default::default()
+    };
+
+    // Validate the loaded configuration
+    config.validate()?;
+
+    Ok(config)
+}
+
 /// Load configuration from a TOML file, with environment variable overrides
 ///
 /// Environment variables for backend servers take precedence over config file:
