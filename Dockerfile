@@ -1,5 +1,5 @@
-# Build stage
-FROM rust:1.85-slim AS builder
+# Build stage - use nightly for let-chains support
+FROM rustlang/rust:nightly-slim AS builder
 
 WORKDIR /usr/src/app
 
@@ -9,23 +9,12 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifest files first for better layer caching
+# Copy everything and build
 COPY Cargo.toml Cargo.lock ./
 COPY benches/ benches/
-
-# Create dummy source to build dependencies only
-RUN mkdir -p src/bin && \
-    echo "fn main() {}" > src/bin/nntp-proxy.rs && \
-    echo "fn main() {}" > src/bin/nntp-cache-proxy.rs && \
-    mkdir -p src && \
-    echo "" > src/lib.rs && \
-    cargo build --release --bin nntp-proxy --bin nntp-cache-proxy && \
-    rm -rf src
-
-# Copy source code
 COPY src/ src/
 
-# Build the application (dependencies are already cached)
+# Build the application
 RUN cargo build --release --bin nntp-proxy
 
 # Runtime stage
@@ -53,17 +42,40 @@ USER nntp-proxy
 # Expose default proxy port
 EXPOSE 8119
 
-# Environment variables with defaults
+# Environment variables
+# Proxy settings
 ENV NNTP_PROXY_PORT=8119 \
     NNTP_PROXY_ROUTING_MODE=hybrid \
     NNTP_PROXY_CONFIG=/etc/nntp-proxy/config.toml \
+    NNTP_PROXY_THREADS="" \
     RUST_LOG=info
+
+# Backend server configuration (example - override these)
+# Server 0 (required if no config file)
+# ENV NNTP_SERVER_0_HOST=news.example.com
+# ENV NNTP_SERVER_0_PORT=119
+# ENV NNTP_SERVER_0_NAME="News Server 1"
+# ENV NNTP_SERVER_0_USERNAME=""
+# ENV NNTP_SERVER_0_PASSWORD=""
+# ENV NNTP_SERVER_0_MAX_CONNECTIONS=10
+# ENV NNTP_SERVER_0_USE_TLS=false
+# ENV NNTP_SERVER_0_TLS_VERIFY_CERT=true
+# ENV NNTP_SERVER_0_TLS_CERT_PATH=""
+# ENV NNTP_SERVER_0_CONNECTION_KEEPALIVE=""
+# ENV NNTP_SERVER_0_HEALTH_CHECK_MAX_PER_CYCLE=5
+# ENV NNTP_SERVER_0_HEALTH_CHECK_POOL_TIMEOUT=100
+
+# Server 1 (optional - for load balancing)
+# ENV NNTP_SERVER_1_HOST=news2.example.com
+# ENV NNTP_SERVER_1_PORT=119
+# ENV NNTP_SERVER_1_NAME="News Server 2"
+# ENV NNTP_SERVER_1_USERNAME=""
+# ENV NNTP_SERVER_1_PASSWORD=""
+# ENV NNTP_SERVER_1_MAX_CONNECTIONS=10
 
 # Health check using netcat
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD nc -z localhost ${NNTP_PROXY_PORT} || exit 1
 
 # Run the application
-# The config file is optional - if not present and NNTP_SERVER_0_* env vars are set,
-# the proxy will use environment variable configuration
 CMD ["/usr/local/bin/nntp-proxy"]
