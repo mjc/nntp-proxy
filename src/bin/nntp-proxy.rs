@@ -6,7 +6,8 @@ use tokio::signal;
 use tracing::{error, info, warn};
 
 use nntp_proxy::{
-    NntpProxy, RoutingMode, create_default_config, load_config,
+    NntpProxy, RoutingMode, create_default_config, has_server_env_vars, load_config,
+    load_config_from_env,
     types::{ConfigPath, Port, ThreadCount},
 };
 
@@ -20,7 +21,8 @@ fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
     // This reduces context switching and improves cache locality
     let mut cpu_set = CpuSet::new();
     for core in 0..num_cores {
-        cpu_set.set(core)?;
+        // Ignore errors when setting CPU affinity (may not have all cores in container)
+        let _ = cpu_set.set(core);
     }
 
     match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
@@ -128,7 +130,7 @@ fn main() -> Result<()> {
 async fn run_proxy(args: Args) -> Result<()> {
     // Load configuration
     let config = if std::path::Path::new(args.config.as_str()).exists() {
-        // File exists, try to load it
+        // File exists, try to load it (env vars can override servers)
         match load_config(args.config.as_str()) {
             Ok(config) => config,
             Err(e) => {
@@ -140,12 +142,28 @@ async fn run_proxy(args: Args) -> Result<()> {
                 return Err(e);
             }
         }
+    } else if has_server_env_vars() {
+        // File doesn't exist but env vars are set - use environment configuration
+        match load_config_from_env() {
+            Ok(config) => {
+                info!("Using configuration from environment variables (no config file)");
+                config
+            }
+            Err(e) => {
+                error!(
+                    "Failed to load configuration from environment variables: {}",
+                    e
+                );
+                return Err(e);
+            }
+        }
     } else {
-        // File doesn't exist, create default
+        // No config file and no NNTP_SERVER_* env vars - create default config file
         warn!(
-            "Config file '{}' not found, creating default config",
+            "Config file '{}' not found and no NNTP_SERVER_* environment variables set",
             args.config
         );
+        warn!("Creating default config file - please edit it to add your backend servers");
         let default_config = create_default_config();
         let config_toml = toml::to_string_pretty(&default_config)?;
         std::fs::write(args.config.as_str(), &config_toml)?;

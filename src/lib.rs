@@ -54,7 +54,8 @@ pub mod types;
 
 // Public exports
 pub use config::{
-    CacheConfig, Config, RoutingMode, ServerConfig, create_default_config, load_config,
+    CacheConfig, Config, RoutingMode, ServerConfig, create_default_config, has_server_env_vars,
+    load_config, load_config_from_env,
 };
 pub use network::SocketOptimizer;
 pub use proxy::{NntpProxy, NntpProxyBuilder};

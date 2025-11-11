@@ -1,0 +1,62 @@
+# Build artifacts
+target/
+*.o
+*.so
+*.a
+*.rlib
+
+# Test and coverage artifacts
+tests/
+coverage/
+*.profdata
+*.profraw
+perf.data*
+
+# Release artifacts
+release/
+
+# Development files
+.git/
+.gitignore
+.github/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Documentation and examples
+*.md
+!README.md
+docs/
+examples/
+
+# Configuration files (use environment variables instead)
+*.toml
+!Cargo.toml
+!Cargo.lock
+
+# Scripts
+scripts/
+*.sh
+
+# IDE and editor files
+.idea/
+*.iml
+.vscode/
+.vs/
+
+# NixOS/direnv
+.envrc
+flake.nix
+flake.lock
+.direnv/
+
+# Workspace files
+*.code-workspace
+
+# Service files
+*.service
+
+# Temporary files
+tmp/
+*.tmp

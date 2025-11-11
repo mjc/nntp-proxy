@@ -1,5 +1,5 @@
-# Build stage
-FROM rust:1.80-slim as builder
+# Build stage - use nightly for let-chains support
+FROM rustlang/rust:nightly-slim AS builder
 
 WORKDIR /usr/src/app
 
@@ -9,46 +9,66 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifest files
+# Copy everything and build
 COPY Cargo.toml Cargo.lock ./
-
-# Copy source code
 COPY src/ src/
+COPY benches/ benches/
 
 # Build the application
-RUN cargo build --release
+RUN cargo build --release --bin nntp-proxy
 
 # Runtime stage
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
+# Install runtime dependencies and netcat for health checks
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash nntp-proxy
+RUN useradd --create-home --shell /bin/bash --uid 1000 nntp-proxy
 
 # Create directories
-RUN mkdir -p /etc/nntp-proxy /var/log/nntp-proxy
-RUN chown nntp-proxy:nntp-proxy /var/log/nntp-proxy
+RUN mkdir -p /etc/nntp-proxy /var/log/nntp-proxy && \
+    chown -R nntp-proxy:nntp-proxy /var/log/nntp-proxy /etc/nntp-proxy
 
 # Copy the binary from builder stage
 COPY --from=builder /usr/src/app/target/release/nntp-proxy /usr/local/bin/nntp-proxy
 
-# Copy default config
-COPY config.toml /etc/nntp-proxy/config.toml
-RUN chown -R nntp-proxy:nntp-proxy /etc/nntp-proxy
-
 # Switch to non-root user
 USER nntp-proxy
 
-# Expose port
+# Expose default proxy port
 EXPOSE 8119
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD nc -z localhost 8119 || exit 1
+# Environment variables
+# Proxy settings
+ENV NNTP_PROXY_PORT=8119 \
+    NNTP_PROXY_ROUTING_MODE=hybrid \
+    NNTP_PROXY_CONFIG=/etc/nntp-proxy/config.toml \
+    RUST_LOG=info
+
+# Backend server configuration (example - override these)
+# Server 0 (required if no config file)
+# ENV NNTP_SERVER_0_HOST=news.example.com
+# ENV NNTP_SERVER_0_PORT=119
+# ENV NNTP_SERVER_0_NAME="News Server 1"
+# ENV NNTP_SERVER_0_USERNAME=""
+# ENV NNTP_SERVER_0_PASSWORD=""
+# ENV NNTP_SERVER_0_MAX_CONNECTIONS=10
+
+# Server 1 (optional - for load balancing)
+# ENV NNTP_SERVER_1_HOST=news2.example.com
+# ENV NNTP_SERVER_1_PORT=119
+# ENV NNTP_SERVER_1_NAME="News Server 2"
+# ENV NNTP_SERVER_1_USERNAME=""
+# ENV NNTP_SERVER_1_PASSWORD=""
+# ENV NNTP_SERVER_1_MAX_CONNECTIONS=10
+
+# Health check: Verify proxy is listening on configured port
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/bin/sh", "-c", "nc -z localhost ${NNTP_PROXY_PORT} || exit 1"]
 
 # Run the application
-CMD ["/usr/local/bin/nntp-proxy", "--config", "/etc/nntp-proxy/config.toml"]
+CMD ["/usr/local/bin/nntp-proxy"]

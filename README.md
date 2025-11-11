@@ -155,6 +155,124 @@ cargo run
 telnet localhost 8119
 ```
 
+### Docker
+
+The proxy includes Docker support with environment variable configuration for easy deployment.
+
+#### Quick Start with Docker
+
+```bash
+# Build the image
+docker build -t nntp-proxy .
+
+# Run with environment variables (no config file needed!)
+docker run -d \
+  --name nntp-proxy \
+  -p 8119:8119 \
+  -e NNTP_SERVER_0_HOST=news.example.com \
+  -e NNTP_SERVER_0_PORT=119 \
+  -e NNTP_SERVER_0_NAME="My News Server" \
+  -e NNTP_PROXY_ROUTING_MODE=hybrid \
+  nntp-proxy
+```
+
+#### Using Docker Compose
+
+The repository includes a `docker-compose.yml` with examples:
+
+```bash
+# Edit docker-compose.yml to set your backend servers
+# Then start the proxy:
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop the proxy
+docker-compose down
+```
+
+#### Environment Variables
+
+**Proxy Configuration:**
+- `NNTP_PROXY_PORT` - Port to listen on (default: `8119`)
+- `NNTP_PROXY_ROUTING_MODE` - Routing mode: `standard`, `per-command`, or `hybrid` (default: `hybrid`)
+- `NNTP_PROXY_THREADS` - Number of worker threads (default: number of CPUs)
+- `NNTP_PROXY_CONFIG` - Path to config file (default: `/etc/nntp-proxy/config.toml`)
+- `RUST_LOG` - Log level: `trace`, `debug`, `info`, `warn`, or `error` (default: `info`)
+
+**Backend Server Configuration:**
+
+Configure servers using indexed environment variables:
+
+```bash
+# Server 0 (required - at least one server)
+NNTP_SERVER_0_HOST=news.example.com
+NNTP_SERVER_0_PORT=119
+NNTP_SERVER_0_NAME="Primary Server"
+NNTP_SERVER_0_USERNAME=user        # Optional
+NNTP_SERVER_0_PASSWORD=pass        # Optional
+NNTP_SERVER_0_MAX_CONNECTIONS=10   # Optional
+
+# Server 1 (optional - for load balancing)
+NNTP_SERVER_1_HOST=news2.example.com
+NNTP_SERVER_1_PORT=119
+NNTP_SERVER_1_NAME="Secondary Server"
+
+# Server 2, 3, 4... (add as many as needed)
+```
+
+**Configuration Priority:**
+
+1. If config file exists → load it, then override servers with `NNTP_SERVER_*` env vars if present
+2. Else if `NNTP_SERVER_*` environment variables are set → use env vars only
+3. Else → create default config file
+
+**Note:** Command-line arguments (like `--port`) always take precedence over both config file and environment variables.
+
+This allows you to:
+- Use pure environment variable configuration in containers (recommended)
+- Override backend servers via environment variables while keeping other config file settings
+- Mount a config file for complex configurations
+
+#### Example: Load Balanced Setup
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  nntp-proxy:
+    image: nntp-proxy
+    ports:
+      - "8119:8119"
+    environment:
+      NNTP_PROXY_ROUTING_MODE: hybrid
+      RUST_LOG: info
+      
+      # ⚠️ SECURITY: Never hardcode credentials in compose files. Use environment variable substitution.
+      # Copy .env.example to .env and fill in your credentials, then reference them here.
+      
+      # Three backends for round-robin load balancing
+      NNTP_SERVER_0_HOST: news1.example.com
+      NNTP_SERVER_0_PORT: 119
+      NNTP_SERVER_0_NAME: "Server 1"
+      NNTP_SERVER_0_USERNAME: ${BACKEND_USER_0}
+      NNTP_SERVER_0_PASSWORD: ${BACKEND_PASS_0}
+      
+      NNTP_SERVER_1_HOST: news2.example.com
+      NNTP_SERVER_1_PORT: 119
+      NNTP_SERVER_1_NAME: "Server 2"
+      NNTP_SERVER_1_USERNAME: ${BACKEND_USER_1}
+      NNTP_SERVER_1_PASSWORD: ${BACKEND_PASS_1}
+      
+      NNTP_SERVER_2_HOST: news3.example.com
+      NNTP_SERVER_2_PORT: 119
+      NNTP_SERVER_2_NAME: "Server 3"
+      NNTP_SERVER_2_USERNAME: ${BACKEND_USER_2}
+      NNTP_SERVER_2_PASSWORD: ${BACKEND_PASS_2}
+    restart: unless-stopped
+```
+
 ## Configuration
 
 The proxy uses a TOML configuration file. Create `config.toml`:

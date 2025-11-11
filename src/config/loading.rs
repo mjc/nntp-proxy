@@ -58,19 +58,59 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
             .and_then(crate::types::MaxConnections::new)
             .unwrap_or_else(defaults::max_connections);
 
+        // TLS configuration
+        let use_tls_key = format!("NNTP_SERVER_{}_USE_TLS", index);
+        let use_tls = std::env::var(&use_tls_key)
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        let tls_verify_key = format!("NNTP_SERVER_{}_TLS_VERIFY_CERT", index);
+        let tls_verify_cert = std::env::var(&tls_verify_key)
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or_else(defaults::tls_verify_cert);
+
+        let tls_cert_path_key = format!("NNTP_SERVER_{}_TLS_CERT_PATH", index);
+        let tls_cert_path = std::env::var(&tls_cert_path_key).ok();
+
+        // Connection keepalive (in seconds)
+        let keepalive_key = format!("NNTP_SERVER_{}_CONNECTION_KEEPALIVE", index);
+        let connection_keepalive = std::env::var(&keepalive_key)
+            .ok()
+            .and_then(|k| k.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+
+        // Health check configuration
+        let health_max_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_MAX_PER_CYCLE", index);
+        let health_check_max_per_cycle = std::env::var(&health_max_key)
+            .ok()
+            .and_then(|h| h.parse::<usize>().ok())
+            .unwrap_or_else(defaults::health_check_max_per_cycle);
+
+        let health_timeout_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_POOL_TIMEOUT", index);
+        let health_check_pool_timeout = std::env::var(&health_timeout_key)
+            .ok()
+            .and_then(|h| h.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(defaults::health_check_pool_timeout);
+
         servers.push(ServerConfig {
-            host: crate::types::HostName::new(host).expect("Valid hostname from env"),
-            port: crate::types::Port::new(port).expect("Valid port from env"),
-            name: crate::types::ServerName::new(name).expect("Valid server name from env"),
+            host: crate::types::HostName::new(host.clone())
+                .unwrap_or_else(|_| panic!("Invalid hostname in {}: '{}'", host_key, host)),
+            port: crate::types::Port::new(port)
+                .unwrap_or_else(|| panic!("Invalid port in {}: {}", port_key, port)),
+            name: crate::types::ServerName::new(name.clone())
+                .unwrap_or_else(|_| panic!("Invalid server name in {}: '{}'", name_key, name)),
             username,
             password,
             max_connections,
-            use_tls: false,
-            tls_verify_cert: defaults::tls_verify_cert(),
-            tls_cert_path: None,
-            connection_keepalive: None,
-            health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
-            health_check_pool_timeout: defaults::health_check_pool_timeout(),
+            use_tls,
+            tls_verify_cert,
+            tls_cert_path,
+            connection_keepalive,
+            health_check_max_per_cycle,
+            health_check_pool_timeout,
         });
 
         index += 1;
@@ -81,6 +121,37 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
     } else {
         Some(servers)
     }
+}
+
+/// Check if any backend server environment variables are set
+///
+/// Returns true if at least NNTP_SERVER_0_HOST is set
+pub fn has_server_env_vars() -> bool {
+    std::env::var("NNTP_SERVER_0_HOST").is_ok()
+}
+
+/// Load configuration from environment variables only
+///
+/// Used when no config file is present. Requires at least NNTP_SERVER_0_HOST to be set.
+///
+/// # Errors
+///
+/// Returns an error if no backend servers are configured via environment variables.
+pub fn load_config_from_env() -> Result<Config> {
+    use anyhow::Context;
+
+    let servers = load_servers_from_env()
+        .context("No backend servers configured via environment variables. Set NNTP_SERVER_0_HOST, NNTP_SERVER_0_PORT, etc.")?;
+
+    let config = Config {
+        servers,
+        ..Default::default()
+    };
+
+    // Validate the loaded configuration
+    config.validate()?;
+
+    Ok(config)
 }
 
 /// Load configuration from a TOML file, with environment variable overrides
