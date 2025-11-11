@@ -9,11 +9,12 @@ use nntp_proxy::{Config, NntpProxy, RoutingMode};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
 mod config_helpers;
+mod test_helpers;
 use config_helpers::*;
+use test_helpers::MockNntpServer;
 
 /// Helper function to find an available port
 async fn find_available_port() -> u16 {
@@ -113,28 +114,17 @@ fn test_single_greeting_per_command_mode() -> Result<()> {
 #[tokio::test]
 async fn test_article_fetch_no_corruption() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpStream;
 
     // Start mock backend server
     let mock_port = find_available_port().await;
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", mock_port))
-            .await
-            .unwrap();
-        if let Ok((mut stream, _)) = listener.accept().await {
-            stream.write_all(b"200 Mock Server Ready\r\n").await.ok();
-
-            let mut buf = [0u8; 1024];
-            if let Ok(n) = stream.read(&mut buf).await
-                && buf[..n].starts_with(b"ARTICLE")
-            {
-                stream
-                    .write_all(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n")
-                    .await
-                    .ok();
-            }
-        }
-    });
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("Mock Server")
+        .on_command(
+            "ARTICLE",
+            "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        )
+        .spawn();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

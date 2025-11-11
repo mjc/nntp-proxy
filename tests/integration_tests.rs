@@ -10,42 +10,14 @@ use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 mod config_helpers;
 use config_helpers::*;
 
+mod test_helpers;
+use test_helpers::MockNntpServer;
+
 /// Helper function to find an available port
 async fn find_available_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     addr.port()
-}
-
-/// Create a mock NNTP server that echoes back client data
-async fn create_mock_server(port: u16) -> Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-
-    loop {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buffer = [0; 1024];
-
-                // Send a welcome message
-                let _ = stream.write_all(b"200 Mock NNTP Server Ready\r\n").await;
-
-                // Echo back any data received
-                while let Ok(n) = stream.read(&mut buffer).await {
-                    if n == 0 {
-                        break;
-                    }
-                    let _ = stream.write_all(&buffer[..n]).await;
-
-                    // If we receive QUIT, close the connection
-                    if buffer.starts_with(b"QUIT") {
-                        let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                        break;
-                    }
-                }
-            });
-        }
-    }
 }
 
 #[tokio::test]
@@ -55,9 +27,15 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     let mock_port2 = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    // Start mock servers
-    tokio::spawn(create_mock_server(mock_port1));
-    tokio::spawn(create_mock_server(mock_port2));
+    // Start mock servers using builder
+    let _mock1 = MockNntpServer::new(mock_port1)
+        .with_name("Mock NNTP Server")
+        .on_command("HELP", "100 HELP command received\r\n")
+        .spawn();
+    let _mock2 = MockNntpServer::new(mock_port2)
+        .with_name("Mock NNTP Server")
+        .on_command("HELP", "100 HELP command received\r\n")
+        .spawn();
 
     // Give servers time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -116,7 +94,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     // Read echo response
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let response = String::from_utf8_lossy(&buffer[..n]);
-    assert!(response.contains("HELP"));
+    assert!(response.contains("HELP") || response.contains("100"));
 
     // Send QUIT command
     client.write_all(b"QUIT\r\n").await?;
@@ -136,64 +114,15 @@ async fn test_round_robin_distribution() -> Result<()> {
     let mock_port2 = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    // Start mock servers that identify themselves
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", mock_port1);
-        let listener = TcpListener::bind(&addr).await.unwrap();
-
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    // Send greeting and flush immediately
-                    if stream.write_all(b"200 Server1 Ready\r\n").await.is_err() {
-                        return;
-                    }
-                    let mut buffer = [0; 1024];
-                    while let Ok(n) = stream.read(&mut buffer).await {
-                        if n == 0 {
-                            break;
-                        }
-                        // Echo back simple responses
-                        if buffer.starts_with(b"QUIT") {
-                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        }
-                        // Respond to any other command
-                        let _ = stream.write_all(b"200 OK\r\n").await;
-                    }
-                });
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", mock_port2);
-        let listener = TcpListener::bind(&addr).await.unwrap();
-
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    // Send greeting and flush immediately
-                    if stream.write_all(b"200 Server2 Ready\r\n").await.is_err() {
-                        return;
-                    }
-                    let mut buffer = [0; 1024];
-                    while let Ok(n) = stream.read(&mut buffer).await {
-                        if n == 0 {
-                            break;
-                        }
-                        // Echo back simple responses
-                        if buffer.starts_with(b"QUIT") {
-                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        }
-                        // Respond to any other command
-                        let _ = stream.write_all(b"200 OK\r\n").await;
-                    }
-                });
-            }
-        }
-    });
+    // Start mock servers using builder
+    let _mock1 = MockNntpServer::new(mock_port1)
+        .with_name("Mock Server 1")
+        .on_command("HELP", "100 HELP command received\r\n")
+        .spawn();
+    let _mock2 = MockNntpServer::new(mock_port2)
+        .with_name("Mock Server 2")
+        .on_command("HELP", "100 HELP command received\r\n")
+        .spawn();
 
     // Give servers time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -375,55 +304,12 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
     let mock_port = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    // Start mock server that simulates article responses
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", mock_port);
-        let listener = TcpListener::bind(&addr).await.unwrap();
-
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-
-                    // Send greeting
-                    stream
-                        .write_all(b"200 Mock NNTP Server Ready\r\n")
-                        .await
-                        .ok();
-                    // IMPORTANT: Mock server DOES flush - this simulates real backend behavior
-                    stream.flush().await.ok();
-
-                    let mut buffer = [0; 1024];
-                    while let Ok(n) = stream.read(&mut buffer).await {
-                        if n == 0 {
-                            break;
-                        }
-
-                        let cmd = String::from_utf8_lossy(&buffer[..n]);
-
-                        if cmd.starts_with("QUIT") {
-                            stream.write_all(b"205 Goodbye\r\n").await.ok();
-                            stream.flush().await.ok();
-                            break;
-                        } else if cmd.contains("BODY") || cmd.contains("ARTICLE") {
-                            // Simulate a multiline article response
-                            let response = b"220 0 <test@example.com>\r\n\
-                                Article body line 1\r\n\
-                                Article body line 2\r\n\
-                                Article body line 3\r\n\
-                                .\r\n";
-                            stream.write_all(response).await.ok();
-                            stream.flush().await.ok();
-                        } else {
-                            // Simple response for other commands
-                            stream.write_all(b"200 OK\r\n").await.ok();
-                            stream.flush().await.ok();
-                        }
-                    }
-                });
-            }
-        }
-    });
+    // Start mock server using builder with custom article responses
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("Mock NNTP Server")
+        .on_command("BODY", "220 0 <test@example.com>\r\nArticle body line 1\r\nArticle body line 2\r\nArticle body line 3\r\n.\r\n")
+        .on_command("ARTICLE", "220 0 <test@example.com>\r\nArticle body line 1\r\nArticle body line 2\r\nArticle body line 3\r\n.\r\n")
+        .spawn();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -493,40 +379,10 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
     let mock_port = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    // Start basic mock server
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", mock_port);
-        let listener = TcpListener::bind(&addr).await.unwrap();
-
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-
-                    // Send greeting
-                    stream.write_all(b"200 TestServer Ready\r\n").await.ok();
-                    stream.flush().await.ok();
-
-                    let mut buffer = [0; 1024];
-                    while let Ok(n) = stream.read(&mut buffer).await {
-                        if n == 0 {
-                            break;
-                        }
-
-                        if buffer[..n].starts_with(b"QUIT") {
-                            stream.write_all(b"205 Goodbye\r\n").await.ok();
-                            stream.flush().await.ok();
-                            break;
-                        }
-
-                        // Echo back simple response
-                        stream.write_all(b"200 OK\r\n").await.ok();
-                        stream.flush().await.ok();
-                    }
-                });
-            }
-        }
-    });
+    // Start mock server using builder
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("TestServer")
+        .spawn();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -604,40 +460,11 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
     let mock_port = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    // Start mock server
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", mock_port);
-        let listener = TcpListener::bind(&addr).await.unwrap();
-
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-
-                    stream.write_all(b"200 Ready\r\n").await.ok();
-                    stream.flush().await.ok();
-
-                    let mut buffer = [0; 1024];
-                    while let Ok(n) = stream.read(&mut buffer).await {
-                        if n == 0 {
-                            break;
-                        }
-
-                        let cmd = String::from_utf8_lossy(&buffer[..n]);
-                        if cmd.starts_with("QUIT") {
-                            stream.write_all(b"205 Goodbye\r\n").await.ok();
-                            stream.flush().await.ok();
-                            break;
-                        }
-
-                        // Send immediate response
-                        stream.write_all(b"200 Command OK\r\n").await.ok();
-                        stream.flush().await.ok();
-                    }
-                });
-            }
-        }
-    });
+    // Start mock server using builder
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("Ready")
+        .on_command("STAT", "200 Command OK\r\n")
+        .spawn();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -707,9 +534,9 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     let mock_port2 = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    // Start mock servers that track command distribution
-    tokio::spawn(create_smart_mock_server(mock_port1, "Server1"));
-    tokio::spawn(create_smart_mock_server(mock_port2, "Server2"));
+    // Start mock servers using builder with smart command handlers
+    let _mock1 = create_smart_mock_builder(mock_port1, "Server1").spawn();
+    let _mock2 = create_smart_mock_builder(mock_port2, "Server2").spawn();
 
     // Give servers time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -791,7 +618,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     let mock_port = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    tokio::spawn(create_smart_mock_server(mock_port, "StatefulServer"));
+    let _mock = create_smart_mock_builder(mock_port, "StatefulServer").spawn();
 
     // Give server time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -885,7 +712,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     let mock_port = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    tokio::spawn(create_smart_mock_server(mock_port, "MultiServer"));
+    let _mock = create_smart_mock_builder(mock_port, "MultiServer").spawn();
 
     // Give server time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -999,78 +826,20 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     Ok(())
 }
 
-/// Enhanced mock server that can handle more NNTP-like responses
-async fn create_smart_mock_server(port: u16, server_name: &str) -> Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    let server_name = server_name.to_string();
-
-    loop {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let server_name_clone = server_name.clone();
-            tokio::spawn(async move {
-                let mut buffer = [0; 1024];
-
-                // Send welcome message
-                let welcome = format!("200 {} Mock NNTP Server Ready\r\n", server_name_clone);
-                let _ = stream.write_all(welcome.as_bytes()).await;
-
-                // Handle commands
-                while let Ok(n) = stream.read(&mut buffer).await {
-                    if n == 0 {
-                        break;
-                    }
-
-                    let command = String::from_utf8_lossy(&buffer[..n]);
-                    let command = command.trim();
-
-                    let response = match command {
-                        cmd if cmd.starts_with("QUIT") => {
-                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        }
-                        cmd if cmd.starts_with("LIST") => {
-                            "215 List of newsgroups\r\nalt.test 100 1 y\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("DATE") => "111 20231013120000\r\n",
-                        cmd if cmd.starts_with("CAPABILITIES") => {
-                            "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("HELP") => {
-                            "100 Help text\r\nCommands available\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("GROUP") => "211 100 1 100 alt.test\r\n",
-                        cmd if cmd.starts_with("ARTICLE") && cmd.contains('<') => {
-                            "220 1 <msg@example.com>\r\nSubject: Test\r\n\r\nTest body\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("ARTICLE") => {
-                            "220 1 <current@example.com>\r\nSubject: Current\r\n\r\nCurrent body\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("HEAD") && cmd.contains('<') => {
-                            "221 1 <msg@example.com>\r\nSubject: Test\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("HEAD") => {
-                            "221 1 <current@example.com>\r\nSubject: Current\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("BODY") && cmd.contains('<') => {
-                            "222 1 <msg@example.com>\r\nTest body\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("BODY") => {
-                            "222 1 <current@example.com>\r\nCurrent body\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("STAT") => "223 1 <current@example.com>\r\n",
-                        cmd if cmd.starts_with("XOVER") => {
-                            "224 Overview\r\n1\tTest Subject\tauthor@example.com\t13 Oct 2023\t<msg1@example.com>\t\t100\t5\r\n.\r\n"
-                        }
-                        cmd if cmd.starts_with("NEXT") => "223 2 <next@example.com>\r\n",
-                        cmd if cmd.starts_with("LAST") => "223 1 <prev@example.com>\r\n",
-                        cmd if cmd.starts_with("AUTHINFO") => "281 Authentication accepted\r\n",
-                        _ => "500 Unknown command\r\n",
-                    };
-
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            });
-        }
-    }
+/// Create a smart mock server builder with comprehensive NNTP command handlers
+fn create_smart_mock_builder(port: u16, server_name: &str) -> MockNntpServer {
+    MockNntpServer::new(port)
+        .with_name(format!("{} Mock NNTP Server", server_name))
+        .on_command("LIST", "215 List of newsgroups\r\nalt.test 100 1 y\r\n.\r\n")
+        .on_command("DATE", "111 20231013120000\r\n")
+        .on_command("CAPABILITIES", "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n")
+        .on_command("HELP", "100 Help text\r\nCommands available\r\n.\r\n")
+        .on_command("GROUP", "211 100 1 100 alt.test\r\n")
+        .on_command("ARTICLE", "220 1 <msg@example.com>\r\nSubject: Test\r\n\r\nTest body\r\n.\r\n")
+        .on_command("HEAD", "221 1 <msg@example.com>\r\nSubject: Test\r\n.\r\n")
+        .on_command("BODY", "222 1 <msg@example.com>\r\nTest body\r\n.\r\n")
+        .on_command("STAT", "223 1 <current@example.com>\r\n")
+        .on_command("XOVER", "224 Overview\r\n1\tTest Subject\tauthor@example.com\t13 Oct 2023\t<msg1@example.com>\t\t100\t5\r\n.\r\n")
+        .on_command("NEXT", "223 2 <next@example.com>\r\n")
+        .on_command("LAST", "223 1 <prev@example.com>\r\n")
 }

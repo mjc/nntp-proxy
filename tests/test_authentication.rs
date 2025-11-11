@@ -10,10 +10,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 mod config_helpers;
+mod test_helpers;
 use config_helpers::create_test_server_config;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
@@ -22,6 +22,7 @@ use nntp_proxy::pool::BufferPool;
 use nntp_proxy::router::BackendSelector;
 use nntp_proxy::session::ClientSession;
 use nntp_proxy::types::BufferSize;
+use test_helpers::MockNntpServer;
 
 /// Create test config with client auth enabled
 fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
@@ -46,32 +47,9 @@ async fn spawn_mock_backend() -> (u16, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let handle = tokio::spawn(async move {
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    // Send greeting
-                    let _ = stream.write_all(b"200 Mock NNTP Server Ready\r\n").await;
-
-                    let (reader, mut writer) = stream.split();
-                    let mut reader = BufReader::new(reader);
-                    let mut line = String::new();
-
-                    // Echo back commands as successful responses
-                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                        if line.trim().to_uppercase().starts_with("QUIT") {
-                            let _ = writer.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        }
-                        // Simple echo for testing
-                        let response = format!("250 OK {}", line);
-                        let _ = writer.write_all(response.as_bytes()).await;
-                        line.clear();
-                    }
-                });
-            }
-        }
-    });
+    let handle = MockNntpServer::new(port)
+        .with_name("Mock NNTP Server")
+        .spawn();
 
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     (port, handle)
