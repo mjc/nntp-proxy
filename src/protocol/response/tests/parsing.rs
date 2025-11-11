@@ -4,12 +4,18 @@ use crate::protocol::response::*;
 
 #[test]
 fn test_parse_status_code() {
-    assert_eq!(NntpResponse::parse_status_code(b"200 Ready\r\n"), Some(200));
+    assert_eq!(
+        NntpResponse::parse_status_code(b"200 Ready\r\n"),
+        Some(StatusCode::new(200))
+    );
     assert_eq!(
         NntpResponse::parse_status_code(b"381 Password required\r\n"),
-        Some(381)
+        Some(StatusCode::new(381))
     );
-    assert_eq!(NntpResponse::parse_status_code(b"500 Error\r\n"), Some(500));
+    assert_eq!(
+        NntpResponse::parse_status_code(b"500 Error\r\n"),
+        Some(StatusCode::new(500))
+    );
     assert_eq!(NntpResponse::parse_status_code(b"XX"), None);
     assert_eq!(NntpResponse::parse_status_code(b""), None);
 }
@@ -90,27 +96,45 @@ fn test_incomplete_responses() {
     assert_eq!(NntpResponse::parse_status_code(b"\r\n"), None);
 
     // Status without message
-    assert_eq!(NntpResponse::parse_status_code(b"200"), Some(200));
+    assert_eq!(
+        NntpResponse::parse_status_code(b"200"),
+        Some(StatusCode::new(200))
+    );
 
     // Status with just space
-    assert_eq!(NntpResponse::parse_status_code(b"200 "), Some(200));
+    assert_eq!(
+        NntpResponse::parse_status_code(b"200 "),
+        Some(StatusCode::new(200))
+    );
 }
 
 #[test]
 fn test_boundary_status_codes() {
     // Minimum valid code
-    assert_eq!(NntpResponse::parse_status_code(b"100 Info\r\n"), Some(100));
+    assert_eq!(
+        NntpResponse::parse_status_code(b"100 Info\r\n"),
+        Some(StatusCode::new(100))
+    );
 
     // Maximum valid code
-    assert_eq!(NntpResponse::parse_status_code(b"599 Error\r\n"), Some(599));
+    assert_eq!(
+        NntpResponse::parse_status_code(b"599 Error\r\n"),
+        Some(StatusCode::new(599))
+    );
 
     // Out of range codes (but still parse)
-    assert_eq!(NntpResponse::parse_status_code(b"000 Zero\r\n"), Some(0));
-    assert_eq!(NntpResponse::parse_status_code(b"999 Max\r\n"), Some(999));
+    assert_eq!(
+        NntpResponse::parse_status_code(b"000 Zero\r\n"),
+        Some(StatusCode::new(0))
+    );
+    assert_eq!(
+        NntpResponse::parse_status_code(b"999 Max\r\n"),
+        Some(StatusCode::new(999))
+    );
 
     // Four digit code (only first 3 parsed)
     assert_eq!(
         NntpResponse::parse_status_code(b"1234 Invalid\r\n"),
-        Some(123)
+        Some(StatusCode::new(123))
     );
 }

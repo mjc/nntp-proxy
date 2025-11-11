@@ -21,8 +21,7 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Shorten UUID to first 8 characters for log readability
 #[inline]
 pub fn short_id(uuid: &uuid::Uuid) -> String {
-    let s = uuid.to_string();
-    s[..8].to_owned()
+    uuid.to_string()[..8].to_string()
 }
 
 #[cfg(test)]

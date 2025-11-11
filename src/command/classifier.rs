@@ -448,7 +448,8 @@ impl NntpCommand {
     /// Returns true if the command requires a dedicated backend connection
     /// with maintained state (e.g., GROUP, XOVER, article-by-number).
     #[inline]
-    pub fn is_stateful(&self) -> bool {
+    #[must_use]
+    pub const fn is_stateful(&self) -> bool {
         matches!(self, Self::Stateful)
     }
 

@@ -4,12 +4,13 @@
 //! routing when a stateful command is encountered in hybrid mode.
 
 use crate::session::ClientSession;
+use crate::session::common;
 use anyhow::Result;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{debug, error, info, warn};
 
-use crate::types::BytesTransferred;
+use crate::types::{BytesTransferred, TransferMetrics};
 
 impl ClientSession {
     /// Switch from per-command routing to stateful mode by acquiring a dedicated backend connection
@@ -20,14 +21,13 @@ impl ClientSession {
         initial_command: &str,
         client_to_backend_bytes: BytesTransferred,
         backend_to_client_bytes: BytesTransferred,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<TransferMetrics> {
         use tokio::io::AsyncBufReadExt;
 
         // Get router to select backend for stateful session
-        let router = self
-            .router
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Hybrid mode requires a router"))?;
+        let Some(router) = self.router.as_ref() else {
+            anyhow::bail!("Hybrid mode requires a router");
+        };
 
         // Route this first stateful command to get a backend
         let backend_id = router.route_command_sync(self.client_id, initial_command)?;
@@ -38,9 +38,9 @@ impl ClientSession {
         );
 
         // Get provider for this backend
-        let provider = router
-            .get_backend_provider(backend_id)
-            .ok_or_else(|| anyhow::anyhow!("Backend {:?} not found", backend_id))?;
+        let Some(provider) = router.get_backend_provider(backend_id) else {
+            anyhow::bail!("Backend {:?} not found", backend_id);
+        };
 
         // Get a dedicated connection from the pool
         let mut pooled_conn = provider.get_pooled_connection().await?;
@@ -73,11 +73,9 @@ impl ClientSession {
                     e
                 );
                 router.complete_command_sync(backend_id);
-                return result.map(|_| {
-                    (
-                        client_to_backend_bytes.as_u64(),
-                        backend_to_client_bytes.as_u64(),
-                    )
+                return result.map(|_| TransferMetrics {
+                    client_to_backend: client_to_backend_bytes,
+                    backend_to_client: backend_to_client_bytes,
                 });
             } else {
                 // Client disconnected while receiving data, backend is healthy
@@ -124,21 +122,18 @@ impl ClientSession {
                     debug!("Client {} stateful command: {}", self.client_addr, trimmed);
 
                     // Handle QUIT locally
-                    if trimmed.eq_ignore_ascii_case("QUIT") {
-                        use crate::protocol::CONNECTION_CLOSING;
-
-                        if let Err(e) = client_write.write_all(CONNECTION_CLOSING).await {
+                    match common::handle_quit_command(&command, &mut client_write).await? {
+                        common::QuitStatus::Quit(bytes) => {
+                            backend_to_client += bytes.as_u64();
                             debug!(
-                                "Failed to write CONNECTION_CLOSING to client {}: {}",
-                                self.client_addr, e
+                                "Client {} sent QUIT in stateful mode, closing",
+                                self.client_addr
                             );
+                            break;
                         }
-                        backend_to_client += CONNECTION_CLOSING.len() as u64;
-                        debug!(
-                            "Client {} sent QUIT in stateful mode, closing",
-                            self.client_addr
-                        );
-                        break;
+                        common::QuitStatus::Continue => {
+                            // Not a QUIT, continue processing
+                        }
                     }
 
                     // Execute on dedicated backend connection
@@ -191,6 +186,14 @@ impl ClientSession {
             }
         }
 
-        Ok((client_to_backend, backend_to_client))
+        let mut c2b = BytesTransferred::zero();
+        let mut b2c = BytesTransferred::zero();
+        c2b.add_u64(client_to_backend);
+        b2c.add_u64(backend_to_client);
+
+        Ok(TransferMetrics {
+            client_to_backend: c2b,
+            backend_to_client: b2c,
+        })
     }
 }

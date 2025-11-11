@@ -4,16 +4,21 @@
 
 pub mod config;
 pub mod metrics;
+pub mod pool;
 pub mod protocol;
 pub mod validated;
 
 pub use config::{
-    BufferSize, CacheCapacity, MaxConnections, MaxErrors, Port, WindowSize, duration_serde,
+    BackendReadTimeout, BufferSize, CacheCapacity, CommandExecutionTimeout, ConnectionTimeout,
+    HealthCheckTimeout, MaxConnections, MaxErrors, Port, ThreadCount, WindowSize, duration_serde,
     option_duration_serde,
 };
 pub use metrics::{BytesTransferred, TransferMetrics};
+pub use pool::{
+    AvailableConnections, CreatedConnections, InUseConnections, MaxPoolSize, PoolUtilization,
+};
 pub use protocol::MessageId;
-pub use validated::{HostName, ServerName, ValidationError};
+pub use validated::{ConfigPath, HostName, Password, ServerName, Username, ValidationError};
 
 use uuid::Uuid;
 

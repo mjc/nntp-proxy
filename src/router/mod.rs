@@ -13,14 +13,18 @@
 //!
 //! ```no_run
 //! use nntp_proxy::router::BackendSelector;
-//! use nntp_proxy::types::{BackendId, ClientId};
+//! use nntp_proxy::types::{BackendId, ClientId, ServerName};
 //! # use nntp_proxy::pool::DeadpoolConnectionProvider;
 //!
 //! let mut selector = BackendSelector::new();
 //! # let provider = DeadpoolConnectionProvider::new(
 //! #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
 //! # );
-//! selector.add_backend(BackendId::from_index(0), "server1".to_string(), provider);
+//! selector.add_backend(
+//!     BackendId::from_index(0),
+//!     ServerName::new("server1".to_string()).unwrap(),
+//!     provider,
+//! );
 //!
 //! // Route a command
 //! let client_id = ClientId::new();
@@ -36,7 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info};
 
 use crate::pool::DeadpoolConnectionProvider;
-use crate::types::{BackendId, ClientId};
+use crate::types::{BackendId, ClientId, ServerName};
 
 /// Backend connection information
 #[derive(Debug, Clone)]
@@ -44,7 +48,7 @@ struct BackendInfo {
     /// Backend identifier
     id: BackendId,
     /// Server name for logging
-    name: String,
+    name: ServerName,
     /// Connection provider for this backend
     provider: DeadpoolConnectionProvider,
     /// Number of pending requests on this backend (for load balancing)
@@ -71,7 +75,7 @@ struct BackendInfo {
 ///
 /// ```no_run
 /// # use nntp_proxy::router::BackendSelector;
-/// # use nntp_proxy::types::{BackendId, ClientId};
+/// # use nntp_proxy::types::{BackendId, ClientId, ServerName};
 /// # use nntp_proxy::pool::DeadpoolConnectionProvider;
 /// let mut selector = BackendSelector::new();
 ///
@@ -80,7 +84,7 @@ struct BackendInfo {
 /// # );
 /// selector.add_backend(
 ///     BackendId::from_index(0),
-///     "backend-1".to_string(),
+///     ServerName::new("backend-1".to_string()).unwrap(),
 ///     provider,
 /// );
 ///
@@ -117,7 +121,7 @@ impl BackendSelector {
     pub fn add_backend(
         &mut self,
         backend_id: BackendId,
-        name: String,
+        name: ServerName,
         provider: DeadpoolConnectionProvider,
     ) {
         info!("Added backend {:?} ({})", backend_id, name);

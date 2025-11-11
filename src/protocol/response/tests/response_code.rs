@@ -7,11 +7,11 @@ fn test_response_code_parse() {
     // Greetings
     assert_eq!(
         ResponseCode::parse(b"200 Ready\r\n"),
-        ResponseCode::Greeting(200)
+        ResponseCode::Greeting(StatusCode::new(200))
     );
     assert_eq!(
         ResponseCode::parse(b"201 No posting\r\n"),
-        ResponseCode::Greeting(201)
+        ResponseCode::Greeting(StatusCode::new(201))
     );
 
     // Disconnect
@@ -23,11 +23,11 @@ fn test_response_code_parse() {
     // Auth
     assert_eq!(
         ResponseCode::parse(b"381 Password required\r\n"),
-        ResponseCode::AuthRequired(381)
+        ResponseCode::AuthRequired(StatusCode::new(381))
     );
     assert_eq!(
         ResponseCode::parse(b"480 Auth required\r\n"),
-        ResponseCode::AuthRequired(480)
+        ResponseCode::AuthRequired(StatusCode::new(480))
     );
     assert_eq!(
         ResponseCode::parse(b"281 Auth success\r\n"),
@@ -37,25 +37,25 @@ fn test_response_code_parse() {
     // Multiline
     assert_eq!(
         ResponseCode::parse(b"100 Help\r\n"),
-        ResponseCode::MultilineData(100)
+        ResponseCode::MultilineData(StatusCode::new(100))
     );
     assert_eq!(
         ResponseCode::parse(b"215 LIST\r\n"),
-        ResponseCode::MultilineData(215)
+        ResponseCode::MultilineData(StatusCode::new(215))
     );
     assert_eq!(
         ResponseCode::parse(b"220 Article\r\n"),
-        ResponseCode::MultilineData(220)
+        ResponseCode::MultilineData(StatusCode::new(220))
     );
 
     // Single-line
     assert_eq!(
         ResponseCode::parse(b"211 Group selected\r\n"),
-        ResponseCode::SingleLine(211)
+        ResponseCode::SingleLine(StatusCode::new(211))
     );
     assert_eq!(
         ResponseCode::parse(b"400 Error\r\n"),
-        ResponseCode::SingleLine(400)
+        ResponseCode::SingleLine(StatusCode::new(400))
     );
 
     // Invalid
@@ -72,9 +72,18 @@ fn test_response_code_is_multiline() {
 
 #[test]
 fn test_response_code_status_code() {
-    assert_eq!(ResponseCode::parse(b"200 OK\r\n").status_code(), Some(200));
-    assert_eq!(ResponseCode::Disconnect.status_code(), Some(205));
-    assert_eq!(ResponseCode::AuthSuccess.status_code(), Some(281));
+    assert_eq!(
+        ResponseCode::parse(b"200 OK\r\n").status_code(),
+        Some(StatusCode::new(200))
+    );
+    assert_eq!(
+        ResponseCode::Disconnect.status_code(),
+        Some(StatusCode::new(205))
+    );
+    assert_eq!(
+        ResponseCode::AuthSuccess.status_code(),
+        Some(StatusCode::new(281))
+    );
     assert_eq!(ResponseCode::Invalid.status_code(), None);
 }
 

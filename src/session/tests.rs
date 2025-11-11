@@ -1,14 +1,19 @@
 use super::*;
 use crate::auth::AuthHandler;
 use crate::protocol::QUIT;
-use crate::types::BufferSize;
+use crate::types::{BufferSize, ServerName};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Helper to create a default AuthHandler for tests (no auth)
+fn create_test_auth_handler() -> Arc<AuthHandler> {
+    Arc::new(AuthHandler::new(None, None).unwrap())
+}
+
+/// Alias for compatibility
 fn test_auth_handler() -> Arc<AuthHandler> {
-    Arc::new(AuthHandler::new(None, None))
+    create_test_auth_handler()
 }
 
 #[test]
@@ -181,7 +186,7 @@ async fn test_quit_command_per_command_routing() {
     );
     router.add_backend(
         crate::types::BackendId::from_index(0),
-        "test-backend".to_string(),
+        ServerName::new("test-backend".to_string()).unwrap(),
         provider,
     );
 
@@ -232,11 +237,17 @@ async fn test_quit_command_per_command_routing() {
         result
     );
 
-    if let Ok((sent, received)) = result {
+    if let Ok(metrics) = result {
         // Should have sent QUIT command
-        assert!(sent > 0, "Should have sent bytes (QUIT command)");
+        assert!(
+            metrics.client_to_backend.as_u64() > 0,
+            "Should have sent bytes (QUIT command)"
+        );
         // Should have received greeting and possibly closing message
-        assert!(received > 0, "Should have received bytes (greeting)");
+        assert!(
+            metrics.backend_to_client.as_u64() > 0,
+            "Should have received bytes (greeting)"
+        );
     }
 
     // Wait for client to finish
@@ -273,7 +284,7 @@ async fn test_quit_command_closes_connection_cleanly() {
     );
     router.add_backend(
         crate::types::BackendId::from_index(0),
-        "test".to_string(),
+        ServerName::new("test".to_string()).unwrap(),
         provider,
     );
 

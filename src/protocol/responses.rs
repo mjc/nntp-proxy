@@ -23,6 +23,12 @@ pub const AUTH_REQUIRED: &[u8] = b"381 Password required\r\n";
 /// Authentication accepted response (281)
 pub const AUTH_ACCEPTED: &[u8] = b"281 Authentication accepted\r\n";
 
+/// Authentication failed response (481)
+pub const AUTH_FAILED: &[u8] = b"481 Authentication failed\r\n";
+
+/// Authentication required for this command (480)
+pub const AUTH_REQUIRED_FOR_COMMAND: &[u8] = b"480 Authentication required\r\n";
+
 // Standard responses
 
 /// Proxy greeting for per-command routing mode (200)
@@ -153,6 +159,11 @@ mod tests {
     fn test_auth_constants() {
         assert_eq!(AUTH_REQUIRED, b"381 Password required\r\n");
         assert_eq!(AUTH_ACCEPTED, b"281 Authentication accepted\r\n");
+        assert_eq!(AUTH_FAILED, b"481 Authentication failed\r\n");
+        assert_eq!(
+            AUTH_REQUIRED_FOR_COMMAND,
+            b"480 Authentication required\r\n"
+        );
     }
 
     #[test]
@@ -174,6 +185,8 @@ mod tests {
     fn test_all_responses_end_with_crlf() {
         assert!(AUTH_REQUIRED.ends_with(CRLF));
         assert!(AUTH_ACCEPTED.ends_with(CRLF));
+        assert!(AUTH_FAILED.ends_with(CRLF));
+        assert!(AUTH_REQUIRED_FOR_COMMAND.ends_with(CRLF));
         assert!(PROXY_GREETING_PCR.ends_with(CRLF));
         assert!(CONNECTION_CLOSING.ends_with(CRLF));
         assert!(GOODBYE.ends_with(CRLF));

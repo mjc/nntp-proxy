@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::CacheConfig;
 use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use nntp_proxy::protocol::BACKEND_UNAVAILABLE;
-use nntp_proxy::types::ClientId;
+use nntp_proxy::types::{CacheCapacity, ClientId, ConfigPath, Port, ThreadCount};
 use nntp_proxy::{NntpProxy, create_default_config, load_config};
 
 /// Pin current process to specific CPU cores for optimal performance
@@ -57,7 +57,7 @@ struct Args {
     ///
     /// Can be overridden with NNTP_CACHE_PROXY_PORT environment variable
     #[arg(short, long, default_value = "8120", env = "NNTP_CACHE_PROXY_PORT")]
-    port: u16,
+    port: Port,
 
     /// Configuration file path
     ///
@@ -68,19 +68,19 @@ struct Args {
         default_value = "cache-config.toml",
         env = "NNTP_CACHE_PROXY_CONFIG"
     )]
-    config: String,
+    config: ConfigPath,
 
     /// Number of worker threads (defaults to number of CPU cores)
     ///
     /// Can be overridden with NNTP_CACHE_PROXY_THREADS environment variable
     #[arg(short, long, env = "NNTP_CACHE_PROXY_THREADS")]
-    threads: Option<usize>,
+    threads: Option<ThreadCount>,
 
     /// Cache max capacity (number of articles)
     ///
     /// Can be overridden with NNTP_CACHE_PROXY_CACHE_CAPACITY environment variable
     #[arg(long, default_value = "10000", env = "NNTP_CACHE_PROXY_CACHE_CAPACITY")]
-    cache_capacity: u64,
+    cache_capacity: CacheCapacity,
 
     /// Cache TTL in seconds
     ///
@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     let num_cpus = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
-    let worker_threads = args.threads.unwrap_or(num_cpus);
+    let worker_threads = args.threads.map(|t| t.get()).unwrap_or(num_cpus);
 
     // Pin to specific CPU cores for optimal performance
     pin_to_cpu_cores(worker_threads)?;
@@ -131,8 +131,8 @@ fn main() -> Result<()> {
 
 async fn run_caching_proxy(args: Args) -> Result<()> {
     // Load configuration
-    let config = if std::path::Path::new(&args.config).exists() {
-        match load_config(&args.config) {
+    let config = if std::path::Path::new(args.config.as_str()).exists() {
+        match load_config(args.config.as_str()) {
             Ok(config) => config,
             Err(e) => {
                 error!(
@@ -150,20 +150,15 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
         );
         let default_config = create_default_config();
         let config_toml = toml::to_string_pretty(&default_config)?;
-        std::fs::write(&args.config, &config_toml)?;
+        std::fs::write(args.config.as_str(), &config_toml)?;
         info!("Created default config file: {}", args.config);
         default_config
     };
 
     // Set up cache configuration
-    let cache_config = config.cache.clone().unwrap_or_else(|| {
-        use nntp_proxy::types::CacheCapacity;
-        use std::time::Duration;
-        CacheConfig {
-            max_capacity: CacheCapacity::new(args.cache_capacity as usize)
-                .expect("Valid cache capacity"),
-            ttl: Duration::from_secs(args.cache_ttl),
-        }
+    let cache_config = config.cache.clone().unwrap_or_else(|| CacheConfig {
+        max_capacity: args.cache_capacity,
+        ttl: Duration::from_secs(args.cache_ttl),
     });
 
     info!(
@@ -195,13 +190,20 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     )?);
 
     // Create auth handler from config
-    let auth_handler = Arc::new(AuthHandler::new(
-        config.client_auth.username.clone(),
-        config.client_auth.password.clone(),
-    ));
+    let auth_handler = Arc::new(
+        AuthHandler::new(
+            config.client_auth.username.clone(),
+            config.client_auth.password.clone(),
+        )
+        .with_context(|| {
+            "Invalid authentication configuration. \
+             If you set username/password in config, they cannot be empty. \
+             Remove them entirely to disable authentication."
+        })?,
+    );
 
     // Start listening
-    let listen_addr = format!("0.0.0.0:{}", args.port);
+    let listen_addr = format!("0.0.0.0:{}", args.port.get());
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP caching proxy listening on {} (caching mode)",
@@ -330,10 +332,12 @@ async fn handle_caching_client(
 
     // Log session results
     match copy_result {
-        Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
+        Ok(metrics) => {
             info!(
                 "Connection closed for client {}: {} bytes sent, {} bytes received",
-                client_addr, client_to_backend_bytes, backend_to_client_bytes
+                client_addr,
+                metrics.client_to_backend.as_u64(),
+                metrics.backend_to_client.as_u64()
             );
         }
         Err(e) => {
@@ -350,13 +354,13 @@ async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
-            .expect("failed to install Ctrl+C handler");
+            .expect("Failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
+            .expect("Failed to install signal handler")
             .recv()
             .await;
     };

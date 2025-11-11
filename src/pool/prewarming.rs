@@ -80,7 +80,7 @@ pub async fn prewarm_pools(
         .enumerate()
         .map(|(i, server)| {
             let provider = providers[i].clone();
-            let server_name = server.name.as_str().to_string();
+            let server_name = server.name.to_string();
             let max_connections = server.max_connections.get();
 
             tokio::spawn(prewarm_single_pool(provider, server_name, max_connections))
@@ -190,9 +190,9 @@ mod tests {
             .iter()
             .map(|s| {
                 crate::pool::DeadpoolConnectionProvider::new(
-                    s.host.as_str().to_string(),
+                    s.host.to_string(),
                     s.port.get(),
-                    s.name.as_str().to_string(),
+                    s.name.to_string(),
                     s.max_connections.get(),
                     s.username.clone(),
                     s.password.clone(),

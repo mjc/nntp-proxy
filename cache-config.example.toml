@@ -8,9 +8,9 @@ name = "Example News Server"
 # username = "your_username"
 # password = "your_password"
 max_connections = 10
-# Connection health check interval (0 = disabled, recommended: 60-120 seconds)
+# Connection health check interval (omit to disable, recommended: 60-120 seconds)
 # Sends DATE command to detect stale connections before reuse
-connection_keepalive_secs = 60
+connection_keepalive = 60
 # TLS/SSL configuration
 use_tls = false
 tls_verify_cert = true

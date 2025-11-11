@@ -275,9 +275,9 @@ impl DeadpoolConnectionProvider {
         let tls_config = tls_builder.build();
 
         let manager = TcpManager::new_with_tls(
-            server.host.as_str().to_string(),
+            server.host.to_string(),
             server.port.get(),
-            server.name.as_str().to_string(),
+            server.name.to_string(),
             server.username.clone(),
             server.password.clone(),
             tls_config,
@@ -296,7 +296,7 @@ impl DeadpoolConnectionProvider {
 
             // Spawn background health check task
             let pool_clone = pool.clone();
-            let name_clone = server.name.as_str().to_string();
+            let name_clone = server.name.to_string();
             let metrics_clone = metrics.clone();
             tokio::spawn(async move {
                 Self::run_periodic_health_checks(
@@ -316,7 +316,7 @@ impl DeadpoolConnectionProvider {
 
         Ok(Self {
             pool,
-            name: server.name.as_str().to_string(),
+            name: server.name.to_string(),
             keepalive_interval,
             shutdown_tx,
             health_check_metrics: metrics,
@@ -481,11 +481,12 @@ impl DeadpoolConnectionProvider {
 #[async_trait]
 impl ConnectionProvider for DeadpoolConnectionProvider {
     fn status(&self) -> PoolStatus {
+        use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
         let status = self.pool.status();
         PoolStatus {
-            available: status.available,
-            max_size: status.max_size,
-            created: status.size,
+            available: AvailableConnections::new(status.available),
+            max_size: MaxPoolSize::new(status.max_size),
+            created: CreatedConnections::new(status.size),
         }
     }
 }
@@ -512,11 +513,12 @@ impl ConnectionPool for DeadpoolConnectionProvider {
     }
 
     fn status(&self) -> PoolStatus {
+        use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
         let status = self.pool.status();
         PoolStatus {
-            available: status.available,
-            max_size: status.max_size,
-            created: status.size,
+            available: AvailableConnections::new(status.available),
+            max_size: MaxPoolSize::new(status.max_size),
+            created: CreatedConnections::new(status.size),
         }
     }
 

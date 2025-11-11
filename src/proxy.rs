@@ -153,21 +153,24 @@ impl NntpProxyBuilder {
                 router::BackendSelector::new(),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    r.add_backend(
-                        backend_id,
-                        servers[idx].name.as_str().to_string(),
-                        provider.clone(),
-                    );
+                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
                     r
                 },
             )
         });
 
         // Create auth handler from config
-        let auth_handler = Arc::new(AuthHandler::new(
-            self.config.client_auth.username.clone(),
-            self.config.client_auth.password.clone(),
-        ));
+        let auth_handler = Arc::new(
+            AuthHandler::new(
+                self.config.client_auth.username.clone(),
+                self.config.client_auth.password.clone(),
+            )
+            .with_context(|| {
+                "Invalid authentication configuration. \
+                 If you set username/password in config, they cannot be empty. \
+                 Remove them entirely to disable authentication."
+            })?,
+        );
 
         Ok(NntpProxy {
             servers,
@@ -257,24 +260,28 @@ impl NntpProxy {
     }
 
     /// Get the list of servers
+    #[must_use]
     #[inline]
     pub fn servers(&self) -> &[ServerConfig] {
         &self.servers
     }
 
     /// Get the router
+    #[must_use]
     #[inline]
     pub fn router(&self) -> &Arc<router::BackendSelector> {
         &self.router
     }
 
     /// Get the connection providers
+    #[must_use]
     #[inline]
     pub fn connection_providers(&self) -> &[DeadpoolConnectionProvider] {
         &self.connection_providers
     }
 
     /// Get the buffer pool
+    #[must_use]
     #[inline]
     pub fn buffer_pool(&self) -> &BufferPool {
         &self.buffer_pool
@@ -375,10 +382,12 @@ impl NntpProxy {
 
         // Log session results and handle backend connection errors
         match copy_result {
-            Ok((client_to_backend_bytes, backend_to_client_bytes)) => {
+            Ok(metrics) => {
                 info!(
                     "Connection closed for client {}: {} bytes sent, {} bytes received",
-                    client_addr, client_to_backend_bytes, backend_to_client_bytes
+                    client_addr,
+                    metrics.client_to_backend.as_u64(),
+                    metrics.backend_to_client.as_u64()
                 );
             }
             Err(e) => {
@@ -451,13 +460,13 @@ impl NntpProxy {
 
         // Log session results
         match result {
-            Ok((client_to_backend, backend_to_client)) => {
+            Ok(metrics) => {
                 info!(
                     "Session closed {} [{}] ↑{} ↓{}",
                     client_addr,
                     session_id,
-                    crate::formatting::format_bytes(client_to_backend),
-                    crate::formatting::format_bytes(backend_to_client)
+                    crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
+                    crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
                 );
             }
             Err(e) => {

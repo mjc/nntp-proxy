@@ -1,23 +1,24 @@
 //! Client authentication handling
 
 use crate::command::AuthAction;
-use crate::protocol::{AUTH_ACCEPTED, AUTH_REQUIRED};
+use crate::protocol::{AUTH_ACCEPTED, AUTH_FAILED, AUTH_REQUIRED};
+use crate::types::{Password, Username, ValidationError};
 use tokio::io::AsyncWriteExt;
 
 /// Client credentials for authentication
 #[derive(Clone)]
 struct Credentials {
-    username: String,
-    password: String,
+    username: Username,
+    password: Password,
 }
 
 impl Credentials {
-    fn new(username: String, password: String) -> Self {
+    fn new(username: Username, password: Password) -> Self {
         Self { username, password }
     }
 
     fn validate(&self, username: &str, password: &str) -> bool {
-        self.username == username && self.password == password
+        self.username.as_str() == username && self.password.as_str() == password
     }
 }
 
@@ -37,12 +38,34 @@ impl std::fmt::Debug for AuthHandler {
 
 impl AuthHandler {
     /// Create a new auth handler with optional credentials
-    pub fn new(username: Option<String>, password: Option<String>) -> Self {
+    ///
+    /// # Authentication behavior:
+    /// - `None, None` → Auth disabled (allows all connections)
+    /// - `Some(user), Some(pass)` → Auth enabled with validation
+    /// - `Some(user), None` or `None, Some(pass)` → Auth disabled (both must be provided)
+    ///
+    /// # Errors
+    /// Returns `Err` if either username or password is explicitly provided but empty/whitespace.
+    /// This prevents misconfiguration where empty credentials would silently disable auth,
+    /// which is a critical security vulnerability.
+    ///
+    /// # Security
+    /// If you explicitly set credentials in config and they're empty, the proxy will
+    /// **refuse to start** rather than silently running with no authentication.
+    pub fn new(
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Result<Self, ValidationError> {
         let credentials = match (username, password) {
-            (Some(u), Some(p)) => Some(Credentials::new(u, p)),
-            _ => None,
+            (Some(u), Some(p)) => {
+                // Both provided - validate they're non-empty
+                let username = Username::new(u)?; // Returns Err if empty
+                let password = Password::new(p)?; // Returns Err if empty
+                Some(Credentials::new(username, password))
+            }
+            _ => None, // At least one is None = auth disabled
         };
-        Self { credentials }
+        Ok(Self { credentials })
     }
 
     /// Check if authentication is enabled
@@ -88,7 +111,7 @@ impl AuthHandler {
                 let response = if auth_success {
                     AUTH_ACCEPTED
                 } else {
-                    b"481 Authentication failed\r\n" as &[u8]
+                    AUTH_FAILED
                 };
                 writer.write_all(response).await?;
                 Ok((response.len(), auth_success))
@@ -114,7 +137,7 @@ mod tests {
     use super::*;
 
     fn test_handler() -> AuthHandler {
-        AuthHandler::new(None, None)
+        AuthHandler::new(None, None).unwrap()
     }
 
     mod credentials {
@@ -122,46 +145,65 @@ mod tests {
 
         #[test]
         fn test_new() {
-            let creds = Credentials::new("user".to_string(), "pass".to_string());
-            assert_eq!(creds.username, "user");
-            assert_eq!(creds.password, "pass");
+            let creds = Credentials::new(
+                Username::new("user".to_string()).unwrap(),
+                Password::new("pass".to_string()).unwrap(),
+            );
+            assert_eq!(creds.username.as_str(), "user");
+            assert_eq!(creds.password.as_str(), "pass");
         }
 
         #[test]
         fn test_validate_correct() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(creds.validate("alice", "secret123"));
         }
 
         #[test]
         fn test_validate_wrong_username() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(!creds.validate("bob", "secret123"));
         }
 
         #[test]
         fn test_validate_wrong_password() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(!creds.validate("alice", "wrong"));
         }
 
         #[test]
         fn test_validate_both_wrong() {
-            let creds = Credentials::new("alice".to_string(), "secret123".to_string());
+            let creds = Credentials::new(
+                Username::new("alice".to_string()).unwrap(),
+                Password::new("secret123".to_string()).unwrap(),
+            );
             assert!(!creds.validate("bob", "wrong"));
         }
 
         #[test]
-        fn test_validate_empty_strings() {
-            let creds = Credentials::new("".to_string(), "".to_string());
-            assert!(creds.validate("", ""));
-            assert!(!creds.validate("user", ""));
-            assert!(!creds.validate("", "pass"));
+        fn test_validate_empty_strings_rejected() {
+            // Empty strings should fail validation
+            assert!(Username::new("".to_string()).is_err());
+            assert!(Password::new("".to_string()).is_err());
+            assert!(Username::new("   ".to_string()).is_err());
+            assert!(Password::new("   ".to_string()).is_err());
         }
 
         #[test]
         fn test_validate_case_sensitive() {
-            let creds = Credentials::new("Alice".to_string(), "Secret".to_string());
+            let creds = Credentials::new(
+                Username::new("Alice".to_string()).unwrap(),
+                Password::new("Secret".to_string()).unwrap(),
+            );
             assert!(creds.validate("Alice", "Secret"));
             assert!(!creds.validate("alice", "Secret"));
             assert!(!creds.validate("Alice", "secret"));
@@ -170,29 +212,40 @@ mod tests {
 
         #[test]
         fn test_validate_with_spaces() {
-            let creds = Credentials::new("user name".to_string(), "pass word".to_string());
+            let creds = Credentials::new(
+                Username::new("user name".to_string()).unwrap(),
+                Password::new("pass word".to_string()).unwrap(),
+            );
             assert!(creds.validate("user name", "pass word"));
             assert!(!creds.validate("username", "password"));
         }
 
         #[test]
         fn test_validate_unicode() {
-            let creds = Credentials::new("用户".to_string(), "密码".to_string());
+            let creds = Credentials::new(
+                Username::new("用户".to_string()).unwrap(),
+                Password::new("密码".to_string()).unwrap(),
+            );
             assert!(creds.validate("用户", "密码"));
             assert!(!creds.validate("user", "pass"));
         }
 
         #[test]
         fn test_validate_special_chars() {
-            let creds =
-                Credentials::new("user@example.com".to_string(), "p@ss!w0rd#123".to_string());
+            let creds = Credentials::new(
+                Username::new("user@example.com".to_string()).unwrap(),
+                Password::new("p@ss!w0rd#123".to_string()).unwrap(),
+            );
             assert!(creds.validate("user@example.com", "p@ss!w0rd#123"));
             assert!(!creds.validate("user", "p@ss!w0rd#123"));
         }
 
         #[test]
         fn test_clone() {
-            let creds1 = Credentials::new("user".to_string(), "pass".to_string());
+            let creds1 = Credentials::new(
+                Username::new("user".to_string()).unwrap(),
+                Password::new("pass".to_string()).unwrap(),
+            );
             let creds2 = creds1.clone();
             assert_eq!(creds1.username, creds2.username);
             assert_eq!(creds1.password, creds2.password);
@@ -203,7 +256,10 @@ mod tests {
         fn test_very_long_credentials() {
             let long_user = "u".repeat(1000);
             let long_pass = "p".repeat(1000);
-            let creds = Credentials::new(long_user.clone(), long_pass.clone());
+            let creds = Credentials::new(
+                Username::new(long_user.clone()).unwrap(),
+                Password::new(long_pass.clone()).unwrap(),
+            );
             assert!(creds.validate(&long_user, &long_pass));
             assert!(!creds.validate(&long_user, "wrong"));
         }
@@ -220,31 +276,62 @@ mod tests {
 
         #[test]
         fn test_new_with_both_credentials() {
-            let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string()));
+            let handler =
+                AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap();
             assert!(handler.is_enabled());
         }
 
         #[test]
         fn test_new_with_only_username() {
-            let handler = AuthHandler::new(Some("user".to_string()), None);
+            let handler = AuthHandler::new(Some("user".to_string()), None).unwrap();
             assert!(!handler.is_enabled());
         }
 
         #[test]
         fn test_new_with_only_password() {
-            let handler = AuthHandler::new(None, Some("pass".to_string()));
+            let handler = AuthHandler::new(None, Some("pass".to_string())).unwrap();
             assert!(!handler.is_enabled());
         }
 
         #[test]
         fn test_new_with_neither() {
-            let handler = AuthHandler::new(None, None);
+            let handler = AuthHandler::new(None, None).unwrap();
             assert!(!handler.is_enabled());
         }
 
         #[test]
+        fn test_new_with_empty_username_fails() {
+            let result = AuthHandler::new(Some("".to_string()), Some("pass".to_string()));
+            assert!(result.is_err(), "Empty username should return error");
+        }
+
+        #[test]
+        fn test_new_with_empty_password_fails() {
+            let result = AuthHandler::new(Some("user".to_string()), Some("".to_string()));
+            assert!(result.is_err(), "Empty password should return error");
+        }
+
+        #[test]
+        fn test_new_with_whitespace_username_fails() {
+            let result = AuthHandler::new(Some("   ".to_string()), Some("pass".to_string()));
+            assert!(
+                result.is_err(),
+                "Whitespace-only username should return error"
+            );
+        }
+
+        #[test]
+        fn test_new_with_whitespace_password_fails() {
+            let result = AuthHandler::new(Some("user".to_string()), Some("   ".to_string()));
+            assert!(
+                result.is_err(),
+                "Whitespace-only password should return error"
+            );
+        }
+
+        #[test]
         fn test_validate_when_disabled() {
-            let handler = AuthHandler::default();
+            let handler = AuthHandler::new(None, None).unwrap();
             assert!(handler.validate("any", "thing"));
             assert!(handler.validate("", ""));
             assert!(handler.validate("foo", "bar"));
@@ -252,7 +339,8 @@ mod tests {
 
         #[test]
         fn test_validate_when_enabled() {
-            let handler = AuthHandler::new(Some("alice".to_string()), Some("secret".to_string()));
+            let handler =
+                AuthHandler::new(Some("alice".to_string()), Some("secret".to_string())).unwrap();
             assert!(handler.validate("alice", "secret"));
             assert!(!handler.validate("alice", "wrong"));
             assert!(!handler.validate("bob", "secret"));
@@ -261,11 +349,11 @@ mod tests {
 
         #[test]
         fn test_is_enabled_consistent() {
-            let disabled = AuthHandler::new(None, None);
+            let disabled = AuthHandler::new(None, None).unwrap();
             assert!(!disabled.is_enabled());
             assert!(!disabled.is_enabled()); // Call twice to ensure consistency
 
-            let enabled = AuthHandler::new(Some("u".to_string()), Some("p".to_string()));
+            let enabled = AuthHandler::new(Some("u".to_string()), Some("p".to_string())).unwrap();
             assert!(enabled.is_enabled());
             assert!(enabled.is_enabled()); // Call twice to ensure consistency
         }
@@ -337,17 +425,81 @@ mod tests {
 
     #[test]
     fn test_auth_new_none_none() {
-        let handler = AuthHandler::new(None, None);
+        let handler = AuthHandler::new(None, None).unwrap();
         assert!(!handler.is_enabled());
         assert!(handler.validate("any", "thing"));
     }
 
     #[test]
     fn test_auth_enabled_with_credentials() {
-        let handler = AuthHandler::new(Some("mjc".to_string()), Some("nntp1337".to_string()));
+        let handler =
+            AuthHandler::new(Some("mjc".to_string()), Some("nntp1337".to_string())).unwrap();
         assert!(handler.is_enabled());
         assert!(handler.validate("mjc", "nntp1337"));
         assert!(!handler.validate("mjc", "wrong"));
         assert!(!handler.validate("wrong", "nntp1337"));
+    }
+
+    #[test]
+    fn test_security_empty_credentials_rejected() {
+        // SECURITY: Empty username must fail
+        let result = AuthHandler::new(Some("".to_string()), Some("pass".to_string()));
+        assert!(
+            result.is_err(),
+            "Empty username should be rejected to prevent silent auth bypass"
+        );
+
+        // SECURITY: Empty password must fail
+        let result = AuthHandler::new(Some("user".to_string()), Some("".to_string()));
+        assert!(
+            result.is_err(),
+            "Empty password should be rejected to prevent silent auth bypass"
+        );
+
+        // SECURITY: Both empty must fail
+        let result = AuthHandler::new(Some("".to_string()), Some("".to_string()));
+        assert!(
+            result.is_err(),
+            "Both empty should be rejected to prevent silent auth bypass"
+        );
+    }
+
+    #[test]
+    fn test_security_whitespace_credentials_rejected() {
+        // SECURITY: Whitespace-only username must fail
+        let result = AuthHandler::new(Some("   ".to_string()), Some("pass".to_string()));
+        assert!(
+            result.is_err(),
+            "Whitespace-only username should be rejected"
+        );
+
+        // SECURITY: Whitespace-only password must fail
+        let result = AuthHandler::new(Some("user".to_string()), Some("   ".to_string()));
+        assert!(
+            result.is_err(),
+            "Whitespace-only password should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_security_explicit_config_prevents_silent_bypass() {
+        // This test demonstrates the security fix:
+        // If someone sets credentials in config but they're empty,
+        // we MUST fail rather than silently disable auth.
+        //
+        // Before fix: Empty credentials = auth silently disabled = MASSIVE SECURITY HOLE
+        // After fix: Empty credentials = proxy refuses to start = SAFE
+
+        // Simulate someone setting credentials in config
+        let username_from_config = Some("".to_string()); // Typo or misconfiguration
+        let password_from_config = Some("secret".to_string());
+
+        let result = AuthHandler::new(username_from_config, password_from_config);
+
+        assert!(
+            result.is_err(),
+            "Proxy must refuse to start with empty credentials from config. \
+             Silently disabling auth would be a critical security vulnerability!"
+        );
     }
 }

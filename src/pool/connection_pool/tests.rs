@@ -24,12 +24,13 @@ async fn test_mock_connection_pool_with_custom_settings() {
 
 #[tokio::test]
 async fn test_mock_connection_pool_status() {
+    use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
     let pool = MockConnectionPool::new("test-server");
     let status = pool.status();
 
-    assert_eq!(status.available, 0);
-    assert_eq!(status.max_size, 0);
-    assert_eq!(status.created, 0);
+    assert_eq!(status.available, AvailableConnections::zero());
+    assert_eq!(status.max_size, MaxPoolSize::new(0));
+    assert_eq!(status.created, CreatedConnections::zero());
 }
 
 #[tokio::test]
@@ -45,6 +46,7 @@ async fn test_mock_connection_pool_get_fails() {
 
 #[tokio::test]
 async fn test_deadpool_connection_provider_implements_trait() {
+    use crate::types::MaxPoolSize;
     // Test that DeadpoolConnectionProvider implements ConnectionPool trait
     let provider = DeadpoolConnectionProvider::builder("news.example.com", 119)
         .name("Test Server")
@@ -58,7 +60,7 @@ async fn test_deadpool_connection_provider_implements_trait() {
     assert_eq!(provider.port(), 119);
 
     let status = provider.status();
-    assert_eq!(status.max_size, 5);
+    assert_eq!(status.max_size, MaxPoolSize::new(5));
 }
 
 #[tokio::test]

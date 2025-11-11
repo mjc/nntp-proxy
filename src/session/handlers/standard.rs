@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::command::CommandHandler;
 use crate::constants::buffer::COMMAND;
-use crate::types::BytesTransferred;
+use crate::types::{BytesTransferred, TransferMetrics};
 
 impl ClientSession {
     /// Handle a client connection with a dedicated backend connection (standard 1:1 mode)
@@ -16,7 +16,7 @@ impl ClientSession {
         &self,
         mut client_stream: TcpStream,
         backend_conn: T,
-    ) -> Result<(u64, u64)>
+    ) -> Result<TransferMetrics>
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -77,25 +77,23 @@ impl ClientSession {
                                 match action {
                                     CommandAction::ForwardStateless => {
                                         // Reject all non-auth commands before authentication
-                                        let response = b"480 Authentication required\r\n";
-                                        client_write.write_all(response).await?;
-                                        backend_to_client_bytes.add(response.len());
+                                        use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+                                        client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+                                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        // Store username if this is AUTHINFO USER
-                                        if let crate::command::AuthAction::RequestPassword(ref username) = auth_action {
-                                            auth_username = Some(username.clone());
-                                        }
+                                        let result = crate::session::common::handle_auth_command(
+                                            &self.auth_handler,
+                                            auth_action,
+                                            &mut client_write,
+                                            &mut auth_username,
+                                            &self.authenticated,
+                                        )
+                                        .await?;
 
-                                        // Handle auth and validate
-                                        let (bytes, auth_success) = self
-                                            .auth_handler
-                                            .handle_auth_command(auth_action, &mut client_write, auth_username.as_deref())
-                                            .await?;
-                                        backend_to_client_bytes.add(bytes);
-
-                                        if auth_success {
-                                            self.authenticated.store(true, std::sync::atomic::Ordering::Release);
+                                        backend_to_client_bytes += result.bytes_written;
+                                        if result.authenticated {
+                                            skip_auth_check = true;
                                         }
                                     }
                                     CommandAction::Reject(response) => {
@@ -132,9 +130,9 @@ impl ClientSession {
             }
         }
 
-        Ok((
-            client_to_backend_bytes.as_u64(),
-            backend_to_client_bytes.as_u64(),
-        ))
+        Ok(TransferMetrics {
+            client_to_backend: client_to_backend_bytes,
+            backend_to_client: backend_to_client_bytes,
+        })
     }
 }

@@ -16,7 +16,7 @@ pub use response::ResponseParser;
 
 // Re-export for future use
 #[allow(unused_imports)]
-pub use response::{NntpResponse, ResponseCode};
+pub use response::{NntpResponse, ResponseCode, StatusCode};
 
 // Re-export command construction helpers
 pub use commands::{
@@ -26,10 +26,11 @@ pub use commands::{
 
 // Re-export response constants and helpers
 pub use responses::{
-    AUTH_ACCEPTED, AUTH_REQUIRED, BACKEND_ERROR, BACKEND_UNAVAILABLE, COMMAND_NOT_SUPPORTED,
-    COMMAND_NOT_SUPPORTED_STATELESS, CONNECTION_CLOSING, CRLF, GOODBYE, MIN_RESPONSE_LENGTH,
-    MULTILINE_TERMINATOR, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE, error_response, greeting,
-    greeting_readonly, ok_response, response,
+    AUTH_ACCEPTED, AUTH_FAILED, AUTH_REQUIRED, AUTH_REQUIRED_FOR_COMMAND, BACKEND_ERROR,
+    BACKEND_UNAVAILABLE, COMMAND_NOT_SUPPORTED, COMMAND_NOT_SUPPORTED_STATELESS,
+    CONNECTION_CLOSING, CRLF, GOODBYE, MIN_RESPONSE_LENGTH, MULTILINE_TERMINATOR,
+    PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE, error_response, greeting, greeting_readonly,
+    ok_response, response,
 };
 
 /// Send NNTP proxy greeting to a client

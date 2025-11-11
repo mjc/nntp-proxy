@@ -42,6 +42,7 @@
 //!   - Distinguishes backend errors from client disconnects
 
 pub mod backend;
+pub(crate) mod common;
 pub mod connection;
 pub mod error_classification;
 pub mod handlers;
@@ -124,7 +125,7 @@ pub struct ClientSession {
 ///
 /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
-/// let auth_handler = Arc::new(AuthHandler::new(None, None));
+/// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 ///
 /// // Standard 1:1 routing mode
 /// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone())
@@ -260,7 +261,7 @@ impl ClientSession {
     ///
     /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
-    /// let auth_handler = Arc::new(AuthHandler::new(None, None));
+    /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
     ///
     /// // Standard 1:1 routing mode
     /// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)

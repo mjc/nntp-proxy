@@ -8,20 +8,17 @@
 //! - Edge cases and error conditions
 //! - Security (credential redaction)
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 mod config_helpers;
+mod test_helpers;
 use config_helpers::create_test_server_config;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::config::{Config, RoutingMode};
-use nntp_proxy::pool::BufferPool;
-use nntp_proxy::router::BackendSelector;
 use nntp_proxy::session::ClientSession;
-use nntp_proxy::types::BufferSize;
+use test_helpers::MockNntpServer;
 
 /// Create test config with client auth enabled
 fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
@@ -42,36 +39,13 @@ fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &s
 }
 
 /// Spawn a mock NNTP backend server
-async fn spawn_mock_backend() -> (u16, tokio::task::JoinHandle<()>) {
+async fn spawn_mock_backend() -> (u16, tokio::task::AbortHandle) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let handle = tokio::spawn(async move {
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    // Send greeting
-                    let _ = stream.write_all(b"200 Mock NNTP Server Ready\r\n").await;
-
-                    let (reader, mut writer) = stream.split();
-                    let mut reader = BufReader::new(reader);
-                    let mut line = String::new();
-
-                    // Echo back commands as successful responses
-                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                        if line.trim().to_uppercase().starts_with("QUIT") {
-                            let _ = writer.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        }
-                        // Simple echo for testing
-                        let response = format!("250 OK {}", line);
-                        let _ = writer.write_all(response.as_bytes()).await;
-                        line.clear();
-                    }
-                });
-            }
-        }
-    });
+    let handle = MockNntpServer::new(port)
+        .with_name("Mock NNTP Server")
+        .spawn();
 
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     (port, handle)
@@ -79,47 +53,51 @@ async fn spawn_mock_backend() -> (u16, tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 async fn test_auth_handler_disabled_by_default() {
-    let handler = AuthHandler::new(None, None);
+    let handler = AuthHandler::new(None, None).unwrap();
     assert!(!handler.is_enabled());
 }
 
 #[tokio::test]
 async fn test_auth_handler_enabled_with_credentials() {
-    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string()));
+    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap();
     assert!(handler.is_enabled());
 }
 
 #[tokio::test]
 async fn test_auth_handler_validates_correct_credentials() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string()));
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(handler.validate("alice", "secret123"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_rejects_wrong_password() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string()));
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(!handler.validate("alice", "wrongpass"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_rejects_wrong_username() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string()));
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(!handler.validate("bob", "secret123"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_rejects_both_wrong() {
-    let handler = AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string()));
+    let handler =
+        AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
     assert!(!handler.validate("bob", "wrongpass"));
 }
 
 #[tokio::test]
 async fn test_auth_disabled_accepts_any_credentials() {
-    let handler = AuthHandler::new(None, None);
+    let handler = AuthHandler::new(None, None).unwrap();
 
     assert!(handler.validate("anything", "works"));
     assert!(handler.validate("", ""));
@@ -129,25 +107,27 @@ async fn test_auth_disabled_accepts_any_credentials() {
 #[tokio::test]
 async fn test_auth_handler_partial_config_disabled() {
     // Only username, no password - should be disabled
-    let handler1 = AuthHandler::new(Some("user".to_string()), None);
+    let handler1 = AuthHandler::new(Some("user".to_string()), None).unwrap();
     assert!(!handler1.is_enabled());
 
     // Only password, no username - should be disabled
-    let handler2 = AuthHandler::new(None, Some("pass".to_string()));
+    let handler2 = AuthHandler::new(None, Some("pass".to_string())).unwrap();
     assert!(!handler2.is_enabled());
 }
 
 #[tokio::test]
 async fn test_auth_handler_empty_string_credentials() {
-    let handler = AuthHandler::new(Some("".to_string()), Some("".to_string()));
-    assert!(handler.is_enabled());
-    assert!(handler.validate("", ""));
-    assert!(!handler.validate("nonempty", ""));
+    // SECURITY: Empty credentials must be rejected, not silently disable auth
+    let result = AuthHandler::new(Some("".to_string()), Some("".to_string()));
+    assert!(
+        result.is_err(),
+        "Empty credentials should be rejected to prevent silent auth bypass"
+    );
 }
 
 #[tokio::test]
 async fn test_auth_handler_case_sensitive() {
-    let handler = AuthHandler::new(Some("Alice".to_string()), Some("Secret".to_string()));
+    let handler = AuthHandler::new(Some("Alice".to_string()), Some("Secret".to_string())).unwrap();
 
     assert!(handler.validate("Alice", "Secret"));
     assert!(!handler.validate("alice", "Secret"));
@@ -157,7 +137,8 @@ async fn test_auth_handler_case_sensitive() {
 
 #[tokio::test]
 async fn test_auth_handler_whitespace_in_credentials() {
-    let handler = AuthHandler::new(Some("user name".to_string()), Some("pass word".to_string()));
+    let handler =
+        AuthHandler::new(Some("user name".to_string()), Some("pass word".to_string())).unwrap();
 
     assert!(handler.validate("user name", "pass word"));
     assert!(!handler.validate("username", "password"));
@@ -168,14 +149,15 @@ async fn test_auth_handler_special_characters() {
     let handler = AuthHandler::new(
         Some("user@example.com".to_string()),
         Some("p@$$w0rd!#%".to_string()),
-    );
+    )
+    .unwrap();
 
     assert!(handler.validate("user@example.com", "p@$$w0rd!#%"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_unicode_credentials() {
-    let handler = AuthHandler::new(Some("用户".to_string()), Some("密码".to_string()));
+    let handler = AuthHandler::new(Some("用户".to_string()), Some("密码".to_string())).unwrap();
 
     assert!(handler.validate("用户", "密码"));
     assert!(!handler.validate("user", "password"));
@@ -186,7 +168,8 @@ async fn test_auth_handler_debug_redacts_credentials() {
     let handler = AuthHandler::new(
         Some("supersecret".to_string()),
         Some("topsecretpassword".to_string()),
-    );
+    )
+    .unwrap();
 
     let debug_output = format!("{:?}", handler);
 
@@ -199,10 +182,9 @@ async fn test_auth_handler_debug_redacts_credentials() {
 
 #[tokio::test]
 async fn test_auth_handler_debug_when_disabled() {
-    let handler = AuthHandler::new(None, None);
+    let handler = AuthHandler::new(None, None).unwrap();
 
     let debug_output = format!("{:?}", handler);
-
     assert!(debug_output.contains("AuthHandler"));
     assert!(debug_output.contains("enabled: false"));
 }
@@ -228,7 +210,7 @@ async fn test_auth_command_sequence_valid() {
 
 #[tokio::test]
 async fn test_auth_responses_are_valid_nntp() {
-    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string()));
+    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap();
 
     let user_resp = handler.user_response();
     let user_str = String::from_utf8_lossy(user_resp);
@@ -245,7 +227,7 @@ async fn test_auth_responses_are_valid_nntp() {
 async fn test_auth_handler_processes_auth_commands() {
     use nntp_proxy::command::AuthAction;
 
-    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string()));
+    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap();
     let mut output = Vec::new();
 
     // Test USER command
@@ -302,14 +284,13 @@ async fn test_command_classification_for_stateless() {
 
 #[tokio::test]
 async fn test_session_with_auth_handler() {
-    let (_backend_port, _handle) = spawn_mock_backend().await;
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("testuser".to_string()),
-        Some("testpass".to_string()),
-    ));
+    use test_helpers::{create_test_addr, create_test_auth_handler_with, create_test_buffer_pool};
 
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    let (_backend_port, _handle) = spawn_mock_backend().await;
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler_with("testuser", "testpass");
+
+    let addr = create_test_addr();
     let _session = ClientSession::new(addr, buffer_pool, auth_handler);
 
     // Session should be created successfully with auth handler
@@ -317,11 +298,15 @@ async fn test_session_with_auth_handler() {
 
 #[tokio::test]
 async fn test_session_with_disabled_auth() {
-    let (_backend_port, _handle) = spawn_mock_backend().await;
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(None, None));
+    use test_helpers::{
+        create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
+    };
 
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    let (_backend_port, _handle) = spawn_mock_backend().await;
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler_disabled();
+
+    let addr = create_test_addr();
     let _session = ClientSession::new(addr, buffer_pool, auth_handler.clone());
 
     assert!(!auth_handler.is_enabled());
@@ -392,7 +377,7 @@ async fn test_auth_handler_with_very_long_credentials() {
     let long_user = "a".repeat(1000);
     let long_pass = "b".repeat(1000);
 
-    let handler = AuthHandler::new(Some(long_user.clone()), Some(long_pass.clone()));
+    let handler = AuthHandler::new(Some(long_user.clone()), Some(long_pass.clone())).unwrap();
 
     assert!(handler.validate(&long_user, &long_pass));
     assert!(!handler.validate(&long_user, "short"));
@@ -401,8 +386,8 @@ async fn test_auth_handler_with_very_long_credentials() {
 
 #[tokio::test]
 async fn test_multiple_auth_handlers_independent() {
-    let handler1 = AuthHandler::new(Some("user1".to_string()), Some("pass1".to_string()));
-    let handler2 = AuthHandler::new(Some("user2".to_string()), Some("pass2".to_string()));
+    let handler1 = AuthHandler::new(Some("user1".to_string()), Some("pass1".to_string())).unwrap();
+    let handler2 = AuthHandler::new(Some("user2".to_string()), Some("pass2".to_string())).unwrap();
 
     assert!(handler1.validate("user1", "pass1"));
     assert!(!handler1.validate("user2", "pass2"));
@@ -413,10 +398,9 @@ async fn test_multiple_auth_handlers_independent() {
 
 #[tokio::test]
 async fn test_auth_handler_clone_via_arc() {
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ));
+    use test_helpers::create_test_auth_handler;
+
+    let handler = create_test_auth_handler();
     let handler_clone = handler.clone();
 
     assert!(handler.validate("user", "pass"));
@@ -426,12 +410,11 @@ async fn test_auth_handler_clone_via_arc() {
 
 #[tokio::test]
 async fn test_session_builder_with_auth_handler() {
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ));
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    use test_helpers::{create_test_addr, create_test_auth_handler, create_test_buffer_pool};
+
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler();
+    let addr = create_test_addr();
 
     let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone()).build();
 
@@ -440,13 +423,14 @@ async fn test_session_builder_with_auth_handler() {
 
 #[tokio::test]
 async fn test_session_builder_with_router_and_auth() {
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 4);
-    let auth_handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ));
-    let router = Arc::new(BackendSelector::new());
-    let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    use test_helpers::{
+        create_test_addr, create_test_auth_handler, create_test_buffer_pool, create_test_router,
+    };
+
+    let buffer_pool = create_test_buffer_pool();
+    let auth_handler = create_test_auth_handler();
+    let router = create_test_router();
+    let addr = create_test_addr();
 
     let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
         .with_router(router)
@@ -534,13 +518,10 @@ async fn test_auth_case_variations() {
 
 #[tokio::test]
 async fn test_concurrent_auth_handlers() {
-    use std::sync::Arc;
+    use test_helpers::create_test_auth_handler_with;
     use tokio::task::JoinSet;
 
-    let handler = Arc::new(AuthHandler::new(
-        Some("shared".to_string()),
-        Some("password".to_string()),
-    ));
+    let handler = create_test_auth_handler_with("shared", "password");
 
     let mut set = JoinSet::new();
 
@@ -572,7 +553,7 @@ async fn test_concurrent_auth_handlers() {
 
 #[tokio::test]
 async fn test_auth_handler_response_consistency() {
-    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string()));
+    let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap();
 
     // Call multiple times, should always return same static responses
     for _ in 0..10 {
@@ -587,7 +568,8 @@ async fn test_auth_with_newlines_in_credentials() {
     let handler = AuthHandler::new(
         Some("user\nname".to_string()),
         Some("pass\nword".to_string()),
-    );
+    )
+    .unwrap();
 
     assert!(handler.validate("user\nname", "pass\nword"));
     assert!(!handler.validate("username", "password"));
@@ -599,7 +581,8 @@ async fn test_auth_with_null_bytes_in_credentials() {
     let handler = AuthHandler::new(
         Some("user\0name".to_string()),
         Some("pass\0word".to_string()),
-    );
+    )
+    .unwrap();
 
     assert!(handler.validate("user\0name", "pass\0word"));
 }
@@ -607,12 +590,10 @@ async fn test_auth_with_null_bytes_in_credentials() {
 #[tokio::test]
 async fn test_auth_handler_with_concurrent_requests() {
     use nntp_proxy::command::AuthAction;
+    use test_helpers::create_test_auth_handler;
     use tokio::task::JoinSet;
 
-    let handler = Arc::new(AuthHandler::new(
-        Some("user".to_string()),
-        Some("pass".to_string()),
-    ));
+    let handler = create_test_auth_handler();
 
     let mut set = JoinSet::new();
 

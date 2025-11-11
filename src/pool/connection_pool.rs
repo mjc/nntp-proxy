@@ -128,10 +128,11 @@ impl ConnectionPool for MockConnectionPool {
     }
 
     fn status(&self) -> super::PoolStatus {
+        use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
         super::PoolStatus {
-            available: 0,
-            max_size: 0,
-            created: 0,
+            available: AvailableConnections::zero(),
+            max_size: MaxPoolSize::new(0),
+            created: CreatedConnections::zero(),
         }
     }
 

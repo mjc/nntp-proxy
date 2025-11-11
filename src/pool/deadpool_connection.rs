@@ -80,10 +80,9 @@ impl TcpManager {
 
         // Resolve hostname
         let addr = format!("{}:{}", self.host, self.port);
-        let socket_addr = tokio::net::lookup_host(&addr)
-            .await?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No addresses found for {}", addr))?;
+        let Some(socket_addr) = tokio::net::lookup_host(&addr).await?.next() else {
+            anyhow::bail!("No addresses found for {}", addr);
+        };
 
         // Create and configure socket
         let domain = if socket_addr.is_ipv4() {
@@ -117,10 +116,9 @@ impl TcpManager {
         // Perform TLS handshake if enabled
         if self.tls_config.use_tls {
             // Use cached TLS manager to avoid re-parsing certificates
-            let tls_manager = self
-                .tls_manager
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("TLS enabled but TLS manager not initialized"))?;
+            let Some(tls_manager) = self.tls_manager.as_ref() else {
+                anyhow::bail!("TLS enabled but TLS manager not initialized");
+            };
 
             let tls_stream = tls_manager
                 .handshake(tcp_stream, &self.host, &self.name)
@@ -176,10 +174,9 @@ impl managed::Manager for TcpManager {
 
             if crate::protocol::ResponseParser::is_auth_required(response) {
                 // Password required
-                let password = self
-                    .password
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Password required but not provided"))?;
+                let Some(password) = self.password.as_ref() else {
+                    anyhow::bail!("Password required but not provided");
+                };
 
                 stream.write_all(authinfo_pass(password).as_bytes()).await?;
                 let n = stream.read(&mut buffer).await?;

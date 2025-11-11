@@ -5,7 +5,10 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use nntp_proxy::{NntpProxy, create_default_config, load_config};
+use nntp_proxy::{
+    NntpProxy, RoutingMode, create_default_config, load_config,
+    types::{ConfigPath, Port, ThreadCount},
+};
 
 /// Pin current process to specific CPU cores for optimal performance
 #[cfg(target_os = "linux")]
@@ -51,7 +54,7 @@ struct Args {
     ///
     /// Can be overridden with NNTP_PROXY_PORT environment variable
     #[arg(short, long, default_value = "8119", env = "NNTP_PROXY_PORT")]
-    port: u16,
+    port: Port,
 
     /// Routing mode: standard, per-command, or hybrid
     ///
@@ -67,37 +70,19 @@ struct Args {
         default_value = "hybrid",
         env = "NNTP_PROXY_ROUTING_MODE"
     )]
-    routing_mode: RoutingModeArg,
+    routing_mode: RoutingMode,
 
     /// Configuration file path
     ///
     /// Can be overridden with NNTP_PROXY_CONFIG environment variable
     #[arg(short, long, default_value = "config.toml", env = "NNTP_PROXY_CONFIG")]
-    config: String,
+    config: ConfigPath,
 
     /// Number of worker threads (defaults to number of CPU cores)
     ///
     /// Can be overridden with NNTP_PROXY_THREADS environment variable
     #[arg(short, long, env = "NNTP_PROXY_THREADS")]
-    threads: Option<usize>,
-}
-
-/// Routing mode for CLI argument parsing
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum RoutingModeArg {
-    Standard,
-    PerCommand,
-    Hybrid,
-}
-
-impl From<RoutingModeArg> for nntp_proxy::RoutingMode {
-    fn from(arg: RoutingModeArg) -> Self {
-        match arg {
-            RoutingModeArg::Standard => nntp_proxy::RoutingMode::Standard,
-            RoutingModeArg::PerCommand => nntp_proxy::RoutingMode::PerCommand,
-            RoutingModeArg::Hybrid => nntp_proxy::RoutingMode::Hybrid,
-        }
-    }
+    threads: Option<ThreadCount>,
 }
 
 fn main() -> Result<()> {
@@ -115,7 +100,7 @@ fn main() -> Result<()> {
     let num_cpus = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
-    let worker_threads = args.threads.unwrap_or(num_cpus);
+    let worker_threads = args.threads.map(|t| t.get()).unwrap_or(num_cpus);
 
     // Pin to specific CPU cores for optimal performance
     pin_to_cpu_cores(worker_threads)?;
@@ -142,9 +127,9 @@ fn main() -> Result<()> {
 
 async fn run_proxy(args: Args) -> Result<()> {
     // Load configuration
-    let config = if std::path::Path::new(&args.config).exists() {
+    let config = if std::path::Path::new(args.config.as_str()).exists() {
         // File exists, try to load it
-        match load_config(&args.config) {
+        match load_config(args.config.as_str()) {
             Ok(config) => config,
             Err(e) => {
                 error!(
@@ -163,7 +148,7 @@ async fn run_proxy(args: Args) -> Result<()> {
         );
         let default_config = create_default_config();
         let config_toml = toml::to_string_pretty(&default_config)?;
-        std::fs::write(&args.config, &config_toml)?;
+        std::fs::write(args.config.as_str(), &config_toml)?;
         info!("Created default config file: {}", args.config);
         default_config
     };
@@ -173,11 +158,8 @@ async fn run_proxy(args: Args) -> Result<()> {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
 
-    // Convert routing mode arg to internal type
-    let routing_mode: nntp_proxy::RoutingMode = args.routing_mode.into();
-
     // Create proxy (wrapped in Arc for sharing across tasks)
-    let proxy = Arc::new(NntpProxy::new(config, routing_mode)?);
+    let proxy = Arc::new(NntpProxy::new(config, args.routing_mode)?);
 
     // Prewarm connection pools before accepting clients
     info!("Prewarming connection pools...");
@@ -187,28 +169,12 @@ async fn run_proxy(args: Args) -> Result<()> {
     info!("Connection pools ready");
 
     // Start listening
-    let listen_addr = format!("0.0.0.0:{}", args.port);
+    let listen_addr = format!("0.0.0.0:{}", args.port.get());
     let listener = TcpListener::bind(&listen_addr).await?;
-    match routing_mode {
-        nntp_proxy::RoutingMode::Standard => {
-            info!(
-                "NNTP proxy listening on {} (standard 1:1 mode)",
-                listen_addr
-            );
-        }
-        nntp_proxy::RoutingMode::PerCommand => {
-            info!(
-                "NNTP proxy listening on {} (per-command routing mode)",
-                listen_addr
-            );
-        }
-        nntp_proxy::RoutingMode::Hybrid => {
-            info!(
-                "NNTP proxy listening on {} (hybrid routing mode)",
-                listen_addr
-            );
-        }
-    }
+    info!(
+        "NNTP proxy listening on {} ({})",
+        listen_addr, args.routing_mode
+    );
 
     // Set up graceful shutdown
     let proxy_for_shutdown = proxy.clone();
@@ -220,41 +186,30 @@ async fn run_proxy(args: Args) -> Result<()> {
         std::process::exit(0);
     });
 
+    // Determine which handler to use based on routing mode
+    let uses_per_command_routing = args.routing_mode.supports_per_command_routing();
+
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
-                match routing_mode {
-                    nntp_proxy::RoutingMode::Standard => {
-                        // Traditional 1:1 mode
-                        tokio::spawn(async move {
-                            if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                                error!("Error handling client {}: {}", addr, e);
-                            }
-                        });
-                    }
-                    nntp_proxy::RoutingMode::PerCommand => {
-                        // Per-command routing mode
-                        tokio::spawn(async move {
-                            if let Err(e) = proxy_clone
-                                .handle_client_per_command_routing(stream, addr)
-                                .await
-                            {
-                                error!("Error handling client {}: {}", addr, e);
-                            }
-                        });
-                    }
-                    nntp_proxy::RoutingMode::Hybrid => {
-                        // Hybrid routing mode - starts in per-command, switches to stateful on demand
-                        tokio::spawn(async move {
-                            if let Err(e) = proxy_clone
-                                .handle_client_per_command_routing(stream, addr)
-                                .await
-                            {
-                                error!("Error handling client {}: {}", addr, e);
-                            }
-                        });
-                    }
+                if uses_per_command_routing {
+                    // Per-command or Hybrid mode
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_clone
+                            .handle_client_per_command_routing(stream, addr)
+                            .await
+                        {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
+                } else {
+                    // Standard 1:1 mode
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_clone.handle_client(stream, addr).await {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
                 }
             }
             Err(e) => {
@@ -269,13 +224,13 @@ async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
-            .expect("failed to install Ctrl+C handler");
+            .expect("Failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
+            .expect("Failed to install signal handler")
             .recv()
             .await;
     };
