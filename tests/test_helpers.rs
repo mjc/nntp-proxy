@@ -5,12 +5,191 @@
 
 use anyhow::Result;
 use nntp_proxy::config::{Config, ServerConfig};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+/// Builder for creating mock NNTP servers with custom behavior
+///
+/// This builder eliminates the need to duplicate mock server code across tests.
+/// Supports authentication, custom command handlers, and various response patterns.
+///
+/// # Examples
+///
+/// Basic server:
+/// ```ignore
+/// let handle = MockNntpServer::new(8119)
+///     .with_name("TestServer")
+///     .spawn();
+/// ```
+///
+/// Server with authentication:
+/// ```ignore
+/// let handle = MockNntpServer::new(8119)
+///     .with_auth("user", "pass")
+///     .spawn();
+/// ```
+///
+/// Server with custom command handlers:
+/// ```ignore
+/// let handle = MockNntpServer::new(8119)
+///     .on_command("LIST", "215 list follows\r\n.\r\n")
+///     .on_command("GROUP", "211 100 1 100 alt.test\r\n")
+///     .spawn();
+/// ```
+pub struct MockNntpServer {
+    port: u16,
+    name: String,
+    require_auth: bool,
+    credentials: Option<(String, String)>,
+    command_handlers: HashMap<String, String>,
+}
+
+impl MockNntpServer {
+    /// Create a new mock server builder on the specified port
+    pub fn new(port: u16) -> Self {
+        Self {
+            port,
+            name: "MockServer".to_string(),
+            require_auth: false,
+            credentials: None,
+            command_handlers: HashMap::new(),
+        }
+    }
+
+    /// Set the server name that appears in the greeting
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Require authentication with the given credentials
+    pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.require_auth = true;
+        self.credentials = Some((username.into(), password.into()));
+        self
+    }
+
+    /// Add a custom handler for a specific command prefix
+    ///
+    /// When a command starting with `cmd` is received, respond with `response`.
+    pub fn on_command(mut self, cmd: impl Into<String>, response: impl Into<String>) -> Self {
+        self.command_handlers
+            .insert(cmd.into().to_uppercase(), response.into());
+        self
+    }
+
+    /// Spawn the mock server and return a handle to its background task
+    pub fn spawn(self) -> JoinHandle<()> {
+        let Self {
+            port,
+            name,
+            require_auth,
+            credentials,
+            command_handlers,
+        } = self;
+
+        tokio::spawn(async move {
+            let addr = format!("127.0.0.1:{}", port);
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Failed to bind mock server on {}: {}", addr, e);
+                    return;
+                }
+            };
+
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let name = name.clone();
+                let credentials = credentials.clone();
+                let handlers = command_handlers.clone();
+
+                tokio::spawn(async move {
+                    // Send greeting
+                    let greeting = if require_auth {
+                        format!("200 {} Ready (auth required)\r\n", name)
+                    } else {
+                        format!("200 {} Ready\r\n", name)
+                    };
+                    if stream.write_all(greeting.as_bytes()).await.is_err() {
+                        return;
+                    }
+
+                    let mut authenticated = !require_auth;
+                    let mut buffer = [0; 1024];
+
+                    loop {
+                        let n = match stream.read(&mut buffer).await {
+                            Ok(0) => break, // Connection closed
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+
+                        let cmd_str = String::from_utf8_lossy(&buffer[..n]);
+                        let cmd_upper = cmd_str.trim().to_uppercase();
+
+                        // Handle QUIT
+                        if cmd_upper.starts_with("QUIT") {
+                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                            break;
+                        }
+
+                        // Handle authentication
+                        if require_auth {
+                            if cmd_upper.starts_with("AUTHINFO USER") {
+                                if let Some((user, _)) = &credentials {
+                                    if cmd_str.contains(user.as_str()) {
+                                        let _ =
+                                            stream.write_all(b"381 Password required\r\n").await;
+                                        continue;
+                                    }
+                                }
+                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
+                                continue;
+                            } else if cmd_upper.starts_with("AUTHINFO PASS") {
+                                if let Some((_, pass)) = &credentials {
+                                    if cmd_str.contains(pass.as_str()) {
+                                        authenticated = true;
+                                        let _ = stream
+                                            .write_all(b"281 Authentication accepted\r\n")
+                                            .await;
+                                        continue;
+                                    }
+                                }
+                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
+                                continue;
+                            } else if !authenticated {
+                                let _ = stream.write_all(b"480 Authentication required\r\n").await;
+                                continue;
+                            }
+                        }
+
+                        // Check custom command handlers
+                        let mut handled = false;
+                        for (prefix, response) in &handlers {
+                            if cmd_upper.starts_with(prefix) {
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                handled = true;
+                                break;
+                            }
+                        }
+
+                        // Default response
+                        if !handled {
+                            let _ = stream.write_all(b"200 OK\r\n").await;
+                        }
+                    }
+                });
+            }
+        })
+    }
+}
+
 /// Spawn a mock NNTP server that responds with a greeting
+///
+/// **Deprecated:** Use `MockNntpServer::new(port).with_name(name).spawn()` instead.
 ///
 /// # Arguments
 /// * `port` - Port to listen on
@@ -19,47 +198,12 @@ use tokio::task::JoinHandle;
 /// # Returns
 /// Handle to the background task running the mock server
 pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
-    let name = server_name.to_string();
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Failed to bind mock server on {}: {}", addr, e);
-                return;
-            }
-        };
-
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let name_clone = name.clone();
-            tokio::spawn(async move {
-                // Send greeting
-                let greeting = format!("200 {} Ready\r\n", name_clone);
-                let _ = stream.write_all(greeting.as_bytes()).await;
-
-                // Echo commands until QUIT
-                let mut buffer = [0; 1024];
-                loop {
-                    match stream.read(&mut buffer).await {
-                        Ok(0) => break, // Connection closed
-                        Ok(n) => {
-                            // Check for QUIT
-                            if buffer[..n].starts_with(b"QUIT") {
-                                let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                                break;
-                            }
-                            // Echo back a simple response
-                            let _ = stream.write_all(b"200 OK\r\n").await;
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-    })
+    MockNntpServer::new(port).with_name(server_name).spawn()
 }
 
 /// Spawn a mock NNTP server that requires authentication
+///
+/// **Deprecated:** Use `MockNntpServer::new(port).with_auth(user, pass).spawn()` instead.
 ///
 /// # Arguments
 /// * `port` - Port to listen on
@@ -74,63 +218,9 @@ pub fn spawn_mock_server_with_auth(
     expected_user: &str,
     expected_pass: &str,
 ) -> JoinHandle<()> {
-    let user = expected_user.to_string();
-    let pass = expected_pass.to_string();
-
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-
-        loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let user_clone = user.clone();
-                let pass_clone = pass.clone();
-
-                tokio::spawn(async move {
-                    // Send greeting requesting auth
-                    let _ = stream
-                        .write_all(b"200 Server ready (auth required)\r\n")
-                        .await;
-
-                    let mut authenticated = false;
-                    let mut buffer = [0; 1024];
-
-                    while let Ok(n) = stream.read(&mut buffer).await {
-                        if n == 0 {
-                            break;
-                        }
-
-                        let cmd = String::from_utf8_lossy(&buffer[..n]);
-
-                        if cmd.starts_with("AUTHINFO USER") {
-                            if cmd.contains(&user_clone) {
-                                let _ = stream.write_all(b"381 Password required\r\n").await;
-                            } else {
-                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
-                            }
-                        } else if cmd.starts_with("AUTHINFO PASS") {
-                            if cmd.contains(&pass_clone) {
-                                authenticated = true;
-                                let _ = stream.write_all(b"281 Authentication accepted\r\n").await;
-                            } else {
-                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
-                            }
-                        } else if cmd.starts_with("QUIT") {
-                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        } else if authenticated {
-                            let _ = stream.write_all(b"200 OK\r\n").await;
-                        } else {
-                            let _ = stream.write_all(b"480 Authentication required\r\n").await;
-                        }
-                    }
-                });
-            }
-        }
-    })
+    MockNntpServer::new(port)
+        .with_auth(expected_user, expected_pass)
+        .spawn()
 }
 
 /// Create a test configuration with servers on the given ports
@@ -265,6 +355,103 @@ mod tests {
 
         assert!(response.contains("200"));
         assert!(response.contains("TestServer"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_server_builder_basic() {
+        let port = 19005;
+        let _handle = MockNntpServer::new(port).with_name("BuilderTest").spawn();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        let mut buffer = [0; 1024];
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+
+        assert!(response.contains("200"));
+        assert!(response.contains("BuilderTest"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_server_builder_with_auth() {
+        let port = 19006;
+        let _handle = MockNntpServer::new(port)
+            .with_auth("testuser", "testpass")
+            .spawn();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        let mut buffer = [0; 1024];
+
+        // Read greeting
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("200"));
+        assert!(response.contains("auth required"));
+
+        // Send command without auth
+        stream.write_all(b"LIST\r\n").await.unwrap();
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("480")); // Auth required
+
+        // Authenticate
+        stream
+            .write_all(b"AUTHINFO USER testuser\r\n")
+            .await
+            .unwrap();
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("381")); // Password required
+
+        stream
+            .write_all(b"AUTHINFO PASS testpass\r\n")
+            .await
+            .unwrap();
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("281")); // Auth accepted
+    }
+
+    #[tokio::test]
+    async fn test_mock_server_builder_custom_commands() {
+        let port = 19007;
+        let _handle = MockNntpServer::new(port)
+            .on_command("LIST", "215 list follows\r\n.\r\n")
+            .on_command("GROUP", "211 100 1 100 alt.test\r\n")
+            .spawn();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        let mut buffer = [0; 1024];
+
+        // Read greeting
+        stream.read(&mut buffer).await.unwrap();
+
+        // Test custom LIST handler
+        stream.write_all(b"LIST\r\n").await.unwrap();
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("215"));
+
+        // Test custom GROUP handler
+        stream.write_all(b"GROUP alt.test\r\n").await.unwrap();
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("211"));
+        assert!(response.contains("alt.test"));
     }
 
     #[tokio::test]
