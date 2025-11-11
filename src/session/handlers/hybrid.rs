@@ -25,10 +25,9 @@ impl ClientSession {
         use tokio::io::AsyncBufReadExt;
 
         // Get router to select backend for stateful session
-        let router = self
-            .router
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Hybrid mode requires a router"))?;
+        let Some(router) = self.router.as_ref() else {
+            anyhow::bail!("Hybrid mode requires a router");
+        };
 
         // Route this first stateful command to get a backend
         let backend_id = router.route_command_sync(self.client_id, initial_command)?;
@@ -39,9 +38,9 @@ impl ClientSession {
         );
 
         // Get provider for this backend
-        let provider = router
-            .get_backend_provider(backend_id)
-            .ok_or_else(|| anyhow::anyhow!("Backend {:?} not found", backend_id))?;
+        let Some(provider) = router.get_backend_provider(backend_id) else {
+            anyhow::bail!("Backend {:?} not found", backend_id);
+        };
 
         // Get a dedicated connection from the pool
         let mut pooled_conn = provider.get_pooled_connection().await?;

@@ -33,10 +33,9 @@ impl ClientSession {
             self.client_addr
         );
 
-        let router = self
-            .router
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Per-command routing mode requires a router"))?;
+        let Some(router) = self.router.as_ref() else {
+            anyhow::bail!("Per-command routing mode requires a router");
+        };
 
         let (client_read, mut client_write) = client_stream.split();
         let mut client_reader = BufReader::new(client_read);
@@ -276,9 +275,9 @@ impl ClientSession {
         );
 
         // Get a connection from the router's backend pool
-        let provider = router
-            .get_backend_provider(backend_id)
-            .ok_or_else(|| anyhow::anyhow!("Backend {:?} not found", backend_id))?;
+        let Some(provider) = router.get_backend_provider(backend_id) else {
+            anyhow::bail!("Backend {:?} not found", backend_id);
+        };
 
         debug!(
             "Client {} getting pooled connection for backend {:?}",
