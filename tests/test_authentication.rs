@@ -39,7 +39,7 @@ fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &s
 }
 
 /// Spawn a mock NNTP backend server
-async fn spawn_mock_backend() -> (u16, tokio::task::JoinHandle<()>) {
+async fn spawn_mock_backend() -> (u16, tokio::task::AbortHandle) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 

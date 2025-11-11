@@ -165,13 +165,10 @@ impl NntpProxyBuilder {
                 self.config.client_auth.username.clone(),
                 self.config.client_auth.password.clone(),
             )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Invalid authentication configuration: {}. \
-                     If you set username/password in config, they cannot be empty. \
-                     Remove them entirely to disable authentication.",
-                    e
-                )
+            .with_context(|| {
+                "Invalid authentication configuration. \
+                 If you set username/password in config, they cannot be empty. \
+                 Remove them entirely to disable authentication."
             })?,
         );
 

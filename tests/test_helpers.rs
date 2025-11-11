@@ -7,9 +7,9 @@ use anyhow::Result;
 use nntp_proxy::config::{Config, ServerConfig};
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
 /// Builder for creating mock NNTP servers with custom behavior
 ///
@@ -82,7 +82,11 @@ impl MockNntpServer {
     }
 
     /// Spawn the mock server and return a handle to its background task
-    pub fn spawn(self) -> JoinHandle<()> {
+    /// Spawn mock server and return AbortHandle for automatic cleanup
+    ///
+    /// When the AbortHandle is dropped, the background task is immediately cancelled.
+    /// This prevents tests from hanging during shutdown waiting for mock servers to exit.
+    pub fn spawn(self) -> AbortHandle {
         let Self {
             port,
             name,
@@ -106,7 +110,8 @@ impl MockNntpServer {
                 let credentials = credentials.clone();
                 let handlers = command_handlers.clone();
 
-                tokio::spawn(async move {
+                // Spawn per-connection handler (fire and forget)
+                let _ = tokio::spawn(async move {
                     // Send greeting
                     let greeting = if require_auth {
                         format!("200 {} Ready (auth required)\r\n", name)
@@ -182,6 +187,7 @@ impl MockNntpServer {
                 });
             }
         })
+        .abort_handle()
     }
 }
 
@@ -195,8 +201,12 @@ impl MockNntpServer {
 ///
 /// # Returns
 /// Handle to the background task running the mock server
-pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
-    MockNntpServer::new(port).with_name(server_name).spawn()
+/// Spawn a basic mock NNTP server
+///
+/// Returns an AbortHandle that automatically cancels the server when dropped.
+/// This ensures fast test cleanup without waiting for graceful shutdown.
+pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
+    MockServerBuilder::new(port, server_name).spawn()
 }
 
 /// Spawn a mock NNTP server that requires authentication
@@ -211,13 +221,18 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> JoinHandle<()> {
 /// # Returns
 /// Handle to the background task running the mock server
 #[allow(dead_code)]
+/// Spawn a mock NNTP server that requires authentication
+///
+/// Returns an AbortHandle that automatically cancels the server when dropped.
+/// This ensures fast test cleanup without waiting for graceful shutdown.
 pub fn spawn_mock_server_with_auth(
     port: u16,
-    expected_user: &str,
-    expected_pass: &str,
-) -> JoinHandle<()> {
-    MockNntpServer::new(port)
-        .with_auth(expected_user, expected_pass)
+    server_name: &str,
+    username: &str,
+    password: &str,
+) -> AbortHandle {
+    MockServerBuilder::new(port, server_name)
+        .with_auth(username, password)
         .spawn()
 }
 

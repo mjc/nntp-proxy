@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
@@ -195,13 +195,10 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
             config.client_auth.username.clone(),
             config.client_auth.password.clone(),
         )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Invalid authentication configuration: {}. \
-                 If you set username/password in config, they cannot be empty. \
-                 Remove them entirely to disable authentication.",
-                e
-            )
+        .with_context(|| {
+            "Invalid authentication configuration. \
+             If you set username/password in config, they cannot be empty. \
+             Remove them entirely to disable authentication."
         })?,
     );
 
