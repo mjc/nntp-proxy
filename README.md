@@ -177,8 +177,8 @@ max_connections = 10
 
 # Health check configuration (optional)
 [health_check]
-interval_secs = 30         # Seconds between checks (default: 30)
-timeout_secs = 5           # Timeout per check (default: 5)
+interval = 30         # Seconds between checks (default: 30)
+timeout = 5           # Timeout per check (default: 5)
 unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 ```
 
@@ -197,6 +197,7 @@ unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 | `use_tls` | boolean | No | false | Enable TLS/SSL encryption |
 | `tls_verify_cert` | boolean | No | true | Verify server certificates (uses system CA store) |
 | `tls_cert_path` | string | No | - | Path to additional CA certificate (PEM format) |
+| `connection_keepalive` | integer | No | - | Send DATE command every N seconds on idle connections (omit to disable) |
 
 ### TLS/SSL Support
 
@@ -298,8 +299,8 @@ docker run -e NNTP_SERVER_0_HOST=news.example.com \
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `interval_secs` | integer | 30 | Seconds between health checks |
-| `timeout_secs` | integer | 5 | Health check timeout in seconds |
+| `interval` | integer | 30 | Seconds between health checks |
+| `timeout` | integer | 5 | Health check timeout in seconds |
 | `unhealthy_threshold` | integer | 3 | Consecutive failures before marking unhealthy |
 
 ### Authentication
