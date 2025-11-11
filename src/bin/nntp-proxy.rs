@@ -21,7 +21,8 @@ fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
     // This reduces context switching and improves cache locality
     let mut cpu_set = CpuSet::new();
     for core in 0..num_cores {
-        cpu_set.set(core)?;
+        // Ignore errors when setting CPU affinity (may not have all cores in container)
+        let _ = cpu_set.set(core);
     }
 
     match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
