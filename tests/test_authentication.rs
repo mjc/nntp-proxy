@@ -14,11 +14,11 @@ use tokio::net::TcpListener;
 mod config_helpers;
 mod test_helpers;
 use config_helpers::create_test_server_config;
-use test_helpers::MockNntpServer;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::config::{Config, RoutingMode};
 use nntp_proxy::session::ClientSession;
+use test_helpers::MockNntpServer;
 
 /// Create test config with client auth enabled
 fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
@@ -285,7 +285,7 @@ async fn test_command_classification_for_stateless() {
 #[tokio::test]
 async fn test_session_with_auth_handler() {
     use test_helpers::{create_test_addr, create_test_auth_handler_with, create_test_buffer_pool};
-    
+
     let (_backend_port, _handle) = spawn_mock_backend().await;
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_with("testuser", "testpass");
@@ -301,7 +301,7 @@ async fn test_session_with_disabled_auth() {
     use test_helpers::{
         create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
     };
-    
+
     let (_backend_port, _handle) = spawn_mock_backend().await;
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_disabled();
@@ -399,7 +399,7 @@ async fn test_multiple_auth_handlers_independent() {
 #[tokio::test]
 async fn test_auth_handler_clone_via_arc() {
     use test_helpers::create_test_auth_handler;
-    
+
     let handler = create_test_auth_handler();
     let handler_clone = handler.clone();
 
@@ -411,7 +411,7 @@ async fn test_auth_handler_clone_via_arc() {
 #[tokio::test]
 async fn test_session_builder_with_auth_handler() {
     use test_helpers::{create_test_addr, create_test_auth_handler, create_test_buffer_pool};
-    
+
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler();
     let addr = create_test_addr();
@@ -426,7 +426,7 @@ async fn test_session_builder_with_router_and_auth() {
     use test_helpers::{
         create_test_addr, create_test_auth_handler, create_test_buffer_pool, create_test_router,
     };
-    
+
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler();
     let router = create_test_router();

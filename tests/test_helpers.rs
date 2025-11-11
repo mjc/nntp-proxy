@@ -139,24 +139,22 @@ impl MockNntpServer {
                         // Handle authentication
                         if require_auth {
                             if cmd_upper.starts_with("AUTHINFO USER") {
-                                if let Some((user, _)) = &credentials {
-                                    if cmd_str.contains(user.as_str()) {
-                                        let _ =
-                                            stream.write_all(b"381 Password required\r\n").await;
-                                        continue;
-                                    }
+                                if let Some((user, _)) = &credentials
+                                    && cmd_str.contains(user.as_str())
+                                {
+                                    let _ = stream.write_all(b"381 Password required\r\n").await;
+                                    continue;
                                 }
                                 let _ = stream.write_all(b"481 Authentication failed\r\n").await;
                                 continue;
                             } else if cmd_upper.starts_with("AUTHINFO PASS") {
-                                if let Some((_, pass)) = &credentials {
-                                    if cmd_str.contains(pass.as_str()) {
-                                        authenticated = true;
-                                        let _ = stream
-                                            .write_all(b"281 Authentication accepted\r\n")
-                                            .await;
-                                        continue;
-                                    }
+                                if let Some((_, pass)) = &credentials
+                                    && cmd_str.contains(pass.as_str())
+                                {
+                                    authenticated = true;
+                                    let _ =
+                                        stream.write_all(b"281 Authentication accepted\r\n").await;
+                                    continue;
                                 }
                                 let _ = stream.write_all(b"481 Authentication failed\r\n").await;
                                 continue;
@@ -352,7 +350,7 @@ pub async fn read_response(
 pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
     use nntp_proxy::pool::BufferPool;
     use nntp_proxy::types::BufferSize;
-    
+
     BufferPool::new(BufferSize::new(8192).unwrap(), 4)
 }
 
@@ -368,7 +366,7 @@ pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
 pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     use nntp_proxy::auth::AuthHandler;
     use std::sync::Arc;
-    
+
     Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap())
 }
 
@@ -384,7 +382,7 @@ pub fn create_test_auth_handler_with(
 ) -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     use nntp_proxy::auth::AuthHandler;
     use std::sync::Arc;
-    
+
     Arc::new(AuthHandler::new(Some(username.to_string()), Some(password.to_string())).unwrap())
 }
 
@@ -400,7 +398,7 @@ pub fn create_test_auth_handler_with(
 pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     use nntp_proxy::auth::AuthHandler;
     use std::sync::Arc;
-    
+
     Arc::new(AuthHandler::new(None, None).unwrap())
 }
 
@@ -416,7 +414,7 @@ pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::A
 pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelector> {
     use nntp_proxy::router::BackendSelector;
     use std::sync::Arc;
-    
+
     Arc::new(BackendSelector::new())
 }
 

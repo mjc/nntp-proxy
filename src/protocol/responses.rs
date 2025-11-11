@@ -160,7 +160,10 @@ mod tests {
         assert_eq!(AUTH_REQUIRED, b"381 Password required\r\n");
         assert_eq!(AUTH_ACCEPTED, b"281 Authentication accepted\r\n");
         assert_eq!(AUTH_FAILED, b"481 Authentication failed\r\n");
-        assert_eq!(AUTH_REQUIRED_FOR_COMMAND, b"480 Authentication required\r\n");
+        assert_eq!(
+            AUTH_REQUIRED_FOR_COMMAND,
+            b"480 Authentication required\r\n"
+        );
     }
 
     #[test]
