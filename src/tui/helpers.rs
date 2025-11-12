@@ -1,169 +1,21 @@
 //! TUI rendering helper functions
 
 use ratatui::style::Color;
-use smallvec::SmallVec;
 
 use super::constants::{BACKEND_COLORS, throughput};
+use super::types::{
+    BackendChartData, BackendIndex, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec,
+};
 use crate::config::ServerConfig;
 use crate::tui::TuiApp;
 use crate::tui::app::ThroughputPoint;
 
 // ============================================================================
-// Chart Data Types
+// Chart Data Building
 // ============================================================================
-
-/// Backend index for color selection and identification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BackendIndex(usize);
-
-impl BackendIndex {
-    /// Create a new backend index
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub const fn new(index: usize) -> Self {
-        Self(index)
-    }
-
-    /// Get the inner index value
-    #[must_use]
-    #[inline]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl From<usize> for BackendIndex {
-    #[inline]
-    fn from(index: usize) -> Self {
-        Self(index)
-    }
-}
-
-/// Chart X-axis coordinate (time index)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChartX(f64);
-
-impl ChartX {
-    /// Create a new X coordinate
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub const fn new(x: f64) -> Self {
-        Self(x)
-    }
-
-    /// Get the inner value
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub const fn get(self) -> f64 {
-        self.0
-    }
-}
-
-impl From<usize> for ChartX {
-    #[inline]
-    fn from(index: usize) -> Self {
-        Self(index as f64)
-    }
-}
-
-/// Chart Y-axis coordinate (throughput value)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChartY(f64);
-
-impl ChartY {
-    /// Create a new Y coordinate
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub const fn new(y: f64) -> Self {
-        Self(y)
-    }
-
-    /// Get the inner value
-    #[must_use]
-    #[inline]
-    pub const fn get(self) -> f64 {
-        self.0
-    }
-
-    /// Calculate maximum of two Y values
-    #[must_use]
-    #[inline]
-    pub fn max(self, other: Self) -> Self {
-        Self(self.0.max(other.0))
-    }
-}
-
-impl From<f64> for ChartY {
-    #[inline]
-    fn from(y: f64) -> Self {
-        Self(y)
-    }
-}
-
-/// Chart data point (X, Y coordinates)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChartPoint {
-    pub x: ChartX,
-    pub y: ChartY,
-}
-
-impl ChartPoint {
-    /// Create a new chart point
-    #[must_use]
-    #[inline]
-    pub const fn new(x: ChartX, y: ChartY) -> Self {
-        Self { x, y }
-    }
-
-    /// Convert to tuple for ratatui (requires &(f64, f64))
-    #[must_use]
-    #[inline]
-    pub const fn as_tuple(&self) -> (f64, f64) {
-        (self.x.0, self.y.0)
-    }
-}
-
-/// Stack-allocated chart data for typical backend counts (up to 8 backends)
-/// Most deployments have 1-4 backends, so this avoids heap allocation
-pub type ChartDataVec = SmallVec<[BackendChartData; 8]>;
-
-/// Stack-allocated point vectors for typical history sizes (60 points = 60 seconds)
-type PointVec = SmallVec<[ChartPoint; 64]>;
 
 /// Accumulator for building point vectors and tracking max in single fold
 type PointAccumulator = ((PointVec, PointVec), ChartY);
-
-/// Chart data for a single backend server
-///
-/// Pre-computed data points to avoid nested iterations during rendering
-pub struct BackendChartData {
-    /// Server name for legend
-    pub name: String,
-    /// Color for this backend's lines
-    pub color: Color,
-    /// Data points for sent throughput (x, y) where x is time index
-    pub sent_points: PointVec,
-    /// Data points for received throughput (x, y) where x is time index
-    pub recv_points: PointVec,
-}
-
-impl BackendChartData {
-    /// Convert sent points to tuples for ratatui Dataset
-    #[must_use]
-    pub fn sent_points_as_tuples(&self) -> Vec<(f64, f64)> {
-        self.sent_points.iter().map(|p| p.as_tuple()).collect()
-    }
-
-    /// Convert recv points to tuples for ratatui Dataset
-    #[must_use]
-    pub fn recv_points_as_tuples(&self) -> Vec<(f64, f64)> {
-        self.recv_points.iter().map(|p| p.as_tuple()).collect()
-    }
-}
 
 /// Build chart data for all backends
 ///

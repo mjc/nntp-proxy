@@ -5,6 +5,7 @@
 mod app;
 mod constants;
 mod helpers;
+mod types;
 mod ui;
 
 pub use app::TuiApp;

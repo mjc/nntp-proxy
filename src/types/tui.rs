@@ -38,38 +38,6 @@ impl Default for HistorySize {
     }
 }
 
-/// Type-safe backend index
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BackendIndex(usize);
-
-impl BackendIndex {
-    /// Create from raw index
-    #[must_use]
-    #[inline]
-    pub const fn new(index: usize) -> Self {
-        Self(index)
-    }
-
-    /// Get raw index
-    #[must_use]
-    #[inline]
-    pub const fn get(&self) -> usize {
-        self.0
-    }
-}
-
-impl From<usize> for BackendIndex {
-    fn from(index: usize) -> Self {
-        Self::new(index)
-    }
-}
-
-impl From<BackendIndex> for usize {
-    fn from(index: BackendIndex) -> Self {
-        index.get()
-    }
-}
-
 /// Type-safe throughput in bytes per second
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct BytesPerSecond(f64);
@@ -285,15 +253,6 @@ mod tests {
     #[should_panic(expected = "HistorySize must be non-zero")]
     fn test_history_size_zero_panics() {
         let _ = HistorySize::new(0);
-    }
-
-    #[test]
-    fn test_backend_index() {
-        let idx = BackendIndex::new(5);
-        assert_eq!(idx.get(), 5);
-
-        let idx2: BackendIndex = 10.into();
-        assert_eq!(usize::from(idx2), 10);
     }
 
     #[test]
