@@ -411,16 +411,31 @@ impl NntpProxy {
         }
 
         // Create session and handle connection
-        let session = ClientSession::new(
+        let session = ClientSession::builder(
             client_addr,
             self.buffer_pool.clone(),
             self.auth_handler.clone(),
-        );
+        )
+        .with_metrics(self.metrics.clone())
+        .build();
+
         debug!("Starting session for client {}", client_addr);
 
-        let copy_result = session
-            .handle_with_pooled_backend(client_stream, &mut *backend_conn)
-            .await;
+        let copy_result = if self.enable_metrics {
+            // Use metrics-enabled version for periodic reporting
+            session
+                .handle_with_pooled_backend_and_metrics(
+                    client_stream,
+                    &mut *backend_conn,
+                    server_idx,
+                )
+                .await
+        } else {
+            // Use basic version without metrics overhead
+            session
+                .handle_with_pooled_backend(client_stream, &mut *backend_conn)
+                .await
+        };
 
         debug!("Session completed for client {}", client_addr);
 
@@ -505,19 +520,20 @@ impl NntpProxy {
         // ("200 NNTP Proxy Ready (Per-Command Routing)")
         // All backend greetings are consumed when connections are created
 
-        // Create session with router for per-command routing
-        let mut session = ClientSession::new_with_router(
+        // Create session - conditionally enable metrics (causes ~45% performance penalty)
+        let mut session_builder = ClientSession::builder(
             client_addr,
             self.buffer_pool.clone(),
-            self.router.clone(),
-            self.routing_mode,
             self.auth_handler.clone(),
-        );
+        )
+        .with_router(self.router.clone())
+        .with_routing_mode(self.routing_mode);
 
-        // Conditionally enable metrics (causes ~45% performance penalty)
         if self.enable_metrics {
-            session = session.with_metrics(self.metrics.clone());
+            session_builder = session_builder.with_metrics(self.metrics.clone());
         }
+
+        let session = session_builder.build();
 
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
 

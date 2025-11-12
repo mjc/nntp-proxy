@@ -147,6 +147,7 @@ pub struct ClientSessionBuilder {
     router: Option<Arc<BackendSelector>>,
     routing_mode: RoutingMode,
     auth_handler: Arc<AuthHandler>,
+    metrics: Option<MetricsCollector>,
 }
 
 impl ClientSessionBuilder {
@@ -179,6 +180,13 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Add metrics collection to this session
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Build the client session
     ///
     /// Creates a new `ClientSession` with a unique client ID and the configured
@@ -205,7 +213,7 @@ impl ClientSessionBuilder {
             routing_mode,
             auth_handler: self.auth_handler,
             authenticated: std::sync::atomic::AtomicBool::new(false),
-            metrics: None,
+            metrics: self.metrics,
         }
     }
 }
@@ -231,7 +239,10 @@ impl ClientSession {
         }
     }
 
-    /// Create a new client session for per-command routing mode
+    /// Create a new client session with per-command routing
+    ///
+    /// Each command will be routed to a potentially different backend server
+    /// using round-robin load balancing.
     #[must_use]
     pub fn new_with_router(
         client_addr: SocketAddr,
@@ -253,13 +264,6 @@ impl ClientSession {
         }
     }
 
-    /// Add metrics collection to this session (builder pattern)
-    #[must_use]
-    pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
-        self.metrics = Some(metrics);
-        self
-    }
-
     /// Create a builder for constructing a client session
     ///
     /// # Examples
@@ -276,11 +280,8 @@ impl ClientSession {
     /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
     /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
     ///
-    /// // Standard 1:1 routing mode
-    /// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
+    /// let session = ClientSession::builder(addr, buffer_pool, auth_handler)
     ///     .build();
-    ///
-    /// assert!(!session.is_per_command_routing());
     /// ```
     #[must_use]
     pub fn builder(
@@ -294,9 +295,12 @@ impl ClientSession {
             router: None,
             routing_mode: RoutingMode::Standard,
             auth_handler,
+            metrics: None,
         }
     }
+}
 
+impl ClientSession {
     /// Get the unique client ID
     #[must_use]
     #[inline]
