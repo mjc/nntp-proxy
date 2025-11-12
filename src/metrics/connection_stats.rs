@@ -28,6 +28,79 @@ struct UserConnectionStats {
     last_seen: Instant,
 }
 
+impl UserConnectionStats {
+    /// Create new stats for a single event
+    fn new(routing_mode: String, timestamp: Instant) -> Self {
+        Self {
+            count: 1,
+            routing_mode,
+            first_seen: timestamp,
+            last_seen: timestamp,
+        }
+    }
+
+    /// Update stats with a new event at the given timestamp
+    fn record_event(&mut self, timestamp: Instant) {
+        self.count += 1;
+        self.last_seen = timestamp;
+    }
+
+    /// Duration between first and last event
+    fn duration(&self) -> Duration {
+        self.last_seen.duration_since(self.first_seen)
+    }
+
+    /// Pluralized "connection" or "connections"
+    fn connection_noun(&self) -> &'static str {
+        if self.count == 1 {
+            "connection"
+        } else {
+            "connections"
+        }
+    }
+
+    /// Pluralized "session" or "sessions"
+    fn session_noun(&self) -> &'static str {
+        if self.count == 1 {
+            "session"
+        } else {
+            "sessions"
+        }
+    }
+
+    /// Log this as a connection event
+    fn log_connection(&self, username: &str) {
+        info!(
+            username = %username,
+            count = self.count,
+            routing_mode = %self.routing_mode,
+            duration_secs = self.duration().as_secs_f64(),
+            "User {} created {} {} in {} in {:.1}s",
+            username,
+            self.count,
+            self.connection_noun(),
+            self.routing_mode,
+            self.duration().as_secs_f64()
+        );
+    }
+
+    /// Log this as a disconnection event
+    fn log_disconnection(&self, username: &str) {
+        info!(
+            username = %username,
+            count = self.count,
+            routing_mode = %self.routing_mode,
+            duration_secs = self.duration().as_secs_f64(),
+            "{} {} closed for {} in {} over {:.1}s",
+            self.count,
+            self.session_noun(),
+            username,
+            self.routing_mode,
+            self.duration().as_secs_f64()
+        );
+    }
+}
+
 /// Aggregated connection statistics
 #[derive(Debug)]
 struct AggregationState {
@@ -37,6 +110,61 @@ struct AggregationState {
     disconnection_stats: HashMap<String, UserConnectionStats>,
     /// Last time we flushed stats
     last_flush: Instant,
+}
+
+impl AggregationState {
+    /// Create new aggregation state
+    fn new() -> Self {
+        Self {
+            connection_stats: HashMap::new(),
+            disconnection_stats: HashMap::new(),
+            last_flush: Instant::now(),
+        }
+    }
+
+    /// Check if aggregation window has elapsed and we have stats to flush
+    fn should_flush(&self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_flush) >= AGGREGATION_WINDOW;
+        let has_stats = !self.connection_stats.is_empty() || !self.disconnection_stats.is_empty();
+        elapsed && has_stats
+    }
+
+    /// Record an event in the specified stats map
+    fn record_event(
+        stats_map: &mut HashMap<String, UserConnectionStats>,
+        username: String,
+        routing_mode: String,
+        timestamp: Instant,
+    ) {
+        stats_map
+            .entry(username)
+            .and_modify(|stats| stats.record_event(timestamp))
+            .or_insert_with(|| UserConnectionStats::new(routing_mode, timestamp));
+    }
+
+    /// Flush all stats and reset
+    fn flush(&mut self) {
+        if self.connection_stats.is_empty() && self.disconnection_stats.is_empty() {
+            self.last_flush = Instant::now();
+            return;
+        }
+
+        // Log connections
+        self.connection_stats
+            .iter()
+            .map(|(username, stats)| stats.log_connection(username))
+            .last();
+
+        // Log disconnections
+        self.disconnection_stats
+            .iter()
+            .map(|(username, stats)| stats.log_disconnection(username))
+            .last();
+
+        self.connection_stats.clear();
+        self.disconnection_stats.clear();
+        self.last_flush = Instant::now();
+    }
 }
 
 /// Connection statistics aggregator
@@ -53,145 +181,48 @@ impl ConnectionStatsAggregator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            stats: Arc::new(Mutex::new(AggregationState {
-                connection_stats: HashMap::new(),
-                disconnection_stats: HashMap::new(),
-                last_flush: Instant::now(),
-            })),
+            stats: Arc::new(Mutex::new(AggregationState::new())),
+        }
+    }
+
+    /// Record a connection or disconnection event
+    fn record_event(&self, username: Option<&str>, routing_mode: &str, is_connection: bool) {
+        let username = username.unwrap_or(ANONYMOUS).to_string();
+        let routing_mode = routing_mode.to_string();
+
+        if let Ok(mut state) = self.stats.lock() {
+            let now = Instant::now();
+
+            // Auto-flush if window elapsed and we have pending stats
+            if state.should_flush(now) {
+                state.flush();
+            }
+
+            // Record the event in the appropriate stats map
+            let stats_map = if is_connection {
+                &mut state.connection_stats
+            } else {
+                &mut state.disconnection_stats
+            };
+
+            AggregationState::record_event(stats_map, username, routing_mode, now);
         }
     }
 
     /// Record a new connection
     pub fn record_connection(&self, username: Option<&str>, routing_mode: &str) {
-        let username = username.unwrap_or(ANONYMOUS).to_string();
-
-        if let Ok(mut state) = self.stats.lock() {
-            let now = Instant::now();
-
-            // Check if we should flush (30 second window elapsed AND we have stats to flush)
-            if now.duration_since(state.last_flush) >= AGGREGATION_WINDOW
-                && (!state.connection_stats.is_empty() || !state.disconnection_stats.is_empty())
-            {
-                Self::flush_stats(&mut state);
-            }
-
-            // Update or insert stats for this user
-            state
-                .connection_stats
-                .entry(username.clone())
-                .and_modify(|stats| {
-                    stats.count += 1;
-                    stats.last_seen = now;
-                })
-                .or_insert(UserConnectionStats {
-                    count: 1,
-                    routing_mode: routing_mode.to_string(),
-                    first_seen: now,
-                    last_seen: now,
-                });
-        }
+        self.record_event(username, routing_mode, true);
     }
 
     /// Record a disconnection
     pub fn record_disconnection(&self, username: Option<&str>, routing_mode: &str) {
-        let username = username.unwrap_or(ANONYMOUS).to_string();
-
-        if let Ok(mut state) = self.stats.lock() {
-            let now = Instant::now();
-            let elapsed = now.duration_since(state.last_flush);
-            let has_stats =
-                !state.connection_stats.is_empty() || !state.disconnection_stats.is_empty();
-
-            tracing::debug!(
-                "record_disconnection: elapsed={:.1}s, has_stats={}, disconnect_count={}",
-                elapsed.as_secs_f64(),
-                has_stats,
-                state
-                    .disconnection_stats
-                    .get(&username)
-                    .map(|s| s.count)
-                    .unwrap_or(0)
-            );
-
-            // Check if we should flush (30 second window elapsed AND we have stats to flush)
-            if elapsed >= AGGREGATION_WINDOW && has_stats {
-                tracing::debug!("Flushing stats due to 30s window");
-                Self::flush_stats(&mut state);
-            }
-
-            // Update or insert stats for this user
-            state
-                .disconnection_stats
-                .entry(username.clone())
-                .and_modify(|stats| {
-                    stats.count += 1;
-                    stats.last_seen = now;
-                })
-                .or_insert(UserConnectionStats {
-                    count: 1,
-                    routing_mode: routing_mode.to_string(),
-                    first_seen: now,
-                    last_seen: now,
-                });
-        }
-    }
-
-    /// Flush accumulated stats and log them
-    fn flush_stats(state: &mut AggregationState) {
-        let has_connections = !state.connection_stats.is_empty();
-        let has_disconnections = !state.disconnection_stats.is_empty();
-
-        if !has_connections && !has_disconnections {
-            state.last_flush = Instant::now();
-            return;
-        }
-
-        // Log aggregated connection stats for each user
-        for (username, stats) in &state.connection_stats {
-            let duration = stats.last_seen.duration_since(stats.first_seen);
-
-            info!(
-                username = %username,
-                count = stats.count,
-                routing_mode = %stats.routing_mode,
-                duration_secs = duration.as_secs_f64(),
-                "User {} created {} connection{} in {} in {:.1}s",
-                username,
-                stats.count,
-                if stats.count == 1 { "" } else { "s" },
-                stats.routing_mode,
-                duration.as_secs_f64()
-            );
-        }
-
-        // Log aggregated disconnection stats for each user
-        for (username, stats) in &state.disconnection_stats {
-            let duration = stats.last_seen.duration_since(stats.first_seen);
-
-            info!(
-                username = %username,
-                count = stats.count,
-                routing_mode = %stats.routing_mode,
-                duration_secs = duration.as_secs_f64(),
-                "{} session{} closed for {} in {} over {:.1}s",
-                stats.count,
-                if stats.count == 1 { "" } else { "s" },
-                username,
-                stats.routing_mode,
-                duration.as_secs_f64()
-            );
-        }
-
-        // Clear stats and reset timer
-        state.connection_stats.clear();
-        state.disconnection_stats.clear();
-        state.last_flush = Instant::now();
+        self.record_event(username, routing_mode, false);
     }
 
     /// Force flush all pending stats (for graceful shutdown)
     pub fn flush(&self) {
         if let Ok(mut state) = self.stats.lock() {
-            Self::flush_stats(&mut state);
+            state.flush();
         }
     }
 }

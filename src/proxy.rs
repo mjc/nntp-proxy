@@ -582,13 +582,8 @@ impl NntpProxy {
         match result {
             Ok(metrics) => {
                 // Record disconnection for aggregation
-                let username = session.username();
-                debug!(
-                    "Recording disconnect for username={:?}",
-                    username.as_deref()
-                );
                 self.connection_stats.record_disconnection(
-                    username.as_deref(),
+                    session.username().as_deref(),
                     &self.routing_mode.to_string().to_lowercase(),
                 );
 
