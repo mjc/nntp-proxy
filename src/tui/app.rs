@@ -202,7 +202,7 @@ impl TuiApp {
 
     /// Update metrics snapshot and calculate throughput
     pub fn update(&mut self) {
-        let new_snapshot = self.metrics.snapshot();
+        let new_snapshot = self.metrics.snapshot().with_pool_status(&self.router);
         let now = Timestamp::now();
         let time_delta = now.duration_since(self.last_update).as_secs_f64();
 

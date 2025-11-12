@@ -211,6 +211,10 @@ impl MetricsCollector {
     /// This creates a consistent point-in-time view of all metrics.
     /// Note: Individual values may be slightly inconsistent due to concurrent updates,
     /// but this is acceptable for display purposes.
+    ///
+    /// **Note:** `active_connections` per backend is NOT populated here.
+    /// It must be populated separately by querying pool status from the router.
+    /// Use `MetricsSnapshot::with_pool_status()` to add pool utilization data.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
         let num_backends = self.inner.backend_metrics.len();
@@ -220,7 +224,7 @@ impl MetricsCollector {
         for (id, metrics) in self.inner.backend_metrics.iter().enumerate() {
             backend_stats.push(BackendStats {
                 backend_id: id,
-                active_connections: metrics.active_connections.load(Ordering::Relaxed),
+                active_connections: 0, // Will be populated from pool status
                 total_commands: metrics.total_commands.load(Ordering::Relaxed),
                 bytes_sent: metrics.bytes_sent.load(Ordering::Relaxed),
                 bytes_received: metrics.bytes_received.load(Ordering::Relaxed),
@@ -251,6 +255,28 @@ impl MetricsCollector {
 }
 
 impl MetricsSnapshot {
+    /// Update backend active connections from pool status
+    ///
+    /// Populates `active_connections` for each backend by querying the connection pool.
+    /// Active connections = max_size - available connections.
+    pub fn with_pool_status(mut self, router: &crate::router::BackendSelector) -> Self {
+        use crate::pool::ConnectionProvider;
+
+        for stats in &mut self.backend_stats {
+            let backend_id = crate::types::BackendId::from_index(stats.backend_id);
+            if let Some(provider) = router.get_backend_provider(backend_id) {
+                let pool_status = provider.status();
+                // Active = checked out connections = max - available
+                let active = pool_status
+                    .max_size
+                    .get()
+                    .saturating_sub(pool_status.available.get());
+                stats.active_connections = active;
+            }
+        }
+        self
+    }
+
     /// Format uptime as a human-readable string
     #[must_use]
     pub fn format_uptime(&self) -> String {
