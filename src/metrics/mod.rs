@@ -3,6 +3,10 @@
 //! This module provides lock-free, thread-safe metrics tracking using atomic operations.
 //! Metrics are designed to be updated frequently from hot paths with minimal overhead.
 
+mod connection_stats;
+
+pub use connection_stats::ConnectionStatsAggregator;
+
 use crate::types::BackendBytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

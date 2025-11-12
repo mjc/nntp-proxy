@@ -5,10 +5,12 @@
 mod app;
 mod constants;
 mod helpers;
+pub mod log_capture;
 mod types;
 mod ui;
 
 pub use app::TuiApp;
+pub use log_capture::{LogBuffer, LogMakeWriter};
 pub use ui::render_ui;
 
 use anyhow::Result;

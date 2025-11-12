@@ -32,7 +32,7 @@ impl LogBuffer {
         }
     }
 
-    /// Get recent log lines (returns a copy to avoid holding lock)
+    /// Get recent log lines (clones strings)
     #[must_use]
     pub fn recent_lines(&self, count: usize) -> Vec<String> {
         if let Ok(lines) = self.lines.lock() {
@@ -42,7 +42,7 @@ impl LogBuffer {
         }
     }
 
-    /// Get all log lines (returns a copy to avoid holding lock)
+    /// Get all log lines (clones strings)
     #[must_use]
     pub fn all_lines(&self) -> Vec<String> {
         if let Ok(lines) = self.lines.lock() {
@@ -50,6 +50,20 @@ impl LogBuffer {
         } else {
             Vec::new()
         }
+    }
+
+    /// Access log lines with a closure (zero-allocation, holds lock briefly)
+    ///
+    /// The closure receives the deque and skip count for the last N visible lines.
+    /// Returns the result of the closure, or None if lock is poisoned.
+    pub fn with_recent_lines<F, R>(&self, count: usize, f: F) -> Option<R>
+    where
+        F: FnOnce(&VecDeque<String>, usize) -> R,
+    {
+        self.lines.lock().ok().map(|lines| {
+            let skip = lines.len().saturating_sub(count);
+            f(&lines, skip)
+        })
     }
 }
 
@@ -78,8 +92,9 @@ impl LogWriter {
 
 impl Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let s = std::str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
+        let s =
+            std::str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
         for c in s.chars() {
             if c == '\n' {
                 // Complete line - push to buffer
@@ -91,7 +106,7 @@ impl Write for LogWriter {
                 self.line_buffer.push(c);
             }
         }
-        
+
         Ok(buf.len())
     }
 
@@ -147,7 +162,7 @@ mod tests {
     #[test]
     fn test_log_buffer_capacity_limit() {
         let buffer = LogBuffer::new();
-        
+
         // Add more than MAX_LOG_LINES
         for i in 0..1500 {
             buffer.push(format!("Line {}", i));

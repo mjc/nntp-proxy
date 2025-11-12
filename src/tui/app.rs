@@ -3,6 +3,7 @@
 use crate::config::ServerConfig;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
+use crate::tui::log_capture::LogBuffer;
 use crate::types::tui::{BytesPerSecond, CommandsPerSecond, HistorySize, Timestamp};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -140,6 +141,8 @@ pub struct TuiApp {
     /// History capacity
     #[allow(dead_code)]
     history_size: HistorySize,
+    /// Log buffer for displaying recent log messages
+    log_buffer: Arc<LogBuffer>,
 }
 
 impl TuiApp {
@@ -150,6 +153,35 @@ impl TuiApp {
         servers: Arc<Vec<ServerConfig>>,
     ) -> Self {
         Self::with_history_size(metrics, router, servers, HistorySize::DEFAULT)
+    }
+
+    /// Create with log buffer
+    pub fn with_log_buffer(
+        metrics: MetricsCollector,
+        router: Arc<BackendSelector>,
+        servers: Arc<Vec<ServerConfig>>,
+        log_buffer: LogBuffer,
+    ) -> Self {
+        let snapshot = metrics.snapshot();
+        let backend_count = servers.len();
+
+        // Initialize empty history for each backend
+        let backend_history = (0..backend_count)
+            .map(|_| ThroughputHistory::new(HistorySize::DEFAULT))
+            .collect();
+
+        Self {
+            metrics,
+            router,
+            servers,
+            snapshot,
+            backend_history,
+            client_history: ThroughputHistory::new(HistorySize::DEFAULT),
+            previous_snapshot: None,
+            last_update: Timestamp::now(),
+            history_size: HistorySize::DEFAULT,
+            log_buffer: Arc::new(log_buffer),
+        }
     }
 
     /// Create with custom history size
@@ -177,6 +209,7 @@ impl TuiApp {
             previous_snapshot: None,
             last_update: Timestamp::now(),
             history_size,
+            log_buffer: Arc::new(LogBuffer::new()),
         }
     }
 
@@ -292,12 +325,18 @@ impl TuiApp {
         self.backend_history[backend_idx].points()
     }
 
-    /// Get latest throughput for a backend
+    /// Get latest backend throughput for a backend
     #[must_use]
     pub fn latest_backend_throughput(&self, backend_idx: usize) -> Option<&ThroughputPoint> {
         self.backend_history
             .get(backend_idx)
             .and_then(|h| h.latest())
+    }
+
+    /// Get log buffer for displaying recent log messages
+    #[must_use]
+    pub fn log_buffer(&self) -> &Arc<LogBuffer> {
+        &self.log_buffer
     }
 }
 

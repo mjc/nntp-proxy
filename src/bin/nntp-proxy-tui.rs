@@ -82,7 +82,7 @@ fn main() -> Result<()> {
 
     // If TUI is enabled, we need special logging setup
     // If TUI is disabled, use normal logging
-    if args.no_tui {
+    let log_buffer = if args.no_tui {
         // Normal logging to stderr
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -90,23 +90,27 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
             )
             .init();
+        None
     } else {
-        // For TUI mode, redirect logs to a file to avoid interference
-        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        // For TUI mode, capture logs in memory
+        use nntp_proxy::tui::{LogBuffer, LogMakeWriter};
 
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("nntp-proxy-tui.log")?;
+        let log_buffer = LogBuffer::new();
+        let log_writer = LogMakeWriter::new(log_buffer.clone());
 
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
             )
-            .with_writer(log_file.with_max_level(tracing::Level::INFO))
+            .with_writer(log_writer)
+            .with_ansi(false) // No ANSI codes in TUI logs
+            .with_target(false) // Remove module paths (nntp_proxy::proxy)
+            .compact() // Compact format: HH:MM:SS.microseconds
             .init();
-    }
+
+        Some(log_buffer)
+    };
 
     let num_cpus = std::thread::available_parallelism()
         .map(|p| p.get())
@@ -120,7 +124,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        rt.block_on(run_proxy(args))
+        rt.block_on(run_proxy(args, log_buffer))
     } else {
         info!(
             "Starting NNTP proxy with {} worker threads (detected {} CPUs)",
@@ -130,11 +134,11 @@ fn main() -> Result<()> {
             .worker_threads(worker_threads)
             .enable_all()
             .build()?;
-        rt.block_on(run_proxy(args))
+        rt.block_on(run_proxy(args, log_buffer))
     }
 }
 
-async fn run_proxy(args: Args) -> Result<()> {
+async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -> Result<()> {
     // Load configuration
     let config = if std::path::Path::new(args.config.as_str()).exists() {
         match load_config(args.config.as_str()) {
@@ -201,11 +205,20 @@ async fn run_proxy(args: Args) -> Result<()> {
     // Launch TUI FIRST if enabled
     // This allows seeing the dashboard before connections start
     let tui_handle = if !args.no_tui {
-        let tui_app = tui::TuiApp::new(
-            proxy.metrics().clone(),
-            proxy.router().clone(),
-            proxy.servers().to_vec().into(),
-        );
+        let tui_app = if let Some(log_buffer) = log_buffer {
+            tui::TuiApp::with_log_buffer(
+                proxy.metrics().clone(),
+                proxy.router().clone(),
+                proxy.servers().to_vec().into(),
+                log_buffer,
+            )
+        } else {
+            tui::TuiApp::new(
+                proxy.metrics().clone(),
+                proxy.router().clone(),
+                proxy.servers().to_vec().into(),
+            )
+        };
 
         let shutdown_tx_for_tui = shutdown_tx.clone();
         Some(tokio::spawn(async move {

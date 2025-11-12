@@ -22,18 +22,46 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     let snapshot = app.snapshot();
     let servers = app.servers();
 
-    // Create main layout
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints(layout::main_sections())
-        .split(f.area());
+    // Determine if we have enough space for a log window
+    // We need at least 40 lines total to fit everything comfortably
+    const MIN_HEIGHT_FOR_LOGS: u16 = 40;
+    const LOG_WINDOW_HEIGHT: u16 = 10;
+    let show_logs = f.area().height >= MIN_HEIGHT_FOR_LOGS;
+
+    // Create main layout - dynamically add log section if space allows
+    use ratatui::layout::Constraint;
+    let chunks = if show_logs {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(layout::TITLE_HEIGHT),
+                Constraint::Length(layout::SUMMARY_HEIGHT),
+                Constraint::Min(layout::MIN_CHART_HEIGHT),
+                Constraint::Length(LOG_WINDOW_HEIGHT),
+                Constraint::Length(layout::FOOTER_HEIGHT),
+            ])
+            .split(f.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints(layout::main_sections())
+            .split(f.area())
+    };
 
     // Render each section
     render_title(f, chunks[0], snapshot);
     render_summary(f, chunks[1], app);
-    render_backends(f, chunks[2], snapshot, servers, app);
-    render_footer(f, chunks[3]);
+
+    if show_logs {
+        render_backends(f, chunks[2], snapshot, servers, app);
+        render_logs(f, chunks[3], app);
+        render_footer(f, chunks[4]);
+    } else {
+        render_backends(f, chunks[2], snapshot, servers, app);
+        render_footer(f, chunks[3]);
+    }
 }
 
 /// Render the title bar
@@ -377,4 +405,36 @@ fn render_footer(f: &mut Frame, area: Rect) {
     .alignment(Alignment::Center);
 
     f.render_widget(footer, area);
+}
+
+/// Render recent log messages
+fn render_logs(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let log_buffer = app.log_buffer();
+
+    // Calculate how many lines fit in the visible area (subtract 2 for borders)
+    let visible_lines = area.height.saturating_sub(2) as usize;
+
+    // Optimized: collect only the visible lines (not all 1000), then build items
+    // This reduces allocations from 1000 strings to only ~8-10 visible strings
+    let visible_logs = log_buffer
+        .with_recent_lines(visible_lines, |lines, skip| {
+            lines.iter().skip(skip).cloned().collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // Build list items from visible logs (they're now owned, so no lifetime issues)
+    let mut items = Vec::with_capacity(visible_logs.len());
+    for line in &visible_logs {
+        items
+            .push(ListItem::new(Line::from(line.as_str())).style(Style::default().fg(Color::Gray)));
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Recent Logs ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(styles::BORDER_ACTIVE)),
+    );
+
+    f.render_widget(list, area);
 }
