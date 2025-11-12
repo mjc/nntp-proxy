@@ -46,7 +46,8 @@ impl ClientSession {
         // Auth state: username from AUTHINFO USER command
         let mut auth_username: Option<String> = None;
 
-        // Send initial greeting to client
+        // Send initial greeting to client and flush immediately
+        // This ensures the client receives the greeting before we start reading commands
         debug!(
             "Client {} sending greeting: {} | hex: {:02x?}",
             self.client_addr,
@@ -64,6 +65,17 @@ impl ClientSession {
             );
             return Err(e.into());
         }
+
+        if let Err(e) = client_write.flush().await {
+            debug!(
+                "Client {} failed to flush greeting: {} (kind: {:?})",
+                self.client_addr,
+                e,
+                e.kind()
+            );
+            return Err(e.into());
+        }
+
         backend_to_client_bytes.add(PROXY_GREETING_PCR.len());
 
         debug!(
@@ -429,10 +441,10 @@ impl ClientSession {
         } else {
             // Single-line response - just write the first chunk
             let log_msg = if let Some(id) = msgid {
-                // 430 (No such article) and other 4xx errors are expected single-line responses
+                // 223 (No such article number), 430 (No such article), and other 4xx/5xx errors are expected single-line responses
                 if let Some(code) = _response_code.status_code() {
                     let raw_code = code.as_u16();
-                    if (400..500).contains(&raw_code) {
+                    if raw_code == 223 || (400..600).contains(&raw_code) {
                         format!(
                             "Client {} ARTICLE {} → error {} (single-line), writing {}",
                             self.client_addr,
@@ -471,12 +483,13 @@ impl ClientSession {
                 )
             };
 
-            // Only warn if it's truly unusual (not a 4xx/5xx error response)
+            // Only warn if it's truly unusual (not 223 or 4xx/5xx error responses)
             if let Some(code) = _response_code.status_code() {
-                if code.is_error() {
-                    debug!("{}", log_msg); // Errors are expected, just debug
+                let raw_code = code.as_u16();
+                if raw_code == 223 || code.is_error() {
+                    debug!("{}", log_msg); // 223 and errors are expected, just debug
                 } else if msgid.is_some() {
-                    warn!("{}", log_msg); // ARTICLE with 2xx/3xx single-line is unusual
+                    warn!("{}", log_msg); // ARTICLE with other 2xx/3xx single-line is unusual
                 } else {
                     debug!("{}", log_msg);
                 }
