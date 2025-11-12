@@ -70,11 +70,12 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  |  Total: ", Style::default().fg(Color::Gray)),
+            Span::styled(" connections  |  Total: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{}", snapshot.total_connections),
                 Style::default().fg(Color::Blue),
             ),
+            Span::styled(" connections", Style::default().fg(Color::Gray)),
         ]),
     ])
     .block(
@@ -209,7 +210,7 @@ fn render_backend_list(
                         format!("{}", stats.active_connections),
                         Style::default().fg(Color::Yellow),
                     ),
-                    Span::styled("  |  Commands: ", Style::default().fg(Color::Gray)),
+                    Span::styled(" clients  |  Commands: ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         format!("{}", stats.total_commands),
                         Style::default().fg(Color::Cyan),
@@ -258,6 +259,9 @@ fn render_data_flow(
         .max()
         .unwrap_or(1);
 
+    // Format max bytes for display
+    let max_bytes_str = format_bytes(max_bytes);
+
     // Create bar groups for each backend
     let bars: Vec<Bar> = snapshot
         .backend_stats
@@ -276,10 +280,23 @@ fn render_data_flow(
                 0
             };
 
+            // Create labels with backend number and actual byte values
+            let sent_label = if stats.bytes_sent > 0 {
+                format!("↑{}", format_bytes(stats.bytes_sent))
+            } else {
+                "↑".to_string()
+            };
+
+            let recv_label = if stats.bytes_received > 0 {
+                format!("↓{}", format_bytes(stats.bytes_received))
+            } else {
+                "↓".to_string()
+            };
+
             vec![
                 Bar::default()
                     .value(sent_height)
-                    .label(Line::from("↑").alignment(Alignment::Center))
+                    .label(Line::from(sent_label).alignment(Alignment::Center))
                     .style(Style::default().fg(Color::Green))
                     .value_style(
                         Style::default()
@@ -288,7 +305,7 @@ fn render_data_flow(
                     ),
                 Bar::default()
                     .value(recv_height)
-                    .label(Line::from("↓").alignment(Alignment::Center))
+                    .label(Line::from(recv_label).alignment(Alignment::Center))
                     .style(Style::default().fg(Color::Blue))
                     .value_style(
                         Style::default()
@@ -299,14 +316,13 @@ fn render_data_flow(
         })
         .collect();
 
-    // Bar chart doesn't need labels in the current implementation
-    // Labels are shown in the backend list on the left side
+    let chart_title = format!("Data Flow (max: {})", max_bytes_str);
 
     let bar_chart = BarChart::default()
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Data Flow (↑ Sent / ↓ Received)")
+                .title(chart_title)
                 .border_style(Style::default().fg(Color::White)),
         )
         .bar_width(3)
