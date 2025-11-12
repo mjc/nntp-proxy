@@ -1,46 +1,57 @@
-//! Connection statistics aggregation for reduced logging noise
+//! Connection statistics aggregation
+//!
+//! Aggregates connection events by user over a time window to reduce log spam.
+//! Instead of logging every connection individually, we batch them and log:
+//! "User abc created 90 connections in per-command routing mode in 5.2s"
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::info;
 
-/// Time window for aggregating connection events (30 seconds)
+/// Time window for aggregating connection stats (30 seconds)
 const AGGREGATION_WINDOW: Duration = Duration::from_secs(30);
 
-/// Username for unauthenticated connections
-const ANONYMOUS: &str = "anonymous";
+/// Placeholder for anonymous/unauthenticated connections
+const ANONYMOUS: &str = "<anonymous>";
 
-/// Aggregates connection events to reduce log spam
-#[derive(Clone)]
-pub struct ConnectionStatsAggregator {
-    stats: Arc<Mutex<AggregatorState>>,
-}
-
-struct AggregatorState {
-    /// Per-user connection stats
-    user_stats: HashMap<String, UserConnectionStats>,
-    /// Last flush time
-    last_flush: Instant,
-}
-
+/// Statistics for a single user's connections
+#[derive(Debug, Clone)]
 struct UserConnectionStats {
-    /// Number of connections
-    count: usize,
+    /// Number of connections in this window
+    count: u64,
+    /// Routing mode used
+    routing_mode: String,
     /// First connection timestamp
     first_seen: Instant,
     /// Last connection timestamp
     last_seen: Instant,
-    /// Routing mode for these connections
-    routing_mode: String,
+}
+
+/// Aggregated connection statistics
+#[derive(Debug)]
+struct AggregationState {
+    /// Stats per username
+    user_stats: HashMap<String, UserConnectionStats>,
+    /// Last time we flushed stats
+    last_flush: Instant,
+}
+
+/// Connection statistics aggregator
+///
+/// Buffers connection events and periodically logs aggregated stats
+/// to reduce log spam from high-frequency connections.
+#[derive(Clone, Debug)]
+pub struct ConnectionStatsAggregator {
+    stats: Arc<Mutex<AggregationState>>,
 }
 
 impl ConnectionStatsAggregator {
-    /// Create a new aggregator
+    /// Create a new connection stats aggregator
     #[must_use]
     pub fn new() -> Self {
         Self {
-            stats: Arc::new(Mutex::new(AggregatorState {
+            stats: Arc::new(Mutex::new(AggregationState {
                 user_stats: HashMap::new(),
                 last_flush: Instant::now(),
             })),
@@ -67,24 +78,17 @@ impl ConnectionStatsAggregator {
                     stats.count += 1;
                     stats.last_seen = now;
                 })
-                .or_insert_with(|| UserConnectionStats {
+                .or_insert(UserConnectionStats {
                     count: 1,
+                    routing_mode: routing_mode.to_string(),
                     first_seen: now,
                     last_seen: now,
-                    routing_mode: routing_mode.to_string(),
                 });
         }
     }
 
-    /// Manually flush accumulated stats
-    pub fn flush(&self) {
-        if let Ok(mut state) = self.stats.lock() {
-            Self::flush_stats(&mut state);
-        }
-    }
-
-    /// Internal flush implementation
-    fn flush_stats(state: &mut AggregatorState) {
+    /// Flush accumulated stats and log them
+    fn flush_stats(state: &mut AggregationState) {
         if state.user_stats.is_empty() {
             state.last_flush = Instant::now();
             return;
@@ -97,19 +101,20 @@ impl ConnectionStatsAggregator {
             if stats.count == 1 {
                 // Single connection - log normally
                 info!(
-                    user = %username,
+                    username = %username,
                     routing_mode = %stats.routing_mode,
                     "Client connected"
                 );
             } else {
                 // Multiple connections - log aggregated
                 info!(
-                    user = %username,
+                    username = %username,
                     count = stats.count,
-                    duration_secs = duration.as_secs_f64(),
                     routing_mode = %stats.routing_mode,
-                    "User created {} connections in {:.1}s",
+                    duration_secs = duration.as_secs_f64(),
+                    "User created {} connections in {} routing mode in {:.1}s",
                     stats.count,
+                    stats.routing_mode,
                     duration.as_secs_f64()
                 );
             }
@@ -118,6 +123,13 @@ impl ConnectionStatsAggregator {
         // Clear stats and reset timer
         state.user_stats.clear();
         state.last_flush = Instant::now();
+    }
+
+    /// Force flush all pending stats (for graceful shutdown)
+    pub fn flush(&self) {
+        if let Ok(mut state) = self.stats.lock() {
+            Self::flush_stats(&mut state);
+        }
     }
 }
 
@@ -129,7 +141,7 @@ impl Default for ConnectionStatsAggregator {
 
 impl Drop for ConnectionStatsAggregator {
     fn drop(&mut self) {
-        // Flush any remaining stats on shutdown
+        // Flush any remaining stats on drop
         self.flush();
     }
 }
@@ -137,8 +149,6 @@ impl Drop for ConnectionStatsAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_single_connection() {

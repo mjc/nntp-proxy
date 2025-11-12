@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth::AuthHandler;
 use crate::config::{Config, RoutingMode, ServerConfig};
 use crate::constants::buffer::{POOL, POOL_COUNT};
-use crate::metrics::MetricsCollector;
+use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
 use crate::protocol::BACKEND_UNAVAILABLE;
@@ -206,6 +206,7 @@ impl NntpProxyBuilder {
             auth_handler,
             metrics,
             enable_metrics: self.enable_metrics,
+            connection_stats: ConnectionStatsAggregator::new(),
         })
     }
 }
@@ -227,6 +228,8 @@ pub struct NntpProxy {
     metrics: MetricsCollector,
     /// Whether metrics collection is enabled (causes ~45% perf penalty)
     enable_metrics: bool,
+    /// Connection statistics aggregator (reduces log spam)
+    connection_stats: ConnectionStatsAggregator,
 }
 
 impl NntpProxy {
@@ -417,6 +420,7 @@ impl NntpProxy {
             self.auth_handler.clone(),
         )
         .with_metrics(self.metrics.clone())
+        .with_connection_stats(self.connection_stats.clone())
         .build();
 
         debug!("Starting session for client {}", client_addr);
@@ -438,6 +442,19 @@ impl NntpProxy {
         };
 
         debug!("Session completed for client {}", client_addr);
+
+        // Record connection statistics (aggregated logging)
+        let username = session.username();
+        let routing_mode_str = match session.mode() {
+            crate::session::SessionMode::PerCommand => "per-command",
+            crate::session::SessionMode::Stateful => match self.routing_mode {
+                RoutingMode::Standard => "standard",
+                RoutingMode::Hybrid => "hybrid",
+                _ => "stateful",
+            },
+        };
+        self.connection_stats
+            .record_connection(username.as_deref(), routing_mode_str);
 
         // Complete the routing (decrement pending count)
         self.router.complete_command_sync(backend_id);
@@ -527,7 +544,8 @@ impl NntpProxy {
             self.auth_handler.clone(),
         )
         .with_router(self.router.clone())
-        .with_routing_mode(self.routing_mode);
+        .with_routing_mode(self.routing_mode)
+        .with_connection_stats(self.connection_stats.clone());
 
         if self.enable_metrics {
             session_builder = session_builder.with_metrics(self.metrics.clone());
@@ -536,11 +554,6 @@ impl NntpProxy {
         let session = session_builder.build();
 
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
-
-        info!(
-            "Client {} [{}] connected in per-command routing mode",
-            client_addr, session_id
-        );
 
         // Handle the session with per-command routing
         let result = session
@@ -564,6 +577,10 @@ impl NntpProxy {
                     crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
                 );
                 // Metrics already recorded per-command during session
+
+                // Record connection statistics (aggregated logging)
+                self.connection_stats
+                    .record_connection(session.username().as_deref(), "per-command");
             }
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)

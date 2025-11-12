@@ -154,6 +154,17 @@ impl ClientSession {
 
                         backend_to_client_bytes += result.bytes_written;
                         if result.authenticated {
+                            // Store username after successful authentication
+                            self.set_username(auth_username.clone());
+
+                            // Record connection for aggregation (after auth so we have username)
+                            if let Some(stats) = self.connection_stats() {
+                                stats.record_connection(
+                                    auth_username.as_deref(),
+                                    &self.routing_mode.to_string().to_lowercase(),
+                                );
+                            }
+
                             skip_auth_check = true;
                         }
                     }
