@@ -68,8 +68,10 @@ impl ConnectionStatsAggregator {
         if let Ok(mut state) = self.stats.lock() {
             let now = Instant::now();
 
-            // Check if we should flush (30 second window elapsed)
-            if now.duration_since(state.last_flush) >= AGGREGATION_WINDOW {
+            // Check if we should flush (30 second window elapsed AND we have stats to flush)
+            if now.duration_since(state.last_flush) >= AGGREGATION_WINDOW
+                && (!state.connection_stats.is_empty() || !state.disconnection_stats.is_empty())
+            {
                 Self::flush_stats(&mut state);
             }
 
@@ -97,8 +99,10 @@ impl ConnectionStatsAggregator {
         if let Ok(mut state) = self.stats.lock() {
             let now = Instant::now();
 
-            // Check if we should flush (30 second window elapsed)
-            if now.duration_since(state.last_flush) >= AGGREGATION_WINDOW {
+            // Check if we should flush (30 second window elapsed AND we have stats to flush)
+            if now.duration_since(state.last_flush) >= AGGREGATION_WINDOW
+                && (!state.connection_stats.is_empty() || !state.disconnection_stats.is_empty())
+            {
                 Self::flush_stats(&mut state);
             }
 
@@ -133,52 +137,34 @@ impl ConnectionStatsAggregator {
         for (username, stats) in &state.connection_stats {
             let duration = stats.last_seen.duration_since(stats.first_seen);
 
-            if stats.count == 1 {
-                // Single connection - log normally
-                info!(
-                    username = %username,
-                    routing_mode = %stats.routing_mode,
-                    "Client connected"
-                );
-            } else {
-                // Multiple connections - log aggregated
-                info!(
-                    username = %username,
-                    count = stats.count,
-                    routing_mode = %stats.routing_mode,
-                    duration_secs = duration.as_secs_f64(),
-                    "User created {} connections in {} routing mode in {:.1}s",
-                    stats.count,
-                    stats.routing_mode,
-                    duration.as_secs_f64()
-                );
-            }
+            info!(
+                username = %username,
+                count = stats.count,
+                routing_mode = %stats.routing_mode,
+                duration_secs = duration.as_secs_f64(),
+                "User created {} connection{} in {} routing mode in {:.1}s",
+                stats.count,
+                if stats.count == 1 { "" } else { "s" },
+                stats.routing_mode,
+                duration.as_secs_f64()
+            );
         }
 
         // Log aggregated disconnection stats for each user
         for (username, stats) in &state.disconnection_stats {
             let duration = stats.last_seen.duration_since(stats.first_seen);
 
-            if stats.count == 1 {
-                // Single disconnection - log normally
-                info!(
-                    username = %username,
-                    routing_mode = %stats.routing_mode,
-                    "Session closed"
-                );
-            } else {
-                // Multiple disconnections - log aggregated
-                info!(
-                    username = %username,
-                    count = stats.count,
-                    routing_mode = %stats.routing_mode,
-                    duration_secs = duration.as_secs_f64(),
-                    "{} sessions closed for user in {} routing mode over {:.1}s",
-                    stats.count,
-                    stats.routing_mode,
-                    duration.as_secs_f64()
-                );
-            }
+            info!(
+                username = %username,
+                count = stats.count,
+                routing_mode = %stats.routing_mode,
+                duration_secs = duration.as_secs_f64(),
+                "{} session{} closed for user in {} routing mode over {:.1}s",
+                stats.count,
+                if stats.count == 1 { "" } else { "s" },
+                stats.routing_mode,
+                duration.as_secs_f64()
+            );
         }
 
         // Clear stats and reset timer
