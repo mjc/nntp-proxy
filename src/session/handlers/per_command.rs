@@ -327,7 +327,7 @@ impl ClientSession {
             // Record per-backend metrics first (peek without consuming)
             metrics.record_client_to_backend_bytes_for(backend_id.as_index(), cmd_bytes.peek());
             metrics.record_backend_to_client_bytes_for(backend_id.as_index(), resp_bytes.peek());
-            
+
             // Then record global metrics (consumes the Unrecorded bytes)
             let _ = metrics.record_client_to_backend(cmd_bytes);
             let _ = metrics.record_backend_to_client(resp_bytes);

@@ -438,10 +438,14 @@ impl NntpProxy {
                 );
                 // Record transfer metrics
                 if self.enable_metrics {
-                    self.metrics
-                        .record_client_to_backend_bytes_for(server_idx, metrics.client_to_backend.as_u64());
-                    self.metrics
-                        .record_backend_to_client_bytes_for(server_idx, metrics.backend_to_client.as_u64());
+                    self.metrics.record_client_to_backend_bytes_for(
+                        server_idx,
+                        metrics.client_to_backend.as_u64(),
+                    );
+                    self.metrics.record_backend_to_client_bytes_for(
+                        server_idx,
+                        metrics.backend_to_client.as_u64(),
+                    );
                 }
             }
             Err(e) => {

@@ -96,32 +96,16 @@ fn render_summary(
     _snapshot: &crate::metrics::MetricsSnapshot,
     app: &TuiApp,
 ) {
-    // Calculate current throughput
-    let mut client_to_backend_bps = 0.0; // Commands to backend
-    let mut backend_to_client_bps = 0.0; // Article data from backend
-
-    // Get throughput from history
-    if let Some(latest) = app.client_throughput_history().back() {
-        client_to_backend_bps = latest.sent_per_sec;
-        backend_to_client_bps = latest.received_per_sec;
-    }
-
-    // Format traffic
-    let client_to_backend_str = if client_to_backend_bps > 1_000_000.0 {
-        format!("↑{:.2} MB/s", client_to_backend_bps / 1_000_000.0)
-    } else if client_to_backend_bps > 1_000.0 {
-        format!("↑{:.2} KB/s", client_to_backend_bps / 1_000.0)
-    } else {
-        format!("↑{:.0} B/s", client_to_backend_bps)
-    };
-
-    let backend_to_client_str = if backend_to_client_bps > 1_000_000.0 {
-        format!("↓{:.2} MB/s", backend_to_client_bps / 1_000_000.0)
-    } else if backend_to_client_bps > 1_000.0 {
-        format!("↓{:.2} KB/s", backend_to_client_bps / 1_000.0)
-    } else {
-        format!("↓{:.0} B/s", backend_to_client_bps)
-    };
+    // Get latest throughput from history (functional approach)
+    let (client_to_backend_str, backend_to_client_str) = app
+        .latest_client_throughput()
+        .map(|point| {
+            (
+                format!("↑{}", point.sent_per_sec()),
+                format!("↓{}", point.received_per_sec()),
+            )
+        })
+        .unwrap_or_else(|| (String::from("↑0 B/s"), String::from("↓0 B/s")));
 
     let summary = Paragraph::new(vec![
         Line::from(vec![
@@ -198,10 +182,10 @@ fn render_backend_list(
 
             // Get latest commands/sec from throughput history
             let cmd_per_sec = app
-                .throughput_history(i)
-                .back()
-                .map(|point| point.commands_per_sec)
-                .unwrap_or(0.0);
+                .latest_backend_throughput(i)
+                .and_then(|point| point.commands_per_sec())
+                .map(|cps| cps.to_string())
+                .unwrap_or_else(|| String::from("0.0"));
 
             let content = vec![
                 Line::from(vec![
@@ -229,7 +213,7 @@ fn render_backend_list(
                     ),
                     Span::styled(" clients  |  Cmd/s: ", Style::default().fg(Color::Gray)),
                     Span::styled(
-                        format!("{:.1}", cmd_per_sec),
+                        cmd_per_sec,
                         Style::default().fg(Color::Cyan),
                     ),
                 ]),
@@ -270,38 +254,40 @@ fn render_data_flow(
     app: &TuiApp,
 ) {
     // Find max throughput across all backends for scaling Y-axis
-    let mut max_throughput = 1_000_000.0; // Start at 1 MB/s minimum
+    let max_throughput = servers
+        .iter()
+        .enumerate()
+        .flat_map(|(i, _)| app.throughput_history(i).iter())
+        .flat_map(|point| {
+            [
+                point.sent_per_sec().get(),
+                point.received_per_sec().get(),
+            ]
+        })
+        .fold(1_000_000.0, f64::max); // Start at 1 MB/s minimum
 
-    for i in 0..servers.len() {
-        let history = app.throughput_history(i);
-        for point in history.iter() {
-            let max_point = point
-                .backend_sent_per_sec
-                .max(point.backend_received_per_sec);
-            if max_point > max_throughput {
-                max_throughput = max_point;
-            }
+    // Round up to next nice number (pure function)
+    let round_up_throughput = |value: f64| -> f64 {
+        if value > 100_000_000.0 {
+            (value / 10_000_000.0).ceil() * 10_000_000.0 // Round to 10 MB/s
+        } else if value > 10_000_000.0 {
+            (value / 1_000_000.0).ceil() * 1_000_000.0 // Round to 1 MB/s
+        } else if value > 1_000_000.0 {
+            (value / 100_000.0).ceil() * 100_000.0 // Round to 100 KB/s
+        } else {
+            (value / 10_000.0).ceil() * 10_000.0 // Round to 10 KB/s
         }
-    }
-
-    // Round up to next nice number
-    max_throughput = if max_throughput > 100_000_000.0 {
-        (max_throughput / 10_000_000.0).ceil() * 10_000_000.0 // Round to 10 MB/s
-    } else if max_throughput > 10_000_000.0 {
-        (max_throughput / 1_000_000.0).ceil() * 1_000_000.0 // Round to 1 MB/s
-    } else if max_throughput > 1_000_000.0 {
-        (max_throughput / 100_000.0).ceil() * 100_000.0 // Round to 100 KB/s
-    } else {
-        (max_throughput / 10_000.0).ceil() * 10_000.0 // Round to 10 KB/s
     };
 
+    let max_throughput_rounded = round_up_throughput(max_throughput);
+
     // Format Y-axis label
-    let max_label = if max_throughput >= 1_000_000.0 {
-        format!("{:.0} MB/s", max_throughput / 1_000_000.0)
-    } else if max_throughput >= 1_000.0 {
-        format!("{:.0} KB/s", max_throughput / 1_000.0)
+    let max_label = if max_throughput_rounded >= 1_000_000.0 {
+        format!("{:.0} MB/s", max_throughput_rounded / 1_000_000.0)
+    } else if max_throughput_rounded >= 1_000.0 {
+        format!("{:.0} KB/s", max_throughput_rounded / 1_000.0)
     } else {
-        format!("{:.0} B/s", max_throughput)
+        format!("{:.0} B/s", max_throughput_rounded)
     };
 
     // Create datasets for each backend
@@ -315,8 +301,11 @@ fn render_data_flow(
         Color::Blue,
     ];
 
+    // Type alias for backend chart data: (sent_bytes_points, recv_bytes_points, name, color)
+    type BackendChartData<'a> = (Vec<(f64, f64)>, Vec<(f64, f64)>, &'a str, Color);
+
     // Collect all data points first (to satisfy lifetime requirements)
-    let mut all_data: Vec<(Vec<(f64, f64)>, Vec<(f64, f64)>, &str, Color)> = Vec::new();
+    let mut all_data: Vec<BackendChartData> = Vec::new();
 
     for (i, server) in servers.iter().enumerate() {
         let history = app.throughput_history(i);
@@ -326,14 +315,14 @@ fn render_data_flow(
         let sent_data: Vec<(f64, f64)> = history
             .iter()
             .enumerate()
-            .map(|(idx, point)| (idx as f64, point.backend_sent_per_sec))
+            .map(|(idx, point)| (idx as f64, point.sent_per_sec().get()))
             .collect();
 
         // Create data points for received (download from backend)
         let recv_data: Vec<(f64, f64)> = history
             .iter()
             .enumerate()
-            .map(|(idx, point)| (idx as f64, point.backend_received_per_sec))
+            .map(|(idx, point)| (idx as f64, point.received_per_sec().get()))
             .collect();
 
         all_data.push((sent_data, recv_data, server.name.as_str(), color));
@@ -387,10 +376,10 @@ fn render_data_flow(
             Axis::default()
                 .title("Throughput")
                 .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, max_throughput])
+                .bounds([0.0, max_throughput_rounded])
                 .labels(vec![
                     Line::from("0"),
-                    Line::from(format!("{:.0}", max_throughput / 2.0)),
+                    Line::from(format!("{:.0}", max_throughput_rounded / 2.0)),
                     Line::from(max_label),
                 ]),
         );

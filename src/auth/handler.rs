@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
 
 /// Handles client-facing authentication interception
+#[derive(Default)]
 pub struct AuthHandler {
     /// Map of username -> password for O(1) lookups
     users: HashMap<String, String>,
@@ -18,14 +19,6 @@ impl std::fmt::Debug for AuthHandler {
             .field("enabled", &!self.users.is_empty())
             .field("user_count", &self.users.len())
             .finish_non_exhaustive()
-    }
-}
-
-impl Default for AuthHandler {
-    fn default() -> Self {
-        Self {
-            users: HashMap::new(),
-        }
     }
 }
 
@@ -84,16 +77,25 @@ impl AuthHandler {
         !self.users.is_empty()
     }
 
-    /// Validate credentials
-    pub fn validate(&self, username: &str, password: &str) -> bool {
+    /// Validate client credentials
+    ///
+    /// If auth is disabled (no users configured), returns true for all credentials
+    pub fn validate_credentials(&self, username: &str, password: &str) -> bool {
         if self.users.is_empty() {
-            return true; // Auth disabled, always accept
+            // Auth disabled - allow all
+            true
+        } else {
+            // Auth enabled - validate credentials
+            self.users
+                .get(username)
+                .is_some_and(|stored_pass| stored_pass == password)
         }
+    }
 
-        // Check if user exists and password matches
-        self.users
-            .get(username)
-            .map_or(false, |stored_pass| stored_pass == password)
+    /// Validate client credentials (alias for validate_credentials)
+    #[inline]
+    pub fn validate(&self, username: &str, password: &str) -> bool {
+        self.validate_credentials(username, password)
     }
 
     /// Handle an auth command - writes response to client and returns (bytes_written, auth_success)

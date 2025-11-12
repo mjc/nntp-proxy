@@ -3,22 +3,120 @@
 use crate::config::ServerConfig;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
+use crate::types::tui::{BytesPerSecond, CommandsPerSecond, HistorySize, Timestamp};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
-/// Number of historical data points to keep (60 points = 1 minute at 1 update/sec)
-const HISTORY_SIZE: usize = 60;
-
-/// Historical throughput data point
+/// Historical throughput data point (generic over traffic direction)
 #[derive(Debug, Clone)]
 pub struct ThroughputPoint {
     /// Timestamp of this measurement
-    pub timestamp: Instant,
-    /// Proxy ↔ Backend traffic
-    pub backend_sent_per_sec: f64,     // Bytes sent TO backends (commands)
-    pub backend_received_per_sec: f64, // Bytes received FROM backends (article data)
-    pub commands_per_sec: f64,         // Commands processed per second
+    timestamp: Timestamp,
+    /// Bytes sent per second
+    sent_per_sec: BytesPerSecond,
+    /// Bytes received per second
+    received_per_sec: BytesPerSecond,
+    /// Commands processed per second (backend only)
+    commands_per_sec: Option<CommandsPerSecond>,
+}
+
+impl ThroughputPoint {
+    /// Create a new backend throughput point
+    #[must_use]
+    pub const fn new_backend(
+        timestamp: Timestamp,
+        sent_per_sec: BytesPerSecond,
+        received_per_sec: BytesPerSecond,
+        commands_per_sec: CommandsPerSecond,
+    ) -> Self {
+        Self {
+            timestamp,
+            sent_per_sec,
+            received_per_sec,
+            commands_per_sec: Some(commands_per_sec),
+        }
+    }
+
+    /// Create a new client throughput point
+    #[must_use]
+    pub const fn new_client(
+        timestamp: Timestamp,
+        sent_per_sec: BytesPerSecond,
+        received_per_sec: BytesPerSecond,
+    ) -> Self {
+        Self {
+            timestamp,
+            sent_per_sec,
+            received_per_sec,
+            commands_per_sec: None,
+        }
+    }
+
+    /// Get timestamp
+    #[must_use]
+    #[inline]
+    pub const fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    /// Get sent bytes per second
+    #[must_use]
+    #[inline]
+    pub const fn sent_per_sec(&self) -> BytesPerSecond {
+        self.sent_per_sec
+    }
+
+    /// Get received bytes per second
+    #[must_use]
+    #[inline]
+    pub const fn received_per_sec(&self) -> BytesPerSecond {
+        self.received_per_sec
+    }
+
+    /// Get commands per second (if backend point)
+    #[must_use]
+    #[inline]
+    pub const fn commands_per_sec(&self) -> Option<CommandsPerSecond> {
+        self.commands_per_sec
+    }
+}
+
+/// Circular buffer for throughput history
+#[derive(Debug, Clone)]
+struct ThroughputHistory {
+    points: VecDeque<ThroughputPoint>,
+    capacity: HistorySize,
+}
+
+impl ThroughputHistory {
+    /// Create a new history with the given capacity
+    #[must_use]
+    fn new(capacity: HistorySize) -> Self {
+        Self {
+            points: VecDeque::with_capacity(capacity.get()),
+            capacity,
+        }
+    }
+
+    /// Add a point, removing oldest if at capacity
+    fn push(&mut self, point: ThroughputPoint) {
+        if self.points.len() >= self.capacity.get() {
+            self.points.pop_front();
+        }
+        self.points.push_back(point);
+    }
+
+    /// Get all points
+    #[must_use]
+    fn points(&self) -> &VecDeque<ThroughputPoint> {
+        &self.points
+    }
+
+    /// Get the latest point
+    #[must_use]
+    fn latest(&self) -> Option<&ThroughputPoint> {
+        self.points.back()
+    }
 }
 
 /// TUI application state
@@ -32,21 +130,16 @@ pub struct TuiApp {
     /// Current metrics snapshot
     snapshot: MetricsSnapshot,
     /// Historical throughput data per backend
-    throughput_history: Vec<VecDeque<ThroughputPoint>>,
-    /// Historical client throughput (global, not per-backend)
-    client_throughput_history: VecDeque<ClientThroughputPoint>,
+    backend_history: Vec<ThroughputHistory>,
+    /// Historical client throughput (global)
+    client_history: ThroughputHistory,
     /// Previous snapshot for calculating deltas
     previous_snapshot: Option<MetricsSnapshot>,
     /// Last update time
-    last_update: Instant,
-}
-
-/// Client throughput point (global, not per-backend)
-#[derive(Debug, Clone)]
-pub struct ClientThroughputPoint {
-    pub timestamp: Instant,
-    pub sent_per_sec: f64,     // TO clients (article data)
-    pub received_per_sec: f64, // FROM clients (commands)
+    last_update: Timestamp,
+    /// History capacity
+    #[allow(dead_code)]
+    history_size: HistorySize,
 }
 
 impl TuiApp {
@@ -56,32 +149,65 @@ impl TuiApp {
         router: Arc<BackendSelector>,
         servers: Arc<Vec<ServerConfig>>,
     ) -> Self {
+        Self::with_history_size(metrics, router, servers, HistorySize::DEFAULT)
+    }
+
+    /// Create with custom history size
+    pub fn with_history_size(
+        metrics: MetricsCollector,
+        router: Arc<BackendSelector>,
+        servers: Arc<Vec<ServerConfig>>,
+        history_size: HistorySize,
+    ) -> Self {
         let snapshot = metrics.snapshot();
         let backend_count = servers.len();
 
         // Initialize empty history for each backend
-        let throughput_history = vec![VecDeque::with_capacity(HISTORY_SIZE); backend_count];
+        let backend_history = (0..backend_count)
+            .map(|_| ThroughputHistory::new(history_size))
+            .collect();
 
         Self {
             metrics,
             router,
             servers,
             snapshot,
-            throughput_history,
-            client_throughput_history: VecDeque::with_capacity(HISTORY_SIZE),
+            backend_history,
+            client_history: ThroughputHistory::new(history_size),
             previous_snapshot: None,
-            last_update: Instant::now(),
+            last_update: Timestamp::now(),
+            history_size,
+        }
+    }
+
+    /// Calculate throughput rate from byte delta and time delta
+    #[inline]
+    fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> BytesPerSecond {
+        if time_delta_secs > 0.0 {
+            BytesPerSecond::new(byte_delta as f64 / time_delta_secs)
+        } else {
+            BytesPerSecond::zero()
+        }
+    }
+
+    /// Calculate command rate from command delta and time delta
+    #[inline]
+    fn calculate_command_rate(cmd_delta: u64, time_delta_secs: f64) -> CommandsPerSecond {
+        if time_delta_secs > 0.0 {
+            CommandsPerSecond::new(cmd_delta as f64 / time_delta_secs)
+        } else {
+            CommandsPerSecond::zero()
         }
     }
 
     /// Update metrics snapshot and calculate throughput
     pub fn update(&mut self) {
         let new_snapshot = self.metrics.snapshot();
-        let now = Instant::now();
+        let now = Timestamp::now();
         let time_delta = now.duration_since(self.last_update).as_secs_f64();
 
         if let Some(prev) = &self.previous_snapshot {
-            // Calculate traffic deltas (global totals)
+            // Calculate client traffic deltas (global totals)
             let client_to_backend_delta = new_snapshot
                 .client_to_backend_bytes
                 .saturating_sub(prev.client_to_backend_bytes);
@@ -89,75 +215,35 @@ impl TuiApp {
                 .backend_to_client_bytes
                 .saturating_sub(prev.backend_to_client_bytes);
 
-            let client_to_backend_per_sec = if time_delta > 0.0 {
-                client_to_backend_delta as f64 / time_delta
-            } else {
-                0.0
-            };
+            // Calculate rates
+            let client_sent_rate = Self::calculate_rate(client_to_backend_delta, time_delta);
+            let client_recv_rate = Self::calculate_rate(backend_to_client_delta, time_delta);
 
-            let backend_to_client_per_sec = if time_delta > 0.0 {
-                backend_to_client_delta as f64 / time_delta
-            } else {
-                0.0
-            };
+            // Store client throughput point
+            let client_point = ThroughputPoint::new_client(now, client_sent_rate, client_recv_rate);
+            self.client_history.push(client_point);
 
-            // Store throughput (global, once)
-            let client_point = ClientThroughputPoint {
-                timestamp: now,
-                sent_per_sec: client_to_backend_per_sec,
-                received_per_sec: backend_to_client_per_sec,
-            };
-
-            if self.client_throughput_history.len() >= HISTORY_SIZE {
-                self.client_throughput_history.pop_front();
-            }
-            self.client_throughput_history.push_back(client_point);
-
-            // Calculate per-backend throughput (backend traffic only)
+            // Calculate per-backend throughput
             for (i, (new_stats, prev_stats)) in new_snapshot
                 .backend_stats
                 .iter()
                 .zip(prev.backend_stats.iter())
                 .enumerate()
             {
-                let backend_sent_delta = new_stats.bytes_sent.saturating_sub(prev_stats.bytes_sent);
-                let backend_recv_delta = new_stats
+                let sent_delta = new_stats.bytes_sent.saturating_sub(prev_stats.bytes_sent);
+                let recv_delta = new_stats
                     .bytes_received
                     .saturating_sub(prev_stats.bytes_received);
-                let commands_delta = new_stats
+                let cmd_delta = new_stats
                     .total_commands
                     .saturating_sub(prev_stats.total_commands);
 
-                let backend_sent_per_sec = if time_delta > 0.0 {
-                    backend_sent_delta as f64 / time_delta
-                } else {
-                    0.0
-                };
+                let sent_rate = Self::calculate_rate(sent_delta, time_delta);
+                let recv_rate = Self::calculate_rate(recv_delta, time_delta);
+                let cmd_rate = Self::calculate_command_rate(cmd_delta, time_delta);
 
-                let backend_recv_per_sec = if time_delta > 0.0 {
-                    backend_recv_delta as f64 / time_delta
-                } else {
-                    0.0
-                };
-
-                let commands_per_sec = if time_delta > 0.0 {
-                    commands_delta as f64 / time_delta
-                } else {
-                    0.0
-                };
-
-                let point = ThroughputPoint {
-                    timestamp: now,
-                    backend_sent_per_sec,
-                    backend_received_per_sec: backend_recv_per_sec,
-                    commands_per_sec,
-                };
-
-                // Add to history, removing oldest if at capacity
-                if self.throughput_history[i].len() >= HISTORY_SIZE {
-                    self.throughput_history[i].pop_front();
-                }
-                self.throughput_history[i].push_back(point);
+                let point = ThroughputPoint::new_backend(now, sent_rate, recv_rate, cmd_rate);
+                self.backend_history[i].push(point);
             }
         }
 
@@ -181,23 +267,35 @@ impl TuiApp {
 
     /// Get client throughput history (global)
     #[must_use]
-    pub fn client_throughput_history(&self) -> &VecDeque<ClientThroughputPoint> {
-        &self.client_throughput_history
+    pub fn client_throughput_history(&self) -> &VecDeque<ThroughputPoint> {
+        self.client_history.points()
+    }
+
+    /// Get latest client throughput
+    #[must_use]
+    pub fn latest_client_throughput(&self) -> Option<&ThroughputPoint> {
+        self.client_history.latest()
     }
 
     /// Get pending command count for a backend
     #[must_use]
-    pub fn backend_pending_count(&self, backend_id: usize) -> usize {
+    pub fn backend_pending_count(&self, backend_idx: usize) -> usize {
         use crate::types::BackendId;
         self.router
-            .backend_load(BackendId::from_index(backend_id))
+            .backend_load(BackendId::from_index(backend_idx))
             .unwrap_or(0)
     }
 
     /// Get throughput history for a backend
     #[must_use]
-    pub fn throughput_history(&self, backend_id: usize) -> &VecDeque<ThroughputPoint> {
-        &self.throughput_history[backend_id]
+    pub fn throughput_history(&self, backend_idx: usize) -> &VecDeque<ThroughputPoint> {
+        self.backend_history[backend_idx].points()
+    }
+
+    /// Get latest throughput for a backend
+    #[must_use]
+    pub fn latest_backend_throughput(&self, backend_idx: usize) -> Option<&ThroughputPoint> {
+        self.backend_history.get(backend_idx).and_then(|h| h.latest())
     }
 }
 

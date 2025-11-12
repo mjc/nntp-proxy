@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod metrics_recording;
 pub mod pool;
 pub mod protocol;
+pub mod tui;
 pub mod validated;
 
 pub use config::{

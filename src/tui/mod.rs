@@ -76,21 +76,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.update();
 
                 // Check for keyboard input (non-blocking)
-                if event::poll(Duration::from_millis(0))? {
-                    if let Event::Key(key) = event::read()? {
-                        if key.kind == KeyEventKind::Press {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => {
-                                    // User pressed 'q' - exit TUI and shut down app
-                                    break;
-                                }
-                                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                                    // Ctrl-C pressed - exit TUI and shut down app
-                                    break;
-                                }
-                                _ => {}
-                            }
+                if event::poll(Duration::from_millis(0))?
+                    && let Event::Key(key) = event::read()?
+                    && key.kind == KeyEventKind::Press
+                {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            // User pressed 'q' - exit TUI and shut down app
+                            break;
                         }
+                        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            // Ctrl-C pressed - exit TUI and shut down app
+                            break;
+                        }
+                        _ => {}
                     }
                 }
             }

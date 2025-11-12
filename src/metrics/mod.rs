@@ -215,7 +215,7 @@ impl MetricsCollector {
     pub fn snapshot(&self) -> MetricsSnapshot {
         let num_backends = self.inner.backend_metrics.len();
         let mut backend_stats = Vec::with_capacity(num_backends);
-        
+
         // Pre-allocate and populate to avoid allocations
         for (id, metrics) in self.inner.backend_metrics.iter().enumerate() {
             backend_stats.push(BackendStats {

@@ -28,11 +28,10 @@ impl RecordingState for Recorded {}
 ///
 /// ```rust
 /// use nntp_proxy::types::metrics_recording::{MetricsBytes, Unrecorded};
-/// use nntp_proxy::metrics::MetricsCollector;
 ///
 /// let bytes = MetricsBytes::<Unrecorded>::new(1024);
-/// // Can only record once - this consumes the Unrecorded bytes
-/// let recorded = metrics.record_and_mark(bytes);
+/// // Can only record once - bytes consumed when marked recorded
+/// let recorded = bytes.mark_recorded();
 /// // Can't record again - `bytes` has been moved!
 /// ```
 #[derive(Debug, Clone, Copy)]
