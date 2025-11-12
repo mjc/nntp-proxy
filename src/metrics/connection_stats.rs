@@ -98,11 +98,24 @@ impl ConnectionStatsAggregator {
 
         if let Ok(mut state) = self.stats.lock() {
             let now = Instant::now();
+            let elapsed = now.duration_since(state.last_flush);
+            let has_stats =
+                !state.connection_stats.is_empty() || !state.disconnection_stats.is_empty();
+
+            tracing::debug!(
+                "record_disconnection: elapsed={:.1}s, has_stats={}, disconnect_count={}",
+                elapsed.as_secs_f64(),
+                has_stats,
+                state
+                    .disconnection_stats
+                    .get(&username)
+                    .map(|s| s.count)
+                    .unwrap_or(0)
+            );
 
             // Check if we should flush (30 second window elapsed AND we have stats to flush)
-            if now.duration_since(state.last_flush) >= AGGREGATION_WINDOW
-                && (!state.connection_stats.is_empty() || !state.disconnection_stats.is_empty())
-            {
+            if elapsed >= AGGREGATION_WINDOW && has_stats {
+                tracing::debug!("Flushing stats due to 30s window");
                 Self::flush_stats(&mut state);
             }
 
@@ -142,7 +155,8 @@ impl ConnectionStatsAggregator {
                 count = stats.count,
                 routing_mode = %stats.routing_mode,
                 duration_secs = duration.as_secs_f64(),
-                "User created {} connection{} in {} routing mode in {:.1}s",
+                "User {} created {} connection{} in {} in {:.1}s",
+                username,
                 stats.count,
                 if stats.count == 1 { "" } else { "s" },
                 stats.routing_mode,
@@ -159,9 +173,10 @@ impl ConnectionStatsAggregator {
                 count = stats.count,
                 routing_mode = %stats.routing_mode,
                 duration_secs = duration.as_secs_f64(),
-                "{} session{} closed for user in {} routing mode over {:.1}s",
+                "{} session{} closed for {} in {} over {:.1}s",
                 stats.count,
                 if stats.count == 1 { "" } else { "s" },
+                username,
                 stats.routing_mode,
                 duration.as_secs_f64()
             );
@@ -184,13 +199,6 @@ impl ConnectionStatsAggregator {
 impl Default for ConnectionStatsAggregator {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for ConnectionStatsAggregator {
-    fn drop(&mut self) {
-        // Flush any remaining stats on drop
-        self.flush();
     }
 }
 

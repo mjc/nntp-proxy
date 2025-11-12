@@ -204,6 +204,17 @@ async fn run_proxy(args: Args) -> Result<()> {
         std::process::exit(0);
     });
 
+    // Start periodic connection stats flusher (every 30 seconds)
+    let connection_stats = proxy.connection_stats().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            connection_stats.flush();
+        }
+    });
+
     // Determine which handler to use based on routing mode
     let uses_per_command_routing = args.routing_mode.supports_per_command_routing();
 

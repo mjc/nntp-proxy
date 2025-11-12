@@ -328,6 +328,13 @@ impl NntpProxy {
         &self.metrics
     }
 
+    /// Get connection stats aggregator
+    #[must_use]
+    #[inline]
+    pub fn connection_stats(&self) -> &ConnectionStatsAggregator {
+        &self.connection_stats
+    }
+
     /// Common setup for client connections
     ///
     /// Sends the proxy's greeting immediately to the client.
@@ -575,8 +582,13 @@ impl NntpProxy {
         match result {
             Ok(metrics) => {
                 // Record disconnection for aggregation
+                let username = session.username();
+                debug!(
+                    "Recording disconnect for username={:?}",
+                    username.as_deref()
+                );
                 self.connection_stats.record_disconnection(
-                    session.username().as_deref(),
+                    username.as_deref(),
                     &self.routing_mode.to_string().to_lowercase(),
                 );
 
