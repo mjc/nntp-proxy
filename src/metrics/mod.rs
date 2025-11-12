@@ -416,4 +416,125 @@ mod tests {
 
         assert_eq!(snapshot.throughput_bps(), 1000.0); // 10000 bytes / 10 seconds
     }
+
+    #[test]
+    fn test_snapshot_without_pool_status() {
+        let metrics = MetricsCollector::new(2);
+        metrics.record_client_to_backend_bytes_for(0, 100);
+        metrics.record_command(1);
+
+        let snapshot = metrics.snapshot();
+
+        // Backend stats should have default (0) active_connections
+        assert_eq!(snapshot.backend_stats[0].active_connections, 0);
+        assert_eq!(snapshot.backend_stats[1].active_connections, 0);
+
+        // Other metrics should still work
+        assert_eq!(snapshot.backend_stats[0].bytes_sent, 100);
+        assert_eq!(snapshot.backend_stats[1].total_commands, 1);
+    }
+
+    #[test]
+    fn test_with_pool_status_integration() {
+        use crate::pool::{ConnectionProvider, DeadpoolConnectionProvider};
+        use crate::router::BackendSelector;
+        use crate::types::{BackendId, ServerName};
+
+        let metrics = MetricsCollector::new(2);
+
+        // Create router with two backends
+        let mut router = BackendSelector::new();
+
+        let provider1 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "Backend 1".to_string(),
+            10, // max_size = 10
+            None,
+            None,
+        );
+
+        let provider2 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            120,
+            "Backend 2".to_string(),
+            5, // max_size = 5
+            None,
+            None,
+        );
+
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::new("backend1".to_string()).unwrap(),
+            provider1.clone(),
+        );
+
+        router.add_backend(
+            BackendId::from_index(1),
+            ServerName::new("backend2".to_string()).unwrap(),
+            provider2.clone(),
+        );
+
+        // Get snapshot with pool status
+        let snapshot = metrics.snapshot().with_pool_status(&router);
+
+        // Check that active_connections is calculated from pool
+        // Since pools are empty initially: active = max_size - available = max_size - max_size = 0
+        let status1 = provider1.status();
+        let status2 = provider2.status();
+
+        let expected_active1 = status1
+            .max_size
+            .get()
+            .saturating_sub(status1.available.get());
+        let expected_active2 = status2
+            .max_size
+            .get()
+            .saturating_sub(status2.available.get());
+
+        assert_eq!(
+            snapshot.backend_stats[0].active_connections,
+            expected_active1
+        );
+        assert_eq!(
+            snapshot.backend_stats[1].active_connections,
+            expected_active2
+        );
+    }
+
+    #[test]
+    fn test_pool_status_calculates_active_correctly() {
+        use crate::pool::{ConnectionProvider, DeadpoolConnectionProvider};
+        use crate::router::BackendSelector;
+        use crate::types::{BackendId, ServerName};
+
+        let metrics = MetricsCollector::new(1);
+        let mut router = BackendSelector::new();
+
+        let provider = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "Test Backend".to_string(),
+            10,
+            None,
+            None,
+        );
+
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::new("test".to_string()).unwrap(),
+            provider.clone(),
+        );
+
+        let snapshot = metrics.snapshot().with_pool_status(&router);
+
+        // Verify active = max_size - available
+        let pool_status = provider.status();
+        let expected = pool_status
+            .max_size
+            .get()
+            .saturating_sub(pool_status.available.get());
+
+        assert_eq!(snapshot.backend_stats[0].active_connections, expected);
+    }
 }
