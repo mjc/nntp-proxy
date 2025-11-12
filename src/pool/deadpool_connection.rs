@@ -155,9 +155,7 @@ impl managed::Manager for TcpManager {
 
         let mut stream = self.create_optimized_stream().await?;
 
-        // IMPORTANT: Consume backend's greeting immediately
-        // This ensures the proxy can send its own greeting to clients
-        // without forwarding the backend's greeting
+        // Consume greeting
         let mut buffer = vec![0u8; 4096];
         let n = stream.read(&mut buffer).await?;
         let greeting = &buffer[..n];

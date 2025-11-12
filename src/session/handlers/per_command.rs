@@ -46,7 +46,8 @@ impl ClientSession {
         // Auth state: username from AUTHINFO USER command
         let mut auth_username: Option<String> = None;
 
-        // Send initial greeting to client
+        // Send initial greeting to client and flush immediately
+        // This ensures the client receives the greeting before we start reading commands
         debug!(
             "Client {} sending greeting: {} | hex: {:02x?}",
             self.client_addr,
@@ -64,6 +65,17 @@ impl ClientSession {
             );
             return Err(e.into());
         }
+
+        if let Err(e) = client_write.flush().await {
+            debug!(
+                "Client {} failed to flush greeting: {} (kind: {:?})",
+                self.client_addr,
+                e,
+                e.kind()
+            );
+            return Err(e.into());
+        }
+
         backend_to_client_bytes.add(PROXY_GREETING_PCR.len());
 
         debug!(
