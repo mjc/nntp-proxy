@@ -809,6 +809,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "smallvec",
  "socket2",
  "tempfile",
  "thiserror",

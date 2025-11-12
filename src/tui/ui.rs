@@ -3,7 +3,7 @@
 use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
 use crate::tui::constants::{chart, layout, status, styles, text};
-use crate::tui::helpers::{backend_color, format_throughput_label, round_up_throughput};
+use crate::tui::helpers::{build_chart_data, format_throughput_label, round_up_throughput};
 use ratatui::{
     Frame,
     layout::{Alignment, Direction, Layout, Rect},
@@ -253,66 +253,41 @@ fn render_data_flow(
     servers: &[crate::config::ServerConfig],
     app: &TuiApp,
 ) {
-    // Find max throughput across all backends for scaling Y-axis
-    let max_throughput = servers
-        .iter()
-        .enumerate()
-        .flat_map(|(i, _)| app.throughput_history(i).iter())
-        .flat_map(|point| [point.sent_per_sec().get(), point.received_per_sec().get()])
-        .fold(chart::MIN_THROUGHPUT, f64::max);
+    // Build chart data in single pass (no nested loops)
+    let (chart_data, max_throughput) = build_chart_data(servers, app);
 
-    let max_throughput_rounded = round_up_throughput(max_throughput);
+    // Apply minimum threshold and round for nice axis labels
+    let max_throughput_clamped = max_throughput.max(chart::MIN_THROUGHPUT);
+    let max_throughput_rounded = round_up_throughput(max_throughput_clamped);
     let max_label = format_throughput_label(max_throughput_rounded);
 
-    // Collect chart data for all backends (must keep data alive for dataset references)
-    let chart_data: Vec<_> = servers
-        .iter()
-        .enumerate()
-        .map(|(i, server)| {
-            let history = app.throughput_history(i);
-            let color = backend_color(i);
-
-            let sent_data: Vec<(f64, f64)> = history
-                .iter()
-                .enumerate()
-                .map(|(idx, point)| (idx as f64, point.sent_per_sec().get()))
-                .collect();
-
-            let recv_data: Vec<(f64, f64)> = history
-                .iter()
-                .enumerate()
-                .map(|(idx, point)| (idx as f64, point.received_per_sec().get()))
-                .collect();
-
-            (sent_data, recv_data, server.name.clone(), color)
-        })
-        .collect();
-
-    // Create datasets from chart data
+    // Build datasets from pre-computed chart data
     let datasets: Vec<Dataset> = chart_data
         .iter()
-        .flat_map(|(sent_data, recv_data, name, color)| {
+        .flat_map(|data| {
             let mut ds = Vec::with_capacity(2);
 
-            if !sent_data.is_empty() {
+            // Sent data (upload to backend)
+            if !data.sent_points.is_empty() {
                 ds.push(
                     Dataset::default()
-                        .name(format!("{} {}", name, text::ARROW_UP))
+                        .name(format!("{} {}", data.name, text::ARROW_UP))
                         .marker(symbols::Marker::Braille)
                         .graph_type(GraphType::Line)
-                        .style(Style::default().fg(*color))
-                        .data(sent_data),
+                        .style(Style::default().fg(data.color))
+                        .data(&data.sent_points),
                 );
             }
 
-            if !recv_data.is_empty() {
+            // Received data (download from backend)
+            if !data.recv_points.is_empty() {
                 ds.push(
                     Dataset::default()
-                        .name(format!("{} {}", name, text::ARROW_DOWN))
+                        .name(format!("{} {}", data.name, text::ARROW_DOWN))
                         .marker(symbols::Marker::Braille)
                         .graph_type(GraphType::Line)
-                        .style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
-                        .data(recv_data),
+                        .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
+                        .data(&data.recv_points),
                 );
             }
 
