@@ -843,3 +843,124 @@ fn create_smart_mock_builder(port: u16, server_name: &str) -> MockNntpServer {
         .on_command("NEXT", "223 2 <next@example.com>\r\n")
         .on_command("LAST", "223 1 <prev@example.com>\r\n")
 }
+
+/// Test that backends can return 223 for ARTICLE commands with message-IDs
+///
+/// In practice, some backends return "223 0 <msgid>" for article-by-message-ID
+/// requests when the article is not found, even though RFC 3977 specifies 223
+/// is for "no such article number" (numeric requests). This is a real-world
+/// backend behavior that the proxy should handle gracefully without warnings.
+#[tokio::test]
+async fn test_backend_223_response_for_message_id() -> Result<()> {
+    // Find available ports
+    let mock_port = find_available_port().await;
+    let proxy_port = find_available_port().await;
+
+    // Start mock backend that returns 223 for missing articles by message-ID
+    // This simulates real-world backend behavior observed in production
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("Backend That Returns 223")
+        .on_command("ARTICLE <missing@", "223 0 <missing@example.com>\r\n")
+        .on_command(
+            "ARTICLE <exists@",
+            "220 1 <exists@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        )
+        .spawn();
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create proxy configuration
+    let config = Config {
+        servers: vec![create_test_server_config_with_max_connections(
+            "127.0.0.1",
+            mock_port,
+            "Backend That Returns 223",
+            5,
+        )],
+        ..Default::default()
+    };
+
+    // Start proxy in per-command mode (where this issue was observed)
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+    let proxy_clone = proxy.clone();
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr_clone = proxy_addr.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        let listener = TcpListener::bind(&proxy_addr_clone).await.unwrap();
+        while let Ok((stream, addr)) = listener.accept().await {
+            let proxy = proxy_clone.clone();
+            tokio::spawn(async move {
+                let _ = proxy.handle_client_per_command_routing(stream, addr).await;
+            });
+        }
+    });
+
+    // Give proxy time to start
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect to proxy
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+
+    // Read greeting
+    let mut buffer = [0; 1024];
+    let n = client.read(&mut buffer).await?;
+    let greeting = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        greeting.starts_with("200"),
+        "Expected greeting, got: {}",
+        greeting
+    );
+
+    // Request a missing article - backend will return 223
+    client
+        .write_all(b"ARTICLE <missing@example.com>\r\n")
+        .await?;
+    client.flush().await?;
+
+    buffer = [0; 1024];
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+
+    // Verify we get the 223 response from backend
+    assert!(
+        response.starts_with("223"),
+        "Expected 223 response, got: {}",
+        response
+    );
+    assert!(
+        response.contains("<missing@example.com>"),
+        "Response should contain message-ID"
+    );
+
+    // Now request an existing article - should work normally
+    client
+        .write_all(b"ARTICLE <exists@example.com>\r\n")
+        .await?;
+    client.flush().await?;
+
+    let mut large_buffer = [0u8; 4096];
+    let n = timeout(Duration::from_secs(2), client.read(&mut large_buffer)).await??;
+    let response = String::from_utf8_lossy(&large_buffer[..n]);
+
+    // Verify we get the 220 multiline response
+    assert!(
+        response.starts_with("220"),
+        "Expected 220 response, got: {}",
+        response
+    );
+    assert!(
+        response.contains("Subject: Test"),
+        "Should have article headers"
+    );
+    assert!(
+        response.ends_with(".\r\n"),
+        "Should have multiline terminator"
+    );
+
+    // Clean up
+    client.write_all(b"QUIT\r\n").await?;
+
+    Ok(())
+}
