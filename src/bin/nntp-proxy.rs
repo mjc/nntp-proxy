@@ -6,48 +6,9 @@ use tokio::signal;
 use tracing::{error, info, warn};
 
 use nntp_proxy::{
-    NntpProxy, RoutingMode, create_default_config, has_server_env_vars, load_config,
-    load_config_from_env,
+    NntpProxy, RoutingMode, RuntimeConfig, load_config_with_fallback,
     types::{ConfigPath, Port, ThreadCount},
 };
-
-/// Pin current process to specific CPU cores for optimal performance
-#[cfg(target_os = "linux")]
-fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
-    use nix::sched::{CpuSet, sched_setaffinity};
-    use nix::unistd::Pid;
-
-    // Pin to CPU cores based on number of worker threads
-    // This reduces context switching and improves cache locality
-    let mut cpu_set = CpuSet::new();
-    for core in 0..num_cores {
-        // Ignore errors when setting CPU affinity (may not have all cores in container)
-        let _ = cpu_set.set(core);
-    }
-
-    match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
-        Ok(_) => {
-            info!(
-                "Successfully pinned process to {} CPU cores for optimal performance",
-                num_cores
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Failed to set CPU affinity: {}, continuing without pinning",
-                e
-            );
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
-    info!("CPU pinning not available on this platform");
-    Ok(())
-}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -98,79 +59,18 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Log threading info
-    let num_cpus = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1);
-    let worker_threads = args.threads.map(|t| t.get()).unwrap_or(num_cpus);
-
-    // Pin to specific CPU cores for optimal performance
-    pin_to_cpu_cores(worker_threads)?;
-
-    // Use different runtime based on thread count for optimal performance
-    if worker_threads == 1 {
-        info!("Starting NNTP proxy with single-threaded runtime for optimal performance");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(run_proxy(args))
-    } else {
-        info!(
-            "Starting NNTP proxy with {} worker threads (detected {} CPUs)",
-            worker_threads, num_cpus
-        );
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()?;
-        rt.block_on(run_proxy(args))
-    }
+    // Build and configure runtime
+    let runtime_config = RuntimeConfig::from_args(args.threads);
+    let rt = runtime_config.build_runtime()?;
+    
+    rt.block_on(run_proxy(args))
 }
 
 async fn run_proxy(args: Args) -> Result<()> {
-    // Load configuration
-    let config = if std::path::Path::new(args.config.as_str()).exists() {
-        // File exists, try to load it (env vars can override servers)
-        match load_config(args.config.as_str()) {
-            Ok(config) => config,
-            Err(e) => {
-                error!(
-                    "Failed to load existing config file '{}': {}",
-                    args.config, e
-                );
-                error!("Please check your config file syntax and try again");
-                return Err(e);
-            }
-        }
-    } else if has_server_env_vars() {
-        // File doesn't exist but env vars are set - use environment configuration
-        match load_config_from_env() {
-            Ok(config) => {
-                info!("Using configuration from environment variables (no config file)");
-                config
-            }
-            Err(e) => {
-                error!(
-                    "Failed to load configuration from environment variables: {}",
-                    e
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        // No config file and no NNTP_SERVER_* env vars - create default config file
-        warn!(
-            "Config file '{}' not found and no NNTP_SERVER_* environment variables set",
-            args.config
-        );
-        warn!("Creating default config file - please edit it to add your backend servers");
-        let default_config = create_default_config();
-        let config_toml = toml::to_string_pretty(&default_config)?;
-        std::fs::write(args.config.as_str(), &config_toml)?;
-        info!("Created default config file: {}", args.config);
-        default_config
-    };
-
+    // Load configuration with automatic fallback
+    let (config, source) = load_config_with_fallback(args.config.as_str())?;
+    
+    info!("Loaded configuration from {}", source.description());
     info!("Loaded {} backend servers:", config.servers.len());
     for server in &config.servers {
         info!("  - {} ({}:{})", server.name, server.host, server.port);

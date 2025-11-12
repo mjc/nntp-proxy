@@ -9,7 +9,7 @@ pub mod log_capture;
 mod types;
 mod ui;
 
-pub use app::TuiApp;
+pub use app::{TuiApp, TuiAppBuilder};
 pub use log_capture::{LogBuffer, LogMakeWriter};
 pub use ui::render_ui;
 
