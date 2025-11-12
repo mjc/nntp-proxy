@@ -5,15 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2025-11-12
+
+### Added
+- **Domain Types Refactoring** ([#35](https://github.com/mjc/nntp-proxy/pull/35))
+  - Comprehensive newtype pattern implementation across codebase
+  - Type-safe newtypes for all domain values:
+    - `Username`, `Password` - Validated authentication credentials
+    - `StatusCode` - NNTP response status codes
+    - `TransferMetrics` - Replaces (u64, u64) tuples
+    - `AuthResult`, `QuitStatus` - Return value newtypes
+    - `Timeout` newtypes for type-safe duration handling
+    - Connection pool metrics: `AvailableConnections`, `CreatedConnections`, `InUseConnections`
+  - Comprehensive config validation tests (25 new tests)
+  - `MockNntpServer` builder pattern to eliminate test duplication
+  - Test factory functions reducing boilerplate by ~800 lines
+  - GitHub Actions CI workflow with cargo-nextest (7x faster)
+  - **Fixes**: [#31](https://github.com/mjc/nntp-proxy/issues/31) - Config field naming inconsistencies
+  - **Fixes**: [#33](https://github.com/mjc/nntp-proxy/issues/33) - Client auth appearing to be required
+
+- **Docker Support** ([#36](https://github.com/mjc/nntp-proxy/pull/36))
+  - Multi-stage Docker build with Rust nightly (for let-chains feature)
+  - Environment variable configuration for containerized deployments
+  - Backend server configuration via indexed env vars: `NNTP_SERVER_N_*`
+  - Full TLS configuration support via environment variables
+  - Health check configuration: max per cycle, pool timeout
+  - Connection keepalive duration configuration
+  - Docker Compose examples with .env.example pattern
+  - Secure credential management (no hardcoded defaults)
+  - **Fixes**: [#32](https://github.com/mjc/nntp-proxy/pull/32) - Docker build issues
+
+### Fixed
+- **Critical: Greeting Flush Bug** ([#37](https://github.com/mjc/nntp-proxy/pull/37))
+  - Fixed connection resets for NNTP clients that send commands immediately after connecting
+  - Root cause: greetings buffered in TCP send buffer without flush
+  - Added `flush()` immediately after all greeting writes
+  - Affects per-command and hybrid routing modes
+  
+- **223 Response Code Handling**
+  - Backends commonly return 223 for missing articles (even on message-ID requests)
+  - Changed log level from WARN to DEBUG for 223 responses
+  - Added integration test demonstrating real-world backend behavior
+
+- **Docker Build Issues**
+  - Fixed empty NNTP_PROXY_THREADS env var causing parse errors
+  - Fixed Duration type conversions from u64 environment variables
+  - Fixed health check variable expansion in docker-compose
+  - Improved error messages with specific variable names
+
+- **Security Improvements**
+  - Removed insecure credential defaults from docker-compose
+  - Fail-fast behavior when required credentials missing
+
+### Changed
+- **Domain Types Code Quality** ([#35](https://github.com/mjc/nntp-proxy/pull/35))
+  - Comprehensive newtype pattern across codebase for type safety
+  - Consolidated config/pool/protocol types with macros
+  - Code reduction: ~1,840 lines while improving type safety
+  - Refactored integration tests: -800 lines of boilerplate
+  - Improved Rust idioms: const fn, #[must_use], #[inline]
+  - Extracted common auth and QUIT handling
+
+- **Documentation**
+  - Clarified greeting flow in code comments
+  - Updated function documentation for greeting handling
+
+### Technical Details
+- **Greeting Flow**: Backend greetings consumed when connections created in pool; proxy sends own greeting with immediate flush to client
+- **Type Safety**: All domain values now use validated newtypes (Username, Password, StatusCode, TransferMetrics, etc.)
+- **Testing**: Added MockNntpServer builder, cargo-nextest CI, 25 config validation tests, random ports for parallel execution
+
 ## [0.2.2] - 2025-11-07
 
 ### Added
-- **Client Authentication System**
+- **Client Authentication System** ([#29](https://github.com/mjc/nntp-proxy/pull/29))
   - Config-file based client authentication support
   - Credential validation against configured users
   - Authentication caching for improved performance
   - RFC-compliant NNTP response codes (480, 481, 482)
   - Comprehensive authentication security tests (bypass prevention, integration, security)
+  - **Closes**: [#28](https://github.com/mjc/nntp-proxy/issues/28) - Basic user auth/permissions
   
 ### Changed
 - **Performance Optimizations**
@@ -43,7 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.1] - 2025-10-27
 
 ### Fixed
-- **Error handling and logging improvements**
+- **Error handling and logging improvements** ([#24](https://github.com/mjc/nntp-proxy/pull/24))
   - Fixed spurious "broken pipe" error logs that masked real issues like authentication failures
   - Client disconnects after successful data transfer now correctly log at DEBUG level instead of ERROR/WARN
   - Authentication failures now prominently visible in logs with full context (backend name, host, port, username, server response)
