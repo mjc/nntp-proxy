@@ -50,6 +50,11 @@ impl ClientSession {
             self.client_addr, backend_id
         );
 
+        // Record command in metrics
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_command(backend_id.as_index());
+        }
+
         // Get buffer from pool for command execution
         let mut buffer = self.buffer_pool.get_buffer().await;
 
@@ -140,6 +145,11 @@ impl ClientSession {
                     let mut cmd_bytes = BytesTransferred::zero();
                     let mut resp_bytes = BytesTransferred::zero();
                     cmd_bytes.add(command.len());
+
+                    // Record command in metrics
+                    if let Some(ref metrics) = self.metrics {
+                        metrics.record_command(backend_id.as_index());
+                    }
 
                     let (result, _got_backend_data) = self
                         .execute_command_on_backend(

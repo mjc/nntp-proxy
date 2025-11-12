@@ -34,11 +34,13 @@
 // Module declarations
 pub mod auth;
 pub mod connection_error;
-mod formatting;
+pub mod formatting;
+pub mod metrics;
 pub mod network;
 pub mod protocol;
 mod proxy;
 pub mod stream;
+pub mod tui;
 
 // Public modules for integration tests
 pub mod cache;

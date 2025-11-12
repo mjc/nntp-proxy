@@ -53,6 +53,7 @@ use std::sync::Arc;
 
 use crate::auth::AuthHandler;
 use crate::config::RoutingMode;
+use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
 use crate::types::ClientId;
@@ -105,6 +106,8 @@ pub struct ClientSession {
     auth_handler: Arc<AuthHandler>,
     /// Whether client has authenticated (starts false, set true after successful auth)
     authenticated: std::sync::atomic::AtomicBool,
+    /// Optional metrics collector for TUI
+    metrics: Option<MetricsCollector>,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -202,6 +205,7 @@ impl ClientSessionBuilder {
             routing_mode,
             auth_handler: self.auth_handler,
             authenticated: std::sync::atomic::AtomicBool::new(false),
+            metrics: None,
         }
     }
 }
@@ -223,6 +227,7 @@ impl ClientSession {
             routing_mode: RoutingMode::Standard,
             auth_handler,
             authenticated: std::sync::atomic::AtomicBool::new(false),
+            metrics: None,
         }
     }
 
@@ -244,7 +249,15 @@ impl ClientSession {
             routing_mode,
             auth_handler,
             authenticated: std::sync::atomic::AtomicBool::new(false),
+            metrics: None,
         }
+    }
+
+    /// Add metrics collection to this session (builder pattern)
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Create a builder for constructing a client session

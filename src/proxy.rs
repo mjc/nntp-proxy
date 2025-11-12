@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth::AuthHandler;
 use crate::config::{Config, RoutingMode, ServerConfig};
 use crate::constants::buffer::{POOL, POOL_COUNT};
+use crate::metrics::MetricsCollector;
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
 use crate::protocol::BACKEND_UNAVAILABLE;
@@ -144,6 +145,9 @@ impl NntpProxyBuilder {
             buffer_count,
         );
 
+        // Create metrics collector (before moving servers)
+        let metrics = MetricsCollector::new(self.config.servers.len());
+
         let servers = Arc::new(self.config.servers);
 
         // Create backend selector and add all backends
@@ -179,6 +183,7 @@ impl NntpProxyBuilder {
             buffer_pool,
             routing_mode: self.routing_mode,
             auth_handler,
+            metrics,
         })
     }
 }
@@ -196,6 +201,8 @@ pub struct NntpProxy {
     routing_mode: RoutingMode,
     /// Authentication handler for client auth interception
     auth_handler: Arc<AuthHandler>,
+    /// Metrics collector for TUI and monitoring
+    metrics: MetricsCollector,
 }
 
 impl NntpProxy {
@@ -287,6 +294,13 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
+    /// Get the metrics collector
+    #[must_use]
+    #[inline]
+    pub fn metrics(&self) -> &MetricsCollector {
+        &self.metrics
+    }
+
     /// Common setup for client connections
     ///
     /// Sends the proxy's greeting immediately to the client.
@@ -307,6 +321,9 @@ impl NntpProxy {
         client_addr: SocketAddr,
     ) -> Result<()> {
         debug!("New client connection from {}", client_addr);
+
+        // Record connection metrics
+        self.metrics.connection_opened();
 
         // Use a dummy ClientId and command for routing (synchronous 1:1 mapping)
         use types::ClientId;
@@ -393,8 +410,16 @@ impl NntpProxy {
                     metrics.client_to_backend.as_u64(),
                     metrics.backend_to_client.as_u64()
                 );
+                // Record transfer metrics
+                self.metrics
+                    .record_bytes_sent(server_idx, metrics.client_to_backend.as_u64());
+                self.metrics
+                    .record_bytes_received(server_idx, metrics.backend_to_client.as_u64());
             }
             Err(e) => {
+                // Record error
+                self.metrics.record_error(server_idx);
+
                 // Check if this is a backend I/O error - if so, remove connection from pool
                 if crate::pool::is_connection_error(&e) {
                     warn!(
@@ -402,12 +427,14 @@ impl NntpProxy {
                         client_addr, e
                     );
                     crate::pool::remove_from_pool(backend_conn);
+                    self.metrics.connection_closed();
                     return Err(e);
                 }
                 warn!("Session error for client {}: {}", client_addr, e);
             }
         }
 
+        self.metrics.connection_closed();
         debug!("Connection returned to pool for {}", server.name);
         Ok(())
     }
@@ -426,6 +453,9 @@ impl NntpProxy {
             client_addr
         );
 
+        // Record connection metrics
+        self.metrics.connection_opened();
+
         // Enable TCP_NODELAY for low latency
         if let Err(e) = client_stream.set_nodelay(true) {
             debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
@@ -442,7 +472,8 @@ impl NntpProxy {
             self.router.clone(),
             self.routing_mode,
             self.auth_handler.clone(),
-        );
+        )
+        .with_metrics(self.metrics.clone());
 
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
 
@@ -472,6 +503,9 @@ impl NntpProxy {
                     crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
                     crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
                 );
+                // Record transfer metrics
+                // Note: per-command routing uses multiple backends, so we don't record per-backend
+                // The session internals will handle per-command metrics recording
             }
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
@@ -493,10 +527,10 @@ impl NntpProxy {
             }
         }
 
+        self.metrics.connection_closed();
         debug!(
             "Per-command routing connection closed for {} (ID: {})",
-            client_addr,
-            session.client_id()
+            client_addr, session_id
         );
         Ok(())
     }

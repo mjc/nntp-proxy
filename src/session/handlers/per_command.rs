@@ -303,6 +303,11 @@ impl ClientSession {
             self.client_addr, backend_id
         );
 
+        // Record command execution in metrics
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_command(backend_id.as_index());
+        }
+
         // Execute the command - returns (result, got_backend_data)
         // If got_backend_data is true, we successfully communicated with backend
         let (result, got_backend_data) = self
@@ -331,10 +336,16 @@ impl ClientSession {
                         "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
                         self.client_addr, backend_id
                     ),
-                    false => warn!(
-                        "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
-                        self.client_addr, backend_id, e
-                    ),
+                    false => {
+                        warn!(
+                            "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
+                            self.client_addr, backend_id, e
+                        );
+                        // Record error in metrics
+                        if let Some(ref metrics) = self.metrics {
+                            metrics.record_error(backend_id.as_index());
+                        }
+                    }
                 }
             })
             .filter(|_| !got_backend_data)
@@ -504,6 +515,12 @@ impl ClientSession {
         };
 
         backend_to_client_bytes.add(bytes_written as usize);
+
+        // Record metrics if collector is available
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_bytes_sent(backend_id.as_index(), command.len() as u64);
+            metrics.record_bytes_received(backend_id.as_index(), bytes_written);
+        }
 
         if let Some(id) = msgid {
             debug!(

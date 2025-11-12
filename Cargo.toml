@@ -20,6 +20,10 @@ path = "src/bin/nntp-proxy.rs"
 name = "nntp-cache-proxy"
 path = "src/bin/nntp-cache-proxy.rs"
 
+[[bin]]
+name = "nntp-proxy-tui"
+path = "src/bin/nntp-proxy-tui.rs"
+
 [lib]
 name = "nntp_proxy"
 path = "src/lib.rs"
@@ -42,6 +46,8 @@ memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with sy
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
 moka = { version = "0.12", features = ["future"], default-features = false }  # Async LRU cache, minimal features
 bytes = "1.0"  # Efficient byte buffer for zero-copy operations
+ratatui = "0.29"  # Terminal UI framework
+crossterm = "0.28"  # Cross-platform terminal manipulation
 
 # TLS dependencies - use ring for smaller binaries (pure Rust, no C dependencies)
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
