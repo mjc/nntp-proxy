@@ -1,8 +1,33 @@
+# Client Authentication Configuration
+# Two formats supported:
+#
+# 1. Single user (legacy format - still supported):
 [client_auth]
 username = "clientusername"
 password = "client password"
 # Optional custom greeting message
 greeting = "200 Hold On To Your Butts"
+
+# 2. Multiple users (NEW - recommended for grouping clients):
+# [[client_auth.users]]
+# username = "alice"
+# password = "secret123"
+#
+# [[client_auth.users]]
+# username = "bob"  
+# password = "password456"
+#
+# [[client_auth.users]]
+# username = "charlie"
+# password = "hunter2"
+#
+# Benefits of multiple users:
+# - Group parallel connections by username in TUI
+# - Track per-user bandwidth and activity
+# - Different credentials for different client machines
+#
+# Note: You can use either format, but not both. Multi-user is recommended
+# for production deployments where you want to differentiate clients.
 
 [[servers]]
 host = "news.example.com"

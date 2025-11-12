@@ -58,6 +58,7 @@ pub struct NntpProxyBuilder {
     routing_mode: RoutingMode,
     buffer_size: Option<usize>,
     buffer_count: Option<usize>,
+    enable_metrics: bool,
 }
 
 impl NntpProxyBuilder {
@@ -71,6 +72,7 @@ impl NntpProxyBuilder {
             routing_mode: RoutingMode::Standard,
             buffer_size: None,
             buffer_count: None,
+            enable_metrics: false, // Default to disabled for performance
         }
     }
 
@@ -103,6 +105,17 @@ impl NntpProxyBuilder {
     #[must_use]
     pub fn with_buffer_pool_count(mut self, count: usize) -> Self {
         self.buffer_count = Some(count);
+        self
+    }
+
+    /// Enable metrics collection for TUI and monitoring
+    ///
+    /// **Warning:** Metrics collection causes ~45% performance regression
+    /// (110MB/s -> 60MB/s) due to atomic operations in the hot path.
+    /// Only enable this when you need the TUI or monitoring.
+    #[must_use]
+    pub fn with_metrics(mut self) -> Self {
+        self.enable_metrics = true;
         self
     }
 
@@ -164,17 +177,25 @@ impl NntpProxyBuilder {
         });
 
         // Create auth handler from config
-        let auth_handler = Arc::new(
-            AuthHandler::new(
-                self.config.client_auth.username.clone(),
-                self.config.client_auth.password.clone(),
-            )
-            .with_context(|| {
-                "Invalid authentication configuration. \
-                 If you set username/password in config, they cannot be empty. \
-                 Remove them entirely to disable authentication."
-            })?,
-        );
+        let auth_handler = {
+            let all_users: Vec<(String, String)> = self
+                .config
+                .client_auth
+                .all_users()
+                .into_iter()
+                .map(|(u, p)| (u.to_string(), p.to_string()))
+                .collect();
+
+            if all_users.is_empty() {
+                Arc::new(AuthHandler::default())
+            } else {
+                Arc::new(AuthHandler::with_users(all_users).with_context(|| {
+                    "Invalid authentication configuration. \
+                             If you set username/password in config, they cannot be empty. \
+                             Remove them entirely to disable authentication."
+                })?)
+            }
+        };
 
         Ok(NntpProxy {
             servers,
@@ -184,6 +205,7 @@ impl NntpProxyBuilder {
             routing_mode: self.routing_mode,
             auth_handler,
             metrics,
+            enable_metrics: self.enable_metrics,
         })
     }
 }
@@ -203,6 +225,8 @@ pub struct NntpProxy {
     auth_handler: Arc<AuthHandler>,
     /// Metrics collector for TUI and monitoring
     metrics: MetricsCollector,
+    /// Whether metrics collection is enabled (causes ~45% perf penalty)
+    enable_metrics: bool,
 }
 
 impl NntpProxy {
@@ -323,7 +347,9 @@ impl NntpProxy {
         debug!("New client connection from {}", client_addr);
 
         // Record connection metrics
-        self.metrics.connection_opened();
+        if self.enable_metrics {
+            self.metrics.connection_opened();
+        }
 
         // Use a dummy ClientId and command for routing (synchronous 1:1 mapping)
         use types::ClientId;
@@ -411,14 +437,18 @@ impl NntpProxy {
                     metrics.backend_to_client.as_u64()
                 );
                 // Record transfer metrics
-                self.metrics
-                    .record_bytes_sent(server_idx, metrics.client_to_backend.as_u64());
-                self.metrics
-                    .record_bytes_received(server_idx, metrics.backend_to_client.as_u64());
+                if self.enable_metrics {
+                    self.metrics
+                        .record_client_to_backend_bytes_for(server_idx, metrics.client_to_backend.as_u64());
+                    self.metrics
+                        .record_backend_to_client_bytes_for(server_idx, metrics.backend_to_client.as_u64());
+                }
             }
             Err(e) => {
                 // Record error
-                self.metrics.record_error(server_idx);
+                if self.enable_metrics {
+                    self.metrics.record_error(server_idx);
+                }
 
                 // Check if this is a backend I/O error - if so, remove connection from pool
                 if crate::pool::is_connection_error(&e) {
@@ -427,14 +457,18 @@ impl NntpProxy {
                         client_addr, e
                     );
                     crate::pool::remove_from_pool(backend_conn);
-                    self.metrics.connection_closed();
+                    if self.enable_metrics {
+                        self.metrics.connection_closed();
+                    }
                     return Err(e);
                 }
                 warn!("Session error for client {}: {}", client_addr, e);
             }
         }
 
-        self.metrics.connection_closed();
+        if self.enable_metrics {
+            self.metrics.connection_closed();
+        }
         debug!("Connection returned to pool for {}", server.name);
         Ok(())
     }
@@ -454,7 +488,9 @@ impl NntpProxy {
         );
 
         // Record connection metrics
-        self.metrics.connection_opened();
+        if self.enable_metrics {
+            self.metrics.connection_opened();
+        }
 
         // Enable TCP_NODELAY for low latency
         if let Err(e) = client_stream.set_nodelay(true) {
@@ -466,14 +502,18 @@ impl NntpProxy {
         // All backend greetings are consumed when connections are created
 
         // Create session with router for per-command routing
-        let session = ClientSession::new_with_router(
+        let mut session = ClientSession::new_with_router(
             client_addr,
             self.buffer_pool.clone(),
             self.router.clone(),
             self.routing_mode,
             self.auth_handler.clone(),
-        )
-        .with_metrics(self.metrics.clone());
+        );
+
+        // Conditionally enable metrics (causes ~45% performance penalty)
+        if self.enable_metrics {
+            session = session.with_metrics(self.metrics.clone());
+        }
 
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
 
@@ -503,9 +543,7 @@ impl NntpProxy {
                     crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
                     crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
                 );
-                // Record transfer metrics
-                // Note: per-command routing uses multiple backends, so we don't record per-backend
-                // The session internals will handle per-command metrics recording
+                // Metrics already recorded per-command during session
             }
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
@@ -527,7 +565,9 @@ impl NntpProxy {
             }
         }
 
-        self.metrics.connection_closed();
+        if self.enable_metrics {
+            self.metrics.connection_closed();
+        }
         debug!(
             "Per-command routing connection closed for {} (ID: {})",
             client_addr, session_id

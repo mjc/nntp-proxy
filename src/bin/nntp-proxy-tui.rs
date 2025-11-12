@@ -180,8 +180,13 @@ async fn run_proxy(args: Args) -> Result<()> {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
 
-    // Create proxy
-    let proxy = Arc::new(NntpProxy::new(config, args.routing_mode)?);
+    // Create proxy with metrics enabled for TUI
+    let proxy = Arc::new(
+        NntpProxy::builder(config)
+            .with_routing_mode(args.routing_mode)
+            .with_metrics() // Enable metrics for TUI (causes ~45% perf penalty)
+            .build()?,
+    );
 
     // Prewarm connection pools
     info!("Prewarming connection pools...");
@@ -189,6 +194,30 @@ async fn run_proxy(args: Args) -> Result<()> {
         warn!("Failed to prewarm connection pools: {}", e);
     }
     info!("Connection pools ready");
+
+    // Create shutdown channel - TUI will control shutdown
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+    // Launch TUI FIRST if enabled
+    // This allows seeing the dashboard before connections start
+    let tui_handle = if !args.no_tui {
+        let tui_app = tui::TuiApp::new(
+            proxy.metrics().clone(),
+            proxy.router().clone(),
+            proxy.servers().to_vec().into(),
+        );
+
+        let shutdown_tx_for_tui = shutdown_tx.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = tui::run_tui(tui_app, shutdown_tx_for_tui).await {
+                error!("TUI error: {}", e);
+            }
+            // When TUI exits, signal shutdown
+            info!("TUI exited, initiating shutdown");
+        }))
+    } else {
+        None
+    };
 
     // Start listening
     let listen_addr = format!("0.0.0.0:{}", args.port.get());
@@ -198,72 +227,70 @@ async fn run_proxy(args: Args) -> Result<()> {
         listen_addr, args.routing_mode
     );
 
-    // Create shutdown channel for TUI
-    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-
-    // Launch TUI if enabled
-    let _tui_handle = if !args.no_tui {
-        let tui_app = tui::TuiApp::new(proxy.metrics().clone(), proxy.servers().to_vec().into());
-
-        let shutdown_rx_tui = shutdown_rx;
-        Some(tokio::spawn(async move {
-            if let Err(e) = tui::run_tui(tui_app, shutdown_rx_tui).await {
-                error!("TUI error: {}", e);
-            }
-        }))
-    } else {
-        // Still need to handle shutdown_rx even without TUI
-        drop(shutdown_rx);
-        None
-    };
-
-    // Set up graceful shutdown signal handler
+    // Set up graceful shutdown signal handler for non-TUI mode or SIGTERM
     let proxy_for_shutdown = proxy.clone();
-    let shutdown_tx_clone = shutdown_tx.clone();
+    let shutdown_tx_signal = shutdown_tx.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("Shutdown signal received, closing idle connections...");
 
-        // Notify TUI to exit
-        let _ = shutdown_tx_clone.send(()).await;
+        // Notify anyone listening
+        let _ = shutdown_tx_signal.send(()).await;
 
         proxy_for_shutdown.graceful_shutdown().await;
         info!("Graceful shutdown complete");
-        std::process::exit(0);
     });
 
     // Accept connections
     let uses_per_command_routing = args.routing_mode.supports_per_command_routing();
 
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let proxy_clone = proxy.clone();
-                if uses_per_command_routing {
-                    tokio::spawn(async move {
-                        if let Err(e) = proxy_clone
-                            .handle_client_per_command_routing(stream, addr)
-                            .await
-                        {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
-                } else {
-                    tokio::spawn(async move {
-                        if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
-                }
+        tokio::select! {
+            // Check for shutdown signal from TUI
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown initiated, stopping accept loop");
+                break;
             }
-            Err(e) => {
-                error!("Failed to accept connection: {}", e);
+            // Accept new connections
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        let proxy_clone = proxy.clone();
+                        if uses_per_command_routing {
+                            tokio::spawn(async move {
+                                if let Err(e) = proxy_clone
+                                    .handle_client_per_command_routing(stream, addr)
+                                    .await
+                                {
+                                    error!("Error handling client {}: {}", addr, e);
+                                }
+                            });
+                        } else {
+                            tokio::spawn(async move {
+                                if let Err(e) = proxy_clone.handle_client(stream, addr).await {
+                                    error!("Error handling client {}: {}", addr, e);
+                                }
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                    }
+                }
             }
         }
     }
 
-    // Note: The loop above runs forever, so this code is unreachable
-    // The process exits via the shutdown signal handler
+    // Graceful shutdown
+    proxy.graceful_shutdown().await;
+    info!("Proxy shutdown complete");
+
+    // Wait for TUI to exit if it's running
+    if let Some(handle) = tui_handle {
+        let _ = handle.await;
+    }
+
+    Ok(())
 }
 
 /// Wait for shutdown signal

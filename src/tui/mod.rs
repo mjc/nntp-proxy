@@ -22,14 +22,15 @@ use tokio::sync::mpsc;
 /// Run the TUI event loop
 ///
 /// This function takes ownership of the terminal and runs until the user presses 'q' or Ctrl+C.
+/// When the TUI exits, it sends a shutdown signal via the provided channel.
 ///
 /// # Arguments
 /// * `app` - The TUI application state
-/// * `mut shutdown_rx` - Receiver for shutdown signals
+/// * `shutdown_tx` - Sender to signal shutdown when TUI exits
 ///
 /// # Returns
 /// Ok(()) when the TUI exits normally, or an error if terminal operations fail
-pub async fn run_tui(mut app: TuiApp, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
+pub async fn run_tui(mut app: TuiApp, shutdown_tx: mpsc::Sender<()>) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -40,7 +41,7 @@ pub async fn run_tui(mut app: TuiApp, mut shutdown_rx: mpsc::Receiver<()>) -> Re
     // Clear the terminal
     terminal.clear()?;
 
-    let result = run_app(&mut terminal, &mut app, &mut shutdown_rx).await;
+    let result = run_app(&mut terminal, &mut app).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -51,6 +52,9 @@ pub async fn run_tui(mut app: TuiApp, mut shutdown_rx: mpsc::Receiver<()>) -> Re
     )?;
     terminal.show_cursor()?;
 
+    // Signal shutdown when TUI exits
+    let _ = shutdown_tx.send(()).await;
+
     result
 }
 
@@ -58,35 +62,39 @@ pub async fn run_tui(mut app: TuiApp, mut shutdown_rx: mpsc::Receiver<()>) -> Re
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut TuiApp,
-    shutdown_rx: &mut mpsc::Receiver<()>,
 ) -> Result<()> {
+    // Create update interval (4 times per second for responsive UI)
+    let mut update_interval = tokio::time::interval(Duration::from_millis(250));
+
     loop {
         // Render the UI
         terminal.draw(|f| ui::render_ui(f, app))?;
 
-        // Check for shutdown signal (non-blocking)
-        if shutdown_rx.try_recv().is_ok() {
-            break;
-        }
+        tokio::select! {
+            // Update timer
+            _ = update_interval.tick() => {
+                app.update();
 
-        // Poll for events with a timeout to allow periodic updates
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            // Only handle key press events (not release)
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        break;
+                // Check for keyboard input (non-blocking)
+                if event::poll(Duration::from_millis(0))? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind == KeyEventKind::Press {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    // User pressed 'q' - exit TUI and shut down app
+                                    break;
+                                }
+                                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                    // Ctrl-C pressed - exit TUI and shut down app
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    _ => {}
                 }
             }
         }
-
-        // Update metrics
-        app.update();
     }
 
     Ok(())

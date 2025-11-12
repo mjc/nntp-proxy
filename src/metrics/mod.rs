@@ -3,6 +3,7 @@
 //! This module provides lock-free, thread-safe metrics tracking using atomic operations.
 //! Metrics are designed to be updated frequently from hot paths with minimal overhead.
 
+use crate::types::BackendBytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -25,13 +26,6 @@ struct MetricsInner {
     // Per-backend metrics (indexed by backend ID)
     backend_metrics: Vec<BackendMetrics>,
 
-    // Data transfer metrics
-    total_bytes_sent: AtomicU64,
-    total_bytes_received: AtomicU64,
-
-    // Command metrics
-    total_commands: AtomicU64,
-
     // Start time for uptime calculation
     start_time: Instant,
 }
@@ -51,9 +45,9 @@ struct BackendMetrics {
 pub struct MetricsSnapshot {
     pub total_connections: u64,
     pub active_connections: usize,
-    pub total_bytes_sent: u64,
-    pub total_bytes_received: u64,
-    pub total_commands: u64,
+    // Traffic flows
+    pub client_to_backend_bytes: BackendBytes, // Commands from client to backend
+    pub backend_to_client_bytes: BackendBytes, // Article data from backend to client
     pub uptime: Duration,
     pub backend_stats: Vec<BackendStats>,
 }
@@ -90,9 +84,6 @@ impl MetricsCollector {
                 total_connections: AtomicU64::new(0),
                 active_connections: AtomicUsize::new(0),
                 backend_metrics,
-                total_bytes_sent: AtomicU64::new(0),
-                total_bytes_received: AtomicU64::new(0),
-                total_commands: AtomicU64::new(0),
                 start_time: Instant::now(),
             }),
         }
@@ -115,32 +106,77 @@ impl MetricsCollector {
             .fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Record bytes transferred to a backend
+    /// Record bytes sent TO a specific backend (commands)
     #[inline]
-    pub fn record_bytes_sent(&self, backend_id: usize, bytes: u64) {
-        self.inner
-            .total_bytes_sent
-            .fetch_add(bytes, Ordering::Relaxed);
+    pub fn record_client_to_backend_bytes_for(&self, backend_id: usize, bytes: u64) {
         if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
             backend.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
-    /// Record bytes received from a backend
+    /// Record bytes received FROM a specific backend (article data)
     #[inline]
-    pub fn record_bytes_received(&self, backend_id: usize, bytes: u64) {
-        self.inner
-            .total_bytes_received
-            .fetch_add(bytes, Ordering::Relaxed);
+    pub fn record_backend_to_client_bytes_for(&self, backend_id: usize, bytes: u64) {
         if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
             backend.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Type-safe recording: consumes unrecorded bytes and returns recorded marker
+    ///
+    /// This method uses the typestate pattern to prevent double-counting at compile time.
+    /// The `Unrecorded` bytes are consumed and cannot be used again.
+    ///
+    /// Note: Global metrics are calculated by summing per-backend metrics.
+    /// Use the per-backend recording methods to actually record bytes.
+    #[inline]
+    pub fn record_client_to_backend(
+        &self,
+        bytes: crate::types::MetricsBytes<crate::types::Unrecorded>,
+    ) -> crate::types::MetricsBytes<crate::types::Recorded> {
+        let count = bytes.into_u64();
+        // No global recording - just consume and mark as recorded
+        crate::types::MetricsBytes::new(count).mark_recorded()
+    }
+
+    /// Type-safe recording: consumes unrecorded bytes and returns recorded marker
+    ///
+    /// This method uses the typestate pattern to prevent double-counting at compile time.
+    /// The `Unrecorded` bytes are consumed and cannot be used again.
+    ///
+    /// Note: Global metrics are calculated by summing per-backend metrics.
+    /// Use the per-backend recording methods to actually record bytes.
+    #[inline]
+    pub fn record_backend_to_client(
+        &self,
+        bytes: crate::types::MetricsBytes<crate::types::Unrecorded>,
+    ) -> crate::types::MetricsBytes<crate::types::Recorded> {
+        let count = bytes.into_u64();
+        // No global recording - just consume and mark as recorded
+        crate::types::MetricsBytes::new(count).mark_recorded()
+    }
+
+    /// Type-safe directional recording
+    ///
+    /// Records bytes in the appropriate direction based on the transfer type.
+    /// Prevents accidentally swapping directions at compile time.
+    #[inline]
+    pub fn record_directional(
+        &self,
+        bytes: crate::types::DirectionalBytes<crate::types::Unrecorded>,
+    ) -> crate::types::MetricsBytes<crate::types::Recorded> {
+        use crate::types::TransferDirection;
+
+        match bytes.direction() {
+            TransferDirection::ClientToBackend => self.record_client_to_backend(bytes.into_bytes()),
+            TransferDirection::BackendToClient => self.record_backend_to_client(bytes.into_bytes()),
         }
     }
 
     /// Record a command processed
     #[inline]
     pub fn record_command(&self, backend_id: usize) {
-        self.inner.total_commands.fetch_add(1, Ordering::Relaxed);
+        // Only track per-backend commands, no global total
         if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
             backend.total_commands.fetch_add(1, Ordering::Relaxed);
         }
@@ -177,27 +213,30 @@ impl MetricsCollector {
     /// but this is acceptable for display purposes.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let backend_stats = self
-            .inner
-            .backend_metrics
-            .iter()
-            .enumerate()
-            .map(|(id, metrics)| BackendStats {
+        let num_backends = self.inner.backend_metrics.len();
+        let mut backend_stats = Vec::with_capacity(num_backends);
+        
+        // Pre-allocate and populate to avoid allocations
+        for (id, metrics) in self.inner.backend_metrics.iter().enumerate() {
+            backend_stats.push(BackendStats {
                 backend_id: id,
                 active_connections: metrics.active_connections.load(Ordering::Relaxed),
                 total_commands: metrics.total_commands.load(Ordering::Relaxed),
                 bytes_sent: metrics.bytes_sent.load(Ordering::Relaxed),
                 bytes_received: metrics.bytes_received.load(Ordering::Relaxed),
                 errors: metrics.errors.load(Ordering::Relaxed),
-            })
-            .collect();
+            });
+        }
+
+        // Calculate global totals by summing backend metrics
+        let c2b_bytes: u64 = backend_stats.iter().map(|b| b.bytes_sent).sum();
+        let b2c_bytes: u64 = backend_stats.iter().map(|b| b.bytes_received).sum();
 
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),
             active_connections: self.inner.active_connections.load(Ordering::Relaxed),
-            total_bytes_sent: self.inner.total_bytes_sent.load(Ordering::Relaxed),
-            total_bytes_received: self.inner.total_bytes_received.load(Ordering::Relaxed),
-            total_commands: self.inner.total_commands.load(Ordering::Relaxed),
+            client_to_backend_bytes: BackendBytes::new(c2b_bytes),
+            backend_to_client_bytes: BackendBytes::new(b2c_bytes),
             uptime: self.inner.start_time.elapsed(),
             backend_stats,
         }
@@ -229,11 +268,11 @@ impl MetricsSnapshot {
         }
     }
 
-    /// Get total bytes transferred (sent + received)
+    /// Get total bytes transferred (sent + received) across backends
     #[must_use]
     #[inline]
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes_sent + self.total_bytes_received
+        self.client_to_backend_bytes.as_u64() + self.backend_to_client_bytes.as_u64()
     }
 
     /// Calculate throughput in bytes per second
@@ -281,14 +320,21 @@ mod tests {
     fn test_bytes_tracking() {
         let metrics = MetricsCollector::new(2);
 
-        metrics.record_bytes_sent(0, 1024);
-        metrics.record_bytes_received(0, 2048);
+        // Record bytes for specific backends
+        metrics.record_client_to_backend_bytes_for(0, 512);
+        metrics.record_client_to_backend_bytes_for(1, 512);
+        metrics.record_backend_to_client_bytes_for(0, 1024);
+        metrics.record_backend_to_client_bytes_for(1, 1024);
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.total_bytes_sent, 1024);
-        assert_eq!(snapshot.total_bytes_received, 2048);
-        assert_eq!(snapshot.backend_stats[0].bytes_sent, 1024);
-        assert_eq!(snapshot.backend_stats[0].bytes_received, 2048);
+        // Global totals should be sum of all backends
+        assert_eq!(snapshot.client_to_backend_bytes.as_u64(), 1024);
+        assert_eq!(snapshot.backend_to_client_bytes.as_u64(), 2048);
+        // Per-backend totals
+        assert_eq!(snapshot.backend_stats[0].bytes_sent, 512);
+        assert_eq!(snapshot.backend_stats[0].bytes_received, 1024);
+        assert_eq!(snapshot.backend_stats[1].bytes_sent, 512);
+        assert_eq!(snapshot.backend_stats[1].bytes_received, 1024);
     }
 
     #[test]
@@ -300,7 +346,7 @@ mod tests {
         metrics.record_command(1);
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.total_commands, 3);
+        // No global total anymore, just per-backend
         assert_eq!(snapshot.backend_stats[0].total_commands, 2);
         assert_eq!(snapshot.backend_stats[1].total_commands, 1);
     }
@@ -322,9 +368,8 @@ mod tests {
         let snapshot = MetricsSnapshot {
             total_connections: 0,
             active_connections: 0,
-            total_bytes_sent: 0,
-            total_bytes_received: 0,
-            total_commands: 0,
+            client_to_backend_bytes: BackendBytes::new(0),
+            backend_to_client_bytes: BackendBytes::new(0),
             uptime: Duration::from_secs(3665), // 1h 1m 5s
             backend_stats: vec![],
         };
@@ -337,9 +382,8 @@ mod tests {
         let snapshot = MetricsSnapshot {
             total_connections: 0,
             active_connections: 0,
-            total_bytes_sent: 5000,
-            total_bytes_received: 5000,
-            total_commands: 0,
+            client_to_backend_bytes: BackendBytes::new(5000),
+            backend_to_client_bytes: BackendBytes::new(5000),
             uptime: Duration::from_secs(10),
             backend_stats: vec![],
         };

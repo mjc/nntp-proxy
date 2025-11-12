@@ -131,20 +131,50 @@ impl Default for HealthCheckConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ClientAuthConfig {
     /// Required username for client authentication (if set, auth is enabled)
+    /// DEPRECATED: Use `users` instead for multi-user support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Required password for client authentication
+    /// DEPRECATED: Use `users` instead for multi-user support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Optional custom greeting message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub greeting: Option<String>,
+    /// List of authorized users (replaces username/password for multi-user support)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<UserCredentials>,
+}
+
+/// Individual user credentials
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserCredentials {
+    pub username: String,
+    pub password: String,
 }
 
 impl ClientAuthConfig {
     /// Check if authentication is enabled
     pub fn is_enabled(&self) -> bool {
-        self.username.is_some() && self.password.is_some()
+        // Auth is enabled if either the legacy single-user config or multi-user list is populated
+        (!self.users.is_empty()) || (self.username.is_some() && self.password.is_some())
+    }
+
+    /// Get all users (combines legacy + new format)
+    pub fn all_users(&self) -> Vec<(&str, &str)> {
+        let mut users = Vec::new();
+
+        // Add legacy single user if present
+        if let (Some(u), Some(p)) = (&self.username, &self.password) {
+            users.push((u.as_str(), p.as_str()));
+        }
+
+        // Add multi-user list
+        for user in &self.users {
+            users.push((user.username.as_str(), user.password.as_str()));
+        }
+
+        users
     }
 }
 

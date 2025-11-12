@@ -6,8 +6,9 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Bar, BarChart, BarGroup, Block, Borders, List, ListItem, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph},
 };
 
 /// Render the main UI
@@ -31,10 +32,10 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     render_title(f, chunks[0], snapshot);
 
     // Render summary statistics
-    render_summary(f, chunks[1], snapshot);
+    render_summary(f, chunks[1], snapshot, app);
 
     // Render backend data flow visualization
-    render_backends(f, chunks[2], snapshot, servers);
+    render_backends(f, chunks[2], snapshot, servers, app);
 
     // Render footer
     render_footer(f, chunks[3]);
@@ -89,44 +90,50 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
 }
 
 /// Render summary statistics
-fn render_summary(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
-    let throughput = snapshot.throughput_bps();
-    let throughput_str = if throughput > 1_000_000.0 {
-        format!("{:.2} MB/s", throughput / 1_000_000.0)
-    } else if throughput > 1_000.0 {
-        format!("{:.2} KB/s", throughput / 1_000.0)
+fn render_summary(
+    f: &mut Frame,
+    area: Rect,
+    _snapshot: &crate::metrics::MetricsSnapshot,
+    app: &TuiApp,
+) {
+    // Calculate current throughput
+    let mut client_to_backend_bps = 0.0; // Commands to backend
+    let mut backend_to_client_bps = 0.0; // Article data from backend
+
+    // Get throughput from history
+    if let Some(latest) = app.client_throughput_history().back() {
+        client_to_backend_bps = latest.sent_per_sec;
+        backend_to_client_bps = latest.received_per_sec;
+    }
+
+    // Format traffic
+    let client_to_backend_str = if client_to_backend_bps > 1_000_000.0 {
+        format!("↑{:.2} MB/s", client_to_backend_bps / 1_000_000.0)
+    } else if client_to_backend_bps > 1_000.0 {
+        format!("↑{:.2} KB/s", client_to_backend_bps / 1_000.0)
     } else {
-        format!("{:.0} B/s", throughput)
+        format!("↑{:.0} B/s", client_to_backend_bps)
+    };
+
+    let backend_to_client_str = if backend_to_client_bps > 1_000_000.0 {
+        format!("↓{:.2} MB/s", backend_to_client_bps / 1_000_000.0)
+    } else if backend_to_client_bps > 1_000.0 {
+        format!("↓{:.2} KB/s", backend_to_client_bps / 1_000.0)
+    } else {
+        format!("↓{:.0} B/s", backend_to_client_bps)
     };
 
     let summary = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Commands: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{}", snapshot.total_commands),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  |  ", Style::default().fg(Color::Gray)),
-            Span::styled("↑ Sent: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format_bytes(snapshot.total_bytes_sent),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled("  |  ", Style::default().fg(Color::Gray)),
-            Span::styled("↓ Received: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format_bytes(snapshot.total_bytes_received),
-                Style::default().fg(Color::Blue),
-            ),
+            Span::styled("Client → Backend: ", Style::default().fg(Color::Gray)),
+            Span::styled(&client_to_backend_str, Style::default().fg(Color::Yellow)),
         ]),
         Line::from(vec![
-            Span::styled("Throughput: ", Style::default().fg(Color::Gray)),
+            Span::styled("Backend → Client: ", Style::default().fg(Color::Gray)),
             Span::styled(
-                throughput_str,
+                &backend_to_client_str,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -148,6 +155,7 @@ fn render_backends(
     area: Rect,
     snapshot: &crate::metrics::MetricsSnapshot,
     servers: &[crate::config::ServerConfig],
+    app: &TuiApp,
 ) {
     // Split into two columns: backend list and data flow chart
     let chunks = Layout::default()
@@ -156,10 +164,10 @@ fn render_backends(
         .split(area);
 
     // Render backend list
-    render_backend_list(f, chunks[0], snapshot, servers);
+    render_backend_list(f, chunks[0], snapshot, servers, app);
 
     // Render data flow visualization
-    render_data_flow(f, chunks[1], snapshot, servers);
+    render_data_flow(f, chunks[1], snapshot, servers, app);
 }
 
 /// Render list of backend servers with their stats
@@ -168,12 +176,14 @@ fn render_backend_list(
     area: Rect,
     snapshot: &crate::metrics::MetricsSnapshot,
     servers: &[crate::config::ServerConfig],
+    app: &crate::tui::TuiApp,
 ) {
     let items: Vec<ListItem> = snapshot
         .backend_stats
         .iter()
         .zip(servers.iter())
-        .map(|(stats, server)| {
+        .enumerate()
+        .map(|(i, (stats, server))| {
             let status_color = if stats.active_connections > 0 {
                 Color::Green
             } else {
@@ -185,6 +195,13 @@ fn render_backend_list(
             } else {
                 String::new()
             };
+
+            // Get latest commands/sec from throughput history
+            let cmd_per_sec = app
+                .throughput_history(i)
+                .back()
+                .map(|point| point.commands_per_sec)
+                .unwrap_or(0.0);
 
             let content = vec![
                 Line::from(vec![
@@ -210,9 +227,9 @@ fn render_backend_list(
                         format!("{}", stats.active_connections),
                         Style::default().fg(Color::Yellow),
                     ),
-                    Span::styled(" clients  |  Commands: ", Style::default().fg(Color::Gray)),
+                    Span::styled(" clients  |  Cmd/s: ", Style::default().fg(Color::Gray)),
                     Span::styled(
-                        format!("{}", stats.total_commands),
+                        format!("{:.1}", cmd_per_sec),
                         Style::default().fg(Color::Cyan),
                     ),
                 ]),
@@ -244,95 +261,141 @@ fn render_backend_list(
     f.render_widget(list, area);
 }
 
-/// Render data flow visualization as a bar chart
+/// Render data flow visualization as line graphs
 fn render_data_flow(
     f: &mut Frame,
     area: Rect,
-    snapshot: &crate::metrics::MetricsSnapshot,
+    _snapshot: &crate::metrics::MetricsSnapshot,
     servers: &[crate::config::ServerConfig],
+    app: &TuiApp,
 ) {
-    // Find max bytes for scaling
-    let max_bytes = snapshot
-        .backend_stats
-        .iter()
-        .map(|s| s.bytes_sent.max(s.bytes_received))
-        .max()
-        .unwrap_or(1);
+    // Find max throughput across all backends for scaling Y-axis
+    let mut max_throughput = 1_000_000.0; // Start at 1 MB/s minimum
 
-    // Format max bytes for display
-    let max_bytes_str = format_bytes(max_bytes);
+    for i in 0..servers.len() {
+        let history = app.throughput_history(i);
+        for point in history.iter() {
+            let max_point = point
+                .backend_sent_per_sec
+                .max(point.backend_received_per_sec);
+            if max_point > max_throughput {
+                max_throughput = max_point;
+            }
+        }
+    }
 
-    // Create bar groups for each backend
-    let bars: Vec<Bar> = snapshot
-        .backend_stats
-        .iter()
-        .zip(servers.iter())
-        .flat_map(|(stats, _server)| {
-            // Calculate bar heights (scaled to max 100)
-            let sent_height = if max_bytes > 0 {
-                ((stats.bytes_sent as f64 / max_bytes as f64) * 100.0) as u64
-            } else {
-                0
-            };
-            let recv_height = if max_bytes > 0 {
-                ((stats.bytes_received as f64 / max_bytes as f64) * 100.0) as u64
-            } else {
-                0
-            };
+    // Round up to next nice number
+    max_throughput = if max_throughput > 100_000_000.0 {
+        (max_throughput / 10_000_000.0).ceil() * 10_000_000.0 // Round to 10 MB/s
+    } else if max_throughput > 10_000_000.0 {
+        (max_throughput / 1_000_000.0).ceil() * 1_000_000.0 // Round to 1 MB/s
+    } else if max_throughput > 1_000_000.0 {
+        (max_throughput / 100_000.0).ceil() * 100_000.0 // Round to 100 KB/s
+    } else {
+        (max_throughput / 10_000.0).ceil() * 10_000.0 // Round to 10 KB/s
+    };
 
-            // Create labels with backend number and actual byte values
-            let sent_label = if stats.bytes_sent > 0 {
-                format!("↑{}", format_bytes(stats.bytes_sent))
-            } else {
-                "↑".to_string()
-            };
+    // Format Y-axis label
+    let max_label = if max_throughput >= 1_000_000.0 {
+        format!("{:.0} MB/s", max_throughput / 1_000_000.0)
+    } else if max_throughput >= 1_000.0 {
+        format!("{:.0} KB/s", max_throughput / 1_000.0)
+    } else {
+        format!("{:.0} B/s", max_throughput)
+    };
 
-            let recv_label = if stats.bytes_received > 0 {
-                format!("↓{}", format_bytes(stats.bytes_received))
-            } else {
-                "↓".to_string()
-            };
+    // Create datasets for each backend
+    let mut datasets = Vec::new();
+    let colors = [
+        Color::Green,
+        Color::Cyan,
+        Color::Yellow,
+        Color::Magenta,
+        Color::Red,
+        Color::Blue,
+    ];
 
-            vec![
-                Bar::default()
-                    .value(sent_height)
-                    .label(Line::from(sent_label).alignment(Alignment::Center))
-                    .style(Style::default().fg(Color::Green))
-                    .value_style(
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                Bar::default()
-                    .value(recv_height)
-                    .label(Line::from(recv_label).alignment(Alignment::Center))
-                    .style(Style::default().fg(Color::Blue))
-                    .value_style(
-                        Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-            ]
-        })
-        .collect();
+    // Collect all data points first (to satisfy lifetime requirements)
+    let mut all_data: Vec<(Vec<(f64, f64)>, Vec<(f64, f64)>, &str, Color)> = Vec::new();
 
-    let chart_title = format!("Data Flow (max: {})", max_bytes_str);
+    for (i, server) in servers.iter().enumerate() {
+        let history = app.throughput_history(i);
+        let color = colors[i % colors.len()];
 
-    let bar_chart = BarChart::default()
+        // Create data points for sent (upload to backend)
+        let sent_data: Vec<(f64, f64)> = history
+            .iter()
+            .enumerate()
+            .map(|(idx, point)| (idx as f64, point.backend_sent_per_sec))
+            .collect();
+
+        // Create data points for received (download from backend)
+        let recv_data: Vec<(f64, f64)> = history
+            .iter()
+            .enumerate()
+            .map(|(idx, point)| (idx as f64, point.backend_received_per_sec))
+            .collect();
+
+        all_data.push((sent_data, recv_data, server.name.as_str(), color));
+    }
+
+    // Now create datasets from collected data
+    for (sent_data, recv_data, name, color) in &all_data {
+        if !sent_data.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name(format!("{} ↑", name))
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(*color))
+                    .data(sent_data),
+            );
+        }
+
+        if !recv_data.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name(format!("{} ↓", name))
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
+                    .data(recv_data),
+            );
+        }
+    }
+
+    let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(chart_title)
+                .title("Throughput (15s)")
                 .border_style(Style::default().fg(Color::White)),
         )
-        .bar_width(3)
-        .bar_gap(1)
-        .group_gap(2)
-        .bar_style(Style::default().fg(Color::White))
-        .value_style(Style::default().add_modifier(Modifier::BOLD))
-        .data(BarGroup::default().bars(&bars));
+        .x_axis(
+            Axis::default()
+                .title("")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, 60.0])
+                .labels(vec![
+                    Line::from("15s"),
+                    Line::from("10s"),
+                    Line::from("5s"),
+                    Line::from("0s"),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("Throughput")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, max_throughput])
+                .labels(vec![
+                    Line::from("0"),
+                    Line::from(format!("{:.0}", max_throughput / 2.0)),
+                    Line::from(max_label),
+                ]),
+        );
 
-    f.render_widget(bar_chart, area);
+    f.render_widget(chart, area);
 }
 
 /// Render footer with help text
