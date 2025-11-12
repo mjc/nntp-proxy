@@ -291,7 +291,7 @@ mod tests {
     fn test_backend_index() {
         let idx = BackendIndex::new(5);
         assert_eq!(idx.get(), 5);
-        
+
         let idx2: BackendIndex = 10.into();
         assert_eq!(usize::from(idx2), 10);
     }
@@ -300,13 +300,13 @@ mod tests {
     fn test_bytes_per_second() {
         let bps = BytesPerSecond::new(1_500_000.0);
         assert_eq!(bps.format(), "1.50 MB/s");
-        
+
         let bps2 = BytesPerSecond::new(2_500.0);
         assert_eq!(bps2.format(), "2.50 KB/s");
-        
+
         let bps3 = BytesPerSecond::new(500.0);
         assert_eq!(bps3.format(), "500 B/s");
-        
+
         assert_eq!(BytesPerSecond::zero().get(), 0.0);
     }
 
@@ -314,7 +314,7 @@ mod tests {
     fn test_commands_per_second() {
         let cps = CommandsPerSecond::new(123.456);
         assert_eq!(cps.to_string(), "123.5");
-        
+
         assert_eq!(CommandsPerSecond::zero().get(), 0.0);
     }
 

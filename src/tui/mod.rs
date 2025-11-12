@@ -3,6 +3,8 @@
 //! Provides real-time visualization of proxy metrics when running in an interactive terminal.
 
 mod app;
+mod constants;
+mod helpers;
 mod ui;
 
 pub use app::TuiApp;

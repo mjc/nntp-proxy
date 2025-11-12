@@ -295,7 +295,9 @@ impl TuiApp {
     /// Get latest throughput for a backend
     #[must_use]
     pub fn latest_backend_throughput(&self, backend_idx: usize) -> Option<&ThroughputPoint> {
-        self.backend_history.get(backend_idx).and_then(|h| h.latest())
+        self.backend_history
+            .get(backend_idx)
+            .and_then(|h| h.latest())
     }
 }
 

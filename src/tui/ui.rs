@@ -2,14 +2,20 @@
 
 use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
+use crate::tui::constants::{chart, layout, status, styles, text};
+use crate::tui::helpers::{backend_color, format_throughput_label, round_up_throughput};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph},
 };
+
+// ============================================================================
+// Render Functions
+// ============================================================================
 
 /// Render the main UI
 pub fn render_ui(f: &mut Frame, app: &TuiApp) {
@@ -20,24 +26,13 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(5), // Summary stats
-            Constraint::Min(10),   // Backend visualization
-            Constraint::Length(3), // Footer/help
-        ])
+        .constraints(layout::main_sections())
         .split(f.area());
 
-    // Render title
+    // Render each section
     render_title(f, chunks[0], snapshot);
-
-    // Render summary statistics
-    render_summary(f, chunks[1], snapshot, app);
-
-    // Render backend data flow visualization
+    render_summary(f, chunks[1], app);
     render_backends(f, chunks[2], snapshot, servers, app);
-
-    // Render footer
     render_footer(f, chunks[3]);
 }
 
@@ -48,7 +43,7 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
             Span::styled(
                 "NNTP Proxy ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(styles::BORDER_ACTIVE)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -57,32 +52,35 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
             ),
         ]),
         Line::from(vec![
-            Span::styled("Uptime: ", Style::default().fg(Color::Gray)),
+            Span::styled("Uptime: ", Style::default().fg(styles::LABEL)),
             Span::styled(
                 snapshot.format_uptime(),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(styles::VALUE_PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  |  Active: ", Style::default().fg(Color::Gray)),
+            Span::styled("  |  Active: ", Style::default().fg(styles::LABEL)),
             Span::styled(
                 format!("{}", snapshot.active_connections),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(styles::VALUE_SECONDARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" connections  |  Total: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                " connections  |  Total: ",
+                Style::default().fg(styles::LABEL),
+            ),
             Span::styled(
                 format!("{}", snapshot.total_connections),
-                Style::default().fg(Color::Blue),
+                Style::default().fg(styles::VALUE_NEUTRAL),
             ),
-            Span::styled(" connections", Style::default().fg(Color::Gray)),
+            Span::styled(" connections", Style::default().fg(styles::LABEL)),
         ]),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(styles::BORDER_ACTIVE)),
     )
     .alignment(Alignment::Center);
 
@@ -90,34 +88,37 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
 }
 
 /// Render summary statistics
-fn render_summary(
-    f: &mut Frame,
-    area: Rect,
-    _snapshot: &crate::metrics::MetricsSnapshot,
-    app: &TuiApp,
-) {
+fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
     // Get latest throughput from history (functional approach)
     let (client_to_backend_str, backend_to_client_str) = app
         .latest_client_throughput()
         .map(|point| {
             (
-                format!("↑{}", point.sent_per_sec()),
-                format!("↓{}", point.received_per_sec()),
+                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
+                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
             )
         })
-        .unwrap_or_else(|| (String::from("↑0 B/s"), String::from("↓0 B/s")));
+        .unwrap_or_else(|| {
+            (
+                format!("{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT),
+                format!("{}{}", text::ARROW_DOWN, text::DEFAULT_THROUGHPUT),
+            )
+        });
 
     let summary = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Client → Backend: ", Style::default().fg(Color::Gray)),
-            Span::styled(&client_to_backend_str, Style::default().fg(Color::Yellow)),
+            Span::styled("Client → Backend: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                &client_to_backend_str,
+                Style::default().fg(styles::VALUE_SECONDARY),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("Backend → Client: ", Style::default().fg(Color::Gray)),
+            Span::styled("Backend → Client: ", Style::default().fg(styles::LABEL)),
             Span::styled(
                 &backend_to_client_str,
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(styles::VALUE_PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -126,7 +127,7 @@ fn render_summary(
         Block::default()
             .borders(Borders::ALL)
             .title("Summary")
-            .border_style(Style::default().fg(Color::White)),
+            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
     )
     .alignment(Alignment::Left);
 
@@ -144,14 +145,11 @@ fn render_backends(
     // Split into two columns: backend list and data flow chart
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints(layout::backend_columns())
         .split(area);
 
-    // Render backend list
     render_backend_list(f, chunks[0], snapshot, servers, app);
-
-    // Render data flow visualization
-    render_data_flow(f, chunks[1], snapshot, servers, app);
+    render_data_flow(f, chunks[1], servers, app);
 }
 
 /// Render list of backend servers with their stats
@@ -169,13 +167,13 @@ fn render_backend_list(
         .enumerate()
         .map(|(i, (stats, server))| {
             let status_color = if stats.active_connections > 0 {
-                Color::Green
+                status::ACTIVE
             } else {
-                Color::Gray
+                status::INACTIVE
             };
 
             let error_indicator = if stats.errors > 0 {
-                format!(" ⚠ {}", stats.errors)
+                format!("{}{}", text::WARNING_ICON, stats.errors)
             } else {
                 String::new()
             };
@@ -185,48 +183,51 @@ fn render_backend_list(
                 .latest_backend_throughput(i)
                 .and_then(|point| point.commands_per_sec())
                 .map(|cps| cps.to_string())
-                .unwrap_or_else(|| String::from("0.0"));
+                .unwrap_or_else(|| String::from(text::DEFAULT_CMD_RATE));
 
             let content = vec![
                 Line::from(vec![
-                    Span::styled("● ", Style::default().fg(status_color)),
+                    Span::styled(text::STATUS_INDICATOR, Style::default().fg(status_color)),
                     Span::styled(
-                        format!("{}", server.name),
+                        server.name.as_str(),
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(error_indicator, Style::default().fg(Color::Red)),
+                    Span::styled(error_indicator, Style::default().fg(status::ERROR)),
                 ]),
                 Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
                         format!("{}:{}", server.host, server.port),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(styles::LABEL),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Active: ", Style::default().fg(Color::Gray)),
+                    Span::styled("  Active: ", Style::default().fg(styles::LABEL)),
                     Span::styled(
                         format!("{}", stats.active_connections),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(styles::VALUE_SECONDARY),
                     ),
-                    Span::styled(" clients  |  Cmd/s: ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        cmd_per_sec,
-                        Style::default().fg(Color::Cyan),
-                    ),
+                    Span::styled(" clients  |  Cmd/s: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  ↑ ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        format!("  {} ", text::ARROW_UP),
+                        Style::default().fg(styles::VALUE_PRIMARY),
+                    ),
                     Span::styled(
                         format_bytes(stats.bytes_sent),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(styles::VALUE_PRIMARY),
                     ),
-                    Span::styled("  ↓ ", Style::default().fg(Color::Blue)),
+                    Span::styled(
+                        format!("  {} ", text::ARROW_DOWN),
+                        Style::default().fg(styles::VALUE_NEUTRAL),
+                    ),
                     Span::styled(
                         format_bytes(stats.bytes_received),
-                        Style::default().fg(Color::Blue),
+                        Style::default().fg(styles::VALUE_NEUTRAL),
                     ),
                 ]),
             ];
@@ -239,7 +240,7 @@ fn render_backend_list(
         Block::default()
             .borders(Borders::ALL)
             .title("Backend Servers")
-            .border_style(Style::default().fg(Color::White)),
+            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
     );
 
     f.render_widget(list, area);
@@ -249,7 +250,6 @@ fn render_backend_list(
 fn render_data_flow(
     f: &mut Frame,
     area: Rect,
-    _snapshot: &crate::metrics::MetricsSnapshot,
     servers: &[crate::config::ServerConfig],
     app: &TuiApp,
 ) {
@@ -258,128 +258,96 @@ fn render_data_flow(
         .iter()
         .enumerate()
         .flat_map(|(i, _)| app.throughput_history(i).iter())
-        .flat_map(|point| {
-            [
-                point.sent_per_sec().get(),
-                point.received_per_sec().get(),
-            ]
-        })
-        .fold(1_000_000.0, f64::max); // Start at 1 MB/s minimum
-
-    // Round up to next nice number (pure function)
-    let round_up_throughput = |value: f64| -> f64 {
-        if value > 100_000_000.0 {
-            (value / 10_000_000.0).ceil() * 10_000_000.0 // Round to 10 MB/s
-        } else if value > 10_000_000.0 {
-            (value / 1_000_000.0).ceil() * 1_000_000.0 // Round to 1 MB/s
-        } else if value > 1_000_000.0 {
-            (value / 100_000.0).ceil() * 100_000.0 // Round to 100 KB/s
-        } else {
-            (value / 10_000.0).ceil() * 10_000.0 // Round to 10 KB/s
-        }
-    };
+        .flat_map(|point| [point.sent_per_sec().get(), point.received_per_sec().get()])
+        .fold(chart::MIN_THROUGHPUT, f64::max);
 
     let max_throughput_rounded = round_up_throughput(max_throughput);
+    let max_label = format_throughput_label(max_throughput_rounded);
 
-    // Format Y-axis label
-    let max_label = if max_throughput_rounded >= 1_000_000.0 {
-        format!("{:.0} MB/s", max_throughput_rounded / 1_000_000.0)
-    } else if max_throughput_rounded >= 1_000.0 {
-        format!("{:.0} KB/s", max_throughput_rounded / 1_000.0)
-    } else {
-        format!("{:.0} B/s", max_throughput_rounded)
-    };
+    // Collect chart data for all backends (must keep data alive for dataset references)
+    let chart_data: Vec<_> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, server)| {
+            let history = app.throughput_history(i);
+            let color = backend_color(i);
 
-    // Create datasets for each backend
-    let mut datasets = Vec::new();
-    let colors = [
-        Color::Green,
-        Color::Cyan,
-        Color::Yellow,
-        Color::Magenta,
-        Color::Red,
-        Color::Blue,
-    ];
+            let sent_data: Vec<(f64, f64)> = history
+                .iter()
+                .enumerate()
+                .map(|(idx, point)| (idx as f64, point.sent_per_sec().get()))
+                .collect();
 
-    // Type alias for backend chart data: (sent_bytes_points, recv_bytes_points, name, color)
-    type BackendChartData<'a> = (Vec<(f64, f64)>, Vec<(f64, f64)>, &'a str, Color);
+            let recv_data: Vec<(f64, f64)> = history
+                .iter()
+                .enumerate()
+                .map(|(idx, point)| (idx as f64, point.received_per_sec().get()))
+                .collect();
 
-    // Collect all data points first (to satisfy lifetime requirements)
-    let mut all_data: Vec<BackendChartData> = Vec::new();
+            (sent_data, recv_data, server.name.clone(), color)
+        })
+        .collect();
 
-    for (i, server) in servers.iter().enumerate() {
-        let history = app.throughput_history(i);
-        let color = colors[i % colors.len()];
+    // Create datasets from chart data
+    let datasets: Vec<Dataset> = chart_data
+        .iter()
+        .flat_map(|(sent_data, recv_data, name, color)| {
+            let mut ds = Vec::with_capacity(2);
 
-        // Create data points for sent (upload to backend)
-        let sent_data: Vec<(f64, f64)> = history
-            .iter()
-            .enumerate()
-            .map(|(idx, point)| (idx as f64, point.sent_per_sec().get()))
-            .collect();
+            if !sent_data.is_empty() {
+                ds.push(
+                    Dataset::default()
+                        .name(format!("{} {}", name, text::ARROW_UP))
+                        .marker(symbols::Marker::Braille)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(*color))
+                        .data(sent_data),
+                );
+            }
 
-        // Create data points for received (download from backend)
-        let recv_data: Vec<(f64, f64)> = history
-            .iter()
-            .enumerate()
-            .map(|(idx, point)| (idx as f64, point.received_per_sec().get()))
-            .collect();
+            if !recv_data.is_empty() {
+                ds.push(
+                    Dataset::default()
+                        .name(format!("{} {}", name, text::ARROW_DOWN))
+                        .marker(symbols::Marker::Braille)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
+                        .data(recv_data),
+                );
+            }
 
-        all_data.push((sent_data, recv_data, server.name.as_str(), color));
-    }
+            ds
+        })
+        .collect();
 
-    // Now create datasets from collected data
-    for (sent_data, recv_data, name, color) in &all_data {
-        if !sent_data.is_empty() {
-            datasets.push(
-                Dataset::default()
-                    .name(format!("{} ↑", name))
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(*color))
-                    .data(sent_data),
-            );
-        }
-
-        if !recv_data.is_empty() {
-            datasets.push(
-                Dataset::default()
-                    .name(format!("{} ↓", name))
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
-                    .data(recv_data),
-            );
-        }
-    }
-
+    // Build and render chart
     let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Throughput (15s)")
-                .border_style(Style::default().fg(Color::White)),
+                .title(chart::TITLE)
+                .border_style(Style::default().fg(styles::BORDER_NORMAL)),
         )
         .x_axis(
             Axis::default()
                 .title("")
-                .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, 60.0])
+                .style(Style::default().fg(styles::LABEL))
+                .bounds([0.0, chart::HISTORY_POINTS])
                 .labels(vec![
-                    Line::from("15s"),
-                    Line::from("10s"),
-                    Line::from("5s"),
-                    Line::from("0s"),
+                    Line::from(chart::X_LABEL_15S),
+                    Line::from(chart::X_LABEL_10S),
+                    Line::from(chart::X_LABEL_5S),
+                    Line::from(chart::X_LABEL_0S),
                 ]),
         )
         .y_axis(
             Axis::default()
                 .title("Throughput")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(styles::LABEL))
                 .bounds([0.0, max_throughput_rounded])
                 .labels(vec![
-                    Line::from("0"),
-                    Line::from(format!("{:.0}", max_throughput_rounded / 2.0)),
+                    Line::from(chart::Y_LABEL_ZERO),
+                    Line::from(format_throughput_label(max_throughput_rounded / 2.0)),
                     Line::from(max_label),
                 ]),
         );
@@ -390,33 +358,33 @@ fn render_data_flow(
 /// Render footer with help text
 fn render_footer(f: &mut Frame, area: Rect) {
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("Press ", Style::default().fg(Color::Gray)),
+        Span::styled("Press ", Style::default().fg(styles::LABEL)),
         Span::styled(
             "q",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(styles::VALUE_INFO)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" or ", Style::default().fg(Color::Gray)),
+        Span::styled(" or ", Style::default().fg(styles::LABEL)),
         Span::styled(
             "Esc",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(styles::VALUE_INFO)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" to exit  |  ", Style::default().fg(Color::Gray)),
+        Span::styled(" to exit  |  ", Style::default().fg(styles::LABEL)),
         Span::styled(
             "Ctrl+C",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(styles::VALUE_INFO)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" to shutdown", Style::default().fg(Color::Gray)),
+        Span::styled(" to shutdown", Style::default().fg(styles::LABEL)),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Gray)),
+            .border_style(Style::default().fg(styles::LABEL)),
     )
     .alignment(Alignment::Center);
 
