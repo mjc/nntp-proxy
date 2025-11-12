@@ -462,12 +462,17 @@ impl NntpProxy {
         // Log session results and handle backend connection errors
         match copy_result {
             Ok(metrics) => {
-                info!(
-                    "Connection closed for client {}: {} bytes sent, {} bytes received",
+                // Record disconnection for aggregation
+                self.connection_stats
+                    .record_disconnection(session.username().as_deref(), "standard");
+
+                debug!(
+                    "Connection {} ↑{} ↓{}",
                     client_addr,
                     metrics.client_to_backend.as_u64(),
                     metrics.backend_to_client.as_u64()
                 );
+
                 // Record transfer metrics
                 if self.enable_metrics {
                     self.metrics.record_client_to_backend_bytes_for(
@@ -569,18 +574,19 @@ impl NntpProxy {
         // Log session results
         match result {
             Ok(metrics) => {
-                info!(
-                    "Session closed {} [{}] ↑{} ↓{}",
+                // Record disconnection for aggregation
+                self.connection_stats.record_disconnection(
+                    session.username().as_deref(),
+                    &self.routing_mode.to_string().to_lowercase(),
+                );
+
+                debug!(
+                    "Session {} [{}] ↑{} ↓{}",
                     client_addr,
                     session_id,
                     crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
                     crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
                 );
-                // Metrics already recorded per-command during session
-
-                // Record connection statistics (aggregated logging)
-                self.connection_stats
-                    .record_connection(session.username().as_deref(), "per-command");
             }
             Err(e) => {
                 // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
