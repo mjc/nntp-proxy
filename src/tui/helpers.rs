@@ -12,15 +12,130 @@ use crate::tui::app::ThroughputPoint;
 // Chart Data Types
 // ============================================================================
 
+/// Backend index for color selection and identification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BackendIndex(usize);
+
+impl BackendIndex {
+    /// Create a new backend index
+    #[must_use]
+    #[inline]
+    #[allow(dead_code)]
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// Get the inner index value
+    #[must_use]
+    #[inline]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for BackendIndex {
+    #[inline]
+    fn from(index: usize) -> Self {
+        Self(index)
+    }
+}
+
+/// Chart X-axis coordinate (time index)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChartX(f64);
+
+impl ChartX {
+    /// Create a new X coordinate
+    #[must_use]
+    #[inline]
+    #[allow(dead_code)]
+    pub const fn new(x: f64) -> Self {
+        Self(x)
+    }
+
+    /// Get the inner value
+    #[must_use]
+    #[inline]
+    #[allow(dead_code)]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl From<usize> for ChartX {
+    #[inline]
+    fn from(index: usize) -> Self {
+        Self(index as f64)
+    }
+}
+
+/// Chart Y-axis coordinate (throughput value)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChartY(f64);
+
+impl ChartY {
+    /// Create a new Y coordinate
+    #[must_use]
+    #[inline]
+    #[allow(dead_code)]
+    pub const fn new(y: f64) -> Self {
+        Self(y)
+    }
+
+    /// Get the inner value
+    #[must_use]
+    #[inline]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+
+    /// Calculate maximum of two Y values
+    #[must_use]
+    #[inline]
+    pub fn max(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+}
+
+impl From<f64> for ChartY {
+    #[inline]
+    fn from(y: f64) -> Self {
+        Self(y)
+    }
+}
+
+/// Chart data point (X, Y coordinates)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChartPoint {
+    pub x: ChartX,
+    pub y: ChartY,
+}
+
+impl ChartPoint {
+    /// Create a new chart point
+    #[must_use]
+    #[inline]
+    pub const fn new(x: ChartX, y: ChartY) -> Self {
+        Self { x, y }
+    }
+
+    /// Convert to tuple for ratatui (requires &(f64, f64))
+    #[must_use]
+    #[inline]
+    pub const fn as_tuple(&self) -> (f64, f64) {
+        (self.x.0, self.y.0)
+    }
+}
+
 /// Stack-allocated chart data for typical backend counts (up to 8 backends)
 /// Most deployments have 1-4 backends, so this avoids heap allocation
 pub type ChartDataVec = SmallVec<[BackendChartData; 8]>;
 
 /// Stack-allocated point vectors for typical history sizes (60 points = 60 seconds)
-type PointVec = SmallVec<[(f64, f64); 64]>;
+type PointVec = SmallVec<[ChartPoint; 64]>;
 
 /// Accumulator for building point vectors and tracking max in single fold
-type PointAccumulator = ((PointVec, PointVec), f64);
+type PointAccumulator = ((PointVec, PointVec), ChartY);
 
 /// Chart data for a single backend server
 ///
@@ -36,6 +151,20 @@ pub struct BackendChartData {
     pub recv_points: PointVec,
 }
 
+impl BackendChartData {
+    /// Convert sent points to tuples for ratatui Dataset
+    #[must_use]
+    pub fn sent_points_as_tuples(&self) -> Vec<(f64, f64)> {
+        self.sent_points.iter().map(|p| p.as_tuple()).collect()
+    }
+
+    /// Convert recv points to tuples for ratatui Dataset
+    #[must_use]
+    pub fn recv_points_as_tuples(&self) -> Vec<(f64, f64)> {
+        self.recv_points.iter().map(|p| p.as_tuple()).collect()
+    }
+}
+
 /// Build chart data for all backends
 ///
 /// Single-pass functional pipeline:
@@ -45,17 +174,21 @@ pub struct BackendChartData {
 /// Returns (chart_data, global_max_throughput)
 pub fn build_chart_data(servers: &[ServerConfig], app: &TuiApp) -> (ChartDataVec, f64) {
     #[inline]
-    fn extract_point_data(idx: usize, point: &ThroughputPoint) -> ((f64, f64), (f64, f64), f64) {
-        let x = idx as f64;
-        let sent = point.sent_per_sec().get();
-        let recv = point.received_per_sec().get();
-        ((x, sent), (x, recv), sent.max(recv))
+    fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
+        let x = ChartX::from(idx);
+        let sent = ChartY::from(point.sent_per_sec().get());
+        let recv = ChartY::from(point.received_per_sec().get());
+        (
+            ChartPoint::new(x, sent),
+            ChartPoint::new(x, recv),
+            sent.max(recv),
+        )
     }
 
     #[inline]
     fn accumulate_points(
         ((mut sent_vec, mut recv_vec), max): PointAccumulator,
-        (sent_point, recv_point, point_max): ((f64, f64), (f64, f64), f64),
+        (sent_point, recv_point, point_max): (ChartPoint, ChartPoint, ChartY),
     ) -> PointAccumulator {
         sent_vec.push(sent_point);
         recv_vec.push(recv_point);
@@ -73,18 +206,18 @@ pub fn build_chart_data(servers: &[ServerConfig], app: &TuiApp) -> (ChartDataVec
                 .enumerate()
                 .map(|(idx, point)| extract_point_data(idx, point))
                 .fold(
-                    ((PointVec::new(), PointVec::new()), 0.0_f64),
+                    ((PointVec::new(), PointVec::new()), ChartY::from(0.0)),
                     accumulate_points,
                 );
 
             chart_data.push(BackendChartData {
                 name: server.name.as_str().to_string(),
-                color: backend_color(index),
+                color: backend_color(BackendIndex::from(index)),
                 sent_points,
                 recv_points,
             });
 
-            (chart_data, global_max.max(backend_max))
+            (chart_data, global_max.max(backend_max.get()))
         },
     )
 }
@@ -96,8 +229,8 @@ pub fn build_chart_data(servers: &[ServerConfig], app: &TuiApp) -> (ChartDataVec
 /// Get color for backend by index (round-robin through palette)
 #[inline]
 #[must_use]
-pub fn backend_color(index: usize) -> Color {
-    BACKEND_COLORS[index % BACKEND_COLORS.len()]
+pub fn backend_color(index: BackendIndex) -> Color {
+    BACKEND_COLORS[index.get() % BACKEND_COLORS.len()]
 }
 
 /// Round throughput value up to next nice number for chart axis
@@ -140,17 +273,17 @@ mod tests {
 
     #[test]
     fn test_backend_color_cycles() {
-        let color0 = backend_color(0);
-        let color_wrap = backend_color(BACKEND_COLORS.len());
+        let color0 = backend_color(BackendIndex::from(0));
+        let color_wrap = backend_color(BackendIndex::from(BACKEND_COLORS.len()));
         assert_eq!(color0, color_wrap, "Should wrap around");
     }
 
     #[test]
     fn test_backend_color_distinct() {
         // First few backends should have distinct colors
-        let color0 = backend_color(0);
-        let color1 = backend_color(1);
-        let color2 = backend_color(2);
+        let color0 = backend_color(BackendIndex::from(0));
+        let color1 = backend_color(BackendIndex::from(1));
+        let color2 = backend_color(BackendIndex::from(2));
 
         assert_ne!(color0, color1);
         assert_ne!(color1, color2);
@@ -202,12 +335,15 @@ mod tests {
 
         // Add 60 points (typical 60-second history)
         for i in 0..60 {
-            points.push((i as f64, (i * 1000) as f64));
+            points.push(ChartPoint::new(
+                ChartX::from(i),
+                ChartY::from((i * 1000) as f64),
+            ));
         }
 
         assert_eq!(points.len(), 60);
-        assert_eq!(points[0].0, 0.0);
-        assert_eq!(points[59].0, 59.0);
+        assert_eq!(points[0].x.get(), 0.0);
+        assert_eq!(points[59].x.get(), 59.0);
     }
 
     #[test]
@@ -219,7 +355,7 @@ mod tests {
         for i in 0..8 {
             chart_data.push(BackendChartData {
                 name: format!("Server {}", i),
-                color: backend_color(i),
+                color: backend_color(BackendIndex::from(i)),
                 sent_points: PointVec::new(),
                 recv_points: PointVec::new(),
             });
@@ -234,7 +370,7 @@ mod tests {
     fn test_backend_chart_data_structure() {
         let data = BackendChartData {
             name: "Test Server".to_string(),
-            color: backend_color(0),
+            color: backend_color(BackendIndex::from(0)),
             sent_points: PointVec::new(),
             recv_points: PointVec::new(),
         };

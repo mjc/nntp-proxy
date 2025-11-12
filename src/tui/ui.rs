@@ -262,32 +262,45 @@ fn render_data_flow(
     let max_label = format_throughput_label(max_throughput_rounded);
 
     // Build datasets from pre-computed chart data
-    let datasets: Vec<Dataset> = chart_data
+    // Convert points to tuples first (must be kept alive for Dataset references)
+    let chart_tuples: Vec<_> = chart_data
         .iter()
-        .flat_map(|data| {
+        .map(|data| {
+            (
+                data.sent_points_as_tuples(),
+                data.recv_points_as_tuples(),
+                &data.name,
+                data.color,
+            )
+        })
+        .collect();
+
+    let datasets: Vec<Dataset> = chart_tuples
+        .iter()
+        .flat_map(|(sent_tuples, recv_tuples, name, color)| {
             let mut ds = Vec::with_capacity(2);
 
             // Sent data (upload to backend)
-            if !data.sent_points.is_empty() {
+            if !sent_tuples.is_empty() {
                 ds.push(
                     Dataset::default()
-                        .name(format!("{} {}", data.name, text::ARROW_UP))
+                        .name(format!("{} {}", name, text::ARROW_UP))
                         .marker(symbols::Marker::Braille)
                         .graph_type(GraphType::Line)
-                        .style(Style::default().fg(data.color))
-                        .data(&data.sent_points),
+                        .style(Style::default().fg(*color))
+                        .data(sent_tuples),
                 );
             }
 
             // Received data (download from backend)
-            if !data.recv_points.is_empty() {
+            if !recv_tuples.is_empty() {
                 ds.push(
                     Dataset::default()
-                        .name(format!("{} {}", data.name, text::ARROW_DOWN))
+                        .name(format!("{} {}", name, text::ARROW_DOWN))
                         .marker(symbols::Marker::Braille)
                         .graph_type(GraphType::Line)
-                        .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
-                        .data(&data.recv_points),
+                        .style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
+                        .data(recv_tuples),
                 );
             }
 
