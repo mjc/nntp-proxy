@@ -77,10 +77,10 @@ mod tests {
     fn test_backend_columns_split_evenly() {
         let columns = layout::backend_columns();
 
-        // Should be two columns
-        assert_eq!(columns.len(), 2);
+        // Should be three columns now (backends, chart, top users)
+        assert_eq!(columns.len(), 3);
 
-        // Backend list and chart should split screen
+        // Backend list and chart should split screen, with 25% for top users
         assert_eq!(layout::BACKEND_LIST_WIDTH_PCT, 50);
         assert_eq!(layout::CHART_WIDTH_PCT, 50);
     }

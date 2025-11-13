@@ -18,15 +18,12 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     /// Create runtime config from optional thread count
     ///
-    /// If `threads` is None, uses number of CPU cores available.
+    /// If `threads` is None, defaults to 1 thread.
+    /// If `threads` is Some(ThreadCount(0)), uses number of CPU cores.
     /// Single-threaded runtime is used if threads == 1.
     #[must_use]
     pub fn from_args(threads: Option<ThreadCount>) -> Self {
-        let num_cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-
-        let worker_threads = threads.map(|t| t.get()).unwrap_or(num_cpus);
+        let worker_threads = threads.map(|t| t.get()).unwrap_or(1);
 
         Self {
             worker_threads,
@@ -152,12 +149,10 @@ mod tests {
     fn test_runtime_config_from_args_default() {
         let config = RuntimeConfig::from_args(None);
 
-        // Should use number of CPUs
-        let num_cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-        assert_eq!(config.worker_threads(), num_cpus);
-        assert!(config.enable_cpu_pinning);
+        // Should default to single-threaded (1 thread)
+        assert_eq!(config.worker_threads(), 1);
+        assert!(config.is_single_threaded());
+        assert!(config.enable_cpu_pinning); // CPU pinning helps even with 1 thread
     }
 
     #[test]

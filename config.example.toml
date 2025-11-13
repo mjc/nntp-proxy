@@ -1,3 +1,16 @@
+# NNTP Proxy Configuration
+#
+# This file configures the proxy server, including listen address, backend servers,
+# authentication, and health checking.
+
+# Proxy Server Settings
+[proxy]
+# Host/IP to bind to (default: 0.0.0.0 - all interfaces)
+host = "0.0.0.0"
+# Port to listen on (default: 8119)
+# Can be overridden with --port or NNTP_PROXY_PORT
+port = 8119
+
 # Client Authentication Configuration
 # Two formats supported:
 #

@@ -3,8 +3,8 @@
 //! This module contains all the core configuration structures used by the proxy.
 
 use crate::types::{
-    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, duration_serde,
-    option_duration_serde,
+    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, ThreadCount,
+    duration_serde, option_duration_serde,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -66,6 +66,9 @@ pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+    /// Proxy server settings
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheckConfig,
@@ -75,6 +78,30 @@ pub struct Config {
     /// Client authentication configuration
     #[serde(default)]
     pub client_auth: ClientAuthConfig,
+}
+
+/// Proxy server settings
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProxyConfig {
+    /// Host/IP to bind to (default: 0.0.0.0)
+    #[serde(default = "super::defaults::listen_host")]
+    pub host: String,
+    /// Port to listen on (default: 8119)
+    #[serde(default = "super::defaults::listen_port")]
+    pub port: Port,
+    /// Number of worker threads (default: 1, use 0 for CPU cores)
+    #[serde(default = "super::defaults::threads")]
+    pub threads: ThreadCount,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            host: super::defaults::listen_host(),
+            port: super::defaults::listen_port(),
+            threads: super::defaults::threads(),
+        }
+    }
 }
 
 /// Cache configuration for article caching

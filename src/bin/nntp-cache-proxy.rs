@@ -35,7 +35,7 @@ struct Args {
     )]
     config: ConfigPath,
 
-    /// Number of worker threads (defaults to number of CPU cores)
+    /// Number of worker threads (default: 1, use 0 for CPU cores)
     ///
     /// Can be overridden with NNTP_CACHE_PROXY_THREADS environment variable
     #[arg(short, long, env = "NNTP_CACHE_PROXY_THREADS")]

@@ -357,6 +357,7 @@ async fn test_config_auth_round_trip() {
     // Create config with auth
     let config = Config {
         servers: vec![],
+        proxy: Default::default(),
         health_check: Default::default(),
         cache: None,
         client_auth: ClientAuthConfig {

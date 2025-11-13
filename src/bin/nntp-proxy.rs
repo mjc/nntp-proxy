@@ -13,11 +13,17 @@ use nntp_proxy::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port to listen on
+    /// Port to listen on (overrides config file)
     ///
     /// Can be overridden with NNTP_PROXY_PORT environment variable
-    #[arg(short, long, default_value = "8119", env = "NNTP_PROXY_PORT")]
-    port: Port,
+    #[arg(short, long, env = "NNTP_PROXY_PORT")]
+    port: Option<Port>,
+
+    /// Host to bind to (overrides config file)
+    ///
+    /// Can be overridden with NNTP_PROXY_HOST environment variable
+    #[arg(long, env = "NNTP_PROXY_HOST")]
+    host: Option<String>,
 
     /// Routing mode: standard, per-command, or hybrid
     ///
@@ -41,7 +47,7 @@ struct Args {
     #[arg(short, long, default_value = "config.toml", env = "NNTP_PROXY_CONFIG")]
     config: ConfigPath,
 
-    /// Number of worker threads (defaults to number of CPU cores)
+    /// Number of worker threads (default: 1, use 0 for CPU cores)
     ///
     /// Can be overridden with NNTP_PROXY_THREADS environment variable
     #[arg(short, long, env = "NNTP_PROXY_THREADS")]
@@ -59,22 +65,29 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Load configuration first to get thread count
+    let (config, _) = load_config_with_fallback(args.config.as_str())?;
+
+    // Use CLI arg if provided, else config value (0 means use CPU cores)
+    let threads = args.threads.or(Some(config.proxy.threads));
+
     // Build and configure runtime
-    let runtime_config = RuntimeConfig::from_args(args.threads);
+    let runtime_config = RuntimeConfig::from_args(threads);
     let rt = runtime_config.build_runtime()?;
 
-    rt.block_on(run_proxy(args))
+    rt.block_on(run_proxy(args, config))
 }
 
-async fn run_proxy(args: Args) -> Result<()> {
-    // Load configuration with automatic fallback
-    let (config, source) = load_config_with_fallback(args.config.as_str())?;
-
-    info!("Loaded configuration from {}", source.description());
+async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()> {
+    // Config already loaded in main()
     info!("Loaded {} backend servers:", config.servers.len());
     for server in &config.servers {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
+
+    // Extract listen address before moving config
+    let listen_host = args.host.unwrap_or_else(|| config.proxy.host.clone());
+    let listen_port = args.port.unwrap_or(config.proxy.port);
 
     // Create proxy (wrapped in Arc for sharing across tasks)
     let proxy = Arc::new(NntpProxy::new(config, args.routing_mode)?);
@@ -87,7 +100,7 @@ async fn run_proxy(args: Args) -> Result<()> {
     info!("Connection pools ready");
 
     // Start listening
-    let listen_addr = format!("0.0.0.0:{}", args.port.get());
+    let listen_addr = format!("{}:{}", listen_host, listen_port.get());
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP proxy listening on {} ({})",

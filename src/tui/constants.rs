@@ -27,10 +27,11 @@ pub mod layout {
         ]
     }
 
-    pub fn backend_columns() -> [Constraint; 2] {
+    pub fn backend_columns() -> [Constraint; 3] {
         [
             Constraint::Percentage(BACKEND_LIST_WIDTH_PCT),
             Constraint::Percentage(CHART_WIDTH_PCT),
+            Constraint::Percentage(25), // Top users column
         ]
     }
 }

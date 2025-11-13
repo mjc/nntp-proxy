@@ -29,28 +29,11 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     // We need at least 40 lines total to fit everything comfortably
     const MIN_HEIGHT_FOR_LOGS: u16 = 40;
     const LOG_WINDOW_HEIGHT: u16 = 10;
-    const USER_STATS_HEIGHT: u16 = 14; // Header + 10 users + borders
-    const MIN_HEIGHT_FOR_USER_STATS: u16 = 50; // Need more space for user stats
     let show_logs = f.area().height >= MIN_HEIGHT_FOR_LOGS;
-    let show_user_stats =
-        f.area().height >= MIN_HEIGHT_FOR_USER_STATS && !snapshot.user_stats.is_empty();
 
-    // Create main layout - dynamically add sections based on available space
+    // Create main layout - dynamically add log section based on available space
     use ratatui::layout::Constraint;
-    let chunks = if show_user_stats {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(layout::TITLE_HEIGHT),
-                Constraint::Length(layout::SUMMARY_HEIGHT),
-                Constraint::Min(layout::MIN_CHART_HEIGHT),
-                Constraint::Length(USER_STATS_HEIGHT),
-                Constraint::Length(LOG_WINDOW_HEIGHT),
-                Constraint::Length(layout::FOOTER_HEIGHT),
-            ])
-            .split(f.area())
-    } else if show_logs {
+    let chunks = if show_logs {
         Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -74,17 +57,13 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     render_title(f, chunks[0], snapshot);
     render_summary(f, chunks[1], app);
 
-    if show_user_stats {
-        render_backends(f, chunks[2], snapshot, servers, app);
-        render_user_stats(f, chunks[3], snapshot);
-        render_logs(f, chunks[4], app);
-        render_footer(f, chunks[5]);
-    } else if show_logs {
-        render_backends(f, chunks[2], snapshot, servers, app);
+    // Backends area now contains 3 columns: backends, chart, and user stats
+    render_backends(f, chunks[2], snapshot, servers, app);
+
+    if show_logs {
         render_logs(f, chunks[3], app);
         render_footer(f, chunks[4]);
     } else {
-        render_backends(f, chunks[2], snapshot, servers, app);
         render_footer(f, chunks[3]);
     }
 }
@@ -183,7 +162,7 @@ fn render_backends(
     servers: &[crate::config::ServerConfig],
     app: &TuiApp,
 ) {
-    // Split into two columns: backend list and data flow chart
+    // Split into three columns: backend list, data flow chart, and top users
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(layout::backend_columns())
@@ -191,6 +170,11 @@ fn render_backends(
 
     render_backend_list(f, chunks[0], snapshot, servers, app);
     render_data_flow(f, chunks[1], servers, app);
+
+    // Render top users in the third column if we have user stats
+    if !snapshot.user_stats.is_empty() {
+        render_user_stats(f, chunks[2], snapshot);
+    }
 }
 
 /// Render list of backend servers with their stats
@@ -461,6 +445,13 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     // Take top 10 users or all if less than 10
     let top_users: Vec<_> = sorted_users.iter().take(10).collect();
 
+    // Find max total bytes for scaling sparkline
+    let max_total = top_users
+        .iter()
+        .map(|u| u.bytes_sent + u.bytes_received)
+        .max()
+        .unwrap_or(1);
+
     let mut items = Vec::with_capacity(top_users.len() + 1);
 
     // Header
@@ -473,65 +464,68 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
         ),
         Span::raw("  "),
         Span::styled(
+            "Bandwidth",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("       "),
+        Span::styled(
             "Conns",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Sent",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Recv",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Cmds",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
     ])));
 
-    // User rows
+    // User rows with sparkline
     for user in top_users {
-        let username = if user.username.len() > 20 {
-            format!("{}...", &user.username[..17])
+        let username = if user.username.len() > 12 {
+            format!("{}...", &user.username[..9])
         } else {
-            format!("{:<20}", user.username)
+            format!("{:<12}", user.username)
         };
 
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(username, Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>5}", user.active_connections),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>8}", format_bytes(user.bytes_sent)),
-                Style::default().fg(Color::Blue),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>8}", format_bytes(user.bytes_received)),
-                Style::default().fg(Color::Magenta),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>6}", user.total_commands),
-                Style::default().fg(Color::White),
-            ),
-        ])));
+        let total_bytes = user.bytes_sent + user.bytes_received;
+
+        // Create sparkline bar (simple text-based visualization)
+        let bar_width = 15;
+        let filled = if max_total > 0 {
+            ((total_bytes as f64 / max_total as f64) * bar_width as f64) as usize
+        } else {
+            0
+        };
+        let bar = "█".repeat(filled.min(bar_width)) + &"░".repeat(bar_width.saturating_sub(filled));
+
+        items.push(ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(username, Style::default().fg(Color::Cyan)),
+                Span::raw(" "),
+                Span::styled(bar, Style::default().fg(Color::Blue)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:>5}", user.active_connections),
+                    Style::default().fg(Color::Green),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("  ↑"),
+                Span::styled(
+                    format!("{:>8}", format_bytes(user.bytes_sent)),
+                    Style::default().fg(Color::Blue),
+                ),
+                Span::raw("  ↓"),
+                Span::styled(
+                    format!("{:>8}", format_bytes(user.bytes_received)),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{}cmd", user.total_commands),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ]));
     }
 
     let list = List::new(items).block(

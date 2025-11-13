@@ -14,9 +14,13 @@ use nntp_proxy::{
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Proxy with TUI Dashboard", long_about = None)]
 struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value = "8119", env = "NNTP_PROXY_PORT")]
-    port: Port,
+    /// Port to listen on (overrides config file)
+    #[arg(short, long, env = "NNTP_PROXY_PORT")]
+    port: Option<Port>,
+
+    /// Host to bind to (overrides config file)
+    #[arg(long, env = "NNTP_PROXY_HOST")]
+    host: Option<String>,
 
     /// Routing mode: standard, per-command, or hybrid
     #[arg(
@@ -32,7 +36,7 @@ struct Args {
     #[arg(short, long, default_value = "config.toml", env = "NNTP_PROXY_CONFIG")]
     config: ConfigPath,
 
-    /// Number of worker threads (defaults to number of CPU cores)
+    /// Number of worker threads (default: 1, use 0 for CPU cores)
     #[arg(short, long, env = "NNTP_PROXY_THREADS")]
     threads: Option<ThreadCount>,
 
@@ -93,6 +97,10 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
 
+    // Extract listen address before moving config
+    let listen_host = args.host.unwrap_or_else(|| config.proxy.host.clone());
+    let listen_port = args.port.unwrap_or(config.proxy.port);
+
     // Create proxy with metrics enabled for TUI
     let proxy = Arc::new(
         NntpProxy::builder(config)
@@ -101,18 +109,14 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
             .build()?,
     );
 
-    // Prewarm connection pools
-    info!("Prewarming connection pools...");
-    if let Err(e) = proxy.prewarm_connections().await {
-        warn!("Failed to prewarm connection pools: {}", e);
-    }
-    info!("Connection pools ready");
-
     // Create shutdown channel - TUI will control shutdown
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-    // Launch TUI FIRST if enabled
-    // This allows seeing the dashboard before connections start
+    // Create channel for signaling TUI to shutdown from external signals
+    let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
+
+    // Launch TUI FIRST if enabled (before prewarming for faster startup)
+    // This allows seeing the dashboard immediately
     let tui_handle = if !args.no_tui {
         let tui_app = if let Some(log_buffer) = log_buffer {
             tui::TuiApp::with_log_buffer(
@@ -131,7 +135,7 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
 
         let shutdown_tx_for_tui = shutdown_tx.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = tui::run_tui(tui_app, shutdown_tx_for_tui).await {
+            if let Err(e) = tui::run_tui(tui_app, shutdown_tx_for_tui, tui_shutdown_rx).await {
                 error!("TUI error: {}", e);
             }
             // When TUI exits, signal shutdown
@@ -141,24 +145,49 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
         None
     };
 
+    // Prewarm connection pools in background (doesn't block TUI startup)
+    let proxy_for_prewarm = proxy.clone();
+    let prewarm_handle = tokio::spawn(async move {
+        info!("Prewarming connection pools...");
+        if let Err(e) = proxy_for_prewarm.prewarm_connections().await {
+            warn!("Failed to prewarm connection pools: {}", e);
+            return false;
+        }
+        info!("Connection pools ready");
+        true
+    });
+
     // Start listening
-    let listen_addr = format!("0.0.0.0:{}", args.port.get());
+    let listen_addr = format!("{}:{}", listen_host, listen_port.get());
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP proxy listening on {} ({})",
         listen_addr, args.routing_mode
     );
 
+    // Wait for prewarming to complete before accepting connections
+    info!("Waiting for connection pools to be ready...");
+    match prewarm_handle.await {
+        Ok(true) => info!("Ready to accept connections"),
+        Ok(false) => warn!("Prewarming failed, but continuing anyway"),
+        Err(e) => warn!("Prewarming task failed: {}", e),
+    }
+
     // Set up graceful shutdown signal handler for non-TUI mode or SIGTERM
     let proxy_for_shutdown = proxy.clone();
     let shutdown_tx_signal = shutdown_tx.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        info!("Shutdown signal received, closing idle connections...");
+
+        info!("Shutdown signal received");
+
+        // Signal TUI to exit (it will clean up terminal properly and immediately)
+        let _ = tui_shutdown_tx.send(()).await;
 
         // Notify anyone listening
         let _ = shutdown_tx_signal.send(()).await;
 
+        // Close idle connections
         proxy_for_shutdown.graceful_shutdown().await;
         info!("Graceful shutdown complete");
     });

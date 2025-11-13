@@ -2,8 +2,26 @@
 //!
 //! This module centralizes all default value functions used in serde deserialization.
 
-use crate::types::{CacheCapacity, MaxConnections, MaxErrors};
+use crate::types::{CacheCapacity, MaxConnections, MaxErrors, Port, ThreadCount};
 use std::time::Duration;
+
+/// Default listen host (bind to all interfaces)
+#[inline]
+pub fn listen_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+/// Default listen port
+#[inline]
+pub fn listen_port() -> Port {
+    Port::new(8119).expect("8119 is a valid port")
+}
+
+/// Default number of worker threads (1 for single-threaded)
+#[inline]
+pub fn threads() -> ThreadCount {
+    ThreadCount::from_value(1).expect("1 is non-zero")
+}
 
 /// Default maximum connections per server
 #[inline]
