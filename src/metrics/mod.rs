@@ -8,8 +8,9 @@ mod connection_stats;
 pub use connection_stats::ConnectionStatsAggregator;
 
 use crate::types::BackendBytes;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Thread-safe metrics collector for the entire proxy
@@ -30,6 +31,9 @@ struct MetricsInner {
     // Per-backend metrics (indexed by backend ID)
     backend_metrics: Vec<BackendMetrics>,
 
+    // Per-user metrics (protected by mutex for HashMap operations)
+    user_metrics: Mutex<HashMap<String, UserMetrics>>,
+
     // Start time for uptime calculation
     start_time: Instant,
 }
@@ -44,6 +48,17 @@ struct BackendMetrics {
     errors: AtomicU64,
 }
 
+/// Metrics for a single user
+#[derive(Debug, Clone, Default)]
+struct UserMetrics {
+    active_connections: usize,
+    total_connections: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    total_commands: u64,
+    errors: u64,
+}
+
 /// Snapshot of current metrics (for display/reporting)
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
@@ -54,6 +69,7 @@ pub struct MetricsSnapshot {
     pub backend_to_client_bytes: BackendBytes, // Article data from backend to client
     pub uptime: Duration,
     pub backend_stats: Vec<BackendStats>,
+    pub user_stats: Vec<UserStats>,
 }
 
 /// Statistics for a single backend
@@ -64,6 +80,18 @@ pub struct BackendStats {
     pub total_commands: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub errors: u64,
+}
+
+/// Statistics for a single user
+#[derive(Debug, Clone)]
+pub struct UserStats {
+    pub username: String,
+    pub active_connections: usize,
+    pub total_connections: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub total_commands: u64,
     pub errors: u64,
 }
 
@@ -88,6 +116,7 @@ impl MetricsCollector {
                 total_connections: AtomicU64::new(0),
                 active_connections: AtomicUsize::new(0),
                 backend_metrics,
+                user_metrics: Mutex::new(HashMap::new()),
                 start_time: Instant::now(),
             }),
         }
@@ -210,6 +239,57 @@ impl MetricsCollector {
         }
     }
 
+    /// Record user connection opened
+    pub fn user_connection_opened(&self, username: Option<&str>) {
+        let username = username.unwrap_or("<anonymous>").to_string();
+        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
+            let metrics = user_metrics.entry(username).or_default();
+            metrics.active_connections += 1;
+            metrics.total_connections += 1;
+        }
+    }
+
+    /// Record user connection closed
+    pub fn user_connection_closed(&self, username: Option<&str>) {
+        let username = username.unwrap_or("<anonymous>").to_string();
+        if let Ok(mut user_metrics) = self.inner.user_metrics.lock()
+            && let Some(metrics) = user_metrics.get_mut(&username) {
+                metrics.active_connections = metrics.active_connections.saturating_sub(1);
+            }
+    }
+
+    /// Record bytes sent for a specific user
+    pub fn user_bytes_sent(&self, username: Option<&str>, bytes: u64) {
+        let username = username.unwrap_or("<anonymous>").to_string();
+        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
+            user_metrics.entry(username).or_default().bytes_sent += bytes;
+        }
+    }
+
+    /// Record bytes received for a specific user
+    pub fn user_bytes_received(&self, username: Option<&str>, bytes: u64) {
+        let username = username.unwrap_or("<anonymous>").to_string();
+        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
+            user_metrics.entry(username).or_default().bytes_received += bytes;
+        }
+    }
+
+    /// Record a command processed for a specific user
+    pub fn user_command(&self, username: Option<&str>) {
+        let username = username.unwrap_or("<anonymous>").to_string();
+        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
+            user_metrics.entry(username).or_default().total_commands += 1;
+        }
+    }
+
+    /// Record an error for a specific user
+    pub fn user_error(&self, username: Option<&str>) {
+        let username = username.unwrap_or("<anonymous>").to_string();
+        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
+            user_metrics.entry(username).or_default().errors += 1;
+        }
+    }
+
     /// Get a snapshot of current metrics
     ///
     /// This creates a consistent point-in-time view of all metrics.
@@ -240,6 +320,24 @@ impl MetricsCollector {
         let c2b_bytes: u64 = backend_stats.iter().map(|b| b.bytes_sent).sum();
         let b2c_bytes: u64 = backend_stats.iter().map(|b| b.bytes_received).sum();
 
+        // Collect user stats
+        let user_stats = if let Ok(user_metrics) = self.inner.user_metrics.lock() {
+            user_metrics
+                .iter()
+                .map(|(username, metrics)| UserStats {
+                    username: username.clone(),
+                    active_connections: metrics.active_connections,
+                    total_connections: metrics.total_connections,
+                    bytes_sent: metrics.bytes_sent,
+                    bytes_received: metrics.bytes_received,
+                    total_commands: metrics.total_commands,
+                    errors: metrics.errors,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),
             active_connections: self.inner.active_connections.load(Ordering::Relaxed),
@@ -247,6 +345,7 @@ impl MetricsCollector {
             backend_to_client_bytes: BackendBytes::new(b2c_bytes),
             uptime: self.inner.start_time.elapsed(),
             backend_stats,
+            user_stats,
         }
     }
 
@@ -402,6 +501,7 @@ mod tests {
             backend_to_client_bytes: BackendBytes::new(0),
             uptime: Duration::from_secs(3665), // 1h 1m 5s
             backend_stats: vec![],
+            user_stats: vec![],
         };
 
         assert_eq!(snapshot.format_uptime(), "1h 1m 5s");
@@ -416,6 +516,7 @@ mod tests {
             backend_to_client_bytes: BackendBytes::new(5000),
             uptime: Duration::from_secs(10),
             backend_stats: vec![],
+            user_stats: vec![],
         };
 
         assert_eq!(snapshot.throughput_bps(), 1000.0); // 10000 bytes / 10 seconds

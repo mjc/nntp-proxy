@@ -29,11 +29,28 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     // We need at least 40 lines total to fit everything comfortably
     const MIN_HEIGHT_FOR_LOGS: u16 = 40;
     const LOG_WINDOW_HEIGHT: u16 = 10;
+    const USER_STATS_HEIGHT: u16 = 14; // Header + 10 users + borders
+    const MIN_HEIGHT_FOR_USER_STATS: u16 = 50; // Need more space for user stats
     let show_logs = f.area().height >= MIN_HEIGHT_FOR_LOGS;
+    let show_user_stats =
+        f.area().height >= MIN_HEIGHT_FOR_USER_STATS && !snapshot.user_stats.is_empty();
 
-    // Create main layout - dynamically add log section if space allows
+    // Create main layout - dynamically add sections based on available space
     use ratatui::layout::Constraint;
-    let chunks = if show_logs {
+    let chunks = if show_user_stats {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(layout::TITLE_HEIGHT),
+                Constraint::Length(layout::SUMMARY_HEIGHT),
+                Constraint::Min(layout::MIN_CHART_HEIGHT),
+                Constraint::Length(USER_STATS_HEIGHT),
+                Constraint::Length(LOG_WINDOW_HEIGHT),
+                Constraint::Length(layout::FOOTER_HEIGHT),
+            ])
+            .split(f.area())
+    } else if show_logs {
         Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -57,7 +74,12 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     render_title(f, chunks[0], snapshot);
     render_summary(f, chunks[1], app);
 
-    if show_logs {
+    if show_user_stats {
+        render_backends(f, chunks[2], snapshot, servers, app);
+        render_user_stats(f, chunks[3], snapshot);
+        render_logs(f, chunks[4], app);
+        render_footer(f, chunks[5]);
+    } else if show_logs {
         render_backends(f, chunks[2], snapshot, servers, app);
         render_logs(f, chunks[3], app);
         render_footer(f, chunks[4]);
@@ -419,6 +441,102 @@ fn render_logs(f: &mut Frame, area: Rect, app: &TuiApp) {
     let list = List::new(items).block(
         Block::default()
             .title(" Recent Logs ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(styles::BORDER_ACTIVE)),
+    );
+
+    f.render_widget(list, area);
+}
+
+/// Render per-user statistics panel
+fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
+    // Sort users by total bytes transferred (sent + received) descending
+    let mut sorted_users = snapshot.user_stats.clone();
+    sorted_users.sort_by(|a, b| {
+        let a_total = a.bytes_sent + a.bytes_received;
+        let b_total = b.bytes_sent + b.bytes_received;
+        b_total.cmp(&a_total)
+    });
+
+    // Take top 10 users or all if less than 10
+    let top_users: Vec<_> = sorted_users.iter().take(10).collect();
+
+    let mut items = Vec::with_capacity(top_users.len() + 1);
+
+    // Header
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(
+            "User",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Conns",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Sent",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Recv",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Cmds",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])));
+
+    // User rows
+    for user in top_users {
+        let username = if user.username.len() > 20 {
+            format!("{}...", &user.username[..17])
+        } else {
+            format!("{:<20}", user.username)
+        };
+
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(username, Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>5}", user.active_connections),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>8}", format_bytes(user.bytes_sent)),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>8}", format_bytes(user.bytes_received)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>6}", user.total_commands),
+                Style::default().fg(Color::White),
+            ),
+        ])));
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Top Users ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(styles::BORDER_ACTIVE)),
     );
