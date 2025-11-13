@@ -421,7 +421,7 @@ mod tests {
         Arc::new(
             (0..count)
                 .map(|i| {
-                    ServerConfig::builder(&format!("backend{}.example.com", i), 119)
+                    ServerConfig::builder(format!("backend{}.example.com", i), 119)
                         .name(format!("Backend {}", i))
                         .build()
                         .unwrap()

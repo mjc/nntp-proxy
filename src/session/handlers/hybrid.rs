@@ -53,6 +53,12 @@ impl ClientSession {
         // Record command in metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_command(backend_id.as_index());
+            // Track per-user command
+            if let Some(username) = self.username() {
+                metrics.user_command(Some(&username));
+            } else {
+                metrics.user_command(None);
+            }
         }
 
         // Get buffer from pool for command execution
@@ -155,6 +161,12 @@ impl ClientSession {
                     // Record command in metrics
                     if let Some(ref metrics) = self.metrics {
                         metrics.record_command(backend_id.as_index());
+                        // Track per-user command
+                        if let Some(username) = self.username() {
+                            metrics.user_command(Some(&username));
+                        } else {
+                            metrics.user_command(None);
+                        }
                     }
 
                     let (result, _got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes) =

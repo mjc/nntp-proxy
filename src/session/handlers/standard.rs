@@ -171,6 +171,11 @@ impl ClientSession {
                                                 );
                                             }
 
+                                            // Track user connection in metrics
+                                            if let Some(metrics) = self.metrics.as_ref() {
+                                                metrics.user_connection_opened(auth_username.as_deref());
+                                            }
+
                                             skip_auth_check = true;
                                         }
                                     }
@@ -205,6 +210,42 @@ impl ClientSession {
                         }
                     }
                 }
+            }
+        }
+
+        // Report final metrics deltas before session ends
+        if let (Some(metrics), Some(bid)) = (self.metrics.as_ref(), backend_id) {
+            let current_c2b = client_to_backend_bytes.as_u64();
+            let current_b2c = backend_to_client_bytes.as_u64();
+
+            let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
+            let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
+
+            if delta_c2b > 0 {
+                metrics.record_client_to_backend_bytes_for(bid, delta_c2b);
+            }
+            if delta_b2c > 0 {
+                metrics.record_backend_to_client_bytes_for(bid, delta_b2c);
+            }
+
+            // Track final per-user metrics
+            if let Some(username) = self.username() {
+                if delta_c2b > 0 {
+                    metrics.user_bytes_sent(Some(&username), delta_c2b);
+                }
+                if delta_b2c > 0 {
+                    metrics.user_bytes_received(Some(&username), delta_b2c);
+                }
+                metrics.user_connection_closed(Some(&username));
+            } else {
+                // Anonymous user
+                if delta_c2b > 0 {
+                    metrics.user_bytes_sent(None, delta_c2b);
+                }
+                if delta_b2c > 0 {
+                    metrics.user_bytes_received(None, delta_b2c);
+                }
+                metrics.user_connection_closed(None);
             }
         }
 

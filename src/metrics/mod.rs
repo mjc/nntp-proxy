@@ -253,9 +253,10 @@ impl MetricsCollector {
     pub fn user_connection_closed(&self, username: Option<&str>) {
         let username = username.unwrap_or("<anonymous>").to_string();
         if let Ok(mut user_metrics) = self.inner.user_metrics.lock()
-            && let Some(metrics) = user_metrics.get_mut(&username) {
-                metrics.active_connections = metrics.active_connections.saturating_sub(1);
-            }
+            && let Some(metrics) = user_metrics.get_mut(&username)
+        {
+            metrics.active_connections = metrics.active_connections.saturating_sub(1);
+        }
     }
 
     /// Record bytes sent for a specific user

@@ -165,6 +165,11 @@ impl ClientSession {
                                 );
                             }
 
+                            // Track user connection in metrics
+                            if let Some(metrics) = self.metrics.as_ref() {
+                                metrics.user_connection_opened(auth_username.as_deref());
+                            }
+
                             skip_auth_check = true;
                         }
                     }
@@ -264,6 +269,32 @@ impl ClientSession {
             );
         }
 
+        // Track final per-user metrics
+        if let Some(metrics) = self.metrics.as_ref() {
+            if let Some(username) = self.username() {
+                let c2b = client_to_backend_bytes.as_u64();
+                let b2c = backend_to_client_bytes.as_u64();
+                if c2b > 0 {
+                    metrics.user_bytes_sent(Some(&username), c2b);
+                }
+                if b2c > 0 {
+                    metrics.user_bytes_received(Some(&username), b2c);
+                }
+                metrics.user_connection_closed(Some(&username));
+            } else {
+                // Anonymous user
+                let c2b = client_to_backend_bytes.as_u64();
+                let b2c = backend_to_client_bytes.as_u64();
+                if c2b > 0 {
+                    metrics.user_bytes_sent(None, c2b);
+                }
+                if b2c > 0 {
+                    metrics.user_bytes_received(None, b2c);
+                }
+                metrics.user_connection_closed(None);
+            }
+        }
+
         Ok(TransferMetrics {
             client_to_backend: client_to_backend_bytes,
             backend_to_client: backend_to_client_bytes,
@@ -317,6 +348,12 @@ impl ClientSession {
         // Record command execution in metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_command(backend_id.as_index());
+            // Track per-user command
+            if let Some(username) = self.username() {
+                metrics.user_command(Some(&username));
+            } else {
+                metrics.user_command(None);
+            }
         }
 
         // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
@@ -366,6 +403,12 @@ impl ClientSession {
                         // Record error in metrics
                         if let Some(ref metrics) = self.metrics {
                             metrics.record_error(backend_id.as_index());
+                            // Track per-user error
+                            if let Some(username) = self.username() {
+                                metrics.user_error(Some(&username));
+                            } else {
+                                metrics.user_error(None);
+                            }
                         }
                     }
                 }
