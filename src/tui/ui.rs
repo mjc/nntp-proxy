@@ -3,7 +3,10 @@
 use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
 use crate::tui::constants::{chart, layout, status, styles, text};
-use crate::tui::helpers::{build_chart_data, format_throughput_label, round_up_throughput};
+use crate::tui::helpers::{
+    backend_display_info, build_chart_data, calculate_chart_bounds, format_summary_throughput,
+    format_throughput_label,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Direction, Layout, Rect},
@@ -117,21 +120,9 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
 
 /// Render summary statistics
 fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
-    // Get latest throughput from history (functional approach)
-    let (client_to_backend_str, backend_to_client_str) = app
-        .latest_client_throughput()
-        .map(|point| {
-            (
-                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
-                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                format!("{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT),
-                format!("{}{}", text::ARROW_DOWN, text::DEFAULT_THROUGHPUT),
-            )
-        });
+    // Get latest throughput from history (extracted for testing)
+    let (client_to_backend_str, backend_to_client_str) =
+        format_summary_throughput(app.latest_client_throughput());
 
     let summary = Paragraph::new(vec![
         Line::from(vec![
@@ -194,17 +185,8 @@ fn render_backend_list(
         .zip(servers.iter())
         .enumerate()
         .map(|(i, (stats, server))| {
-            let status_color = if stats.active_connections > 0 {
-                status::ACTIVE
-            } else {
-                status::INACTIVE
-            };
-
-            let error_indicator = if stats.errors > 0 {
-                format!("{}{}", text::WARNING_ICON, stats.errors)
-            } else {
-                String::new()
-            };
+            // Use extracted helper for display info
+            let display_info = backend_display_info(stats.active_connections as u64, stats.errors);
 
             // Get latest commands/sec from throughput history
             let cmd_per_sec = app
@@ -215,14 +197,20 @@ fn render_backend_list(
 
             let content = vec![
                 Line::from(vec![
-                    Span::styled(text::STATUS_INDICATOR, Style::default().fg(status_color)),
+                    Span::styled(
+                        text::STATUS_INDICATOR,
+                        Style::default().fg(display_info.status_color),
+                    ),
                     Span::styled(
                         server.name.as_str(),
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(error_indicator, Style::default().fg(status::ERROR)),
+                    Span::styled(
+                        display_info.error_indicator,
+                        Style::default().fg(status::ERROR),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -284,9 +272,8 @@ fn render_data_flow(
     // Build chart data in single pass (no nested loops)
     let (chart_data, max_throughput) = build_chart_data(servers, app);
 
-    // Apply minimum threshold and round for nice axis labels
-    let max_throughput_clamped = max_throughput.max(chart::MIN_THROUGHPUT);
-    let max_throughput_rounded = round_up_throughput(max_throughput_clamped);
+    // Calculate chart bounds (extracted for testing)
+    let max_throughput_rounded = calculate_chart_bounds(max_throughput);
     let max_label = format_throughput_label(max_throughput_rounded);
 
     // Build datasets from pre-computed chart data

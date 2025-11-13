@@ -112,7 +112,7 @@ impl Default for RuntimeConfig {
 /// * `num_cores` - Number of CPU cores to pin to (0..num_cores)
 #[cfg(target_os = "linux")]
 fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
-    use nix::sched::{sched_setaffinity, CpuSet};
+    use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
 
     let mut cpu_set = CpuSet::new();
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn test_runtime_config_from_args_default() {
         let config = RuntimeConfig::from_args(None);
-        
+
         // Should use number of CPUs
         let num_cpus = std::thread::available_parallelism()
             .map(|p| p.get())
@@ -164,7 +164,7 @@ mod tests {
     fn test_runtime_config_from_args_explicit() {
         let thread_count = ThreadCount::new(4).unwrap();
         let config = RuntimeConfig::from_args(Some(thread_count));
-        
+
         assert_eq!(config.worker_threads(), 4);
         assert!(!config.is_single_threaded());
     }
@@ -173,7 +173,7 @@ mod tests {
     fn test_runtime_config_single_threaded() {
         let thread_count = ThreadCount::new(1).unwrap();
         let config = RuntimeConfig::from_args(Some(thread_count));
-        
+
         assert_eq!(config.worker_threads(), 1);
         assert!(config.is_single_threaded());
     }
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn test_runtime_config_new() {
         let config = RuntimeConfig::new(8);
-        
+
         assert_eq!(config.worker_threads(), 8);
         assert!(config.enable_cpu_pinning);
     }
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn test_runtime_config_without_cpu_pinning() {
         let config = RuntimeConfig::new(4).without_cpu_pinning();
-        
+
         assert_eq!(config.worker_threads(), 4);
         assert!(!config.enable_cpu_pinning);
     }
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn test_runtime_config_default() {
         let config = RuntimeConfig::default();
-        
+
         // Should match from_args(None)
         let expected = RuntimeConfig::from_args(None);
         assert_eq!(config.worker_threads(), expected.worker_threads());

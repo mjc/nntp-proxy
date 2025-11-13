@@ -62,14 +62,14 @@ fn main() -> Result<()> {
     // Build and configure runtime
     let runtime_config = RuntimeConfig::from_args(args.threads);
     let rt = runtime_config.build_runtime()?;
-    
+
     rt.block_on(run_proxy(args))
 }
 
 async fn run_proxy(args: Args) -> Result<()> {
     // Load configuration with automatic fallback
     let (config, source) = load_config_with_fallback(args.config.as_str())?;
-    
+
     info!("Loaded configuration from {}", source.description());
     info!("Loaded {} backend servers:", config.servers.len());
     for server in &config.servers {

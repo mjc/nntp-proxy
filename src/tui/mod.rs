@@ -8,6 +8,8 @@ mod helpers;
 pub mod log_capture;
 mod types;
 mod ui;
+#[cfg(test)]
+mod ui_tests;
 
 pub use app::{TuiApp, TuiAppBuilder};
 pub use log_capture::{LogBuffer, LogMakeWriter};

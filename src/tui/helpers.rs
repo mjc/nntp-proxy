@@ -119,6 +119,88 @@ pub fn format_throughput_label(value: f64) -> String {
     }
 }
 
+// ============================================================================
+// Backend List Helpers
+// ============================================================================
+
+/// Backend display information (extracted for testing)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendDisplayInfo {
+    pub status_color: Color,
+    pub error_indicator: String,
+}
+
+/// Calculate backend status color based on active connections
+#[inline]
+#[must_use]
+pub fn backend_status_color(active_connections: u64) -> Color {
+    use super::constants::status;
+
+    if active_connections > 0 {
+        status::ACTIVE
+    } else {
+        status::INACTIVE
+    }
+}
+
+/// Format error indicator for backend
+#[must_use]
+pub fn format_error_indicator(errors: u64) -> String {
+    use super::constants::text;
+
+    if errors > 0 {
+        format!("{}{}", text::WARNING_ICON, errors)
+    } else {
+        String::new()
+    }
+}
+
+/// Get backend display information
+#[must_use]
+pub fn backend_display_info(active_connections: u64, errors: u64) -> BackendDisplayInfo {
+    BackendDisplayInfo {
+        status_color: backend_status_color(active_connections),
+        error_indicator: format_error_indicator(errors),
+    }
+}
+
+// ============================================================================
+// Summary Helpers
+// ============================================================================
+
+/// Format throughput strings for summary display
+#[must_use]
+pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) -> (String, String) {
+    use super::constants::text;
+
+    latest_throughput
+        .map(|point| {
+            (
+                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
+                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                format!("{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT),
+                format!("{}{}", text::ARROW_DOWN, text::DEFAULT_THROUGHPUT),
+            )
+        })
+}
+
+// ============================================================================
+// Chart Helpers
+// ============================================================================
+
+/// Calculate chart bounds (clamped and rounded for nice axis labels)
+#[must_use]
+pub fn calculate_chart_bounds(max_throughput: f64) -> f64 {
+    use super::constants::chart;
+
+    let clamped = max_throughput.max(chart::MIN_THROUGHPUT);
+    round_up_throughput(clamped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +312,120 @@ mod tests {
         assert_eq!(data.name, "Test Server");
         assert_eq!(data.sent_points.len(), 0);
         assert_eq!(data.recv_points.len(), 0);
+    }
+
+    // ========================================================================
+    // Backend Display Tests
+    // ========================================================================
+
+    #[test]
+    fn test_backend_status_color_active() {
+        use super::super::constants::status;
+        assert_eq!(backend_status_color(1), status::ACTIVE);
+        assert_eq!(backend_status_color(5), status::ACTIVE);
+        assert_eq!(backend_status_color(100), status::ACTIVE);
+    }
+
+    #[test]
+    fn test_backend_status_color_inactive() {
+        use super::super::constants::status;
+        assert_eq!(backend_status_color(0), status::INACTIVE);
+    }
+
+    #[test]
+    fn test_format_error_indicator_no_errors() {
+        assert_eq!(format_error_indicator(0), "");
+    }
+
+    #[test]
+    fn test_format_error_indicator_with_errors() {
+        use super::super::constants::text;
+        assert_eq!(
+            format_error_indicator(1),
+            format!("{}1", text::WARNING_ICON)
+        );
+        assert_eq!(
+            format_error_indicator(5),
+            format!("{}5", text::WARNING_ICON)
+        );
+    }
+
+    #[test]
+    fn test_backend_display_info() {
+        use super::super::constants::status;
+
+        let info = backend_display_info(3, 0);
+        assert_eq!(info.status_color, status::ACTIVE);
+        assert_eq!(info.error_indicator, "");
+
+        let info_with_errors = backend_display_info(0, 5);
+        assert_eq!(info_with_errors.status_color, status::INACTIVE);
+        assert!(info_with_errors.error_indicator.contains('5'));
+    }
+
+    // ========================================================================
+    // Summary Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_summary_throughput_none() {
+        use super::super::constants::text;
+
+        let (up, down) = format_summary_throughput(None);
+
+        assert!(up.starts_with(text::ARROW_UP));
+        assert!(down.starts_with(text::ARROW_DOWN));
+        assert!(up.contains(text::DEFAULT_THROUGHPUT));
+        assert!(down.contains(text::DEFAULT_THROUGHPUT));
+    }
+
+    #[test]
+    fn test_format_summary_throughput_with_data() {
+        use super::super::constants::text;
+        use crate::types::tui::{BytesPerSecond, CommandsPerSecond, Timestamp};
+
+        let point = ThroughputPoint::new_backend(
+            Timestamp::now(),
+            BytesPerSecond::new(1_000_000.0),
+            BytesPerSecond::new(2_000_000.0),
+            CommandsPerSecond::new(10.0),
+        );
+
+        let (up, down) = format_summary_throughput(Some(&point));
+
+        assert!(up.starts_with(text::ARROW_UP));
+        assert!(down.starts_with(text::ARROW_DOWN));
+        // Should contain formatted throughput values
+        assert!(up.contains("MB/s") || up.contains("KB/s") || up.contains("B/s"));
+        assert!(down.contains("MB/s") || down.contains("KB/s") || down.contains("B/s"));
+    }
+
+    // ========================================================================
+    // Chart Bounds Tests
+    // ========================================================================
+
+    #[test]
+    fn test_calculate_chart_bounds_below_min() {
+        use super::super::constants::chart;
+
+        // Should clamp to MIN_THROUGHPUT and round
+        let bounds = calculate_chart_bounds(500_000.0);
+        assert!(bounds >= chart::MIN_THROUGHPUT);
+    }
+
+    #[test]
+    fn test_calculate_chart_bounds_above_min() {
+        // Should round up nicely
+        let bounds = calculate_chart_bounds(15_500_000.0);
+        assert_eq!(bounds, 16_000_000.0); // Rounded to 16 MB/s
+    }
+
+    #[test]
+    fn test_calculate_chart_bounds_zero() {
+        use super::super::constants::chart;
+
+        // Zero should clamp to minimum
+        let bounds = calculate_chart_bounds(0.0);
+        assert_eq!(bounds, round_up_throughput(chart::MIN_THROUGHPUT));
     }
 }

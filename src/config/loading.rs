@@ -277,12 +277,12 @@ pub fn load_config_with_fallback(config_path: &str) -> Result<(Config, ConfigSou
     tracing::warn!("Creating default config file - please edit it to add your backend servers");
 
     let default_config = create_default_config();
-    let config_toml = toml::to_string_pretty(&default_config)
-        .context("Failed to serialize default config")?;
-    
+    let config_toml =
+        toml::to_string_pretty(&default_config).context("Failed to serialize default config")?;
+
     std::fs::write(config_path, &config_toml)
         .with_context(|| format!("Failed to write default config to '{}'", config_path))?;
-    
+
     tracing::info!("Created default config file: {}", config_path);
     Ok((default_config, ConfigSource::DefaultCreated))
 }
@@ -318,7 +318,10 @@ mod tests {
     #[test]
     fn test_config_source_description() {
         assert_eq!(ConfigSource::File.description(), "configuration file");
-        assert_eq!(ConfigSource::Environment.description(), "environment variables");
+        assert_eq!(
+            ConfigSource::Environment.description(),
+            "environment variables"
+        );
         assert_eq!(
             ConfigSource::DefaultCreated.description(),
             "default configuration (created)"
@@ -328,22 +331,22 @@ mod tests {
     #[test]
     fn test_load_config_with_fallback_creates_default() {
         use tempfile::NamedTempFile;
-        
+
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_str().unwrap().to_string();
-        
+
         // Remove the temp file so it doesn't exist
         drop(temp_file);
-        
+
         // Should create default config
         let result = load_config_with_fallback(&path);
         assert!(result.is_ok());
-        
+
         let (config, source) = result.unwrap();
         assert_eq!(source, ConfigSource::DefaultCreated);
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].host.as_str(), "news.example.com");
-        
+
         // Cleanup
         let _ = std::fs::remove_file(&path);
     }
@@ -352,9 +355,9 @@ mod tests {
     fn test_load_config_with_fallback_reads_existing() {
         use std::io::Write;
         use tempfile::NamedTempFile;
-        
+
         let mut temp_file = NamedTempFile::new().unwrap();
-        
+
         // Write a valid config
         let config_content = r#"
 [[servers]]
@@ -364,13 +367,13 @@ name = "Test Server"
 "#;
         temp_file.write_all(config_content.as_bytes()).unwrap();
         temp_file.flush().unwrap();
-        
+
         // Get path as owned string before borrowing for read
         let path = temp_file.path().to_str().unwrap().to_string();
-        
+
         let result = load_config_with_fallback(&path);
         assert!(result.is_ok());
-        
+
         let (config, source) = result.unwrap();
         assert_eq!(source, ConfigSource::File);
         assert_eq!(config.servers.len(), 1);

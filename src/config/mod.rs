@@ -10,8 +10,8 @@ mod validation;
 
 // Re-export public types
 pub use loading::{
-    create_default_config, has_server_env_vars, load_config, load_config_from_env,
-    load_config_with_fallback, ConfigSource,
+    ConfigSource, create_default_config, has_server_env_vars, load_config, load_config_from_env,
+    load_config_with_fallback,
 };
 pub use types::{
     CacheConfig, ClientAuthConfig, Config, HealthCheckConfig, RoutingMode, ServerConfig,
