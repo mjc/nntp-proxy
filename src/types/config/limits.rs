@@ -119,6 +119,13 @@ impl ThreadCount {
     }
 }
 
+impl Default for ThreadCount {
+    /// Default to single-threaded (1 thread)
+    fn default() -> Self {
+        Self(NonZeroUsize::new(1).unwrap())
+    }
+}
+
 impl std::fmt::Display for ThreadCount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.get())
@@ -157,6 +164,24 @@ impl std::str::FromStr for ThreadCount {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let value = s.parse::<usize>()?;
-        Ok(Self::from_value(value).unwrap_or(Self::DEFAULT))
+        Ok(Self::from_value(value).unwrap_or_else(Self::default))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_thread_count_default() {
+        let threads = ThreadCount::default();
+        assert_eq!(threads.get(), 1);
+    }
+
+    #[test]
+    fn test_thread_count_from_value_auto() {
+        let threads = ThreadCount::from_value(0).unwrap();
+        // Should return CPU count (at least 1)
+        assert!(threads.get() >= 1);
     }
 }

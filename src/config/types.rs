@@ -82,24 +82,27 @@ pub struct Config {
 
 /// Proxy server settings
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ProxyConfig {
     /// Host/IP to bind to (default: 0.0.0.0)
-    #[serde(default = "super::defaults::listen_host")]
     pub host: String,
     /// Port to listen on (default: 8119)
-    #[serde(default = "super::defaults::listen_port")]
     pub port: Port,
     /// Number of worker threads (default: 1, use 0 for CPU cores)
-    #[serde(default = "super::defaults::threads")]
     pub threads: ThreadCount,
+}
+
+impl ProxyConfig {
+    /// Default listen host (all interfaces)
+    pub const DEFAULT_HOST: &'static str = "0.0.0.0";
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            host: super::defaults::listen_host(),
-            port: super::defaults::listen_port(),
-            threads: super::defaults::threads(),
+            host: Self::DEFAULT_HOST.to_string(),
+            port: Port::default(),
+            threads: ThreadCount::default(),
         }
     }
 }
