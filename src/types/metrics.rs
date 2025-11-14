@@ -80,6 +80,82 @@ impl fmt::Display for BytesTransferred {
     }
 }
 
+/// Client traffic metrics (Client ↔ Proxy)
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct ClientBytes(u64);
+
+impl ClientBytes {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn saturating_sub(self, other: Self) -> u64 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
+impl From<u64> for ClientBytes {
+    #[inline]
+    fn from(bytes: u64) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for ClientBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
+/// Backend traffic metrics (Proxy ↔ Backend)
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct BackendBytes(u64);
+
+impl BackendBytes {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn saturating_sub(self, other: Self) -> u64 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
+impl From<u64> for BackendBytes {
+    #[inline]
+    fn from(bytes: u64) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for BackendBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
 /// Transfer statistics for a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferMetrics {

@@ -103,6 +103,7 @@ impl ClientSession {
                 Err(e) => {
                     connection::log_client_error(
                         self.client_addr,
+                        self.username().as_deref(),
                         &e,
                         TransferMetrics {
                             client_to_backend: client_to_backend_bytes,
@@ -154,6 +155,22 @@ impl ClientSession {
 
                         backend_to_client_bytes += result.bytes_written;
                         if result.authenticated {
+                            // Store username after successful authentication
+                            self.set_username(auth_username.clone());
+
+                            // Record connection for aggregation (after auth so we have username)
+                            if let Some(stats) = self.connection_stats() {
+                                stats.record_connection(
+                                    auth_username.as_deref(),
+                                    &self.routing_mode.to_string().to_lowercase(),
+                                );
+                            }
+
+                            // Track user connection in metrics
+                            if let Some(metrics) = self.metrics.as_ref() {
+                                metrics.user_connection_opened(auth_username.as_deref());
+                            }
+
                             skip_auth_check = true;
                         }
                     }
@@ -253,6 +270,32 @@ impl ClientSession {
             );
         }
 
+        // Track final per-user metrics
+        if let Some(metrics) = self.metrics.as_ref() {
+            if let Some(username) = self.username() {
+                let c2b = client_to_backend_bytes.as_u64();
+                let b2c = backend_to_client_bytes.as_u64();
+                if c2b > 0 {
+                    metrics.user_bytes_sent(Some(&username), c2b);
+                }
+                if b2c > 0 {
+                    metrics.user_bytes_received(Some(&username), b2c);
+                }
+                metrics.user_connection_closed(Some(&username));
+            } else {
+                // Anonymous user
+                let c2b = client_to_backend_bytes.as_u64();
+                let b2c = backend_to_client_bytes.as_u64();
+                if c2b > 0 {
+                    metrics.user_bytes_sent(None, c2b);
+                }
+                if b2c > 0 {
+                    metrics.user_bytes_received(None, b2c);
+                }
+                metrics.user_connection_closed(None);
+            }
+        }
+
         Ok(TransferMetrics {
             client_to_backend: client_to_backend_bytes,
             backend_to_client: backend_to_client_bytes,
@@ -303,9 +346,20 @@ impl ClientSession {
             self.client_addr, backend_id
         );
 
-        // Execute the command - returns (result, got_backend_data)
+        // Record command execution in metrics
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_command(backend_id.as_index());
+            // Track per-user command
+            if let Some(username) = self.username() {
+                metrics.user_command(Some(&username));
+            } else {
+                metrics.user_command(None);
+            }
+        }
+
+        // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
         // If got_backend_data is true, we successfully communicated with backend
-        let (result, got_backend_data) = self
+        let (result, got_backend_data, cmd_bytes, resp_bytes) = self
             .execute_command_on_backend(
                 &mut pooled_conn,
                 command,
@@ -316,6 +370,17 @@ impl ClientSession {
                 &mut buffer, // Pass reusable buffer
             )
             .await;
+
+        // Record metrics ONCE using type-safe API (prevents double-counting)
+        if let Some(ref metrics) = self.metrics {
+            // Record per-backend metrics first (peek without consuming)
+            metrics.record_client_to_backend_bytes_for(backend_id.as_index(), cmd_bytes.peek());
+            metrics.record_backend_to_client_bytes_for(backend_id.as_index(), resp_bytes.peek());
+
+            // Then record global metrics (consumes the Unrecorded bytes)
+            let _ = metrics.record_client_to_backend(cmd_bytes);
+            let _ = metrics.record_backend_to_client(resp_bytes);
+        }
 
         // Return buffer to pool before handling result
 
@@ -331,10 +396,22 @@ impl ClientSession {
                         "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
                         self.client_addr, backend_id
                     ),
-                    false => warn!(
-                        "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
-                        self.client_addr, backend_id, e
-                    ),
+                    false => {
+                        warn!(
+                            "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
+                            self.client_addr, backend_id, e
+                        );
+                        // Record error in metrics
+                        if let Some(ref metrics) = self.metrics {
+                            metrics.record_error(backend_id.as_index());
+                            // Track per-user error
+                            if let Some(username) = self.username() {
+                                metrics.user_error(Some(&username));
+                            } else {
+                                metrics.user_error(None);
+                            }
+                        }
+                    }
                 }
             })
             .filter(|_| !got_backend_data)
@@ -361,10 +438,15 @@ impl ClientSession {
     ///
     /// The complexity here is justified by the 100x+ performance gain on large transfers.
     ///
-    /// # Return Value
+    /// Execute a command on a backend connection
     ///
-    /// Returns `(Result<()>, got_backend_data)` where:
+    /// **IMPORTANT CHANGE**: This function now returns type-safe `MetricsBytes<Unrecorded>`
+    /// to prevent double-counting. The caller MUST record these bytes to metrics exactly once.
+    ///
+    /// Returns `(Result<()>, got_backend_data, cmd_bytes, resp_bytes)` where:
     /// - `got_backend_data = true` means we successfully read from backend before any error
+    /// - `cmd_bytes`: Unrecorded command bytes (MUST be recorded by caller)
+    /// - `resp_bytes`: Unrecorded response bytes (MUST be recorded by caller)
     /// - This distinguishes backend failures (remove from pool) from client disconnects (keep backend)
     ///
     /// This function is `pub(super)` and is intended for use by `hybrid.rs` for stateful mode command execution.
@@ -378,7 +460,13 @@ impl ClientSession {
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
         chunk_buffer: &mut PooledBuffer, // Reusable buffer from pool
-    ) -> (Result<()>, bool) {
+    ) -> (
+        Result<()>,
+        bool,
+        crate::types::MetricsBytes<crate::types::Unrecorded>,
+        crate::types::MetricsBytes<crate::types::Unrecorded>,
+    ) {
+        use crate::types::MetricsBytes;
         let mut got_backend_data = false;
 
         // Send command and read first chunk into reusable buffer
@@ -395,7 +483,14 @@ impl ClientSession {
                 got_backend_data = true;
                 result
             }
-            Err(e) => return (Err(e), got_backend_data),
+            Err(e) => {
+                return (
+                    Err(e),
+                    got_backend_data,
+                    MetricsBytes::new(0),
+                    MetricsBytes::new(0),
+                );
+            }
         };
 
         client_to_backend_bytes.add(command.len());
@@ -436,7 +531,14 @@ impl ClientSession {
             .await
             {
                 Ok(bytes) => bytes,
-                Err(e) => return (Err(e), got_backend_data),
+                Err(e) => {
+                    return (
+                        Err(e),
+                        got_backend_data,
+                        MetricsBytes::new(command.len() as u64),
+                        MetricsBytes::new(0),
+                    );
+                }
             }
         } else {
             // Single-line response - just write the first chunk
@@ -499,11 +601,22 @@ impl ClientSession {
 
             match client_write.write_all(&chunk_buffer[..n]).await {
                 Ok(_) => n as u64,
-                Err(e) => return (Err(e.into()), got_backend_data),
+                Err(e) => {
+                    return (
+                        Err(e.into()),
+                        got_backend_data,
+                        MetricsBytes::new(command.len() as u64),
+                        MetricsBytes::new(0),
+                    );
+                }
             }
         };
 
         backend_to_client_bytes.add(bytes_written as usize);
+
+        // Return unrecorded metrics bytes - caller MUST record to prevent double-counting
+        let cmd_bytes = MetricsBytes::new(command.len() as u64);
+        let resp_bytes = MetricsBytes::new(bytes_written);
 
         if let Some(id) = msgid {
             debug!(
@@ -512,7 +625,7 @@ impl ClientSession {
             );
         }
 
-        (Ok(()), got_backend_data)
+        (Ok(()), got_backend_data, cmd_bytes, resp_bytes)
     }
 
     /// Route a command and handle any errors with appropriate logging and client responses

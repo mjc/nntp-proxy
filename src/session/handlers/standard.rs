@@ -12,10 +12,47 @@ use crate::types::{BytesTransferred, TransferMetrics};
 
 impl ClientSession {
     /// Handle a client connection with a dedicated backend connection (standard 1:1 mode)
+    ///
+    /// # Metrics Reporting
+    ///
+    /// If `backend_id` is provided and metrics are enabled, this handler will:
+    /// - Report byte counts periodically during long-running sessions
+    /// - Enable real-time throughput monitoring in the TUI
+    /// - Still return final totals at session end for accuracy
     pub async fn handle_with_pooled_backend<T>(
+        &self,
+        client_stream: TcpStream,
+        backend_conn: T,
+    ) -> Result<TransferMetrics>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        self.handle_with_pooled_backend_impl(client_stream, backend_conn, None)
+            .await
+    }
+
+    /// Handle a client connection with periodic metrics reporting
+    ///
+    /// This version accepts a backend_id for per-backend metrics tracking.
+    pub async fn handle_with_pooled_backend_and_metrics<T>(
+        &self,
+        client_stream: TcpStream,
+        backend_conn: T,
+        backend_id: usize,
+    ) -> Result<TransferMetrics>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        self.handle_with_pooled_backend_impl(client_stream, backend_conn, Some(backend_id))
+            .await
+    }
+
+    /// Internal implementation with optional periodic metrics reporting
+    async fn handle_with_pooled_backend_impl<T>(
         &self,
         mut client_stream: TcpStream,
         backend_conn: T,
+        backend_id: Option<usize>,
     ) -> Result<TransferMetrics>
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -30,6 +67,10 @@ impl ClientSession {
         let mut client_to_backend_bytes = BytesTransferred::zero();
         let mut backend_to_client_bytes = BytesTransferred::zero();
 
+        // Track last reported values for incremental metrics updates
+        let mut last_reported_c2b = 0u64;
+        let mut last_reported_b2c = 0u64;
+
         // Reuse line buffer to avoid per-iteration allocations
         let mut line = String::with_capacity(COMMAND);
 
@@ -42,9 +83,36 @@ impl ClientSession {
 
         debug!("Client {} session loop starting", self.client_addr);
 
+        // Counter for periodic metrics flush (every N iterations)
+        let mut iteration_count = 0u32;
+        const METRICS_FLUSH_INTERVAL: u32 = 100; // Flush every 100 commands
+
         loop {
             line.clear();
             let mut buffer = self.buffer_pool.get_buffer().await;
+
+            // Periodically flush metrics for long-running sessions
+            iteration_count += 1;
+            if iteration_count >= METRICS_FLUSH_INTERVAL {
+                if let (Some(metrics), Some(bid)) = (self.metrics.as_ref(), backend_id) {
+                    let current_c2b = client_to_backend_bytes.as_u64();
+                    let current_b2c = backend_to_client_bytes.as_u64();
+
+                    let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
+                    let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
+
+                    if delta_c2b > 0 {
+                        metrics.record_client_to_backend_bytes_for(bid, delta_c2b);
+                    }
+                    if delta_b2c > 0 {
+                        metrics.record_backend_to_client_bytes_for(bid, delta_b2c);
+                    }
+
+                    last_reported_c2b = current_c2b;
+                    last_reported_b2c = current_b2c;
+                }
+                iteration_count = 0;
+            }
 
             tokio::select! {
                 // Read command from client
@@ -92,6 +160,22 @@ impl ClientSession {
 
                                         backend_to_client_bytes += result.bytes_written;
                                         if result.authenticated {
+                                            // Store username after successful authentication
+                                            self.set_username(auth_username.clone());
+
+                                            // Record connection for aggregation (after auth so we have username)
+                                            if let Some(stats) = self.connection_stats() {
+                                                stats.record_connection(
+                                                    auth_username.as_deref(),
+                                                    "standard",
+                                                );
+                                            }
+
+                                            // Track user connection in metrics
+                                            if let Some(metrics) = self.metrics.as_ref() {
+                                                metrics.user_connection_opened(auth_username.as_deref());
+                                            }
+
                                             skip_auth_check = true;
                                         }
                                     }
@@ -126,6 +210,42 @@ impl ClientSession {
                         }
                     }
                 }
+            }
+        }
+
+        // Report final metrics deltas before session ends
+        if let (Some(metrics), Some(bid)) = (self.metrics.as_ref(), backend_id) {
+            let current_c2b = client_to_backend_bytes.as_u64();
+            let current_b2c = backend_to_client_bytes.as_u64();
+
+            let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
+            let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
+
+            if delta_c2b > 0 {
+                metrics.record_client_to_backend_bytes_for(bid, delta_c2b);
+            }
+            if delta_b2c > 0 {
+                metrics.record_backend_to_client_bytes_for(bid, delta_b2c);
+            }
+
+            // Track final per-user metrics
+            if let Some(username) = self.username() {
+                if delta_c2b > 0 {
+                    metrics.user_bytes_sent(Some(&username), delta_c2b);
+                }
+                if delta_b2c > 0 {
+                    metrics.user_bytes_received(Some(&username), delta_b2c);
+                }
+                metrics.user_connection_closed(Some(&username));
+            } else {
+                // Anonymous user
+                if delta_c2b > 0 {
+                    metrics.user_bytes_sent(None, delta_c2b);
+                }
+                if delta_b2c > 0 {
+                    metrics.user_bytes_received(None, delta_b2c);
+                }
+                metrics.user_connection_closed(None);
             }
         }
 

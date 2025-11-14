@@ -34,11 +34,13 @@
 // Module declarations
 pub mod auth;
 pub mod connection_error;
-mod formatting;
+pub mod formatting;
+pub mod metrics;
 pub mod network;
 pub mod protocol;
 mod proxy;
 pub mod stream;
+pub mod tui;
 
 // Public modules for integration tests
 pub mod cache;
@@ -48,14 +50,16 @@ pub mod constants;
 pub mod health;
 pub mod pool;
 pub mod router;
+pub mod runtime;
 pub mod session;
 pub mod tls;
 pub mod types;
 
 // Public exports
 pub use config::{
-    CacheConfig, Config, RoutingMode, ServerConfig, create_default_config, has_server_env_vars,
-    load_config, load_config_from_env,
+    CacheConfig, Config, ConfigSource, RoutingMode, ServerConfig, create_default_config,
+    has_server_env_vars, load_config, load_config_from_env, load_config_with_fallback,
 };
 pub use network::SocketOptimizer;
 pub use proxy::{NntpProxy, NntpProxyBuilder};
+pub use runtime::RuntimeConfig;

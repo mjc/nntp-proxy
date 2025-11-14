@@ -36,6 +36,16 @@ impl Port {
 
     /// NNTPS port (563)
     pub const NNTPS: Self = Self(NonZeroU16::new(563).unwrap());
+
+    /// Default proxy listen port (8119)
+    pub const DEFAULT: Self = Self(NonZeroU16::new(8119).unwrap());
+}
+
+impl Default for Port {
+    /// Default to port 8119 (common NNTP proxy port)
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 impl FromStr for Port {
@@ -66,5 +76,24 @@ impl PartialOrd for Port {
 impl Ord for Port {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.get().cmp(&other.get())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_port_default() {
+        let port = Port::default();
+        assert_eq!(port.get(), 8119);
+        assert_eq!(port, Port::DEFAULT);
+    }
+
+    #[test]
+    fn test_port_constants() {
+        assert_eq!(Port::NNTP.get(), 119);
+        assert_eq!(Port::NNTPS.get(), 563);
+        assert_eq!(Port::DEFAULT.get(), 8119);
     }
 }

@@ -50,11 +50,22 @@ impl ClientSession {
             self.client_addr, backend_id
         );
 
+        // Record command in metrics
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_command(backend_id.as_index());
+            // Track per-user command
+            if let Some(username) = self.username() {
+                metrics.user_command(Some(&username));
+            } else {
+                metrics.user_command(None);
+            }
+        }
+
         // Get buffer from pool for command execution
         let mut buffer = self.buffer_pool.get_buffer().await;
 
         // Execute the initial command that triggered the switch
-        let (result, got_backend_data) = self
+        let (result, got_backend_data, cmd_bytes, resp_bytes) = self
             .execute_command_on_backend(
                 &mut pooled_conn,
                 initial_command,
@@ -65,6 +76,12 @@ impl ClientSession {
                 &mut buffer,
             )
             .await;
+
+        // Record metrics ONCE using type-safe API (prevents double-counting)
+        if let Some(ref metrics) = self.metrics {
+            let _ = metrics.record_client_to_backend(cmd_bytes);
+            let _ = metrics.record_backend_to_client(resp_bytes);
+        }
 
         if let Err(ref e) = result {
             if !got_backend_data {
@@ -141,8 +158,19 @@ impl ClientSession {
                     let mut resp_bytes = BytesTransferred::zero();
                     cmd_bytes.add(command.len());
 
-                    let (result, _got_backend_data) = self
-                        .execute_command_on_backend(
+                    // Record command in metrics
+                    if let Some(ref metrics) = self.metrics {
+                        metrics.record_command(backend_id.as_index());
+                        // Track per-user command
+                        if let Some(username) = self.username() {
+                            metrics.user_command(Some(&username));
+                        } else {
+                            metrics.user_command(None);
+                        }
+                    }
+
+                    let (result, _got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes) =
+                        self.execute_command_on_backend(
                             &mut pooled_conn,
                             &command,
                             &mut client_write,
@@ -152,6 +180,12 @@ impl ClientSession {
                             &mut buffer,
                         )
                         .await;
+
+                    // Record metrics ONCE using type-safe API (prevents double-counting)
+                    if let Some(ref metrics) = self.metrics {
+                        let _ = metrics.record_client_to_backend(unrecorded_cmd_bytes);
+                        let _ = metrics.record_backend_to_client(unrecorded_resp_bytes);
+                    }
 
                     client_to_backend += cmd_bytes.as_u64();
                     backend_to_client += resp_bytes.as_u64();
@@ -175,6 +209,7 @@ impl ClientSession {
 
                     connection::log_client_error(
                         self.client_addr,
+                        self.username().as_deref(),
                         &e,
                         TransferMetrics {
                             client_to_backend: c2b,

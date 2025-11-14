@@ -3,8 +3,8 @@
 //! This module contains all the core configuration structures used by the proxy.
 
 use crate::types::{
-    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, duration_serde,
-    option_duration_serde,
+    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, ThreadCount,
+    duration_serde, option_duration_serde,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -66,6 +66,9 @@ pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+    /// Proxy server settings
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheckConfig,
@@ -75,6 +78,33 @@ pub struct Config {
     /// Client authentication configuration
     #[serde(default)]
     pub client_auth: ClientAuthConfig,
+}
+
+/// Proxy server settings
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProxyConfig {
+    /// Host/IP to bind to (default: 0.0.0.0)
+    pub host: String,
+    /// Port to listen on (default: 8119)
+    pub port: Port,
+    /// Number of worker threads (default: 1, use 0 for CPU cores)
+    pub threads: ThreadCount,
+}
+
+impl ProxyConfig {
+    /// Default listen host (all interfaces)
+    pub const DEFAULT_HOST: &'static str = "0.0.0.0";
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            host: Self::DEFAULT_HOST.to_string(),
+            port: Port::default(),
+            threads: ThreadCount::default(),
+        }
+    }
 }
 
 /// Cache configuration for article caching
@@ -131,20 +161,50 @@ impl Default for HealthCheckConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ClientAuthConfig {
     /// Required username for client authentication (if set, auth is enabled)
+    /// DEPRECATED: Use `users` instead for multi-user support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Required password for client authentication
+    /// DEPRECATED: Use `users` instead for multi-user support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Optional custom greeting message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub greeting: Option<String>,
+    /// List of authorized users (replaces username/password for multi-user support)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<UserCredentials>,
+}
+
+/// Individual user credentials
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserCredentials {
+    pub username: String,
+    pub password: String,
 }
 
 impl ClientAuthConfig {
     /// Check if authentication is enabled
     pub fn is_enabled(&self) -> bool {
-        self.username.is_some() && self.password.is_some()
+        // Auth is enabled if either the legacy single-user config or multi-user list is populated
+        (!self.users.is_empty()) || (self.username.is_some() && self.password.is_some())
+    }
+
+    /// Get all users (combines legacy + new format)
+    pub fn all_users(&self) -> Vec<(&str, &str)> {
+        let mut users = Vec::new();
+
+        // Add legacy single user if present
+        if let (Some(u), Some(p)) = (&self.username, &self.password) {
+            users.push((u.as_str(), p.as_str()));
+        }
+
+        // Add multi-user list
+        for user in &self.users {
+            users.push((user.username.as_str(), user.password.as_str()));
+        }
+
+        users
     }
 }
 

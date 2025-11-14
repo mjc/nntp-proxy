@@ -23,7 +23,7 @@
       };
 
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-        extensions = ["rust-src" "rust-analyzer"];
+        extensions = ["rust-src" "rust-analyzer" "llvm-tools-preview"];
       };
 
       # Nightly toolchain with all cross-compilation targets for releases
@@ -61,6 +61,7 @@
           cargo-tarpaulin
           cargo-nextest
           cargo-mutants
+          cargo-llvm-cov
 
           # Build & dependencies
           cargo-outdated
@@ -127,6 +128,7 @@
           echo "   cargo nextest run - Fast test runner"
           echo "   cargo tarpaulin   - Code coverage analysis"
           echo "   cargo mutants     - Mutation testing"
+          echo "   cargo llvm-cov    - LLVM-based code coverage"
           echo ""
           echo "⚡ Performance:"
           echo "   cargo flamegraph  - Generate performance flamegraph"

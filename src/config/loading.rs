@@ -187,6 +187,106 @@ pub fn load_config(config_path: &str) -> Result<Config> {
     Ok(config)
 }
 
+/// Configuration source
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Loaded from TOML file
+    File,
+    /// Loaded from environment variables
+    Environment,
+    /// Default config created (file doesn't exist)
+    DefaultCreated,
+}
+
+impl ConfigSource {
+    /// Get a human-readable description
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::File => "configuration file",
+            Self::Environment => "environment variables",
+            Self::DefaultCreated => "default configuration (created)",
+        }
+    }
+}
+
+/// Load configuration with automatic fallback logic
+///
+/// Attempts to load configuration in this order:
+/// 1. If config file exists, load from file (with env var overrides)
+/// 2. Else if environment variables exist (`NNTP_SERVER_*`), load from env
+/// 3. Else create default config file and return default config
+///
+/// # Arguments
+/// * `config_path` - Path to configuration file
+///
+/// # Returns
+/// Tuple of (Config, ConfigSource) indicating where config came from
+///
+/// # Errors
+/// Returns error if:
+/// - Config file exists but can't be read or parsed
+/// - Environment variables exist but are invalid
+/// - Default config can't be created
+pub fn load_config_with_fallback(config_path: &str) -> Result<(Config, ConfigSource)> {
+    use anyhow::Context;
+
+    // Check if config file exists
+    if std::path::Path::new(config_path).exists() {
+        match load_config(config_path) {
+            Ok(config) => {
+                tracing::info!("Loaded configuration from file: {}", config_path);
+                return Ok((config, ConfigSource::File));
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to load existing config file '{}': {}",
+                    config_path,
+                    e
+                );
+                tracing::error!("Please check your config file syntax and try again");
+                return Err(e);
+            }
+        }
+    }
+
+    // Config file doesn't exist - check for environment variables
+    if has_server_env_vars() {
+        match load_config_from_env() {
+            Ok(config) => {
+                tracing::info!(
+                    "Using configuration from environment variables (no config file found)"
+                );
+                return Ok((config, ConfigSource::Environment));
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to load configuration from environment variables: {}",
+                    e
+                );
+                return Err(e);
+            }
+        }
+    }
+
+    // No config file and no env vars - create default
+    tracing::warn!(
+        "Config file '{}' not found and no NNTP_SERVER_* environment variables set",
+        config_path
+    );
+    tracing::warn!("Creating default config file - please edit it to add your backend servers");
+
+    let default_config = create_default_config();
+    let config_toml =
+        toml::to_string_pretty(&default_config).context("Failed to serialize default config")?;
+
+    std::fs::write(config_path, &config_toml)
+        .with_context(|| format!("Failed to write default config to '{}'", config_path))?;
+
+    tracing::info!("Created default config file: {}", config_path);
+    Ok((default_config, ConfigSource::DefaultCreated))
+}
+
 /// Create a default configuration for examples/testing
 #[must_use]
 pub fn create_default_config() -> Config {
@@ -208,5 +308,75 @@ pub fn create_default_config() -> Config {
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
         }],
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_source_description() {
+        assert_eq!(ConfigSource::File.description(), "configuration file");
+        assert_eq!(
+            ConfigSource::Environment.description(),
+            "environment variables"
+        );
+        assert_eq!(
+            ConfigSource::DefaultCreated.description(),
+            "default configuration (created)"
+        );
+    }
+
+    #[test]
+    fn test_load_config_with_fallback_creates_default() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        // Remove the temp file so it doesn't exist
+        drop(temp_file);
+
+        // Should create default config
+        let result = load_config_with_fallback(&path);
+        assert!(result.is_ok());
+
+        let (config, source) = result.unwrap();
+        assert_eq!(source, ConfigSource::DefaultCreated);
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].host.as_str(), "news.example.com");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_config_with_fallback_reads_existing() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Write a valid config
+        let config_content = r#"
+[[servers]]
+host = "test.example.com"
+port = 119
+name = "Test Server"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        // Get path as owned string before borrowing for read
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        let result = load_config_with_fallback(&path);
+        assert!(result.is_ok());
+
+        let (config, source) = result.unwrap();
+        assert_eq!(source, ConfigSource::File);
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].host.as_str(), "test.example.com");
     }
 }

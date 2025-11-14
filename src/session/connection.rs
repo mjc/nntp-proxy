@@ -124,39 +124,45 @@ where
 /// Log client disconnect/error with appropriate log level and context
 pub fn log_client_error(
     client_addr: std::net::SocketAddr,
+    username: Option<&str>,
     error: &std::io::Error,
     metrics: TransferMetrics,
 ) {
     let (c2b, b2c) = metrics.as_tuple();
+    let user_info = username.unwrap_or("anonymous");
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => {
             debug!(
-                "Client {} closed connection (EOF) | ↑{} ↓{}",
+                "Client {} ({}) closed connection (EOF) | ↑{} ↓{}",
                 client_addr,
+                user_info,
                 crate::formatting::format_bytes(c2b),
                 crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::BrokenPipe => {
             debug!(
-                "Client {} connection broken pipe | ↑{} ↓{}",
+                "Client {} ({}) connection broken pipe | ↑{} ↓{}",
                 client_addr,
+                user_info,
                 crate::formatting::format_bytes(c2b),
                 crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::ConnectionReset => {
             warn!(
-                "Client {} connection reset | ↑{} ↓{}",
+                "Client {} ({}) connection reset | ↑{} ↓{}",
                 client_addr,
+                user_info,
                 crate::formatting::format_bytes(c2b),
                 crate::formatting::format_bytes(b2c)
             );
         }
         _ => {
             warn!(
-                "Error reading from client {}: {} ({:?}) | ↑{} ↓{}",
+                "Error reading from client {} ({}): {} ({:?}) | ↑{} ↓{}",
                 client_addr,
+                user_info,
                 error,
                 error.kind(),
                 crate::formatting::format_bytes(c2b),
