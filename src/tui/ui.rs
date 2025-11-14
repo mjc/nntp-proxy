@@ -184,11 +184,7 @@ fn render_backends(
 
     render_backend_list(f, chunks[0], snapshot, servers, app);
     render_data_flow(f, chunks[1], servers, app);
-
-    // Render top users in the third column if we have user stats
-    if !snapshot.user_stats.is_empty() {
-        render_user_stats(f, chunks[2], snapshot);
-    }
+    render_user_stats(f, chunks[2], snapshot);
 }
 
 /// Render list of backend servers with their stats
