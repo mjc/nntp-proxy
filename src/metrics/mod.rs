@@ -331,8 +331,8 @@ impl MetricsCollector {
 
     /// Record user connection closed
     pub fn user_connection_closed(&self, username: Option<&str>) {
-        let username_str = username.unwrap_or("<anonymous>");
-        if let Some(mut metrics) = self.inner.user_metrics.get_mut(username_str) {
+        let username_arc: Arc<str> = Arc::from(username.unwrap_or("<anonymous>"));
+        if let Some(mut metrics) = self.inner.user_metrics.get_mut(&username_arc) {
             metrics.active_connections = metrics.active_connections.saturating_sub(1);
         }
     }
@@ -894,5 +894,126 @@ mod tests {
             .saturating_sub(pool_status.available.get());
 
         assert_eq!(snapshot.backend_stats[0].active_connections, expected);
+    }
+
+    #[test]
+    fn test_user_connection_closed_decrements_active() {
+        let metrics = MetricsCollector::new(1);
+
+        // Open connection for user
+        metrics.user_connection_opened(Some("testuser"));
+
+        let snapshot1 = metrics.snapshot();
+        assert_eq!(snapshot1.user_stats.len(), 1);
+        assert_eq!(snapshot1.user_stats[0].username.as_ref(), "testuser");
+        assert_eq!(snapshot1.user_stats[0].active_connections, 1);
+        assert_eq!(snapshot1.user_stats[0].total_connections, 1);
+
+        // Close connection - should decrement active_connections
+        metrics.user_connection_closed(Some("testuser"));
+
+        let snapshot2 = metrics.snapshot();
+        assert_eq!(snapshot2.user_stats.len(), 1);
+        assert_eq!(snapshot2.user_stats[0].active_connections, 0);
+        assert_eq!(snapshot2.user_stats[0].total_connections, 1); // Total unchanged
+    }
+
+    #[test]
+    fn test_user_connection_closed_with_arc_str_key() {
+        let metrics = MetricsCollector::new(1);
+
+        // Open multiple connections
+        metrics.user_connection_opened(Some("alice"));
+        metrics.user_connection_opened(Some("alice"));
+        metrics.user_connection_opened(Some("bob"));
+
+        let snapshot1 = metrics.snapshot();
+        let alice = snapshot1
+            .user_stats
+            .iter()
+            .find(|u| u.username.as_ref() == "alice")
+            .unwrap();
+        let bob = snapshot1
+            .user_stats
+            .iter()
+            .find(|u| u.username.as_ref() == "bob")
+            .unwrap();
+
+        assert_eq!(alice.active_connections, 2);
+        assert_eq!(bob.active_connections, 1);
+
+        // Close one of alice's connections
+        metrics.user_connection_closed(Some("alice"));
+
+        let snapshot2 = metrics.snapshot();
+        let alice2 = snapshot2
+            .user_stats
+            .iter()
+            .find(|u| u.username.as_ref() == "alice")
+            .unwrap();
+
+        assert_eq!(alice2.active_connections, 1); // Decremented from 2 to 1
+        assert_eq!(alice2.total_connections, 2); // Unchanged
+    }
+
+    #[test]
+    fn test_article_size_tracking() {
+        let metrics = MetricsCollector::new(1);
+
+        // Record some articles
+        metrics.record_article(0, 5000); // 5KB
+        metrics.record_article(0, 15000); // 15KB
+        metrics.record_article(0, 10000); // 10KB
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.backend_stats[0].article_count, 3);
+        assert_eq!(snapshot.backend_stats[0].article_bytes_total, 30000);
+
+        // Average should be 10KB
+        assert_eq!(
+            snapshot.backend_stats[0].average_article_size(),
+            Some(10000)
+        );
+    }
+
+    #[test]
+    fn test_article_size_returns_none_when_no_articles() {
+        let metrics = MetricsCollector::new(1);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.backend_stats[0].article_count, 0);
+        assert_eq!(snapshot.backend_stats[0].average_article_size(), None);
+    }
+
+    #[test]
+    fn test_article_tracking_multiple_backends() {
+        let metrics = MetricsCollector::new(3);
+
+        // Backend 0: small articles
+        metrics.record_article(0, 1000);
+        metrics.record_article(0, 2000);
+
+        // Backend 1: large articles
+        metrics.record_article(1, 50000);
+        metrics.record_article(1, 100000);
+
+        // Backend 2: no articles
+
+        let snapshot = metrics.snapshot();
+
+        // Backend 0: avg 1.5KB
+        assert_eq!(snapshot.backend_stats[0].article_count, 2);
+        assert_eq!(snapshot.backend_stats[0].average_article_size(), Some(1500));
+
+        // Backend 1: avg 75KB
+        assert_eq!(snapshot.backend_stats[1].article_count, 2);
+        assert_eq!(
+            snapshot.backend_stats[1].average_article_size(),
+            Some(75000)
+        );
+
+        // Backend 2: no data
+        assert_eq!(snapshot.backend_stats[2].article_count, 0);
+        assert_eq!(snapshot.backend_stats[2].average_article_size(), None);
     }
 }

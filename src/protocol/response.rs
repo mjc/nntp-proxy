@@ -300,27 +300,28 @@ impl NntpResponse {
     /// Benchmarks show this is **72% faster for small responses** (37ns → 13ns) and
     /// **64% faster for medium responses** (109ns → 40ns) compared to the manual loop
     /// that creates a new slice on each iteration.
+    ///
+    /// **Hot path optimization**: Check end first (99% case for streaming chunks),
+    /// then scan forward if needed. Compiler optimizes slice comparison to memcmp.
     #[inline]
     pub fn find_terminator_end(data: &[u8]) -> Option<usize> {
+        const TERMINATOR: [u8; 5] = *b"\r\n.\r\n";
+
         let n = data.len();
         if n < 5 {
             return None;
         }
 
-        // Use memchr::Memchr iterator to avoid repeated slice creation
-        for r_pos in memchr::memchr_iter(b'\r', data) {
-            // Not enough space for full terminator
-            if r_pos + 5 > n {
-                return None;
-            }
-
-            // Check for full terminator pattern
-            if &data[r_pos..r_pos + 5] == b"\r\n.\r\n" {
-                return Some(r_pos + 5);
-            }
+        // Fast path: terminator at end (99% of streaming chunks)
+        if data[n - 5..n] == TERMINATOR {
+            return Some(n);
         }
 
-        None
+        // Slow path: scan for terminator mid-chunk (rare - only when responses batched)
+        memchr::memchr_iter(b'\r', data)
+            .take_while(|&pos| pos + 5 <= n)
+            .find(|&pos| data[pos..pos + 5] == TERMINATOR)
+            .map(|pos| pos + 5)
     }
 
     /// Check if a terminator spans across a boundary between tail and current chunk

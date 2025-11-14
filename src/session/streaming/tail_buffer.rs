@@ -71,6 +71,10 @@ impl TailBuffer {
         NntpResponse::has_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
     }
     /// Detect terminator in chunk, considering possible boundary spanning
+    ///
+    /// **Performance**: find_terminator_end() checks end first (O(1)),
+    /// only scans with memchr if terminator is mid-chunk (rare).
+    /// This optimizes the 99% case where terminator is at chunk end.
     pub(super) fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
         if let Some(pos) = NntpResponse::find_terminator_end(chunk) {
             TerminatorStatus::FoundAt(pos)
