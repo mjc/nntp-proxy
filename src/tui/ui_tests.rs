@@ -14,6 +14,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_min_height_for_logs_constant() {
         const MIN_HEIGHT_FOR_LOGS: u16 = 40;
 
@@ -26,6 +27,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_log_window_height_reasonable() {
         const LOG_WINDOW_HEIGHT: u16 = 10;
 

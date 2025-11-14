@@ -159,23 +159,46 @@ pub struct BackendChartData {
     pub name: String,
     /// Color for this backend's lines
     pub color: Color,
-    /// Data points for sent throughput (x, y) where x is time index
-    pub sent_points: PointVec,
-    /// Data points for received throughput (x, y) where x is time index
-    pub recv_points: PointVec,
+    /// Data points for sent throughput (x, y) where x is time index (internal)
+    #[allow(dead_code)]
+    sent_points: PointVec,
+    /// Data points for received throughput (x, y) where x is time index (internal)
+    #[allow(dead_code)]
+    recv_points: PointVec,
+    /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
+    sent_tuples: Vec<(f64, f64)>,
+    /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
+    recv_tuples: Vec<(f64, f64)>,
 }
 
 impl BackendChartData {
-    /// Get sent points as tuples for ratatui
+    /// Create new chart data with pre-computed tuples
     #[must_use]
-    pub fn sent_points_as_tuples(&self) -> Vec<(f64, f64)> {
-        self.sent_points.iter().map(|p| p.as_tuple()).collect()
+    pub fn new(name: String, color: Color, sent_points: PointVec, recv_points: PointVec) -> Self {
+        let sent_tuples = sent_points.iter().map(|p| p.as_tuple()).collect();
+        let recv_tuples = recv_points.iter().map(|p| p.as_tuple()).collect();
+        Self {
+            name,
+            color,
+            sent_points,
+            recv_points,
+            sent_tuples,
+            recv_tuples,
+        }
     }
 
-    /// Get received points as tuples for ratatui
+    /// Get sent points as tuples for ratatui (pre-computed, zero-copy)
     #[must_use]
-    pub fn recv_points_as_tuples(&self) -> Vec<(f64, f64)> {
-        self.recv_points.iter().map(|p| p.as_tuple()).collect()
+    #[inline]
+    pub fn sent_points_as_tuples(&self) -> &[(f64, f64)] {
+        &self.sent_tuples
+    }
+
+    /// Get received points as tuples for ratatui (pre-computed, zero-copy)
+    #[must_use]
+    #[inline]
+    pub fn recv_points_as_tuples(&self) -> &[(f64, f64)] {
+        &self.recv_tuples
     }
 }
 
@@ -232,17 +255,16 @@ mod tests {
 
     #[test]
     fn test_backend_chart_data_conversions() {
-        let mut data = BackendChartData {
-            name: "Test".to_string(),
-            color: Color::Green,
-            sent_points: PointVec::new(),
-            recv_points: PointVec::new(),
-        };
+        let mut sent_points = PointVec::new();
+        sent_points.push(ChartPoint::new(ChartX::new(0.0), ChartY::new(100.0)));
+        sent_points.push(ChartPoint::new(ChartX::new(1.0), ChartY::new(200.0)));
 
-        data.sent_points
-            .push(ChartPoint::new(ChartX::new(0.0), ChartY::new(100.0)));
-        data.sent_points
-            .push(ChartPoint::new(ChartX::new(1.0), ChartY::new(200.0)));
+        let data = BackendChartData::new(
+            "Test".to_string(),
+            Color::Green,
+            sent_points,
+            PointVec::new(),
+        );
 
         let tuples = data.sent_points_as_tuples();
         assert_eq!(tuples.len(), 2);
