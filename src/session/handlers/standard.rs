@@ -7,7 +7,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use crate::command::CommandHandler;
-use crate::constants::buffer::COMMAND;
+use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::types::{BytesTransferred, TransferMetrics};
 
 impl ClientSession {
@@ -62,7 +62,7 @@ impl ClientSession {
         // Split streams for independent read/write
         let (client_read, mut client_write) = client_stream.split();
         let (mut backend_read, mut backend_write) = tokio::io::split(backend_conn);
-        let mut client_reader = BufReader::new(client_read);
+        let mut client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
 
         let mut client_to_backend_bytes = BytesTransferred::zero();
         let mut backend_to_client_bytes = BytesTransferred::zero();
