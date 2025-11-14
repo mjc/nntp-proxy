@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::mem;
 use std::sync::{Arc, Mutex};
 
 /// Maximum number of log lines to keep in memory
@@ -99,8 +100,8 @@ impl Write for LogWriter {
             if c == '\n' {
                 // Complete line - push to buffer
                 if !self.line_buffer.is_empty() {
-                    self.buffer.push(self.line_buffer.clone());
-                    self.line_buffer.clear();
+                    // Move string out, replacing with empty (zero-copy)
+                    self.buffer.push(mem::take(&mut self.line_buffer));
                 }
             } else {
                 self.line_buffer.push(c);
@@ -113,8 +114,8 @@ impl Write for LogWriter {
     fn flush(&mut self) -> io::Result<()> {
         // Flush any remaining content
         if !self.line_buffer.is_empty() {
-            self.buffer.push(self.line_buffer.clone());
-            self.line_buffer.clear();
+            // Move string out, replacing with empty (zero-copy)
+            self.buffer.push(mem::take(&mut self.line_buffer));
         }
         Ok(())
     }

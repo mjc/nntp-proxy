@@ -91,12 +91,12 @@ pub fn build_chart_data(servers: &[ServerConfig], app: &TuiApp) -> (ChartDataVec
                     accumulate_points,
                 );
 
-            chart_data.push(BackendChartData {
-                name: server.name.as_str().to_string(),
-                color: backend_color(BackendIndex::from(index)),
+            chart_data.push(BackendChartData::new(
+                server.name.as_str().to_string(),
+                backend_color(BackendIndex::from(index)),
                 sent_points,
                 recv_points,
-            });
+            ));
 
             (chart_data, global_max.max(backend_max.get()))
         },
@@ -271,12 +271,12 @@ mod tests {
 
         // Add 8 backends (at SmallVec capacity)
         for i in 0..8 {
-            chart_data.push(BackendChartData {
-                name: format!("Server {}", i),
-                color: backend_color(BackendIndex::from(i)),
-                sent_points: PointVec::new(),
-                recv_points: PointVec::new(),
-            });
+            chart_data.push(BackendChartData::new(
+                format!("Server {}", i),
+                backend_color(BackendIndex::from(i)),
+                PointVec::new(),
+                PointVec::new(),
+            ));
         }
 
         assert_eq!(chart_data.len(), 8);
@@ -286,16 +286,17 @@ mod tests {
 
     #[test]
     fn test_backend_chart_data_structure() {
-        let data = BackendChartData {
-            name: "Test Server".to_string(),
-            color: backend_color(BackendIndex::from(0)),
-            sent_points: PointVec::new(),
-            recv_points: PointVec::new(),
-        };
+        let data = BackendChartData::new(
+            "Test Server".to_string(),
+            backend_color(BackendIndex::from(0)),
+            PointVec::new(),
+            PointVec::new(),
+        );
 
         assert_eq!(data.name, "Test Server");
-        assert_eq!(data.sent_points.len(), 0);
-        assert_eq!(data.recv_points.len(), 0);
+        // Verify pre-computed tuples are empty
+        assert_eq!(data.sent_points_as_tuples().len(), 0);
+        assert_eq!(data.recv_points_as_tuples().len(), 0);
     }
 
     // ========================================================================

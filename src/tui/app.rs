@@ -196,7 +196,7 @@ impl TuiAppBuilder {
     /// Build the TuiApp
     #[must_use]
     pub fn build(self) -> TuiApp {
-        let snapshot = self.metrics.snapshot();
+        let snapshot = Arc::new(self.metrics.snapshot());
         let backend_count = self.servers.len();
 
         // Initialize empty history for each backend
@@ -228,14 +228,14 @@ pub struct TuiApp {
     router: Arc<BackendSelector>,
     /// Server configurations for display names
     servers: Arc<Vec<ServerConfig>>,
-    /// Current metrics snapshot
-    snapshot: MetricsSnapshot,
+    /// Current metrics snapshot (Arc for zero-cost sharing)
+    snapshot: Arc<MetricsSnapshot>,
     /// Historical throughput data per backend
     backend_history: Vec<ThroughputHistory>,
     /// Historical client throughput (global)
     client_history: ThroughputHistory,
-    /// Previous snapshot for calculating deltas
-    previous_snapshot: Option<MetricsSnapshot>,
+    /// Previous snapshot for calculating deltas (Arc for zero-cost sharing)
+    previous_snapshot: Option<Arc<MetricsSnapshot>>,
     /// Last update time
     last_update: Timestamp,
     /// History capacity
@@ -315,7 +315,7 @@ impl TuiApp {
 
     /// Update metrics snapshot and calculate throughput
     pub fn update(&mut self) {
-        let new_snapshot = self.metrics.snapshot().with_pool_status(&self.router);
+        let new_snapshot = Arc::new(self.metrics.snapshot().with_pool_status(&self.router));
         let now = Timestamp::now();
         let time_delta = now.duration_since(self.last_update).as_secs_f64();
 
@@ -360,8 +360,11 @@ impl TuiApp {
             }
         }
 
-        // Update snapshots: new becomes previous for next iteration
-        self.previous_snapshot = Some(new_snapshot.clone());
+        // Update snapshots: Arc::clone is cheap (just increments ref count)
+        // We need new_snapshot in both places:
+        // - snapshot: for UI rendering
+        // - previous_snapshot: for next iteration's delta calculations
+        self.previous_snapshot = Some(Arc::clone(&new_snapshot));
         self.snapshot = new_snapshot;
         self.last_update = now;
     }

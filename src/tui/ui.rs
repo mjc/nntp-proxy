@@ -524,7 +524,7 @@ fn render_logs(f: &mut Frame, area: Rect, app: &TuiApp) {
 /// Render per-user statistics panel
 fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
     // Sort users by total bytes transferred (sent + received) descending
-    let mut sorted_users = snapshot.user_stats.clone();
+    let mut sorted_users = snapshot.user_stats.iter().collect::<Vec<_>>();
     sorted_users.sort_by(|a, b| {
         let a_total = a.bytes_sent + a.bytes_received;
         let b_total = b.bytes_sent + b.bytes_received;
