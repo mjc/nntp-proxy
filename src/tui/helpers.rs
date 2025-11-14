@@ -11,6 +11,35 @@ use crate::tui::TuiApp;
 use crate::tui::app::ThroughputPoint;
 
 // ============================================================================
+// Sparkline Rendering
+// ============================================================================
+
+/// Width of bandwidth sparkline bars in characters
+const SPARKLINE_WIDTH: usize = 15;
+
+/// Create a text-based sparkline bar visualization
+///
+/// Creates a bar using filled (█) and empty (░) characters scaled
+/// relative to the maximum value.
+///
+/// # Arguments
+/// * `value` - The value to visualize
+/// * `max_value` - The maximum value for scaling (0-100% range)
+///
+/// # Returns
+/// A string of length `SPARKLINE_WIDTH` with filled/empty blocks
+#[must_use]
+pub fn create_sparkline(value: u64, max_value: u64) -> String {
+    let filled = if max_value > 0 {
+        ((value as f64 / max_value as f64) * SPARKLINE_WIDTH as f64) as usize
+    } else {
+        0
+    };
+
+    "█".repeat(filled.min(SPARKLINE_WIDTH)) + &"░".repeat(SPARKLINE_WIDTH.saturating_sub(filled))
+}
+
+// ============================================================================
 // Chart Data Building
 // ============================================================================
 
@@ -398,6 +427,39 @@ mod tests {
         // Should contain formatted throughput values
         assert!(up.contains("MB/s") || up.contains("KB/s") || up.contains("B/s"));
         assert!(down.contains("MB/s") || down.contains("KB/s") || down.contains("B/s"));
+    }
+
+    // ========================================================================
+    // Sparkline Tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_sparkline_full() {
+        let bar = create_sparkline(100, 100);
+        assert_eq!(bar.len(), SPARKLINE_WIDTH * "█".len());
+        assert_eq!(bar, "█".repeat(SPARKLINE_WIDTH));
+    }
+
+    #[test]
+    fn test_create_sparkline_empty() {
+        let bar = create_sparkline(0, 100);
+        assert_eq!(bar.len(), SPARKLINE_WIDTH * "░".len());
+        assert_eq!(bar, "░".repeat(SPARKLINE_WIDTH));
+    }
+
+    #[test]
+    fn test_create_sparkline_half() {
+        let bar = create_sparkline(50, 100);
+        let expected_filled = SPARKLINE_WIDTH / 2;
+        assert!(bar.starts_with(&"█".repeat(expected_filled)));
+        assert!(bar.ends_with(&"░".repeat(SPARKLINE_WIDTH - expected_filled)));
+    }
+
+    #[test]
+    fn test_create_sparkline_zero_max() {
+        let bar = create_sparkline(50, 0);
+        // Should be all empty when max is 0
+        assert_eq!(bar, "░".repeat(SPARKLINE_WIDTH));
     }
 
     // ========================================================================

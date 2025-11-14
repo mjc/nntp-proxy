@@ -31,15 +31,6 @@ impl RuntimeConfig {
         }
     }
 
-    /// Create runtime config with specific thread count
-    #[must_use]
-    pub fn new(worker_threads: usize) -> Self {
-        Self {
-            worker_threads,
-            enable_cpu_pinning: true,
-        }
-    }
-
     /// Disable CPU pinning
     #[must_use]
     pub fn without_cpu_pinning(mut self) -> Self {
@@ -174,8 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_config_new() {
-        let config = RuntimeConfig::new(8);
+    fn test_runtime_config_multi_threaded() {
+        let thread_count = ThreadCount::new(8).unwrap();
+        let config = RuntimeConfig::from_args(Some(thread_count));
 
         assert_eq!(config.worker_threads(), 8);
         assert!(config.enable_cpu_pinning);
@@ -183,7 +175,8 @@ mod tests {
 
     #[test]
     fn test_runtime_config_without_cpu_pinning() {
-        let config = RuntimeConfig::new(4).without_cpu_pinning();
+        let thread_count = ThreadCount::new(4).unwrap();
+        let config = RuntimeConfig::from_args(Some(thread_count)).without_cpu_pinning();
 
         assert_eq!(config.worker_threads(), 4);
         assert!(!config.enable_cpu_pinning);

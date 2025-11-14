@@ -4,8 +4,8 @@ use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
 use crate::tui::constants::{chart, layout, status, styles, text};
 use crate::tui::helpers::{
-    backend_display_info, build_chart_data, calculate_chart_bounds, format_summary_throughput,
-    format_throughput_label,
+    backend_display_info, build_chart_data, calculate_chart_bounds, create_sparkline,
+    format_summary_throughput, format_throughput_label,
 };
 use ratatui::{
     Frame,
@@ -487,15 +487,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
         };
 
         let total_bytes = user.bytes_sent + user.bytes_received;
-
-        // Create sparkline bar (simple text-based visualization)
-        let bar_width = 15;
-        let filled = if max_total > 0 {
-            ((total_bytes as f64 / max_total as f64) * bar_width as f64) as usize
-        } else {
-            0
-        };
-        let bar = "█".repeat(filled.min(bar_width)) + &"░".repeat(bar_width.saturating_sub(filled));
+        let bar = create_sparkline(total_bytes, max_total);
 
         items.push(ListItem::new(vec![
             Line::from(vec![

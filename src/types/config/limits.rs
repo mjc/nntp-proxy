@@ -146,7 +146,9 @@ impl<'de> serde::Deserialize<'de> for ThreadCount {
         D: serde::Deserializer<'de>,
     {
         let value = usize::deserialize(deserializer)?;
-        Self::from_value(value).ok_or_else(|| serde::de::Error::custom("ThreadCount cannot be 0"))
+        Self::from_value(value).ok_or_else(|| {
+            serde::de::Error::custom("ThreadCount must be a positive integer (0 means auto-detect)")
+        })
     }
 }
 
