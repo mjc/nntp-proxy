@@ -22,9 +22,31 @@ use ratatui::{
 
 /// Render the main UI
 pub fn render_ui(f: &mut Frame, app: &TuiApp) {
+    use crate::tui::app::ViewMode;
     let snapshot = app.snapshot();
     let servers = app.servers();
 
+    // Check if we're in log fullscreen mode
+    if app.view_mode() == ViewMode::LogFullscreen {
+        // Fullscreen logs - show only title and logs
+        use ratatui::layout::Constraint;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(layout::TITLE_HEIGHT),
+                Constraint::Min(10), // Most of screen for logs
+                Constraint::Length(layout::FOOTER_HEIGHT),
+            ])
+            .split(f.area());
+
+        render_title(f, chunks[0], snapshot);
+        render_logs(f, chunks[1], app);
+        render_footer(f, chunks[2]);
+        return;
+    }
+
+    // Normal mode - show all panels
     // Determine if we have enough space for a log window
     // We need at least 40 lines total to fit everything comfortably
     const MIN_HEIGHT_FOR_LOGS: u16 = 40;
@@ -442,6 +464,13 @@ fn render_footer(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" to exit  |  ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            "L",
+            Style::default()
+                .fg(styles::VALUE_INFO)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" to toggle logs  |  ", Style::default().fg(styles::LABEL)),
         Span::styled(
             "Ctrl+C",
             Style::default()

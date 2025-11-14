@@ -11,7 +11,7 @@ mod ui;
 #[cfg(test)]
 mod ui_tests;
 
-pub use app::{TuiApp, TuiAppBuilder};
+pub use app::{TuiApp, TuiAppBuilder, ViewMode};
 pub use log_capture::{LogBuffer, LogMakeWriter};
 pub use ui::render_ui;
 
@@ -126,6 +126,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                             // Ctrl-C pressed - exit TUI and shut down app
                             break;
+                        }
+                        KeyCode::Char('l') => {
+                            // Toggle log fullscreen mode
+                            app.toggle_log_fullscreen();
                         }
                         _ => {}
                     }

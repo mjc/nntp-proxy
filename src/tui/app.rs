@@ -8,6 +8,16 @@ use crate::types::tui::{BytesPerSecond, CommandsPerSecond, HistorySize, Timestam
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+/// TUI view mode - controls what is displayed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Normal view - shows all panels
+    #[default]
+    Normal,
+    /// Log fullscreen - shows only title and logs (mostly fullscreen)
+    LogFullscreen,
+}
+
 /// Historical throughput data point (generic over traffic direction)
 #[derive(Debug, Clone)]
 pub struct ThroughputPoint {
@@ -205,6 +215,7 @@ impl TuiAppBuilder {
             last_update: Timestamp::now(),
             history_size: self.history_size,
             log_buffer: Arc::new(self.log_buffer.unwrap_or_default()),
+            view_mode: ViewMode::default(),
         }
     }
 }
@@ -232,6 +243,8 @@ pub struct TuiApp {
     history_size: HistorySize,
     /// Log buffer for displaying recent log messages
     log_buffer: Arc<LogBuffer>,
+    /// Current view mode (normal or log fullscreen)
+    view_mode: ViewMode,
 }
 
 impl TuiApp {
@@ -404,6 +417,20 @@ impl TuiApp {
     #[must_use]
     pub fn log_buffer(&self) -> &Arc<LogBuffer> {
         &self.log_buffer
+    }
+
+    /// Get current view mode
+    #[must_use]
+    pub const fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    /// Toggle between normal and log fullscreen view
+    pub fn toggle_log_fullscreen(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Normal => ViewMode::LogFullscreen,
+            ViewMode::LogFullscreen => ViewMode::Normal,
+        };
     }
 }
 
