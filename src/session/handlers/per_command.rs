@@ -626,8 +626,10 @@ impl ClientSession {
         {
             let raw_code = code.as_u16();
 
-            // Track 4xx/5xx errors
-            if (400..500).contains(&raw_code) {
+            // Track 4xx/5xx errors (excluding expected "not found" responses)
+            // 423 = No such article (normal when searching)
+            // 430 = No such article in group (normal when searching)
+            if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
                 metrics.record_error_4xx(backend_id.as_index());
             } else if raw_code >= 500 {
                 metrics.record_error_5xx(backend_id.as_index());
