@@ -8,9 +8,9 @@ mod connection_stats;
 pub use connection_stats::ConnectionStatsAggregator;
 
 use crate::types::BackendBytes;
-use std::collections::HashMap;
+use dashmap::DashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Backend health status
@@ -66,8 +66,10 @@ struct MetricsInner {
     // Per-backend metrics (indexed by backend ID)
     backend_metrics: Vec<BackendMetrics>,
 
-    // Per-user metrics (protected by mutex for HashMap operations)
-    user_metrics: Mutex<HashMap<String, UserMetrics>>,
+    // Per-user metrics (lock-free concurrent HashMap)
+    // Uses Arc<str> keys to avoid String allocations
+    // DashMap provides concurrent access without locks
+    user_metrics: DashMap<Arc<str>, UserMetrics>,
 
     // Start time for uptime calculation
     start_time: Instant,
@@ -96,9 +98,10 @@ struct BackendMetrics {
     health_status: AtomicU8,
 }
 
-/// Metrics for a single user
-#[derive(Debug, Clone, Default)]
+/// Metrics for a single user (internal storage)
+#[derive(Debug, Clone)]
 struct UserMetrics {
+    username: Arc<str>, // Share username across snapshots to avoid cloning
     active_connections: usize,
     total_connections: u64,
     bytes_sent: u64,
@@ -143,7 +146,7 @@ pub struct BackendStats {
 /// Statistics for a single user
 #[derive(Debug, Clone)]
 pub struct UserStats {
-    pub username: String,
+    pub username: Arc<str>, // Shared reference to avoid allocations
     pub active_connections: usize,
     pub total_connections: u64,
     pub bytes_sent: u64,
@@ -182,7 +185,7 @@ impl MetricsCollector {
                 active_connections: AtomicUsize::new(0),
                 stateful_sessions: AtomicUsize::new(0),
                 backend_metrics,
-                user_metrics: Mutex::new(HashMap::new()),
+                user_metrics: DashMap::with_capacity(64), // Pre-allocate for typical user count
                 start_time: Instant::now(),
             }),
         }
@@ -307,54 +310,111 @@ impl MetricsCollector {
 
     /// Record user connection opened
     pub fn user_connection_opened(&self, username: Option<&str>) {
-        let username = username.unwrap_or("<anonymous>").to_string();
-        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
-            let metrics = user_metrics.entry(username).or_default();
-            metrics.active_connections += 1;
-            metrics.total_connections += 1;
-        }
+        let username_arc: Arc<str> = Arc::from(username.unwrap_or("<anonymous>"));
+        self.inner
+            .user_metrics
+            .entry(Arc::clone(&username_arc))
+            .and_modify(|metrics| {
+                metrics.active_connections += 1;
+                metrics.total_connections += 1;
+            })
+            .or_insert_with(|| UserMetrics {
+                username: Arc::clone(&username_arc),
+                active_connections: 1,
+                total_connections: 1,
+                bytes_sent: 0,
+                bytes_received: 0,
+                total_commands: 0,
+                errors: 0,
+            });
     }
 
     /// Record user connection closed
     pub fn user_connection_closed(&self, username: Option<&str>) {
-        let username = username.unwrap_or("<anonymous>").to_string();
-        if let Ok(mut user_metrics) = self.inner.user_metrics.lock()
-            && let Some(metrics) = user_metrics.get_mut(&username)
-        {
+        let username_str = username.unwrap_or("<anonymous>");
+        if let Some(mut metrics) = self.inner.user_metrics.get_mut(username_str) {
             metrics.active_connections = metrics.active_connections.saturating_sub(1);
         }
     }
 
     /// Record bytes sent for a specific user
     pub fn user_bytes_sent(&self, username: Option<&str>, bytes: u64) {
-        let username = username.unwrap_or("<anonymous>").to_string();
-        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
-            user_metrics.entry(username).or_default().bytes_sent += bytes;
-        }
+        let username_arc: Arc<str> = Arc::from(username.unwrap_or("<anonymous>"));
+        self.inner
+            .user_metrics
+            .entry(Arc::clone(&username_arc))
+            .and_modify(|metrics| {
+                metrics.bytes_sent += bytes;
+            })
+            .or_insert_with(|| UserMetrics {
+                username: Arc::clone(&username_arc),
+                active_connections: 0,
+                total_connections: 0,
+                bytes_sent: bytes,
+                bytes_received: 0,
+                total_commands: 0,
+                errors: 0,
+            });
     }
 
     /// Record bytes received for a specific user
     pub fn user_bytes_received(&self, username: Option<&str>, bytes: u64) {
-        let username = username.unwrap_or("<anonymous>").to_string();
-        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
-            user_metrics.entry(username).or_default().bytes_received += bytes;
-        }
+        let username_arc: Arc<str> = Arc::from(username.unwrap_or("<anonymous>"));
+        self.inner
+            .user_metrics
+            .entry(Arc::clone(&username_arc))
+            .and_modify(|metrics| {
+                metrics.bytes_received += bytes;
+            })
+            .or_insert_with(|| UserMetrics {
+                username: Arc::clone(&username_arc),
+                active_connections: 0,
+                total_connections: 0,
+                bytes_sent: 0,
+                bytes_received: bytes,
+                total_commands: 0,
+                errors: 0,
+            });
     }
 
     /// Record a command processed for a specific user
     pub fn user_command(&self, username: Option<&str>) {
-        let username = username.unwrap_or("<anonymous>").to_string();
-        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
-            user_metrics.entry(username).or_default().total_commands += 1;
-        }
+        let username_arc: Arc<str> = Arc::from(username.unwrap_or("<anonymous>"));
+        self.inner
+            .user_metrics
+            .entry(Arc::clone(&username_arc))
+            .and_modify(|metrics| {
+                metrics.total_commands += 1;
+            })
+            .or_insert_with(|| UserMetrics {
+                username: Arc::clone(&username_arc),
+                active_connections: 0,
+                total_connections: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                total_commands: 1,
+                errors: 0,
+            });
     }
 
     /// Record an error for a specific user
     pub fn user_error(&self, username: Option<&str>) {
-        let username = username.unwrap_or("<anonymous>").to_string();
-        if let Ok(mut user_metrics) = self.inner.user_metrics.lock() {
-            user_metrics.entry(username).or_default().errors += 1;
-        }
+        let username_arc: Arc<str> = Arc::from(username.unwrap_or("<anonymous>"));
+        self.inner
+            .user_metrics
+            .entry(Arc::clone(&username_arc))
+            .and_modify(|metrics| {
+                metrics.errors += 1;
+            })
+            .or_insert_with(|| UserMetrics {
+                username: Arc::clone(&username_arc),
+                active_connections: 0,
+                total_connections: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                total_commands: 0,
+                errors: 1,
+            });
     }
 
     /// Record a session entering stateful mode (hybrid mode tracking)
@@ -465,23 +525,25 @@ impl MetricsCollector {
         let c2b_bytes: u64 = backend_stats.iter().map(|b| b.bytes_sent).sum();
         let b2c_bytes: u64 = backend_stats.iter().map(|b| b.bytes_received).sum();
 
-        // Collect user stats
-        let user_stats = if let Ok(user_metrics) = self.inner.user_metrics.lock() {
-            user_metrics
-                .iter()
-                .map(|(username, metrics)| UserStats {
-                    username: username.clone(),
+        // Collect user stats (zero-copy username sharing via Arc<str>)
+        // DashMap provides lock-free iteration - no mutex needed!
+        let user_stats: Vec<UserStats> = self
+            .inner
+            .user_metrics
+            .iter()
+            .map(|entry| {
+                let metrics = entry.value();
+                UserStats {
+                    username: Arc::clone(&metrics.username), // Arc clone is just pointer increment
                     active_connections: metrics.active_connections,
                     total_connections: metrics.total_connections,
                     bytes_sent: metrics.bytes_sent,
                     bytes_received: metrics.bytes_received,
                     total_commands: metrics.total_commands,
                     errors: metrics.errors,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                }
+            })
+            .collect();
 
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),

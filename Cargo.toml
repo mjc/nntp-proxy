@@ -49,6 +49,7 @@ bytes = "1.0"  # Efficient byte buffer for zero-copy operations
 ratatui = "0.29"  # Terminal UI framework
 crossterm = "0.28"  # Cross-platform terminal manipulation
 smallvec = "1.13"  # Stack-allocated vectors for small collections
+dashmap = "6.1"  # Lock-free concurrent HashMap for metrics
 
 # TLS dependencies - use ring for smaller binaries (pure Rust, no C dependencies)
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
