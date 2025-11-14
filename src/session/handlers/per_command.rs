@@ -103,6 +103,7 @@ impl ClientSession {
                 Err(e) => {
                     connection::log_client_error(
                         self.client_addr,
+                        self.username().as_deref(),
                         &e,
                         TransferMetrics {
                             client_to_backend: client_to_backend_bytes,
