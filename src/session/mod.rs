@@ -53,6 +53,7 @@ use std::sync::Arc;
 
 use crate::auth::AuthHandler;
 use crate::config::RoutingMode;
+use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
 use crate::types::ClientId;
@@ -105,6 +106,13 @@ pub struct ClientSession {
     auth_handler: Arc<AuthHandler>,
     /// Whether client has authenticated (starts false, set true after successful auth)
     authenticated: std::sync::atomic::AtomicBool,
+    /// Authenticated username (set after successful auth)
+    username: std::sync::RwLock<Option<String>>,
+    /// Metrics collector for session statistics
+    metrics: Option<crate::metrics::MetricsCollector>,
+
+    /// Connection statistics aggregator for logging connection creation
+    connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -144,6 +152,8 @@ pub struct ClientSessionBuilder {
     router: Option<Arc<BackendSelector>>,
     routing_mode: RoutingMode,
     auth_handler: Arc<AuthHandler>,
+    metrics: Option<MetricsCollector>,
+    connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 }
 
 impl ClientSessionBuilder {
@@ -176,6 +186,23 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Add metrics collection to this session
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Add connection stats aggregation to this session
+    #[must_use]
+    pub fn with_connection_stats(
+        mut self,
+        connection_stats: crate::metrics::ConnectionStatsAggregator,
+    ) -> Self {
+        self.connection_stats = Some(connection_stats);
+        self
+    }
+
     /// Build the client session
     ///
     /// Creates a new `ClientSession` with a unique client ID and the configured
@@ -202,6 +229,9 @@ impl ClientSessionBuilder {
             routing_mode,
             auth_handler: self.auth_handler,
             authenticated: std::sync::atomic::AtomicBool::new(false),
+            username: std::sync::RwLock::new(None),
+            metrics: self.metrics,
+            connection_stats: self.connection_stats,
         }
     }
 }
@@ -223,10 +253,16 @@ impl ClientSession {
             routing_mode: RoutingMode::Standard,
             auth_handler,
             authenticated: std::sync::atomic::AtomicBool::new(false),
+            username: std::sync::RwLock::new(None),
+            metrics: None,
+            connection_stats: None,
         }
     }
 
-    /// Create a new client session for per-command routing mode
+    /// Create a new client session with per-command routing
+    ///
+    /// Each command will be routed to a potentially different backend server
+    /// using round-robin load balancing.
     #[must_use]
     pub fn new_with_router(
         client_addr: SocketAddr,
@@ -244,6 +280,9 @@ impl ClientSession {
             routing_mode,
             auth_handler,
             authenticated: std::sync::atomic::AtomicBool::new(false),
+            username: std::sync::RwLock::new(None),
+            metrics: None,
+            connection_stats: None,
         }
     }
 
@@ -263,11 +302,8 @@ impl ClientSession {
     /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
     /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
     ///
-    /// // Standard 1:1 routing mode
-    /// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
+    /// let session = ClientSession::builder(addr, buffer_pool, auth_handler)
     ///     .build();
-    ///
-    /// assert!(!session.is_per_command_routing());
     /// ```
     #[must_use]
     pub fn builder(
@@ -281,9 +317,13 @@ impl ClientSession {
             router: None,
             routing_mode: RoutingMode::Standard,
             auth_handler,
+            metrics: None,
+            connection_stats: None,
         }
     }
+}
 
+impl ClientSession {
     /// Get the unique client ID
     #[must_use]
     #[inline]
@@ -303,6 +343,26 @@ impl ClientSession {
     #[inline]
     pub fn mode(&self) -> SessionMode {
         self.mode
+    }
+
+    /// Get the authenticated username (if any)
+    #[must_use]
+    pub fn username(&self) -> Option<String> {
+        self.username.read().ok().and_then(|u| u.clone())
+    }
+
+    /// Set the authenticated username
+    pub(crate) fn set_username(&self, username: Option<String>) {
+        if let Ok(mut u) = self.username.write() {
+            *u = username;
+        }
+    }
+
+    /// Get the connection stats aggregator (if enabled)
+    #[must_use]
+    #[inline]
+    pub(crate) fn connection_stats(&self) -> Option<&crate::metrics::ConnectionStatsAggregator> {
+        self.connection_stats.as_ref()
     }
 }
 

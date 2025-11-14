@@ -4,8 +4,10 @@
 
 pub mod config;
 pub mod metrics;
+pub mod metrics_recording;
 pub mod pool;
 pub mod protocol;
+pub mod tui;
 pub mod validated;
 
 pub use config::{
@@ -13,7 +15,10 @@ pub use config::{
     HealthCheckTimeout, MaxConnections, MaxErrors, Port, ThreadCount, WindowSize, duration_serde,
     option_duration_serde,
 };
-pub use metrics::{BytesTransferred, TransferMetrics};
+pub use metrics::{BackendBytes, BytesTransferred, ClientBytes, TransferMetrics};
+pub use metrics_recording::{
+    DirectionalBytes, MetricsBytes, Recorded, RecordingState, TransferDirection, Unrecorded,
+};
 pub use pool::{
     AvailableConnections, CreatedConnections, InUseConnections, MaxPoolSize, PoolUtilization,
 };

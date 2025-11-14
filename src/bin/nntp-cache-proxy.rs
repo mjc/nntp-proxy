@@ -13,42 +13,7 @@ use nntp_proxy::config::CacheConfig;
 use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use nntp_proxy::protocol::BACKEND_UNAVAILABLE;
 use nntp_proxy::types::{CacheCapacity, ClientId, ConfigPath, Port, ThreadCount};
-use nntp_proxy::{NntpProxy, create_default_config, load_config};
-
-/// Pin current process to specific CPU cores for optimal performance
-#[cfg(target_os = "linux")]
-fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
-    use nix::sched::{CpuSet, sched_setaffinity};
-    use nix::unistd::Pid;
-
-    let mut cpu_set = CpuSet::new();
-    for core in 0..num_cores {
-        cpu_set.set(core)?;
-    }
-
-    match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
-        Ok(_) => {
-            info!(
-                "Successfully pinned process to {} CPU cores for optimal performance",
-                num_cores
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Failed to set CPU affinity: {}, continuing without pinning",
-                e
-            );
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
-    info!("CPU pinning not available on this platform");
-    Ok(())
-}
+use nntp_proxy::{NntpProxy, RuntimeConfig, load_config_with_fallback};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Caching Proxy Server", long_about = None)]
@@ -70,7 +35,7 @@ struct Args {
     )]
     config: ConfigPath,
 
-    /// Number of worker threads (defaults to number of CPU cores)
+    /// Number of worker threads (default: 1, use 0 for CPU cores)
     ///
     /// Can be overridden with NNTP_CACHE_PROXY_THREADS environment variable
     #[arg(short, long, env = "NNTP_CACHE_PROXY_THREADS")]
@@ -100,60 +65,18 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Log threading info
-    let num_cpus = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1);
-    let worker_threads = args.threads.map(|t| t.get()).unwrap_or(num_cpus);
+    // Build and configure runtime
+    let runtime_config = RuntimeConfig::from_args(args.threads);
+    let rt = runtime_config.build_runtime()?;
 
-    // Pin to specific CPU cores for optimal performance
-    pin_to_cpu_cores(worker_threads)?;
-
-    // Use different runtime based on thread count for optimal performance
-    if worker_threads == 1 {
-        info!("Starting NNTP caching proxy with single-threaded runtime for optimal performance");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(run_caching_proxy(args))
-    } else {
-        info!(
-            "Starting NNTP caching proxy with {} worker threads (detected {} CPUs)",
-            worker_threads, num_cpus
-        );
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()?;
-        rt.block_on(run_caching_proxy(args))
-    }
+    rt.block_on(run_caching_proxy(args))
 }
 
 async fn run_caching_proxy(args: Args) -> Result<()> {
-    // Load configuration
-    let config = if std::path::Path::new(args.config.as_str()).exists() {
-        match load_config(args.config.as_str()) {
-            Ok(config) => config,
-            Err(e) => {
-                error!(
-                    "Failed to load existing config file '{}': {}",
-                    args.config, e
-                );
-                error!("Please check your config file syntax and try again");
-                return Err(e);
-            }
-        }
-    } else {
-        warn!(
-            "Config file '{}' not found, creating default config",
-            args.config
-        );
-        let default_config = create_default_config();
-        let config_toml = toml::to_string_pretty(&default_config)?;
-        std::fs::write(args.config.as_str(), &config_toml)?;
-        info!("Created default config file: {}", args.config);
-        default_config
-    };
+    // Load configuration with automatic fallback
+    let (config, source) = load_config_with_fallback(args.config.as_str())?;
+
+    info!("Loaded configuration from {}", source.description());
 
     // Set up cache configuration
     let cache_config = config.cache.clone().unwrap_or_else(|| CacheConfig {

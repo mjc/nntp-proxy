@@ -6,57 +6,24 @@ use tokio::signal;
 use tracing::{error, info, warn};
 
 use nntp_proxy::{
-    NntpProxy, RoutingMode, create_default_config, has_server_env_vars, load_config,
-    load_config_from_env,
+    NntpProxy, RoutingMode, RuntimeConfig, load_config_with_fallback,
     types::{ConfigPath, Port, ThreadCount},
 };
-
-/// Pin current process to specific CPU cores for optimal performance
-#[cfg(target_os = "linux")]
-fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
-    use nix::sched::{CpuSet, sched_setaffinity};
-    use nix::unistd::Pid;
-
-    // Pin to CPU cores based on number of worker threads
-    // This reduces context switching and improves cache locality
-    let mut cpu_set = CpuSet::new();
-    for core in 0..num_cores {
-        // Ignore errors when setting CPU affinity (may not have all cores in container)
-        let _ = cpu_set.set(core);
-    }
-
-    match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
-        Ok(_) => {
-            info!(
-                "Successfully pinned process to {} CPU cores for optimal performance",
-                num_cores
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Failed to set CPU affinity: {}, continuing without pinning",
-                e
-            );
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
-    info!("CPU pinning not available on this platform");
-    Ok(())
-}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port to listen on
+    /// Port to listen on (overrides config file)
     ///
     /// Can be overridden with NNTP_PROXY_PORT environment variable
-    #[arg(short, long, default_value = "8119", env = "NNTP_PROXY_PORT")]
-    port: Port,
+    #[arg(short, long, env = "NNTP_PROXY_PORT")]
+    port: Option<Port>,
+
+    /// Host to bind to (overrides config file)
+    ///
+    /// Can be overridden with NNTP_PROXY_HOST environment variable
+    #[arg(long, env = "NNTP_PROXY_HOST")]
+    host: Option<String>,
 
     /// Routing mode: standard, per-command, or hybrid
     ///
@@ -80,7 +47,7 @@ struct Args {
     #[arg(short, long, default_value = "config.toml", env = "NNTP_PROXY_CONFIG")]
     config: ConfigPath,
 
-    /// Number of worker threads (defaults to number of CPU cores)
+    /// Number of worker threads (default: 1, use 0 for CPU cores)
     ///
     /// Can be overridden with NNTP_PROXY_THREADS environment variable
     #[arg(short, long, env = "NNTP_PROXY_THREADS")]
@@ -98,83 +65,29 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Log threading info
-    let num_cpus = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1);
-    let worker_threads = args.threads.map(|t| t.get()).unwrap_or(num_cpus);
+    // Load configuration first to get thread count
+    let (config, _) = load_config_with_fallback(args.config.as_str())?;
 
-    // Pin to specific CPU cores for optimal performance
-    pin_to_cpu_cores(worker_threads)?;
+    // Use CLI arg if provided, else config value (0 means use CPU cores)
+    let threads = args.threads.or(Some(config.proxy.threads));
 
-    // Use different runtime based on thread count for optimal performance
-    if worker_threads == 1 {
-        info!("Starting NNTP proxy with single-threaded runtime for optimal performance");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(run_proxy(args))
-    } else {
-        info!(
-            "Starting NNTP proxy with {} worker threads (detected {} CPUs)",
-            worker_threads, num_cpus
-        );
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()?;
-        rt.block_on(run_proxy(args))
-    }
+    // Build and configure runtime
+    let runtime_config = RuntimeConfig::from_args(threads);
+    let rt = runtime_config.build_runtime()?;
+
+    rt.block_on(run_proxy(args, config))
 }
 
-async fn run_proxy(args: Args) -> Result<()> {
-    // Load configuration
-    let config = if std::path::Path::new(args.config.as_str()).exists() {
-        // File exists, try to load it (env vars can override servers)
-        match load_config(args.config.as_str()) {
-            Ok(config) => config,
-            Err(e) => {
-                error!(
-                    "Failed to load existing config file '{}': {}",
-                    args.config, e
-                );
-                error!("Please check your config file syntax and try again");
-                return Err(e);
-            }
-        }
-    } else if has_server_env_vars() {
-        // File doesn't exist but env vars are set - use environment configuration
-        match load_config_from_env() {
-            Ok(config) => {
-                info!("Using configuration from environment variables (no config file)");
-                config
-            }
-            Err(e) => {
-                error!(
-                    "Failed to load configuration from environment variables: {}",
-                    e
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        // No config file and no NNTP_SERVER_* env vars - create default config file
-        warn!(
-            "Config file '{}' not found and no NNTP_SERVER_* environment variables set",
-            args.config
-        );
-        warn!("Creating default config file - please edit it to add your backend servers");
-        let default_config = create_default_config();
-        let config_toml = toml::to_string_pretty(&default_config)?;
-        std::fs::write(args.config.as_str(), &config_toml)?;
-        info!("Created default config file: {}", args.config);
-        default_config
-    };
-
+async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()> {
+    // Config already loaded in main()
     info!("Loaded {} backend servers:", config.servers.len());
     for server in &config.servers {
         info!("  - {} ({}:{})", server.name, server.host, server.port);
     }
+
+    // Extract listen address before moving config
+    let listen_host = args.host.unwrap_or_else(|| config.proxy.host.clone());
+    let listen_port = args.port.unwrap_or(config.proxy.port);
 
     // Create proxy (wrapped in Arc for sharing across tasks)
     let proxy = Arc::new(NntpProxy::new(config, args.routing_mode)?);
@@ -187,7 +100,7 @@ async fn run_proxy(args: Args) -> Result<()> {
     info!("Connection pools ready");
 
     // Start listening
-    let listen_addr = format!("0.0.0.0:{}", args.port.get());
+    let listen_addr = format!("{}:{}", listen_host, listen_port.get());
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP proxy listening on {} ({})",
@@ -202,6 +115,17 @@ async fn run_proxy(args: Args) -> Result<()> {
         proxy_for_shutdown.graceful_shutdown().await;
         info!("Graceful shutdown complete");
         std::process::exit(0);
+    });
+
+    // Start periodic connection stats flusher (every 30 seconds)
+    let connection_stats = proxy.connection_stats().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            connection_stats.flush();
+        }
     });
 
     // Determine which handler to use based on routing mode

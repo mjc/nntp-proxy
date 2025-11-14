@@ -28,9 +28,11 @@ fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &s
             .into_iter()
             .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
             .collect(),
+        proxy: Default::default(),
         health_check: Default::default(),
         cache: None,
         client_auth: ClientAuthConfig {
+            users: vec![],
             username: Some(username.to_string()),
             password: Some(password.to_string()),
             greeting: None,
@@ -317,6 +319,7 @@ async fn test_config_client_auth_is_enabled() {
     use nntp_proxy::config::ClientAuthConfig;
 
     let config = ClientAuthConfig {
+        users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
         greeting: None,
@@ -330,6 +333,7 @@ async fn test_config_client_auth_disabled_missing_username() {
     use nntp_proxy::config::ClientAuthConfig;
 
     let config = ClientAuthConfig {
+        users: vec![],
         username: None,
         password: Some("pass".to_string()),
         greeting: None,
@@ -343,6 +347,7 @@ async fn test_config_client_auth_disabled_missing_password() {
     use nntp_proxy::config::ClientAuthConfig;
 
     let config = ClientAuthConfig {
+        users: vec![],
         username: Some("user".to_string()),
         password: None,
         greeting: None,
@@ -356,6 +361,7 @@ async fn test_config_client_auth_disabled_both_missing() {
     use nntp_proxy::config::ClientAuthConfig;
 
     let config = ClientAuthConfig {
+        users: vec![],
         username: None,
         password: None,
         greeting: None,

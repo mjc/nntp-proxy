@@ -31,6 +31,7 @@ async fn test_auth_flow_complete_with_valid_credentials() {
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuthConfig {
+        users: vec![],
         username: Some("testuser".to_string()),
         password: Some("testpass".to_string()),
         greeting: None,
@@ -157,6 +158,7 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuthConfig {
+        users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
         greeting: None,
@@ -216,6 +218,7 @@ async fn test_multiple_clients_with_auth() {
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuthConfig {
+        users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
         greeting: None,
@@ -354,9 +357,11 @@ async fn test_config_auth_round_trip() {
     // Create config with auth
     let config = Config {
         servers: vec![],
+        proxy: Default::default(),
         health_check: Default::default(),
         cache: None,
         client_auth: ClientAuthConfig {
+            users: vec![],
             username: Some("testuser".to_string()),
             password: Some("testpass".to_string()),
             greeting: Some("Custom Auth Required".to_string()),
