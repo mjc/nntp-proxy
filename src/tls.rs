@@ -420,6 +420,12 @@ impl TlsManager {
         client_config.enable_early_data = true; // Enable TLS 1.3 0-RTT for faster reconnections
         client_config.resumption = rustls::client::Resumption::default(); // Enable session resumption
 
+        // Note: max_fragment_size is for outgoing records only (sending data to server)
+        // For incoming data (server->client), rustls uses internal buffering
+        // TLS 1.3 spec max is 16KB per record, larger values are not standard compliant
+        // and can cause connection failures with some servers
+        // client_config.max_fragment_size = Some(16384); // Keep default 16KB
+
         Ok(client_config)
     }
 }

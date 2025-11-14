@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::command::{CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
-use crate::constants::buffer::COMMAND;
+use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::protocol::{BACKEND_ERROR, PROXY_GREETING_PCR};
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
@@ -38,7 +38,7 @@ impl ClientSession {
         };
 
         let (client_read, mut client_write) = client_stream.split();
-        let mut client_reader = BufReader::new(client_read);
+        let mut client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
 
         let mut client_to_backend_bytes = BytesTransferred::zero();
         let mut backend_to_client_bytes = BytesTransferred::zero();
