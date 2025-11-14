@@ -635,8 +635,9 @@ impl ClientSession {
                 metrics.record_error_5xx(backend_id.as_index());
             }
 
-            // Track article size for successful ARTICLE responses (220)
-            if raw_code == 220 && is_multiline {
+            // Track article size for successful article retrieval responses
+            // 220 = ARTICLE (full article), 221 = HEAD (headers only), 222 = BODY (body only)
+            if is_multiline && (raw_code == 220 || raw_code == 221 || raw_code == 222) {
                 metrics.record_article(backend_id.as_index(), bytes_written);
             }
         }
