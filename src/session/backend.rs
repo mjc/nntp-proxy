@@ -13,7 +13,7 @@ use crate::types::BackendId;
 
 /// Send command to backend and read first chunk
 ///
-/// Returns (bytes_read, response_code, is_multiline)
+/// Returns (bytes_read, response_code, is_multiline, latency_micros)
 /// The first chunk is written into the provided buffer.
 pub async fn send_command_and_read_first_chunk<T>(
     backend_conn: &mut T,
@@ -21,10 +21,14 @@ pub async fn send_command_and_read_first_chunk<T>(
     backend_id: BackendId,
     client_addr: std::net::SocketAddr,
     chunk: &mut PooledBuffer,
-) -> Result<(usize, ResponseCode, bool)>
+) -> Result<(usize, ResponseCode, bool, u64)>
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    use std::time::Instant;
+
+    let start = Instant::now();
+
     // Write command to backend
     debug!(
         "Client {} forwarding command to backend {:?} ({} bytes): {}",
@@ -111,5 +115,13 @@ where
         );
     }
 
-    Ok((n, response_code, is_multiline))
+    let elapsed = start.elapsed();
+    debug!(
+        "Client {} backend {:?} response time: {:.2}ms",
+        client_addr,
+        backend_id,
+        elapsed.as_secs_f64() * 1000.0
+    );
+
+    Ok((n, response_code, is_multiline, elapsed.as_micros() as u64))
 }

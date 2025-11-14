@@ -2,12 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::formatting::format_bytes;
     use crate::tui::app::ThroughputPoint;
-    use crate::tui::constants::{chart, layout, status, text};
+    use crate::tui::constants::{chart, layout, text};
     use crate::tui::helpers::{
-        backend_display_info, calculate_chart_bounds, format_summary_throughput,
-        format_throughput_label,
+        calculate_chart_bounds, format_summary_throughput, format_throughput_label,
     };
     use crate::types::tui::{BytesPerSecond, Timestamp};
 
@@ -88,35 +86,6 @@ mod tests {
     // ========================================================================
     // Widget Construction Tests (data flow, not rendering)
     // ========================================================================
-
-    #[test]
-    fn test_backend_list_data_preparation() {
-        // Test the helper functions used in rendering
-        let active_connections = 3;
-        let errors = 2;
-        let bytes_sent = 1024;
-        let bytes_received = 2048;
-
-        let display_info = backend_display_info(active_connections, errors);
-
-        assert_eq!(display_info.status_color, status::ACTIVE);
-        assert!(display_info.error_indicator.contains('2'));
-
-        let formatted_sent = format_bytes(bytes_sent);
-        let formatted_recv = format_bytes(bytes_received);
-
-        assert_eq!(formatted_sent, "1.00 KB");
-        assert_eq!(formatted_recv, "2.00 KB");
-    }
-
-    #[test]
-    fn test_backend_display_info_inactive() {
-        // Test inactive backend
-        let display_info = backend_display_info(0, 0);
-
-        assert_eq!(display_info.status_color, status::INACTIVE);
-        assert_eq!(display_info.error_indicator, "");
-    }
 
     #[test]
     fn test_chart_data_bounds_calculation() {

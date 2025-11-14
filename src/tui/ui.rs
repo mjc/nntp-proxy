@@ -2,10 +2,10 @@
 
 use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
-use crate::tui::constants::{chart, layout, status, styles, text};
+use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::helpers::{
-    backend_display_info, build_chart_data, calculate_chart_bounds, create_sparkline,
-    format_summary_throughput, format_throughput_label,
+    build_chart_data, calculate_chart_bounds, create_sparkline, format_summary_throughput,
+    format_throughput_label,
 };
 use ratatui::{
     Frame,
@@ -121,6 +121,8 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
 
 /// Render summary statistics
 fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let snapshot = app.snapshot();
+
     // Get latest throughput from history (extracted for testing)
     let (client_to_backend_str, backend_to_client_str) =
         format_summary_throughput(app.latest_client_throughput());
@@ -131,6 +133,18 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
             Span::styled(
                 &client_to_backend_str,
                 Style::default().fg(styles::VALUE_SECONDARY),
+            ),
+            Span::styled(
+                "  |  Stateful Sessions: ",
+                Style::default().fg(styles::LABEL),
+            ),
+            Span::styled(
+                format!("{}", snapshot.stateful_sessions),
+                Style::default().fg(if snapshot.stateful_sessions > 0 {
+                    styles::VALUE_PRIMARY
+                } else {
+                    styles::VALUE_NEUTRAL
+                }),
             ),
         ]),
         Line::from(vec![
@@ -191,22 +205,53 @@ fn render_backend_list(
         .zip(servers.iter())
         .enumerate()
         .map(|(i, (stats, server))| {
-            // Use extracted helper for display info
-            let display_info = backend_display_info(stats.active_connections as u64, stats.errors);
+            use crate::metrics::HealthStatus;
+
+            // Determine health status indicator
+            let (health_icon, health_color) = match stats.health_status {
+                HealthStatus::Healthy => ("●", Color::Green),
+                HealthStatus::Degraded => ("◐", Color::Yellow),
+                HealthStatus::Down => ("○", Color::Red),
+            };
+
+            // Format error rate
+            let error_rate = stats.error_rate_percent();
+            let error_text = if error_rate > 5.0 {
+                format!(" ⚠ {:.1}%", error_rate)
+            } else if error_rate > 0.0 {
+                format!(" {:.1}%", error_rate)
+            } else {
+                String::new()
+            };
 
             // Get latest commands/sec from throughput history
             let cmd_per_sec = app
                 .latest_backend_throughput(i)
                 .and_then(|point| point.commands_per_sec())
-                .map(|cps| cps.to_string())
+                .map(|cps| format!("{:.0}", cps.get()))
                 .unwrap_or_else(|| String::from(text::DEFAULT_CMD_RATE));
+
+            // Format latency
+            let latency_text = stats
+                .average_latency_ms()
+                .map(|ms| format!("{:.1}ms", ms))
+                .unwrap_or_else(|| "N/A".to_string());
+
+            // Format average article size
+            let avg_size_text = stats
+                .average_article_size()
+                .map(format_bytes)
+                .unwrap_or_else(|| "N/A".to_string());
 
             let content = vec![
                 Line::from(vec![
                     Span::styled(
-                        text::STATUS_INDICATOR,
-                        Style::default().fg(display_info.status_color),
+                        health_icon,
+                        Style::default()
+                            .fg(health_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
+                    Span::raw(" "),
                     Span::styled(
                         server.name.as_str(),
                         Style::default()
@@ -214,8 +259,12 @@ fn render_backend_list(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        display_info.error_indicator,
-                        Style::default().fg(status::ERROR),
+                        error_text,
+                        Style::default().fg(if error_rate > 5.0 {
+                            Color::Red
+                        } else {
+                            Color::Yellow
+                        }),
                     ),
                 ]),
                 Line::from(vec![
@@ -231,8 +280,10 @@ fn render_backend_list(
                         format!("{}", stats.active_connections),
                         Style::default().fg(styles::VALUE_SECONDARY),
                     ),
-                    Span::styled(" clients  |  Cmd/s: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
                     Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
+                    Span::styled(" | Lat: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(latency_text, Style::default().fg(styles::VALUE_INFO)),
                 ]),
                 Line::from(vec![
                     Span::styled(
@@ -250,6 +301,19 @@ fn render_backend_list(
                     Span::styled(
                         format_bytes(stats.bytes_received),
                         Style::default().fg(styles::VALUE_NEUTRAL),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Avg Article: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(avg_size_text, Style::default().fg(styles::VALUE_INFO)),
+                    Span::styled(" | Errors: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(
+                        format!("4xx:{} 5xx:{}", stats.errors_4xx, stats.errors_5xx),
+                        Style::default().fg(if stats.errors > 0 {
+                            Color::Yellow
+                        } else {
+                            styles::VALUE_NEUTRAL
+                        }),
                     ),
                 ]),
             ];

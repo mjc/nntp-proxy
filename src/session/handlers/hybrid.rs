@@ -50,6 +50,11 @@ impl ClientSession {
             self.client_addr, backend_id
         );
 
+        // Track stateful session start
+        if let Some(ref metrics) = self.metrics {
+            metrics.stateful_session_started();
+        }
+
         // Record command in metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_command(backend_id.as_index());
@@ -225,6 +230,11 @@ impl ClientSession {
         let mut b2c = BytesTransferred::zero();
         c2b.add_u64(client_to_backend);
         b2c.add_u64(backend_to_client);
+
+        // Track stateful session end
+        if let Some(ref metrics) = self.metrics {
+            metrics.stateful_session_ended();
+        }
 
         Ok(TransferMetrics {
             client_to_backend: c2b,

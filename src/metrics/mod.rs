@@ -9,9 +9,41 @@ pub use connection_stats::ConnectionStatsAggregator;
 
 use crate::types::BackendBytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Backend health status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthStatus {
+    /// Backend is healthy and responding normally
+    Healthy,
+    /// Backend is degraded (high error rate or slow)
+    Degraded,
+    /// Backend is down or unreachable
+    Down,
+}
+
+impl From<u8> for HealthStatus {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Healthy,
+            1 => Self::Degraded,
+            2 => Self::Down,
+            _ => Self::Healthy,
+        }
+    }
+}
+
+impl From<HealthStatus> for u8 {
+    fn from(status: HealthStatus) -> Self {
+        match status {
+            HealthStatus::Healthy => 0,
+            HealthStatus::Degraded => 1,
+            HealthStatus::Down => 2,
+        }
+    }
+}
 
 /// Thread-safe metrics collector for the entire proxy
 ///
@@ -27,6 +59,9 @@ struct MetricsInner {
     // Connection metrics
     total_connections: AtomicU64,
     active_connections: AtomicUsize,
+
+    // Hybrid mode tracking - count of sessions currently in stateful mode
+    stateful_sessions: AtomicUsize,
 
     // Per-backend metrics (indexed by backend ID)
     backend_metrics: Vec<BackendMetrics>,
@@ -46,6 +81,19 @@ struct BackendMetrics {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
     errors: AtomicU64,
+    // Error classification
+    errors_4xx: AtomicU64,
+    errors_5xx: AtomicU64,
+    // Article size tracking (for averaging)
+    article_bytes_total: AtomicU64,
+    article_count: AtomicU64,
+    // Latency tracking (for averaging)
+    latency_micros_total: AtomicU64,
+    latency_count: AtomicU64,
+    // Connection failures
+    connection_failures: AtomicU64,
+    // Health status (0 = healthy, 1 = degraded, 2 = down)
+    health_status: AtomicU8,
 }
 
 /// Metrics for a single user
@@ -64,6 +112,7 @@ struct UserMetrics {
 pub struct MetricsSnapshot {
     pub total_connections: u64,
     pub active_connections: usize,
+    pub stateful_sessions: usize,
     // Traffic flows
     pub client_to_backend_bytes: BackendBytes, // Commands from client to backend
     pub backend_to_client_bytes: BackendBytes, // Article data from backend to client
@@ -81,6 +130,14 @@ pub struct BackendStats {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub errors: u64,
+    pub errors_4xx: u64,
+    pub errors_5xx: u64,
+    pub article_bytes_total: u64,
+    pub article_count: u64,
+    pub latency_micros_total: u64,
+    pub latency_count: u64,
+    pub connection_failures: u64,
+    pub health_status: HealthStatus,
 }
 
 /// Statistics for a single user
@@ -108,6 +165,14 @@ impl MetricsCollector {
                 bytes_sent: AtomicU64::new(0),
                 bytes_received: AtomicU64::new(0),
                 errors: AtomicU64::new(0),
+                errors_4xx: AtomicU64::new(0),
+                errors_5xx: AtomicU64::new(0),
+                article_bytes_total: AtomicU64::new(0),
+                article_count: AtomicU64::new(0),
+                latency_micros_total: AtomicU64::new(0),
+                latency_count: AtomicU64::new(0),
+                connection_failures: AtomicU64::new(0),
+                health_status: AtomicU8::new(0), // Healthy
             })
             .collect();
 
@@ -115,6 +180,7 @@ impl MetricsCollector {
             inner: Arc::new(MetricsInner {
                 total_connections: AtomicU64::new(0),
                 active_connections: AtomicUsize::new(0),
+                stateful_sessions: AtomicUsize::new(0),
                 backend_metrics,
                 user_metrics: Mutex::new(HashMap::new()),
                 start_time: Instant::now(),
@@ -291,6 +357,76 @@ impl MetricsCollector {
         }
     }
 
+    /// Record a session entering stateful mode (hybrid mode tracking)
+    #[inline]
+    pub fn stateful_session_started(&self) {
+        self.inner.stateful_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a session leaving stateful mode
+    #[inline]
+    pub fn stateful_session_ended(&self) {
+        self.inner.stateful_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Record a 4xx error for a backend
+    #[inline]
+    pub fn record_error_4xx(&self, backend_id: usize) {
+        if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
+            backend.errors.fetch_add(1, Ordering::Relaxed);
+            backend.errors_4xx.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a 5xx error for a backend
+    #[inline]
+    pub fn record_error_5xx(&self, backend_id: usize) {
+        if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
+            backend.errors.fetch_add(1, Ordering::Relaxed);
+            backend.errors_5xx.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record an article retrieval with its size
+    #[inline]
+    pub fn record_article(&self, backend_id: usize, bytes: u64) {
+        if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
+            backend
+                .article_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+            backend.article_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record response latency in microseconds
+    #[inline]
+    pub fn record_latency_micros(&self, backend_id: usize, micros: u64) {
+        if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
+            backend
+                .latency_micros_total
+                .fetch_add(micros, Ordering::Relaxed);
+            backend.latency_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a connection failure
+    #[inline]
+    pub fn record_connection_failure(&self, backend_id: usize) {
+        if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
+            backend.connection_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Update backend health status
+    #[inline]
+    pub fn set_backend_health(&self, backend_id: usize, status: HealthStatus) {
+        if let Some(backend) = self.inner.backend_metrics.get(backend_id) {
+            backend
+                .health_status
+                .store(status.into(), Ordering::Relaxed);
+        }
+    }
+
     /// Get a snapshot of current metrics
     ///
     /// This creates a consistent point-in-time view of all metrics.
@@ -314,6 +450,14 @@ impl MetricsCollector {
                 bytes_sent: metrics.bytes_sent.load(Ordering::Relaxed),
                 bytes_received: metrics.bytes_received.load(Ordering::Relaxed),
                 errors: metrics.errors.load(Ordering::Relaxed),
+                errors_4xx: metrics.errors_4xx.load(Ordering::Relaxed),
+                errors_5xx: metrics.errors_5xx.load(Ordering::Relaxed),
+                article_bytes_total: metrics.article_bytes_total.load(Ordering::Relaxed),
+                article_count: metrics.article_count.load(Ordering::Relaxed),
+                latency_micros_total: metrics.latency_micros_total.load(Ordering::Relaxed),
+                latency_count: metrics.latency_count.load(Ordering::Relaxed),
+                connection_failures: metrics.connection_failures.load(Ordering::Relaxed),
+                health_status: metrics.health_status.load(Ordering::Relaxed).into(),
             });
         }
 
@@ -342,6 +486,7 @@ impl MetricsCollector {
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),
             active_connections: self.inner.active_connections.load(Ordering::Relaxed),
+            stateful_sessions: self.inner.stateful_sessions.load(Ordering::Relaxed),
             client_to_backend_bytes: BackendBytes::new(c2b_bytes),
             backend_to_client_bytes: BackendBytes::new(b2c_bytes),
             uptime: self.inner.start_time.elapsed(),
@@ -414,6 +559,49 @@ impl MetricsSnapshot {
         } else {
             0.0
         }
+    }
+}
+
+impl BackendStats {
+    /// Calculate average article size in bytes
+    #[must_use]
+    #[inline]
+    pub fn average_article_size(&self) -> Option<u64> {
+        if self.article_count > 0 {
+            Some(self.article_bytes_total / self.article_count)
+        } else {
+            None
+        }
+    }
+
+    /// Calculate average latency in milliseconds
+    #[must_use]
+    #[inline]
+    pub fn average_latency_ms(&self) -> Option<f64> {
+        if self.latency_count > 0 {
+            let avg_micros = self.latency_micros_total as f64 / self.latency_count as f64;
+            Some(avg_micros / 1000.0) // Convert to milliseconds
+        } else {
+            None
+        }
+    }
+
+    /// Calculate error rate as a percentage
+    #[must_use]
+    #[inline]
+    pub fn error_rate_percent(&self) -> f64 {
+        if self.total_commands > 0 {
+            (self.errors as f64 / self.total_commands as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Check if backend has high error rate (> 5%)
+    #[must_use]
+    #[inline]
+    pub fn has_high_error_rate(&self) -> bool {
+        self.error_rate_percent() > 5.0
     }
 }
 
@@ -498,6 +686,7 @@ mod tests {
         let snapshot = MetricsSnapshot {
             total_connections: 0,
             active_connections: 0,
+            stateful_sessions: 0,
             client_to_backend_bytes: BackendBytes::new(0),
             backend_to_client_bytes: BackendBytes::new(0),
             uptime: Duration::from_secs(3665), // 1h 1m 5s
@@ -513,6 +702,7 @@ mod tests {
         let snapshot = MetricsSnapshot {
             total_connections: 0,
             active_connections: 0,
+            stateful_sessions: 0,
             client_to_backend_bytes: BackendBytes::new(5000),
             backend_to_client_bytes: BackendBytes::new(5000),
             uptime: Duration::from_secs(10),
