@@ -470,28 +470,34 @@ impl ClientSession {
         let mut got_backend_data = false;
 
         // Send command and read first chunk into reusable buffer
-        let (n, _response_code, is_multiline) = match backend::send_command_and_read_first_chunk(
-            &mut **pooled_conn,
-            command,
-            backend_id,
-            self.client_addr,
-            chunk_buffer,
-        )
-        .await
-        {
-            Ok(result) => {
-                got_backend_data = true;
-                result
-            }
-            Err(e) => {
-                return (
-                    Err(e),
-                    got_backend_data,
-                    MetricsBytes::new(0),
-                    MetricsBytes::new(0),
-                );
-            }
-        };
+        let (n, _response_code, is_multiline, latency_micros) =
+            match backend::send_command_and_read_first_chunk(
+                &mut **pooled_conn,
+                command,
+                backend_id,
+                self.client_addr,
+                chunk_buffer,
+            )
+            .await
+            {
+                Ok(result) => {
+                    got_backend_data = true;
+                    result
+                }
+                Err(e) => {
+                    return (
+                        Err(e),
+                        got_backend_data,
+                        MetricsBytes::new(0),
+                        MetricsBytes::new(0),
+                    );
+                }
+            };
+
+        // Record latency
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_latency_micros(backend_id.as_index(), latency_micros);
+        }
 
         client_to_backend_bytes.add(command.len());
 
@@ -613,6 +619,25 @@ impl ClientSession {
         };
 
         backend_to_client_bytes.add(bytes_written as usize);
+
+        // Track metrics based on response code
+        if let Some(ref metrics) = self.metrics
+            && let Some(code) = _response_code.status_code()
+        {
+            let raw_code = code.as_u16();
+
+            // Track 4xx/5xx errors
+            if (400..500).contains(&raw_code) {
+                metrics.record_error_4xx(backend_id.as_index());
+            } else if raw_code >= 500 {
+                metrics.record_error_5xx(backend_id.as_index());
+            }
+
+            // Track article size for successful ARTICLE responses (220)
+            if raw_code == 220 && is_multiline {
+                metrics.record_article(backend_id.as_index(), bytes_written);
+            }
+        }
 
         // Return unrecorded metrics bytes - caller MUST record to prevent double-counting
         let cmd_bytes = MetricsBytes::new(command.len() as u64);

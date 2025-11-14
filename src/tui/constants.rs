@@ -72,9 +72,6 @@ pub const BACKEND_COLORS: &[Color] = &[
 pub mod status {
     use ratatui::style::Color;
 
-    pub const ACTIVE: Color = Color::Green;
-    pub const INACTIVE: Color = Color::Gray;
-    pub const ERROR: Color = Color::Red;
     #[allow(dead_code)] // May be used in future features
     pub const WARNING: Color = Color::Yellow;
 }
@@ -98,10 +95,8 @@ pub mod styles {
 
 /// UI text constants
 pub mod text {
-    pub const STATUS_INDICATOR: &str = "● ";
     pub const ARROW_UP: &str = "↑";
     pub const ARROW_DOWN: &str = "↓";
-    pub const WARNING_ICON: &str = " ⚠ ";
     pub const DEFAULT_CMD_RATE: &str = "0.0";
     #[allow(dead_code)] // Used in default values
     pub const DEFAULT_THROUGHPUT: &str = "0 B/s";
