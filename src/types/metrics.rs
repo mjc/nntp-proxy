@@ -276,3 +276,205 @@ mod tests {
         assert_eq!(metrics.total().as_u64(), 3072);
     }
 }
+
+// ============================================================================
+// Per-Backend/User Byte Counters
+// ============================================================================
+
+/// Bytes sent by a backend or user
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct BytesSent(u64);
+
+impl BytesSent {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn saturating_sub(self, other: Self) -> u64 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
+impl From<u64> for BytesSent {
+    #[inline]
+    fn from(bytes: u64) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for BytesSent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
+/// Bytes received by a backend or user
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct BytesReceived(u64);
+
+impl BytesReceived {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn saturating_sub(self, other: Self) -> u64 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
+impl From<u64> for BytesReceived {
+    #[inline]
+    fn from(bytes: u64) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for BytesReceived {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
+/// Total connections count
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct TotalConnections(u64);
+
+impl TotalConnections {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(count: u64) -> Self {
+        Self(count)
+    }
+
+    #[must_use]
+    pub const fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for TotalConnections {
+    #[inline]
+    fn from(count: u64) -> Self {
+        Self(count)
+    }
+}
+
+impl fmt::Display for TotalConnections {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} connections", self.0)
+    }
+}
+
+/// Bytes per second (rate)
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct BytesPerSecondRate(u64);
+
+impl BytesPerSecondRate {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(rate: u64) -> Self {
+        Self(rate)
+    }
+
+    #[must_use]
+    pub const fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for BytesPerSecondRate {
+    #[inline]
+    fn from(rate: u64) -> Self {
+        Self(rate)
+    }
+}
+
+impl fmt::Display for BytesPerSecondRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} B/s", self.0)
+    }
+}
+
+/// Article bytes total (cumulative)
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct ArticleBytesTotal(u64);
+
+impl ArticleBytesTotal {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for ArticleBytesTotal {
+    #[inline]
+    fn from(bytes: u64) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for ArticleBytesTotal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
+/// Timing measurement count (for averaging TTFB/send/recv times)
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct TimingMeasurementCount(u64);
+
+impl TimingMeasurementCount {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(count: u64) -> Self {
+        Self(count)
+    }
+
+    #[must_use]
+    pub const fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for TimingMeasurementCount {
+    #[inline]
+    fn from(count: u64) -> Self {
+        Self(count)
+    }
+}

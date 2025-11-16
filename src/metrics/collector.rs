@@ -34,21 +34,24 @@ struct BackendMetrics {
 impl BackendMetrics {
     fn to_backend_stats(&self, backend_id: usize) -> BackendStats {
         use super::types::*;
+        use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
         BackendStats {
             backend_id,
             active_connections: ActiveConnections::new(
                 self.active_connections.load(Ordering::Relaxed),
             ),
             total_commands: CommandCount::new(self.total_commands.load(Ordering::Relaxed)),
-            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
-            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            bytes_sent: BytesSent::new(self.bytes_sent.load(Ordering::Relaxed)),
+            bytes_received: BytesReceived::new(self.bytes_received.load(Ordering::Relaxed)),
             errors: ErrorCount::new(self.errors.load(Ordering::Relaxed)),
             errors_4xx: ErrorCount::new(self.errors_4xx.load(Ordering::Relaxed)),
             errors_5xx: ErrorCount::new(self.errors_5xx.load(Ordering::Relaxed)),
-            article_bytes_total: self.article_bytes_total.load(Ordering::Relaxed),
+            article_bytes_total: ArticleBytesTotal::new(
+                self.article_bytes_total.load(Ordering::Relaxed),
+            ),
             article_count: ArticleCount::new(self.article_count.load(Ordering::Relaxed)),
             ttfb_micros_total: TtfbMicros::new(self.ttfb_micros_total.load(Ordering::Relaxed)),
-            ttfb_count: self.ttfb_count.load(Ordering::Relaxed),
+            ttfb_count: TimingMeasurementCount::new(self.ttfb_count.load(Ordering::Relaxed)),
             send_micros_total: SendMicros::new(self.send_micros_total.load(Ordering::Relaxed)),
             recv_micros_total: RecvMicros::new(self.recv_micros_total.load(Ordering::Relaxed)),
             connection_failures: FailureCount::new(
@@ -85,16 +88,18 @@ impl UserMetrics {
     }
 
     fn to_user_stats(&self) -> UserStats {
+        use crate::metrics::types::{CommandCount, ErrorCount};
+        use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
         UserStats {
             username: self.username.clone(),
             active_connections: self.active_connections,
-            total_connections: self.total_connections,
-            bytes_sent: self.bytes_sent,
-            bytes_received: self.bytes_received,
-            total_commands: self.total_commands,
-            errors: self.errors,
-            bytes_sent_per_sec: 0,
-            bytes_received_per_sec: 0,
+            total_connections: TotalConnections::new(self.total_connections),
+            bytes_sent: BytesSent::new(self.bytes_sent),
+            bytes_received: BytesReceived::new(self.bytes_received),
+            total_commands: CommandCount::new(self.total_commands),
+            errors: ErrorCount::new(self.errors),
+            bytes_sent_per_sec: BytesPerSecondRate::ZERO,
+            bytes_received_per_sec: BytesPerSecondRate::ZERO,
         }
     }
 }
@@ -382,8 +387,11 @@ impl MetricsCollector {
             .map(|entry| entry.value().to_user_stats())
             .collect();
 
-        let total_sent: u64 = backend_stats.iter().map(|b| b.bytes_sent).sum();
-        let total_received: u64 = backend_stats.iter().map(|b| b.bytes_received).sum();
+        let total_sent: u64 = backend_stats.iter().map(|b| b.bytes_sent.as_u64()).sum();
+        let total_received: u64 = backend_stats
+            .iter()
+            .map(|b| b.bytes_received.as_u64())
+            .sum();
 
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),

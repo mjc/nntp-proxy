@@ -1,7 +1,10 @@
 //! Comprehensive tests for metrics module
 
 use nntp_proxy::metrics::*;
-use nntp_proxy::types::{BackendToClientBytes, ClientToBackendBytes};
+use nntp_proxy::types::{
+    ArticleBytesTotal, BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent,
+    ClientToBackendBytes, TimingMeasurementCount, TotalConnections,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +22,7 @@ fn test_backend_stats_default() {
 fn test_backend_stats_average_article_size() {
     let mut stats = BackendStats::default();
     stats.article_count = ArticleCount::new(10);
-    stats.article_bytes_total = 1000;
+    stats.article_bytes_total = ArticleBytesTotal::new(1000);
 
     assert_eq!(stats.average_article_size(), Some(100));
 
@@ -34,7 +37,7 @@ fn test_backend_stats_timing_averages() {
     stats.ttfb_micros_total = TtfbMicros::new(10000);
     stats.send_micros_total = SendMicros::new(500);
     stats.recv_micros_total = RecvMicros::new(9000);
-    stats.ttfb_count = 5;
+    stats.ttfb_count = TimingMeasurementCount::new(5);
 
     // 10000 / 5 / 1000 = 2.0ms
     assert_eq!(stats.average_ttfb_ms(), Some(2.0));
@@ -177,12 +180,12 @@ fn test_backend_stats_with_realistic_values() {
     stats.errors = ErrorCount::new(10);
     stats.errors_4xx = ErrorCount::new(7);
     stats.errors_5xx = ErrorCount::new(3);
-    stats.bytes_sent = 50000;
-    stats.bytes_received = 1000000;
+    stats.bytes_sent = BytesSent::new(50000);
+    stats.bytes_received = BytesReceived::new(1000000);
     stats.article_count = ArticleCount::new(50);
-    stats.article_bytes_total = 1000000;
+    stats.article_bytes_total = ArticleBytesTotal::new(1000000);
     stats.ttfb_micros_total = TtfbMicros::new(500000);
-    stats.ttfb_count = 1000;
+    stats.ttfb_count = TimingMeasurementCount::new(1000);
     stats.send_micros_total = SendMicros::new(50000);
     stats.recv_micros_total = RecvMicros::new(400000);
     stats.connection_failures = FailureCount::new(2);
@@ -203,18 +206,18 @@ fn test_user_stats_structure() {
     let user_stats = UserStats {
         username: "testuser".to_string(),
         active_connections: 2,
-        total_connections: 10,
-        bytes_sent: 5000,
-        bytes_received: 50000,
-        total_commands: 100,
-        errors: 2,
-        bytes_sent_per_sec: 100,
-        bytes_received_per_sec: 1000,
+        total_connections: TotalConnections::new(10),
+        bytes_sent: BytesSent::new(5000),
+        bytes_received: BytesReceived::new(50000),
+        total_commands: CommandCount::new(100),
+        errors: ErrorCount::new(2),
+        bytes_sent_per_sec: BytesPerSecondRate::new(100),
+        bytes_received_per_sec: BytesPerSecondRate::new(1000),
     };
 
     assert_eq!(user_stats.username, "testuser");
     assert_eq!(user_stats.active_connections, 2);
-    assert_eq!(user_stats.total_commands, 100);
+    assert_eq!(user_stats.total_commands.get(), 100);
 }
 
 #[test]
@@ -222,16 +225,16 @@ fn test_metrics_snapshot_with_multiple_backends() {
     let stats1 = BackendStats {
         backend_id: 0,
         total_commands: CommandCount::new(100),
-        bytes_sent: 1000,
-        bytes_received: 10000,
+        bytes_sent: BytesSent::new(1000),
+        bytes_received: BytesReceived::new(10000),
         ..Default::default()
     };
 
     let stats2 = BackendStats {
         backend_id: 1,
         total_commands: CommandCount::new(50),
-        bytes_sent: 500,
-        bytes_received: 5000,
+        bytes_sent: BytesSent::new(500),
+        bytes_received: BytesReceived::new(5000),
         ..Default::default()
     };
 

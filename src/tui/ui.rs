@@ -332,7 +332,7 @@ fn render_backend_list(
                         Style::default().fg(styles::VALUE_PRIMARY),
                     ),
                     Span::styled(
-                        format_bytes(stats.bytes_sent),
+                        format_bytes(stats.bytes_sent.as_u64()),
                         Style::default().fg(styles::VALUE_PRIMARY),
                     ),
                     Span::styled(
@@ -340,7 +340,7 @@ fn render_backend_list(
                         Style::default().fg(styles::VALUE_NEUTRAL),
                     ),
                     Span::styled(
-                        format_bytes(stats.bytes_received),
+                        format_bytes(stats.bytes_received.as_u64()),
                         Style::default().fg(styles::VALUE_NEUTRAL),
                     ),
                 ]),
@@ -556,8 +556,8 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     // Sort users by total bytes transferred (sent + received) descending
     let mut sorted_users = snapshot.user_stats.iter().collect::<Vec<_>>();
     sorted_users.sort_by(|a, b| {
-        let a_total = a.bytes_sent + a.bytes_received;
-        let b_total = b.bytes_sent + b.bytes_received;
+        let a_total = a.total_bytes();
+        let b_total = b.total_bytes();
         b_total.cmp(&a_total)
     });
 
@@ -565,11 +565,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     let top_users: Vec<_> = sorted_users.iter().take(10).collect();
 
     // Find max total bytes for scaling sparkline
-    let max_total = top_users
-        .iter()
-        .map(|u| u.bytes_sent + u.bytes_received)
-        .max()
-        .unwrap_or(1);
+    let max_total = top_users.iter().map(|u| u.total_bytes()).max().unwrap_or(1);
 
     let mut items = Vec::with_capacity(top_users.len() + 1);
 
@@ -605,7 +601,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
             format!("{:<12}", user.username)
         };
 
-        let total_bytes = user.bytes_sent + user.bytes_received;
+        let total_bytes = user.total_bytes();
         let bar = create_sparkline(total_bytes, max_total);
 
         items.push(ListItem::new(vec![
@@ -622,24 +618,24 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
             Line::from(vec![
                 Span::raw("  ↑"),
                 Span::styled(
-                    format!("{:>8}", format_bytes(user.bytes_sent)),
+                    format!("{:>8}", format_bytes(user.bytes_sent.as_u64())),
                     Style::default().fg(Color::Blue),
                 ),
                 Span::raw("  ↓"),
                 Span::styled(
-                    format!("{:>8}", format_bytes(user.bytes_received)),
+                    format!("{:>8}", format_bytes(user.bytes_received.as_u64())),
                     Style::default().fg(Color::Magenta),
                 ),
             ]),
             Line::from(vec![
                 Span::raw("  Rate: "),
                 Span::styled(
-                    format!("↑{}/s", format_bytes(user.bytes_sent_per_sec)),
+                    format!("↑{}/s", format_bytes(user.bytes_sent_per_sec.get())),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    format!("↓{}/s", format_bytes(user.bytes_received_per_sec)),
+                    format!("↓{}/s", format_bytes(user.bytes_received_per_sec.get())),
                     Style::default().fg(Color::Yellow),
                 ),
             ]),

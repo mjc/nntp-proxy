@@ -1,6 +1,7 @@
 //! Backend statistics snapshot type
 
 use super::types::*;
+use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
 
 /// Statistics for a single backend (cloneable snapshot)
 #[derive(Debug, Clone)]
@@ -8,15 +9,15 @@ pub struct BackendStats {
     pub backend_id: usize,
     pub active_connections: ActiveConnections,
     pub total_commands: CommandCount,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
+    pub bytes_sent: BytesSent,
+    pub bytes_received: BytesReceived,
     pub errors: ErrorCount,
     pub errors_4xx: ErrorCount,
     pub errors_5xx: ErrorCount,
-    pub article_bytes_total: u64,
+    pub article_bytes_total: ArticleBytesTotal,
     pub article_count: ArticleCount,
     pub ttfb_micros_total: TtfbMicros,
-    pub ttfb_count: u64,
+    pub ttfb_count: TimingMeasurementCount,
     pub send_micros_total: SendMicros,
     pub recv_micros_total: RecvMicros,
     pub connection_failures: FailureCount,
@@ -29,15 +30,15 @@ impl Default for BackendStats {
             backend_id: 0,
             active_connections: ActiveConnections::default(),
             total_commands: CommandCount::default(),
-            bytes_sent: 0,
-            bytes_received: 0,
+            bytes_sent: BytesSent::ZERO,
+            bytes_received: BytesReceived::ZERO,
             errors: ErrorCount::default(),
             errors_4xx: ErrorCount::default(),
             errors_5xx: ErrorCount::default(),
-            article_bytes_total: 0,
+            article_bytes_total: ArticleBytesTotal::ZERO,
             article_count: ArticleCount::default(),
             ttfb_micros_total: TtfbMicros::default(),
-            ttfb_count: 0,
+            ttfb_count: TimingMeasurementCount::ZERO,
             send_micros_total: SendMicros::default(),
             recv_micros_total: RecvMicros::default(),
             connection_failures: FailureCount::default(),
@@ -51,14 +52,15 @@ impl BackendStats {
     #[must_use]
     #[inline]
     pub fn average_article_size(&self) -> Option<u64> {
-        self.article_count.average_bytes(self.article_bytes_total)
+        self.article_count
+            .average_bytes(self.article_bytes_total.get())
     }
 
     /// Calculate average time to first byte in milliseconds
     #[must_use]
     #[inline]
     pub fn average_ttfb_ms(&self) -> Option<f64> {
-        std::num::NonZeroU64::new(self.ttfb_count)
+        std::num::NonZeroU64::new(self.ttfb_count.get())
             .map(|count| TtfbMicros::average(self.ttfb_micros_total, count).get())
     }
 
@@ -66,7 +68,7 @@ impl BackendStats {
     #[must_use]
     #[inline]
     pub fn average_send_ms(&self) -> Option<f64> {
-        std::num::NonZeroU64::new(self.ttfb_count)
+        std::num::NonZeroU64::new(self.ttfb_count.get())
             .map(|count| SendMicros::average(self.send_micros_total, count).get())
     }
 
@@ -74,7 +76,7 @@ impl BackendStats {
     #[must_use]
     #[inline]
     pub fn average_recv_ms(&self) -> Option<f64> {
-        std::num::NonZeroU64::new(self.ttfb_count)
+        std::num::NonZeroU64::new(self.ttfb_count.get())
             .map(|count| RecvMicros::average(self.recv_micros_total, count).get())
     }
 
@@ -82,7 +84,7 @@ impl BackendStats {
     #[must_use]
     #[inline]
     pub fn average_overhead_ms(&self) -> Option<f64> {
-        std::num::NonZeroU64::new(self.ttfb_count).map(|count| {
+        std::num::NonZeroU64::new(self.ttfb_count.get()).map(|count| {
             let ttfb = TtfbMicros::average(self.ttfb_micros_total, count);
             let send = SendMicros::average(self.send_micros_total, count);
             let recv = RecvMicros::average(self.recv_micros_total, count);
@@ -129,7 +131,9 @@ impl BackendStats {
     #[must_use]
     #[inline]
     pub fn total_bytes(&self) -> u64 {
-        self.bytes_sent.saturating_add(self.bytes_received)
+        self.bytes_sent
+            .as_u64()
+            .saturating_add(self.bytes_received.as_u64())
     }
 
     /// Check if backend has any activity

@@ -16,7 +16,9 @@ pub use config::{
     option_duration_serde,
 };
 pub use metrics::{
-    BackendToClientBytes, BytesTransferred, ClientBytes, ClientToBackendBytes, TransferMetrics,
+    ArticleBytesTotal, BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent,
+    BytesTransferred, ClientBytes, ClientToBackendBytes, TimingMeasurementCount, TotalConnections,
+    TransferMetrics,
 };
 pub use metrics_recording::{
     DirectionalBytes, MetricsBytes, Recorded, RecordingState, TransferDirection, Unrecorded,

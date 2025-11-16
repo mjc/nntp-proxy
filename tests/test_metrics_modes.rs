@@ -4,7 +4,7 @@ use nntp_proxy::config::RoutingMode;
 use nntp_proxy::metrics::MetricsCollector;
 use nntp_proxy::pool::{ConnectionProvider, DeadpoolConnectionProvider};
 use nntp_proxy::router::BackendSelector;
-use nntp_proxy::types::{BackendId, ServerName};
+use nntp_proxy::types::{BackendId, BytesReceived, BytesSent, ServerName};
 
 #[test]
 fn test_metrics_with_pool_status_standard_mode() {
@@ -39,8 +39,11 @@ fn test_metrics_with_pool_status_standard_mode() {
     let snapshot = metrics.snapshot().with_pool_status(&router);
 
     // Verify metrics
-    assert_eq!(snapshot.backend_stats[0].bytes_sent, 1000);
-    assert_eq!(snapshot.backend_stats[0].bytes_received, 5000);
+    assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(1000));
+    assert_eq!(
+        snapshot.backend_stats[0].bytes_received,
+        BytesReceived::new(5000)
+    );
     assert_eq!(
         snapshot.backend_stats[0].total_commands,
         nntp_proxy::metrics::CommandCount::new(0)
@@ -124,8 +127,8 @@ fn test_metrics_with_pool_status_per_command_mode() {
         nntp_proxy::metrics::CommandCount::new(1)
     );
 
-    assert_eq!(snapshot.backend_stats[0].bytes_sent, 100);
-    assert_eq!(snapshot.backend_stats[1].bytes_sent, 50);
+    assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(100));
+    assert_eq!(snapshot.backend_stats[1].bytes_sent, BytesSent::new(50));
 
     // Pool utilization should work for both backends
     let status1 = provider1.status();
@@ -197,8 +200,11 @@ fn test_metrics_with_pool_status_hybrid_mode() {
         snapshot.backend_stats[0].total_commands,
         nntp_proxy::metrics::CommandCount::new(3)
     );
-    assert_eq!(snapshot.backend_stats[0].bytes_sent, 200);
-    assert_eq!(snapshot.backend_stats[0].bytes_received, 5400);
+    assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(200));
+    assert_eq!(
+        snapshot.backend_stats[0].bytes_received,
+        BytesReceived::new(5400)
+    );
 
     // Pool utilization should work
     let pool_status = provider.status();
@@ -256,12 +262,14 @@ fn test_all_modes_show_meaningful_metrics() {
         // All modes should show:
         // 1. Bytes transferred
         assert_eq!(
-            snapshot.backend_stats[0].bytes_sent, 1000,
+            snapshot.backend_stats[0].bytes_sent,
+            BytesSent::new(1000),
             "{} should track bytes sent",
             mode_name
         );
         assert_eq!(
-            snapshot.backend_stats[0].bytes_received, 5000,
+            snapshot.backend_stats[0].bytes_received,
+            BytesReceived::new(5000),
             "{} should track bytes received",
             mode_name
         );

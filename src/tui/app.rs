@@ -325,6 +325,8 @@ impl TuiApp {
         prev_snapshot: &crate::metrics::MetricsSnapshot,
         time_delta: f64,
     ) -> crate::metrics::UserStats {
+        use crate::types::BytesPerSecondRate;
+
         let (bytes_sent_per_sec, bytes_received_per_sec) = prev_snapshot
             .user_stats
             .iter()
@@ -333,11 +335,15 @@ impl TuiApp {
                 let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
                 let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
                 (
-                    Self::calculate_rate(sent_delta, time_delta).get() as u64,
-                    Self::calculate_rate(recv_delta, time_delta).get() as u64,
+                    BytesPerSecondRate::new(
+                        Self::calculate_rate(sent_delta, time_delta).get() as u64
+                    ),
+                    BytesPerSecondRate::new(
+                        Self::calculate_rate(recv_delta, time_delta).get() as u64
+                    ),
                 )
             })
-            .unwrap_or((0, 0));
+            .unwrap_or((BytesPerSecondRate::ZERO, BytesPerSecondRate::ZERO));
 
         crate::metrics::UserStats {
             username: current.username.clone(),
