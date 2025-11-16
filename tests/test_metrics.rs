@@ -2,6 +2,7 @@
 
 use nntp_proxy::metrics::*;
 use nntp_proxy::types::BackendBytes;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
@@ -86,7 +87,7 @@ fn test_metrics_snapshot_total_bytes() {
         client_to_backend_bytes: BackendBytes::new(1000),
         backend_to_client_bytes: BackendBytes::new(5000),
         uptime: Duration::from_secs(60),
-        backend_stats: vec![],
+        backend_stats: Arc::new(vec![]),
         user_stats: vec![],
     };
 
@@ -102,7 +103,7 @@ fn test_metrics_snapshot_throughput() {
         client_to_backend_bytes: BackendBytes::new(2000),
         backend_to_client_bytes: BackendBytes::new(8000),
         uptime: Duration::from_secs(10),
-        backend_stats: vec![],
+        backend_stats: Arc::new(vec![]),
         user_stats: vec![],
     };
 
@@ -126,7 +127,7 @@ fn test_metrics_snapshot_format_uptime() {
         client_to_backend_bytes: BackendBytes::new(0),
         backend_to_client_bytes: BackendBytes::new(0),
         uptime: Duration::from_secs(45),
-        backend_stats: vec![],
+        backend_stats: Arc::new(vec![]),
         user_stats: vec![],
     };
     assert_eq!(snapshot_secs.format_uptime(), "45s");
@@ -138,7 +139,7 @@ fn test_metrics_snapshot_format_uptime() {
         client_to_backend_bytes: BackendBytes::new(0),
         backend_to_client_bytes: BackendBytes::new(0),
         uptime: Duration::from_secs(185),
-        backend_stats: vec![],
+        backend_stats: Arc::new(vec![]),
         user_stats: vec![],
     };
     assert_eq!(snapshot_mins.format_uptime(), "3m 5s");
@@ -150,7 +151,7 @@ fn test_metrics_snapshot_format_uptime() {
         client_to_backend_bytes: BackendBytes::new(0),
         backend_to_client_bytes: BackendBytes::new(0),
         uptime: Duration::from_secs(7265),
-        backend_stats: vec![],
+        backend_stats: Arc::new(vec![]),
         user_stats: vec![],
     };
     assert_eq!(snapshot_hours.format_uptime(), "2h 1m 5s");
@@ -241,7 +242,7 @@ fn test_metrics_snapshot_with_multiple_backends() {
         client_to_backend_bytes: BackendBytes::new(1500),
         backend_to_client_bytes: BackendBytes::new(15000),
         uptime: Duration::from_secs(100),
-        backend_stats: vec![stats1, stats2],
+        backend_stats: Arc::new(vec![stats1, stats2]),
         user_stats: vec![],
     };
 

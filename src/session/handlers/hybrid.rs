@@ -129,6 +129,9 @@ impl ClientSession {
         let mut last_reported_c2b = client_to_backend;
         let mut last_reported_b2c = backend_to_client;
 
+        // Cache username to avoid Arc cloning on every flush
+        let username_cache = self.username();
+
         // Reuse command buffer for remaining session
         let mut command = String::with_capacity(COMMAND);
 
@@ -230,12 +233,12 @@ impl ClientSession {
                             }
 
                             // Report user metrics incrementally as well
-                            if let Some(username) = self.username() {
+                            if let Some(ref username) = username_cache {
                                 if delta_c2b > 0 {
-                                    metrics.user_bytes_sent(Some(&*username), delta_c2b);
+                                    metrics.user_bytes_sent(Some(&**username), delta_c2b);
                                 }
                                 if delta_b2c > 0 {
-                                    metrics.user_bytes_received(Some(&*username), delta_b2c);
+                                    metrics.user_bytes_received(Some(&**username), delta_b2c);
                                 }
                             } else {
                                 // Anonymous user

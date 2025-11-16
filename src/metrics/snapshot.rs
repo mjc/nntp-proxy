@@ -5,6 +5,7 @@
 
 use super::types::*;
 use crate::types::BackendBytes;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::BackendStats;
@@ -18,6 +19,11 @@ use super::UserStats;
 /// # Rates
 /// This snapshot contains cumulative counters only. The TUI calculates rates
 /// by taking deltas between snapshots over time.
+///
+/// # Arc Sharing
+/// `backend_stats` is Arc-wrapped to avoid cloning the entire Vec when
+/// calculating user rates every TUI frame (4 Hz). This reduces allocations
+/// from O(backends) to O(1) per update.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     pub total_connections: u64,
@@ -26,7 +32,7 @@ pub struct MetricsSnapshot {
     pub client_to_backend_bytes: BackendBytes,
     pub backend_to_client_bytes: BackendBytes,
     pub uptime: Duration,
-    pub backend_stats: Vec<BackendStats>,
+    pub backend_stats: Arc<Vec<BackendStats>>,
     pub user_stats: Vec<UserStats>,
 }
 
@@ -41,7 +47,10 @@ impl MetricsSnapshot {
     pub fn with_pool_status(mut self, router: &crate::router::BackendSelector) -> Self {
         use crate::pool::ConnectionProvider;
 
-        for stats in &mut self.backend_stats {
+        // Get mutable access - clones only if Arc has other refs
+        let backend_stats = Arc::make_mut(&mut self.backend_stats);
+
+        for stats in backend_stats {
             let backend_id = crate::types::BackendId::from_index(stats.backend_id);
             if let Some(provider) = router.get_backend_provider(backend_id) {
                 let pool_status = provider.status();

@@ -140,20 +140,26 @@ impl MetricsCollector {
         }
     }
 
-    /// Update or insert user metrics using a closure (functional update pattern)
+    /// Update or insert user metrics using a closure (lock-free fast path)
     #[inline]
     fn update_user_metrics<F>(&self, username: Option<&str>, update: F)
     where
         F: Fn(&mut UserMetrics),
     {
         let key = Self::normalize_username(username);
-        update(
-            &mut self
-                .inner
-                .user_metrics
-                .entry(key.clone())
-                .or_insert_with(|| UserMetrics::new(key)),
-        );
+
+        // Fast path: try lock-free update if entry exists
+        if let Some(mut entry) = self.inner.user_metrics.get_mut(&key) {
+            update(&mut entry);
+            return;
+        }
+
+        // Slow path: insert new entry (only happens once per user)
+        let new_metrics = UserMetrics::new(key.clone());
+        self.inner.user_metrics.insert(key.clone(), new_metrics);
+        if let Some(mut entry) = self.inner.user_metrics.get_mut(&key) {
+            update(&mut entry);
+        }
     }
 
     /// Create a new metrics collector
@@ -386,7 +392,7 @@ impl MetricsCollector {
             client_to_backend_bytes: BackendBytes::new(total_sent),
             backend_to_client_bytes: BackendBytes::new(total_received),
             uptime: self.inner.start_time.elapsed(),
-            backend_stats,
+            backend_stats: Arc::new(backend_stats),
             user_stats,
         }
     }

@@ -297,10 +297,11 @@ impl TuiApp {
     }
 
     /// Calculate throughput rate from byte delta and time delta
+    /// Calculate byte transfer rate
     #[inline]
     fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> BytesPerSecond {
         if time_delta_secs > 0.0 {
-            BytesPerSecond::new(byte_delta as f64 / time_delta_secs)
+            BytesPerSecond::new((byte_delta as f64) / time_delta_secs)
         } else {
             BytesPerSecond::zero()
         }
@@ -310,9 +311,44 @@ impl TuiApp {
     #[inline]
     fn calculate_command_rate(cmd_delta: u64, time_delta_secs: f64) -> CommandsPerSecond {
         if time_delta_secs > 0.0 {
-            CommandsPerSecond::new(cmd_delta as f64 / time_delta_secs)
+            CommandsPerSecond::new((cmd_delta as f64) / time_delta_secs)
         } else {
             CommandsPerSecond::zero()
+        }
+    }
+
+    /// Calculate per-user rates from deltas
+    #[inline]
+    fn calculate_user_rates(
+        &self,
+        current: &crate::metrics::UserStats,
+        prev_snapshot: &crate::metrics::MetricsSnapshot,
+        time_delta: f64,
+    ) -> crate::metrics::UserStats {
+        let (bytes_sent_per_sec, bytes_received_per_sec) = prev_snapshot
+            .user_stats
+            .iter()
+            .find(|u| u.username == current.username)
+            .map(|prev| {
+                let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
+                let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
+                (
+                    Self::calculate_rate(sent_delta, time_delta).get() as u64,
+                    Self::calculate_rate(recv_delta, time_delta).get() as u64,
+                )
+            })
+            .unwrap_or((0, 0));
+
+        crate::metrics::UserStats {
+            username: current.username.clone(),
+            active_connections: current.active_connections,
+            total_connections: current.total_connections,
+            bytes_sent: current.bytes_sent,
+            bytes_received: current.bytes_received,
+            total_commands: current.total_commands,
+            errors: current.errors,
+            bytes_sent_per_sec,
+            bytes_received_per_sec,
         }
     }
 
@@ -362,67 +398,20 @@ impl TuiApp {
                 self.backend_history[i].push(point);
             }
 
-            // Calculate per-user rates from deltas
-            let user_stats_with_rates: Vec<crate::metrics::UserStats> = new_snapshot
+            // Enrich user stats with calculated rates
+            let user_stats = new_snapshot
                 .user_stats
                 .iter()
-                .map(|user_stats| {
-                    // Find corresponding previous user stats
-                    let (bytes_sent_per_sec, bytes_received_per_sec) = if let Some(prev_user) = prev
-                        .user_stats
-                        .iter()
-                        .find(|u| u.username == user_stats.username)
-                    {
-                        let sent_delta = user_stats.bytes_sent.saturating_sub(prev_user.bytes_sent);
-                        let recv_delta = user_stats
-                            .bytes_received
-                            .saturating_sub(prev_user.bytes_received);
-
-                        let sent_rate = if time_delta > 0.0 {
-                            (sent_delta as f64 / time_delta) as u64
-                        } else {
-                            0
-                        };
-                        let recv_rate = if time_delta > 0.0 {
-                            (recv_delta as f64 / time_delta) as u64
-                        } else {
-                            0
-                        };
-
-                        (sent_rate, recv_rate)
-                    } else {
-                        (0, 0)
-                    };
-
-                    crate::metrics::UserStats {
-                        username: user_stats.username.clone(),
-                        active_connections: user_stats.active_connections,
-                        total_connections: user_stats.total_connections,
-                        bytes_sent: user_stats.bytes_sent,
-                        bytes_received: user_stats.bytes_received,
-                        total_commands: user_stats.total_commands,
-                        errors: user_stats.errors,
-                        bytes_sent_per_sec,
-                        bytes_received_per_sec,
-                    }
-                })
+                .map(|stats| self.calculate_user_rates(stats, prev, time_delta))
                 .collect();
 
-            // Create new snapshot with updated user stats
-            let snapshot_with_rates = crate::metrics::MetricsSnapshot {
-                total_connections: new_snapshot.total_connections,
-                active_connections: new_snapshot.active_connections,
-                stateful_sessions: new_snapshot.stateful_sessions,
-                client_to_backend_bytes: new_snapshot.client_to_backend_bytes,
-                backend_to_client_bytes: new_snapshot.backend_to_client_bytes,
-                uptime: new_snapshot.uptime,
-                backend_stats: new_snapshot.backend_stats.clone(),
-                user_stats: user_stats_with_rates,
-            };
-
-            // Update snapshots
+            // Build enriched snapshot (shares backend_stats via Arc)
+            self.snapshot = Arc::new(crate::metrics::MetricsSnapshot {
+                user_stats,
+                backend_stats: Arc::clone(&new_snapshot.backend_stats),
+                ..*new_snapshot
+            });
             self.previous_snapshot = Some(new_snapshot);
-            self.snapshot = Arc::new(snapshot_with_rates);
         } else {
             // First update - no previous snapshot
             self.previous_snapshot = Some(Arc::clone(&new_snapshot));
