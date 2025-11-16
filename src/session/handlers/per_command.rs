@@ -156,6 +156,10 @@ impl ClientSession {
                         backend_to_client_bytes += result.bytes_written;
                         if result.authenticated {
                             // Store username after successful authentication
+                            debug!(
+                                "Client {} authenticated as: {:?}",
+                                self.client_addr, auth_username
+                            );
                             self.set_username(auth_username.clone());
 
                             // Record connection for aggregation (after auth so we have username)
@@ -169,6 +173,10 @@ impl ClientSession {
                             // Track user connection in metrics
                             if let Some(metrics) = self.metrics.as_ref() {
                                 metrics.user_connection_opened(auth_username.as_deref());
+                                debug!(
+                                    "Client {} opened connection for user: {:?}",
+                                    self.client_addr, auth_username
+                                );
                             }
 
                             skip_auth_check = true;
@@ -270,28 +278,11 @@ impl ClientSession {
             );
         }
 
-        // Track final per-user metrics
+        // Close user connection in metrics
         if let Some(metrics) = self.metrics.as_ref() {
             if let Some(username) = self.username() {
-                let c2b = client_to_backend_bytes.as_u64();
-                let b2c = backend_to_client_bytes.as_u64();
-                if c2b > 0 {
-                    metrics.user_bytes_sent(Some(&username), c2b);
-                }
-                if b2c > 0 {
-                    metrics.user_bytes_received(Some(&username), b2c);
-                }
                 metrics.user_connection_closed(Some(&username));
             } else {
-                // Anonymous user
-                let c2b = client_to_backend_bytes.as_u64();
-                let b2c = backend_to_client_bytes.as_u64();
-                if c2b > 0 {
-                    metrics.user_bytes_sent(None, c2b);
-                }
-                if b2c > 0 {
-                    metrics.user_bytes_received(None, b2c);
-                }
                 metrics.user_connection_closed(None);
             }
         }
@@ -376,6 +367,15 @@ impl ClientSession {
             // Record per-backend metrics first (peek without consuming)
             metrics.record_client_to_backend_bytes_for(backend_id.as_index(), cmd_bytes.peek());
             metrics.record_backend_to_client_bytes_for(backend_id.as_index(), resp_bytes.peek());
+
+            // Record per-user metrics
+            if let Some(ref username) = self.username() {
+                metrics.user_bytes_sent(Some(username), cmd_bytes.peek());
+                metrics.user_bytes_received(Some(username), resp_bytes.peek());
+            } else {
+                metrics.user_bytes_sent(None, cmd_bytes.peek());
+                metrics.user_bytes_received(None, resp_bytes.peek());
+            }
 
             // Then record global metrics (consumes the Unrecorded bytes)
             let _ = metrics.record_client_to_backend(cmd_bytes);
@@ -470,7 +470,7 @@ impl ClientSession {
         let mut got_backend_data = false;
 
         // Send command and read first chunk into reusable buffer
-        let (n, _response_code, is_multiline, latency_micros) =
+        let (n, _response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
             match backend::send_command_and_read_first_chunk(
                 &mut **pooled_conn,
                 command,
@@ -494,9 +494,10 @@ impl ClientSession {
                 }
             };
 
-        // Record latency
+        // Record time to first byte and split timing
         if let Some(ref metrics) = self.metrics {
-            metrics.record_latency_micros(backend_id.as_index(), latency_micros);
+            metrics.record_ttfb_micros(backend_id.as_index(), ttfb_micros);
+            metrics.record_send_recv_micros(backend_id.as_index(), send_micros, recv_micros);
         }
 
         client_to_backend_bytes.add(command.len());

@@ -4,11 +4,10 @@ pub use types::{BackendHealth, HealthMetrics, HealthStatus};
 
 use crate::protocol::{DATE, ResponseParser};
 use crate::types::BackendId;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::RwLock;
 use tokio::time;
 
 /// Configuration for health checking
@@ -34,8 +33,8 @@ impl Default for HealthCheckConfig {
 
 /// Health checker for backend connections
 pub struct HealthChecker {
-    /// Health status for each backend
-    backend_health: Arc<RwLock<HashMap<BackendId, BackendHealth>>>,
+    /// Health status for each backend (lock-free)
+    backend_health: Arc<DashMap<BackendId, BackendHealth>>,
     /// Configuration
     config: HealthCheckConfig,
 }
@@ -44,15 +43,14 @@ impl HealthChecker {
     /// Create a new health checker
     pub fn new(config: HealthCheckConfig) -> Self {
         Self {
-            backend_health: Arc::new(RwLock::new(HashMap::new())),
+            backend_health: Arc::new(DashMap::new()),
             config,
         }
     }
 
     /// Initialize health tracking for a backend
     pub async fn register_backend(&self, backend_id: BackendId) {
-        let mut health = self.backend_health.write().await;
-        health.entry(backend_id).or_insert_with(BackendHealth::new);
+        self.backend_health.entry(backend_id).or_default();
     }
 
     /// Start the background health checking task
@@ -83,13 +81,10 @@ impl HealthChecker {
         backend_id: BackendId,
     ) {
         // Check if this backend needs a check
+        if let Some(backend_health) = self.backend_health.get(&backend_id)
+            && !backend_health.needs_check(self.config.check_interval)
         {
-            let health = self.backend_health.read().await;
-            if let Some(backend_health) = health.get(&backend_id)
-                && !backend_health.needs_check(self.config.check_interval)
-            {
-                return;
-            }
+            return;
         }
 
         // Perform the health check with timeout
@@ -100,16 +95,11 @@ impl HealthChecker {
         .await;
 
         // Update health status
-        let mut health = self.backend_health.write().await;
-        let backend_health = health.entry(backend_id).or_insert_with(BackendHealth::new);
+        let mut backend_health = self.backend_health.entry(backend_id).or_default();
 
         match check_result {
-            Ok(Ok(())) => {
-                backend_health.record_success();
-            }
-            Ok(Err(_)) | Err(_) => {
-                backend_health.record_failure(self.config.unhealthy_threshold);
-            }
+            Ok(Ok(())) => backend_health.record_success(),
+            Ok(Err(_)) | Err(_) => backend_health.record_failure(self.config.unhealthy_threshold),
         }
     }
 
@@ -141,8 +131,7 @@ impl HealthChecker {
 
     /// Check if a backend is healthy
     pub async fn is_healthy(&self, backend_id: BackendId) -> bool {
-        let health = self.backend_health.read().await;
-        health
+        self.backend_health
             .get(&backend_id)
             .map(|h| h.status == HealthStatus::Healthy)
             .unwrap_or(true) // Assume healthy if not tracked yet
@@ -150,39 +139,36 @@ impl HealthChecker {
 
     /// Get health status for a specific backend
     pub async fn get_backend_health(&self, backend_id: BackendId) -> Option<BackendHealth> {
-        let health = self.backend_health.read().await;
-        health.get(&backend_id).cloned()
+        self.backend_health.get(&backend_id).map(|h| h.clone())
     }
 
     /// Get aggregated health metrics
     pub async fn get_metrics(&self) -> HealthMetrics {
-        let health = self.backend_health.read().await;
-
         let mut metrics = HealthMetrics {
-            total_checks: health
-                .values()
-                .map(|h| h.total_successes + h.total_failures)
+            total_checks: self
+                .backend_health
+                .iter()
+                .map(|entry| entry.total_successes + entry.total_failures)
                 .sum(),
             ..Default::default()
         };
 
-        for backend_health in health.values() {
-            match backend_health.status {
+        self.backend_health
+            .iter()
+            .for_each(|entry| match entry.status {
                 HealthStatus::Healthy => metrics.healthy_count += 1,
                 HealthStatus::Unhealthy => metrics.unhealthy_count += 1,
-            }
-        }
+            });
 
         metrics
     }
 
     /// Get all healthy backend IDs
     pub async fn get_healthy_backends(&self) -> Vec<BackendId> {
-        let health = self.backend_health.read().await;
-        health
+        self.backend_health
             .iter()
-            .filter(|(_, h)| h.status == HealthStatus::Healthy)
-            .map(|(id, _)| *id)
+            .filter(|entry| entry.value().status == HealthStatus::Healthy)
+            .map(|entry| *entry.key())
             .collect()
     }
 }
@@ -283,13 +269,10 @@ mod tests {
         checker.register_backend(backend_id).await;
 
         // Simulate failures by manually updating health
-        {
-            let mut health = checker.backend_health.write().await;
-            if let Some(backend_health) = health.get_mut(&backend_id) {
-                // Record failures to reach threshold
-                backend_health.record_failure(2);
-                backend_health.record_failure(2);
-            }
+        if let Some(mut backend_health) = checker.backend_health.get_mut(&backend_id) {
+            // Record failures to reach threshold
+            backend_health.record_failure(2);
+            backend_health.record_failure(2);
         }
 
         let metrics = checker.get_metrics().await;
@@ -310,14 +293,11 @@ mod tests {
         checker.register_backend(backend_id).await;
 
         // Simulate failures then success
-        {
-            let mut health = checker.backend_health.write().await;
-            if let Some(backend_health) = health.get_mut(&backend_id) {
-                backend_health.record_failure(2);
-                backend_health.record_failure(2);
-                // Now recover
-                backend_health.record_success();
-            }
+        if let Some(mut backend_health) = checker.backend_health.get_mut(&backend_id) {
+            backend_health.record_failure(2);
+            backend_health.record_failure(2);
+            // Now recover
+            backend_health.record_success();
         }
 
         let metrics = checker.get_metrics().await;
@@ -336,19 +316,18 @@ mod tests {
         }
 
         // Make some unhealthy
+        // Make backends 1 and 3 unhealthy
+        if let Some(mut backend_health) = checker.backend_health.get_mut(&BackendId::from_index(1))
         {
-            let mut health = checker.backend_health.write().await;
-            // Make backends 1 and 3 unhealthy
-            if let Some(backend_health) = health.get_mut(&BackendId::from_index(1)) {
-                backend_health.record_failure(3);
-                backend_health.record_failure(3);
-                backend_health.record_failure(3);
-            }
-            if let Some(backend_health) = health.get_mut(&BackendId::from_index(3)) {
-                backend_health.record_failure(3);
-                backend_health.record_failure(3);
-                backend_health.record_failure(3);
-            }
+            backend_health.record_failure(3);
+            backend_health.record_failure(3);
+            backend_health.record_failure(3);
+        }
+        if let Some(mut backend_health) = checker.backend_health.get_mut(&BackendId::from_index(3))
+        {
+            backend_health.record_failure(3);
+            backend_health.record_failure(3);
+            backend_health.record_failure(3);
         }
 
         let metrics = checker.get_metrics().await;
@@ -374,13 +353,10 @@ mod tests {
         checker.register_backend(backend2).await;
 
         // Fail only backend1
-        {
-            let mut health = checker.backend_health.write().await;
-            if let Some(backend_health) = health.get_mut(&backend1) {
-                backend_health.record_failure(3);
-                backend_health.record_failure(3);
-                backend_health.record_failure(3);
-            }
+        if let Some(mut backend_health) = checker.backend_health.get_mut(&backend1) {
+            backend_health.record_failure(3);
+            backend_health.record_failure(3);
+            backend_health.record_failure(3);
         }
 
         let healthy = checker.get_healthy_backends().await;

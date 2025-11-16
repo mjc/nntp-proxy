@@ -1357,6 +1357,24 @@ sudo systemctl status nntp-proxy
    cargo test
    ```
 
+### Pre-1.0 Development
+
+**IMPORTANT:** This project has NOT reached 1.0 yet and is a binary application, not a library.
+
+**Do NOT:**
+- Keep deprecated methods/functions around "for backwards compatibility"
+- Add `#[deprecated]` attributes - just delete old code
+- Maintain multiple versions of the same functionality
+- Preserve old APIs - refactor directly
+
+**DO:**
+- Delete unused code immediately
+- Rename methods directly without deprecation warnings
+- Refactor aggressively - no need for stability guarantees
+- Keep only one way to do things
+
+**Rationale:** We're building toward 1.0, not maintaining a stable API. Clean, focused code is more important than backwards compatibility. Once we hit 1.0, we'll adopt proper deprecation practices.
+
 **Note:** This project has Git pre-commit hooks that automatically run `cargo fmt` and `cargo clippy --all-targets --all-features`. If clippy finds issues or formatting is incorrect, the commit will be rejected. Fix all issues before committing.
 
 ### NixOS Development Environment

@@ -85,7 +85,7 @@ impl ClientSession {
 
         // Counter for periodic metrics flush (every N iterations)
         let mut iteration_count = 0u32;
-        const METRICS_FLUSH_INTERVAL: u32 = 100; // Flush every 100 commands
+        const METRICS_FLUSH_INTERVAL: u32 = 100; // Flush every 1000 commands
 
         loop {
             line.clear();
@@ -106,6 +106,30 @@ impl ClientSession {
                     }
                     if delta_b2c > 0 {
                         metrics.record_backend_to_client_bytes_for(bid, delta_b2c);
+                    }
+
+                    // Report user metrics incrementally as well
+                    let username_opt = self.username();
+                    debug!(
+                        "Periodic metrics flush: username={:?}, delta_c2b={}, delta_b2c={}",
+                        username_opt, delta_c2b, delta_b2c
+                    );
+
+                    if let Some(ref username) = username_opt {
+                        if delta_c2b > 0 {
+                            metrics.user_bytes_sent(Some(username), delta_c2b);
+                        }
+                        if delta_b2c > 0 {
+                            metrics.user_bytes_received(Some(username), delta_b2c);
+                        }
+                    } else {
+                        // Anonymous user
+                        if delta_c2b > 0 {
+                            metrics.user_bytes_sent(None, delta_c2b);
+                        }
+                        if delta_b2c > 0 {
+                            metrics.user_bytes_received(None, delta_b2c);
+                        }
                     }
 
                     last_reported_c2b = current_c2b;

@@ -17,7 +17,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 /// Connection provider using deadpool for connection pooling
@@ -32,8 +32,8 @@ pub struct DeadpoolConnectionProvider {
     /// Kept alive to enable graceful shutdown when the provider is dropped
     #[allow(dead_code)]
     shutdown_tx: Option<broadcast::Sender<()>>,
-    /// Metrics for health check operations
-    pub health_check_metrics: Arc<Mutex<HealthCheckMetrics>>,
+    /// Metrics for health check operations (lock-free)
+    pub health_check_metrics: Arc<HealthCheckMetrics>,
 }
 
 /// Builder for constructing `DeadpoolConnectionProvider` instances
@@ -162,7 +162,7 @@ impl DeadpoolConnectionProviderBuilder {
                 name,
                 keepalive_interval: None,
                 shutdown_tx: None,
-                health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+                health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
         } else {
             // Build without TLS
@@ -183,7 +183,7 @@ impl DeadpoolConnectionProviderBuilder {
                 name,
                 keepalive_interval: None,
                 shutdown_tx: None,
-                health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+                health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
         }
     }
@@ -227,7 +227,7 @@ impl DeadpoolConnectionProvider {
             name,
             keepalive_interval: None,
             shutdown_tx: None,
-            health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+            health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         }
     }
 
@@ -253,7 +253,7 @@ impl DeadpoolConnectionProvider {
             name,
             keepalive_interval: None,
             shutdown_tx: None,
-            health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+            health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         })
     }
 
@@ -290,7 +290,7 @@ impl DeadpoolConnectionProvider {
         let keepalive_interval = server.connection_keepalive;
 
         // Create metrics and shutdown channel if keepalive is enabled
-        let metrics = Arc::new(Mutex::new(HealthCheckMetrics::new()));
+        let metrics = Arc::new(HealthCheckMetrics::new());
         let shutdown_tx = if let Some(interval) = keepalive_interval {
             let (tx, rx) = broadcast::channel(1);
 
@@ -338,9 +338,9 @@ impl DeadpoolConnectionProvider {
         self.pool.status().max_size
     }
 
-    /// Get a snapshot of the current health check metrics
-    pub async fn get_health_check_metrics(&self) -> HealthCheckMetrics {
-        self.health_check_metrics.lock().await.clone()
+    /// Get a reference to the health check metrics
+    pub fn get_health_check_metrics(&self) -> &HealthCheckMetrics {
+        &self.health_check_metrics
     }
 
     /// Gracefully shutdown the periodic health check task
@@ -363,7 +363,7 @@ impl DeadpoolConnectionProvider {
         name: String,
         interval: std::time::Duration,
         mut shutdown_rx: broadcast::Receiver<()>,
-        metrics: Arc<Mutex<HealthCheckMetrics>>,
+        metrics: Arc<HealthCheckMetrics>,
     ) {
         use crate::constants::pool::{
             HEALTH_CHECK_POOL_TIMEOUT_MS, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE,
@@ -432,11 +432,8 @@ impl DeadpoolConnectionProvider {
             }
 
             if checked > 0 {
-                // Record metrics
-                {
-                    let mut m = metrics.lock().await;
-                    m.record_cycle(checked, failed);
-                }
+                // Record metrics (lock-free)
+                metrics.record_cycle(checked, failed);
 
                 debug!(
                     pool = %name,

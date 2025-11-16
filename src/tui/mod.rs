@@ -139,6 +139,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 app.toggle_log_fullscreen();
                                 terminal.draw(|f| ui::render_ui(f, app))?;
                             }
+                            KeyCode::Char('d') => {
+                                app.toggle_details();
+                                terminal.draw(|f| ui::render_ui(f, app))?;
+                            }
                             _ => {}
                         }
                     }

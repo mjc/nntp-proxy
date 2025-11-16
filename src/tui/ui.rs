@@ -249,11 +249,29 @@ fn render_backend_list(
                 .map(|cps| format!("{:.0}", cps.get()))
                 .unwrap_or_else(|| String::from(text::DEFAULT_CMD_RATE));
 
-            // Format latency
-            let latency_text = stats
-                .average_latency_ms()
+            // Format TTFB (time to first byte)
+            let ttfb_text = stats
+                .average_ttfb_ms()
                 .map(|ms| format!("{:.1}ms", ms))
                 .unwrap_or_else(|| "N/A".to_string());
+
+            // Format timing breakdown (send/recv/overhead) - only in details mode
+            let timing_breakdown = if app.show_details() {
+                if let (Some(send), Some(recv), Some(overhead)) = (
+                    stats.average_send_ms(),
+                    stats.average_recv_ms(),
+                    stats.average_overhead_ms(),
+                ) {
+                    Some(format!(
+                        " (S:{:.1} R:{:.1} O:{:.1}ms)",
+                        send, recv, overhead
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // Format average article size
             let avg_size_text = stats
@@ -300,8 +318,13 @@ fn render_backend_list(
                     ),
                     Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
                     Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
-                    Span::styled(" | Lat: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(latency_text, Style::default().fg(styles::VALUE_INFO)),
+                    Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(ttfb_text, Style::default().fg(styles::VALUE_INFO)),
+                    // Only show timing breakdown if in details mode
+                    Span::styled(
+                        timing_breakdown.unwrap_or_default(),
+                        Style::default().fg(styles::VALUE_SECONDARY),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(
@@ -327,7 +350,7 @@ fn render_backend_list(
                     Span::styled(" | Errors: ", Style::default().fg(styles::LABEL)),
                     Span::styled(
                         format!("4xx:{} 5xx:{}", stats.errors_4xx, stats.errors_5xx),
-                        Style::default().fg(if stats.errors > 0 {
+                        Style::default().fg(if !stats.errors.is_zero() {
                             Color::Yellow
                         } else {
                             styles::VALUE_NEUTRAL
@@ -472,6 +495,13 @@ fn render_footer(f: &mut Frame, area: Rect) {
         ),
         Span::styled(" to toggle logs  |  ", Style::default().fg(styles::LABEL)),
         Span::styled(
+            "d",
+            Style::default()
+                .fg(styles::VALUE_INFO)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" for details  |  ", Style::default().fg(styles::LABEL)),
+        Span::styled(
             "Ctrl+C",
             Style::default()
                 .fg(styles::VALUE_INFO)
@@ -600,10 +630,17 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
                     format!("{:>8}", format_bytes(user.bytes_received)),
                     Style::default().fg(Color::Magenta),
                 ),
-                Span::raw("  "),
+            ]),
+            Line::from(vec![
+                Span::raw("  Rate: "),
                 Span::styled(
-                    format!("{}cmd", user.total_commands),
-                    Style::default().fg(Color::DarkGray),
+                    format!("↑{}/s", format_bytes(user.bytes_sent_per_sec)),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("↓{}/s", format_bytes(user.bytes_received_per_sec)),
+                    Style::default().fg(Color::Yellow),
                 ),
             ]),
         ]));

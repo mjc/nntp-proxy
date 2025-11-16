@@ -123,6 +123,12 @@ impl ClientSession {
         let mut client_to_backend = client_to_backend_bytes.as_u64();
         let mut backend_to_client = backend_to_client_bytes.as_u64();
 
+        // Track metrics incrementally for long-running sessions
+        const METRICS_FLUSH_INTERVAL: u32 = 100;
+        let mut iteration_count: u32 = 0;
+        let mut last_reported_c2b = client_to_backend;
+        let mut last_reported_b2c = backend_to_client;
+
         // Reuse command buffer for remaining session
         let mut command = String::with_capacity(COMMAND);
 
@@ -201,6 +207,50 @@ impl ClientSession {
                             self.client_addr, e
                         );
                         break;
+                    }
+
+                    // Periodically flush metrics for long-running sessions
+                    iteration_count += 1;
+                    if iteration_count >= METRICS_FLUSH_INTERVAL {
+                        if let Some(ref metrics) = self.metrics {
+                            let delta_c2b = client_to_backend.saturating_sub(last_reported_c2b);
+                            let delta_b2c = backend_to_client.saturating_sub(last_reported_b2c);
+
+                            if delta_c2b > 0 {
+                                metrics.record_client_to_backend_bytes_for(
+                                    backend_id.as_index(),
+                                    delta_c2b,
+                                );
+                            }
+                            if delta_b2c > 0 {
+                                metrics.record_backend_to_client_bytes_for(
+                                    backend_id.as_index(),
+                                    delta_b2c,
+                                );
+                            }
+
+                            // Report user metrics incrementally as well
+                            if let Some(username) = self.username() {
+                                if delta_c2b > 0 {
+                                    metrics.user_bytes_sent(Some(&*username), delta_c2b);
+                                }
+                                if delta_b2c > 0 {
+                                    metrics.user_bytes_received(Some(&*username), delta_b2c);
+                                }
+                            } else {
+                                // Anonymous user
+                                if delta_c2b > 0 {
+                                    metrics.user_bytes_sent(None, delta_c2b);
+                                }
+                                if delta_b2c > 0 {
+                                    metrics.user_bytes_received(None, delta_b2c);
+                                }
+                            }
+
+                            last_reported_c2b = client_to_backend;
+                            last_reported_b2c = backend_to_client;
+                        }
+                        iteration_count = 0;
                     }
                 }
                 Err(e) => {

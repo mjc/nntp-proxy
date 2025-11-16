@@ -41,7 +41,10 @@ fn test_metrics_with_pool_status_standard_mode() {
     // Verify metrics
     assert_eq!(snapshot.backend_stats[0].bytes_sent, 1000);
     assert_eq!(snapshot.backend_stats[0].bytes_received, 5000);
-    assert_eq!(snapshot.backend_stats[0].total_commands, 0); // Not counted in standard mode
+    assert_eq!(
+        snapshot.backend_stats[0].total_commands,
+        nntp_proxy::metrics::CommandCount::new(0)
+    ); // Not counted in standard mode
 
     // Pool utilization should work
     let pool_status = provider.status();
@@ -51,7 +54,7 @@ fn test_metrics_with_pool_status_standard_mode() {
         .saturating_sub(pool_status.available.get());
     assert_eq!(
         snapshot.backend_stats[0].active_connections,
-        expected_active
+        nntp_proxy::metrics::ActiveConnections::new(expected_active)
     );
 }
 
@@ -112,8 +115,14 @@ fn test_metrics_with_pool_status_per_command_mode() {
     let snapshot = metrics.snapshot().with_pool_status(&router);
 
     // Verify round-robin distribution
-    assert_eq!(snapshot.backend_stats[0].total_commands, 2);
-    assert_eq!(snapshot.backend_stats[1].total_commands, 1);
+    assert_eq!(
+        snapshot.backend_stats[0].total_commands,
+        nntp_proxy::metrics::CommandCount::new(2)
+    );
+    assert_eq!(
+        snapshot.backend_stats[1].total_commands,
+        nntp_proxy::metrics::CommandCount::new(1)
+    );
 
     assert_eq!(snapshot.backend_stats[0].bytes_sent, 100);
     assert_eq!(snapshot.backend_stats[1].bytes_sent, 50);
@@ -133,11 +142,11 @@ fn test_metrics_with_pool_status_per_command_mode() {
 
     assert_eq!(
         snapshot.backend_stats[0].active_connections,
-        expected_active1
+        nntp_proxy::metrics::ActiveConnections::new(expected_active1)
     );
     assert_eq!(
         snapshot.backend_stats[1].active_connections,
-        expected_active2
+        nntp_proxy::metrics::ActiveConnections::new(expected_active2)
     );
 }
 
@@ -184,7 +193,10 @@ fn test_metrics_with_pool_status_hybrid_mode() {
     let snapshot = metrics.snapshot().with_pool_status(&router);
 
     // Verify metrics accumulated across both modes
-    assert_eq!(snapshot.backend_stats[0].total_commands, 3);
+    assert_eq!(
+        snapshot.backend_stats[0].total_commands,
+        nntp_proxy::metrics::CommandCount::new(3)
+    );
     assert_eq!(snapshot.backend_stats[0].bytes_sent, 200);
     assert_eq!(snapshot.backend_stats[0].bytes_received, 5400);
 
@@ -196,7 +208,7 @@ fn test_metrics_with_pool_status_hybrid_mode() {
         .saturating_sub(pool_status.available.get());
     assert_eq!(
         snapshot.backend_stats[0].active_connections,
-        expected_active
+        nntp_proxy::metrics::ActiveConnections::new(expected_active)
     );
 }
 
@@ -261,7 +273,8 @@ fn test_all_modes_show_meaningful_metrics() {
             .get()
             .saturating_sub(pool_status.available.get());
         assert_eq!(
-            snapshot.backend_stats[0].active_connections, expected_active,
+            snapshot.backend_stats[0].active_connections,
+            nntp_proxy::metrics::ActiveConnections::new(expected_active),
             "{} should show pool utilization",
             mode_name
         );
@@ -270,11 +283,17 @@ fn test_all_modes_show_meaningful_metrics() {
         match mode {
             RoutingMode::Standard => {
                 // Standard mode doesn't parse commands
-                assert_eq!(snapshot.backend_stats[0].total_commands, 0);
+                assert_eq!(
+                    snapshot.backend_stats[0].total_commands,
+                    nntp_proxy::metrics::CommandCount::new(0)
+                );
             }
             RoutingMode::PerCommand | RoutingMode::Hybrid => {
                 // These modes count commands
-                assert_eq!(snapshot.backend_stats[0].total_commands, 1);
+                assert_eq!(
+                    snapshot.backend_stats[0].total_commands,
+                    nntp_proxy::metrics::CommandCount::new(1)
+                );
             }
         }
     }

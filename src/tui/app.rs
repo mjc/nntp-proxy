@@ -216,6 +216,7 @@ impl TuiAppBuilder {
             history_size: self.history_size,
             log_buffer: Arc::new(self.log_buffer.unwrap_or_default()),
             view_mode: ViewMode::default(),
+            show_details: false,
         }
     }
 }
@@ -245,6 +246,8 @@ pub struct TuiApp {
     log_buffer: Arc<LogBuffer>,
     /// Current view mode (normal or log fullscreen)
     view_mode: ViewMode,
+    /// Show detailed metrics (timing breakdown, etc.)
+    show_details: bool,
 }
 
 impl TuiApp {
@@ -353,19 +356,79 @@ impl TuiApp {
 
                 let sent_rate = Self::calculate_rate(sent_delta, time_delta);
                 let recv_rate = Self::calculate_rate(recv_delta, time_delta);
-                let cmd_rate = Self::calculate_command_rate(cmd_delta, time_delta);
+                let cmd_rate = Self::calculate_command_rate(cmd_delta.get(), time_delta);
 
                 let point = ThroughputPoint::new_backend(now, sent_rate, recv_rate, cmd_rate);
                 self.backend_history[i].push(point);
             }
+
+            // Calculate per-user rates from deltas
+            let user_stats_with_rates: Vec<crate::metrics::UserStats> = new_snapshot
+                .user_stats
+                .iter()
+                .map(|user_stats| {
+                    // Find corresponding previous user stats
+                    let (bytes_sent_per_sec, bytes_received_per_sec) = if let Some(prev_user) = prev
+                        .user_stats
+                        .iter()
+                        .find(|u| u.username == user_stats.username)
+                    {
+                        let sent_delta = user_stats.bytes_sent.saturating_sub(prev_user.bytes_sent);
+                        let recv_delta = user_stats
+                            .bytes_received
+                            .saturating_sub(prev_user.bytes_received);
+
+                        let sent_rate = if time_delta > 0.0 {
+                            (sent_delta as f64 / time_delta) as u64
+                        } else {
+                            0
+                        };
+                        let recv_rate = if time_delta > 0.0 {
+                            (recv_delta as f64 / time_delta) as u64
+                        } else {
+                            0
+                        };
+
+                        (sent_rate, recv_rate)
+                    } else {
+                        (0, 0)
+                    };
+
+                    crate::metrics::UserStats {
+                        username: user_stats.username.clone(),
+                        active_connections: user_stats.active_connections,
+                        total_connections: user_stats.total_connections,
+                        bytes_sent: user_stats.bytes_sent,
+                        bytes_received: user_stats.bytes_received,
+                        total_commands: user_stats.total_commands,
+                        errors: user_stats.errors,
+                        bytes_sent_per_sec,
+                        bytes_received_per_sec,
+                    }
+                })
+                .collect();
+
+            // Create new snapshot with updated user stats
+            let snapshot_with_rates = crate::metrics::MetricsSnapshot {
+                total_connections: new_snapshot.total_connections,
+                active_connections: new_snapshot.active_connections,
+                stateful_sessions: new_snapshot.stateful_sessions,
+                client_to_backend_bytes: new_snapshot.client_to_backend_bytes,
+                backend_to_client_bytes: new_snapshot.backend_to_client_bytes,
+                uptime: new_snapshot.uptime,
+                backend_stats: new_snapshot.backend_stats.clone(),
+                user_stats: user_stats_with_rates,
+            };
+
+            // Update snapshots
+            self.previous_snapshot = Some(new_snapshot);
+            self.snapshot = Arc::new(snapshot_with_rates);
+        } else {
+            // First update - no previous snapshot
+            self.previous_snapshot = Some(Arc::clone(&new_snapshot));
+            self.snapshot = new_snapshot;
         }
 
-        // Update snapshots: Arc::clone is cheap (just increments ref count)
-        // We need new_snapshot in both places:
-        // - snapshot: for UI rendering
-        // - previous_snapshot: for next iteration's delta calculations
-        self.previous_snapshot = Some(Arc::clone(&new_snapshot));
-        self.snapshot = new_snapshot;
         self.last_update = now;
     }
 
@@ -434,6 +497,17 @@ impl TuiApp {
             ViewMode::Normal => ViewMode::LogFullscreen,
             ViewMode::LogFullscreen => ViewMode::Normal,
         };
+    }
+
+    /// Toggle detailed metrics display
+    pub fn toggle_details(&mut self) {
+        self.show_details = !self.show_details;
+    }
+
+    /// Get current details display state
+    #[must_use]
+    pub fn show_details(&self) -> bool {
+        self.show_details
     }
 }
 

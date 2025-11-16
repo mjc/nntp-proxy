@@ -13,7 +13,7 @@ use crate::types::BackendId;
 
 /// Send command to backend and read first chunk
 ///
-/// Returns (bytes_read, response_code, is_multiline, latency_micros)
+/// Returns (bytes_read, response_code, is_multiline, ttfb_micros, send_micros, recv_micros)
 /// The first chunk is written into the provided buffer.
 pub async fn send_command_and_read_first_chunk<T>(
     backend_conn: &mut T,
@@ -21,7 +21,7 @@ pub async fn send_command_and_read_first_chunk<T>(
     backend_id: BackendId,
     client_addr: std::net::SocketAddr,
     chunk: &mut PooledBuffer,
-) -> Result<(usize, ResponseCode, bool, u64)>
+) -> Result<(usize, ResponseCode, bool, u64, u64, u64)>
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -38,11 +38,15 @@ where
         command.trim()
     );
 
+    let send_start = Instant::now();
     backend_conn.write_all(command.as_bytes()).await?;
+    let send_elapsed = send_start.elapsed();
 
     debug!(
-        "Client {} command sent to backend {:?}",
-        client_addr, backend_id
+        "Client {} command sent to backend {:?} (send time: {:.2}ms)",
+        client_addr,
+        backend_id,
+        send_elapsed.as_secs_f64() * 1000.0
     );
 
     // Read first chunk to determine response type
@@ -51,16 +55,19 @@ where
         client_addr, backend_id
     );
 
+    let recv_start = Instant::now();
     let n = chunk.read_from(backend_conn).await?;
+    let recv_elapsed = recv_start.elapsed();
 
     if n == 0 {
         return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
     }
 
     debug!(
-        "Client {} received backend response chunk ({} bytes): {}",
+        "Client {} received backend response chunk ({} bytes, recv time: {:.2}ms): {}",
         client_addr,
         n,
+        recv_elapsed.as_secs_f64() * 1000.0,
         String::from_utf8_lossy(&chunk[..n.min(100)])
     );
 
@@ -117,11 +124,21 @@ where
 
     let elapsed = start.elapsed();
     debug!(
-        "Client {} backend {:?} response time: {:.2}ms",
+        "Client {} backend {:?} total TTFB: {:.2}ms (send: {:.2}ms, recv: {:.2}ms, overhead: {:.2}ms)",
         client_addr,
         backend_id,
-        elapsed.as_secs_f64() * 1000.0
+        elapsed.as_secs_f64() * 1000.0,
+        send_elapsed.as_secs_f64() * 1000.0,
+        recv_elapsed.as_secs_f64() * 1000.0,
+        (elapsed - send_elapsed - recv_elapsed).as_secs_f64() * 1000.0
     );
 
-    Ok((n, response_code, is_multiline, elapsed.as_micros() as u64))
+    Ok((
+        n,
+        response_code,
+        is_multiline,
+        elapsed.as_micros() as u64,
+        send_elapsed.as_micros() as u64,
+        recv_elapsed.as_micros() as u64,
+    ))
 }

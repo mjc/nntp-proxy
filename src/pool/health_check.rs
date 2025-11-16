@@ -6,6 +6,7 @@
 //! - Health check metrics tracking
 
 use deadpool::managed;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -58,17 +59,15 @@ impl From<HealthCheckError> for managed::RecycleError<anyhow::Error> {
     }
 }
 
-/// Metrics for periodic health checks
-#[derive(Debug, Default, Clone)]
+/// Metrics for periodic health checks (lock-free)
+#[derive(Debug, Default)]
 pub struct HealthCheckMetrics {
     /// Total number of health check cycles run
-    pub cycles_run: u64,
+    cycles_run: AtomicU64,
     /// Total number of connections checked
-    pub connections_checked: u64,
+    connections_checked: AtomicU64,
     /// Total number of connections that failed health checks
-    pub connections_failed: u64,
-    /// Last check timestamp
-    pub last_check_time: Option<std::time::Instant>,
+    connections_failed: AtomicU64,
 }
 
 impl HealthCheckMetrics {
@@ -78,20 +77,37 @@ impl HealthCheckMetrics {
     }
 
     /// Record a health check cycle
-    pub fn record_cycle(&mut self, checked: u64, failed: u64) {
-        self.cycles_run += 1;
-        self.connections_checked += checked;
-        self.connections_failed += failed;
-        self.last_check_time = Some(std::time::Instant::now());
+    pub fn record_cycle(&self, checked: u64, failed: u64) {
+        self.cycles_run.fetch_add(1, Ordering::Relaxed);
+        self.connections_checked
+            .fetch_add(checked, Ordering::Relaxed);
+        self.connections_failed.fetch_add(failed, Ordering::Relaxed);
     }
 
     /// Get the failure rate (0.0 to 1.0)
     pub fn failure_rate(&self) -> f64 {
-        if self.connections_checked == 0 {
+        let checked = self.connections_checked.load(Ordering::Relaxed);
+        if checked == 0 {
             0.0
         } else {
-            self.connections_failed as f64 / self.connections_checked as f64
+            let failed = self.connections_failed.load(Ordering::Relaxed);
+            failed as f64 / checked as f64
         }
+    }
+
+    /// Get total cycles run
+    pub fn cycles_run(&self) -> u64 {
+        self.cycles_run.load(Ordering::Relaxed)
+    }
+
+    /// Get total connections checked
+    pub fn connections_checked(&self) -> u64 {
+        self.connections_checked.load(Ordering::Relaxed)
+    }
+
+    /// Get total connections failed
+    pub fn connections_failed(&self) -> u64 {
+        self.connections_failed.load(Ordering::Relaxed)
     }
 }
 

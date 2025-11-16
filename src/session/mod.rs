@@ -50,6 +50,8 @@ pub mod streaming;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 
 use crate::auth::AuthHandler;
 use crate::config::RoutingMode;
@@ -105,9 +107,9 @@ pub struct ClientSession {
     /// Authentication handler
     auth_handler: Arc<AuthHandler>,
     /// Whether client has authenticated (starts false, set true after successful auth)
-    authenticated: std::sync::atomic::AtomicBool,
-    /// Authenticated username (set after successful auth)
-    username: std::sync::RwLock<Option<String>>,
+    authenticated: AtomicBool,
+    /// Authenticated username (write-once, lock-free reads with cheap clones)
+    username: Arc<OnceLock<Arc<str>>>,
     /// Metrics collector for session statistics
     metrics: Option<crate::metrics::MetricsCollector>,
 
@@ -228,8 +230,8 @@ impl ClientSessionBuilder {
             mode,
             routing_mode,
             auth_handler: self.auth_handler,
-            authenticated: std::sync::atomic::AtomicBool::new(false),
-            username: std::sync::RwLock::new(None),
+            authenticated: AtomicBool::new(false),
+            username: Arc::new(OnceLock::new()),
             metrics: self.metrics,
             connection_stats: self.connection_stats,
         }
@@ -252,8 +254,8 @@ impl ClientSession {
             mode: SessionMode::Stateful, // 1:1 mode is always stateful
             routing_mode: RoutingMode::Standard,
             auth_handler,
-            authenticated: std::sync::atomic::AtomicBool::new(false),
-            username: std::sync::RwLock::new(None),
+            authenticated: AtomicBool::new(false),
+            username: Arc::new(OnceLock::new()),
             metrics: None,
             connection_stats: None,
         }
@@ -279,8 +281,8 @@ impl ClientSession {
             mode: SessionMode::PerCommand, // Starts in per-command mode
             routing_mode,
             auth_handler,
-            authenticated: std::sync::atomic::AtomicBool::new(false),
-            username: std::sync::RwLock::new(None),
+            authenticated: AtomicBool::new(false),
+            username: Arc::new(OnceLock::new()),
             metrics: None,
             connection_stats: None,
         }
@@ -345,16 +347,16 @@ impl ClientSession {
         self.mode
     }
 
-    /// Get the authenticated username (if any)
+    /// Get the authenticated username (if any) - cheap clone via Arc
     #[must_use]
-    pub fn username(&self) -> Option<String> {
-        self.username.read().ok().and_then(|u| u.clone())
+    pub fn username(&self) -> Option<Arc<str>> {
+        self.username.get().map(Arc::clone)
     }
 
-    /// Set the authenticated username
+    /// Set the authenticated username (write-once)
     pub(crate) fn set_username(&self, username: Option<String>) {
-        if let Ok(mut u) = self.username.write() {
-            *u = username;
+        if let Some(name) = username {
+            let _ = self.username.set(name.into());
         }
     }
 
