@@ -76,8 +76,6 @@ impl ClientSession {
             return Err(e.into());
         }
 
-        backend_to_client_bytes.add(PROXY_GREETING_PCR.len());
-
         debug!(
             "Client {} sent greeting successfully, entering command loop",
             self.client_addr
