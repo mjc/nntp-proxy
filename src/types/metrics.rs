@@ -118,12 +118,12 @@ impl fmt::Display for ClientBytes {
     }
 }
 
-/// Backend traffic metrics (Proxy ↔ Backend)
+/// Client → Backend traffic (request bytes)
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct BackendBytes(u64);
+pub struct ClientToBackendBytes(u64);
 
-impl BackendBytes {
+impl ClientToBackendBytes {
     pub const ZERO: Self = Self(0);
 
     #[must_use]
@@ -143,18 +143,60 @@ impl BackendBytes {
     }
 }
 
-impl From<u64> for BackendBytes {
+impl From<u64> for ClientToBackendBytes {
     #[inline]
     fn from(bytes: u64) -> Self {
         Self(bytes)
     }
 }
 
-impl fmt::Display for BackendBytes {
+impl fmt::Display for ClientToBackendBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} bytes", self.0)
     }
 }
+
+/// Backend → Client traffic (response bytes)
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct BackendToClientBytes(u64);
+
+impl BackendToClientBytes {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn saturating_sub(self, other: Self) -> u64 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
+impl From<u64> for BackendToClientBytes {
+    #[inline]
+    fn from(bytes: u64) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for BackendToClientBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
+/// Legacy type alias for backwards compatibility during refactor
+#[deprecated(note = "Use ClientToBackendBytes or BackendToClientBytes instead")]
+pub type BackendBytes = ClientToBackendBytes;
 
 /// Transfer statistics for a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

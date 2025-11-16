@@ -15,7 +15,9 @@ pub use config::{
     HealthCheckTimeout, MaxConnections, MaxErrors, Port, ThreadCount, WindowSize, duration_serde,
     option_duration_serde,
 };
-pub use metrics::{BackendBytes, BytesTransferred, ClientBytes, TransferMetrics};
+pub use metrics::{
+    BackendToClientBytes, BytesTransferred, ClientBytes, ClientToBackendBytes, TransferMetrics,
+};
 pub use metrics_recording::{
     DirectionalBytes, MetricsBytes, Recorded, RecordingState, TransferDirection, Unrecorded,
 };

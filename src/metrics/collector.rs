@@ -1,7 +1,7 @@
 //! Lock-free metrics collector
 
 use super::{BackendStats, HealthStatus, MetricsSnapshot, UserStats};
-use crate::types::BackendBytes;
+use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -389,8 +389,8 @@ impl MetricsCollector {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),
             active_connections: self.inner.active_connections.load(Ordering::Relaxed),
             stateful_sessions: self.inner.stateful_sessions.load(Ordering::Relaxed),
-            client_to_backend_bytes: BackendBytes::new(total_sent),
-            backend_to_client_bytes: BackendBytes::new(total_received),
+            client_to_backend_bytes: ClientToBackendBytes::new(total_sent),
+            backend_to_client_bytes: BackendToClientBytes::new(total_received),
             uptime: self.inner.start_time.elapsed(),
             backend_stats: Arc::new(backend_stats),
             user_stats,

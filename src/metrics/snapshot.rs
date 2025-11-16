@@ -4,7 +4,7 @@
 //! for querying and aggregating metrics across backends.
 
 use super::types::*;
-use crate::types::BackendBytes;
+use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,8 +29,8 @@ pub struct MetricsSnapshot {
     pub total_connections: u64,
     pub active_connections: usize,
     pub stateful_sessions: usize,
-    pub client_to_backend_bytes: BackendBytes,
-    pub backend_to_client_bytes: BackendBytes,
+    pub client_to_backend_bytes: ClientToBackendBytes,
+    pub backend_to_client_bytes: BackendToClientBytes,
     pub uptime: Duration,
     pub backend_stats: Arc<Vec<BackendStats>>,
     pub user_stats: Vec<UserStats>,

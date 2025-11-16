@@ -1,7 +1,7 @@
 //! Comprehensive tests for metrics module
 
 use nntp_proxy::metrics::*;
-use nntp_proxy::types::BackendBytes;
+use nntp_proxy::types::{BackendToClientBytes, ClientToBackendBytes};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,8 +84,8 @@ fn test_metrics_snapshot_total_bytes() {
         total_connections: 10,
         active_connections: 5,
         stateful_sessions: 2,
-        client_to_backend_bytes: BackendBytes::new(1000),
-        backend_to_client_bytes: BackendBytes::new(5000),
+        client_to_backend_bytes: ClientToBackendBytes::new(1000),
+        backend_to_client_bytes: BackendToClientBytes::new(5000),
         uptime: Duration::from_secs(60),
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
@@ -100,8 +100,8 @@ fn test_metrics_snapshot_throughput() {
         total_connections: 10,
         active_connections: 5,
         stateful_sessions: 2,
-        client_to_backend_bytes: BackendBytes::new(2000),
-        backend_to_client_bytes: BackendBytes::new(8000),
+        client_to_backend_bytes: ClientToBackendBytes::new(2000),
+        backend_to_client_bytes: BackendToClientBytes::new(8000),
         uptime: Duration::from_secs(10),
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
@@ -124,8 +124,8 @@ fn test_metrics_snapshot_format_uptime() {
         total_connections: 0,
         active_connections: 0,
         stateful_sessions: 0,
-        client_to_backend_bytes: BackendBytes::new(0),
-        backend_to_client_bytes: BackendBytes::new(0),
+        client_to_backend_bytes: ClientToBackendBytes::new(0),
+        backend_to_client_bytes: BackendToClientBytes::new(0),
         uptime: Duration::from_secs(45),
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
@@ -136,8 +136,8 @@ fn test_metrics_snapshot_format_uptime() {
         total_connections: 0,
         active_connections: 0,
         stateful_sessions: 0,
-        client_to_backend_bytes: BackendBytes::new(0),
-        backend_to_client_bytes: BackendBytes::new(0),
+        client_to_backend_bytes: ClientToBackendBytes::new(0),
+        backend_to_client_bytes: BackendToClientBytes::new(0),
         uptime: Duration::from_secs(185),
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
@@ -148,8 +148,8 @@ fn test_metrics_snapshot_format_uptime() {
         total_connections: 0,
         active_connections: 0,
         stateful_sessions: 0,
-        client_to_backend_bytes: BackendBytes::new(0),
-        backend_to_client_bytes: BackendBytes::new(0),
+        client_to_backend_bytes: ClientToBackendBytes::new(0),
+        backend_to_client_bytes: BackendToClientBytes::new(0),
         uptime: Duration::from_secs(7265),
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
@@ -239,8 +239,8 @@ fn test_metrics_snapshot_with_multiple_backends() {
         total_connections: 20,
         active_connections: 10,
         stateful_sessions: 5,
-        client_to_backend_bytes: BackendBytes::new(1500),
-        backend_to_client_bytes: BackendBytes::new(15000),
+        client_to_backend_bytes: ClientToBackendBytes::new(1500),
+        backend_to_client_bytes: BackendToClientBytes::new(15000),
         uptime: Duration::from_secs(100),
         backend_stats: Arc::new(vec![stats1, stats2]),
         user_stats: vec![],
