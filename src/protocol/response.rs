@@ -102,7 +102,7 @@ impl std::fmt::Display for StatusCode {
 /// - **4xx**: Temporary failure
 /// - **5xx**: Permanent failure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseCode {
+pub enum Response {
     /// Server greeting - [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
     /// - 200: Posting allowed
     /// - 201: No posting allowed
@@ -134,7 +134,7 @@ pub enum ResponseCode {
     Invalid,
 }
 
-impl ResponseCode {
+impl Response {
     /// Parse response data into a categorized response code
     ///
     /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
@@ -480,28 +480,28 @@ impl ResponseParser {
     #[inline]
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
-        ResponseCode::parse(data).is_success()
+        Response::parse(data).is_success()
     }
 
     /// Check if response is a greeting (200 or 201)
     #[inline]
     #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
-        matches!(ResponseCode::parse(data), ResponseCode::Greeting(_))
+        matches!(Response::parse(data), Response::Greeting(_))
     }
 
     /// Check if response indicates authentication is required (381 or 480)
     #[inline]
     #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
-        matches!(ResponseCode::parse(data), ResponseCode::AuthRequired(_))
+        matches!(Response::parse(data), Response::AuthRequired(_))
     }
 
     /// Check if response indicates successful authentication (281)
     #[inline]
     #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
-        matches!(ResponseCode::parse(data), ResponseCode::AuthSuccess)
+        matches!(Response::parse(data), Response::AuthSuccess)
     }
 
     /// Check if response has a specific status code

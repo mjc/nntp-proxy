@@ -11,7 +11,7 @@ use crate::auth::AuthHandler;
 use crate::cache::article::{ArticleCache, CachedArticle};
 use crate::command::{CommandHandler, NntpCommand};
 use crate::constants::buffer;
-use crate::protocol::{NntpResponse, ResponseCode};
+use crate::protocol::{NntpResponse, Response};
 use crate::types::{BytesTransferred, TransferMetrics};
 
 /// Caching session that wraps standard session with article cache
@@ -125,7 +125,7 @@ impl CachingSession {
                                 }
 
                                 // Parse response code once and reuse it (avoid redundant parsing)
-                                let response_code = ResponseCode::parse(&response_buffer);
+                                let response_code = Response::parse(&response_buffer);
                                 let is_multiline = response_code.is_multiline();
 
                                 // Read multiline data if needed (as raw bytes)

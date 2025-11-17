@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::pool::PooledBuffer;
-use crate::protocol::{MIN_RESPONSE_LENGTH, ResponseCode};
+use crate::protocol::{MIN_RESPONSE_LENGTH, Response};
 use crate::types::BackendId;
 
 /// Send command to backend and read first chunk
@@ -21,7 +21,7 @@ pub async fn send_command_and_read_first_chunk<T>(
     backend_id: BackendId,
     client_addr: std::net::SocketAddr,
     chunk: &mut PooledBuffer,
-) -> Result<(usize, ResponseCode, bool, u64, u64, u64)>
+) -> Result<(usize, Response, bool, u64, u64, u64)>
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -84,11 +84,11 @@ where
     }
 
     // Parse response code and check if multiline
-    let response_code = ResponseCode::parse(&chunk[..n]);
+    let response_code = Response::parse(&chunk[..n]);
     let is_multiline = response_code.is_multiline();
 
     // Validate response code
-    if response_code == ResponseCode::Invalid {
+    if response_code == Response::Invalid {
         warn!(
             "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
             client_addr,
