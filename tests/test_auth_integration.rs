@@ -26,11 +26,11 @@ async fn test_auth_flow_complete_with_valid_credentials() {
         .unwrap();
 
     // Create config with auth
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
     use test_helpers::create_test_config;
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
-    config.client_auth = ClientAuthConfig {
+    config.client_auth = ClientAuth {
         users: vec![],
         username: Some("testuser".to_string()),
         password: Some("testpass".to_string()),
@@ -153,11 +153,11 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
         .await
         .unwrap();
 
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
     use test_helpers::create_test_config;
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
-    config.client_auth = ClientAuthConfig {
+    config.client_auth = ClientAuth {
         users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
@@ -206,7 +206,7 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
 async fn test_multiple_clients_with_auth() {
     let backend_port = 19122;
 
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
     use test_helpers::create_test_config;
     use tokio::task::JoinSet;
 
@@ -217,7 +217,7 @@ async fn test_multiple_clients_with_auth() {
         .unwrap();
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
-    config.client_auth = ClientAuthConfig {
+    config.client_auth = ClientAuth {
         users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
@@ -298,7 +298,7 @@ async fn test_auth_handler_in_cache_session() {
 
     // Verify auth handler is configured
     assert!(auth_handler.is_enabled());
-    assert!(auth_handler.validate("cacheuser", "cachepass"));
+    assert!(auth_handler.validate_credentials("cacheuser", "cachepass"));
 }
 
 #[tokio::test]
@@ -352,7 +352,7 @@ async fn test_auth_handler_integration() {
 
 #[tokio::test]
 async fn test_config_auth_round_trip() {
-    use nntp_proxy::config::{ClientAuthConfig, Config};
+    use nntp_proxy::config::{ClientAuth, Config};
 
     // Create config with auth
     let config = Config {
@@ -360,7 +360,7 @@ async fn test_config_auth_round_trip() {
         proxy: Default::default(),
         health_check: Default::default(),
         cache: None,
-        client_auth: ClientAuthConfig {
+        client_auth: ClientAuth {
             users: vec![],
             username: Some("testuser".to_string()),
             password: Some("testpass".to_string()),

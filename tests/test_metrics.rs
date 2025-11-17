@@ -2,8 +2,8 @@
 
 use nntp_proxy::metrics::*;
 use nntp_proxy::types::{
-    ArticleBytesTotal, BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent,
-    ClientToBackendBytes, TimingMeasurementCount, TotalConnections,
+    ArticleBytesTotal, BackendId, BackendToClientBytes, BytesPerSecondRate, BytesReceived,
+    BytesSent, ClientToBackendBytes, TimingMeasurementCount, TotalConnections,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use std::time::Duration;
 #[test]
 fn test_backend_stats_default() {
     let stats = BackendStats::default();
-    assert_eq!(stats.backend_id, 0);
+    assert_eq!(stats.backend_id, BackendId::from(0));
     assert_eq!(stats.total_commands.get(), 0);
     assert_eq!(stats.errors.get(), 0);
     assert_eq!(stats.active_connections.get(), 0);
@@ -175,7 +175,7 @@ fn test_health_status_conversion() {
 #[test]
 fn test_backend_stats_with_realistic_values() {
     let mut stats = BackendStats::default();
-    stats.backend_id = 0;
+    stats.backend_id = BackendId::from(0);
     stats.total_commands = CommandCount::new(1000);
     stats.errors = ErrorCount::new(10);
     stats.errors_4xx = ErrorCount::new(7);
@@ -223,7 +223,7 @@ fn test_user_stats_structure() {
 #[test]
 fn test_metrics_snapshot_with_multiple_backends() {
     let stats1 = BackendStats {
-        backend_id: 0,
+        backend_id: BackendId::from(0),
         total_commands: CommandCount::new(100),
         bytes_sent: BytesSent::new(1000),
         bytes_received: BytesReceived::new(10000),
@@ -231,7 +231,7 @@ fn test_metrics_snapshot_with_multiple_backends() {
     };
 
     let stats2 = BackendStats {
-        backend_id: 1,
+        backend_id: BackendId::from(1),
         total_commands: CommandCount::new(50),
         bytes_sent: BytesSent::new(500),
         bytes_received: BytesReceived::new(5000),
@@ -250,8 +250,8 @@ fn test_metrics_snapshot_with_multiple_backends() {
     };
 
     assert_eq!(snapshot.backend_stats.len(), 2);
-    assert_eq!(snapshot.backend_stats[0].backend_id, 0);
-    assert_eq!(snapshot.backend_stats[1].backend_id, 1);
+    assert_eq!(snapshot.backend_stats[0].backend_id, BackendId::from(0));
+    assert_eq!(snapshot.backend_stats[1].backend_id, BackendId::from(1));
     assert_eq!(snapshot.total_bytes(), 16500);
     assert_eq!(snapshot.throughput_bps(), 165.0);
 }
