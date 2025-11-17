@@ -4,15 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::cache::ArticleCache;
-use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::Cache;
-use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
-use nntp_proxy::protocol::BACKEND_UNAVAILABLE;
-use nntp_proxy::types::ClientId;
+use nntp_proxy::network::{NetworkOptimizer, TcpOptimizer};
 use nntp_proxy::{CacheArgs, CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback};
 
 #[derive(Parser, Debug)]
@@ -77,10 +74,10 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
         );
     }
 
-    // Create proxy (cache proxy always uses Standard/1:1 mode)
+    // Create proxy with per-command routing for load balancing
     let proxy = Arc::new(NntpProxy::new(
         config.clone(),
-        nntp_proxy::RoutingMode::Standard,
+        nntp_proxy::RoutingMode::PerCommand, // Use per-command routing for caching
     )?);
 
     // Create auth handler from config
@@ -159,45 +156,13 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
 async fn handle_caching_client(
     proxy: Arc<NntpProxy>,
     cache: Arc<ArticleCache>,
-    auth_handler: Arc<AuthHandler>,
-    mut client_stream: tokio::net::TcpStream,
+    _auth_handler: Arc<AuthHandler>,
+    client_stream: tokio::net::TcpStream,
     client_addr: std::net::SocketAddr,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     use tracing::debug;
 
     debug!("New caching client connection from {}", client_addr);
-
-    // Select backend using round-robin
-    let client_id = ClientId::new();
-    let backend_id = proxy.router().route_command(client_id, "")?;
-    let server_idx = backend_id.as_index();
-    let servers = proxy.servers();
-    let server = &servers[server_idx];
-
-    info!(
-        "Routing client {} to backend {:?} ({}:{})",
-        client_addr, backend_id, server.host, server.port
-    );
-
-    // Send greeting
-    nntp_proxy::protocol::send_proxy_greeting(&mut client_stream, client_addr).await?;
-
-    // Get pooled backend connection
-    let mut backend_conn = match proxy.connection_providers()[server_idx]
-        .get_pooled_connection()
-        .await
-    {
-        Ok(conn) => {
-            debug!("Got pooled connection for {}", server.name);
-            conn
-        }
-        Err(e) => {
-            error!("Failed to get pooled connection for {}: {}", server.name, e);
-            let _ = client_stream.write_all(BACKEND_UNAVAILABLE).await;
-            return Err(e);
-        }
-    };
 
     // Apply socket optimizations
     let client_optimizer = TcpOptimizer::new(&client_stream);
@@ -205,42 +170,10 @@ async fn handle_caching_client(
         debug!("Failed to optimize client socket: {}", e);
     }
 
-    let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
-    if let Err(e) = backend_optimizer.optimize() {
-        debug!("Failed to optimize backend socket: {}", e);
-    }
-
-    // Create caching session and handle connection
-    let session = CachingSession::new(client_addr, cache, auth_handler);
-
-    debug!("Starting caching session for client {}", client_addr);
-
-    let copy_result = session
-        .handle_with_pooled_backend(client_stream, &mut *backend_conn)
-        .await;
-
-    debug!("Caching session completed for client {}", client_addr);
-
-    // Complete the routing
-    proxy.router().complete_command(backend_id);
-
-    // Log session results
-    match copy_result {
-        Ok(metrics) => {
-            info!(
-                "Connection closed for client {}: {} bytes sent, {} bytes received",
-                client_addr,
-                metrics.client_to_backend.as_u64(),
-                metrics.backend_to_client.as_u64()
-            );
-        }
-        Err(e) => {
-            warn!("Session error for client {}: {}", client_addr, e);
-        }
-    }
-
-    debug!("Connection returned to pool for {}", server.name);
-    Ok(())
+    // Handle client using standard proxy with cache enabled
+    proxy
+        .handle_client_with_cache(client_stream, client_addr, cache)
+        .await
 }
 
 /// Wait for shutdown signal

@@ -115,6 +115,9 @@ pub struct ClientSession {
 
     /// Connection statistics aggregator for logging connection creation
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
+
+    /// Optional article cache for ARTICLE responses
+    cache: Option<Arc<crate::cache::ArticleCache>>,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -156,6 +159,7 @@ pub struct ClientSessionBuilder {
     auth_handler: Arc<AuthHandler>,
     metrics: Option<MetricsCollector>,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
+    cache: Option<Arc<crate::cache::ArticleCache>>,
 }
 
 impl ClientSessionBuilder {
@@ -205,6 +209,13 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Add article cache to this session
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<crate::cache::ArticleCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
     /// Build the client session
     ///
     /// Creates a new `ClientSession` with a unique client ID and the configured
@@ -234,6 +245,7 @@ impl ClientSessionBuilder {
             username: Arc::new(OnceLock::new()),
             metrics: self.metrics,
             connection_stats: self.connection_stats,
+            cache: self.cache,
         }
     }
 }
@@ -258,6 +270,7 @@ impl ClientSession {
             username: Arc::new(OnceLock::new()),
             metrics: None,
             connection_stats: None,
+            cache: None,
         }
     }
 
@@ -285,6 +298,7 @@ impl ClientSession {
             username: Arc::new(OnceLock::new()),
             metrics: None,
             connection_stats: None,
+            cache: None,
         }
     }
 
@@ -321,6 +335,7 @@ impl ClientSession {
             auth_handler,
             metrics: None,
             connection_stats: None,
+            cache: None,
         }
     }
 }

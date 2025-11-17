@@ -4,7 +4,5 @@
 //! allowing the proxy to cache article content and reduce backend load.
 
 mod article;
-mod session;
 
-pub use article::ArticleCache;
-pub use session::CachingSession;
+pub use article::{ArticleCache, CachedArticle};

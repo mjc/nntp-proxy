@@ -212,6 +212,29 @@ impl ClientSession {
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
+        // Check cache for ARTICLE by message-ID
+        if let Some(ref cache) = self.cache
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
+            && let Some(message_id) = crate::protocol::NntpResponse::extract_message_id(command)
+        {
+            if let Some(cached) = cache.get(&message_id).await {
+                info!(
+                    "Cache HIT for message-ID: {} (size: {} bytes)",
+                    message_id,
+                    cached.response.len()
+                );
+                client_write.write_all(&cached.response).await?;
+                backend_to_client_bytes.add(cached.response.len());
+
+                // Still need to route to get a backend_id for metrics
+                let backend_id = router.route_command(self.client_id, command)?;
+                router.complete_command(backend_id);
+
+                return Ok(backend_id);
+            }
+            info!("Cache MISS for message-ID: {}", message_id);
+        }
+
         // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
         let mut buffer = self.buffer_pool.acquire().await;
 
@@ -238,8 +261,24 @@ impl ClientSession {
 
         // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
         // If got_backend_data is true, we successfully communicated with backend
-        let (result, got_backend_data, cmd_bytes, resp_bytes) = self
-            .execute_command_on_backend(
+        //
+        // For ARTICLE by message-ID with cache enabled, capture response for caching
+        let should_cache = self.cache.is_some()
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId);
+
+        let (result, got_backend_data, cmd_bytes, resp_bytes) = if should_cache {
+            self.execute_command_with_caching(
+                &mut pooled_conn,
+                command,
+                client_write,
+                backend_id,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+                &mut buffer,
+            )
+            .await
+        } else {
+            self.execute_command_on_backend(
                 &mut pooled_conn,
                 command,
                 client_write,
@@ -248,7 +287,8 @@ impl ClientSession {
                 backend_to_client_bytes,
                 &mut buffer, // Pass reusable buffer
             )
-            .await;
+            .await
+        };
 
         // Record metrics ONCE using type-safe API (prevents double-counting)
         if let Some(ref metrics) = self.metrics {
@@ -460,6 +500,153 @@ impl ClientSession {
         }
 
         (Ok(()), got_backend_data, cmd_bytes, resp_bytes)
+    }
+
+    /// Execute a command with response caching
+    ///
+    /// Similar to `execute_command_on_backend` but buffers the entire response for caching.
+    /// Only call this for ARTICLE by message-ID commands when cache is enabled.
+    ///
+    /// **Performance trade-off**: Buffers entire response instead of streaming.
+    /// Acceptable for ARTICLE commands since users want caching, but don't use for other commands.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn execute_command_with_caching(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_id: crate::types::BackendId,
+        client_to_backend_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BytesTransferred,
+        chunk_buffer: &mut PooledBuffer,
+    ) -> (
+        Result<()>,
+        bool,
+        crate::types::MetricsBytes<crate::types::Unrecorded>,
+        crate::types::MetricsBytes<crate::types::Unrecorded>,
+    ) {
+        use crate::types::MetricsBytes;
+        let mut got_backend_data = false;
+        let mut response_buffer = Vec::new();
+
+        // Send command and read first chunk
+        let (n, response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
+            match backend::send_command_and_read_first_chunk(
+                &mut **pooled_conn,
+                command,
+                backend_id,
+                self.client_addr,
+                chunk_buffer,
+            )
+            .await
+            {
+                Ok(result) => {
+                    got_backend_data = true;
+                    result
+                }
+                Err(e) => {
+                    return (
+                        Err(e),
+                        got_backend_data,
+                        MetricsBytes::new(0),
+                        MetricsBytes::new(0),
+                    );
+                }
+            };
+
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_ttfb_micros(backend_id, ttfb_micros);
+            metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
+        }
+
+        client_to_backend_bytes.add(command.len());
+
+        // Buffer first chunk
+        response_buffer.extend_from_slice(&chunk_buffer[..n]);
+
+        // For multiline, read and buffer all chunks
+        if is_multiline {
+            use tokio::io::AsyncReadExt;
+            loop {
+                let bytes_read = match pooled_conn.read(chunk_buffer.as_mut_slice()).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        return (
+                            Err(e.into()),
+                            got_backend_data,
+                            MetricsBytes::new(command.len() as u64),
+                            MetricsBytes::new(0),
+                        );
+                    }
+                };
+
+                let chunk = &chunk_buffer[..bytes_read];
+                response_buffer.extend_from_slice(chunk);
+
+                // Check for terminator
+                if crate::protocol::NntpResponse::has_terminator_at_end(chunk) {
+                    break;
+                }
+            }
+        }
+
+        // Write entire buffered response to client
+        let bytes_written = response_buffer.len() as u64;
+        if let Err(e) = client_write.write_all(&response_buffer).await {
+            return (
+                Err(e.into()),
+                got_backend_data,
+                MetricsBytes::new(command.len() as u64),
+                MetricsBytes::new(0),
+            );
+        }
+
+        backend_to_client_bytes.add(bytes_written as usize);
+
+        // Cache successful ARTICLE responses (2xx status codes)
+        if let Some(ref cache) = self.cache
+            && let Some(message_id) = crate::protocol::NntpResponse::extract_message_id(command)
+            && let Some(code) = response_code.status_code()
+            && code.is_success()
+        {
+            info!(
+                "Caching response for message-ID: {} ({} bytes)",
+                message_id, bytes_written
+            );
+            cache
+                .insert(
+                    message_id,
+                    crate::cache::CachedArticle {
+                        response: std::sync::Arc::new(response_buffer),
+                    },
+                )
+                .await;
+        }
+
+        // Track metrics
+        if let Some(ref metrics) = self.metrics
+            && let Some(code) = response_code.status_code()
+        {
+            let raw_code = code.as_u16();
+
+            if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
+                metrics.record_error_4xx(backend_id);
+            } else if raw_code >= 500 {
+                metrics.record_error_5xx(backend_id);
+            }
+
+            if is_multiline && (raw_code == 220 || raw_code == 221 || raw_code == 222) {
+                metrics.record_article(backend_id, bytes_written);
+            }
+        }
+
+        (
+            Ok(()),
+            got_backend_data,
+            MetricsBytes::new(command.len() as u64),
+            MetricsBytes::new(bytes_written),
+        )
     }
 }
 

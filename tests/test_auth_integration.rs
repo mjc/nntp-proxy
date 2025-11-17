@@ -283,25 +283,6 @@ async fn test_multiple_clients_with_auth() {
 }
 
 #[tokio::test]
-async fn test_auth_handler_in_cache_session() {
-    use nntp_proxy::auth::AuthHandler;
-    use nntp_proxy::cache::{ArticleCache, CachingSession};
-    use std::time::Duration;
-
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600)));
-    let auth_handler = Arc::new(
-        AuthHandler::new(Some("cacheuser".to_string()), Some("cachepass".to_string())).unwrap(),
-    );
-
-    let addr = "127.0.0.1:9999".parse().unwrap();
-    let _session = CachingSession::new(addr, cache, auth_handler.clone());
-
-    // Verify auth handler is configured
-    assert!(auth_handler.is_enabled());
-    assert!(auth_handler.validate_credentials("cacheuser", "cachepass"));
-}
-
-#[tokio::test]
 async fn test_auth_handler_integration() {
     use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
     use test_helpers::create_test_auth_handler_with;

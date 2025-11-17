@@ -521,6 +521,88 @@ impl NntpProxy {
         Ok(())
     }
 
+    /// Handle client connection using per-command routing with article caching
+    pub async fn handle_client_with_cache(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        cache: Arc<crate::cache::ArticleCache>,
+    ) -> Result<()> {
+        debug!(
+            "New caching client connection from {} (per-command routing + cache)",
+            client_addr
+        );
+
+        // Record connection metrics
+        if self.enable_metrics {
+            self.metrics.connection_opened();
+        }
+
+        // Enable TCP_NODELAY for low latency
+        if let Err(e) = client_stream.set_nodelay(true) {
+            debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
+        }
+
+        // Create session with cache enabled
+        let mut session_builder = ClientSession::builder(
+            client_addr,
+            self.buffer_pool.clone(),
+            self.auth_handler.clone(),
+        )
+        .with_router(self.router.clone())
+        .with_routing_mode(self.routing_mode)
+        .with_connection_stats(self.connection_stats.clone())
+        .with_cache(cache);
+
+        if self.enable_metrics {
+            session_builder = session_builder.with_metrics(self.metrics.clone());
+        }
+
+        let session = session_builder.build();
+        let session_id = crate::formatting::short_id(session.client_id().as_uuid());
+
+        // Handle the session with per-command routing + caching
+        let result = session
+            .handle_per_command_routing(client_stream)
+            .await
+            .with_context(|| {
+                format!(
+                    "Caching session failed for {} [{}]",
+                    client_addr, session_id
+                )
+            });
+
+        // Log session results
+        match result {
+            Ok(metrics) => {
+                self.connection_stats.record_disconnection(
+                    session.username().as_deref(),
+                    &self.routing_mode.to_string().to_lowercase(),
+                );
+
+                debug!(
+                    "Caching session {} [{}] ↑{} ↓{}",
+                    client_addr,
+                    session_id,
+                    crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
+                    crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Caching session error for {} [{}]: {}",
+                    client_addr, session_id, e
+                );
+            }
+        }
+
+        if self.enable_metrics {
+            self.metrics.connection_closed();
+        }
+
+        Ok(())
+    }
+
     /// Handle client connection using per-command routing mode
     ///
     /// This creates a session with the router, allowing commands from this client
