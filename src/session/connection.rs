@@ -129,7 +129,7 @@ pub fn log_client_error(
     metrics: TransferMetrics,
 ) {
     let (c2b, b2c) = metrics.as_tuple();
-    let user_info = username.unwrap_or("anonymous");
+    let user_info = username.unwrap_or(crate::constants::user::ANONYMOUS);
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => {
             debug!(

@@ -132,7 +132,9 @@ impl MetricsCollector {
 
     #[inline]
     fn normalize_username(username: Option<&str>) -> String {
-        username.unwrap_or("<anonymous>").to_string()
+        username
+            .unwrap_or(crate::constants::user::ANONYMOUS)
+            .to_string()
     }
 
     #[inline]

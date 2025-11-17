@@ -13,8 +13,8 @@ use tracing::info;
 /// Time window for aggregating connection stats (30 seconds)
 const AGGREGATION_WINDOW: Duration = Duration::from_secs(30);
 
-/// Placeholder for anonymous/unauthenticated connections
-const ANONYMOUS: &str = "<anonymous>";
+// Use centralized constant from constants::user module
+use crate::constants::user::ANONYMOUS;
 
 /// Statistics for a single user's connections
 #[derive(Debug)]

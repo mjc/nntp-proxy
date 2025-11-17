@@ -169,6 +169,18 @@ pub mod stateless_proxy {
     pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
 }
 
+/// Display strings for user metrics and logging
+pub mod user {
+    /// Display name for anonymous/unauthenticated users
+    ///
+    /// Used as HashMap key and display value for users who haven't authenticated.
+    /// The `<anonymous>` format is chosen to:
+    /// - Sort first in alphabetical listings (< comes before letters)
+    /// - Be clearly distinguished from actual usernames
+    /// - Be consistent across all metrics and logging
+    pub const ANONYMOUS: &str = "<anonymous>";
+}
+
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 mod tests {
