@@ -107,27 +107,29 @@ impl ClientSession {
             match (action, skip_auth_check, self.auth_handler.is_enabled()) {
                 // Auth commands - ALWAYS intercept
                 (CommandAction::InterceptAuth(auth_action), _, _) => {
-                    let result = common::handle_auth_command(
+                    backend_to_client_bytes += match common::handle_auth_command(
                         &self.auth_handler,
                         auth_action,
                         &mut client_write,
                         &mut auth_username,
                         &self.authenticated,
                     )
-                    .await?;
-
-                    backend_to_client_bytes += result.bytes_written;
-                    if result.authenticated {
-                        common::on_authentication_success(
-                            self.client_addr,
-                            auth_username.clone(),
-                            &self.routing_mode,
-                            &self.metrics,
-                            self.connection_stats(),
-                            |username| self.set_username(username),
-                        );
-                        skip_auth_check = true;
-                    }
+                    .await?
+                    {
+                        common::AuthResult::Authenticated(bytes) => {
+                            common::on_authentication_success(
+                                self.client_addr,
+                                auth_username.clone(),
+                                &self.routing_mode,
+                                &self.metrics,
+                                self.connection_stats(),
+                                |username| self.set_username(username),
+                            );
+                            skip_auth_check = true;
+                            bytes
+                        }
+                        common::AuthResult::NotAuthenticated(bytes) => bytes,
+                    };
                 }
 
                 // Stateless - authenticated or auth disabled

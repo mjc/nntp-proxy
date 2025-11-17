@@ -13,22 +13,11 @@ pub(crate) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
 
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AuthResult {
-    /// Number of bytes written to client
-    pub bytes_written: BytesTransferred,
-    /// Whether authentication succeeded
-    pub authenticated: bool,
-}
-
-impl AuthResult {
-    /// Create a new auth result
-    #[inline]
-    pub const fn new(bytes_written: BytesTransferred, authenticated: bool) -> Self {
-        Self {
-            bytes_written,
-            authenticated,
-        }
-    }
+pub(crate) enum AuthResult {
+    /// Authentication succeeded
+    Authenticated(BytesTransferred),
+    /// Authentication failed or not required yet
+    NotAuthenticated(BytesTransferred),
 }
 
 /// Result of checking for QUIT command
@@ -73,7 +62,12 @@ where
 
     let mut bytes_written = BytesTransferred::zero();
     bytes_written.add(bytes);
-    Ok(AuthResult::new(bytes_written, auth_success))
+
+    Ok(if auth_success {
+        AuthResult::Authenticated(bytes_written)
+    } else {
+        AuthResult::NotAuthenticated(bytes_written)
+    })
 }
 
 /// Check if command is QUIT and send closing response

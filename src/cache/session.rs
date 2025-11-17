@@ -178,16 +178,18 @@ impl CachingSession {
                                     CommandAction::InterceptAuth(auth_action) => {
                                         use crate::session::common;
 
-                                        let result = common::handle_auth_command(
+                                        backend_to_client_bytes += match common::handle_auth_command(
                                             &self.auth_handler,
                                             auth_action,
                                             &mut client_write,
                                             &mut auth_username,
                                             &self.authenticated,
                                         )
-                                        .await?;
-
-                                        backend_to_client_bytes += result.bytes_written;
+                                        .await?
+                                        {
+                                            common::AuthResult::Authenticated(bytes)
+                                            | common::AuthResult::NotAuthenticated(bytes) => bytes,
+                                        };
                                     }
                                     CommandAction::Reject(response) => {
                                         // Send rejection response inline
