@@ -2,10 +2,11 @@ use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::signal;
 use tracing::{error, info, warn};
 
-use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback};
+use nntp_proxy::{
+    CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback, shutdown_signal,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -121,30 +122,5 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
                 error!("Failed to accept connection: {}", e);
             }
         }
-    }
-}
-
-/// Wait for shutdown signal
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
     }
 }

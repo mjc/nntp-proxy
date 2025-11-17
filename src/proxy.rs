@@ -599,61 +599,8 @@ impl NntpProxy {
         client_addr: SocketAddr,
         cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
-        debug!(
-            "New caching client connection from {} (per-command routing + cache)",
-            client_addr
-        );
-
-        // Record connection metrics
-        self.record_connection_opened();
-
-        // Enable TCP_NODELAY for low latency
-        if let Err(e) = client_stream.set_nodelay(true) {
-            debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
-        }
-
-        // Create session with cache enabled
-        let session = self.build_session(
-            client_addr,
-            Some(self.router.clone()),
-            self.routing_mode,
-            Some(cache),
-        );
-        let session_id = crate::formatting::short_id(session.client_id().as_uuid());
-
-        // Handle the session with per-command routing + caching
-        let result = session
-            .handle_per_command_routing(client_stream)
+        self.handle_per_command_routing_internal(client_stream, client_addr, Some(cache), "caching")
             .await
-            .with_context(|| {
-                format!(
-                    "Caching session failed for {} [{}]",
-                    client_addr, session_id
-                )
-            });
-
-        // Log session results
-        match result {
-            Ok(metrics) => {
-                self.log_session_completion(
-                    client_addr,
-                    &session_id,
-                    &session,
-                    &self.routing_mode.to_string().to_lowercase(),
-                    &metrics,
-                );
-            }
-            Err(e) => {
-                error!(
-                    "Caching session error for {} [{}]: {}",
-                    client_addr, session_id, e
-                );
-            }
-        }
-
-        self.record_connection_closed();
-
-        Ok(())
     }
 
     /// Handle client connection using per-command routing mode
@@ -665,9 +612,21 @@ impl NntpProxy {
         client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
+        self.handle_per_command_routing_internal(client_stream, client_addr, None, "per-command")
+            .await
+    }
+
+    /// Internal implementation for per-command routing (with optional caching)
+    async fn handle_per_command_routing_internal(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        cache: Option<Arc<crate::cache::ArticleCache>>,
+        mode_label: &str,
+    ) -> Result<()> {
         debug!(
-            "New per-command routing client connection from {}",
-            client_addr
+            "New {} routing client connection from {}",
+            mode_label, client_addr
         );
 
         // Record connection metrics
@@ -678,16 +637,12 @@ impl NntpProxy {
             debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
         }
 
-        // NOTE: handle_per_command_routing sends its own greeting immediately
-        // ("200 NNTP Proxy Ready (Per-Command Routing)")
-        // All backend greetings are consumed when connections are created
-
-        // Create session - conditionally enable metrics (causes ~45% performance penalty)
+        // Create session with optional cache
         let session = self.build_session(
             client_addr,
             Some(self.router.clone()),
             self.routing_mode,
-            None,
+            cache,
         );
 
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
@@ -698,8 +653,8 @@ impl NntpProxy {
             .await
             .with_context(|| {
                 format!(
-                    "Per-command routing session failed for {} [{}]",
-                    client_addr, session_id
+                    "{} routing session failed for {} [{}]",
+                    mode_label, client_addr, session_id
                 )
             });
 

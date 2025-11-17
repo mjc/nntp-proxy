@@ -132,6 +132,33 @@ fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
     Ok(())
 }
 
+/// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix)
+///
+/// This is a common utility for all binary targets.
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

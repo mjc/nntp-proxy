@@ -64,4 +64,4 @@ pub use config::{
 };
 pub use network::SocketOptimizer;
 pub use proxy::{NntpProxy, NntpProxyBuilder};
-pub use runtime::RuntimeConfig;
+pub use runtime::{RuntimeConfig, shutdown_signal};

@@ -3,14 +3,15 @@ use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::signal;
 use tracing::{error, info};
 
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::config::Cache;
 use nntp_proxy::network::{NetworkOptimizer, TcpOptimizer};
-use nntp_proxy::{CacheArgs, CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback};
+use nntp_proxy::{
+    CacheArgs, CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback, shutdown_signal,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Caching Proxy Server", long_about = None)]
@@ -174,29 +175,4 @@ async fn handle_caching_client(
     proxy
         .handle_client_with_cache(client_stream, client_addr, cache)
         .await
-}
-
-/// Wait for shutdown signal
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
 }
