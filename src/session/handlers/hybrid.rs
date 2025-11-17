@@ -57,7 +57,7 @@ impl ClientSession {
 
         // Record command in metrics
         if let Some(ref metrics) = self.metrics {
-            metrics.record_command(backend_id.as_index());
+            metrics.record_command(backend_id);
             // Track per-user command
             if let Some(username) = self.username() {
                 metrics.user_command(Some(&username));
@@ -174,7 +174,7 @@ impl ClientSession {
 
                     // Record command in metrics
                     if let Some(ref metrics) = self.metrics {
-                        metrics.record_command(backend_id.as_index());
+                        metrics.record_command(backend_id);
                         // Track per-user command
                         if let Some(username) = self.username() {
                             metrics.user_command(Some(&username));
@@ -220,16 +220,10 @@ impl ClientSession {
                             let delta_b2c = backend_to_client.saturating_sub(last_reported_b2c);
 
                             if delta_c2b > 0 {
-                                metrics.record_client_to_backend_bytes_for(
-                                    backend_id.as_index(),
-                                    delta_c2b,
-                                );
+                                metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b);
                             }
                             if delta_b2c > 0 {
-                                metrics.record_backend_to_client_bytes_for(
-                                    backend_id.as_index(),
-                                    delta_b2c,
-                                );
+                                metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c);
                             }
 
                             // Report user metrics incrementally as well

@@ -337,7 +337,7 @@ impl ClientSession {
 
         // Record command execution in metrics
         if let Some(ref metrics) = self.metrics {
-            metrics.record_command(backend_id.as_index());
+            metrics.record_command(backend_id);
             // Track per-user command
             if let Some(username) = self.username() {
                 metrics.user_command(Some(&username));
@@ -363,8 +363,8 @@ impl ClientSession {
         // Record metrics ONCE using type-safe API (prevents double-counting)
         if let Some(ref metrics) = self.metrics {
             // Record per-backend metrics first (peek without consuming)
-            metrics.record_client_to_backend_bytes_for(backend_id.as_index(), cmd_bytes.peek());
-            metrics.record_backend_to_client_bytes_for(backend_id.as_index(), resp_bytes.peek());
+            metrics.record_client_to_backend_bytes_for(backend_id, cmd_bytes.peek());
+            metrics.record_backend_to_client_bytes_for(backend_id, resp_bytes.peek());
 
             // Record per-user metrics
             if let Some(ref username) = self.username() {
@@ -401,7 +401,7 @@ impl ClientSession {
                         );
                         // Record error in metrics
                         if let Some(ref metrics) = self.metrics {
-                            metrics.record_error(backend_id.as_index());
+                            metrics.record_error(backend_id);
                             // Track per-user error
                             if let Some(username) = self.username() {
                                 metrics.user_error(Some(&username));
@@ -494,8 +494,8 @@ impl ClientSession {
 
         // Record time to first byte and split timing
         if let Some(ref metrics) = self.metrics {
-            metrics.record_ttfb_micros(backend_id.as_index(), ttfb_micros);
-            metrics.record_send_recv_micros(backend_id.as_index(), send_micros, recv_micros);
+            metrics.record_ttfb_micros(backend_id, ttfb_micros);
+            metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
         }
 
         client_to_backend_bytes.add(command.len());
@@ -629,15 +629,15 @@ impl ClientSession {
             // 423 = No such article (normal when searching)
             // 430 = No such article in group (normal when searching)
             if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
-                metrics.record_error_4xx(backend_id.as_index());
+                metrics.record_error_4xx(backend_id);
             } else if raw_code >= 500 {
-                metrics.record_error_5xx(backend_id.as_index());
+                metrics.record_error_5xx(backend_id);
             }
 
             // Track article size for successful article retrieval responses
             // 220 = ARTICLE (full article), 221 = HEAD (headers only), 222 = BODY (body only)
             if is_multiline && (raw_code == 220 || raw_code == 221 || raw_code == 222) {
-                metrics.record_article(backend_id.as_index(), bytes_written);
+                metrics.record_article(backend_id, bytes_written);
             }
         }
 

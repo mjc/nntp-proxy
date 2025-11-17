@@ -1,12 +1,14 @@
 //! Backend statistics snapshot type
 
 use super::types::*;
-use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
+use crate::types::{
+    ArticleBytesTotal, BackendId, BytesReceived, BytesSent, TimingMeasurementCount,
+};
 
 /// Statistics for a single backend (cloneable snapshot)
 #[derive(Debug, Clone)]
 pub struct BackendStats {
-    pub backend_id: usize,
+    pub backend_id: BackendId,
     pub active_connections: ActiveConnections,
     pub total_commands: CommandCount,
     pub bytes_sent: BytesSent,
@@ -27,7 +29,7 @@ pub struct BackendStats {
 impl Default for BackendStats {
     fn default() -> Self {
         Self {
-            backend_id: 0,
+            backend_id: BackendId::from_index(0),
             active_connections: ActiveConnections::default(),
             total_commands: CommandCount::default(),
             bytes_sent: BytesSent::ZERO,

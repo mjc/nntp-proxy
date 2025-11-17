@@ -4,7 +4,7 @@
 //! for querying and aggregating metrics across backends.
 
 use super::types::*;
-use crate::types::{BackendToClientBytes, ClientToBackendBytes};
+use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,8 +51,7 @@ impl MetricsSnapshot {
         let backend_stats = Arc::make_mut(&mut self.backend_stats);
 
         for stats in backend_stats {
-            let backend_id = crate::types::BackendId::from_index(stats.backend_id);
-            if let Some(provider) = router.get_backend_provider(backend_id) {
+            if let Some(provider) = router.get_backend_provider(stats.backend_id) {
                 let pool_status = provider.status();
                 // Active = checked out connections = max - available
                 let active = pool_status
@@ -144,7 +143,7 @@ impl MetricsSnapshot {
     ///
     /// Returns an iterator of backend IDs with error rates > 5%.
     /// This is a pure calculation using iterator composition.
-    pub fn high_error_backends(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn high_error_backends(&self) -> impl Iterator<Item = BackendId> + '_ {
         self.backend_stats
             .iter()
             .filter(|stats| stats.has_high_error_rate())
@@ -155,7 +154,7 @@ impl MetricsSnapshot {
     ///
     /// Returns an iterator of backend IDs with Healthy status.
     /// This is a pure calculation using iterator composition.
-    pub fn healthy_backends(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn healthy_backends(&self) -> impl Iterator<Item = BackendId> + '_ {
         self.backend_stats
             .iter()
             .filter(|stats| stats.health_status == HealthStatus::Healthy)
@@ -166,8 +165,8 @@ impl MetricsSnapshot {
     ///
     /// Returns None if backend_id is out of range.
     #[must_use]
-    pub fn backend(&self, backend_id: usize) -> Option<&BackendStats> {
-        self.backend_stats.get(backend_id)
+    pub fn backend(&self, backend_id: BackendId) -> Option<&BackendStats> {
+        self.backend_stats.get(backend_id.as_index())
     }
 
     /// Count backends by health status

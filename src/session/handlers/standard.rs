@@ -38,7 +38,7 @@ impl ClientSession {
         &self,
         client_stream: TcpStream,
         backend_conn: T,
-        backend_id: usize,
+        backend_id: crate::types::BackendId,
     ) -> Result<TransferMetrics>
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -52,7 +52,7 @@ impl ClientSession {
         &self,
         mut client_stream: TcpStream,
         backend_conn: T,
-        backend_id: Option<usize>,
+        backend_id: Option<crate::types::BackendId>,
     ) -> Result<TransferMetrics>
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,

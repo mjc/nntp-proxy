@@ -1,7 +1,7 @@
 //! Lock-free metrics collector
 
 use super::{BackendStats, HealthStatus, MetricsSnapshot, UserStats};
-use crate::types::{BackendToClientBytes, ClientToBackendBytes};
+use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -32,7 +32,7 @@ struct BackendMetrics {
 }
 
 impl BackendMetrics {
-    fn to_backend_stats(&self, backend_id: usize) -> BackendStats {
+    fn to_backend_stats(&self, backend_id: BackendId) -> BackendStats {
         use super::types::*;
         use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
         BackendStats {
@@ -126,8 +126,8 @@ struct MetricsInner {
 
 impl MetricsCollector {
     #[inline]
-    fn backend_get(&self, backend_id: usize) -> Option<&BackendMetrics> {
-        self.inner.backend_metrics.get(backend_id)
+    fn backend_get(&self, backend_id: BackendId) -> Option<&BackendMetrics> {
+        self.inner.backend_metrics.get(backend_id.as_index())
     }
 
     #[inline]
@@ -136,7 +136,7 @@ impl MetricsCollector {
     }
 
     #[inline]
-    fn with_backend<F>(&self, backend_id: usize, action: F)
+    fn with_backend<F>(&self, backend_id: BackendId, action: F)
     where
         F: FnOnce(&BackendMetrics),
     {
@@ -218,42 +218,42 @@ impl MetricsCollector {
     // Backend metrics recording (using with_backend pattern for cleaner code)
 
     #[inline]
-    pub fn record_command(&self, backend_id: usize) {
+    pub fn record_command(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
             b.total_commands.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
-    pub fn record_connection_failure(&self, backend_id: usize) {
+    pub fn record_connection_failure(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
             b.connection_failures.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
-    pub fn record_error(&self, backend_id: usize) {
+    pub fn record_error(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
             b.errors.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
-    pub fn record_client_to_backend_bytes_for(&self, backend_id: usize, bytes: u64) {
+    pub fn record_client_to_backend_bytes_for(&self, backend_id: BackendId, bytes: u64) {
         self.with_backend(backend_id, |b| {
             b.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         });
     }
 
     #[inline]
-    pub fn record_backend_to_client_bytes_for(&self, backend_id: usize, bytes: u64) {
+    pub fn record_backend_to_client_bytes_for(&self, backend_id: BackendId, bytes: u64) {
         self.with_backend(backend_id, |b| {
             b.bytes_received.fetch_add(bytes, Ordering::Relaxed);
         });
     }
 
     #[inline]
-    pub fn backend_connection_opened(&self, backend_id: usize) {
+    pub fn backend_connection_opened(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
             b.active_connections.fetch_add(1, Ordering::Relaxed);
         });
@@ -278,14 +278,14 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn backend_connection_closed(&self, backend_id: usize) {
+    pub fn backend_connection_closed(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
             b.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
-    pub fn record_error_4xx(&self, backend_id: usize) {
+    pub fn record_error_4xx(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
             b.errors_4xx.fetch_add(1, Ordering::Relaxed);
             b.errors.fetch_add(1, Ordering::Relaxed);
@@ -293,7 +293,7 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn record_error_5xx(&self, backend_id: usize) {
+    pub fn record_error_5xx(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
             b.errors_5xx.fetch_add(1, Ordering::Relaxed);
             b.errors.fetch_add(1, Ordering::Relaxed);
@@ -301,7 +301,7 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn record_article(&self, backend_id: usize, bytes: u64) {
+    pub fn record_article(&self, backend_id: BackendId, bytes: u64) {
         self.with_backend(backend_id, |b| {
             b.article_bytes_total.fetch_add(bytes, Ordering::Relaxed);
             b.article_count.fetch_add(1, Ordering::Relaxed);
@@ -309,7 +309,7 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn record_ttfb_micros(&self, backend_id: usize, micros: u64) {
+    pub fn record_ttfb_micros(&self, backend_id: BackendId, micros: u64) {
         self.with_backend(backend_id, |b| {
             b.ttfb_micros_total.fetch_add(micros, Ordering::Relaxed);
             b.ttfb_count.fetch_add(1, Ordering::Relaxed);
@@ -317,7 +317,12 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn record_send_recv_micros(&self, backend_id: usize, send_micros: u64, recv_micros: u64) {
+    pub fn record_send_recv_micros(
+        &self,
+        backend_id: BackendId,
+        send_micros: u64,
+        recv_micros: u64,
+    ) {
         self.with_backend(backend_id, |b| {
             b.send_micros_total
                 .fetch_add(send_micros, Ordering::Relaxed);
@@ -327,7 +332,7 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn set_backend_health(&self, backend_id: usize, health: HealthStatus) {
+    pub fn set_backend_health(&self, backend_id: BackendId, health: HealthStatus) {
         self.with_backend(backend_id, |b| {
             b.health_status.store(health.into(), Ordering::Relaxed);
         });
@@ -377,7 +382,7 @@ impl MetricsCollector {
             .backend_metrics
             .iter()
             .enumerate()
-            .map(|(id, metrics)| metrics.to_backend_stats(id))
+            .map(|(id, metrics)| metrics.to_backend_stats(BackendId::from_index(id)))
             .collect();
 
         let user_stats: Vec<UserStats> = self

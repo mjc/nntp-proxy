@@ -557,7 +557,7 @@ mod tests {
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
         // Update 1: 1000 bytes total
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
         app.update();
         assert_eq!(app.snapshot().backend_to_client_bytes.as_u64(), 1000);
         // After update 1, previous_snapshot should be snapshot from update 1 (1000)
@@ -571,7 +571,7 @@ mod tests {
         );
 
         // Update 2: 2000 bytes total
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
         app.update();
         assert_eq!(app.snapshot().backend_to_client_bytes.as_u64(), 2000);
         // After update 2, previous_snapshot should be snapshot from update 2 (2000)
@@ -587,7 +587,7 @@ mod tests {
         );
 
         // Update 3: 3000 bytes total
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
         app.update();
         assert_eq!(app.snapshot().backend_to_client_bytes.as_u64(), 3000);
         // After update 3, previous_snapshot should be snapshot from update 3 (3000)
@@ -638,7 +638,7 @@ mod tests {
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
         // Simulate some traffic
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
 
         // First update
         app.update();
@@ -663,7 +663,7 @@ mod tests {
 
         // Wait a bit and simulate traffic
         std::thread::sleep(Duration::from_millis(100));
-        metrics.record_backend_to_client_bytes_for(0, 100_000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 100_000);
 
         // Second update
         app.update();
@@ -694,7 +694,8 @@ mod tests {
         // Add more updates than history capacity
         for i in 0..10 {
             std::thread::sleep(Duration::from_millis(10));
-            metrics.record_backend_to_client_bytes_for(0, 1000);
+            metrics
+                .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
             app.update();
 
             // History should cap at 5
@@ -724,9 +725,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // Different traffic per backend
-        metrics.record_backend_to_client_bytes_for(0, 1_000_000);
-        metrics.record_backend_to_client_bytes_for(1, 2_000_000);
-        metrics.record_backend_to_client_bytes_for(2, 3_000_000);
+        metrics
+            .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1_000_000);
+        metrics
+            .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(1), 2_000_000);
+        metrics
+            .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(2), 3_000_000);
 
         app.update();
 

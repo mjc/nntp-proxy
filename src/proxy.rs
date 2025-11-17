@@ -438,7 +438,7 @@ impl NntpProxy {
                 .handle_with_pooled_backend_and_metrics(
                     client_stream,
                     &mut *backend_conn,
-                    server_idx,
+                    backend_id,
                 )
                 .await
         } else {
@@ -483,11 +483,11 @@ impl NntpProxy {
                 // Record transfer metrics
                 if self.enable_metrics {
                     self.metrics.record_client_to_backend_bytes_for(
-                        server_idx,
+                        backend_id,
                         metrics.client_to_backend.as_u64(),
                     );
                     self.metrics.record_backend_to_client_bytes_for(
-                        server_idx,
+                        backend_id,
                         metrics.backend_to_client.as_u64(),
                     );
                 }
@@ -495,7 +495,7 @@ impl NntpProxy {
             Err(e) => {
                 // Record error
                 if self.enable_metrics {
-                    self.metrics.record_error(server_idx);
+                    self.metrics.record_error(backend_id);
                 }
 
                 // Check if this is a backend I/O error - if so, remove connection from pool
