@@ -212,9 +212,13 @@ impl ClientSession {
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
+        // Parse command ONCE if cache enabled (avoid double-parse)
+        let is_article_by_msgid = self.cache.is_some()
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId);
+
         // Check cache for ARTICLE by message-ID
-        if let Some(ref cache) = self.cache
-            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
+        if is_article_by_msgid
+            && let Some(ref cache) = self.cache
             && let Some(message_id) = crate::protocol::NntpResponse::extract_message_id(command)
         {
             if let Some(cached) = cache.get(&message_id).await {
@@ -261,8 +265,7 @@ impl ClientSession {
         // If got_backend_data is true, we successfully communicated with backend
         //
         // For ARTICLE by message-ID with cache enabled, capture response for caching
-        let should_cache = self.cache.is_some()
-            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId);
+        let should_cache = is_article_by_msgid;
 
         let (result, got_backend_data, cmd_bytes, resp_bytes) = if should_cache {
             self.execute_command_with_caching(
