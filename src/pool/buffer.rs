@@ -64,6 +64,29 @@ impl PooledBuffer {
         self.buffer[..data.len()].copy_from_slice(data);
         self.initialized = data.len();
     }
+
+    /// Get mutable access to the full buffer capacity
+    ///
+    /// Returns a mutable slice of the entire buffer. After writing to this slice,
+    /// you must manually track how many bytes were initialized (e.g., using the
+    /// return value from `read()` and accessing via `&buffer[..n]`).
+    ///
+    /// # Safety Note
+    /// The returned slice contains **uninitialized memory**. Only access bytes
+    /// that you've written to. This method is primarily for use with I/O
+    /// operations like `AsyncRead::read()`.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let mut buffer = pool.get_buffer().await;
+    /// let n = stream.read(buffer.as_mut_slice()).await?;
+    /// let initialized_data = &buffer.as_mut_slice()[..n];
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer[..]
+    }
 }
 
 impl Deref for PooledBuffer {
@@ -420,6 +443,30 @@ mod tests {
         assert_eq!(large_buf.capacity(), 65536);
 
         // Buffers auto-return on drop
+    }
+
+    #[tokio::test]
+    async fn test_as_mut_slice() {
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let mut buffer = pool.get_buffer().await;
+
+        // Get mutable slice and write to it
+        let slice = buffer.as_mut_slice();
+        assert_eq!(slice.len(), 1024);
+
+        // Write some data manually
+        slice[0] = b'H';
+        slice[1] = b'i';
+        slice[2] = b'!';
+
+        // Can write to the full capacity
+        for (i, byte) in slice.iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+
+        // Note: initialized() doesn't track manual writes via as_mut_slice
+        // This is intentional - as_mut_slice is for low-level I/O
+        assert_eq!(buffer.initialized(), 0);
     }
 
     #[tokio::test]
