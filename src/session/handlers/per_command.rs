@@ -104,9 +104,9 @@ impl ClientSession {
                     .load(std::sync::atomic::Ordering::Acquire);
 
             use crate::command::CommandAction;
-            match action {
+            match (action, skip_auth_check, self.auth_handler.is_enabled()) {
                 // Auth commands - ALWAYS intercept
-                CommandAction::InterceptAuth(auth_action) => {
+                (CommandAction::InterceptAuth(auth_action), _, _) => {
                     let result = common::handle_auth_command(
                         &self.auth_handler,
                         auth_action,
@@ -130,10 +130,9 @@ impl ClientSession {
                     }
                 }
 
-                // Stateless - forward if auth OK
-                CommandAction::ForwardStateless
-                    if skip_auth_check || !self.auth_handler.is_enabled() =>
-                {
+                // Stateless - authenticated or auth disabled
+                (CommandAction::ForwardStateless, true, _)
+                | (CommandAction::ForwardStateless, _, false) => {
                     self.route_and_execute_command(
                         router,
                         &command,
@@ -145,14 +144,14 @@ impl ClientSession {
                 }
 
                 // Stateless - need auth
-                CommandAction::ForwardStateless => {
+                (CommandAction::ForwardStateless, false, true) => {
                     use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
                     client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
                     backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                 }
 
-                // Hybrid mode stateful command - switch
-                CommandAction::Reject(_)
+                // Hybrid mode stateful command - switch to dedicated backend
+                (CommandAction::Reject(_), _, _)
                     if self.routing_mode == RoutingMode::Hybrid
                         && NntpCommand::parse(&command).is_stateful() =>
                 {
@@ -171,8 +170,8 @@ impl ClientSession {
                         .await;
                 }
 
-                // Rejected command
-                CommandAction::Reject(response) => {
+                // All other rejected commands
+                (CommandAction::Reject(response), _, _) => {
                     client_write.write_all(response.as_bytes()).await?;
                     backend_to_client_bytes.add(response.len());
                 }
