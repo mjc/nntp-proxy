@@ -298,7 +298,7 @@ async fn test_buffer_pool_safety_across_cycles() {
 
     // Get buffer, use it, return it
     {
-        let mut buffer = pool.get_buffer().await;
+        let mut buffer = pool.acquire().await;
         let test_data = b"First use";
         buffer.copy_from_slice(test_data);
         assert_eq!(&buffer[..test_data.len()], test_data);
@@ -307,7 +307,7 @@ async fn test_buffer_pool_safety_across_cycles() {
 
     // Get buffer again (might be same buffer, might be new)
     {
-        let mut buffer = pool.get_buffer().await;
+        let mut buffer = pool.acquire().await;
         // Even if this is the same buffer from before, it's safe because:
         // 1. We'll overwrite it with new data via AsyncRead
         // 2. We only access buf[..n] where n is bytes actually read

@@ -89,7 +89,7 @@ impl ClientSession {
 
         loop {
             line.clear();
-            let mut buffer = self.buffer_pool.get_buffer().await;
+            let mut buffer = self.buffer_pool.acquire().await;
 
             // Periodically flush metrics for long-running sessions
             iteration_count += 1;

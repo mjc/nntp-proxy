@@ -22,7 +22,7 @@ impl BackendAuthenticator {
     where
         S: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let mut buffer = buffer_pool.get_buffer().await;
+        let mut buffer = buffer_pool.acquire().await;
 
         // Send AUTHINFO USER command
         backend_stream
@@ -75,7 +75,7 @@ impl BackendAuthenticator {
         B: AsyncReadExt + AsyncWriteExt + Unpin,
         C: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let mut buffer = buffer_pool.get_buffer().await;
+        let mut buffer = buffer_pool.acquire().await;
 
         // Read the server greeting
         let n = buffer.read_from(backend_stream).await?;
@@ -110,7 +110,7 @@ impl BackendAuthenticator {
         B: AsyncReadExt + AsyncWriteExt + Unpin,
         C: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let mut buffer = buffer_pool.get_buffer().await;
+        let mut buffer = buffer_pool.acquire().await;
 
         // Read the server greeting first and forward it
         let n = buffer.read_from(backend_stream).await?;
@@ -178,14 +178,14 @@ mod tests {
         let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 2);
 
         // Verify we can get and return buffers
-        let buffer1 = buffer_pool.get_buffer().await;
-        let buffer2 = buffer_pool.get_buffer().await;
+        let buffer1 = buffer_pool.acquire().await;
+        let buffer2 = buffer_pool.acquire().await;
 
         assert_eq!(buffer1.capacity(), 8192);
         assert_eq!(buffer2.capacity(), 8192);
 
         // Should be able to get them again
-        let buffer3 = buffer_pool.get_buffer().await;
+        let buffer3 = buffer_pool.acquire().await;
         assert_eq!(buffer3.capacity(), 8192);
     }
 

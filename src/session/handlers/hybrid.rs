@@ -67,7 +67,7 @@ impl ClientSession {
         }
 
         // Get buffer from pool for command execution
-        let mut buffer = self.buffer_pool.get_buffer().await;
+        let mut buffer = self.buffer_pool.acquire().await;
 
         // Execute the initial command that triggered the switch
         let (result, got_backend_data, cmd_bytes, resp_bytes) = self

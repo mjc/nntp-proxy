@@ -14,7 +14,7 @@ use tracing::info;
 ///
 /// ## Usage
 /// ```ignore
-/// let mut buffer = pool.get_buffer().await;
+/// let mut buffer = pool.acquire().await;
 /// let n = buffer.read_from(&mut stream).await?;  // Automatic tracking
 /// process(&*buffer);  // Deref returns only &buffer[..n]
 /// ```
@@ -78,7 +78,7 @@ impl PooledBuffer {
     ///
     /// # Examples
     /// ```ignore
-    /// let mut buffer = pool.get_buffer().await;
+    /// let mut buffer = pool.acquire().await;
     /// let n = stream.read(buffer.as_mut_slice()).await?;
     /// let initialized_data = &buffer.as_mut_slice()[..n];
     /// ```
@@ -147,7 +147,7 @@ pub struct BufferPool {
 impl BufferPool {
     /// Create a page-aligned buffer for optimal DMA performance
     ///
-    /// Returns a raw Vec<u8> that will be wrapped in PooledBuffer by get_buffer().
+    /// Returns a raw Vec<u8> that will be wrapped in PooledBuffer by acquire().
     /// The buffer is NOT zero-initialized for performance.
     ///
     /// # Safety
@@ -161,7 +161,7 @@ impl BufferPool {
     /// is the number of bytes read or written) may be accessed. Accessing uninitialized bytes
     /// is undefined behavior.
     ///
-    /// The public API (`get_buffer()`) returns a `PooledBuffer` which is a safe wrapper that
+    /// The public API (`acquire()`) returns a `PooledBuffer` which is a safe wrapper that
     /// enforces this contract through the type system and usage patterns.
     #[allow(clippy::uninit_vec)]
     fn create_aligned_buffer(size: usize) -> Vec<u8> {
@@ -226,7 +226,7 @@ impl BufferPool {
     /// - Callers use AsyncRead which writes into the buffer
     /// - They get back `n` bytes written and access only `&buf[..n]`
     /// - Stale data beyond `n` is never accessed
-    pub async fn get_buffer(&self) -> PooledBuffer {
+    pub async fn acquire(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
             // Buffer from pool is already the correct size (enforced on return)
@@ -271,7 +271,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);
 
         // Pool should pre-allocate buffers
-        let buffer1 = pool.get_buffer().await;
+        let buffer1 = pool.acquire().await;
         assert_eq!(buffer1.capacity(), 8192);
         assert_eq!(buffer1.initialized(), 0); // No bytes initialized yet
         // Buffer automatically returned on drop
@@ -282,7 +282,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::new(4096).unwrap(), 5);
 
         // Get a buffer
-        let buffer = pool.get_buffer().await;
+        let buffer = pool.acquire().await;
         assert_eq!(buffer.capacity(), 4096);
         assert_eq!(buffer.initialized(), 0);
 
@@ -293,7 +293,7 @@ mod tests {
         drop(buffer);
 
         // Get it again - should be from pool
-        let buffer2 = pool.get_buffer().await;
+        let buffer2 = pool.acquire().await;
         assert_eq!(buffer2.capacity(), 4096);
     }
 
@@ -302,11 +302,11 @@ mod tests {
         let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
 
         // Get all pre-allocated buffers
-        let buf1 = pool.get_buffer().await;
-        let buf2 = pool.get_buffer().await;
+        let buf1 = pool.acquire().await;
+        let buf2 = pool.acquire().await;
 
         // Pool is exhausted, should create new buffer
-        let buf3 = pool.get_buffer().await;
+        let buf3 = pool.acquire().await;
         assert_eq!(buf3.capacity(), 1024);
 
         // Drop buffers (automatically returned)
@@ -325,7 +325,7 @@ mod tests {
         for _ in 0..20 {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
-                let buffer = pool_clone.get_buffer().await;
+                let buffer = pool_clone.acquire().await;
                 assert_eq!(buffer.capacity(), 2048);
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
@@ -342,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_alignment() {
         let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 1);
-        let buffer = pool.get_buffer().await;
+        let buffer = pool.acquire().await;
 
         // Buffer capacity should be aligned to page boundaries (4KB)
         assert!(buffer.capacity() >= 8192);
@@ -354,7 +354,7 @@ mod tests {
     async fn test_buffer_clear_and_resize() {
         let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
 
-        let mut buffer = pool.get_buffer().await;
+        let mut buffer = pool.acquire().await;
 
         // Write data using copy_from_slice
         let data = vec![42u8; 101];
@@ -365,7 +365,7 @@ mod tests {
         drop(buffer);
 
         // Get it again - may contain old data (performance optimization)
-        let buffer2 = pool.get_buffer().await;
+        let buffer2 = pool.acquire().await;
         assert_eq!(buffer2.capacity(), 1024);
         // Note: buffer may contain previous data - callers must use &buf[..n] pattern
     }
@@ -375,12 +375,12 @@ mod tests {
         let pool = BufferPool::new(BufferSize::new(512).unwrap(), 3);
 
         // Get all buffers
-        let buf1 = pool.get_buffer().await;
-        let buf2 = pool.get_buffer().await;
-        let buf3 = pool.get_buffer().await;
+        let buf1 = pool.acquire().await;
+        let buf2 = pool.acquire().await;
+        let buf3 = pool.acquire().await;
 
         // Get one more (should create new)
-        let buf4 = pool.get_buffer().await;
+        let buf4 = pool.acquire().await;
 
         // Drop all buffers (automatically returned)
         drop(buf1);
@@ -396,7 +396,7 @@ mod tests {
     async fn test_buffer_wrong_size_not_returned() {
         let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
 
-        let buffer = pool.get_buffer().await;
+        let buffer = pool.acquire().await;
         assert_eq!(buffer.capacity(), 1024);
 
         // PooledBuffer auto-returns on drop with correct size enforcement in Drop impl
@@ -409,7 +409,7 @@ mod tests {
 
         // Do multiple get/return cycles
         for i in 0..20 {
-            let mut buffer = pool.get_buffer().await;
+            let mut buffer = pool.acquire().await;
             assert_eq!(buffer.capacity(), 4096);
 
             // Write some data using copy_from_slice
@@ -434,9 +434,9 @@ mod tests {
         let medium_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 5);
         let large_pool = BufferPool::new(BufferSize::new(65536).unwrap(), 5);
 
-        let small_buf = small_pool.get_buffer().await;
-        let medium_buf = medium_pool.get_buffer().await;
-        let large_buf = large_pool.get_buffer().await;
+        let small_buf = small_pool.acquire().await;
+        let medium_buf = medium_pool.acquire().await;
+        let large_buf = large_pool.acquire().await;
 
         assert_eq!(small_buf.capacity(), 1024);
         assert_eq!(medium_buf.capacity(), 8192);
@@ -448,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn test_as_mut_slice() {
         let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
-        let mut buffer = pool.get_buffer().await;
+        let mut buffer = pool.acquire().await;
 
         // Get mutable slice and write to it
         let slice = buffer.as_mut_slice();
@@ -480,7 +480,7 @@ mod tests {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
                 for _ in 0..10 {
-                    let buffer = pool_clone.get_buffer().await;
+                    let buffer = pool_clone.acquire().await;
                     assert_eq!(buffer.capacity(), 4096);
                 }
             });

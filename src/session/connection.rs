@@ -42,7 +42,7 @@ where
         client_addr
     );
 
-    let mut buffer_b2c = buffer_pool.get_buffer().await;
+    let mut buffer_b2c = buffer_pool.acquire().await;
     let mut command = String::with_capacity(COMMAND);
 
     let mut c2b = client_to_backend_bytes;

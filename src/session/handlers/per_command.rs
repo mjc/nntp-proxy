@@ -306,7 +306,7 @@ impl ClientSession {
         use crate::pool::{is_connection_error, remove_from_pool};
 
         // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
-        let mut buffer = self.buffer_pool.get_buffer().await;
+        let mut buffer = self.buffer_pool.acquire().await;
 
         // Route the command to get a backend (lock-free!)
         let backend_id = router.route_command(self.client_id, command)?;
