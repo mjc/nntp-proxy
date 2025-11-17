@@ -362,22 +362,21 @@ impl ClientSession {
 
         // Record metrics ONCE using type-safe API (prevents double-counting)
         if let Some(ref metrics) = self.metrics {
-            // Record per-backend metrics first (peek without consuming)
-            metrics.record_client_to_backend_bytes_for(backend_id, cmd_bytes.peek());
-            metrics.record_backend_to_client_bytes_for(backend_id, resp_bytes.peek());
+            // Peek byte counts before consuming
+            let cmd_size = cmd_bytes.peek();
+            let resp_size = resp_bytes.peek();
+
+            // Record command + per-backend + global bytes in one call
+            let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
 
             // Record per-user metrics
             if let Some(ref username) = self.username() {
-                metrics.user_bytes_sent(Some(username), cmd_bytes.peek());
-                metrics.user_bytes_received(Some(username), resp_bytes.peek());
+                metrics.user_bytes_sent(Some(username), cmd_size);
+                metrics.user_bytes_received(Some(username), resp_size);
             } else {
-                metrics.user_bytes_sent(None, cmd_bytes.peek());
-                metrics.user_bytes_received(None, resp_bytes.peek());
+                metrics.user_bytes_sent(None, cmd_size);
+                metrics.user_bytes_received(None, resp_size);
             }
-
-            // Then record global metrics (consumes the Unrecorded bytes)
-            let _ = metrics.record_client_to_backend(cmd_bytes);
-            let _ = metrics.record_backend_to_client(resp_bytes);
         }
 
         // Return buffer to pool before handling result

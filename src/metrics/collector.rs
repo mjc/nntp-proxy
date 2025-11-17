@@ -279,6 +279,38 @@ impl MetricsCollector {
         crate::types::MetricsBytes::new(bytes.into_u64()).mark_recorded()
     }
 
+    /// Record command execution with per-backend and global byte tracking
+    ///
+    /// Convenience method that combines the common pattern:
+    /// - Record command count for backend
+    /// - Record per-backend bytes sent/received
+    /// - Mark global bytes as recorded (type-state transition)
+    ///
+    /// Returns recorded byte markers for compile-time tracking.
+    #[inline]
+    pub fn record_command_execution(
+        &self,
+        backend_id: BackendId,
+        client_to_backend: crate::types::MetricsBytes<crate::types::Unrecorded>,
+        backend_to_client: crate::types::MetricsBytes<crate::types::Unrecorded>,
+    ) -> (
+        crate::types::MetricsBytes<crate::types::Recorded>,
+        crate::types::MetricsBytes<crate::types::Recorded>,
+    ) {
+        // Record command count
+        self.record_command(backend_id);
+
+        // Record per-backend bytes
+        self.record_client_to_backend_bytes_for(backend_id, client_to_backend.peek());
+        self.record_backend_to_client_bytes_for(backend_id, backend_to_client.peek());
+
+        // Mark global bytes as recorded (type-state transition)
+        let sent_recorded = self.record_client_to_backend(client_to_backend);
+        let recv_recorded = self.record_backend_to_client(backend_to_client);
+
+        (sent_recorded, recv_recorded)
+    }
+
     #[inline]
     pub fn backend_connection_closed(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {

@@ -84,8 +84,21 @@ impl ClientSession {
 
         // Record metrics ONCE using type-safe API (prevents double-counting)
         if let Some(ref metrics) = self.metrics {
-            let _ = metrics.record_client_to_backend(cmd_bytes);
-            let _ = metrics.record_backend_to_client(resp_bytes);
+            // Peek byte counts before consuming
+            let cmd_size = cmd_bytes.peek();
+            let resp_size = resp_bytes.peek();
+
+            // Record command + per-backend + global bytes in one call
+            let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
+
+            // Record per-user metrics
+            if let Some(ref username) = self.username() {
+                metrics.user_bytes_sent(Some(username), cmd_size);
+                metrics.user_bytes_received(Some(username), resp_size);
+            } else {
+                metrics.user_bytes_sent(None, cmd_size);
+                metrics.user_bytes_received(None, resp_size);
+            }
         }
 
         if let Err(ref e) = result {
@@ -197,8 +210,25 @@ impl ClientSession {
 
                     // Record metrics ONCE using type-safe API (prevents double-counting)
                     if let Some(ref metrics) = self.metrics {
-                        let _ = metrics.record_client_to_backend(unrecorded_cmd_bytes);
-                        let _ = metrics.record_backend_to_client(unrecorded_resp_bytes);
+                        // Peek byte counts before consuming
+                        let cmd_size = unrecorded_cmd_bytes.peek();
+                        let resp_size = unrecorded_resp_bytes.peek();
+
+                        // Record command + per-backend + global bytes in one call
+                        let _ = metrics.record_command_execution(
+                            backend_id,
+                            unrecorded_cmd_bytes,
+                            unrecorded_resp_bytes,
+                        );
+
+                        // Record per-user metrics
+                        if let Some(ref username) = self.username() {
+                            metrics.user_bytes_sent(Some(username), cmd_size);
+                            metrics.user_bytes_received(Some(username), resp_size);
+                        } else {
+                            metrics.user_bytes_sent(None, cmd_size);
+                            metrics.user_bytes_received(None, resp_size);
+                        }
                     }
 
                     client_to_backend += cmd_bytes.as_u64();
