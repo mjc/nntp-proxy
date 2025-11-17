@@ -28,7 +28,7 @@ pub async fn bidirectional_forward<R, W, B>(
     client_write: &mut W,
     pooled_conn: &mut B,
     buffer_pool: &BufferPool,
-    client_addr: std::net::SocketAddr,
+    _client_addr: std::net::SocketAddr,
     client_to_backend_bytes: BytesTransferred,
     backend_to_client_bytes: BytesTransferred,
 ) -> Result<ForwardResult>
@@ -37,11 +37,6 @@ where
     W: AsyncWriteExt + Unpin,
     B: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    debug!(
-        "Client {} entering stateful bidirectional forwarding",
-        client_addr
-    );
-
     let mut buffer_b2c = buffer_pool.acquire().await;
     let mut command = String::with_capacity(COMMAND);
 
@@ -53,15 +48,11 @@ where
             // Read from client and forward to backend
             result = client_reader.read_line(&mut command) => {
                 match result {
-                    Ok(0) => {
-                        debug!("Client {} disconnected from stateful session", client_addr);
-                        break;
-                    }
+                    Ok(0) => break,
                     Ok(n) => {
                         if let Err(e) = pooled_conn.write_all(command.as_bytes()).await {
                             let err: anyhow::Error = e.into();
                             if crate::pool::is_connection_error(&err) {
-                                debug!("Backend write error for client {} ({}), removing connection from pool", client_addr, err);
                                 return Ok(ForwardResult::BackendError(
                                     TransferMetrics {
                                         client_to_backend: c2b,
@@ -69,14 +60,13 @@ where
                                     }
                                 ));
                             }
-                            debug!("Backend write error for client {}: {}", client_addr, err);
                             break;
                         }
                         c2b.add(n);
                         command.clear();
                     }
                     Err(e) => {
-                        debug!("Client {} read error in stateful mode: {}", client_addr, e);
+                        debug!("Client read error: {}", e);
                         break;
                     }
                 }
@@ -85,13 +75,10 @@ where
             // Read from backend and forward to client
             n = buffer_b2c.read_from(pooled_conn) => {
                 match n {
-                    Ok(0) => {
-                        debug!("Backend disconnected while in stateful mode for client {}", client_addr);
-                        break;
-                    }
+                    Ok(0) => break,
                     Ok(n) => {
                         if let Err(e) = client_write.write_all(&buffer_b2c[..n]).await {
-                            debug!("Client write error for {}: {}", client_addr, e);
+                            debug!("Client write error: {}", e);
                             break;
                         }
                         b2c.add(n);
@@ -99,7 +86,6 @@ where
                     Err(e) => {
                         let err: anyhow::Error = e.into();
                         if crate::pool::is_connection_error(&err) {
-                            debug!("Backend connection error for client {} ({}), removing from pool", client_addr, err);
                             return Ok(ForwardResult::BackendError(
                                 TransferMetrics {
                                     client_to_backend: c2b,
@@ -107,7 +93,6 @@ where
                                 }
                             ));
                         }
-                        debug!("Backend read error for client {}: {}", client_addr, err);
                         break;
                     }
                 }

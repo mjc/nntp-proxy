@@ -8,7 +8,7 @@ use crate::session::common;
 use anyhow::Result;
 use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::types::{BytesTransferred, TransferMetrics};
 
@@ -31,11 +31,6 @@ impl ClientSession {
 
         // Route this first stateful command to get a backend
         let backend_id = router.route_command(self.client_id, initial_command)?;
-
-        debug!(
-            "Client {} switching to stateful mode, backend {:?} selected",
-            self.client_addr, backend_id
-        );
 
         // Get provider for this backend
         let Some(provider) = router.backend_provider(backend_id) else {
@@ -108,20 +103,11 @@ impl ClientSession {
                 });
             } else {
                 // Client disconnected while receiving data, backend is healthy
-                debug!(
-                    "Client {} disconnected while receiving initial stateful response",
-                    self.client_addr
-                );
             }
         }
 
         // Mark this command as complete
         router.complete_command(backend_id);
-
-        debug!(
-            "Client {} initial stateful command completed, entering dedicated connection mode",
-            self.client_addr
-        );
 
         // Now enter standard stateful mode with the dedicated backend connection
         // This is the same as the standard 1:1 routing mode
@@ -149,24 +135,14 @@ impl ClientSession {
             command.clear();
 
             match client_reader.read_line(&mut command).await {
-                Ok(0) => {
-                    debug!("Client {} disconnected in stateful mode", self.client_addr);
-                    break;
-                }
+                Ok(0) => break,
                 Ok(n) => {
                     client_to_backend += n as u64;
-                    let trimmed = command.trim();
-
-                    debug!("Client {} stateful command: {}", self.client_addr, trimmed);
 
                     // Handle QUIT locally
                     match common::handle_quit_command(&command, &mut client_write).await? {
                         common::QuitStatus::Quit(bytes) => {
                             backend_to_client += bytes.as_u64();
-                            debug!(
-                                "Client {} sent QUIT in stateful mode, closing",
-                                self.client_addr
-                            );
                             break;
                         }
                         common::QuitStatus::Continue => {

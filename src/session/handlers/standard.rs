@@ -4,7 +4,7 @@ use crate::session::{ClientSession, common};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::command::CommandHandler;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
@@ -81,8 +81,6 @@ impl ClientSession {
         // Auth is disabled or auth happens once, then we skip checks for rest of session
         let mut skip_auth_check = !self.auth_handler.is_enabled();
 
-        debug!("Client {} session loop starting", self.client_addr);
-
         // Counter for periodic metrics flush (every N iterations)
         let mut iteration_count = 0u32;
         const METRICS_FLUSH_INTERVAL: u32 = 100; // Flush every 1000 commands
@@ -110,10 +108,6 @@ impl ClientSession {
 
                     // Report user metrics incrementally as well
                     let username_opt = self.username();
-                    debug!(
-                        "Periodic metrics flush: username={:?}, delta_c2b={}, delta_b2c={}",
-                        username_opt, delta_c2b, delta_b2c
-                    );
 
                     if let Some(ref username) = username_opt {
                         if delta_c2b > 0 {
@@ -142,15 +136,8 @@ impl ClientSession {
                 // Read command from client
                 result = client_reader.read_line(&mut line) => {
                     match result {
-                        Ok(0) => {
-                            debug!("Client {} disconnected (0 bytes read)", self.client_addr);
-                            break; // Client disconnected
-                        }
-                        Ok(n) => {
-                            debug!("Client {} sent {} bytes: {:?}", self.client_addr, n, line.trim());
-                            let trimmed = line.trim();
-                            debug!("Client {} command: {}", self.client_addr, trimmed);
-
+                        Ok(0) => break,
+                        Ok(_) => {
                             // PERFORMANCE OPTIMIZATION: Skip auth checking after first auth
                             // Auth happens ONCE per session, then thousands of ARTICLE commands follow
                             //
