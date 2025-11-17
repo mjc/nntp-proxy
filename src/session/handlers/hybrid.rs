@@ -53,7 +53,7 @@ impl ClientSession {
         // Record command in metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_command(backend_id);
-            common::record_user_command(&self.metrics, self.username().as_deref());
+            metrics.user_command(self.username().as_deref());
         }
 
         // Get buffer from pool for command execution
@@ -82,12 +82,8 @@ impl ClientSession {
             let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
 
             // Record per-user metrics
-            common::record_user_bytes(
-                &self.metrics,
-                self.username().as_deref(),
-                cmd_size,
-                resp_size,
-            );
+            metrics.user_bytes_sent(self.username().as_deref(), cmd_size);
+            metrics.user_bytes_received(self.username().as_deref(), resp_size);
         }
 
         if let Err(ref e) = result {
@@ -158,7 +154,7 @@ impl ClientSession {
                     // Record command in metrics
                     if let Some(ref metrics) = self.metrics {
                         metrics.record_command(backend_id);
-                        common::record_user_command(&self.metrics, self.username().as_deref());
+                        metrics.user_command(self.username().as_deref());
                     }
 
                     let (result, _got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes) =
@@ -187,12 +183,8 @@ impl ClientSession {
                         );
 
                         // Record per-user metrics
-                        common::record_user_bytes(
-                            &self.metrics,
-                            self.username().as_deref(),
-                            cmd_size,
-                            resp_size,
-                        );
+                        metrics.user_bytes_sent(self.username().as_deref(), cmd_size);
+                        metrics.user_bytes_received(self.username().as_deref(), resp_size);
                     }
 
                     client_to_backend += cmd_bytes.as_u64();

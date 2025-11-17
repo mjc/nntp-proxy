@@ -211,12 +211,18 @@ impl ClientSession {
         }
 
         // Log session summary and close user connection
-        common::log_session_summary(
-            self.client_addr,
-            client_to_backend_bytes.as_u64(),
-            backend_to_client_bytes.as_u64(),
-        );
-        common::close_user_connection(&self.metrics, self.username().as_deref());
+        let total_bytes = client_to_backend_bytes.as_u64() + backend_to_client_bytes.as_u64();
+        if total_bytes < common::SMALL_TRANSFER_THRESHOLD {
+            debug!(
+                "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
+                self.client_addr,
+                crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
+                crate::formatting::format_bytes(backend_to_client_bytes.as_u64())
+            );
+        }
+        if let Some(ref m) = self.metrics {
+            m.user_connection_closed(self.username().as_deref());
+        }
 
         Ok(TransferMetrics {
             client_to_backend: client_to_backend_bytes,
@@ -257,7 +263,7 @@ impl ClientSession {
         // Record command execution in metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_command(backend_id);
-            common::record_user_command(&self.metrics, self.username().as_deref());
+            metrics.user_command(self.username().as_deref());
         }
 
         // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
@@ -284,12 +290,8 @@ impl ClientSession {
             let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
 
             // Record per-user metrics
-            common::record_user_bytes(
-                &self.metrics,
-                self.username().as_deref(),
-                cmd_size,
-                resp_size,
-            );
+            metrics.user_bytes_sent(self.username().as_deref(), cmd_size);
+            metrics.user_bytes_received(self.username().as_deref(), resp_size);
         }
 
         // Handle errors functionally - remove from pool if backend error
@@ -302,7 +304,7 @@ impl ClientSession {
                     );
                     if let Some(ref metrics) = self.metrics {
                         metrics.record_error(backend_id);
-                        common::record_user_error(&self.metrics, self.username().as_deref());
+                        metrics.user_error(self.username().as_deref());
                     }
                     crate::pool::remove_from_pool(pooled_conn);
                 }

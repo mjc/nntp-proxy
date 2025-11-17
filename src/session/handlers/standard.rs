@@ -1,6 +1,6 @@
 //! Standard 1:1 routing mode handler
 
-use crate::session::{ClientSession, common};
+use crate::session::ClientSession;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -241,10 +241,15 @@ impl ClientSession {
 
             // Track final per-user metrics
             let username = self.username();
-            if delta_c2b > 0 || delta_b2c > 0 {
-                common::record_user_bytes(&self.metrics, username.as_deref(), delta_c2b, delta_b2c);
+            if let Some(ref m) = self.metrics {
+                if delta_c2b > 0 {
+                    m.user_bytes_sent(username.as_deref(), delta_c2b);
+                }
+                if delta_b2c > 0 {
+                    m.user_bytes_received(username.as_deref(), delta_b2c);
+                }
+                m.user_connection_closed(username.as_deref());
             }
-            common::close_user_connection(&self.metrics, username.as_deref());
         }
 
         Ok(TransferMetrics {
