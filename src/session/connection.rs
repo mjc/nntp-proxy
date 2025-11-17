@@ -55,8 +55,8 @@ where
                             if crate::pool::is_connection_error(&err) {
                                 return Ok(ForwardResult::BackendError(
                                     TransferMetrics {
-                                        client_to_backend: c2b,
-                                        backend_to_client: b2c,
+                                        client_to_backend: c2b.into(),
+                                        backend_to_client: b2c.into(),
                                     }
                                 ));
                             }
@@ -88,8 +88,8 @@ where
                         if crate::pool::is_connection_error(&err) {
                             return Ok(ForwardResult::BackendError(
                                 TransferMetrics {
-                                    client_to_backend: c2b,
-                                    backend_to_client: b2c,
+                                    client_to_backend: c2b.into(),
+                                    backend_to_client: b2c.into(),
                                 }
                             ));
                         }
@@ -101,8 +101,8 @@ where
     }
 
     Ok(ForwardResult::NormalDisconnect(TransferMetrics {
-        client_to_backend: c2b,
-        backend_to_client: b2c,
+        client_to_backend: c2b.into(),
+        backend_to_client: b2c.into(),
     }))
 }
 

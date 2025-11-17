@@ -78,8 +78,8 @@ impl ClientSession {
                         self.username().as_deref(),
                         &e,
                         TransferMetrics {
-                            client_to_backend: client_to_backend_bytes,
-                            backend_to_client: backend_to_client_bytes,
+                            client_to_backend: client_to_backend_bytes.into(),
+                            backend_to_client: backend_to_client_bytes.into(),
                         },
                     );
                     break;
@@ -90,122 +90,91 @@ impl ClientSession {
             let trimmed = command.trim();
 
             // Handle QUIT locally
-            match common::handle_quit_command(&command, &mut client_write).await? {
-                common::QuitStatus::Quit(bytes) => {
-                    backend_to_client_bytes += bytes;
-                    break;
-                }
-                common::QuitStatus::Continue => {}
+            if let common::QuitStatus::Quit(bytes) =
+                common::handle_quit_command(&command, &mut client_write).await?
+            {
+                backend_to_client_bytes += bytes;
+                break;
             }
 
             let action = CommandHandler::classify(&command);
-
-            // ALWAYS intercept auth commands, even when auth is disabled
-            // Auth commands must NEVER be forwarded to backend
-            if matches!(action, CommandAction::InterceptAuth(_)) {
-                match action {
-                    CommandAction::InterceptAuth(auth_action) => {
-                        let result = common::handle_auth_command(
-                            &self.auth_handler,
-                            auth_action,
-                            &mut client_write,
-                            &mut auth_username,
-                            &self.authenticated,
-                        )
-                        .await?;
-
-                        backend_to_client_bytes += result.bytes_written;
-                        if result.authenticated {
-                            // Handle all post-authentication logic
-                            common::on_authentication_success(
-                                self.client_addr,
-                                auth_username.clone(),
-                                &self.routing_mode,
-                                &self.metrics,
-                                self.connection_stats(),
-                                |username| self.set_username(username),
-                            );
-                            skip_auth_check = true;
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                continue;
-            }
-
-            // PERFORMANCE OPTIMIZATION: Fast path after authentication
-            // Once authenticated, skip classification (just route everything)
-            // Cache check to avoid atomic load on hot path
             skip_auth_check = skip_auth_check
                 || self
                     .authenticated
                     .load(std::sync::atomic::Ordering::Acquire);
-            if skip_auth_check {
-                // Already authenticated - just route the command (HOT PATH after auth)
-                self.route_and_execute_command(
-                    router,
-                    &command,
-                    &mut client_write,
-                    &mut client_to_backend_bytes,
-                    &mut backend_to_client_bytes,
-                )
-                .await?;
-                continue;
-            }
 
-            // Not yet authenticated - need to check for auth/stateful commands
-
-            // In hybrid mode, stateful commands trigger a switch to stateful connection
-            if self.routing_mode == RoutingMode::Hybrid
-                && matches!(action, CommandAction::Reject(_))
-                && NntpCommand::parse(&command).is_stateful()
-            {
-                info!(
-                    "Client {} switching to stateful mode (command: {})",
-                    self.client_addr, trimmed
-                );
-                return self
-                    .switch_to_stateful_mode(
-                        client_reader,
-                        client_write,
-                        &command,
-                        client_to_backend_bytes,
-                        backend_to_client_bytes,
-                    )
-                    .await;
-            }
-
-            // Handle the command - inline for performance
-            // Check ForwardStateless FIRST (70%+ of traffic)
             use crate::command::CommandAction;
             match action {
-                CommandAction::ForwardStateless => {
-                    // Check if auth is required but not completed
-                    if self.auth_handler.is_enabled() {
-                        // Reject all non-auth commands before authentication
-                        use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
-                        client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
-                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
-                    } else {
-                        // Auth disabled - forward to backend via router (HOT PATH - 70%+ of commands)
-                        self.route_and_execute_command(
-                            router,
-                            &command,
-                            &mut client_write,
-                            &mut client_to_backend_bytes,
-                            &mut backend_to_client_bytes,
-                        )
-                        .await?;
+                // Auth commands - ALWAYS intercept
+                CommandAction::InterceptAuth(auth_action) => {
+                    let result = common::handle_auth_command(
+                        &self.auth_handler,
+                        auth_action,
+                        &mut client_write,
+                        &mut auth_username,
+                        &self.authenticated,
+                    )
+                    .await?;
+
+                    backend_to_client_bytes += result.bytes_written;
+                    if result.authenticated {
+                        common::on_authentication_success(
+                            self.client_addr,
+                            auth_username.clone(),
+                            &self.routing_mode,
+                            &self.metrics,
+                            self.connection_stats(),
+                            |username| self.set_username(username),
+                        );
+                        skip_auth_check = true;
                     }
                 }
+
+                // Stateless - forward if auth OK
+                CommandAction::ForwardStateless
+                    if skip_auth_check || !self.auth_handler.is_enabled() =>
+                {
+                    self.route_and_execute_command(
+                        router,
+                        &command,
+                        &mut client_write,
+                        &mut client_to_backend_bytes,
+                        &mut backend_to_client_bytes,
+                    )
+                    .await?;
+                }
+
+                // Stateless - need auth
+                CommandAction::ForwardStateless => {
+                    use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+                    client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+                    backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
+                }
+
+                // Hybrid mode stateful command - switch
+                CommandAction::Reject(_)
+                    if self.routing_mode == RoutingMode::Hybrid
+                        && NntpCommand::parse(&command).is_stateful() =>
+                {
+                    info!(
+                        "Client {} switching to stateful mode (command: {})",
+                        self.client_addr, trimmed
+                    );
+                    return self
+                        .switch_to_stateful_mode(
+                            client_reader,
+                            client_write,
+                            &command,
+                            client_to_backend_bytes.into(),
+                            backend_to_client_bytes.into(),
+                        )
+                        .await;
+                }
+
+                // Rejected command
                 CommandAction::Reject(response) => {
-                    // Send rejection response inline
                     client_write.write_all(response.as_bytes()).await?;
                     backend_to_client_bytes.add(response.len());
-                }
-                CommandAction::InterceptAuth(_) => {
-                    // Already handled above before fast path check
-                    unreachable!("Auth commands should be handled before reaching here");
                 }
             }
         }
@@ -225,8 +194,8 @@ impl ClientSession {
         }
 
         Ok(TransferMetrics {
-            client_to_backend: client_to_backend_bytes,
-            backend_to_client: backend_to_client_bytes,
+            client_to_backend: client_to_backend_bytes.into(),
+            backend_to_client: backend_to_client_bytes.into(),
         })
     }
 

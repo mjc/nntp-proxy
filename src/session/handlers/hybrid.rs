@@ -10,7 +10,7 @@ use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{error, info, warn};
 
-use crate::types::{BytesTransferred, TransferMetrics};
+use crate::types::{BackendToClientBytes, BytesTransferred, ClientToBackendBytes, TransferMetrics};
 
 impl ClientSession {
     /// Switch from per-command routing to stateful mode by acquiring a dedicated backend connection
@@ -19,8 +19,8 @@ impl ClientSession {
         mut client_reader: BufReader<ReadHalf<'_>>,
         mut client_write: WriteHalf<'_>,
         initial_command: &str,
-        client_to_backend_bytes: BytesTransferred,
-        backend_to_client_bytes: BytesTransferred,
+        client_to_backend_bytes: ClientToBackendBytes,
+        backend_to_client_bytes: BackendToClientBytes,
     ) -> Result<TransferMetrics> {
         use tokio::io::AsyncBufReadExt;
 
@@ -59,6 +59,10 @@ impl ClientSession {
         // Get buffer from pool for command execution
         let mut buffer = self.buffer_pool.acquire().await;
 
+        // Track bytes for initial command
+        let mut initial_cmd_bytes = BytesTransferred::zero();
+        let mut initial_resp_bytes = BytesTransferred::zero();
+
         // Execute the initial command that triggered the switch
         let (result, got_backend_data, cmd_bytes, resp_bytes) = self
             .execute_command_on_backend(
@@ -66,8 +70,8 @@ impl ClientSession {
                 initial_command,
                 &mut client_write,
                 backend_id,
-                &mut client_to_backend_bytes.clone(),
-                &mut backend_to_client_bytes.clone(),
+                &mut initial_cmd_bytes,
+                &mut initial_resp_bytes,
                 &mut buffer,
             )
             .await;
@@ -86,31 +90,34 @@ impl ClientSession {
             metrics.user_bytes_received(self.username().as_deref(), resp_size);
         }
 
-        if let Err(ref e) = result {
-            if !got_backend_data {
-                error!(
-                    "Failed to execute initial command after switching to stateful mode: {}",
-                    e
-                );
-                router.complete_command(backend_id);
-                return result.map(|_| TransferMetrics {
-                    client_to_backend: client_to_backend_bytes,
-                    backend_to_client: backend_to_client_bytes,
-                });
-            } else {
-                // Client disconnected while receiving data, backend is healthy
-            }
+        // Handle early error before we got backend data
+        if let Err(ref e) = result
+            && !got_backend_data
+        {
+            error!(
+                "Failed to execute initial command after switching to stateful mode: {}",
+                e
+            );
+            router.complete_command(backend_id);
+            return result.map(|_| TransferMetrics {
+                client_to_backend: client_to_backend_bytes,
+                backend_to_client: backend_to_client_bytes,
+            });
         }
+        // Client disconnected while receiving data, backend is healthy - continue
 
-        // Mark this command as complete
+        // Mark this command as complete (skipped if early return above)
         router.complete_command(backend_id);
 
         // Now enter standard stateful mode with the dedicated backend connection
         // This is the same as the standard 1:1 routing mode
         use crate::constants::buffer::COMMAND;
 
-        let mut client_to_backend = client_to_backend_bytes.as_u64();
-        let mut backend_to_client = backend_to_client_bytes.as_u64();
+        // Add initial command bytes to running totals
+        let mut client_to_backend =
+            client_to_backend_bytes + ClientToBackendBytes::from(initial_cmd_bytes);
+        let mut backend_to_client =
+            backend_to_client_bytes + BackendToClientBytes::from(initial_resp_bytes);
 
         // Track metrics incrementally for long-running sessions
         const METRICS_FLUSH_INTERVAL: u32 = 100;
@@ -133,17 +140,14 @@ impl ClientSession {
             match client_reader.read_line(&mut command).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    client_to_backend += n as u64;
+                    client_to_backend.add(n);
 
                     // Handle QUIT locally
-                    match common::handle_quit_command(&command, &mut client_write).await? {
-                        common::QuitStatus::Quit(bytes) => {
-                            backend_to_client += bytes.as_u64();
-                            break;
-                        }
-                        common::QuitStatus::Continue => {
-                            // Not a QUIT, continue processing
-                        }
+                    if let common::QuitStatus::Quit(bytes) =
+                        common::handle_quit_command(&command, &mut client_write).await?
+                    {
+                        backend_to_client += BackendToClientBytes::from(bytes);
+                        break;
                     }
 
                     // Execute on dedicated backend connection
@@ -187,8 +191,8 @@ impl ClientSession {
                         metrics.user_bytes_received(self.username().as_deref(), resp_size);
                     }
 
-                    client_to_backend += cmd_bytes.as_u64();
-                    backend_to_client += resp_bytes.as_u64();
+                    client_to_backend += ClientToBackendBytes::from(cmd_bytes);
+                    backend_to_client += BackendToClientBytes::from(resp_bytes);
 
                     if let Err(e) = result {
                         warn!(
@@ -240,18 +244,13 @@ impl ClientSession {
                     use crate::session::connection;
                     use crate::types::TransferMetrics;
 
-                    let mut c2b = BytesTransferred::zero();
-                    let mut b2c = BytesTransferred::zero();
-                    c2b.add(client_to_backend as usize);
-                    b2c.add(backend_to_client as usize);
-
                     connection::log_client_error(
                         self.client_addr,
                         self.username().as_deref(),
                         &e,
                         TransferMetrics {
-                            client_to_backend: c2b,
-                            backend_to_client: b2c,
+                            client_to_backend,
+                            backend_to_client,
                         },
                     );
                     break;
@@ -259,19 +258,14 @@ impl ClientSession {
             }
         }
 
-        let mut c2b = BytesTransferred::zero();
-        let mut b2c = BytesTransferred::zero();
-        c2b.add_u64(client_to_backend);
-        b2c.add_u64(backend_to_client);
-
         // Track stateful session end
         if let Some(ref metrics) = self.metrics {
             metrics.stateful_session_ended();
         }
 
         Ok(TransferMetrics {
-            client_to_backend: c2b,
-            backend_to_client: b2c,
+            client_to_backend,
+            backend_to_client,
         })
     }
 }

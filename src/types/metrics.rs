@@ -132,8 +132,23 @@ impl ClientToBackendBytes {
     }
 
     #[must_use]
+    pub const fn zero() -> Self {
+        Self::ZERO
+    }
+
+    #[must_use]
     pub const fn as_u64(&self) -> u64 {
         self.0
+    }
+
+    #[inline]
+    pub fn add(&mut self, bytes: usize) {
+        self.0 += bytes as u64;
+    }
+
+    #[inline]
+    pub fn add_u64(&mut self, bytes: u64) {
+        self.0 += bytes;
     }
 
     #[must_use]
@@ -147,6 +162,28 @@ impl From<u64> for ClientToBackendBytes {
     #[inline]
     fn from(bytes: u64) -> Self {
         Self(bytes)
+    }
+}
+
+impl From<BytesTransferred> for ClientToBackendBytes {
+    #[inline]
+    fn from(bytes: BytesTransferred) -> Self {
+        Self(bytes.as_u64())
+    }
+}
+
+impl Add for ClientToBackendBytes {
+    type Output = Self;
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+}
+
+impl AddAssign for ClientToBackendBytes {
+    #[inline]
+    fn add_assign(&mut self, other: Self) {
+        self.0 += other.0;
     }
 }
 
@@ -170,8 +207,23 @@ impl BackendToClientBytes {
     }
 
     #[must_use]
+    pub const fn zero() -> Self {
+        Self::ZERO
+    }
+
+    #[must_use]
     pub const fn as_u64(&self) -> u64 {
         self.0
+    }
+
+    #[inline]
+    pub fn add(&mut self, bytes: usize) {
+        self.0 += bytes as u64;
+    }
+
+    #[inline]
+    pub fn add_u64(&mut self, bytes: u64) {
+        self.0 += bytes;
     }
 
     #[must_use]
@@ -188,6 +240,28 @@ impl From<u64> for BackendToClientBytes {
     }
 }
 
+impl From<BytesTransferred> for BackendToClientBytes {
+    #[inline]
+    fn from(bytes: BytesTransferred) -> Self {
+        Self(bytes.as_u64())
+    }
+}
+
+impl Add for BackendToClientBytes {
+    type Output = Self;
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+}
+
+impl AddAssign for BackendToClientBytes {
+    #[inline]
+    fn add_assign(&mut self, other: Self) {
+        self.0 += other.0;
+    }
+}
+
 impl fmt::Display for BackendToClientBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} bytes", self.0)
@@ -201,37 +275,40 @@ pub type BackendBytes = ClientToBackendBytes;
 /// Transfer statistics for a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferMetrics {
-    pub client_to_backend: BytesTransferred,
-    pub backend_to_client: BytesTransferred,
+    pub client_to_backend: ClientToBackendBytes,
+    pub backend_to_client: BackendToClientBytes,
 }
 
 impl TransferMetrics {
     #[must_use]
     pub const fn zero() -> Self {
         Self {
-            client_to_backend: BytesTransferred::ZERO,
-            backend_to_client: BytesTransferred::ZERO,
+            client_to_backend: ClientToBackendBytes::ZERO,
+            backend_to_client: BackendToClientBytes::ZERO,
         }
     }
 
     #[must_use]
     pub const fn new(client_to_backend: u64, backend_to_client: u64) -> Self {
         Self {
-            client_to_backend: BytesTransferred(client_to_backend),
-            backend_to_client: BytesTransferred(backend_to_client),
+            client_to_backend: ClientToBackendBytes(client_to_backend),
+            backend_to_client: BackendToClientBytes(backend_to_client),
         }
     }
 
     #[must_use]
     #[inline]
-    pub fn total(&self) -> BytesTransferred {
-        self.client_to_backend + self.backend_to_client
+    pub fn total(&self) -> u64 {
+        self.client_to_backend.as_u64() + self.backend_to_client.as_u64()
     }
 
     #[must_use]
     #[inline]
     pub fn as_tuple(&self) -> (u64, u64) {
-        (self.client_to_backend.0, self.backend_to_client.0)
+        (
+            self.client_to_backend.as_u64(),
+            self.backend_to_client.as_u64(),
+        )
     }
 }
 
@@ -273,7 +350,7 @@ mod tests {
         let metrics = TransferMetrics::new(1024, 2048);
         assert_eq!(metrics.client_to_backend.as_u64(), 1024);
         assert_eq!(metrics.backend_to_client.as_u64(), 2048);
-        assert_eq!(metrics.total().as_u64(), 3072);
+        assert_eq!(metrics.total(), 3072);
     }
 }
 

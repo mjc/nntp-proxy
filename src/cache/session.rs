@@ -207,8 +207,8 @@ impl CachingSession {
         }
 
         Ok(TransferMetrics {
-            client_to_backend: client_to_backend_bytes,
-            backend_to_client: backend_to_client_bytes,
+            client_to_backend: client_to_backend_bytes.into(),
+            backend_to_client: backend_to_client_bytes.into(),
         })
     }
 }
