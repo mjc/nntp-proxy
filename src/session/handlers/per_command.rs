@@ -295,16 +295,15 @@ impl ClientSession {
         // Handle errors functionally - remove from pool if backend error
         let result = if !got_backend_data {
             result.inspect_err(|e| {
-                if common::is_backend_error(e) {
+                if crate::pool::is_connection_error(e) {
                     warn!(
                         "Backend {:?} connection error: {} - removing from pool",
                         backend_id, e
                     );
-                    common::record_backend_error(
-                        backend_id,
-                        &self.metrics,
-                        self.username().as_deref(),
-                    );
+                    if let Some(ref metrics) = self.metrics {
+                        metrics.record_error(backend_id);
+                        common::record_user_error(&self.metrics, self.username().as_deref());
+                    }
                     crate::pool::remove_from_pool(pooled_conn);
                 }
             })

@@ -205,26 +205,3 @@ pub(crate) fn on_authentication_success(
         );
     }
 }
-
-// ============================================================================
-// Result Pipeline Helpers - Functional error handling
-// ============================================================================
-
-/// Check if error is a backend connection error that should remove connection from pool
-#[inline]
-pub(crate) fn is_backend_error(error: &anyhow::Error) -> bool {
-    crate::pool::is_connection_error(error)
-}
-
-/// Record backend error metrics for a failed connection
-#[inline]
-pub(crate) fn record_backend_error(
-    backend_id: crate::types::BackendId,
-    metrics: &Option<crate::metrics::MetricsCollector>,
-    username: Option<&str>,
-) {
-    if let Some(m) = metrics {
-        m.record_error(backend_id);
-        record_user_error(metrics, username);
-    }
-}
