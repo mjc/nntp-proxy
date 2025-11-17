@@ -548,19 +548,6 @@ impl ClientSession {
                 backend_to_client_bytes.add(BACKEND_ERROR.len());
             }
 
-            // Debug logging for small transfers
-            if (*client_to_backend_bytes + *backend_to_client_bytes).as_u64()
-                < common::SMALL_TRANSFER_THRESHOLD
-            {
-                debug!(
-                    "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
-                     Total session: {} bytes to backend, {} bytes from backend. \
-                     This appears to be a short session (test connection?). \
-                     Check debug logs above for full command/response hex dumps.",
-                    self.client_addr, trimmed, e, client_to_backend_bytes, backend_to_client_bytes
-                );
-            }
-
             return Err(e);
         }
         Ok(())
