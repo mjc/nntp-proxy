@@ -135,7 +135,7 @@ impl ClientSession {
                 }
             }
 
-            let action = CommandHandler::handle_command(&command);
+            let action = CommandHandler::classify(&command);
 
             // ALWAYS intercept auth commands, even when auth is disabled
             // Auth commands must NEVER be forwarded to backend

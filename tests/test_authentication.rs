@@ -196,14 +196,14 @@ async fn test_auth_command_sequence_valid() {
     use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 
     // AUTHINFO USER should request password
-    let user_action = CommandHandler::handle_command("AUTHINFO USER alice\r\n");
+    let user_action = CommandHandler::classify("AUTHINFO USER alice\r\n");
     assert!(matches!(
         user_action,
         CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) if u == "alice"
     ));
 
     // AUTHINFO PASS should validate and respond
-    let pass_action = CommandHandler::handle_command("AUTHINFO PASS secret\r\n");
+    let pass_action = CommandHandler::classify("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         pass_action,
         CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password == "secret"
@@ -277,10 +277,10 @@ async fn test_command_classification_for_stateless() {
     use nntp_proxy::command::{CommandAction, CommandHandler};
 
     // Test that stateless commands are classified correctly
-    let action = CommandHandler::handle_command("ARTICLE <msgid@example.com>\r\n");
+    let action = CommandHandler::classify("ARTICLE <msgid@example.com>\r\n");
     assert_eq!(action, CommandAction::ForwardStateless);
 
-    let action = CommandHandler::handle_command("LIST\r\n");
+    let action = CommandHandler::classify("LIST\r\n");
     assert_eq!(action, CommandAction::ForwardStateless);
 }
 
@@ -462,7 +462,7 @@ async fn test_proxy_creates_auth_handler_from_config() {
 async fn test_auth_with_empty_command() {
     use nntp_proxy::command::CommandHandler;
 
-    let _action = CommandHandler::handle_command("");
+    let _action = CommandHandler::classify("");
     // Should be rejected or handled gracefully, not crash
 }
 
@@ -470,7 +470,7 @@ async fn test_auth_with_empty_command() {
 async fn test_auth_with_whitespace_only_command() {
     use nntp_proxy::command::CommandHandler;
 
-    let _action = CommandHandler::handle_command("   \r\n");
+    let _action = CommandHandler::classify("   \r\n");
     // Should be handled gracefully
 }
 
@@ -479,7 +479,7 @@ async fn test_auth_case_variations() {
     use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 
     // Test uppercase (most common)
-    let upper = CommandHandler::handle_command("AUTHINFO USER test\r\n");
+    let upper = CommandHandler::classify("AUTHINFO USER test\r\n");
     assert!(
         matches!(
             upper,
@@ -489,7 +489,7 @@ async fn test_auth_case_variations() {
     );
 
     // Test lowercase
-    let lower = CommandHandler::handle_command("authinfo user test\r\n");
+    let lower = CommandHandler::classify("authinfo user test\r\n");
     assert!(
         matches!(
             lower,
@@ -499,7 +499,7 @@ async fn test_auth_case_variations() {
     );
 
     // Test Titlecase (Authinfo with lowercase 'user')
-    let title = CommandHandler::handle_command("Authinfo user test\r\n");
+    let title = CommandHandler::classify("Authinfo user test\r\n");
     assert!(
         matches!(
             title,
@@ -509,13 +509,13 @@ async fn test_auth_case_variations() {
     );
 
     // AUTHINFO PASS variations
-    let upper_pass = CommandHandler::handle_command("AUTHINFO PASS secret\r\n");
+    let upper_pass = CommandHandler::classify("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         upper_pass,
         CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. })
     ));
 
-    let lower_pass = CommandHandler::handle_command("authinfo pass secret\r\n");
+    let lower_pass = CommandHandler::classify("authinfo pass secret\r\n");
     assert!(matches!(
         lower_pass,
         CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. })

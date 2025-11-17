@@ -164,7 +164,7 @@ impl ClientSession {
                             } else {
                                 // Not yet authenticated and auth is enabled - check for auth commands
                                 use crate::command::CommandAction;
-                                let action = CommandHandler::handle_command(&line);
+                                let action = CommandHandler::classify(&line);
                                 match action {
                                     CommandAction::ForwardStateless => {
                                         // Reject all non-auth commands before authentication
