@@ -32,6 +32,7 @@
 //!   but commands are still processed serially (NNTP is synchronous)
 
 // Module declarations
+pub mod args;
 pub mod auth;
 pub mod connection_error;
 pub mod formatting;
@@ -56,6 +57,7 @@ pub mod tls;
 pub mod types;
 
 // Public exports
+pub use args::{CacheArgs, CommonArgs};
 pub use config::{
     Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
     load_config, load_config_from_env, load_config_with_fallback,
