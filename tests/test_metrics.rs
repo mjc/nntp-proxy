@@ -20,9 +20,11 @@ fn test_backend_stats_default() {
 
 #[test]
 fn test_backend_stats_average_article_size() {
-    let mut stats = BackendStats::default();
-    stats.article_count = ArticleCount::new(10);
-    stats.article_bytes_total = ArticleBytesTotal::new(1000);
+    let mut stats = BackendStats {
+        article_count: ArticleCount::new(10),
+        article_bytes_total: ArticleBytesTotal::new(1000),
+        ..Default::default()
+    };
 
     assert_eq!(stats.average_article_size(), Some(100));
 
@@ -33,11 +35,13 @@ fn test_backend_stats_average_article_size() {
 
 #[test]
 fn test_backend_stats_timing_averages() {
-    let mut stats = BackendStats::default();
-    stats.ttfb_micros_total = TtfbMicros::new(10000);
-    stats.send_micros_total = SendMicros::new(500);
-    stats.recv_micros_total = RecvMicros::new(9000);
-    stats.ttfb_count = TimingMeasurementCount::new(5);
+    let stats = BackendStats {
+        ttfb_micros_total: TtfbMicros::new(10000),
+        send_micros_total: SendMicros::new(500),
+        recv_micros_total: RecvMicros::new(9000),
+        ttfb_count: TimingMeasurementCount::new(5),
+        ..Default::default()
+    };
 
     // 10000 / 5 / 1000 = 2.0ms
     assert_eq!(stats.average_ttfb_ms(), Some(2.0));
@@ -64,9 +68,11 @@ fn test_backend_stats_timing_averages_zero_count() {
 
 #[test]
 fn test_backend_stats_error_rate() {
-    let mut stats = BackendStats::default();
-    stats.total_commands = CommandCount::new(100);
-    stats.errors = ErrorCount::new(6);
+    let mut stats = BackendStats {
+        total_commands: CommandCount::new(100),
+        errors: ErrorCount::new(6),
+        ..Default::default()
+    };
 
     assert_eq!(stats.error_rate_percent(), 6.0);
     assert!(stats.has_high_error_rate());
@@ -174,8 +180,10 @@ fn test_health_status_conversion() {
 
 #[test]
 fn test_backend_stats_with_realistic_values() {
-    let mut stats = BackendStats::default();
-    stats.backend_id = BackendId::from(0);
+    let mut stats = BackendStats {
+        backend_id: BackendId::from(0),
+        ..Default::default()
+    };
     stats.total_commands = CommandCount::new(1000);
     stats.errors = ErrorCount::new(10);
     stats.errors_4xx = ErrorCount::new(7);
