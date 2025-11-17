@@ -5,53 +5,13 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use nntp_proxy::{
-    NntpProxy, RoutingMode, RuntimeConfig, load_config_with_fallback,
-    types::{ConfigPath, Port, ThreadCount},
-};
+use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port to listen on (overrides config file)
-    ///
-    /// Can be overridden with NNTP_PROXY_PORT environment variable
-    #[arg(short, long, env = "NNTP_PROXY_PORT")]
-    port: Option<Port>,
-
-    /// Host to bind to (overrides config file)
-    ///
-    /// Can be overridden with NNTP_PROXY_HOST environment variable
-    #[arg(long, env = "NNTP_PROXY_HOST")]
-    host: Option<String>,
-
-    /// Routing mode: standard, per-command, or hybrid
-    ///
-    /// - standard: 1:1 mode, each client gets a dedicated backend connection
-    /// - per-command: Each command can use a different backend (stateless only)
-    /// - hybrid: Starts in per-command mode, auto-switches to stateful on first stateful command
-    ///
-    /// Can be overridden with NNTP_PROXY_ROUTING_MODE environment variable
-    #[arg(
-        short = 'm',
-        long = "routing-mode",
-        value_enum,
-        default_value = "hybrid",
-        env = "NNTP_PROXY_ROUTING_MODE"
-    )]
-    routing_mode: RoutingMode,
-
-    /// Configuration file path
-    ///
-    /// Can be overridden with NNTP_PROXY_CONFIG environment variable
-    #[arg(short, long, default_value = "config.toml", env = "NNTP_PROXY_CONFIG")]
-    config: ConfigPath,
-
-    /// Number of worker threads (default: 1, use 0 for CPU cores)
-    ///
-    /// Can be overridden with NNTP_PROXY_THREADS environment variable
-    #[arg(short, long, env = "NNTP_PROXY_THREADS")]
-    threads: Option<ThreadCount>,
+    #[command(flatten)]
+    common: CommonArgs,
 }
 
 fn main() -> Result<()> {
@@ -66,10 +26,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load configuration first to get thread count
-    let (config, _) = load_config_with_fallback(args.config.as_str())?;
+    let (config, _) = load_config_with_fallback(args.common.config.as_str())?;
 
     // Use CLI arg if provided, else config value (0 means use CPU cores)
-    let threads = args.threads.or(Some(config.proxy.threads));
+    let threads = args.common.threads.or(Some(config.proxy.threads));
 
     // Build and configure runtime
     let runtime_config = RuntimeConfig::from_args(threads);
@@ -86,11 +46,14 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     }
 
     // Extract listen address before moving config
-    let listen_host = args.host.unwrap_or_else(|| config.proxy.host.clone());
-    let listen_port = args.port.unwrap_or(config.proxy.port);
+    let listen_host = args
+        .common
+        .host
+        .unwrap_or_else(|| config.proxy.host.clone());
+    let listen_port = args.common.port.unwrap_or(config.proxy.port);
 
     // Create proxy (wrapped in Arc for sharing across tasks)
-    let proxy = Arc::new(NntpProxy::new(config, args.routing_mode)?);
+    let proxy = Arc::new(NntpProxy::new(config, args.common.routing_mode)?);
 
     // Prewarm connection pools before accepting clients
     info!("Prewarming connection pools...");
@@ -104,7 +67,7 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP proxy listening on {} ({})",
-        listen_addr, args.routing_mode
+        listen_addr, args.common.routing_mode
     );
 
     // Set up graceful shutdown
@@ -129,7 +92,7 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     });
 
     // Determine which handler to use based on routing mode
-    let uses_per_command_routing = args.routing_mode.supports_per_command_routing();
+    let uses_per_command_routing = args.common.routing_mode.supports_per_command_routing();
 
     loop {
         match listener.accept().await {

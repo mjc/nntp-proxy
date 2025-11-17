@@ -12,46 +12,17 @@ use nntp_proxy::cache::CachingSession;
 use nntp_proxy::config::Cache;
 use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use nntp_proxy::protocol::BACKEND_UNAVAILABLE;
-use nntp_proxy::types::{CacheCapacity, ClientId, ConfigPath, Port, ThreadCount};
-use nntp_proxy::{NntpProxy, RuntimeConfig, load_config_with_fallback};
+use nntp_proxy::types::ClientId;
+use nntp_proxy::{CacheArgs, CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Caching Proxy Server", long_about = None)]
 struct Args {
-    /// Port to listen on
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_PORT environment variable
-    #[arg(short, long, default_value = "8120", env = "NNTP_CACHE_PROXY_PORT")]
-    port: Port,
+    #[command(flatten)]
+    common: CommonArgs,
 
-    /// Configuration file path
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_CONFIG environment variable
-    #[arg(
-        short,
-        long,
-        default_value = "cache-config.toml",
-        env = "NNTP_CACHE_PROXY_CONFIG"
-    )]
-    config: ConfigPath,
-
-    /// Number of worker threads (default: 1, use 0 for CPU cores)
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_THREADS environment variable
-    #[arg(short, long, env = "NNTP_CACHE_PROXY_THREADS")]
-    threads: Option<ThreadCount>,
-
-    /// Cache max capacity (number of articles)
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_CAPACITY environment variable
-    #[arg(long, default_value = "10000", env = "NNTP_CACHE_PROXY_CACHE_CAPACITY")]
-    cache_capacity: CacheCapacity,
-
-    /// Cache TTL in seconds
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_TTL environment variable
-    #[arg(long, default_value = "3600", env = "NNTP_CACHE_PROXY_CACHE_TTL")]
-    cache_ttl: u64,
+    #[command(flatten)]
+    cache: CacheArgs,
 }
 
 fn main() -> Result<()> {
@@ -66,7 +37,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Build and configure runtime
-    let runtime_config = RuntimeConfig::from_args(args.threads);
+    let runtime_config = RuntimeConfig::from_args(args.common.threads);
     let rt = runtime_config.build_runtime()?;
 
     rt.block_on(run_caching_proxy(args))
@@ -74,14 +45,14 @@ fn main() -> Result<()> {
 
 async fn run_caching_proxy(args: Args) -> Result<()> {
     // Load configuration with automatic fallback
-    let (config, source) = load_config_with_fallback(args.config.as_str())?;
+    let (config, source) = load_config_with_fallback(args.common.config.as_str())?;
 
     info!("Loaded configuration from {}", source.description());
 
     // Set up cache configuration
     let cache_config = config.cache.clone().unwrap_or_else(|| Cache {
-        max_capacity: args.cache_capacity,
-        ttl: Duration::from_secs(args.cache_ttl),
+        max_capacity: args.cache.cache_capacity,
+        ttl: args.cache.ttl(),
     });
 
     info!(
@@ -126,7 +97,7 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     );
 
     // Start listening
-    let listen_addr = format!("0.0.0.0:{}", args.port.get());
+    let listen_addr = args.common.listen_addr(Some(config.proxy.port));
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP caching proxy listening on {} (caching mode)",
