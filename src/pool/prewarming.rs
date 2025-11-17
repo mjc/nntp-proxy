@@ -6,7 +6,7 @@
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
-use crate::config::ServerConfig;
+use crate::config::Server;
 use crate::pool::DeadpoolConnectionProvider;
 
 /// Prewarm a single pool by creating all connections concurrently
@@ -70,7 +70,7 @@ async fn prewarm_single_pool(
 /// Creates all connections concurrently across all pools
 pub async fn prewarm_pools(
     providers: &[DeadpoolConnectionProvider],
-    servers: &[ServerConfig],
+    servers: &[Server],
 ) -> Result<()> {
     info!("Prewarming all connection pools...");
 
@@ -119,7 +119,7 @@ pub async fn prewarm_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerConfig;
+    use crate::config::Server;
     use tokio::net::TcpListener;
 
     /// Helper to find an available port
@@ -171,7 +171,7 @@ mod tests {
         // Give server time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let servers = vec![ServerConfig {
+        let servers = vec![Server {
             name: crate::types::ServerName::new("TestServer1".to_string()).unwrap(),
             host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
             port: crate::types::Port::new(port).unwrap(),

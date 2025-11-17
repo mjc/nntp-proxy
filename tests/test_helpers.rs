@@ -4,7 +4,7 @@
 //! in integration tests.
 
 use anyhow::Result;
-use nntp_proxy::config::{Config, ServerConfig};
+use nntp_proxy::config::{Config, Server};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -243,7 +243,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     Config {
         servers: server_ports
             .into_iter()
-            .map(|(port, name)| ServerConfig {
+            .map(|(port, name)| Server {
                 host: HostName::new("127.0.0.1".to_string()).unwrap(),
                 port: Port::new(port).unwrap(),
                 name: ServerName::new(name.to_string()).unwrap(),
@@ -278,7 +278,7 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
     Config {
         servers: server_ports
             .into_iter()
-            .map(|(port, name, user, pass)| ServerConfig {
+            .map(|(port, name, user, pass)| Server {
                 host: HostName::new("127.0.0.1".to_string()).unwrap(),
                 port: Port::new(port).unwrap(),
                 name: ServerName::new(name.to_string()).unwrap(),

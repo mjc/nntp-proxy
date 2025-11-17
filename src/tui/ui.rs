@@ -195,7 +195,7 @@ fn render_backends(
     f: &mut Frame,
     area: Rect,
     snapshot: &crate::metrics::MetricsSnapshot,
-    servers: &[crate::config::ServerConfig],
+    servers: &[crate::config::Server],
     app: &TuiApp,
 ) {
     // Split into three columns: backend list, data flow chart, and top users
@@ -214,7 +214,7 @@ fn render_backend_list(
     f: &mut Frame,
     area: Rect,
     snapshot: &crate::metrics::MetricsSnapshot,
-    servers: &[crate::config::ServerConfig],
+    servers: &[crate::config::Server],
     app: &crate::tui::TuiApp,
 ) {
     let items: Vec<ListItem> = snapshot
@@ -374,12 +374,7 @@ fn render_backend_list(
 }
 
 /// Render data flow visualization as line graphs
-fn render_data_flow(
-    f: &mut Frame,
-    area: Rect,
-    servers: &[crate::config::ServerConfig],
-    app: &TuiApp,
-) {
+fn render_data_flow(f: &mut Frame, area: Rect, servers: &[crate::config::Server], app: &TuiApp) {
     // Build chart data in single pass (no nested loops)
     let (chart_data, max_throughput) = build_chart_data(servers, app);
 

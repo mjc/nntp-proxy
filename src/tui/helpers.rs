@@ -6,7 +6,7 @@ use super::constants::{BACKEND_COLORS, throughput};
 use super::types::{
     BackendChartData, BackendIndex, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec,
 };
-use crate::config::ServerConfig;
+use crate::config::Server;
 use crate::tui::TuiApp;
 use crate::tui::app::ThroughputPoint;
 
@@ -53,7 +53,7 @@ type PointAccumulator = ((PointVec, PointVec), ChartY);
 /// 2. For each server, fold over history to build points and track backend max
 ///
 /// Returns (chart_data, global_max_throughput)
-pub fn build_chart_data(servers: &[ServerConfig], app: &TuiApp) -> (ChartDataVec, f64) {
+pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64) {
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
         let x = ChartX::from(idx);

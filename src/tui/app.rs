@@ -1,6 +1,6 @@
 //! TUI application state and logic
 
-use crate::config::ServerConfig;
+use crate::config::Server;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
 use crate::tui::log_capture::LogBuffer;
@@ -157,7 +157,7 @@ impl ThroughputHistory {
 pub struct TuiAppBuilder {
     metrics: MetricsCollector,
     router: Arc<BackendSelector>,
-    servers: Arc<Vec<ServerConfig>>,
+    servers: Arc<Vec<Server>>,
     log_buffer: Option<LogBuffer>,
     history_size: HistorySize,
 }
@@ -168,7 +168,7 @@ impl TuiAppBuilder {
     pub fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
     ) -> Self {
         Self {
             metrics,
@@ -228,7 +228,7 @@ pub struct TuiApp {
     /// Router for getting pending command counts
     router: Arc<BackendSelector>,
     /// Server configurations for display names
-    servers: Arc<Vec<ServerConfig>>,
+    servers: Arc<Vec<Server>>,
     /// Current metrics snapshot (Arc for zero-cost sharing)
     snapshot: Arc<MetricsSnapshot>,
     /// Historical throughput data per backend
@@ -259,7 +259,7 @@ impl TuiApp {
     pub fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers).build()
     }
@@ -272,7 +272,7 @@ impl TuiApp {
     pub fn with_log_buffer(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
         log_buffer: LogBuffer,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers)
@@ -288,7 +288,7 @@ impl TuiApp {
     pub fn with_history_size(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
         history_size: HistorySize,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers)
@@ -435,7 +435,7 @@ impl TuiApp {
 
     /// Get server configurations
     #[must_use]
-    pub fn servers(&self) -> &[ServerConfig] {
+    pub fn servers(&self) -> &[Server] {
         &self.servers
     }
 
@@ -509,18 +509,18 @@ impl TuiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerConfig;
+    use crate::config::Server;
     use crate::metrics::MetricsCollector;
     use crate::router::BackendSelector;
     use std::sync::Arc;
     use std::time::Duration;
 
     /// Helper to create test servers
-    fn create_test_servers(count: usize) -> Arc<Vec<ServerConfig>> {
+    fn create_test_servers(count: usize) -> Arc<Vec<Server>> {
         Arc::new(
             (0..count)
                 .map(|i| {
-                    ServerConfig::builder(format!("backend{}.example.com", i), 119)
+                    Server::builder(format!("backend{}.example.com", i), 119)
                         .name(format!("Backend {}", i))
                         .build()
                         .unwrap()
@@ -548,7 +548,7 @@ mod tests {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
         let servers = Arc::new(vec![
-            ServerConfig::builder("test.example.com", 119)
+            Server::builder("test.example.com", 119)
                 .name("Test Server".to_string())
                 .build()
                 .unwrap(),

@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthHandler;
-use crate::config::{Config, RoutingMode, ServerConfig};
+use crate::config::{Config, RoutingMode, Server};
 use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
@@ -213,7 +213,7 @@ impl NntpProxyBuilder {
 
 #[derive(Debug, Clone)]
 pub struct NntpProxy {
-    servers: Arc<Vec<ServerConfig>>,
+    servers: Arc<Vec<Server>>,
     /// Backend selector for round-robin load balancing
     router: Arc<router::BackendSelector>,
     /// Connection providers per server - easily swappable implementation
@@ -296,7 +296,7 @@ impl NntpProxy {
     /// Get the list of servers
     #[must_use]
     #[inline]
-    pub fn servers(&self) -> &[ServerConfig] {
+    pub fn servers(&self) -> &[Server] {
         &self.servers
     }
 
@@ -636,7 +636,7 @@ mod tests {
         use crate::types::{HostName, MaxConnections, Port, ServerName};
         Config {
             servers: vec![
-                ServerConfig {
+                Server {
                     host: HostName::new("server1.example.com".to_string()).unwrap(),
                     port: Port::new(119).unwrap(),
                     name: ServerName::new("Test Server 1".to_string()).unwrap(),
@@ -650,7 +650,7 @@ mod tests {
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
                 },
-                ServerConfig {
+                Server {
                     host: HostName::new("server2.example.com".to_string()).unwrap(),
                     port: Port::new(119).unwrap(),
                     name: ServerName::new("Test Server 2".to_string()).unwrap(),
@@ -664,7 +664,7 @@ mod tests {
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
                 },
-                ServerConfig {
+                Server {
                     host: HostName::new("server3.example.com".to_string()).unwrap(),
                     port: Port::new(119).unwrap(),
                     name: ServerName::new("Test Server 3".to_string()).unwrap(),

@@ -12,7 +12,7 @@ use tokio::time;
 
 /// Configuration for health checking
 #[derive(Debug, Clone)]
-pub struct HealthCheckConfig {
+pub struct HealthCheck {
     /// Interval between health checks
     pub check_interval: Duration,
     /// Timeout for each health check
@@ -21,7 +21,7 @@ pub struct HealthCheckConfig {
     pub unhealthy_threshold: u32,
 }
 
-impl Default for HealthCheckConfig {
+impl Default for HealthCheck {
     fn default() -> Self {
         Self {
             check_interval: Duration::from_secs(30),
@@ -36,12 +36,12 @@ pub struct HealthChecker {
     /// Health status for each backend (lock-free)
     backend_health: Arc<DashMap<BackendId, BackendHealth>>,
     /// Configuration
-    config: HealthCheckConfig,
+    config: HealthCheck,
 }
 
 impl HealthChecker {
     /// Create a new health checker
-    pub fn new(config: HealthCheckConfig) -> Self {
+    pub fn new(config: HealthCheck) -> Self {
         Self {
             backend_health: Arc::new(DashMap::new()),
             config,
@@ -180,7 +180,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_checker_creation() {
-        let config = HealthCheckConfig::default();
+        let config = HealthCheck::default();
         let checker = HealthChecker::new(config);
 
         let metrics = checker.get_metrics().await;
@@ -190,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_backend() {
-        let config = HealthCheckConfig::default();
+        let config = HealthCheck::default();
         let checker = HealthChecker::new(config);
 
         let backend_id = BackendId::from_index(0);
@@ -203,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_backend_registration() {
-        let config = HealthCheckConfig::default();
+        let config = HealthCheck::default();
         let checker = HealthChecker::new(config);
 
         for i in 0..3 {
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_healthy_backends() {
-        let config = HealthCheckConfig::default();
+        let config = HealthCheck::default();
         let checker = HealthChecker::new(config);
 
         let backend_ids = vec![
@@ -236,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check_config_default() {
-        let config = HealthCheckConfig::default();
+        let config = HealthCheck::default();
         assert_eq!(config.check_interval, Duration::from_secs(30));
         assert_eq!(config.check_timeout, Duration::from_secs(5));
         assert_eq!(config.unhealthy_threshold, 3);
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check_config_custom() {
-        let config = HealthCheckConfig {
+        let config = HealthCheck {
             check_interval: Duration::from_secs(10),
             check_timeout: Duration::from_secs(2),
             unhealthy_threshold: 5,
@@ -258,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simulated_connection_failure() {
-        let config = HealthCheckConfig {
+        let config = HealthCheck {
             check_interval: Duration::from_millis(100),
             check_timeout: Duration::from_millis(50),
             unhealthy_threshold: 2,
@@ -282,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_after_failures() {
-        let config = HealthCheckConfig {
+        let config = HealthCheck {
             check_interval: Duration::from_millis(100),
             check_timeout: Duration::from_millis(50),
             unhealthy_threshold: 2,
@@ -307,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_metrics_mixed_states() {
-        let config = HealthCheckConfig::default();
+        let config = HealthCheck::default();
         let checker = HealthChecker::new(config);
 
         // Register multiple backends
@@ -343,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backend_health_isolation() {
-        let config = HealthCheckConfig::default();
+        let config = HealthCheck::default();
         let checker = HealthChecker::new(config);
 
         let backend1 = BackendId::from_index(0);

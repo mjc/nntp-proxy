@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use super::defaults;
-use super::types::{Config, ServerConfig};
+use super::types::{Config, Server};
 
 /// Load backend server configuration from environment variables
 ///
@@ -18,7 +18,7 @@ use super::types::{Config, ServerConfig};
 /// - `NNTP_SERVER_N_USERNAME` - Backend authentication username
 /// - `NNTP_SERVER_N_PASSWORD` - Backend authentication password
 /// - `NNTP_SERVER_N_MAX_CONNECTIONS` - Max connections (default: 10)
-fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
+fn load_servers_from_env() -> Option<Vec<Server>> {
     let mut servers = Vec::new();
     let mut index = 0;
 
@@ -95,7 +95,7 @@ fn load_servers_from_env() -> Option<Vec<ServerConfig>> {
             .map(std::time::Duration::from_secs)
             .unwrap_or_else(defaults::health_check_pool_timeout);
 
-        servers.push(ServerConfig {
+        servers.push(Server {
             host: crate::types::HostName::new(host.clone())
                 .unwrap_or_else(|_| panic!("Invalid hostname in {}: '{}'", host_key, host)),
             port: crate::types::Port::new(port)
@@ -291,7 +291,7 @@ pub fn load_config_with_fallback(config_path: &str) -> Result<(Config, ConfigSou
 #[must_use]
 pub fn create_default_config() -> Config {
     Config {
-        servers: vec![ServerConfig {
+        servers: vec![Server {
             host: crate::types::HostName::new("news.example.com".to_string())
                 .expect("Valid hostname"),
             port: crate::types::Port::new(119).expect("Valid port"),

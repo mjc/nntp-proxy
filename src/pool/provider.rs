@@ -260,7 +260,7 @@ impl DeadpoolConnectionProvider {
     /// Create a connection provider from a server configuration
     ///
     /// This avoids unnecessary cloning of individual fields.
-    pub fn from_server_config(server: &crate::config::ServerConfig) -> Result<Self> {
+    pub fn from_server_config(server: &crate::config::Server) -> Result<Self> {
         let tls_builder = TlsConfig::builder()
             .enabled(server.use_tls)
             .verify_cert(server.tls_verify_cert);

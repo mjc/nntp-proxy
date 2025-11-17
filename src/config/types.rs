@@ -2,6 +2,7 @@
 //!
 //! This module contains all the core configuration structures used by the proxy.
 
+use super::defaults;
 use crate::types::{
     CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, ThreadCount,
     duration_serde, option_duration_serde,
@@ -65,25 +66,25 @@ impl std::fmt::Display for RoutingMode {
 pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
-    pub servers: Vec<ServerConfig>,
+    pub servers: Vec<Server>,
     /// Proxy server settings
     #[serde(default)]
-    pub proxy: ProxyConfig,
+    pub proxy: Proxy,
     /// Health check configuration
     #[serde(default)]
-    pub health_check: HealthCheckConfig,
+    pub health_check: HealthCheck,
     /// Cache configuration (optional, for caching proxy)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache: Option<CacheConfig>,
+    pub cache: Option<Cache>,
     /// Client authentication configuration
     #[serde(default)]
-    pub client_auth: ClientAuthConfig,
+    pub client_auth: ClientAuth,
 }
 
 /// Proxy server settings
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ProxyConfig {
+pub struct Proxy {
     /// Host/IP to bind to (default: 0.0.0.0)
     pub host: String,
     /// Port to listen on (default: 8119)
@@ -92,12 +93,12 @@ pub struct ProxyConfig {
     pub threads: ThreadCount,
 }
 
-impl ProxyConfig {
+impl Proxy {
     /// Default listen host (all interfaces)
     pub const DEFAULT_HOST: &'static str = "0.0.0.0";
 }
 
-impl Default for ProxyConfig {
+impl Default for Proxy {
     fn default() -> Self {
         Self {
             host: Self::DEFAULT_HOST.to_string(),
@@ -109,7 +110,7 @@ impl Default for ProxyConfig {
 
 /// Cache configuration for article caching
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CacheConfig {
+pub struct Cache {
     /// Maximum number of articles to cache
     #[serde(default = "super::defaults::cache_max_capacity")]
     pub max_capacity: CacheCapacity,
@@ -118,18 +119,18 @@ pub struct CacheConfig {
     pub ttl: Duration,
 }
 
-impl Default for CacheConfig {
+impl Default for Cache {
     fn default() -> Self {
         Self {
-            max_capacity: super::defaults::cache_max_capacity(),
-            ttl: super::defaults::cache_ttl(),
+            max_capacity: defaults::cache_max_capacity(),
+            ttl: defaults::cache_ttl(),
         }
     }
 }
 
 /// Health check configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HealthCheckConfig {
+pub struct HealthCheck {
     /// Interval between health checks
     #[serde(
         with = "duration_serde",
@@ -147,7 +148,7 @@ pub struct HealthCheckConfig {
     pub unhealthy_threshold: MaxErrors,
 }
 
-impl Default for HealthCheckConfig {
+impl Default for HealthCheck {
     fn default() -> Self {
         Self {
             interval: super::defaults::health_check_interval(),
@@ -159,7 +160,7 @@ impl Default for HealthCheckConfig {
 
 /// Client authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct ClientAuthConfig {
+pub struct ClientAuth {
     /// Required username for client authentication (if set, auth is enabled)
     /// DEPRECATED: Use `users` instead for multi-user support
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,7 +184,7 @@ pub struct UserCredentials {
     pub password: String,
 }
 
-impl ClientAuthConfig {
+impl ClientAuth {
     /// Check if authentication is enabled
     pub fn is_enabled(&self) -> bool {
         // Auth is enabled if either the legacy single-user config or multi-user list is populated
@@ -210,7 +211,7 @@ impl ClientAuthConfig {
 
 /// Configuration for a single backend server
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ServerConfig {
+pub struct Server {
     pub host: HostName,
     pub port: Port,
     pub name: ServerName,
@@ -252,23 +253,23 @@ pub struct ServerConfig {
     pub health_check_pool_timeout: Duration,
 }
 
-/// Builder for constructing `ServerConfig` instances
+/// Builder for constructing `Server` instances
 ///
 /// Provides a fluent API for creating server configurations, especially useful in tests
-/// where creating ServerConfig with all 11+ fields is verbose.
+/// where creating Server with all 11+ fields is verbose.
 ///
 /// # Examples
 ///
 /// ```
-/// use nntp_proxy::config::ServerConfig;
+/// use nntp_proxy::config::Server;
 ///
 /// // Minimal configuration
-/// let config = ServerConfig::builder("news.example.com", 119)
+/// let config = Server::builder("news.example.com", 119)
 ///     .build()
 ///     .unwrap();
 ///
 /// // With authentication and TLS
-/// let config = ServerConfig::builder("secure.example.com", 563)
+/// let config = Server::builder("secure.example.com", 563)
 ///     .name("Secure Server")
 ///     .username("user")
 ///     .password("pass")
@@ -277,7 +278,7 @@ pub struct ServerConfig {
 ///     .build()
 ///     .unwrap();
 /// ```
-pub struct ServerConfigBuilder {
+pub struct ServerBuilder {
     host: String,
     port: u16,
     name: Option<String>,
@@ -292,7 +293,7 @@ pub struct ServerConfigBuilder {
     health_check_pool_timeout: Option<Duration>,
 }
 
-impl ServerConfigBuilder {
+impl ServerBuilder {
     /// Create a new builder with required parameters
     ///
     /// # Arguments
@@ -386,7 +387,7 @@ impl ServerConfigBuilder {
         self
     }
 
-    /// Build the ServerConfig
+    /// Build the Server
     ///
     /// # Errors
     ///
@@ -395,7 +396,7 @@ impl ServerConfigBuilder {
     /// - Port is 0
     /// - Name is empty (when explicitly set)
     /// - Max connections is 0 (when explicitly set)
-    pub fn build(self) -> Result<ServerConfig, anyhow::Error> {
+    pub fn build(self) -> Result<Server, anyhow::Error> {
         use crate::types::{HostName, MaxConnections, Port, ServerName};
 
         let host = HostName::new(self.host.clone())?;
@@ -423,7 +424,7 @@ impl ServerConfigBuilder {
             .health_check_pool_timeout
             .unwrap_or_else(super::defaults::health_check_pool_timeout);
 
-        Ok(ServerConfig {
+        Ok(Server {
             host,
             port,
             name,
@@ -440,22 +441,22 @@ impl ServerConfigBuilder {
     }
 }
 
-impl ServerConfig {
-    /// Create a builder for constructing a ServerConfig
+impl Server {
+    /// Create a builder for constructing a Server
     ///
     /// # Examples
     ///
     /// ```
-    /// use nntp_proxy::config::ServerConfig;
+    /// use nntp_proxy::config::Server;
     ///
-    /// let config = ServerConfig::builder("news.example.com", 119)
+    /// let config = Server::builder("news.example.com", 119)
     ///     .name("Example Server")
     ///     .max_connections(15)
     ///     .build()
     ///     .unwrap();
     /// ```
     #[must_use]
-    pub fn builder(host: impl Into<String>, port: u16) -> ServerConfigBuilder {
-        ServerConfigBuilder::new(host, port)
+    pub fn builder(host: impl Into<String>, port: u16) -> ServerBuilder {
+        ServerBuilder::new(host, port)
     }
 }

@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CachingSession;
-use nntp_proxy::config::CacheConfig;
+use nntp_proxy::config::Cache;
 use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
 use nntp_proxy::protocol::BACKEND_UNAVAILABLE;
 use nntp_proxy::types::{CacheCapacity, ClientId, ConfigPath, Port, ThreadCount};
@@ -79,7 +79,7 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     info!("Loaded configuration from {}", source.description());
 
     // Set up cache configuration
-    let cache_config = config.cache.clone().unwrap_or_else(|| CacheConfig {
+    let cache_config = config.cache.clone().unwrap_or_else(|| Cache {
         max_capacity: args.cache_capacity,
         ttl: Duration::from_secs(args.cache_ttl),
     });

@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
-use super::types::{Config, ServerConfig};
+use super::types::{Config, Server};
 use crate::constants::pool::{MAX_RECOMMENDED_KEEPALIVE_SECS, MIN_RECOMMENDED_KEEPALIVE_SECS};
 
 const MIN_RECOMMENDED_KEEPALIVE: Duration = Duration::from_secs(MIN_RECOMMENDED_KEEPALIVE_SECS);
@@ -35,7 +35,7 @@ impl Config {
 }
 
 /// Validate a single server configuration
-fn validate_server(server: &ServerConfig) -> Result<()> {
+fn validate_server(server: &Server) -> Result<()> {
     // Name, host, port, max_connections validations now enforced by types:
     // - HostName/ServerName cannot be empty (validated at construction)
     // - Port cannot be 0 (NonZeroU16)
