@@ -1,6 +1,6 @@
 //! Standard 1:1 routing mode handler
 
-use crate::session::ClientSession;
+use crate::session::{ClientSession, common};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -106,24 +106,12 @@ impl ClientSession {
                         metrics.record_backend_to_client_bytes_for(bid, delta_b2c);
                     }
 
-                    // Report user metrics incrementally as well
-                    let username_opt = self.username();
-
-                    if let Some(ref username) = username_opt {
-                        if delta_c2b > 0 {
-                            metrics.user_bytes_sent(Some(username), delta_c2b);
-                        }
-                        if delta_b2c > 0 {
-                            metrics.user_bytes_received(Some(username), delta_b2c);
-                        }
-                    } else {
-                        // Anonymous user
-                        if delta_c2b > 0 {
-                            metrics.user_bytes_sent(None, delta_c2b);
-                        }
-                        if delta_b2c > 0 {
-                            metrics.user_bytes_received(None, delta_b2c);
-                        }
+                    // Report user metrics incrementally
+                    if delta_c2b > 0 {
+                        self.user_bytes_sent(delta_c2b);
+                    }
+                    if delta_b2c > 0 {
+                        self.user_bytes_received(delta_b2c);
                     }
 
                     last_reported_c2b = current_c2b;
@@ -170,21 +158,14 @@ impl ClientSession {
                                         .await?
                                         {
                                             crate::session::common::AuthResult::Authenticated(bytes) => {
-                                                // Store username after successful authentication
-                                                self.set_username(auth_username.clone());
-
-                                                // Record connection for aggregation (after auth so we have username)
-                                                if let Some(stats) = self.connection_stats() {
-                                                    stats.record_connection(
-                                                        auth_username.as_deref(),
-                                                        "standard",
-                                                    );
-                                                }
-
-                                                // Track user connection in metrics
-                                                if let Some(metrics) = self.metrics.as_ref() {
-                                                    metrics.user_connection_opened(auth_username.as_deref());
-                                                }
+                                                common::on_authentication_success(
+                                                    self.client_addr,
+                                                    auth_username.clone(),
+                                                    &crate::config::RoutingMode::Standard,
+                                                    &self.metrics,
+                                                    self.connection_stats(),
+                                                    |username| self.set_username(username),
+                                                );
 
                                                 skip_auth_check = true;
                                                 bytes
@@ -242,15 +223,15 @@ impl ClientSession {
             }
 
             // Track final per-user metrics
-            let username = self.username();
+            if delta_c2b > 0 {
+                self.user_bytes_sent(delta_c2b);
+            }
+            if delta_b2c > 0 {
+                self.user_bytes_received(delta_b2c);
+            }
+
             if let Some(ref m) = self.metrics {
-                if delta_c2b > 0 {
-                    m.user_bytes_sent(username.as_deref(), delta_c2b);
-                }
-                if delta_b2c > 0 {
-                    m.user_bytes_received(username.as_deref(), delta_b2c);
-                }
-                m.user_connection_closed(username.as_deref());
+                m.user_connection_closed(self.username().as_deref());
             }
         }
 

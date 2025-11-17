@@ -46,15 +46,11 @@ impl ClientSession {
         );
 
         // Track stateful session start
-        if let Some(ref metrics) = self.metrics {
-            metrics.stateful_session_started();
-        }
+        self.stateful_session_started();
 
         // Record command in metrics
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_command(backend_id);
-            metrics.user_command(self.username().as_deref());
-        }
+        self.record_command(backend_id);
+        self.user_command();
 
         // Get buffer from pool for command execution
         let mut buffer = self.buffer_pool.acquire().await;
@@ -86,8 +82,8 @@ impl ClientSession {
             let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
 
             // Record per-user metrics
-            metrics.user_bytes_sent(self.username().as_deref(), cmd_size);
-            metrics.user_bytes_received(self.username().as_deref(), resp_size);
+            self.user_bytes_sent(cmd_size);
+            self.user_bytes_received(resp_size);
         }
 
         // Handle early error before we got backend data
@@ -125,9 +121,6 @@ impl ClientSession {
         let mut last_reported_c2b = client_to_backend;
         let mut last_reported_b2c = backend_to_client;
 
-        // Cache username to avoid Arc cloning on every flush
-        let username_cache = self.username();
-
         // Reuse command buffer for remaining session
         let mut command = String::with_capacity(COMMAND);
 
@@ -156,10 +149,8 @@ impl ClientSession {
                     cmd_bytes.add(command.len());
 
                     // Record command in metrics
-                    if let Some(ref metrics) = self.metrics {
-                        metrics.record_command(backend_id);
-                        metrics.user_command(self.username().as_deref());
-                    }
+                    self.record_command(backend_id);
+                    self.user_command();
 
                     let (result, _got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes) =
                         self.execute_command_on_backend(
@@ -187,8 +178,8 @@ impl ClientSession {
                         );
 
                         // Record per-user metrics
-                        metrics.user_bytes_sent(self.username().as_deref(), cmd_size);
-                        metrics.user_bytes_received(self.username().as_deref(), resp_size);
+                        self.user_bytes_sent(cmd_size);
+                        self.user_bytes_received(resp_size);
                     }
 
                     client_to_backend += ClientToBackendBytes::from(cmd_bytes);
@@ -217,21 +208,11 @@ impl ClientSession {
                             }
 
                             // Report user metrics incrementally as well
-                            if let Some(ref username) = username_cache {
-                                if delta_c2b > 0 {
-                                    metrics.user_bytes_sent(Some(&**username), delta_c2b);
-                                }
-                                if delta_b2c > 0 {
-                                    metrics.user_bytes_received(Some(&**username), delta_b2c);
-                                }
-                            } else {
-                                // Anonymous user
-                                if delta_c2b > 0 {
-                                    metrics.user_bytes_sent(None, delta_c2b);
-                                }
-                                if delta_b2c > 0 {
-                                    metrics.user_bytes_received(None, delta_b2c);
-                                }
+                            if delta_c2b > 0 {
+                                self.user_bytes_sent(delta_c2b);
+                            }
+                            if delta_b2c > 0 {
+                                self.user_bytes_received(delta_b2c);
                             }
 
                             last_reported_c2b = client_to_backend;
@@ -259,9 +240,7 @@ impl ClientSession {
         }
 
         // Track stateful session end
-        if let Some(ref metrics) = self.metrics {
-            metrics.stateful_session_ended();
-        }
+        self.stateful_session_ended();
 
         Ok(TransferMetrics {
             client_to_backend,

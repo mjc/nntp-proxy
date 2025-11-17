@@ -381,6 +381,50 @@ impl ClientSession {
     pub(crate) fn connection_stats(&self) -> Option<&crate::metrics::ConnectionStatsAggregator> {
         self.connection_stats.as_ref()
     }
+
+    // Metrics helper methods - encapsulate Option checks for cleaner handler code
+
+    #[inline]
+    pub(crate) fn record_command(&self, backend_id: crate::types::BackendId) {
+        if let Some(ref m) = self.metrics {
+            m.record_command(backend_id);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn user_command(&self) {
+        if let Some(ref m) = self.metrics {
+            m.user_command(self.username().as_deref());
+        }
+    }
+
+    #[inline]
+    pub(crate) fn stateful_session_started(&self) {
+        if let Some(ref m) = self.metrics {
+            m.stateful_session_started();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn stateful_session_ended(&self) {
+        if let Some(ref m) = self.metrics {
+            m.stateful_session_ended();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn user_bytes_sent(&self, bytes: u64) {
+        if let Some(ref m) = self.metrics {
+            m.user_bytes_sent(self.username().as_deref(), bytes);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn user_bytes_received(&self, bytes: u64) {
+        if let Some(ref m) = self.metrics {
+            m.user_bytes_received(self.username().as_deref(), bytes);
+        }
+    }
 }
 
 #[cfg(test)]

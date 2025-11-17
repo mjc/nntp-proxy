@@ -254,10 +254,8 @@ impl ClientSession {
         );
 
         // Record command execution in metrics
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_command(backend_id);
-            metrics.user_command(self.username().as_deref());
-        }
+        self.record_command(backend_id);
+        self.user_command();
 
         // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
         // If got_backend_data is true, we successfully communicated with backend
@@ -300,8 +298,8 @@ impl ClientSession {
             let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
 
             // Record per-user metrics
-            metrics.user_bytes_sent(self.username().as_deref(), cmd_size);
-            metrics.user_bytes_received(self.username().as_deref(), resp_size);
+            self.user_bytes_sent(cmd_size);
+            self.user_bytes_received(resp_size);
         }
 
         // Handle errors functionally - remove from pool if backend error
