@@ -338,12 +338,7 @@ impl ClientSession {
         // Record command execution in metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_command(backend_id);
-            // Track per-user command
-            if let Some(username) = self.username() {
-                metrics.user_command(Some(&username));
-            } else {
-                metrics.user_command(None);
-            }
+            common::record_user_command(&self.metrics, self.username().as_deref());
         }
 
         // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
@@ -370,13 +365,12 @@ impl ClientSession {
             let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
 
             // Record per-user metrics
-            if let Some(ref username) = self.username() {
-                metrics.user_bytes_sent(Some(username), cmd_size);
-                metrics.user_bytes_received(Some(username), resp_size);
-            } else {
-                metrics.user_bytes_sent(None, cmd_size);
-                metrics.user_bytes_received(None, resp_size);
-            }
+            common::record_user_bytes(
+                &self.metrics,
+                self.username().as_deref(),
+                cmd_size,
+                resp_size,
+            );
         }
 
         // Return buffer to pool before handling result
@@ -401,12 +395,7 @@ impl ClientSession {
                         // Record error in metrics
                         if let Some(ref metrics) = self.metrics {
                             metrics.record_error(backend_id);
-                            // Track per-user error
-                            if let Some(username) = self.username() {
-                                metrics.user_error(Some(&username));
-                            } else {
-                                metrics.user_error(None);
-                            }
+                            common::record_user_error(&self.metrics, self.username().as_deref());
                         }
                     }
                 }

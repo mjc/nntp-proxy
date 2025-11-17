@@ -128,3 +128,45 @@ where
         Ok(QuitStatus::Continue)
     }
 }
+
+/// Record user command metrics if metrics are enabled
+///
+/// Functional helper that encapsulates the option-checking pattern
+#[inline]
+pub(crate) fn record_user_command(
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    username: Option<&str>,
+) {
+    if let Some(m) = metrics {
+        m.user_command(username);
+    }
+}
+
+/// Record user error metrics if metrics are enabled
+///
+/// Functional helper that encapsulates the option-checking pattern
+#[inline]
+pub(crate) fn record_user_error(
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    username: Option<&str>,
+) {
+    if let Some(m) = metrics {
+        m.user_error(username);
+    }
+}
+
+/// Record user byte transfer metrics if metrics are enabled
+///
+/// Functional helper that records both sent and received bytes
+#[inline]
+pub(crate) fn record_user_bytes(
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    username: Option<&str>,
+    sent: u64,
+    received: u64,
+) {
+    if let Some(m) = metrics {
+        m.user_bytes_sent(username, sent);
+        m.user_bytes_received(username, received);
+    }
+}
