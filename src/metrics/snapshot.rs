@@ -51,7 +51,7 @@ impl MetricsSnapshot {
         let backend_stats = Arc::make_mut(&mut self.backend_stats);
 
         for stats in backend_stats {
-            if let Some(provider) = router.get_backend_provider(stats.backend_id) {
+            if let Some(provider) = router.backend_provider(stats.backend_id) {
                 let pool_status = provider.status();
                 // Active = checked out connections = max - available
                 let active = pool_status

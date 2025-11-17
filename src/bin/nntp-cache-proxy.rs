@@ -199,7 +199,7 @@ async fn handle_caching_client(
 
     // Select backend using round-robin
     let client_id = ClientId::new();
-    let backend_id = proxy.router().route_command_sync(client_id, "")?;
+    let backend_id = proxy.router().route_command(client_id, "")?;
     let server_idx = backend_id.as_index();
     let servers = proxy.servers();
     let server = &servers[server_idx];
@@ -251,7 +251,7 @@ async fn handle_caching_client(
     debug!("Caching session completed for client {}", client_addr);
 
     // Complete the routing
-    proxy.router().complete_command_sync(backend_id);
+    proxy.router().complete_command(backend_id);
 
     // Log session results
     match copy_result {

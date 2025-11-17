@@ -339,7 +339,7 @@ impl DeadpoolConnectionProvider {
     }
 
     /// Get a reference to the health check metrics
-    pub fn get_health_check_metrics(&self) -> &HealthCheckMetrics {
+    pub fn health_check_metrics(&self) -> &HealthCheckMetrics {
         &self.health_check_metrics
     }
 

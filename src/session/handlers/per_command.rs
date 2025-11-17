@@ -309,7 +309,7 @@ impl ClientSession {
         let mut buffer = self.buffer_pool.get_buffer().await;
 
         // Route the command to get a backend (lock-free!)
-        let backend_id = router.route_command_sync(self.client_id, command)?;
+        let backend_id = router.route_command(self.client_id, command)?;
 
         debug!(
             "Client {} routed command to backend {:?}: {}",
@@ -319,7 +319,7 @@ impl ClientSession {
         );
 
         // Get a connection from the router's backend pool
-        let Some(provider) = router.get_backend_provider(backend_id) else {
+        let Some(provider) = router.backend_provider(backend_id) else {
             anyhow::bail!("Backend {:?} not found", backend_id);
         };
 
@@ -416,7 +416,7 @@ impl ClientSession {
             .is_some_and(|_| { remove_from_pool(pooled_conn); true });
 
         // Complete the request - decrement pending count (lock-free!)
-        router.complete_command_sync(backend_id);
+        router.complete_command(backend_id);
 
         result.map(|_| backend_id)
     }

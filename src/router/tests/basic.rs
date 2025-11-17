@@ -45,7 +45,7 @@ fn test_add_multiple_backends() {
 fn test_no_backends_fails() {
     let router = BackendSelector::new();
     let client_id = ClientId::new();
-    let result = router.route_command_sync(client_id, "LIST\r\n");
+    let result = router.route_command(client_id, "LIST\r\n");
 
     assert!(result.is_err());
 }
@@ -62,9 +62,9 @@ fn test_get_backend_provider() {
         provider,
     );
 
-    let retrieved = router.get_backend_provider(backend_id);
+    let retrieved = router.backend_provider(backend_id);
     assert!(retrieved.is_some());
 
     let fake_id = BackendId::from_index(999);
-    assert!(router.get_backend_provider(fake_id).is_none());
+    assert!(router.backend_provider(fake_id).is_none());
 }

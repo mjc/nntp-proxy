@@ -366,7 +366,7 @@ impl NntpProxy {
         let client_id = ClientId::new();
 
         // Select backend using router's round-robin
-        let backend_id = self.router.route_command_sync(client_id, "")?;
+        let backend_id = self.router.route_command(client_id, "")?;
         let server_idx = backend_id.as_index();
         let server = &self.servers[server_idx];
 
@@ -464,7 +464,7 @@ impl NntpProxy {
             .record_connection(username.as_deref(), routing_mode_str);
 
         // Complete the routing (decrement pending count)
-        self.router.complete_command_sync(backend_id);
+        self.router.complete_command(backend_id);
 
         // Log session results and handle backend connection errors
         match copy_result {

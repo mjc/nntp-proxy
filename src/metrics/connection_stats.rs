@@ -193,14 +193,14 @@ impl Default for ConnectionStatsAggregator {
 
 impl ConnectionStatsAggregator {
     /// Get connection count for a user (primarily for testing)
-    pub fn get_connection_count(&self, username: &str) -> Option<u64> {
+    pub fn connection_count(&self, username: &str) -> Option<u64> {
         self.connection_stats
             .get(username)
             .map(|stats| stats.get_count())
     }
 
     /// Get number of tracked users (primarily for testing)
-    pub fn get_user_count(&self) -> usize {
+    pub fn user_count(&self) -> usize {
         self.connection_stats.len()
     }
 }

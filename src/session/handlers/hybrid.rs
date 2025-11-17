@@ -30,7 +30,7 @@ impl ClientSession {
         };
 
         // Route this first stateful command to get a backend
-        let backend_id = router.route_command_sync(self.client_id, initial_command)?;
+        let backend_id = router.route_command(self.client_id, initial_command)?;
 
         debug!(
             "Client {} switching to stateful mode, backend {:?} selected",
@@ -38,7 +38,7 @@ impl ClientSession {
         );
 
         // Get provider for this backend
-        let Some(provider) = router.get_backend_provider(backend_id) else {
+        let Some(provider) = router.backend_provider(backend_id) else {
             anyhow::bail!("Backend {:?} not found", backend_id);
         };
 
@@ -94,7 +94,7 @@ impl ClientSession {
                     "Failed to execute initial command after switching to stateful mode: {}",
                     e
                 );
-                router.complete_command_sync(backend_id);
+                router.complete_command(backend_id);
                 return result.map(|_| TransferMetrics {
                     client_to_backend: client_to_backend_bytes,
                     backend_to_client: backend_to_client_bytes,
@@ -109,7 +109,7 @@ impl ClientSession {
         }
 
         // Mark this command as complete
-        router.complete_command_sync(backend_id);
+        router.complete_command(backend_id);
 
         debug!(
             "Client {} initial stateful command completed, entering dedicated connection mode",
