@@ -170,3 +170,138 @@ pub(crate) fn record_user_bytes(
         m.user_bytes_received(username, received);
     }
 }
+
+/// Handle backend connection error with appropriate logging and metrics
+///
+/// Returns true if connection should be removed from pool
+#[must_use]
+pub(crate) fn handle_backend_error(
+    error: &anyhow::Error,
+    got_backend_data: bool,
+    backend_id: crate::types::BackendId,
+    client_addr: std::net::SocketAddr,
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    username: Option<&str>,
+) -> bool {
+    use crate::pool::is_connection_error;
+    use tracing::{debug, warn};
+
+    if !is_connection_error(error) {
+        return false;
+    }
+
+    match got_backend_data {
+        true => {
+            debug!(
+                "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
+                client_addr, backend_id
+            );
+            false // Don't remove - client disconnect, not backend issue
+        }
+        false => {
+            warn!(
+                "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
+                client_addr, backend_id, error
+            );
+            // Record error in metrics
+            if let Some(m) = metrics {
+                m.record_error(backend_id);
+                record_user_error(metrics, username);
+            }
+            true // Remove from pool - backend issue
+        }
+    }
+}
+
+/// Process command execution result using functional pipeline
+///
+/// Returns (Result mapped to backend_id, should_remove_from_pool)
+#[inline]
+pub(crate) fn process_command_result(
+    result: &Result<(), anyhow::Error>,
+    got_backend_data: bool,
+    backend_id: crate::types::BackendId,
+    client_addr: std::net::SocketAddr,
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    username: Option<&str>,
+) -> (Result<crate::types::BackendId, anyhow::Error>, bool) {
+    let should_remove = handle_backend_error_and_cleanup(
+        result,
+        got_backend_data,
+        backend_id,
+        client_addr,
+        metrics,
+        username,
+    );
+
+    let result_mapped = result
+        .as_ref()
+        .map(|_| backend_id)
+        .map_err(|e| anyhow::anyhow!("{}", e));
+
+    (result_mapped, should_remove)
+}
+
+/// Handle backend error and remove connection if needed
+///
+/// Separate function to handle the pool removal properly
+#[inline]
+pub(crate) fn handle_backend_error_and_cleanup(
+    result: &Result<(), anyhow::Error>,
+    got_backend_data: bool,
+    backend_id: crate::types::BackendId,
+    client_addr: std::net::SocketAddr,
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    username: Option<&str>,
+) -> bool {
+    result
+        .as_ref()
+        .err()
+        .map(|e| {
+            handle_backend_error(
+                e,
+                got_backend_data,
+                backend_id,
+                client_addr,
+                metrics,
+                username,
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Handle successful authentication with all side effects
+///
+/// Sets username, records connection stats, updates metrics
+pub(crate) fn on_authentication_success(
+    client_addr: std::net::SocketAddr,
+    username: Option<String>,
+    routing_mode: &crate::config::RoutingMode,
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
+    set_username_fn: impl FnOnce(Option<String>),
+) {
+    use tracing::debug;
+
+    debug!("Client {} authenticated as: {:?}", client_addr, username);
+
+    // Store username in session
+    set_username_fn(username.clone());
+
+    // Record connection for aggregation (after auth so we have username)
+    if let Some(stats) = connection_stats {
+        stats.record_connection(
+            username.as_deref(),
+            &routing_mode.to_string().to_lowercase(),
+        );
+    }
+
+    // Track user connection in metrics
+    if let Some(m) = metrics {
+        m.user_connection_opened(username.as_deref());
+        debug!(
+            "Client {} opened connection for user: {:?}",
+            client_addr, username
+        );
+    }
+}

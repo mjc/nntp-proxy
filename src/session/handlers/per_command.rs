@@ -153,30 +153,15 @@ impl ClientSession {
 
                         backend_to_client_bytes += result.bytes_written;
                         if result.authenticated {
-                            // Store username after successful authentication
-                            debug!(
-                                "Client {} authenticated as: {:?}",
-                                self.client_addr, auth_username
+                            // Handle all post-authentication logic
+                            common::on_authentication_success(
+                                self.client_addr,
+                                auth_username.clone(),
+                                &self.routing_mode,
+                                &self.metrics,
+                                self.connection_stats(),
+                                |username| self.set_username(username),
                             );
-                            self.set_username(auth_username.clone());
-
-                            // Record connection for aggregation (after auth so we have username)
-                            if let Some(stats) = self.connection_stats() {
-                                stats.record_connection(
-                                    auth_username.as_deref(),
-                                    &self.routing_mode.to_string().to_lowercase(),
-                                );
-                            }
-
-                            // Track user connection in metrics
-                            if let Some(metrics) = self.metrics.as_ref() {
-                                metrics.user_connection_opened(auth_username.as_deref());
-                                debug!(
-                                    "Client {} opened connection for user: {:?}",
-                                    self.client_addr, auth_username
-                                );
-                            }
-
                             skip_auth_check = true;
                         }
                     }
@@ -303,8 +288,6 @@ impl ClientSession {
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
-        use crate::pool::{is_connection_error, remove_from_pool};
-
         // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
         let mut buffer = self.buffer_pool.acquire().await;
 
@@ -375,38 +358,24 @@ impl ClientSession {
 
         // Return buffer to pool before handling result
 
-        // Only remove backend connection if error occurred AND we didn't get data from backend
-        // If we got data from backend, then any error is from writing to client
-        let _ = result
-            .as_ref()
-            .err()
-            .filter(|e| is_connection_error(e))
-            .inspect(|e| {
-                match got_backend_data {
-                    true => debug!(
-                        "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
-                        self.client_addr, backend_id
-                    ),
-                    false => {
-                        warn!(
-                            "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
-                            self.client_addr, backend_id, e
-                        );
-                        // Record error in metrics
-                        if let Some(ref metrics) = self.metrics {
-                            metrics.record_error(backend_id);
-                            common::record_user_error(&self.metrics, self.username().as_deref());
-                        }
-                    }
-                }
-            })
-            .filter(|_| !got_backend_data)
-            .is_some_and(|_| { remove_from_pool(pooled_conn); true });
+        // Process result using functional pipeline (handles errors, metrics, logging)
+        let (result, should_remove) = common::process_command_result(
+            &result,
+            got_backend_data,
+            backend_id,
+            self.client_addr,
+            &self.metrics,
+            self.username().as_deref(),
+        );
+
+        if should_remove {
+            crate::pool::remove_from_pool(pooled_conn);
+        }
 
         // Complete the request - decrement pending count (lock-free!)
         router.complete_command(backend_id);
 
-        result.map(|_| backend_id)
+        result
     }
 
     /// Execute a command on a backend connection and stream the response to the client
