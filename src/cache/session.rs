@@ -85,7 +85,7 @@ impl CachingSession {
                                 // Already authenticated OR auth disabled - process normally (HOT PATH)
 
                                 // Check if this is a cacheable command (article by message-ID)
-                                if matches!(NntpCommand::classify(&line), NntpCommand::ArticleByMessageId) {
+                                if matches!(NntpCommand::parse(&line), NntpCommand::ArticleByMessageId) {
                                     if let Some(message_id) = NntpResponse::extract_message_id(&line) {
                                         // Check cache first
                                         if let Some(cached) = self.cache.get(&message_id).await {
@@ -147,7 +147,7 @@ impl CachingSession {
                                 }
 
                                 // Cache if it was a cacheable command (article by message-ID)
-                                if matches!(NntpCommand::classify(&line), NntpCommand::ArticleByMessageId)
+                                if matches!(NntpCommand::parse(&line), NntpCommand::ArticleByMessageId)
                                     && let Some(message_id) = NntpResponse::extract_message_id(&line) {
                                         // Only cache successful responses (2xx) - reuse already-parsed response_code
                                         if response_code.is_success() {

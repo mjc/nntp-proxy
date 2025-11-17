@@ -211,7 +211,7 @@ impl ClientSession {
             // In hybrid mode, stateful commands trigger a switch to stateful connection
             if self.routing_mode == RoutingMode::Hybrid
                 && matches!(action, CommandAction::Reject(_))
-                && NntpCommand::classify(&command).is_stateful()
+                && NntpCommand::parse(&command).is_stateful()
             {
                 info!(
                     "Client {} switching to stateful mode (command: {})",

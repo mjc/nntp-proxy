@@ -453,7 +453,7 @@ impl NntpCommand {
         matches!(self, Self::Stateful)
     }
 
-    /// Classify an NNTP command for routing/handling strategy
+    /// Parse an NNTP command for routing/handling strategy
     ///
     /// Analyzes the command string and returns the appropriate classification
     /// for proxy routing decisions.
@@ -482,7 +482,7 @@ impl NntpCommand {
     /// commands are case-insensitive. We match against pre-computed literal
     /// variations (UPPER/lower/Title) for maximum performance.
     #[inline]
-    pub fn classify(command: &str) -> Self {
+    pub fn parse(command: &str) -> Self {
         let trimmed = command.trim();
         let bytes = trimmed.as_bytes();
 
@@ -527,7 +527,7 @@ impl NntpCommand {
         // AUTHINFO - authentication (once per connection)
         // Per [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
         if matches_any(cmd, AUTHINFO_CASES) {
-            return Self::classify_authinfo(bytes, cmd_end);
+            return Self::parse_authinfo(bytes, cmd_end);
         }
 
         // Stateless information commands (~5-10% of traffic)
@@ -578,7 +578,7 @@ impl NntpCommand {
         Self::Stateless
     }
 
-    /// Classify AUTHINFO subcommand (USER or PASS)
+    /// Parse AUTHINFO subcommand (USER or PASS)
     ///
     /// Per [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3),
     /// AUTHINFO has multiple subcommands:
@@ -588,7 +588,7 @@ impl NntpCommand {
     ///
     /// This function extracts and classifies the subcommand.
     #[inline]
-    fn classify_authinfo(bytes: &[u8], cmd_end: usize) -> Self {
+    fn parse_authinfo(bytes: &[u8], cmd_end: usize) -> Self {
         if cmd_end + 1 >= bytes.len() {
             return Self::Stateless; // AUTHINFO without args
         }
@@ -615,68 +615,59 @@ mod tests {
     fn test_nntp_command_classification() {
         // Test authentication commands
         assert_eq!(
-            NntpCommand::classify("AUTHINFO USER testuser"),
+            NntpCommand::parse("AUTHINFO USER testuser"),
             NntpCommand::AuthUser
         );
         assert_eq!(
-            NntpCommand::classify("AUTHINFO PASS testpass"),
+            NntpCommand::parse("AUTHINFO PASS testpass"),
             NntpCommand::AuthPass
         );
         assert_eq!(
-            NntpCommand::classify("  AUTHINFO USER  whitespace  "),
+            NntpCommand::parse("  AUTHINFO USER  whitespace  "),
             NntpCommand::AuthUser
         );
 
         // Test stateful commands (should be rejected)
+        assert_eq!(NntpCommand::parse("GROUP alt.test"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("NEXT"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("LAST"), NntpCommand::Stateful);
         assert_eq!(
-            NntpCommand::classify("GROUP alt.test"),
+            NntpCommand::parse("LISTGROUP alt.test"),
             NntpCommand::Stateful
         );
-        assert_eq!(NntpCommand::classify("NEXT"), NntpCommand::Stateful);
-        assert_eq!(NntpCommand::classify("LAST"), NntpCommand::Stateful);
-        assert_eq!(
-            NntpCommand::classify("LISTGROUP alt.test"),
-            NntpCommand::Stateful
-        );
-        assert_eq!(
-            NntpCommand::classify("ARTICLE 12345"),
-            NntpCommand::Stateful
-        );
-        assert_eq!(NntpCommand::classify("ARTICLE"), NntpCommand::Stateful);
-        assert_eq!(NntpCommand::classify("HEAD 67890"), NntpCommand::Stateful);
-        assert_eq!(NntpCommand::classify("STAT"), NntpCommand::Stateful);
-        assert_eq!(NntpCommand::classify("XOVER 1-100"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("ARTICLE 12345"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("ARTICLE"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("HEAD 67890"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("STAT"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("XOVER 1-100"), NntpCommand::Stateful);
 
         // Test article retrieval by message-ID (stateless - allowed)
         assert_eq!(
-            NntpCommand::classify("ARTICLE <message@example.com>"),
+            NntpCommand::parse("ARTICLE <message@example.com>"),
             NntpCommand::ArticleByMessageId
         );
         assert_eq!(
-            NntpCommand::classify("BODY <test@server.org>"),
+            NntpCommand::parse("BODY <test@server.org>"),
             NntpCommand::ArticleByMessageId
         );
         assert_eq!(
-            NntpCommand::classify("HEAD <another@example.net>"),
+            NntpCommand::parse("HEAD <another@example.net>"),
             NntpCommand::ArticleByMessageId
         );
         assert_eq!(
-            NntpCommand::classify("STAT <id@host.com>"),
+            NntpCommand::parse("STAT <id@host.com>"),
             NntpCommand::ArticleByMessageId
         );
 
         // Test stateless commands (allowed)
-        assert_eq!(NntpCommand::classify("HELP"), NntpCommand::Stateless);
-        assert_eq!(NntpCommand::classify("LIST"), NntpCommand::Stateless);
-        assert_eq!(NntpCommand::classify("DATE"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("HELP"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("LIST"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("DATE"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("CAPABILITIES"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("QUIT"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("LIST ACTIVE"), NntpCommand::Stateless);
         assert_eq!(
-            NntpCommand::classify("CAPABILITIES"),
-            NntpCommand::Stateless
-        );
-        assert_eq!(NntpCommand::classify("QUIT"), NntpCommand::Stateless);
-        assert_eq!(NntpCommand::classify("LIST ACTIVE"), NntpCommand::Stateless);
-        assert_eq!(
-            NntpCommand::classify("UNKNOWN COMMAND"),
+            NntpCommand::parse("UNKNOWN COMMAND"),
             NntpCommand::Stateless
         );
     }
@@ -684,91 +675,79 @@ mod tests {
     #[test]
     fn test_case_insensitivity() {
         // Commands should be case-insensitive per NNTP spec
-        assert_eq!(NntpCommand::classify("list"), NntpCommand::Stateless);
-        assert_eq!(NntpCommand::classify("LiSt"), NntpCommand::Stateless);
-        assert_eq!(NntpCommand::classify("QUIT"), NntpCommand::Stateless);
-        assert_eq!(NntpCommand::classify("quit"), NntpCommand::Stateless);
-        assert_eq!(
-            NntpCommand::classify("group alt.test"),
-            NntpCommand::Stateful
-        );
-        assert_eq!(
-            NntpCommand::classify("GROUP alt.test"),
-            NntpCommand::Stateful
-        );
+        assert_eq!(NntpCommand::parse("list"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("LiSt"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("QUIT"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("quit"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("group alt.test"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("GROUP alt.test"), NntpCommand::Stateful);
     }
 
     #[test]
     fn test_empty_and_whitespace_commands() {
         // Empty command
-        assert_eq!(NntpCommand::classify(""), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse(""), NntpCommand::Stateless);
 
         // Only whitespace
-        assert_eq!(NntpCommand::classify("   "), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("   "), NntpCommand::Stateless);
 
         // Tabs and spaces
-        assert_eq!(NntpCommand::classify("\t\t  "), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("\t\t  "), NntpCommand::Stateless);
     }
 
     #[test]
     fn test_malformed_authinfo_commands() {
         // AUTHINFO without USER or PASS
-        assert_eq!(NntpCommand::classify("AUTHINFO"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("AUTHINFO"), NntpCommand::Stateless);
 
         // AUTHINFO with unknown subcommand
         assert_eq!(
-            NntpCommand::classify("AUTHINFO INVALID"),
+            NntpCommand::parse("AUTHINFO INVALID"),
             NntpCommand::Stateless
         );
 
         // AUTHINFO USER without username
-        assert_eq!(
-            NntpCommand::classify("AUTHINFO USER"),
-            NntpCommand::AuthUser
-        );
+        assert_eq!(NntpCommand::parse("AUTHINFO USER"), NntpCommand::AuthUser);
 
         // AUTHINFO PASS without password
-        assert_eq!(
-            NntpCommand::classify("AUTHINFO PASS"),
-            NntpCommand::AuthPass
-        );
+        assert_eq!(NntpCommand::parse("AUTHINFO PASS"), NntpCommand::AuthPass);
     }
 
     #[test]
     fn test_article_commands_with_various_message_ids() {
         // Standard message-ID
         assert_eq!(
-            NntpCommand::classify("ARTICLE <test@example.com>"),
+            NntpCommand::parse("ARTICLE <test@example.com>"),
             NntpCommand::ArticleByMessageId
         );
 
         // Message-ID with complex domain
         assert_eq!(
-            NntpCommand::classify("ARTICLE <msg.123@news.example.co.uk>"),
+            NntpCommand::parse("ARTICLE <msg.123@news.example.co.uk>"),
             NntpCommand::ArticleByMessageId
         );
 
         // Message-ID with special characters
         assert_eq!(
-            NntpCommand::classify("ARTICLE <user+tag@domain.com>"),
+            NntpCommand::parse("ARTICLE <user+tag@domain.com>"),
             NntpCommand::ArticleByMessageId
         );
 
         // BODY with message-ID
         assert_eq!(
-            NntpCommand::classify("BODY <test@test.com>"),
+            NntpCommand::parse("BODY <test@test.com>"),
             NntpCommand::ArticleByMessageId
         );
 
         // HEAD with message-ID
         assert_eq!(
-            NntpCommand::classify("HEAD <id@host>"),
+            NntpCommand::parse("HEAD <id@host>"),
             NntpCommand::ArticleByMessageId
         );
 
         // STAT with message-ID
         assert_eq!(
-            NntpCommand::classify("STAT <msg@server>"),
+            NntpCommand::parse("STAT <msg@server>"),
             NntpCommand::ArticleByMessageId
         );
     }
@@ -776,53 +755,47 @@ mod tests {
     #[test]
     fn test_article_commands_without_message_id() {
         // ARTICLE with number (stateful - requires GROUP context)
-        assert_eq!(
-            NntpCommand::classify("ARTICLE 12345"),
-            NntpCommand::Stateful
-        );
+        assert_eq!(NntpCommand::parse("ARTICLE 12345"), NntpCommand::Stateful);
 
         // ARTICLE without argument (stateful - uses current article)
-        assert_eq!(NntpCommand::classify("ARTICLE"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("ARTICLE"), NntpCommand::Stateful);
 
         // BODY with number
-        assert_eq!(NntpCommand::classify("BODY 999"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("BODY 999"), NntpCommand::Stateful);
 
         // HEAD with number
-        assert_eq!(NntpCommand::classify("HEAD 123"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("HEAD 123"), NntpCommand::Stateful);
     }
 
     #[test]
     fn test_special_characters_in_commands() {
         // Command with newlines
-        assert_eq!(NntpCommand::classify("LIST\r\n"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("LIST\r\n"), NntpCommand::Stateless);
 
         // Command with extra whitespace
         assert_eq!(
-            NntpCommand::classify("  LIST   ACTIVE  "),
+            NntpCommand::parse("  LIST   ACTIVE  "),
             NntpCommand::Stateless
         );
 
         // Command with tabs
-        assert_eq!(
-            NntpCommand::classify("LIST\tACTIVE"),
-            NntpCommand::Stateless
-        );
+        assert_eq!(NntpCommand::parse("LIST\tACTIVE"), NntpCommand::Stateless);
     }
 
     #[test]
     fn test_very_long_commands() {
         // Very long command line
         let long_command = format!("LIST {}", "A".repeat(1000));
-        assert_eq!(NntpCommand::classify(&long_command), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse(&long_command), NntpCommand::Stateless);
 
         // Very long GROUP name
         let long_group = format!("GROUP {}", "alt.".repeat(100));
-        assert_eq!(NntpCommand::classify(&long_group), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse(&long_group), NntpCommand::Stateful);
 
         // Very long message-ID
         let long_msgid = format!("ARTICLE <{}@example.com>", "x".repeat(500));
         assert_eq!(
-            NntpCommand::classify(&long_msgid),
+            NntpCommand::parse(&long_msgid),
             NntpCommand::ArticleByMessageId
         );
     }
@@ -830,20 +803,20 @@ mod tests {
     #[test]
     fn test_list_command_variations() {
         // LIST without arguments
-        assert_eq!(NntpCommand::classify("LIST"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("LIST"), NntpCommand::Stateless);
 
         // LIST ACTIVE
-        assert_eq!(NntpCommand::classify("LIST ACTIVE"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("LIST ACTIVE"), NntpCommand::Stateless);
 
         // LIST NEWSGROUPS
         assert_eq!(
-            NntpCommand::classify("LIST NEWSGROUPS"),
+            NntpCommand::parse("LIST NEWSGROUPS"),
             NntpCommand::Stateless
         );
 
         // LIST OVERVIEW.FMT
         assert_eq!(
-            NntpCommand::classify("LIST OVERVIEW.FMT"),
+            NntpCommand::parse("LIST OVERVIEW.FMT"),
             NntpCommand::Stateless
         );
     }
@@ -851,17 +824,17 @@ mod tests {
     #[test]
     fn test_boundary_conditions() {
         // Single character command
-        assert_eq!(NntpCommand::classify("X"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("X"), NntpCommand::Stateless);
 
         // Command that looks like message-ID but isn't
         assert_eq!(
-            NntpCommand::classify("NOTARTICLE <test@example.com>"),
+            NntpCommand::parse("NOTARTICLE <test@example.com>"),
             NntpCommand::Stateless
         );
 
         // Message-ID without angle brackets (not valid, treated as number)
         assert_eq!(
-            NntpCommand::classify("ARTICLE test@example.com"),
+            NntpCommand::parse("ARTICLE test@example.com"),
             NntpCommand::Stateful
         );
     }
@@ -869,42 +842,36 @@ mod tests {
     #[test]
     fn test_non_routable_commands() {
         // POST command - cannot be routed per-command
-        assert_eq!(NntpCommand::classify("POST"), NntpCommand::NonRoutable);
+        assert_eq!(NntpCommand::parse("POST"), NntpCommand::NonRoutable);
 
         // IHAVE command - cannot be routed per-command
         assert_eq!(
-            NntpCommand::classify("IHAVE <test@example.com>"),
+            NntpCommand::parse("IHAVE <test@example.com>"),
             NntpCommand::NonRoutable
         );
 
         // NEWGROUPS command - cannot be routed per-command
         assert_eq!(
-            NntpCommand::classify("NEWGROUPS 20240101 000000 GMT"),
+            NntpCommand::parse("NEWGROUPS 20240101 000000 GMT"),
             NntpCommand::NonRoutable
         );
 
         // NEWNEWS command - cannot be routed per-command
         assert_eq!(
-            NntpCommand::classify("NEWNEWS * 20240101 000000 GMT"),
+            NntpCommand::parse("NEWNEWS * 20240101 000000 GMT"),
             NntpCommand::NonRoutable
         );
     }
 
     #[test]
     fn test_non_routable_case_insensitive() {
-        assert_eq!(NntpCommand::classify("post"), NntpCommand::NonRoutable);
+        assert_eq!(NntpCommand::parse("post"), NntpCommand::NonRoutable);
 
-        assert_eq!(NntpCommand::classify("Post"), NntpCommand::NonRoutable);
+        assert_eq!(NntpCommand::parse("Post"), NntpCommand::NonRoutable);
 
-        assert_eq!(
-            NntpCommand::classify("IHAVE <msg>"),
-            NntpCommand::NonRoutable
-        );
+        assert_eq!(NntpCommand::parse("IHAVE <msg>"), NntpCommand::NonRoutable);
 
-        assert_eq!(
-            NntpCommand::classify("ihave <msg>"),
-            NntpCommand::NonRoutable
-        );
+        assert_eq!(NntpCommand::parse("ihave <msg>"), NntpCommand::NonRoutable);
     }
 
     #[test]
@@ -920,138 +887,138 @@ mod tests {
         assert!(!NntpCommand::NonRoutable.is_stateful());
 
         // Test with classified commands
-        assert!(NntpCommand::classify("GROUP alt.test").is_stateful());
-        assert!(NntpCommand::classify("XOVER 1-100").is_stateful());
-        assert!(NntpCommand::classify("ARTICLE 123").is_stateful());
-        assert!(!NntpCommand::classify("ARTICLE <msg@example.com>").is_stateful());
-        assert!(!NntpCommand::classify("LIST").is_stateful());
-        assert!(!NntpCommand::classify("AUTHINFO USER test").is_stateful());
+        assert!(NntpCommand::parse("GROUP alt.test").is_stateful());
+        assert!(NntpCommand::parse("XOVER 1-100").is_stateful());
+        assert!(NntpCommand::parse("ARTICLE 123").is_stateful());
+        assert!(!NntpCommand::parse("ARTICLE <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::parse("LIST").is_stateful());
+        assert!(!NntpCommand::parse("AUTHINFO USER test").is_stateful());
     }
 
     #[test]
     fn test_comprehensive_stateful_commands() {
         // All GROUP command variants are stateful
-        assert!(NntpCommand::classify("GROUP alt.test").is_stateful());
-        assert!(NntpCommand::classify("group comp.lang.rust").is_stateful());
-        assert!(NntpCommand::classify("Group misc.test").is_stateful());
+        assert!(NntpCommand::parse("GROUP alt.test").is_stateful());
+        assert!(NntpCommand::parse("group comp.lang.rust").is_stateful());
+        assert!(NntpCommand::parse("Group misc.test").is_stateful());
 
         // All XOVER variants are stateful
-        assert!(NntpCommand::classify("XOVER 1-100").is_stateful());
-        assert!(NntpCommand::classify("xover 50-75").is_stateful());
-        assert!(NntpCommand::classify("Xover 200").is_stateful());
-        assert!(NntpCommand::classify("XOVER").is_stateful()); // Without range
+        assert!(NntpCommand::parse("XOVER 1-100").is_stateful());
+        assert!(NntpCommand::parse("xover 50-75").is_stateful());
+        assert!(NntpCommand::parse("Xover 200").is_stateful());
+        assert!(NntpCommand::parse("XOVER").is_stateful()); // Without range
 
         // OVER command variants (same as XOVER)
-        assert!(NntpCommand::classify("OVER 1-100").is_stateful());
-        assert!(NntpCommand::classify("over 50-75").is_stateful());
-        assert!(NntpCommand::classify("Over 200").is_stateful());
+        assert!(NntpCommand::parse("OVER 1-100").is_stateful());
+        assert!(NntpCommand::parse("over 50-75").is_stateful());
+        assert!(NntpCommand::parse("Over 200").is_stateful());
 
         // XHDR/HDR commands are stateful
-        assert!(NntpCommand::classify("XHDR subject 1-100").is_stateful());
-        assert!(NntpCommand::classify("xhdr from 50-75").is_stateful());
-        assert!(NntpCommand::classify("HDR message-id 1-10").is_stateful());
-        assert!(NntpCommand::classify("hdr references 100").is_stateful());
+        assert!(NntpCommand::parse("XHDR subject 1-100").is_stateful());
+        assert!(NntpCommand::parse("xhdr from 50-75").is_stateful());
+        assert!(NntpCommand::parse("HDR message-id 1-10").is_stateful());
+        assert!(NntpCommand::parse("hdr references 100").is_stateful());
 
         // Navigation commands are stateful
-        assert!(NntpCommand::classify("NEXT").is_stateful());
-        assert!(NntpCommand::classify("next").is_stateful());
-        assert!(NntpCommand::classify("Next").is_stateful());
-        assert!(NntpCommand::classify("LAST").is_stateful());
-        assert!(NntpCommand::classify("last").is_stateful());
-        assert!(NntpCommand::classify("Last").is_stateful());
+        assert!(NntpCommand::parse("NEXT").is_stateful());
+        assert!(NntpCommand::parse("next").is_stateful());
+        assert!(NntpCommand::parse("Next").is_stateful());
+        assert!(NntpCommand::parse("LAST").is_stateful());
+        assert!(NntpCommand::parse("last").is_stateful());
+        assert!(NntpCommand::parse("Last").is_stateful());
 
         // LISTGROUP is stateful
-        assert!(NntpCommand::classify("LISTGROUP alt.test").is_stateful());
-        assert!(NntpCommand::classify("listgroup comp.lang.rust").is_stateful());
-        assert!(NntpCommand::classify("Listgroup misc.test 1-100").is_stateful());
+        assert!(NntpCommand::parse("LISTGROUP alt.test").is_stateful());
+        assert!(NntpCommand::parse("listgroup comp.lang.rust").is_stateful());
+        assert!(NntpCommand::parse("Listgroup misc.test 1-100").is_stateful());
 
         // Article by number commands are stateful (require current group context)
-        assert!(NntpCommand::classify("ARTICLE 123").is_stateful());
-        assert!(NntpCommand::classify("article 456").is_stateful());
-        assert!(NntpCommand::classify("Article 789").is_stateful());
-        assert!(NntpCommand::classify("HEAD 123").is_stateful());
-        assert!(NntpCommand::classify("head 456").is_stateful());
-        assert!(NntpCommand::classify("Head 789").is_stateful());
-        assert!(NntpCommand::classify("BODY 123").is_stateful());
-        assert!(NntpCommand::classify("body 456").is_stateful());
-        assert!(NntpCommand::classify("Body 789").is_stateful());
-        assert!(NntpCommand::classify("STAT 123").is_stateful());
-        assert!(NntpCommand::classify("stat 456").is_stateful());
-        assert!(NntpCommand::classify("Stat 789").is_stateful());
+        assert!(NntpCommand::parse("ARTICLE 123").is_stateful());
+        assert!(NntpCommand::parse("article 456").is_stateful());
+        assert!(NntpCommand::parse("Article 789").is_stateful());
+        assert!(NntpCommand::parse("HEAD 123").is_stateful());
+        assert!(NntpCommand::parse("head 456").is_stateful());
+        assert!(NntpCommand::parse("Head 789").is_stateful());
+        assert!(NntpCommand::parse("BODY 123").is_stateful());
+        assert!(NntpCommand::parse("body 456").is_stateful());
+        assert!(NntpCommand::parse("Body 789").is_stateful());
+        assert!(NntpCommand::parse("STAT 123").is_stateful());
+        assert!(NntpCommand::parse("stat 456").is_stateful());
+        assert!(NntpCommand::parse("Stat 789").is_stateful());
     }
 
     #[test]
     fn test_comprehensive_stateless_commands() {
         // Article by message-ID commands are stateless
-        assert!(!NntpCommand::classify("ARTICLE <msg@example.com>").is_stateful());
-        assert!(!NntpCommand::classify("article <test@test.com>").is_stateful());
-        assert!(!NntpCommand::classify("Article <foo@bar.net>").is_stateful());
-        assert!(!NntpCommand::classify("HEAD <msg@example.com>").is_stateful());
-        assert!(!NntpCommand::classify("head <test@test.com>").is_stateful());
-        assert!(!NntpCommand::classify("BODY <msg@example.com>").is_stateful());
-        assert!(!NntpCommand::classify("body <test@test.com>").is_stateful());
-        assert!(!NntpCommand::classify("STAT <msg@example.com>").is_stateful());
-        assert!(!NntpCommand::classify("stat <test@test.com>").is_stateful());
+        assert!(!NntpCommand::parse("ARTICLE <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::parse("article <test@test.com>").is_stateful());
+        assert!(!NntpCommand::parse("Article <foo@bar.net>").is_stateful());
+        assert!(!NntpCommand::parse("HEAD <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::parse("head <test@test.com>").is_stateful());
+        assert!(!NntpCommand::parse("BODY <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::parse("body <test@test.com>").is_stateful());
+        assert!(!NntpCommand::parse("STAT <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::parse("stat <test@test.com>").is_stateful());
 
         // LIST commands are stateless
-        assert!(!NntpCommand::classify("LIST").is_stateful());
-        assert!(!NntpCommand::classify("list").is_stateful());
-        assert!(!NntpCommand::classify("List").is_stateful());
-        assert!(!NntpCommand::classify("LIST ACTIVE").is_stateful());
-        assert!(!NntpCommand::classify("LIST NEWSGROUPS").is_stateful());
-        assert!(!NntpCommand::classify("list active alt.*").is_stateful());
+        assert!(!NntpCommand::parse("LIST").is_stateful());
+        assert!(!NntpCommand::parse("list").is_stateful());
+        assert!(!NntpCommand::parse("List").is_stateful());
+        assert!(!NntpCommand::parse("LIST ACTIVE").is_stateful());
+        assert!(!NntpCommand::parse("LIST NEWSGROUPS").is_stateful());
+        assert!(!NntpCommand::parse("list active alt.*").is_stateful());
 
         // Metadata commands are stateless
-        assert!(!NntpCommand::classify("DATE").is_stateful());
-        assert!(!NntpCommand::classify("date").is_stateful());
-        assert!(!NntpCommand::classify("CAPABILITIES").is_stateful());
-        assert!(!NntpCommand::classify("capabilities").is_stateful());
-        assert!(!NntpCommand::classify("HELP").is_stateful());
-        assert!(!NntpCommand::classify("help").is_stateful());
-        assert!(!NntpCommand::classify("QUIT").is_stateful());
-        assert!(!NntpCommand::classify("quit").is_stateful());
+        assert!(!NntpCommand::parse("DATE").is_stateful());
+        assert!(!NntpCommand::parse("date").is_stateful());
+        assert!(!NntpCommand::parse("CAPABILITIES").is_stateful());
+        assert!(!NntpCommand::parse("capabilities").is_stateful());
+        assert!(!NntpCommand::parse("HELP").is_stateful());
+        assert!(!NntpCommand::parse("help").is_stateful());
+        assert!(!NntpCommand::parse("QUIT").is_stateful());
+        assert!(!NntpCommand::parse("quit").is_stateful());
 
         // Authentication commands are stateless (handled locally)
-        assert!(!NntpCommand::classify("AUTHINFO USER testuser").is_stateful());
-        assert!(!NntpCommand::classify("authinfo user test").is_stateful());
-        assert!(!NntpCommand::classify("AUTHINFO PASS testpass").is_stateful());
-        assert!(!NntpCommand::classify("authinfo pass secret").is_stateful());
+        assert!(!NntpCommand::parse("AUTHINFO USER testuser").is_stateful());
+        assert!(!NntpCommand::parse("authinfo user test").is_stateful());
+        assert!(!NntpCommand::parse("AUTHINFO PASS testpass").is_stateful());
+        assert!(!NntpCommand::parse("authinfo pass secret").is_stateful());
 
         // Posting commands are stateless (not group-dependent)
-        assert!(!NntpCommand::classify("POST").is_stateful());
-        assert!(!NntpCommand::classify("post").is_stateful());
-        assert!(!NntpCommand::classify("IHAVE <msg@example.com>").is_stateful());
-        assert!(!NntpCommand::classify("ihave <test@test.com>").is_stateful());
+        assert!(!NntpCommand::parse("POST").is_stateful());
+        assert!(!NntpCommand::parse("post").is_stateful());
+        assert!(!NntpCommand::parse("IHAVE <msg@example.com>").is_stateful());
+        assert!(!NntpCommand::parse("ihave <test@test.com>").is_stateful());
     }
 
     #[test]
     fn test_edge_cases_for_stateful_detection() {
         // Empty article number should still be stateful (current article)
-        assert!(NntpCommand::classify("ARTICLE").is_stateful());
-        assert!(NntpCommand::classify("HEAD").is_stateful());
-        assert!(NntpCommand::classify("BODY").is_stateful());
-        assert!(NntpCommand::classify("STAT").is_stateful());
+        assert!(NntpCommand::parse("ARTICLE").is_stateful());
+        assert!(NntpCommand::parse("HEAD").is_stateful());
+        assert!(NntpCommand::parse("BODY").is_stateful());
+        assert!(NntpCommand::parse("STAT").is_stateful());
 
         // Commands with extra whitespace
-        assert!(NntpCommand::classify("GROUP  alt.test").is_stateful());
-        assert!(NntpCommand::classify("XOVER   1-100").is_stateful());
-        assert!(!NntpCommand::classify("LIST  ACTIVE").is_stateful());
+        assert!(NntpCommand::parse("GROUP  alt.test").is_stateful());
+        assert!(NntpCommand::parse("XOVER   1-100").is_stateful());
+        assert!(!NntpCommand::parse("LIST  ACTIVE").is_stateful());
 
         // Mixed case commands - classifier may not support all permutations
         // Only test the explicitly supported case variants
-        assert!(NntpCommand::classify("Group alt.test").is_stateful());
-        assert!(NntpCommand::classify("Xover 1-100").is_stateful());
-        assert!(!NntpCommand::classify("List").is_stateful());
+        assert!(NntpCommand::parse("Group alt.test").is_stateful());
+        assert!(NntpCommand::parse("Xover 1-100").is_stateful());
+        assert!(!NntpCommand::parse("List").is_stateful());
 
         // Article commands - distinguish by argument format
-        assert!(NntpCommand::classify("ARTICLE 12345").is_stateful()); // Number = stateful
-        assert!(!NntpCommand::classify("ARTICLE <12345@example.com>").is_stateful()); // Message-ID = stateless
+        assert!(NntpCommand::parse("ARTICLE 12345").is_stateful()); // Number = stateful
+        assert!(!NntpCommand::parse("ARTICLE <12345@example.com>").is_stateful()); // Message-ID = stateless
 
         // Ensure message-IDs with various formats are detected as stateless
-        assert!(!NntpCommand::classify("ARTICLE <a.b.c@example.com>").is_stateful());
-        assert!(!NntpCommand::classify("ARTICLE <123.456.789@server.net>").is_stateful());
+        assert!(!NntpCommand::parse("ARTICLE <a.b.c@example.com>").is_stateful());
+        assert!(!NntpCommand::parse("ARTICLE <123.456.789@server.net>").is_stateful());
         assert!(
-            !NntpCommand::classify("HEAD <very-long-message-id@domain.example.org>").is_stateful()
+            !NntpCommand::parse("HEAD <very-long-message-id@domain.example.org>").is_stateful()
         );
     }
 }

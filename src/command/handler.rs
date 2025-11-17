@@ -47,7 +47,7 @@ pub struct CommandHandler;
 impl CommandHandler {
     /// Process a command and return the action to take
     pub fn handle_command(command: &str) -> CommandAction {
-        match NntpCommand::classify(command) {
+        match NntpCommand::parse(command) {
             NntpCommand::AuthUser => {
                 // Extract username from "AUTHINFO USER <username>"
                 let username = command

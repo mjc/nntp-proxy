@@ -25,7 +25,7 @@ macro_rules! bench_command {
 
             #[divan::bench(name = "classifier", sample_count = 1000, sample_size = 100)]
             fn classifier(bencher: Bencher) {
-                bencher.bench(|| black_box(NntpCommand::classify(black_box($command))));
+                bencher.bench(|| black_box(NntpCommand::parse(black_box($command))));
             }
         }
     };
@@ -142,7 +142,7 @@ mod realistic_workload {
             .counter(divan::counter::ItemsCount::new(COMMANDS.len()))
             .bench(|| {
                 for cmd in COMMANDS {
-                    black_box(NntpCommand::classify(black_box(cmd)));
+                    black_box(NntpCommand::parse(black_box(cmd)));
                 }
             });
     }

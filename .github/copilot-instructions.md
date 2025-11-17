@@ -102,7 +102,7 @@ Client → Proxy (Routing Logic) → Backend Pool → Backend Server(s)
 2. Proxy sends greeting
 3. Start in per-command mode
 4. For each command:
-   a. Classify command (stateful vs stateless)
+   a. Parse command (stateful vs stateless)
    b. If stateless → route per-command
    c. If stateful → switch to dedicated backend
 5. Once switched, remain in stateful mode
@@ -268,7 +268,7 @@ fn connect(host: HostName, port: Port) -> Result<()> { ... }
 ```rust
 // classifier.rs - 70%+ of all NNTP traffic
 impl NntpCommand {
-    pub fn classify(command: &str) -> Self {
+    pub fn parse(command: &str) -> Self {
         // Direct byte comparisons, no allocations
         let bytes = command.as_bytes();
         
@@ -595,7 +595,7 @@ debug!("Processing {}", cmd); // OK: Filtered out in production
 /// - Zero allocations
 /// - SIMD-friendly byte comparisons
 /// - Branch prediction optimized (UPPERCASE first)
-pub fn classify(command: &str) -> Self {
+pub fn parse(command: &str) -> Self {
     let bytes = command.as_bytes();
     
     // Fast path: Check for message-ID (70%+ hit rate)
@@ -845,7 +845,7 @@ pub fn create_test_config() -> Config {
 ```rust
 #[test]
 fn test_article_by_message_id() {
-    let cmd = NntpCommand::classify("ARTICLE <test@example.com>");
+    let cmd = NntpCommand::parse("ARTICLE <test@example.com>");
     assert_eq!(cmd, NntpCommand::ArticleByMessageId);
     assert!(!cmd.is_stateful());
 }
@@ -854,7 +854,7 @@ fn test_article_by_message_id() {
 fn test_stateful_commands() {
     let commands = vec!["GROUP alt.test", "NEXT", "LAST", "XOVER 1-100"];
     for cmd in commands {
-        let classified = NntpCommand::classify(cmd);
+        let classified = NntpCommand::parse(cmd);
         assert!(classified.is_stateful(), "Command '{}' should be stateful", cmd);
     }
 }
@@ -1005,7 +1005,7 @@ use divan::Bencher;
 #[divan::bench]
 fn classify_article_command(bencher: Bencher) {
     bencher.bench(|| {
-        NntpCommand::classify("ARTICLE <msg@example.com>")
+        NntpCommand::parse("ARTICLE <msg@example.com>")
     });
 }
 
@@ -1089,7 +1089,7 @@ command_cases!(
 );
 
 // Add to classify() function
-pub fn classify(command: &str) -> Self {
+pub fn parse(command: &str) -> Self {
     // ... existing code
     
     if matches_any(cmd, NEWCMD_CASES) {
@@ -1113,7 +1113,7 @@ pub enum NntpCommand {
 
 impl CommandHandler {
     pub fn handle_command(command: &str) -> CommandAction {
-        match NntpCommand::classify(command) {
+        match NntpCommand::parse(command) {
             // ... existing cases
             NntpCommand::NewCommand => CommandAction::ForwardStateless,
         }
@@ -1127,7 +1127,7 @@ impl CommandHandler {
 #[test]
 fn test_new_command_classification() {
     assert_eq!(
-        NntpCommand::classify("NEWCMD"),
+        NntpCommand::parse("NEWCMD"),
         NntpCommand::NewCommand
     );
 }

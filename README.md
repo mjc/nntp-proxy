@@ -573,7 +573,7 @@ Send Greeting (200 NNTP Proxy Ready)
     ↓
 Read Command
     ↓
-Classify Command (is_stateful check)
+Parse Command (is_stateful check)
     ↓
 ┌─ Stateless Command ─────┐    ┌─ Stateful Command ────┐
 │  Route to Backend       │    │  Switch to Stateful   │
@@ -608,7 +608,7 @@ Send Greeting (200 NNTP Proxy Ready)
     ↓
 Read Command
     ↓
-Classify Command (protocol/command.rs)
+Parse Command (protocol/command.rs)
     ↓
 Route to Healthy Backend (round-robin)
     ↓
