@@ -1,6 +1,6 @@
 //! Standard 1:1 routing mode handler
 
-use crate::session::ClientSession;
+use crate::session::{ClientSession, common};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -253,24 +253,11 @@ impl ClientSession {
             }
 
             // Track final per-user metrics
-            if let Some(username) = self.username() {
-                if delta_c2b > 0 {
-                    metrics.user_bytes_sent(Some(&username), delta_c2b);
-                }
-                if delta_b2c > 0 {
-                    metrics.user_bytes_received(Some(&username), delta_b2c);
-                }
-                metrics.user_connection_closed(Some(&username));
-            } else {
-                // Anonymous user
-                if delta_c2b > 0 {
-                    metrics.user_bytes_sent(None, delta_c2b);
-                }
-                if delta_b2c > 0 {
-                    metrics.user_bytes_received(None, delta_b2c);
-                }
-                metrics.user_connection_closed(None);
+            let username = self.username();
+            if delta_c2b > 0 || delta_b2c > 0 {
+                common::record_user_bytes(&self.metrics, username.as_deref(), delta_c2b, delta_b2c);
             }
+            common::close_user_connection(&self.metrics, username.as_deref());
         }
 
         Ok(TransferMetrics {

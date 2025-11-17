@@ -49,25 +49,6 @@ pub(crate) fn extract_message_id(command: &str) -> Option<&str> {
 }
 
 /// Handle AUTHINFO command and update auth state
-///
-/// This function encapsulates the common auth handling logic used across
-/// all routing modes. It:
-/// 1. Stores username if AUTHINFO USER command
-/// 2. Calls the auth handler to process the command
-/// 3. Updates the authenticated flag on success
-/// 4. Returns bytes written and success status
-///
-/// # Arguments
-///
-/// * `auth_handler` - The authentication handler to use
-/// * `auth_action` - The parsed auth action from command classification
-/// * `client_write` - Write half of client connection for responses
-/// * `auth_username` - Mutable reference to Option<String> that stores username between USER and PASS
-/// * `authenticated` - AtomicBool flag to set when auth succeeds
-///
-/// # Returns
-///
-/// `AuthResult` containing bytes written and whether authentication succeeded
 pub(crate) async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction,
@@ -78,12 +59,10 @@ pub(crate) async fn handle_auth_command<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    // Store username if this is AUTHINFO USER
     if let AuthAction::RequestPassword(ref username) = auth_action {
         *auth_username = Some(username.clone());
     }
 
-    // Handle auth and validate
     let (bytes, auth_success) = auth_handler
         .handle_auth_command(auth_action, client_write, auth_username.as_deref())
         .await?;
@@ -94,16 +73,10 @@ where
 
     let mut bytes_written = BytesTransferred::zero();
     bytes_written.add(bytes);
-
     Ok(AuthResult::new(bytes_written, auth_success))
 }
 
-/// Check if command is QUIT and send closing response if so
-///
-/// # Returns
-///
-/// `QuitStatus::Quit(bytes)` if QUIT was detected and response sent
-/// `QuitStatus::Continue` if not a QUIT command
+/// Check if command is QUIT and send closing response
 pub(crate) async fn handle_quit_command<W>(
     command: &str,
     client_write: &mut W,
@@ -130,8 +103,6 @@ where
 }
 
 /// Record user command metrics if metrics are enabled
-///
-/// Functional helper that encapsulates the option-checking pattern
 #[inline]
 pub(crate) fn record_user_command(
     metrics: &Option<crate::metrics::MetricsCollector>,
@@ -143,8 +114,6 @@ pub(crate) fn record_user_command(
 }
 
 /// Record user error metrics if metrics are enabled
-///
-/// Functional helper that encapsulates the option-checking pattern
 #[inline]
 pub(crate) fn record_user_error(
     metrics: &Option<crate::metrics::MetricsCollector>,
@@ -156,8 +125,6 @@ pub(crate) fn record_user_error(
 }
 
 /// Record user byte transfer metrics if metrics are enabled
-///
-/// Functional helper that records both sent and received bytes
 #[inline]
 pub(crate) fn record_user_bytes(
     metrics: &Option<crate::metrics::MetricsCollector>,
@@ -173,101 +140,34 @@ pub(crate) fn record_user_bytes(
 
 /// Handle backend connection error with appropriate logging and metrics
 ///
-/// Returns true if connection should be removed from pool
-#[must_use]
-pub(crate) fn handle_backend_error(
-    error: &anyhow::Error,
-    got_backend_data: bool,
-    backend_id: crate::types::BackendId,
-    client_addr: std::net::SocketAddr,
+/// Close user connection in metrics if enabled
+#[inline]
+pub(crate) fn close_user_connection(
     metrics: &Option<crate::metrics::MetricsCollector>,
     username: Option<&str>,
-) -> bool {
-    use crate::pool::is_connection_error;
-    use tracing::{debug, warn};
-
-    if !is_connection_error(error) {
-        return false;
-    }
-
-    match got_backend_data {
-        true => {
-            debug!(
-                "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
-                client_addr, backend_id
-            );
-            false // Don't remove - client disconnect, not backend issue
-        }
-        false => {
-            warn!(
-                "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
-                client_addr, backend_id, error
-            );
-            // Record error in metrics
-            if let Some(m) = metrics {
-                m.record_error(backend_id);
-                record_user_error(metrics, username);
-            }
-            true // Remove from pool - backend issue
-        }
+) {
+    if let Some(m) = metrics {
+        m.user_connection_closed(username);
     }
 }
 
-/// Process command execution result using functional pipeline
-///
-/// Returns (Result mapped to backend_id, should_remove_from_pool)
+/// Log session summary for debugging
 #[inline]
-pub(crate) fn process_command_result(
-    result: &Result<(), anyhow::Error>,
-    got_backend_data: bool,
-    backend_id: crate::types::BackendId,
+pub(crate) fn log_session_summary(
     client_addr: std::net::SocketAddr,
-    metrics: &Option<crate::metrics::MetricsCollector>,
-    username: Option<&str>,
-) -> (Result<crate::types::BackendId, anyhow::Error>, bool) {
-    let should_remove = handle_backend_error_and_cleanup(
-        result,
-        got_backend_data,
-        backend_id,
-        client_addr,
-        metrics,
-        username,
-    );
+    client_to_backend: u64,
+    backend_to_client: u64,
+) {
+    use tracing::debug;
 
-    let result_mapped = result
-        .as_ref()
-        .map(|_| backend_id)
-        .map_err(|e| anyhow::anyhow!("{}", e));
-
-    (result_mapped, should_remove)
-}
-
-/// Handle backend error and remove connection if needed
-///
-/// Separate function to handle the pool removal properly
-#[inline]
-pub(crate) fn handle_backend_error_and_cleanup(
-    result: &Result<(), anyhow::Error>,
-    got_backend_data: bool,
-    backend_id: crate::types::BackendId,
-    client_addr: std::net::SocketAddr,
-    metrics: &Option<crate::metrics::MetricsCollector>,
-    username: Option<&str>,
-) -> bool {
-    result
-        .as_ref()
-        .err()
-        .map(|e| {
-            handle_backend_error(
-                e,
-                got_backend_data,
-                backend_id,
-                client_addr,
-                metrics,
-                username,
-            )
-        })
-        .unwrap_or(false)
+    if (client_to_backend + backend_to_client) < SMALL_TRANSFER_THRESHOLD {
+        debug!(
+            "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
+            client_addr,
+            crate::formatting::format_bytes(client_to_backend),
+            crate::formatting::format_bytes(backend_to_client)
+        );
+    }
 }
 
 /// Handle successful authentication with all side effects

@@ -249,26 +249,13 @@ impl ClientSession {
             }
         }
 
-        // Log session summary for debugging, especially useful for test connections
-        if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
-            < common::SMALL_TRANSFER_THRESHOLD
-        {
-            debug!(
-                "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
-                self.client_addr,
-                crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
-                crate::formatting::format_bytes(backend_to_client_bytes.as_u64())
-            );
-        }
-
-        // Close user connection in metrics
-        if let Some(metrics) = self.metrics.as_ref() {
-            if let Some(username) = self.username() {
-                metrics.user_connection_closed(Some(&username));
-            } else {
-                metrics.user_connection_closed(None);
-            }
-        }
+        // Log session summary and close user connection
+        common::log_session_summary(
+            self.client_addr,
+            client_to_backend_bytes.as_u64(),
+            backend_to_client_bytes.as_u64(),
+        );
+        common::close_user_connection(&self.metrics, self.username().as_deref());
 
         Ok(TransferMetrics {
             client_to_backend: client_to_backend_bytes,
@@ -356,26 +343,32 @@ impl ClientSession {
             );
         }
 
-        // Return buffer to pool before handling result
+        // Handle errors and cleanup
+        let final_result = result
+            .as_ref()
+            .map(|_| backend_id)
+            .map_err(|e| anyhow::anyhow!("{}", e));
 
-        // Process result using functional pipeline (handles errors, metrics, logging)
-        let (result, should_remove) = common::process_command_result(
-            &result,
-            got_backend_data,
-            backend_id,
-            self.client_addr,
-            &self.metrics,
-            self.username().as_deref(),
-        );
-
-        if should_remove {
+        // Remove from pool if backend error (not client disconnect)
+        if let Err(e) = &result
+            && crate::pool::is_connection_error(e)
+            && !got_backend_data
+        {
+            warn!(
+                "Backend connection error for client {}, backend {:?}: {} - removing from pool",
+                self.client_addr, backend_id, e
+            );
+            if let Some(ref metrics) = self.metrics {
+                metrics.record_error(backend_id);
+                common::record_user_error(&self.metrics, self.username().as_deref());
+            }
             crate::pool::remove_from_pool(pooled_conn);
         }
 
         // Complete the request - decrement pending count (lock-free!)
         router.complete_command(backend_id);
 
-        result
+        final_result
     }
 
     /// Execute a command on a backend connection and stream the response to the client
