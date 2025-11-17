@@ -46,38 +46,12 @@ impl ClientSession {
         // Auth state: username from AUTHINFO USER command
         let mut auth_username: Option<String> = None;
 
-        // Send initial greeting to client and flush immediately
-        // This ensures the client receives the greeting before we start reading commands
-        debug!(
-            "Client {} sending greeting: {} | hex: {:02x?}",
-            self.client_addr,
-            String::from_utf8_lossy(PROXY_GREETING_PCR),
-            PROXY_GREETING_PCR
-        );
-
-        if let Err(e) = client_write.write_all(PROXY_GREETING_PCR).await {
-            debug!(
-                "Client {} failed to send greeting: {} (kind: {:?}). \
-                 This suggests the client disconnected immediately after connecting.",
-                self.client_addr,
-                e,
-                e.kind()
-            );
-            return Err(e.into());
-        }
-
-        if let Err(e) = client_write.flush().await {
-            debug!(
-                "Client {} failed to flush greeting: {} (kind: {:?})",
-                self.client_addr,
-                e,
-                e.kind()
-            );
-            return Err(e.into());
-        }
+        // Send initial greeting to client
+        client_write.write_all(PROXY_GREETING_PCR).await?;
+        client_write.flush().await?;
 
         debug!(
-            "Client {} sent greeting successfully, entering command loop",
+            "Client {} sent greeting, entering command loop",
             self.client_addr
         );
 
@@ -115,24 +89,13 @@ impl ClientSession {
             client_to_backend_bytes.add(n);
             let trimmed = command.trim();
 
-            debug!(
-                "Client {} received command ({} bytes): {} | hex: {:02x?}",
-                self.client_addr,
-                n,
-                trimmed,
-                command.as_bytes()
-            );
-
             // Handle QUIT locally
             match common::handle_quit_command(&command, &mut client_write).await? {
                 common::QuitStatus::Quit(bytes) => {
                     backend_to_client_bytes += bytes;
-                    debug!("Client {} sent QUIT, closing connection", self.client_addr);
                     break;
                 }
-                common::QuitStatus::Continue => {
-                    // Not a QUIT, continue processing
-                }
+                common::QuitStatus::Continue => {}
             }
 
             let action = CommandHandler::classify(&command);
@@ -281,22 +244,10 @@ impl ClientSession {
         // Route the command to get a backend (lock-free!)
         let backend_id = router.route_command(self.client_id, command)?;
 
-        debug!(
-            "Client {} routed command to backend {:?}: {}",
-            self.client_addr,
-            backend_id,
-            command.trim()
-        );
-
         // Get a connection from the router's backend pool
         let Some(provider) = router.backend_provider(backend_id) else {
             anyhow::bail!("Backend {:?} not found", backend_id);
         };
-
-        debug!(
-            "Client {} getting pooled connection for backend {:?}",
-            self.client_addr, backend_id
-        );
 
         let mut pooled_conn = provider.get_pooled_connection().await?;
 
@@ -455,25 +406,6 @@ impl ClientSession {
 
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
-            let log_msg = if let Some(id) = msgid {
-                format!(
-                    "Client {} ARTICLE {} → multiline ({:?}), streaming {}",
-                    self.client_addr,
-                    id,
-                    _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64)
-                )
-            } else {
-                format!(
-                    "Client {} '{}' → multiline ({:?}), streaming {}",
-                    self.client_addr,
-                    command.trim(),
-                    _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64)
-                )
-            };
-            debug!("{}", log_msg);
-
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
@@ -497,61 +429,17 @@ impl ClientSession {
             }
         } else {
             // Single-line response - just write the first chunk
-            let log_msg = if let Some(id) = msgid {
-                // 223 (No such article number), 430 (No such article), and other 4xx/5xx errors are expected single-line responses
-                if let Some(code) = _response_code.status_code() {
-                    let raw_code = code.as_u16();
-                    if raw_code == 223 || (400..600).contains(&raw_code) {
-                        format!(
-                            "Client {} ARTICLE {} → error {} (single-line), writing {}",
-                            self.client_addr,
-                            id,
-                            code,
-                            crate::formatting::format_bytes(n as u64)
-                        )
-                    } else {
-                        format!(
-                            "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
-                            self.client_addr,
-                            id,
-                            _response_code.status_code(),
-                            crate::formatting::format_bytes(n as u64),
-                            &chunk_buffer[..n.min(50)]
-                        )
-                    }
-                } else {
-                    format!(
-                        "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
-                        self.client_addr,
-                        id,
-                        _response_code.status_code(),
-                        crate::formatting::format_bytes(n as u64),
-                        &chunk_buffer[..n.min(50)]
-                    )
-                }
-            } else {
-                format!(
-                    "Client {} '{}' → single-line ({:?}), writing {}: {:02x?}",
-                    self.client_addr,
-                    command.trim(),
-                    _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64),
-                    &chunk_buffer[..n.min(50)]
-                )
-            };
-
-            // Only warn if it's truly unusual (not 223 or 4xx/5xx error responses)
             if let Some(code) = _response_code.status_code() {
                 let raw_code = code.as_u16();
-                if raw_code == 223 || code.is_error() {
-                    debug!("{}", log_msg); // 223 and errors are expected, just debug
-                } else if msgid.is_some() {
-                    warn!("{}", log_msg); // ARTICLE with other 2xx/3xx single-line is unusual
-                } else {
-                    debug!("{}", log_msg);
+                // Warn only for truly unusual responses (not 223 or errors)
+                if msgid.is_some() && raw_code != 223 && !code.is_error() {
+                    warn!(
+                        "Client {} ARTICLE {} got unusual single-line response: {}",
+                        self.client_addr,
+                        msgid.unwrap(),
+                        code
+                    );
                 }
-            } else {
-                debug!("{}", log_msg);
             }
 
             match client_write.write_all(&chunk_buffer[..n]).await {
