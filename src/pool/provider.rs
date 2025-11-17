@@ -68,7 +68,7 @@ pub struct DeadpoolConnectionProvider {
 ///     .build()
 ///     .unwrap();
 /// ```
-pub struct DeadpoolConnectionProviderBuilder {
+pub struct Builder {
     host: String,
     port: u16,
     name: Option<String>,
@@ -78,7 +78,7 @@ pub struct DeadpoolConnectionProviderBuilder {
     tls_config: Option<TlsConfig>,
 }
 
-impl DeadpoolConnectionProviderBuilder {
+impl Builder {
     /// Create a new builder with required connection parameters
     ///
     /// # Arguments
@@ -204,8 +204,8 @@ impl DeadpoolConnectionProvider {
     ///     .unwrap();
     /// ```
     #[must_use]
-    pub fn builder(host: impl Into<String>, port: u16) -> DeadpoolConnectionProviderBuilder {
-        DeadpoolConnectionProviderBuilder::new(host, port)
+    pub fn builder(host: impl Into<String>, port: u16) -> Builder {
+        Builder::new(host, port)
     }
     /// Create a new connection provider
     pub fn new(
