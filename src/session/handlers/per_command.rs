@@ -10,12 +10,12 @@ use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::command::{CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
-use crate::protocol::{BACKEND_ERROR, PROXY_GREETING_PCR};
+use crate::protocol::PROXY_GREETING_PCR;
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
 
@@ -142,13 +142,12 @@ impl ClientSession {
                     .load(std::sync::atomic::Ordering::Acquire);
             if skip_auth_check {
                 // Already authenticated - just route the command (HOT PATH after auth)
-                self.route_command_with_error_handling(
+                self.route_and_execute_command(
                     router,
                     &command,
                     &mut client_write,
                     &mut client_to_backend_bytes,
                     &mut backend_to_client_bytes,
-                    trimmed,
                 )
                 .await?;
                 continue;
@@ -189,13 +188,12 @@ impl ClientSession {
                         backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                     } else {
                         // Auth disabled - forward to backend via router (HOT PATH - 70%+ of commands)
-                        self.route_command_with_error_handling(
+                        self.route_and_execute_command(
                             router,
                             &command,
                             &mut client_write,
                             &mut client_to_backend_bytes,
                             &mut backend_to_client_bytes,
-                            trimmed,
                         )
                         .await?;
                     }
@@ -294,32 +292,32 @@ impl ClientSession {
             );
         }
 
-        // Handle errors and cleanup
-        let final_result = result
-            .as_ref()
-            .map(|_| backend_id)
-            .map_err(|e| anyhow::anyhow!("{}", e));
-
-        // Remove from pool if backend error (not client disconnect)
-        if let Err(e) = &result
-            && crate::pool::is_connection_error(e)
-            && !got_backend_data
-        {
-            warn!(
-                "Backend connection error for client {}, backend {:?}: {} - removing from pool",
-                self.client_addr, backend_id, e
-            );
-            if let Some(ref metrics) = self.metrics {
-                metrics.record_error(backend_id);
-                common::record_user_error(&self.metrics, self.username().as_deref());
-            }
-            crate::pool::remove_from_pool(pooled_conn);
-        }
+        // Handle errors functionally - remove from pool if backend error
+        let result = if !got_backend_data {
+            result.inspect_err(|e| {
+                if common::is_backend_error(e) {
+                    warn!(
+                        "Backend {:?} connection error: {} - removing from pool",
+                        backend_id, e
+                    );
+                    common::record_backend_error(
+                        backend_id,
+                        &self.metrics,
+                        self.username().as_deref(),
+                    );
+                    crate::pool::remove_from_pool(pooled_conn);
+                }
+            })
+        } else {
+            result
+        };
 
         // Complete the request - decrement pending count (lock-free!)
         router.complete_command(backend_id);
 
-        final_result
+        result
+            .map(|_| backend_id)
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     /// Execute a command on a backend connection and stream the response to the client
@@ -491,66 +489,6 @@ impl ClientSession {
         }
 
         (Ok(()), got_backend_data, cmd_bytes, resp_bytes)
-    }
-
-    /// Route a command and handle any errors with appropriate logging and client responses
-    ///
-    /// This helper consolidates the error handling logic that was duplicated in multiple places.
-    /// It routes the command via the router, and if an error occurs, it:
-    /// - Classifies the error (client disconnect vs auth error vs other)
-    /// - Logs appropriately based on error type
-    /// - Sends BACKEND_ERROR response to client (if not disconnected)
-    /// - Includes debug logging for small transfers
-    async fn route_command_with_error_handling(
-        &self,
-        router: &BackendSelector,
-        command: &str,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        client_to_backend_bytes: &mut BytesTransferred,
-        backend_to_client_bytes: &mut BytesTransferred,
-        trimmed: &str,
-    ) -> Result<()> {
-        if let Err(e) = self
-            .route_and_execute_command(
-                router,
-                command,
-                client_write,
-                client_to_backend_bytes,
-                backend_to_client_bytes,
-            )
-            .await
-        {
-            use crate::session::error_classification::ErrorClassifier;
-            let (up, down) = (
-                crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
-                crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
-            );
-
-            // Log based on error type, send error response if client still connected
-            if ErrorClassifier::is_client_disconnect(&e) {
-                debug!(
-                    "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
-                    self.client_addr, trimmed, up, down
-                );
-            } else {
-                if ErrorClassifier::is_authentication_error(&e) {
-                    error!(
-                        "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
-                        self.client_addr, trimmed, e, up, down
-                    );
-                } else {
-                    warn!(
-                        "Client {} error routing '{}': {} | ↑{} ↓{}",
-                        self.client_addr, trimmed, e, up, down
-                    );
-                }
-                let _ = client_write.write_all(BACKEND_ERROR).await;
-                backend_to_client_bytes.add(BACKEND_ERROR.len());
-            }
-
-            return Err(e);
-        }
-        Ok(())
     }
 }
 
