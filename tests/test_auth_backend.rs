@@ -102,6 +102,7 @@ impl MockAuthServer {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Variants used in MockAuthServer but not all instantiated
 enum AuthScenario {
     SuccessWithPassword,
     SuccessWithUsernameOnly,
