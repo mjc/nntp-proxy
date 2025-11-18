@@ -19,7 +19,9 @@ async fn test_cache_hit() -> Result<()> {
 
     let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
     let article = CachedArticle {
-        response: Arc::new(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec()),
+        response: Arc::new(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
+        ),
     };
 
     // Insert
@@ -199,7 +201,7 @@ async fn test_zero_allocation_lookup() -> Result<()> {
 
     // Create different MessageId instance with same content
     let msgid2 = MessageId::from_borrowed("<test@example.com>").unwrap();
-    
+
     // Should find via Borrow<str> trait (zero allocation)
     assert!(cache.get(&msgid2).await.is_some());
 
