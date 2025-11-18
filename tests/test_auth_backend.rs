@@ -102,7 +102,6 @@ impl MockAuthServer {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Variants used in MockAuthServer but not all instantiated
 enum AuthScenario {
     SuccessWithPassword,
     SuccessWithUsernameOnly,
@@ -419,6 +418,68 @@ async fn test_auth_flow_failure() -> Result<()> {
     let response = String::from_utf8_lossy(&buf[..n]);
     assert!(response.starts_with("481"));
     assert!(!ResponseParser::is_auth_success(&buf[..n]));
+
+    Ok(())
+}
+
+/// Test unexpected response to AUTHINFO USER
+#[tokio::test]
+async fn test_auth_flow_unexpected_response() -> Result<()> {
+    let server = MockAuthServer::new().await?;
+    let addr = server.local_addr()?;
+
+    tokio::spawn(async move {
+        server
+            .handle_auth_flow(AuthScenario::UnexpectedResponseToUser)
+            .await
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    let mut stream = TcpStream::connect(addr).await?;
+
+    // Read greeting
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).await?;
+    assert!(ResponseParser::is_greeting(&buf[..n]));
+
+    // Send AUTHINFO USER
+    stream
+        .write_all(authinfo_user("testuser").as_bytes())
+        .await?;
+
+    // Should get unexpected 500 response (not 281 or 381)
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(response.starts_with("500"));
+    assert!(!ResponseParser::is_auth_success(&buf[..n]));
+    assert!(!ResponseParser::is_auth_required(&buf[..n]));
+
+    Ok(())
+}
+
+/// Test non-success greeting from server
+#[tokio::test]
+async fn test_auth_flow_non_success_greeting() -> Result<()> {
+    let server = MockAuthServer::new().await?;
+    let addr = server.local_addr()?;
+
+    tokio::spawn(async move {
+        server
+            .handle_auth_flow(AuthScenario::NonSuccessGreeting)
+            .await
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    let mut stream = TcpStream::connect(addr).await?;
+
+    // Should get non-success greeting (400)
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(response.starts_with("400"));
+    assert!(!ResponseParser::is_greeting(&buf[..n]));
 
     Ok(())
 }

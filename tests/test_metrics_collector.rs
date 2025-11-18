@@ -273,31 +273,19 @@ fn test_backend_connection_lifecycle() {
     let backend = BackendId::from_index(0);
 
     let snapshot = collector.snapshot();
-    assert_eq!(
-        snapshot.backend_stats[0].active_connections.get() as usize,
-        0
-    );
+    assert_eq!(snapshot.backend_stats[0].active_connections.get(), 0);
 
     collector.backend_connection_opened(backend);
     let snapshot = collector.snapshot();
-    assert_eq!(
-        snapshot.backend_stats[0].active_connections.get() as usize,
-        1
-    );
+    assert_eq!(snapshot.backend_stats[0].active_connections.get(), 1);
 
     collector.backend_connection_opened(backend);
     let snapshot = collector.snapshot();
-    assert_eq!(
-        snapshot.backend_stats[0].active_connections.get() as usize,
-        2
-    );
+    assert_eq!(snapshot.backend_stats[0].active_connections.get(), 2);
 
     collector.backend_connection_closed(backend);
     let snapshot = collector.snapshot();
-    assert_eq!(
-        snapshot.backend_stats[0].active_connections.get() as usize,
-        1
-    );
+    assert_eq!(snapshot.backend_stats[0].active_connections.get(), 1);
 }
 
 /// Test health status recording
