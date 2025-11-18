@@ -68,6 +68,14 @@ impl ArticleCache {
             weighted_size: self.cache.weighted_size(),
         }
     }
+
+    /// Run pending background tasks (for testing)
+    ///
+    /// Moka performs maintenance tasks (eviction, expiration) asynchronously.
+    /// This method ensures all pending tasks complete, useful for deterministic testing.
+    pub async fn sync(&self) {
+        self.cache.run_pending_tasks().await;
+    }
 }
 
 /// Cache statistics
