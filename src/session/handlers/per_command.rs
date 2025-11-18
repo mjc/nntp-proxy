@@ -212,32 +212,16 @@ impl ClientSession {
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
-        // Parse command ONCE if cache enabled (avoid double-parse)
-        let is_article_by_msgid = self.cache.is_some()
-            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId);
-
-        // Check cache for ARTICLE by message-ID
-        if is_article_by_msgid
-            && let Some(ref cache) = self.cache
-            && let Some(message_id) = crate::protocol::NntpResponse::extract_message_id(command)
+        // Check cache early - returns Some(backend_id) on cache hit, None otherwise
+        if let Some(backend_id) = self
+            .check_cache_and_serve(router, command, client_write, backend_to_client_bytes)
+            .await?
         {
-            if let Some(cached) = cache.get(&message_id).await {
-                info!(
-                    "Cache HIT for message-ID: {} (size: {} bytes)",
-                    message_id,
-                    cached.response.len()
-                );
-                client_write.write_all(&cached.response).await?;
-                backend_to_client_bytes.add(cached.response.len());
-
-                // Still need to route to get a backend_id for metrics
-                let backend_id = router.route_command(self.client_id, command)?;
-                router.complete_command(backend_id);
-
-                return Ok(backend_id);
-            }
-            info!("Cache MISS for message-ID: {}", message_id);
+            return Ok(backend_id);
         }
+
+        // Determine if we need to cache this response after fetching
+        let should_cache = self.should_cache_command(command);
 
         // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
         let mut buffer = self.buffer_pool.acquire().await;
@@ -264,9 +248,7 @@ impl ClientSession {
         // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
         // If got_backend_data is true, we successfully communicated with backend
         //
-        // For ARTICLE by message-ID with cache enabled, capture response for caching
-        let should_cache = is_article_by_msgid;
-
+        // Use caching path only for cache misses on ARTICLE by message-ID
         let (result, got_backend_data, cmd_bytes, resp_bytes) = if should_cache {
             self.execute_command_with_caching(
                 &mut pooled_conn,
@@ -648,6 +630,75 @@ impl ClientSession {
             MetricsBytes::new(command.len() as u64),
             MetricsBytes::new(bytes_written),
         )
+    }
+
+    /// Check cache and serve if hit, return backend_id on hit, None on miss
+    #[inline]
+    async fn check_cache_and_serve(
+        &self,
+        router: &BackendSelector,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BytesTransferred,
+    ) -> Result<Option<crate::types::BackendId>> {
+        // Functional pipeline: cache → is ARTICLE → extract ID
+        let Some((cache, message_id)) = self
+            .cache
+            .as_ref()
+            .filter(|_| matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId))
+            .zip(crate::protocol::NntpResponse::extract_message_id(command))
+        else {
+            return Ok(None);
+        };
+
+        self.serve_from_cache_or_miss(
+            cache,
+            message_id,
+            router,
+            command,
+            client_write,
+            backend_to_client_bytes,
+        )
+        .await
+    }
+
+    /// Serve cached article or return None on miss
+    #[inline]
+    async fn serve_from_cache_or_miss(
+        &self,
+        cache: &crate::cache::ArticleCache,
+        message_id: crate::types::protocol::MessageId<'_>,
+        router: &BackendSelector,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BytesTransferred,
+    ) -> Result<Option<crate::types::BackendId>> {
+        match cache.get(&message_id).await {
+            Some(cached) => {
+                info!(
+                    "Cache HIT for message-ID: {} (size: {} bytes)",
+                    message_id,
+                    cached.response.len()
+                );
+                client_write.write_all(&cached.response).await?;
+                backend_to_client_bytes.add(cached.response.len());
+
+                let backend_id = router.route_command(self.client_id, command)?;
+                router.complete_command(backend_id);
+                Ok(Some(backend_id))
+            }
+            None => {
+                info!("Cache MISS for message-ID: {}", message_id);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Determine if command should be cached (cache miss on ARTICLE by message-ID)
+    #[inline]
+    fn should_cache_command(&self, command: &str) -> bool {
+        self.cache.is_some()
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
     }
 }
 
