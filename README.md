@@ -33,7 +33,7 @@ A high-performance NNTP proxy server written in Rust, with intelligent hybrid ro
 This NNTP proxy offers three operating modes:
 
 1. **Hybrid mode** (default) - Starts with per-command routing, automatically switches to stateful when needed
-2. **Standard mode** (`--routing-mode standard`) - Full NNTP proxy with complete command support
+2. **Stateful mode** (`--routing-mode stateful`) - Full NNTP proxy with complete command support
 3. **Per-command routing mode** (`--routing-mode per-command`) - Pure stateless routing for maximum efficiency
 
 ### Design Goals
@@ -53,7 +53,7 @@ This NNTP proxy offers three operating modes:
 - **Resource efficiency** - Uses per-command routing when possible, stateful only when necessary
 - **Most deployments** - Recommended default that adapts to client behavior
 
-✅ **Standard mode - Good for:**
+✅ **Stateful mode - Good for:**
 - Traditional newsreaders requiring guaranteed stateful behavior
 - Debugging or when you need predictable 1:1 connection mapping
 - Legacy deployments where hybrid mode is not desired
@@ -67,7 +67,7 @@ This NNTP proxy offers three operating modes:
 
 ❌ **Not suitable for:**
 - Scenarios requiring concurrent request processing (NNTP is inherently serial)
-- Custom NNTP extensions not in RFC 3977 (unless in standard mode with compatible backend)
+- Custom NNTP extensions not in RFC 3977 (unless in stateful mode with compatible backend)
 
 ## Limitations
 
@@ -86,7 +86,7 @@ When running in **per-command routing mode** (`--per-command-routing` or `-r`), 
 - ✅ Posting: `POST` (if backend supports)
 - ✅ Authentication: `AUTHINFO USER/PASS` (handled by proxy)
 
-**Rationale:** Commands requiring group context (current article number, group selection) cannot work reliably when each command routes to a different backend. Use standard mode or hybrid mode if you need these features.
+**Rationale:** Commands requiring group context (current article number, group selection) cannot work reliably when each command routes to a different backend. Use stateful mode or hybrid mode if you need these features.
 
 ### Hybrid Mode Advantage (Default)
 
@@ -99,7 +99,7 @@ When running in **per-command routing mode** (`--per-command-routing` or `-r`), 
 
 ### Standard Mode
 
-In **standard mode** (`--routing-mode standard`):
+In **stateful mode** (`--routing-mode stateful`):
 - ✅ **All RFC 3977 commands supported** - full bidirectional forwarding
 - ✅ Compatible with all NNTP clients
 - ✅ Stateful operations work normally (GROUP, NEXT, LAST, XOVER, etc.)
@@ -465,14 +465,14 @@ nntp-proxy
 # Custom port and config (still uses hybrid mode)
 nntp-proxy --port 8120 --config production.toml
 
-# Standard mode (full stateful behavior)
-nntp-proxy --routing-mode standard
+# Stateful mode (full stateful behavior)
+nntp-proxy --routing-mode stateful
 
 # Per-command routing mode (pure stateless)
 nntp-proxy --routing-mode per-command
 
 # Short form for routing modes
-nntp-proxy -r standard
+nntp-proxy -r stateful
 nntp-proxy -r per-command
 
 # Single-threaded for debugging
@@ -511,7 +511,7 @@ docker run -d \
 - **Pool reservation** - Reserves stateful connections (max_connections - 1) while keeping 1 for per-command routing
 - **Universal compatibility** - Works with any NNTP client, optimizing automatically based on usage patterns
 
-#### Standard Mode - `--routing-mode standard`
+#### Standard Mode - `--routing-mode stateful`
 
 - One backend connection per client
 - Simple 1:1 connection forwarding
@@ -654,7 +654,7 @@ The proxy adheres to NNTP standards:
 
 - **CPU Usage**: Low overhead with lock-free routing and optimized protocol parsing
   - Per-command routing mode: ~15% of one core for 80 connections at 105MB/s (AMD Ryzen 9 5950X)
-  - Standard mode: Similar or lower due to simpler forwarding logic
+  - Stateful mode: Similar or lower due to simpler forwarding logic
 - **Memory**: Constant usage with pooled buffers; no response buffering (streaming only)
 - **Latency**: Minimal overhead (~1-2ms) for command routing and parsing
 - **Throughput**: Typically limited by backend servers or network, not the proxy
@@ -823,7 +823,7 @@ For performance testing, create custom scripts that:
 **"Command not supported" errors**
 - In per-command routing mode, stateful commands are rejected (GROUP, NEXT, etc.)
 - Use message-ID based retrieval instead
-- For stateful operations, use standard mode or connect directly to backend
+- For stateful operations, use stateful mode or connect directly to backend
 
 **High CPU usage**
 - Try per-command routing mode: `-r` or `--per-command-routing`

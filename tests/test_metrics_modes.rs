@@ -224,7 +224,7 @@ fn test_all_modes_show_meaningful_metrics() {
     // for monitoring and debugging purposes
 
     let test_cases = vec![
-        (RoutingMode::Standard, "Standard mode"),
+        (RoutingMode::Stateful, "Standard mode"),
         (RoutingMode::PerCommand, "Per-command mode"),
         (RoutingMode::Hybrid, "Hybrid mode"),
     ];
@@ -289,7 +289,7 @@ fn test_all_modes_show_meaningful_metrics() {
 
         // 3. Commands (per-command and hybrid only)
         match mode {
-            RoutingMode::Standard => {
+            RoutingMode::Stateful => {
                 // Standard mode doesn't parse commands
                 assert_eq!(
                     snapshot.backend_stats[0].total_commands,

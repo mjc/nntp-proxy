@@ -14,8 +14,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutingMode {
-    /// Standard 1:1 mode - each client gets a dedicated backend connection
-    Standard,
+    /// Stateful 1:1 mode - each client gets a dedicated backend connection
+    Stateful,
     /// Per-command routing - each command can use a different backend (stateless only)
     PerCommand,
     /// Hybrid mode - starts in per-command routing, auto-switches to stateful on first stateful command
@@ -41,15 +41,15 @@ impl RoutingMode {
     /// Check if this mode can handle stateful commands
     #[must_use]
     pub const fn supports_stateful_commands(&self) -> bool {
-        matches!(self, Self::Standard | Self::Hybrid)
+        matches!(self, Self::Stateful | Self::Hybrid)
     }
 
     /// Get a human-readable description of this routing mode
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::Standard => "standard 1:1 mode",
-            Self::PerCommand => "per-command routing mode",
+            Self::Stateful => "stateful 1:1 mode",
+            Self::PerCommand => "per-command routing mode (stateless)",
             Self::Hybrid => "hybrid routing mode",
         }
     }

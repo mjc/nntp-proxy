@@ -9,19 +9,19 @@
 //!
 //! ## Three Operating Modes
 //!
-//! 1. **Standard (1:1) Mode** - `handle_with_pooled_backend()`
+//! 1. **Stateful (1:1) Mode** - `handle_with_pooled_backend()`
 //!    - One client maps to one backend connection for entire session
 //!    - Lowest latency, simplest model
-//!    - Used when routing_mode = Standard
+//!    - Used when routing_mode = Stateful
 //!
-//! 2. **Per-Command Mode** - `handle_per_command_routing()`
+//! 2. **Per-Command Mode (Stateless)** - `handle_per_command_routing()`
 //!    - Each command is independently routed to potentially different backends
 //!    - Enables load balancing across multiple backend servers
-//!    - Rejects stateful commands (MODE READER, etc.)
+//!    - Rejects stateful commands (GROUP, NEXT, LAST, etc.)
 //!    - Used when routing_mode = PerCommand
 //!
 //! 3. **Hybrid Mode** - `handle_per_command_routing()` + dynamic switching
-//!    - Starts in per-command mode for load balancing
+//!    - Starts in per-command mode (stateless) for load balancing
 //!    - Automatically switches to stateful mode when stateful command detected
 //!    - Best of both worlds: load balancing + stateful command support
 //!    - Used when routing_mode = Hybrid
@@ -102,7 +102,7 @@ pub struct ClientSession {
     router: Option<Arc<BackendSelector>>,
     /// Current session mode (for hybrid routing)
     mode: SessionMode,
-    /// Routing mode configuration (Standard, PerCommand, or Hybrid)
+    /// Routing mode configuration (Stateful, PerCommand, or Hybrid)
     routing_mode: RoutingMode,
     /// Authentication handler
     auth_handler: Arc<AuthHandler>,
@@ -140,7 +140,7 @@ pub struct ClientSession {
 /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
 /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 ///
-/// // Standard 1:1 routing mode
+/// // Stateful 1:1 routing mode
 /// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone())
 ///     .build();
 ///
@@ -176,7 +176,7 @@ impl ClientSessionBuilder {
     /// Set the routing mode for this session
     ///
     /// # Arguments
-    /// * `mode` - The routing mode (Standard, PerCommand, or Hybrid)
+    /// * `mode` - The routing mode (Stateful, PerCommand, or Hybrid)
     ///
     /// Note: If you use `with_router()`, you typically want PerCommand or Hybrid mode.
     #[must_use]
@@ -223,14 +223,14 @@ impl ClientSessionBuilder {
     #[must_use]
     pub fn build(self) -> ClientSession {
         let (mode, routing_mode) = match (&self.router, self.routing_mode) {
-            // If router is provided, start in per-command mode
+            // Per-command or Hybrid: start in per-command mode (stateless)
             (Some(_), RoutingMode::PerCommand | RoutingMode::Hybrid) => {
                 (SessionMode::PerCommand, self.routing_mode)
             }
-            // If router is provided but mode is Standard, default to PerCommand
-            (Some(_), RoutingMode::Standard) => (SessionMode::PerCommand, RoutingMode::PerCommand),
-            // No router means Standard mode
-            (None, _) => (SessionMode::Stateful, RoutingMode::Standard),
+            // Stateful mode with router: honor the Stateful mode request
+            (Some(_), RoutingMode::Stateful) => (SessionMode::Stateful, RoutingMode::Stateful),
+            // No router: always Stateful mode
+            (None, _) => (SessionMode::Stateful, RoutingMode::Stateful),
         };
 
         ClientSession {
@@ -264,7 +264,7 @@ impl ClientSession {
             client_id: ClientId::new(),
             router: None,
             mode: SessionMode::Stateful, // 1:1 mode is always stateful
-            routing_mode: RoutingMode::Standard,
+            routing_mode: RoutingMode::Stateful,
             auth_handler,
             authenticated: AtomicBool::new(false),
             username: Arc::new(OnceLock::new()),
@@ -331,7 +331,7 @@ impl ClientSession {
             client_addr,
             buffer_pool,
             router: None,
-            routing_mode: RoutingMode::Standard,
+            routing_mode: RoutingMode::Stateful,
             auth_handler,
             metrics: None,
             connection_stats: None,
@@ -609,16 +609,16 @@ mod tests {
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
-        // Standard mode
+        // Stateful mode
         let session = ClientSession::new_with_router(
             addr,
             buffer_pool.clone(),
             router.clone(),
-            RoutingMode::Standard,
+            RoutingMode::Stateful,
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::Standard);
+        assert_eq!(session.routing_mode, RoutingMode::Stateful);
 
         // PerCommand mode
         let session = ClientSession::new_with_router(
@@ -670,12 +670,12 @@ mod tests {
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
-        // Standard mode has router capability
+        // Stateful mode has router capability
         let session = ClientSession::new_with_router(
             addr,
             buffer_pool.clone(),
             router.clone(),
-            RoutingMode::Standard,
+            RoutingMode::Stateful,
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());

@@ -146,7 +146,7 @@ async fn test_round_robin_distribution() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -232,7 +232,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -315,7 +315,7 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
 
     // Create proxy config
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
 
     // Start proxy in per-command routing mode
     spawn_test_proxy(proxy, proxy_port, true).await;
@@ -387,7 +387,7 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
 
     spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -469,7 +469,7 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config, RoutingMode::Standard)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
     spawn_test_proxy(proxy, proxy_port, true).await;
 
     // Give proxy more time to initialize connection pool
@@ -708,13 +708,12 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
 
 #[tokio::test]
 async fn test_hybrid_mode_multiple_clients() -> Result<()> {
-    // Test hybrid mode with multiple clients, some stateless, some stateful
+    // Test multiple concurrent clients in hybrid mode
     let mock_port = find_available_port().await;
     let proxy_port = find_available_port().await;
 
     let _mock = create_smart_mock_builder(mock_port, "MultiServer").spawn();
 
-    // Give server time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -722,7 +721,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
             "127.0.0.1",
             mock_port,
             "Mock Server",
-            6,
+            10,
         )],
         ..Default::default()
     };
@@ -742,87 +741,61 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
         }
     });
 
-    // Give proxy time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Create multiple client tasks
-    let mut client_tasks = Vec::new();
+    // Run 3 clients concurrently
+    let results = tokio::try_join!(
+        async {
+            let mut client = TcpStream::connect(&proxy_addr).await?;
+            let mut buf = [0; 1024];
 
-    // Client 1: Stateless only
-    let proxy_addr_clone = proxy_addr.clone();
-    client_tasks.push(tokio::spawn(async move {
-        let mut client = TcpStream::connect(&proxy_addr_clone).await.unwrap();
+            // Greeting
+            let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+            assert!(n > 0);
 
-        // Read greeting
-        let mut buffer = [0; 1024];
-        let _ = client.read(&mut buffer).await.unwrap();
+            // Command
+            client.write_all(b"DATE\r\n").await?;
+            let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+            assert!(n > 0);
 
-        // Send only stateless commands
-        for _ in 0..3 {
-            client.write_all(b"LIST\r\n").await.unwrap();
-            client.flush().await.unwrap();
-            buffer = [0; 1024];
-            let _ = client.read(&mut buffer).await.unwrap();
+            client.write_all(b"QUIT\r\n").await?;
+            anyhow::Ok(())
+        },
+        async {
+            let mut client = TcpStream::connect(&proxy_addr).await?;
+            let mut buf = [0; 1024];
+
+            // Greeting
+            let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+            assert!(n > 0);
+
+            // Command
+            client.write_all(b"LIST\r\n").await?;
+            let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+            assert!(n > 0);
+
+            client.write_all(b"QUIT\r\n").await?;
+            anyhow::Ok(())
+        },
+        async {
+            let mut client = TcpStream::connect(&proxy_addr).await?;
+            let mut buf = [0; 1024];
+
+            // Greeting
+            let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+            assert!(n > 0);
+
+            // Command
+            client.write_all(b"ARTICLE <msg@example.com>\r\n").await?;
+            let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+            assert!(n > 0);
+
+            client.write_all(b"QUIT\r\n").await?;
+            anyhow::Ok(())
         }
+    );
 
-        client.write_all(b"QUIT\r\n").await.unwrap();
-    }));
-
-    // Client 2: Switch to stateful
-    let proxy_addr_clone = proxy_addr.clone();
-    client_tasks.push(tokio::spawn(async move {
-        let mut client = TcpStream::connect(&proxy_addr_clone).await.unwrap();
-
-        // Read greeting
-        let mut buffer = [0; 1024];
-        let _ = client.read(&mut buffer).await.unwrap();
-
-        // Start with stateless
-        client.write_all(b"DATE\r\n").await.unwrap();
-        client.flush().await.unwrap();
-        buffer = [0; 1024];
-        let _ = client.read(&mut buffer).await.unwrap();
-
-        // Switch to stateful
-        client.write_all(b"GROUP alt.test\r\n").await.unwrap();
-        client.flush().await.unwrap();
-        buffer = [0; 1024];
-        let _ = client.read(&mut buffer).await.unwrap();
-
-        // Use stateful commands
-        client.write_all(b"ARTICLE 1\r\n").await.unwrap();
-        client.flush().await.unwrap();
-        buffer = [0; 1024];
-        let _ = client.read(&mut buffer).await.unwrap();
-
-        client.write_all(b"QUIT\r\n").await.unwrap();
-    }));
-
-    // Client 3: Another stateless client
-    client_tasks.push(tokio::spawn(async move {
-        let mut client = TcpStream::connect(&proxy_addr).await.unwrap();
-
-        // Read greeting
-        let mut buffer = [0; 1024];
-        let _ = client.read(&mut buffer).await.unwrap();
-
-        // Send only stateless commands
-        client
-            .write_all(b"ARTICLE <msg@example.com>\r\n")
-            .await
-            .unwrap();
-        client.flush().await.unwrap();
-        buffer = [0; 1024];
-        let _ = client.read(&mut buffer).await.unwrap();
-
-        client.write_all(b"QUIT\r\n").await.unwrap();
-    }));
-
-    // Wait for all clients to complete
-    for task in client_tasks {
-        task.await?;
-    }
-
+    results?;
     Ok(())
 }
 

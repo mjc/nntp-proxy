@@ -69,7 +69,7 @@ impl NntpProxyBuilder {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            routing_mode: RoutingMode::Standard,
+            routing_mode: RoutingMode::Stateful,
             buffer_size: None,
             buffer_count: None,
             enable_metrics: false, // Default to disabled for performance
@@ -506,11 +506,10 @@ impl NntpProxy {
         }
 
         // Create session and handle connection
-        let session = self.build_session(client_addr, None, RoutingMode::Standard, None);
+        let session = self.build_session(client_addr, None, self.routing_mode, None);
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
 
         debug!("Starting session for client {}", client_addr);
-
         let copy_result = if self.enable_metrics {
             // Use metrics-enabled version for periodic reporting
             session
@@ -533,7 +532,7 @@ impl NntpProxy {
             let routing_mode_str = match session.mode() {
                 crate::session::SessionMode::PerCommand => "per-command",
                 crate::session::SessionMode::Stateful => match self.routing_mode {
-                    RoutingMode::Standard => "standard",
+                    RoutingMode::Stateful => "standard",
                     RoutingMode::Hybrid => "hybrid",
                     _ => "stateful",
                 },
@@ -740,7 +739,7 @@ mod tests {
     fn test_proxy_creation_with_servers() {
         let config = create_test_config();
         let proxy = Arc::new(
-            NntpProxy::new(config, RoutingMode::Standard).expect("Failed to create proxy"),
+            NntpProxy::new(config, RoutingMode::Stateful).expect("Failed to create proxy"),
         );
 
         assert_eq!(proxy.servers().len(), 3);
@@ -753,7 +752,7 @@ mod tests {
             servers: vec![],
             ..Default::default()
         };
-        let result = NntpProxy::new(config, RoutingMode::Standard);
+        let result = NntpProxy::new(config, RoutingMode::Stateful);
 
         assert!(result.is_err());
         assert!(
@@ -768,7 +767,7 @@ mod tests {
     fn test_proxy_has_router() {
         let config = create_test_config();
         let proxy = Arc::new(
-            NntpProxy::new(config, RoutingMode::Standard).expect("Failed to create proxy"),
+            NntpProxy::new(config, RoutingMode::Stateful).expect("Failed to create proxy"),
         );
 
         // Proxy should have a router with backends
@@ -845,7 +844,7 @@ mod tests {
     fn test_backward_compatibility_new() {
         // Ensure NntpProxy::new() still works (it uses builder internally)
         let config = create_test_config();
-        let proxy = NntpProxy::new(config, RoutingMode::Standard)
+        let proxy = NntpProxy::new(config, RoutingMode::Stateful)
             .expect("Failed to create proxy with new()");
 
         assert_eq!(proxy.servers().len(), 3);

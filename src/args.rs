@@ -19,9 +19,9 @@ pub struct CommonArgs {
     #[arg(long, env)]
     pub host: Option<String>,
 
-    /// Routing mode: standard, per-command, or hybrid
+    /// Routing mode: stateful, per-command, or hybrid
     ///
-    /// - standard: 1:1 mode, each client gets a dedicated backend connection
+    /// - stateful: 1:1 mode, each client gets a dedicated backend connection
     /// - per-command: Each command can use a different backend (stateless only)
     /// - hybrid: Starts in per-command mode, auto-switches to stateful on first stateful command
     #[arg(
@@ -241,11 +241,11 @@ mod tests {
         };
         assert_eq!(hybrid.routing_mode, RoutingMode::Hybrid);
 
-        let standard = CommonArgs {
-            routing_mode: RoutingMode::Standard,
+        let stateful = CommonArgs {
+            routing_mode: RoutingMode::Stateful,
             ..default_args()
         };
-        assert_eq!(standard.routing_mode, RoutingMode::Standard);
+        assert_eq!(stateful.routing_mode, RoutingMode::Stateful);
 
         let per_command = CommonArgs {
             routing_mode: RoutingMode::PerCommand,

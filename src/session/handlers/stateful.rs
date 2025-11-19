@@ -1,4 +1,4 @@
-//! Standard 1:1 routing mode handler
+//! Stateful 1:1 routing mode handler
 
 use crate::session::{ClientSession, common};
 use anyhow::Result;
@@ -11,7 +11,7 @@ use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::types::{BytesTransferred, TransferMetrics};
 
 impl ClientSession {
-    /// Handle a client connection with a dedicated backend connection (standard 1:1 mode)
+    /// Handle a client connection with a dedicated backend connection (stateful 1:1 mode)
     ///
     /// # Metrics Reporting
     ///
@@ -161,7 +161,7 @@ impl ClientSession {
                                                 common::on_authentication_success(
                                                     self.client_addr,
                                                     auth_username.clone(),
-                                                    &crate::config::RoutingMode::Standard,
+                                                    &crate::config::RoutingMode::Stateful,
                                                     &self.metrics,
                                                     self.connection_stats(),
                                                     |username| self.set_username(username),
