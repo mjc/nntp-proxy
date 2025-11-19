@@ -12,12 +12,64 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::command::{CommandHandler, NntpCommand};
+use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::protocol::PROXY_GREETING_PCR;
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
+
+/// Decision for how to handle a command in per-command routing mode
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CommandRoutingDecision {
+    /// Intercept and handle authentication locally
+    InterceptAuth,
+    /// Forward command to backend (authenticated or auth disabled)
+    Forward,
+    /// Require authentication first
+    RequireAuth,
+    /// Switch to stateful mode (hybrid mode only)
+    SwitchToStateful,
+    /// Reject the command
+    Reject,
+}
+
+/// Determine how to handle a command based on action, auth state, and routing mode
+///
+/// This is a pure function that can be easily tested without I/O dependencies.
+pub(super) fn decide_command_routing(
+    action: CommandAction,
+    is_authenticated: bool,
+    auth_enabled: bool,
+    routing_mode: RoutingMode,
+    command: &str,
+) -> CommandRoutingDecision {
+    use CommandAction::*;
+
+    match action {
+        // Auth commands - ALWAYS intercept
+        InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
+
+        // Stateless commands
+        ForwardStateless => {
+            if is_authenticated || !auth_enabled {
+                CommandRoutingDecision::Forward
+            } else {
+                CommandRoutingDecision::RequireAuth
+            }
+        }
+
+        // Rejected commands in hybrid mode with stateful command -> switch mode
+        Reject(_)
+            if routing_mode == RoutingMode::Hybrid && NntpCommand::parse(command).is_stateful() =>
+        {
+            CommandRoutingDecision::SwitchToStateful
+        }
+
+        // All other rejected commands
+        Reject(_) => CommandRoutingDecision::Reject,
+    }
+}
 
 impl ClientSession {
     /// Handle a client connection with per-command routing
@@ -103,10 +155,24 @@ impl ClientSession {
                     .authenticated
                     .load(std::sync::atomic::Ordering::Acquire);
 
-            use crate::command::CommandAction;
-            match (action, skip_auth_check, self.auth_handler.is_enabled()) {
-                // Auth commands - ALWAYS intercept
-                (CommandAction::InterceptAuth(auth_action), _, _) => {
+            let decision = decide_command_routing(
+                action.clone(),
+                skip_auth_check,
+                self.auth_handler.is_enabled(),
+                self.routing_mode,
+                &command,
+            );
+
+            match decision {
+                CommandRoutingDecision::InterceptAuth => {
+                    // Extract auth action from the original CommandAction
+                    let auth_action = match action {
+                        CommandAction::InterceptAuth(a) => a,
+                        _ => unreachable!(
+                            "InterceptAuth decision must come from InterceptAuth action"
+                        ),
+                    };
+
                     backend_to_client_bytes += match common::handle_auth_command(
                         &self.auth_handler,
                         auth_action,
@@ -132,9 +198,7 @@ impl ClientSession {
                     };
                 }
 
-                // Stateless - authenticated or auth disabled
-                (CommandAction::ForwardStateless, true, _)
-                | (CommandAction::ForwardStateless, _, false) => {
+                CommandRoutingDecision::Forward => {
                     self.route_and_execute_command(
                         router,
                         &command,
@@ -145,18 +209,13 @@ impl ClientSession {
                     .await?;
                 }
 
-                // Stateless - need auth
-                (CommandAction::ForwardStateless, false, true) => {
+                CommandRoutingDecision::RequireAuth => {
                     use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
                     client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
                     backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                 }
 
-                // Hybrid mode stateful command - switch to dedicated backend
-                (CommandAction::Reject(_), _, _)
-                    if self.routing_mode == RoutingMode::Hybrid
-                        && NntpCommand::parse(&command).is_stateful() =>
-                {
+                CommandRoutingDecision::SwitchToStateful => {
                     info!(
                         "Client {} switching to stateful mode (command: {})",
                         self.client_addr, trimmed
@@ -172,8 +231,11 @@ impl ClientSession {
                         .await;
                 }
 
-                // All other rejected commands
-                (CommandAction::Reject(response), _, _) => {
+                CommandRoutingDecision::Reject => {
+                    let response = match action {
+                        CommandAction::Reject(r) => r,
+                        _ => unreachable!("Reject decision must come from Reject action"),
+                    };
                     client_write.write_all(response.as_bytes()).await?;
                     backend_to_client_bytes.add(response.len());
                 }
@@ -774,5 +836,317 @@ mod tests {
         let command = "BoDy <TeSt@ExAmPlE.cOm>";
         let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<TeSt@ExAmPlE.cOm>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_with_cache_enabled() {
+        let session = create_test_session_with_cache();
+        assert!(session.should_cache_command("ARTICLE <test@example.com>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_with_cache_disabled() {
+        let session = create_test_session_without_cache();
+        assert!(!session.should_cache_command("ARTICLE <test@example.com>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_non_article_command() {
+        let session = create_test_session_with_cache();
+        assert!(!session.should_cache_command("GROUP alt.test"));
+        assert!(!session.should_cache_command("LIST"));
+        assert!(!session.should_cache_command("QUIT"));
+    }
+
+    #[test]
+    fn test_should_cache_command_article_by_number() {
+        let session = create_test_session_with_cache();
+        // ARTICLE by number (not message-ID) should not be cached
+        assert!(!session.should_cache_command("ARTICLE 123"));
+    }
+
+    #[test]
+    fn test_should_cache_command_variations() {
+        let session = create_test_session_with_cache();
+        // Only ARTICLE, BODY, HEAD, STAT with message-ID are cacheable
+        assert!(session.should_cache_command("ARTICLE <msg@host>"));
+        assert!(session.should_cache_command("BODY <msg@host>"));
+        assert!(session.should_cache_command("HEAD <msg@host>"));
+        assert!(session.should_cache_command("STAT <msg@host>"));
+    }
+
+    // Tests for decide_command_routing pure function
+
+    #[test]
+    fn test_decide_routing_auth_commands_always_intercepted() {
+        use crate::command::AuthAction;
+
+        // Auth commands should always be intercepted regardless of other flags
+        let action = CommandAction::InterceptAuth(AuthAction::RequestPassword("test".to_string()));
+
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                true,
+                true,
+                RoutingMode::PerCommand,
+                "AUTHINFO USER test"
+            ),
+            CommandRoutingDecision::InterceptAuth
+        );
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                true,
+                RoutingMode::PerCommand,
+                "AUTHINFO USER test"
+            ),
+            CommandRoutingDecision::InterceptAuth
+        );
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                false,
+                RoutingMode::Stateful,
+                "AUTHINFO USER test"
+            ),
+            CommandRoutingDecision::InterceptAuth
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_forward_when_authenticated() {
+        let action = CommandAction::ForwardStateless;
+
+        // Should forward when authenticated, regardless of auth_enabled
+        assert_eq!(
+            decide_command_routing(action.clone(), true, true, RoutingMode::PerCommand, "LIST"),
+            CommandRoutingDecision::Forward
+        );
+        assert_eq!(
+            decide_command_routing(action.clone(), true, false, RoutingMode::PerCommand, "LIST"),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_forward_when_auth_disabled() {
+        let action = CommandAction::ForwardStateless;
+
+        // Should forward when auth is disabled, even if not authenticated
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                false,
+                RoutingMode::PerCommand,
+                "LIST"
+            ),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_require_auth_when_needed() {
+        let action = CommandAction::ForwardStateless;
+
+        // Should require auth when auth is enabled but not authenticated
+        assert_eq!(
+            decide_command_routing(action, false, true, RoutingMode::PerCommand, "LIST"),
+            CommandRoutingDecision::RequireAuth
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_switch_to_stateful_in_hybrid_mode() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Hybrid mode with stateful command should switch to stateful
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                true,
+                false,
+                RoutingMode::Hybrid,
+                "GROUP alt.test"
+            ),
+            CommandRoutingDecision::SwitchToStateful
+        );
+
+        // Also works when not authenticated
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                false,
+                RoutingMode::Hybrid,
+                "XOVER 1-100"
+            ),
+            CommandRoutingDecision::SwitchToStateful
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_reject_in_per_command_mode() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Per-command mode should reject stateful commands
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                true,
+                false,
+                RoutingMode::PerCommand,
+                "GROUP alt.test"
+            ),
+            CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_reject_in_stateful_mode() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Stateful mode should reject (though this shouldn't happen in practice)
+        assert_eq!(
+            decide_command_routing(action, true, false, RoutingMode::Stateful, "INVALID"),
+            CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_hybrid_mode_stateless_forwarded() {
+        let action = CommandAction::ForwardStateless;
+
+        // Hybrid mode with stateless command should forward
+        assert_eq!(
+            decide_command_routing(action, true, false, RoutingMode::Hybrid, "LIST"),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_hybrid_mode_reject_non_stateful() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Hybrid mode with rejected but non-stateful command should just reject
+        assert_eq!(
+            decide_command_routing(action, true, false, RoutingMode::Hybrid, "INVALIDCMD"),
+            CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_all_modes_with_stateful_commands() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+        let stateful_commands = vec!["GROUP alt.test", "NEXT", "LAST", "XOVER 1-100"];
+
+        for cmd in stateful_commands {
+            // Hybrid mode: switch to stateful
+            assert_eq!(
+                decide_command_routing(action.clone(), true, false, RoutingMode::Hybrid, cmd),
+                CommandRoutingDecision::SwitchToStateful,
+                "Failed for command: {}",
+                cmd
+            );
+
+            // Per-command mode: reject
+            assert_eq!(
+                decide_command_routing(action.clone(), true, false, RoutingMode::PerCommand, cmd),
+                CommandRoutingDecision::Reject,
+                "Failed for command: {}",
+                cmd
+            );
+
+            // Stateful mode: reject (though shouldn't reach this in practice)
+            assert_eq!(
+                decide_command_routing(action.clone(), true, false, RoutingMode::Stateful, cmd),
+                CommandRoutingDecision::Reject,
+                "Failed for command: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_routing_auth_flow_progression() {
+        let stateless_action = CommandAction::ForwardStateless;
+
+        // Step 1: Not authenticated, auth enabled -> require auth
+        assert_eq!(
+            decide_command_routing(
+                stateless_action.clone(),
+                false,
+                true,
+                RoutingMode::PerCommand,
+                "LIST"
+            ),
+            CommandRoutingDecision::RequireAuth
+        );
+
+        // Step 2: Authenticated, auth enabled -> forward
+        assert_eq!(
+            decide_command_routing(
+                stateless_action.clone(),
+                true,
+                true,
+                RoutingMode::PerCommand,
+                "LIST"
+            ),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_should_cache_command_body_and_head() {
+        let session = create_test_session_with_cache();
+        // BODY and HEAD by message-ID should also be cached
+        assert!(session.should_cache_command("BODY <test@example.com>"));
+        assert!(session.should_cache_command("HEAD <msg@host>"));
+        assert!(session.should_cache_command("STAT <stat@test>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_edge_cases() {
+        let session = create_test_session_with_cache();
+        // Empty or malformed commands should not be cached
+        assert!(!session.should_cache_command(""));
+        assert!(!session.should_cache_command("ARTICLE"));
+        // Incomplete message-ID is still recognized by classifier
+        // but won't be cached because extraction will fail later
+        assert!(session.should_cache_command("ARTICLE <incomplete"));
+    }
+
+    // Helper functions for tests
+    fn create_test_session_with_cache() -> ClientSession {
+        use crate::auth::AuthHandler;
+        use crate::cache::ArticleCache;
+        use crate::types::BufferSize;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+
+        ClientSession::builder(addr, buffer_pool, auth_handler)
+            .with_cache(Arc::new(ArticleCache::new(100, Duration::from_secs(3600))))
+            .build()
+    }
+
+    fn create_test_session_without_cache() -> ClientSession {
+        use crate::auth::AuthHandler;
+        use crate::types::BufferSize;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+
+        ClientSession::builder(addr, buffer_pool, auth_handler).build()
     }
 }
