@@ -66,3 +66,86 @@ fn validate_server(server: &Server) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_server(name: &str, keepalive: Option<Duration>) -> Server {
+        let mut builder = Server::builder("localhost", 119).name(name);
+
+        if let Some(ka) = keepalive {
+            builder = builder.connection_keepalive(ka);
+        }
+
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_validate_empty_config_fails() {
+        let config = Config {
+            servers: vec![],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_single_server_succeeds() {
+        let config = Config {
+            servers: vec![create_test_server("test", None)],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_multiple_servers_succeeds() {
+        let config = Config {
+            servers: vec![
+                create_test_server("server1", None),
+                create_test_server("server2", None),
+            ],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_with_recommended_keepalive() {
+        let server = create_test_server("test", Some(Duration::from_secs(60)));
+        assert!(validate_server(&server).is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_with_low_keepalive_warns() {
+        // This should warn but not fail
+        let server = create_test_server("test", Some(Duration::from_secs(5)));
+        assert!(validate_server(&server).is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_with_high_keepalive_warns() {
+        // This should warn but not fail
+        let server = create_test_server("test", Some(Duration::from_secs(600)));
+        assert!(validate_server(&server).is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_with_no_keepalive() {
+        let server = create_test_server("test", None);
+        assert!(validate_server(&server).is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_at_min_boundary() {
+        let server = create_test_server("test", Some(MIN_RECOMMENDED_KEEPALIVE));
+        assert!(validate_server(&server).is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_at_max_boundary() {
+        let server = create_test_server("test", Some(MAX_RECOMMENDED_KEEPALIVE));
+        assert!(validate_server(&server).is_ok());
+    }
+}
