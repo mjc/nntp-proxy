@@ -172,6 +172,145 @@ impl std::str::FromStr for ThreadCount {
 mod tests {
     use super::*;
 
+    // MaxConnections tests
+    #[test]
+    fn test_max_connections_new_valid() {
+        let max = MaxConnections::new(10).unwrap();
+        assert_eq!(max.get(), 10);
+    }
+
+    #[test]
+    fn test_max_connections_new_zero_returns_none() {
+        assert!(MaxConnections::new(0).is_none());
+    }
+
+    #[test]
+    fn test_max_connections_default() {
+        let max = MaxConnections::DEFAULT;
+        assert_eq!(max.get(), 10);
+    }
+
+    #[test]
+    fn test_max_connections_new_one() {
+        let max = MaxConnections::new(1).unwrap();
+        assert_eq!(max.get(), 1);
+    }
+
+    #[test]
+    fn test_max_connections_new_large() {
+        let max = MaxConnections::new(1000).unwrap();
+        assert_eq!(max.get(), 1000);
+    }
+
+    #[test]
+    fn test_max_connections_display() {
+        let max = MaxConnections::new(15).unwrap();
+        assert_eq!(max.to_string(), "15");
+    }
+
+    #[test]
+    fn test_max_connections_serde_json() {
+        let max = MaxConnections::new(20).unwrap();
+        let json = serde_json::to_string(&max).unwrap();
+        assert_eq!(json, "20");
+
+        let parsed: MaxConnections = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.get(), 20);
+    }
+
+    #[test]
+    fn test_max_connections_serde_json_zero_rejected() {
+        let result = serde_json::from_str::<MaxConnections>("0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_connections_equality() {
+        let max1 = MaxConnections::new(10).unwrap();
+        let max2 = MaxConnections::new(10).unwrap();
+        let max3 = MaxConnections::new(20).unwrap();
+
+        assert_eq!(max1, max2);
+        assert_ne!(max1, max3);
+    }
+
+    #[test]
+    fn test_max_connections_clone() {
+        let max = MaxConnections::new(15).unwrap();
+        let cloned = max.clone();
+        assert_eq!(max, cloned);
+    }
+
+    // MaxErrors tests
+    #[test]
+    fn test_max_errors_new_valid() {
+        let max = MaxErrors::new(3).unwrap();
+        assert_eq!(max.get(), 3);
+    }
+
+    #[test]
+    fn test_max_errors_new_zero_returns_none() {
+        assert!(MaxErrors::new(0).is_none());
+    }
+
+    #[test]
+    fn test_max_errors_default() {
+        let max = MaxErrors::DEFAULT;
+        assert_eq!(max.get(), 3);
+    }
+
+    #[test]
+    fn test_max_errors_new_one() {
+        let max = MaxErrors::new(1).unwrap();
+        assert_eq!(max.get(), 1);
+    }
+
+    #[test]
+    fn test_max_errors_new_large() {
+        let max = MaxErrors::new(100).unwrap();
+        assert_eq!(max.get(), 100);
+    }
+
+    #[test]
+    fn test_max_errors_display() {
+        let max = MaxErrors::new(7).unwrap();
+        assert_eq!(max.to_string(), "7");
+    }
+
+    #[test]
+    fn test_max_errors_serde_json() {
+        let max = MaxErrors::new(5).unwrap();
+        let json = serde_json::to_string(&max).unwrap();
+        assert_eq!(json, "5");
+
+        let parsed: MaxErrors = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.get(), 5);
+    }
+
+    #[test]
+    fn test_max_errors_serde_json_zero_rejected() {
+        let result = serde_json::from_str::<MaxErrors>("0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_errors_equality() {
+        let max1 = MaxErrors::new(3).unwrap();
+        let max2 = MaxErrors::new(3).unwrap();
+        let max3 = MaxErrors::new(5).unwrap();
+
+        assert_eq!(max1, max2);
+        assert_ne!(max1, max3);
+    }
+
+    #[test]
+    fn test_max_errors_clone() {
+        let max = MaxErrors::new(10).unwrap();
+        let cloned = max.clone();
+        assert_eq!(max, cloned);
+    }
+
+    // ThreadCount tests
     #[test]
     fn test_thread_count_default() {
         let threads = ThreadCount::default();
@@ -183,5 +322,90 @@ mod tests {
         let threads = ThreadCount::from_value(0).unwrap();
         // Should return CPU count (at least 1)
         assert!(threads.get() >= 1);
+    }
+
+    #[test]
+    fn test_thread_count_from_value_explicit() {
+        let threads = ThreadCount::from_value(4).unwrap();
+        assert_eq!(threads.get(), 4);
+    }
+
+    #[test]
+    fn test_thread_count_new_returns_none_for_zero() {
+        // new() can't call num_cpus() in const context, so returns None for 0
+        assert!(ThreadCount::new(0).is_none());
+    }
+
+    #[test]
+    fn test_thread_count_new_valid() {
+        let threads = ThreadCount::new(8).unwrap();
+        assert_eq!(threads.get(), 8);
+    }
+
+    #[test]
+    fn test_thread_count_display() {
+        let threads = ThreadCount::from_value(2).unwrap();
+        assert_eq!(threads.to_string(), "2");
+    }
+
+    #[test]
+    fn test_thread_count_from() {
+        let threads = ThreadCount::from_value(6).unwrap();
+        let value: usize = threads.into();
+        assert_eq!(value, 6);
+    }
+
+    #[test]
+    fn test_thread_count_from_str_valid() {
+        let threads: ThreadCount = "4".parse().unwrap();
+        assert_eq!(threads.get(), 4);
+    }
+
+    #[test]
+    fn test_thread_count_from_str_zero() {
+        let threads: ThreadCount = "0".parse().unwrap();
+        // Should auto-detect CPU count
+        assert!(threads.get() >= 1);
+    }
+
+    #[test]
+    fn test_thread_count_from_str_invalid() {
+        let result = "not_a_number".parse::<ThreadCount>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_thread_count_serde_json() {
+        let threads = ThreadCount::from_value(3).unwrap();
+        let json = serde_json::to_string(&threads).unwrap();
+        assert_eq!(json, "3");
+
+        let parsed: ThreadCount = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.get(), 3);
+    }
+
+    #[test]
+    fn test_thread_count_serde_json_auto() {
+        let json = "0";
+        let parsed: ThreadCount = serde_json::from_str(json).unwrap();
+        // Should auto-detect CPU count
+        assert!(parsed.get() >= 1);
+    }
+
+    #[test]
+    fn test_thread_count_equality() {
+        let t1 = ThreadCount::from_value(4).unwrap();
+        let t2 = ThreadCount::from_value(4).unwrap();
+        let t3 = ThreadCount::from_value(8).unwrap();
+
+        assert_eq!(t1, t2);
+        assert_ne!(t1, t3);
+    }
+
+    #[test]
+    fn test_thread_count_clone() {
+        let threads = ThreadCount::from_value(2).unwrap();
+        let cloned = threads.clone();
+        assert_eq!(threads, cloned);
     }
 }

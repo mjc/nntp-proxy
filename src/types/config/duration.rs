@@ -48,3 +48,141 @@ pub mod option_duration_serde {
         Ok(secs.map(Duration::from_secs))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct TestDuration {
+        #[serde(with = "duration_serde")]
+        timeout: Duration,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct TestOptionDuration {
+        #[serde(with = "option_duration_serde")]
+        timeout: Option<Duration>,
+    }
+
+    #[test]
+    fn test_duration_serde_serialize() {
+        let test = TestDuration {
+            timeout: Duration::from_secs(30),
+        };
+        let json = serde_json::to_string(&test).unwrap();
+        assert_eq!(json, r#"{"timeout":30}"#);
+    }
+
+    #[test]
+    fn test_duration_serde_deserialize() {
+        let json = r#"{"timeout":30}"#;
+        let test: TestDuration = serde_json::from_str(json).unwrap();
+        assert_eq!(test.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_duration_serde_zero() {
+        let test = TestDuration {
+            timeout: Duration::from_secs(0),
+        };
+        let json = serde_json::to_string(&test).unwrap();
+        assert_eq!(json, r#"{"timeout":0}"#);
+
+        let parsed: TestDuration = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.timeout, Duration::from_secs(0));
+    }
+
+    #[test]
+    fn test_duration_serde_large_value() {
+        let test = TestDuration {
+            timeout: Duration::from_secs(86400), // 24 hours
+        };
+        let json = serde_json::to_string(&test).unwrap();
+        assert_eq!(json, r#"{"timeout":86400}"#);
+
+        let parsed: TestDuration = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.timeout, Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn test_duration_serde_round_trip() {
+        let original = TestDuration {
+            timeout: Duration::from_secs(120),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: TestDuration = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_option_duration_serde_serialize_some() {
+        let test = TestOptionDuration {
+            timeout: Some(Duration::from_secs(60)),
+        };
+        let json = serde_json::to_string(&test).unwrap();
+        assert_eq!(json, r#"{"timeout":60}"#);
+    }
+
+    #[test]
+    fn test_option_duration_serde_serialize_none() {
+        let test = TestOptionDuration { timeout: None };
+        let json = serde_json::to_string(&test).unwrap();
+        assert_eq!(json, r#"{"timeout":null}"#);
+    }
+
+    #[test]
+    fn test_option_duration_serde_deserialize_some() {
+        let json = r#"{"timeout":45}"#;
+        let test: TestOptionDuration = serde_json::from_str(json).unwrap();
+        assert_eq!(test.timeout, Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn test_option_duration_serde_deserialize_null() {
+        let json = r#"{"timeout":null}"#;
+        let test: TestOptionDuration = serde_json::from_str(json).unwrap();
+        assert_eq!(test.timeout, None);
+    }
+
+    #[test]
+    fn test_option_duration_serde_deserialize_missing() {
+        let json = r#"{}"#;
+        let result: Result<TestOptionDuration, _> = serde_json::from_str(json);
+        // serde will error on missing required field
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_option_duration_serde_round_trip_some() {
+        let original = TestOptionDuration {
+            timeout: Some(Duration::from_secs(300)),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: TestOptionDuration = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_option_duration_serde_round_trip_none() {
+        let original = TestOptionDuration { timeout: None };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: TestOptionDuration = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_duration_serde_with_toml() {
+        let toml = r#"timeout = 120"#;
+        let test: TestDuration = toml::from_str(toml).unwrap();
+        assert_eq!(test.timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_option_duration_serde_with_toml_some() {
+        let toml = r#"timeout = 180"#;
+        let test: TestOptionDuration = toml::from_str(toml).unwrap();
+        assert_eq!(test.timeout, Some(Duration::from_secs(180)));
+    }
+}
