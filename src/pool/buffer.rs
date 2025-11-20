@@ -491,4 +491,144 @@ mod tests {
             handle.await.unwrap();
         }
     }
+
+    #[tokio::test]
+    async fn test_pooled_buffer_deref() {
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        // Initially no initialized bytes
+        assert_eq!(buffer.len(), 0);
+
+        // Write data
+        buffer.copy_from_slice(b"Hello");
+
+        // Deref should return only initialized portion
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(&*buffer, b"Hello");
+    }
+
+    #[tokio::test]
+    async fn test_pooled_buffer_as_ref() {
+        let pool = BufferPool::new(BufferSize::new(512).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        buffer.copy_from_slice(b"Test data");
+
+        // AsRef should return initialized portion
+        let slice: &[u8] = buffer.as_ref();
+        assert_eq!(slice, b"Test data");
+        assert_eq!(slice.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_copy_from_slice_updates_initialized() {
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        assert_eq!(buffer.initialized(), 0);
+
+        buffer.copy_from_slice(b"abc");
+        assert_eq!(buffer.initialized(), 3);
+
+        buffer.copy_from_slice(b"longer text");
+        assert_eq!(buffer.initialized(), 11);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "data exceeds buffer capacity")]
+    async fn test_copy_from_slice_panic_on_overflow() {
+        let pool = BufferPool::new(BufferSize::new(10).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        let too_large = vec![0u8; 20];
+        buffer.copy_from_slice(&too_large); // Should panic
+    }
+
+    #[tokio::test]
+    async fn test_buffer_pool_debug() {
+        let pool = BufferPool::new(BufferSize::new(2048).unwrap(), 5);
+        let debug_str = format!("{:?}", pool);
+        assert!(debug_str.contains("BufferPool"));
+    }
+
+    #[tokio::test]
+    async fn test_buffer_initialized_tracking() {
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        // Test multiple writes update initialized correctly
+        buffer.copy_from_slice(b"First");
+        assert_eq!(buffer.initialized(), 5);
+        assert_eq!(&*buffer, b"First");
+
+        buffer.copy_from_slice(b"Second write");
+        assert_eq!(buffer.initialized(), 12);
+        assert_eq!(&*buffer, b"Second write");
+    }
+
+    #[tokio::test]
+    async fn test_buffer_capacity_vs_initialized() {
+        let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        // Capacity is full buffer size
+        assert_eq!(buffer.capacity(), 8192);
+
+        // Initialized is what we've written
+        assert_eq!(buffer.initialized(), 0);
+
+        buffer.copy_from_slice(b"Small");
+        assert_eq!(buffer.capacity(), 8192);
+        assert_eq!(buffer.initialized(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_as_mut_slice_capacity() {
+        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        // as_mut_slice should return full capacity
+        let slice = buffer.as_mut_slice();
+        assert_eq!(slice.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn test_empty_slice_copy() {
+        let pool = BufferPool::new(BufferSize::new(512).unwrap(), 5);
+        let mut buffer = pool.acquire().await;
+
+        // Copying empty slice should work
+        buffer.copy_from_slice(&[]);
+        assert_eq!(buffer.initialized(), 0);
+        assert_eq!(&*buffer, b"");
+    }
+
+    #[tokio::test]
+    async fn test_buffer_reuse_preserves_capacity() {
+        let pool = BufferPool::new(BufferSize::new(2048).unwrap(), 5);
+
+        {
+            let mut buffer = pool.acquire().await;
+            buffer.copy_from_slice(b"test");
+            assert_eq!(buffer.capacity(), 2048);
+        } // Drop returns to pool
+
+        let buffer2 = pool.acquire().await;
+        // Should have same capacity when reused
+        assert_eq!(buffer2.capacity(), 2048);
+    }
+
+    #[test]
+    fn test_buffer_size_alignment() {
+        // Test that create_aligned_buffer aligns to page boundaries
+        let buffer = BufferPool::create_aligned_buffer(1000);
+        // Should be aligned to 4096
+        assert_eq!(buffer.len(), 1000);
+        assert_eq!(buffer.capacity() % 4096, 0);
+
+        let buffer2 = BufferPool::create_aligned_buffer(8192);
+        assert_eq!(buffer2.len(), 8192);
+        assert_eq!(buffer2.capacity() % 4096, 0);
+    }
 }
