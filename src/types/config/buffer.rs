@@ -38,154 +38,121 @@ impl BufferSize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    // WindowSize tests
-    #[test]
-    fn test_window_size_default() {
-        let size = WindowSize::DEFAULT;
-        assert_eq!(size.get(), 100);
+    // Property-based tests for BufferSize
+    proptest! {
+        #[test]
+        fn valid_buffer_sizes_roundtrip(size in 1usize..10_000_000usize) {
+            let buffer = BufferSize::new(size).unwrap();
+            prop_assert_eq!(buffer.get(), size);
+        }
+
+        #[test]
+        fn buffer_size_display_shows_value(size in 1usize..10_000_000usize) {
+            let buffer = BufferSize::new(size).unwrap();
+            let display = format!("{}", buffer);
+            prop_assert!(display.contains(&size.to_string()));
+        }
+
+        #[test]
+        fn buffer_size_debug_shows_value(size in 1usize..10_000_000usize) {
+            let buffer = BufferSize::new(size).unwrap();
+            let debug = format!("{:?}", buffer);
+            prop_assert!(debug.contains("BufferSize"));
+            prop_assert!(debug.contains(&size.to_string()));
+        }
+
+        #[test]
+        fn buffer_size_serde_json_roundtrip(size in 1usize..10_000_000usize) {
+            let original = BufferSize::new(size).unwrap();
+            let json = serde_json::to_string(&original).unwrap();
+            let deserialized: BufferSize = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(original, deserialized);
+        }
+
+        #[test]
+        fn buffer_size_clone_equality(size in 1usize..10_000_000usize) {
+            let original = BufferSize::new(size).unwrap();
+            let cloned = original.clone();
+            prop_assert_eq!(original, cloned);
+            prop_assert_eq!(original.get(), cloned.get());
+        }
+
+        #[test]
+        fn buffer_size_equality_same_value(size in 1usize..10_000_000usize) {
+            let buffer1 = BufferSize::new(size).unwrap();
+            let buffer2 = BufferSize::new(size).unwrap();
+            prop_assert_eq!(buffer1, buffer2);
+        }
     }
 
-    #[test]
-    fn test_window_size_new_valid() {
-        let size = WindowSize::new(50).unwrap();
-        assert_eq!(size.get(), 50);
+    // Property-based tests for WindowSize
+    proptest! {
+        #[test]
+        fn valid_window_sizes_roundtrip(size in 1u64..100_000u64) {
+            let window = WindowSize::new(size).unwrap();
+            prop_assert_eq!(window.get(), size);
+        }
+
+        #[test]
+        fn window_size_display_shows_value(size in 1u64..100_000u64) {
+            let window = WindowSize::new(size).unwrap();
+            let display = format!("{}", window);
+            prop_assert!(display.contains(&size.to_string()));
+        }
+
+        #[test]
+        fn window_size_serde_json_roundtrip(size in 1u64..100_000u64) {
+            let original = WindowSize::new(size).unwrap();
+            let json = serde_json::to_string(&original).unwrap();
+            let deserialized: WindowSize = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(original, deserialized);
+        }
+
+        #[test]
+        fn window_size_clone_equality(size in 1u64..100_000u64) {
+            let original = WindowSize::new(size).unwrap();
+            let cloned = original.clone();
+            prop_assert_eq!(original, cloned);
+        }
     }
 
+    // Edge case tests (keep explicit tests for boundaries)
     #[test]
-    fn test_window_size_new_zero_returns_none() {
-        assert!(WindowSize::new(0).is_none());
-    }
-
-    #[test]
-    fn test_window_size_new_large() {
-        let size = WindowSize::new(10000).unwrap();
-        assert_eq!(size.get(), 10000);
-    }
-
-    #[test]
-    fn test_window_size_display() {
-        let size = WindowSize::new(100).unwrap();
-        assert_eq!(format!("{}", size), "100");
-    }
-
-    #[test]
-    fn test_window_size_clone() {
-        let size1 = WindowSize::new(50).unwrap();
-        let size2 = size1.clone();
-        assert_eq!(size1.get(), size2.get());
-    }
-
-    #[test]
-    fn test_window_size_equality() {
-        let size1 = WindowSize::new(100).unwrap();
-        let size2 = WindowSize::new(100).unwrap();
-        let size3 = WindowSize::new(200).unwrap();
-
-        assert_eq!(size1, size2);
-        assert_ne!(size1, size3);
-    }
-
-    // BufferSize tests
-    #[test]
-    fn test_buffer_size_command_constant() {
-        assert_eq!(BufferSize::COMMAND.get(), 512);
-    }
-
-    #[test]
-    fn test_buffer_size_default_constant() {
-        assert_eq!(BufferSize::DEFAULT.get(), 8192);
-    }
-
-    #[test]
-    fn test_buffer_size_medium_constant() {
-        assert_eq!(BufferSize::MEDIUM.get(), 256 * 1024);
-    }
-
-    #[test]
-    fn test_buffer_size_large_constant() {
-        assert_eq!(BufferSize::LARGE.get(), 4 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_buffer_size_new_valid() {
-        let size = BufferSize::new(1024).unwrap();
-        assert_eq!(size.get(), 1024);
-    }
-
-    #[test]
-    fn test_buffer_size_new_zero_returns_none() {
+    fn buffer_size_zero_is_invalid() {
         assert!(BufferSize::new(0).is_none());
     }
 
     #[test]
-    fn test_buffer_size_new_one() {
+    fn buffer_size_one_is_valid() {
         let size = BufferSize::new(1).unwrap();
         assert_eq!(size.get(), 1);
     }
 
     #[test]
-    fn test_buffer_size_display() {
-        let size = BufferSize::new(8192).unwrap();
-        assert_eq!(format!("{}", size), "8192");
+    fn window_size_zero_is_invalid() {
+        assert!(WindowSize::new(0).is_none());
     }
 
+    // Constant verification tests
     #[test]
-    fn test_buffer_size_clone() {
-        let size1 = BufferSize::COMMAND;
-        let size2 = size1.clone();
-        assert_eq!(size1.get(), size2.get());
-    }
-
-    #[test]
-    fn test_buffer_size_equality() {
-        let size1 = BufferSize::new(1024).unwrap();
-        let size2 = BufferSize::new(1024).unwrap();
-        let size3 = BufferSize::new(2048).unwrap();
-
-        assert_eq!(size1, size2);
-        assert_ne!(size1, size3);
-    }
-
-    #[test]
-    fn test_buffer_size_constants_are_powers_of_two_or_multiples() {
-        // COMMAND is 512 = 2^9
+    fn buffer_size_constants_correct_values() {
         assert_eq!(BufferSize::COMMAND.get(), 512);
-
-        // DEFAULT is 8KB = 2^13
         assert_eq!(BufferSize::DEFAULT.get(), 8192);
-
-        // MEDIUM is 256KB = 2^18
         assert_eq!(BufferSize::MEDIUM.get(), 262_144);
-
-        // LARGE is 4MB = 2^22
         assert_eq!(BufferSize::LARGE.get(), 4_194_304);
     }
 
     #[test]
-    fn test_buffer_size_ordering() {
+    fn buffer_size_constants_ordering() {
         assert!(BufferSize::COMMAND.get() < BufferSize::DEFAULT.get());
         assert!(BufferSize::DEFAULT.get() < BufferSize::MEDIUM.get());
         assert!(BufferSize::MEDIUM.get() < BufferSize::LARGE.get());
     }
 
     #[test]
-    fn test_window_size_serde_json() {
-        let size = WindowSize::new(150).unwrap();
-        let json = serde_json::to_string(&size).unwrap();
-        assert_eq!(json, "150");
-
-        let deserialized: WindowSize = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.get(), 150);
-    }
-
-    #[test]
-    fn test_buffer_size_serde_json() {
-        let size = BufferSize::new(4096).unwrap();
-        let json = serde_json::to_string(&size).unwrap();
-        assert_eq!(json, "4096");
-
-        let deserialized: BufferSize = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.get(), 4096);
+    fn window_size_default_constant() {
+        assert_eq!(WindowSize::DEFAULT.get(), 100);
     }
 }
