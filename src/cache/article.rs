@@ -132,4 +132,138 @@ mod tests {
             "Cache lookup for non-existent key should return None"
         );
     }
+
+    #[tokio::test]
+    async fn test_cache_insert_and_retrieve() {
+        let cache = ArticleCache::new(10, Duration::from_secs(300));
+
+        let msgid = MessageId::from_borrowed("<article@example.com>").unwrap();
+        let response_data =
+            b"220 1 <article@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+        let article = CachedArticle {
+            response: Arc::new(response_data.clone()),
+        };
+
+        cache.insert(msgid.clone(), article).await;
+
+        let retrieved = cache.get(&msgid).await.unwrap();
+        assert_eq!(retrieved.response.as_ref(), &response_data);
+    }
+
+    #[tokio::test]
+    async fn test_cache_stats() {
+        let cache = ArticleCache::new(10, Duration::from_secs(300));
+
+        // Initial stats
+        let stats = cache.stats().await;
+        assert_eq!(stats.entry_count, 0);
+
+        // Insert one article
+        let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
+        let article = CachedArticle {
+            response: Arc::new(b"220 test\r\n.\r\n".to_vec()),
+        };
+        cache.insert(msgid, article).await;
+
+        // Wait for background tasks
+        cache.sync().await;
+
+        // Check stats again
+        let stats = cache.stats().await;
+        assert_eq!(stats.entry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_ttl_expiration() {
+        let cache = ArticleCache::new(10, Duration::from_millis(50));
+
+        let msgid = MessageId::from_borrowed("<expire@example.com>").unwrap();
+        let article = CachedArticle {
+            response: Arc::new(b"220 test\r\n.\r\n".to_vec()),
+        };
+
+        cache.insert(msgid.clone(), article).await;
+
+        // Should be cached immediately
+        assert!(cache.get(&msgid).await.is_some());
+
+        // Wait for TTL expiration + sync
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cache.sync().await;
+
+        // Should be expired
+        assert!(cache.get(&msgid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_capacity_limit() {
+        let cache = ArticleCache::new(2, Duration::from_secs(300));
+
+        // Insert 3 articles (exceeds capacity of 2)
+        for i in 1..=3 {
+            let msgid_str = format!("<article{}@example.com>", i);
+            let msgid = MessageId::new(msgid_str).unwrap();
+            let article = CachedArticle {
+                response: Arc::new(format!("220 {}\r\n.\r\n", i).into_bytes()),
+            };
+            cache.insert(msgid, article).await;
+            cache.sync().await; // Force eviction
+        }
+
+        // Wait for eviction to complete
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cache.sync().await;
+
+        let stats = cache.stats().await;
+        assert!(
+            stats.entry_count <= 2,
+            "Cache should evict to maintain capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_article_clone() {
+        let response = Arc::new(b"220 test\r\n.\r\n".to_vec());
+        let article = CachedArticle {
+            response: response.clone(),
+        };
+
+        let cloned = article.clone();
+        assert_eq!(article.response.as_ref(), cloned.response.as_ref());
+        assert!(Arc::ptr_eq(&article.response, &cloned.response));
+    }
+
+    #[tokio::test]
+    async fn test_cache_clone() {
+        let cache1 = ArticleCache::new(10, Duration::from_secs(300));
+        let cache2 = cache1.clone();
+
+        let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
+        let article = CachedArticle {
+            response: Arc::new(b"220 test\r\n.\r\n".to_vec()),
+        };
+
+        cache1.insert(msgid.clone(), article).await;
+        cache1.sync().await;
+
+        // Should be accessible from cloned cache
+        assert!(cache2.get(&msgid).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cache_with_owned_message_id() {
+        let cache = ArticleCache::new(10, Duration::from_secs(300));
+
+        // Use owned MessageId
+        let msgid = MessageId::new("<owned@example.com>".to_string()).unwrap();
+        let article = CachedArticle {
+            response: Arc::new(b"220 test\r\n.\r\n".to_vec()),
+        };
+
+        cache.insert(msgid.clone(), article).await;
+
+        // Retrieve with borrowed MessageId
+        let borrowed_msgid = MessageId::from_borrowed("<owned@example.com>").unwrap();
+        assert!(cache.get(&borrowed_msgid).await.is_some());
+    }
 }
