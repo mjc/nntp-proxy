@@ -82,127 +82,113 @@ impl Ord for Port {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    #[test]
-    fn test_port_default() {
-        let port = Port::default();
-        assert_eq!(port.get(), 8119);
-        assert_eq!(port, Port::DEFAULT);
+    proptest! {
+        #[test]
+        fn valid_ports_roundtrip(port in 1u16..=65535u16) {
+            let p = Port::new(port).unwrap();
+            prop_assert_eq!(p.get(), port);
+        }
+
+        #[test]
+        fn port_from_str_roundtrip(port in 1u16..=65535u16) {
+            let port_str = port.to_string();
+            let parsed: Port = port_str.parse().unwrap();
+            prop_assert_eq!(parsed.get(), port);
+        }
+
+        #[test]
+        fn port_try_from_roundtrip(port in 1u16..=65535u16) {
+            let p = Port::try_from(port).unwrap();
+            prop_assert_eq!(p.get(), port);
+        }
+
+        #[test]
+        fn port_equality_same_value(port in 1u16..=65535u16) {
+            let p1 = Port::new(port).unwrap();
+            let p2 = Port::new(port).unwrap();
+            prop_assert_eq!(p1, p2);
+        }
+
+        #[test]
+        fn port_clone_equality(port in 1u16..=65535u16) {
+            let p1 = Port::new(port).unwrap();
+            let p2 = p1.clone();
+            prop_assert_eq!(p1, p2);
+        }
+
+        #[test]
+        fn port_ordering(a in 1u16..=65535u16, b in 1u16..=65535u16) {
+            let port_a = Port::new(a).unwrap();
+            let port_b = Port::new(b).unwrap();
+            prop_assert_eq!(port_a.cmp(&port_b), a.cmp(&b));
+            prop_assert_eq!(port_a.partial_cmp(&port_b), Some(a.cmp(&b)));
+        }
+
+        #[test]
+        fn port_display_shows_value(port in 1u16..=65535u16) {
+            let p = Port::new(port).unwrap();
+            let display = format!("{}", p);
+            prop_assert!(display.contains(&port.to_string()));
+        }
     }
 
+    // Edge case tests
     #[test]
-    fn test_port_constants() {
-        assert_eq!(Port::NNTP.get(), 119);
-        assert_eq!(Port::NNTPS.get(), 563);
-        assert_eq!(Port::DEFAULT.get(), 8119);
-    }
-
-    #[test]
-    fn test_port_new_valid() {
-        let port = Port::new(8080).unwrap();
-        assert_eq!(port.get(), 8080);
-    }
-
-    #[test]
-    fn test_port_new_zero_returns_none() {
+    fn port_zero_is_invalid() {
         assert!(Port::new(0).is_none());
     }
 
     #[test]
-    fn test_port_new_max_value() {
-        let port = Port::new(65535).unwrap();
-        assert_eq!(port.get(), 65535);
-    }
-
-    #[test]
-    fn test_port_from_str_valid() {
-        let port: Port = "443".parse().unwrap();
-        assert_eq!(port.get(), 443);
-    }
-
-    #[test]
-    fn test_port_from_str_zero() {
-        let result: Result<Port, _> = "0".parse();
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ValidationError::InvalidPort));
-    }
-
-    #[test]
-    fn test_port_from_str_invalid() {
-        let result: Result<Port, _> = "not_a_port".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_port_from_str_out_of_range() {
-        let result: Result<Port, _> = "65536".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_port_from_str_negative() {
-        let result: Result<Port, _> = "-1".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_port_try_from_valid() {
-        let port = Port::try_from(80).unwrap();
-        assert_eq!(port.get(), 80);
-    }
-
-    #[test]
-    fn test_port_try_from_zero() {
+    fn port_try_from_zero_fails() {
         let result = Port::try_from(0);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ValidationError::InvalidPort));
     }
 
     #[test]
-    fn test_port_try_from_max() {
-        let port = Port::try_from(65535).unwrap();
-        assert_eq!(port.get(), 65535);
+    fn port_from_str_zero_fails() {
+        let result: Result<Port, _> = "0".parse();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ValidationError::InvalidPort));
     }
 
     #[test]
-    fn test_port_partial_ord() {
-        let small = Port::new(80).unwrap();
-        let large = Port::new(8080).unwrap();
-
-        assert!(small < large);
-        assert!(large > small);
-        assert_eq!(small.partial_cmp(&large), Some(std::cmp::Ordering::Less));
+    fn port_from_str_invalid_text() {
+        let result: Result<Port, _> = "not_a_port".parse();
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_port_ord() {
-        let small = Port::new(80).unwrap();
-        let large = Port::new(8080).unwrap();
-        let equal = Port::new(80).unwrap();
-
-        assert_eq!(small.cmp(&large), std::cmp::Ordering::Less);
-        assert_eq!(large.cmp(&small), std::cmp::Ordering::Greater);
-        assert_eq!(small.cmp(&equal), std::cmp::Ordering::Equal);
+    fn port_from_str_out_of_range() {
+        let result: Result<Port, _> = "65536".parse();
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_port_equality() {
-        let port1 = Port::new(443).unwrap();
-        let port2 = Port::new(443).unwrap();
-        let port3 = Port::new(8443).unwrap();
-
-        assert_eq!(port1, port2);
-        assert_ne!(port1, port3);
+    fn port_from_str_negative() {
+        let result: Result<Port, _> = "-1".parse();
+        assert!(result.is_err());
     }
 
+    // Constant verification
     #[test]
-    fn test_port_standard_ports() {
-        // Common HTTP/HTTPS ports
-        assert!(Port::new(80).is_some());
-        assert!(Port::new(443).is_some());
-
-        // Common NNTP ports
+    fn port_constants_correct() {
         assert_eq!(Port::NNTP.get(), 119);
         assert_eq!(Port::NNTPS.get(), 563);
+        assert_eq!(Port::DEFAULT.get(), 8119);
+    }
+
+    #[test]
+    fn port_default_matches_constant() {
+        assert_eq!(Port::default(), Port::DEFAULT);
+        assert_eq!(Port::default().get(), 8119);
+    }
+
+    #[test]
+    fn port_max_value_is_valid() {
+        let port = Port::new(65535).unwrap();
+        assert_eq!(port.get(), 65535);
     }
 }
