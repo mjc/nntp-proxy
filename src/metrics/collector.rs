@@ -32,7 +32,9 @@ struct BackendMetrics {
 }
 
 impl BackendMetrics {
-    fn to_backend_stats(&self, backend_id: BackendId) -> BackendStats {
+    /// Convert to immutable snapshot (public for testing)
+    #[must_use]
+    pub fn to_backend_stats(&self, backend_id: BackendId) -> BackendStats {
         use super::types::*;
         use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
         BackendStats {
@@ -449,5 +451,220 @@ impl MetricsCollector {
     #[inline]
     pub fn num_backends(&self) -> usize {
         self.inner.backend_metrics.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_metrics_default() {
+        let metrics = BackendMetrics::default();
+        let stats = metrics.to_backend_stats(BackendId::from_index(0));
+
+        assert_eq!(stats.total_commands.get(), 0);
+        assert_eq!(stats.bytes_sent.as_u64(), 0);
+        assert_eq!(stats.bytes_received.as_u64(), 0);
+        assert_eq!(stats.errors.get(), 0);
+    }
+
+    #[test]
+    fn test_backend_metrics_to_backend_stats() {
+        let metrics = BackendMetrics::default();
+        metrics.total_commands.store(42, Ordering::Relaxed);
+        metrics.bytes_sent.store(1024, Ordering::Relaxed);
+        metrics.bytes_received.store(2048, Ordering::Relaxed);
+        metrics.errors.store(3, Ordering::Relaxed);
+
+        let stats = metrics.to_backend_stats(BackendId::from_index(5));
+
+        assert_eq!(stats.backend_id.as_index(), 5);
+        assert_eq!(stats.total_commands.get(), 42);
+        assert_eq!(stats.bytes_sent.as_u64(), 1024);
+        assert_eq!(stats.bytes_received.as_u64(), 2048);
+        assert_eq!(stats.errors.get(), 3);
+    }
+
+    #[test]
+    fn test_user_metrics_new() {
+        let metrics = UserMetrics::new("testuser".to_string());
+        assert_eq!(metrics.username, "testuser");
+        assert_eq!(metrics.total_commands, 0);
+        assert_eq!(metrics.bytes_sent, 0);
+        assert_eq!(metrics.bytes_received, 0);
+    }
+
+    #[test]
+    fn test_user_metrics_to_user_stats() {
+        let mut metrics = UserMetrics::new("alice".to_string());
+        metrics.total_commands = 100;
+        metrics.bytes_sent = 5000;
+        metrics.bytes_received = 10000;
+        metrics.errors = 2;
+
+        let stats = metrics.to_user_stats();
+        assert_eq!(stats.username, "alice");
+        assert_eq!(stats.total_commands.get(), 100);
+        assert_eq!(stats.bytes_sent.as_u64(), 5000);
+        assert_eq!(stats.bytes_received.as_u64(), 10000);
+        assert_eq!(stats.errors.get(), 2);
+    }
+
+    #[test]
+    fn test_metrics_collector_new() {
+        let collector = MetricsCollector::new(3);
+        assert_eq!(collector.num_backends(), 3);
+    }
+
+    #[test]
+    fn test_metrics_collector_record_command() {
+        let collector = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+
+        collector.record_command(backend_id);
+        collector.record_command(backend_id);
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.backend_stats[0].total_commands.get(), 2);
+    }
+
+    #[test]
+    fn test_metrics_collector_record_bytes() {
+        let collector = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+
+        collector.record_client_to_backend_bytes_for(backend_id, 1024);
+        collector.record_backend_to_client_bytes_for(backend_id, 2048);
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.backend_stats[0].bytes_sent.as_u64(), 1024);
+        assert_eq!(snapshot.backend_stats[0].bytes_received.as_u64(), 2048);
+    }
+
+    #[test]
+    fn test_metrics_collector_record_errors() {
+        let collector = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+
+        collector.record_error(backend_id);
+        collector.record_error(backend_id);
+        collector.record_error(backend_id);
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.backend_stats[0].errors.get(), 3);
+    }
+
+    #[test]
+    fn test_metrics_collector_connection_lifecycle() {
+        let collector = MetricsCollector::new(1);
+
+        assert_eq!(collector.snapshot().active_connections, 0);
+        assert_eq!(collector.snapshot().total_connections, 0);
+
+        collector.connection_opened();
+        assert_eq!(collector.snapshot().active_connections, 1);
+        assert_eq!(collector.snapshot().total_connections, 1);
+
+        collector.connection_opened();
+        assert_eq!(collector.snapshot().active_connections, 2);
+        assert_eq!(collector.snapshot().total_connections, 2);
+
+        collector.connection_closed();
+        assert_eq!(collector.snapshot().active_connections, 1);
+        assert_eq!(collector.snapshot().total_connections, 2);
+    }
+
+    #[test]
+    fn test_metrics_collector_stateful_sessions() {
+        let collector = MetricsCollector::new(1);
+
+        collector.stateful_session_started();
+        assert_eq!(collector.snapshot().stateful_sessions, 1);
+
+        collector.stateful_session_started();
+        assert_eq!(collector.snapshot().stateful_sessions, 2);
+
+        collector.stateful_session_ended();
+        assert_eq!(collector.snapshot().stateful_sessions, 1);
+    }
+
+    #[test]
+    fn test_metrics_collector_user_metrics() {
+        let collector = MetricsCollector::new(1);
+
+        collector.user_connection_opened(Some("alice"));
+        collector.user_bytes_sent(Some("alice"), 1000);
+        collector.user_bytes_received(Some("alice"), 2000);
+        collector.user_command(Some("alice"));
+
+        let snapshot = collector.snapshot();
+        let alice_stats = snapshot.user_stats.iter().find(|s| s.username == "alice");
+        assert!(alice_stats.is_some());
+
+        let stats = alice_stats.unwrap();
+        assert_eq!(stats.bytes_sent.as_u64(), 1000);
+        assert_eq!(stats.bytes_received.as_u64(), 2000);
+        assert_eq!(stats.total_commands.get(), 1);
+    }
+
+    #[test]
+    fn test_metrics_collector_multiple_users() {
+        let collector = MetricsCollector::new(1);
+
+        collector.user_connection_opened(Some("alice"));
+        collector.user_bytes_sent(Some("alice"), 100);
+
+        collector.user_connection_opened(Some("bob"));
+        collector.user_bytes_sent(Some("bob"), 200);
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.user_stats.len(), 2);
+
+        let alice = snapshot.user_stats.iter().find(|s| s.username == "alice");
+        let bob = snapshot.user_stats.iter().find(|s| s.username == "bob");
+
+        assert!(alice.is_some());
+        assert!(bob.is_some());
+        assert_eq!(alice.unwrap().bytes_sent.as_u64(), 100);
+        assert_eq!(bob.unwrap().bytes_sent.as_u64(), 200);
+    }
+
+    #[test]
+    fn test_metrics_collector_snapshot_aggregation() {
+        let collector = MetricsCollector::new(2);
+
+        // Backend 0
+        collector.record_client_to_backend_bytes_for(BackendId::from_index(0), 1000);
+        collector.record_backend_to_client_bytes_for(BackendId::from_index(0), 2000);
+
+        // Backend 1
+        collector.record_client_to_backend_bytes_for(BackendId::from_index(1), 500);
+        collector.record_backend_to_client_bytes_for(BackendId::from_index(1), 1500);
+
+        let snapshot = collector.snapshot();
+
+        // Total should be sum of both backends
+        assert_eq!(snapshot.client_to_backend_bytes.as_u64(), 1500);
+        assert_eq!(snapshot.backend_to_client_bytes.as_u64(), 3500);
+    }
+
+    #[test]
+    fn test_metrics_collector_clone() {
+        let collector1 = MetricsCollector::new(1);
+        collector1.record_command(BackendId::from_index(0));
+
+        let collector2 = collector1.clone();
+        collector2.record_command(BackendId::from_index(0));
+
+        // Both should see the same data (Arc shared)
+        assert_eq!(
+            collector1.snapshot().backend_stats[0].total_commands.get(),
+            2
+        );
+        assert_eq!(
+            collector2.snapshot().backend_stats[0].total_commands.get(),
+            2
+        );
     }
 }

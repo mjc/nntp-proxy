@@ -184,3 +184,303 @@ impl MetricsSnapshot {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::BackendId;
+
+    fn create_test_snapshot() -> MetricsSnapshot {
+        use crate::types::metrics::*;
+        use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
+
+        let backend1 = BackendStats {
+            backend_id: BackendId::from_index(0),
+            total_commands: CommandCount::new(100),
+            errors: ErrorCount::new(5),
+            bytes_sent: BytesSent::new(1000),
+            bytes_received: BytesReceived::new(2000),
+            health_status: HealthStatus::Healthy,
+            active_connections: ActiveConnections::new(3),
+            errors_4xx: ErrorCount::new(2),
+            errors_5xx: ErrorCount::new(3),
+            article_bytes_total: ArticleBytesTotal::new(5000),
+            article_count: ArticleCount::new(10),
+            ttfb_micros_total: TtfbMicros::new(1000),
+            ttfb_count: TimingMeasurementCount::new(10),
+            send_micros_total: SendMicros::new(500),
+            recv_micros_total: RecvMicros::new(1500),
+            connection_failures: FailureCount::new(0),
+        };
+
+        let backend2 = BackendStats {
+            backend_id: BackendId::from_index(1),
+            total_commands: CommandCount::new(50),
+            errors: ErrorCount::new(10),
+            bytes_sent: BytesSent::new(500),
+            bytes_received: BytesReceived::new(1500),
+            health_status: HealthStatus::Degraded,
+            active_connections: ActiveConnections::new(2),
+            errors_4xx: ErrorCount::new(5),
+            errors_5xx: ErrorCount::new(5),
+            article_bytes_total: ArticleBytesTotal::new(2500),
+            article_count: ArticleCount::new(5),
+            ttfb_micros_total: TtfbMicros::new(500),
+            ttfb_count: TimingMeasurementCount::new(5),
+            send_micros_total: SendMicros::new(250),
+            recv_micros_total: RecvMicros::new(750),
+            connection_failures: FailureCount::new(1),
+        };
+
+        MetricsSnapshot {
+            total_connections: 5,
+            active_connections: 5,
+            stateful_sessions: 2,
+            client_to_backend_bytes: ClientToBackendBytes::new(1500),
+            backend_to_client_bytes: BackendToClientBytes::new(3500),
+            uptime: Duration::from_secs(3600),
+            backend_stats: Arc::new(vec![backend1, backend2]),
+            user_stats: vec![],
+        }
+    }
+
+    #[test]
+    fn test_format_uptime_hours() {
+        let snapshot = MetricsSnapshot {
+            uptime: Duration::from_secs(3661), // 1h 1m 1s
+            ..Default::default()
+        };
+        assert_eq!(snapshot.format_uptime(), "1h 1m 1s");
+    }
+
+    #[test]
+    fn test_format_uptime_minutes() {
+        let snapshot = MetricsSnapshot {
+            uptime: Duration::from_secs(125), // 2m 5s
+            ..Default::default()
+        };
+        assert_eq!(snapshot.format_uptime(), "2m 5s");
+    }
+
+    #[test]
+    fn test_format_uptime_seconds() {
+        let snapshot = MetricsSnapshot {
+            uptime: Duration::from_secs(42),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.format_uptime(), "42s");
+    }
+
+    #[test]
+    fn test_format_uptime_zero() {
+        let snapshot = MetricsSnapshot {
+            uptime: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.format_uptime(), "0s");
+    }
+
+    #[test]
+    fn test_total_bytes() {
+        let snapshot = create_test_snapshot();
+        assert_eq!(snapshot.total_bytes(), 5000); // 1500 + 3500
+    }
+
+    #[test]
+    fn test_total_bytes_zero() {
+        let snapshot = MetricsSnapshot::default();
+        assert_eq!(snapshot.total_bytes(), 0);
+    }
+
+    #[test]
+    fn test_throughput_bps() {
+        let snapshot = create_test_snapshot();
+        let expected = 5000.0 / 3600.0; // total_bytes / uptime_secs
+        assert!((snapshot.throughput_bps() - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_throughput_bps_zero_uptime() {
+        let snapshot = MetricsSnapshot {
+            client_to_backend_bytes: ClientToBackendBytes::new(1000),
+            backend_to_client_bytes: BackendToClientBytes::new(2000),
+            uptime: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.throughput_bps(), 0.0);
+    }
+
+    #[test]
+    fn test_total_commands() {
+        let snapshot = create_test_snapshot();
+        assert_eq!(snapshot.total_commands(), 150); // 100 + 50
+    }
+
+    #[test]
+    fn test_total_commands_empty() {
+        let snapshot = MetricsSnapshot::default();
+        assert_eq!(snapshot.total_commands(), 0);
+    }
+
+    #[test]
+    fn test_total_errors() {
+        let snapshot = create_test_snapshot();
+        assert_eq!(snapshot.total_errors(), 15); // 5 + 10
+    }
+
+    #[test]
+    fn test_total_errors_empty() {
+        let snapshot = MetricsSnapshot::default();
+        assert_eq!(snapshot.total_errors(), 0);
+    }
+
+    #[test]
+    fn test_error_rate_percent() {
+        let snapshot = create_test_snapshot();
+        let expected = 15.0 / 150.0 * 100.0; // (total_errors / total_commands) * 100
+        assert!((snapshot.error_rate_percent() - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_error_rate_percent_zero_commands() {
+        let snapshot = MetricsSnapshot::default();
+        assert_eq!(snapshot.error_rate_percent(), 0.0);
+    }
+
+    #[test]
+    fn test_high_error_backends() {
+        let snapshot = create_test_snapshot();
+        let high_error: Vec<_> = snapshot.high_error_backends().collect();
+        // Backend2 has 10/50 = 20% error rate (> 5%)
+        // Backend1 has 5/100 = 5% error rate (not > 5%)
+        assert_eq!(high_error.len(), 1);
+        assert_eq!(high_error[0], BackendId::from_index(1));
+    }
+
+    #[test]
+    fn test_high_error_backends_empty() {
+        let snapshot = MetricsSnapshot::default();
+        let high_error: Vec<_> = snapshot.high_error_backends().collect();
+        assert_eq!(high_error.len(), 0);
+    }
+
+    #[test]
+    fn test_healthy_backends() {
+        let snapshot = create_test_snapshot();
+        let healthy: Vec<_> = snapshot.healthy_backends().collect();
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0], BackendId::from_index(0));
+    }
+
+    #[test]
+    fn test_healthy_backends_all_down() {
+        let backend = BackendStats {
+            health_status: HealthStatus::Down,
+            ..Default::default()
+        };
+
+        let snapshot = MetricsSnapshot {
+            backend_stats: Arc::new(vec![backend]),
+            ..Default::default()
+        };
+
+        let healthy: Vec<_> = snapshot.healthy_backends().collect();
+        assert_eq!(healthy.len(), 0);
+    }
+
+    #[test]
+    fn test_backend_by_id() {
+        let snapshot = create_test_snapshot();
+
+        let backend0 = snapshot.backend(BackendId::from_index(0));
+        assert!(backend0.is_some());
+        assert_eq!(backend0.unwrap().backend_id, BackendId::from_index(0));
+        assert_eq!(backend0.unwrap().total_commands.get(), 100);
+
+        let backend1 = snapshot.backend(BackendId::from_index(1));
+        assert!(backend1.is_some());
+        assert_eq!(backend1.unwrap().backend_id, BackendId::from_index(1));
+        assert_eq!(backend1.unwrap().total_commands.get(), 50);
+    }
+
+    #[test]
+    fn test_backend_by_id_out_of_range() {
+        let snapshot = create_test_snapshot();
+        let backend = snapshot.backend(BackendId::from_index(99));
+        assert!(backend.is_none());
+    }
+
+    #[test]
+    fn test_backend_health_counts() {
+        let snapshot = create_test_snapshot();
+        let (healthy, degraded, down) = snapshot.backend_health_counts();
+        assert_eq!(healthy, 1);
+        assert_eq!(degraded, 1);
+        assert_eq!(down, 0);
+    }
+
+    #[test]
+    fn test_backend_health_counts_mixed() {
+        let backends = vec![
+            BackendStats {
+                backend_id: BackendId::from_index(0),
+                health_status: HealthStatus::Healthy,
+                ..Default::default()
+            },
+            BackendStats {
+                backend_id: BackendId::from_index(1),
+                health_status: HealthStatus::Healthy,
+                ..Default::default()
+            },
+            BackendStats {
+                backend_id: BackendId::from_index(2),
+                health_status: HealthStatus::Down,
+                ..Default::default()
+            },
+        ];
+
+        let snapshot = MetricsSnapshot {
+            backend_stats: Arc::new(backends),
+            ..Default::default()
+        };
+
+        let (healthy, degraded, down) = snapshot.backend_health_counts();
+        assert_eq!(healthy, 2);
+        assert_eq!(degraded, 0);
+        assert_eq!(down, 1);
+    }
+
+    #[test]
+    fn test_backend_health_counts_empty() {
+        let snapshot = MetricsSnapshot::default();
+        let (healthy, degraded, down) = snapshot.backend_health_counts();
+        assert_eq!(healthy, 0);
+        assert_eq!(degraded, 0);
+        assert_eq!(down, 0);
+    }
+
+    #[test]
+    fn test_snapshot_default() {
+        let snapshot = MetricsSnapshot::default();
+        assert_eq!(snapshot.total_connections, 0);
+        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.stateful_sessions, 0);
+        assert_eq!(snapshot.total_bytes(), 0);
+        assert_eq!(snapshot.uptime, Duration::from_secs(0));
+        assert_eq!(snapshot.backend_stats.len(), 0);
+        assert_eq!(snapshot.user_stats.len(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_clone() {
+        let snapshot = create_test_snapshot();
+        let cloned = snapshot.clone();
+
+        assert_eq!(snapshot.total_connections, cloned.total_connections);
+        assert_eq!(snapshot.total_bytes(), cloned.total_bytes());
+        assert_eq!(snapshot.uptime, cloned.uptime);
+
+        // Arc should share the same allocation
+        assert!(Arc::ptr_eq(&snapshot.backend_stats, &cloned.backend_stats));
+    }
+}

@@ -8,6 +8,117 @@ use anyhow::Result;
 use super::defaults;
 use super::types::{Config, Server};
 
+/// Environment variable getter trait for dependency injection
+pub trait EnvProvider {
+    fn get(&self, key: &str) -> Option<String>;
+}
+
+/// Standard environment provider using std::env::var
+#[derive(Default)]
+pub struct StdEnvProvider;
+
+impl EnvProvider for StdEnvProvider {
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+}
+
+/// Parse server configuration from environment variables (pure function, easily testable)
+///
+/// # Arguments
+/// * `index` - Server index (0, 1, 2, ...)
+/// * `env` - Environment variable provider
+///
+/// # Returns
+/// Some(Server) if HOST variable exists, None otherwise
+pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Server> {
+    // Check if this server index exists by looking for HOST
+    let host_key = format!("NNTP_SERVER_{}_HOST", index);
+    let host = env.get(&host_key)?;
+
+    // Parse port (required)
+    let port_key = format!("NNTP_SERVER_{}_PORT", index);
+    let port = env
+        .get(&port_key)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(119); // Default NNTP port
+
+    // Get name (required, use host as fallback)
+    let name_key = format!("NNTP_SERVER_{}_NAME", index);
+    let name = env
+        .get(&name_key)
+        .unwrap_or_else(|| format!("Server {}", index));
+
+    // Optional fields
+    let username_key = format!("NNTP_SERVER_{}_USERNAME", index);
+    let username = env.get(&username_key);
+
+    let password_key = format!("NNTP_SERVER_{}_PASSWORD", index);
+    let password = env.get(&password_key);
+
+    let max_conn_key = format!("NNTP_SERVER_{}_MAX_CONNECTIONS", index);
+    let max_connections = env
+        .get(&max_conn_key)
+        .and_then(|m| m.parse::<usize>().ok())
+        .and_then(crate::types::MaxConnections::new)
+        .unwrap_or_else(defaults::max_connections);
+
+    // TLS configuration
+    let use_tls_key = format!("NNTP_SERVER_{}_USE_TLS", index);
+    let use_tls = env
+        .get(&use_tls_key)
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
+
+    let tls_verify_key = format!("NNTP_SERVER_{}_TLS_VERIFY_CERT", index);
+    let tls_verify_cert = env
+        .get(&tls_verify_key)
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or_else(defaults::tls_verify_cert);
+
+    let tls_cert_path_key = format!("NNTP_SERVER_{}_TLS_CERT_PATH", index);
+    let tls_cert_path = env.get(&tls_cert_path_key);
+
+    // Connection keepalive (in seconds)
+    let keepalive_key = format!("NNTP_SERVER_{}_CONNECTION_KEEPALIVE", index);
+    let connection_keepalive = env
+        .get(&keepalive_key)
+        .and_then(|k| k.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
+
+    // Health check configuration
+    let health_max_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_MAX_PER_CYCLE", index);
+    let health_check_max_per_cycle = env
+        .get(&health_max_key)
+        .and_then(|h| h.parse::<usize>().ok())
+        .unwrap_or_else(defaults::health_check_max_per_cycle);
+
+    let health_timeout_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_POOL_TIMEOUT", index);
+    let health_check_pool_timeout = env
+        .get(&health_timeout_key)
+        .and_then(|h| h.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(defaults::health_check_pool_timeout);
+
+    Some(Server {
+        host: crate::types::HostName::new(host.clone())
+            .unwrap_or_else(|_| panic!("Invalid hostname in {}: '{}'", host_key, host)),
+        port: crate::types::Port::new(port)
+            .unwrap_or_else(|| panic!("Invalid port in {}: {}", port_key, port)),
+        name: crate::types::ServerName::new(name.clone())
+            .unwrap_or_else(|_| panic!("Invalid server name in {}: '{}'", name_key, name)),
+        username,
+        password,
+        max_connections,
+        use_tls,
+        tls_verify_cert,
+        tls_cert_path,
+        connection_keepalive,
+        health_check_max_per_cycle,
+        health_check_pool_timeout,
+    })
+}
+
 /// Load backend server configuration from environment variables
 ///
 /// Supports indexed environment variables for Docker/container deployments:
@@ -19,102 +130,16 @@ use super::types::{Config, Server};
 /// - `NNTP_SERVER_N_PASSWORD` - Backend authentication password
 /// - `NNTP_SERVER_N_MAX_CONNECTIONS` - Max connections (default: 10)
 fn load_servers_from_env() -> Option<Vec<Server>> {
-    let mut servers = Vec::new();
-    let mut index = 0;
+    load_servers_from_env_provider(&StdEnvProvider)
+}
 
-    loop {
-        // Check if this server index exists by looking for HOST
-        let host_key = format!("NNTP_SERVER_{}_HOST", index);
-        let host = match std::env::var(&host_key) {
-            Ok(h) => h,
-            Err(_) => {
-                // No more servers found
-                break;
-            }
-        };
-
-        // Parse port (required)
-        let port_key = format!("NNTP_SERVER_{}_PORT", index);
-        let port = std::env::var(&port_key)
-            .ok()
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(119); // Default NNTP port
-
-        // Get name (required, use host as fallback)
-        let name_key = format!("NNTP_SERVER_{}_NAME", index);
-        let name = std::env::var(&name_key).unwrap_or_else(|_| format!("Server {}", index));
-
-        // Optional fields
-        let username_key = format!("NNTP_SERVER_{}_USERNAME", index);
-        let username = std::env::var(&username_key).ok();
-
-        let password_key = format!("NNTP_SERVER_{}_PASSWORD", index);
-        let password = std::env::var(&password_key).ok();
-
-        let max_conn_key = format!("NNTP_SERVER_{}_MAX_CONNECTIONS", index);
-        let max_connections = std::env::var(&max_conn_key)
-            .ok()
-            .and_then(|m| m.parse::<usize>().ok())
-            .and_then(crate::types::MaxConnections::new)
-            .unwrap_or_else(defaults::max_connections);
-
-        // TLS configuration
-        let use_tls_key = format!("NNTP_SERVER_{}_USE_TLS", index);
-        let use_tls = std::env::var(&use_tls_key)
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        let tls_verify_key = format!("NNTP_SERVER_{}_TLS_VERIFY_CERT", index);
-        let tls_verify_cert = std::env::var(&tls_verify_key)
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or_else(defaults::tls_verify_cert);
-
-        let tls_cert_path_key = format!("NNTP_SERVER_{}_TLS_CERT_PATH", index);
-        let tls_cert_path = std::env::var(&tls_cert_path_key).ok();
-
-        // Connection keepalive (in seconds)
-        let keepalive_key = format!("NNTP_SERVER_{}_CONNECTION_KEEPALIVE", index);
-        let connection_keepalive = std::env::var(&keepalive_key)
-            .ok()
-            .and_then(|k| k.parse::<u64>().ok())
-            .map(std::time::Duration::from_secs);
-
-        // Health check configuration
-        let health_max_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_MAX_PER_CYCLE", index);
-        let health_check_max_per_cycle = std::env::var(&health_max_key)
-            .ok()
-            .and_then(|h| h.parse::<usize>().ok())
-            .unwrap_or_else(defaults::health_check_max_per_cycle);
-
-        let health_timeout_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_POOL_TIMEOUT", index);
-        let health_check_pool_timeout = std::env::var(&health_timeout_key)
-            .ok()
-            .and_then(|h| h.parse::<u64>().ok())
-            .map(std::time::Duration::from_secs)
-            .unwrap_or_else(defaults::health_check_pool_timeout);
-
-        servers.push(Server {
-            host: crate::types::HostName::new(host.clone())
-                .unwrap_or_else(|_| panic!("Invalid hostname in {}: '{}'", host_key, host)),
-            port: crate::types::Port::new(port)
-                .unwrap_or_else(|| panic!("Invalid port in {}: {}", port_key, port)),
-            name: crate::types::ServerName::new(name.clone())
-                .unwrap_or_else(|_| panic!("Invalid server name in {}: '{}'", name_key, name)),
-            username,
-            password,
-            max_connections,
-            use_tls,
-            tls_verify_cert,
-            tls_cert_path,
-            connection_keepalive,
-            health_check_max_per_cycle,
-            health_check_pool_timeout,
-        });
-
-        index += 1;
-    }
+/// Load servers using a custom environment provider (testable version)
+pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Server>> {
+    let servers: Vec<Server> = (0..)
+        .map(|i| parse_server_from_env(i, env))
+        .take_while(|s| s.is_some())
+        .flatten()
+        .collect();
 
     if servers.is_empty() {
         None
@@ -314,6 +339,231 @@ pub fn create_default_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    // Mock environment provider for testing
+    struct MockEnv {
+        vars: HashMap<String, String>,
+    }
+
+    impl MockEnv {
+        fn new() -> Self {
+            Self {
+                vars: HashMap::new(),
+            }
+        }
+
+        fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+            self.vars.insert(key.into(), value.into());
+            self
+        }
+    }
+
+    impl EnvProvider for MockEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.vars.get(key).cloned()
+        }
+    }
+
+    #[test]
+    fn test_parse_server_from_env_minimal() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com");
+
+        let server = parse_server_from_env(0, &env);
+        assert!(server.is_some());
+
+        let server = server.unwrap();
+        assert_eq!(server.host.as_str(), "news.example.com");
+        assert_eq!(server.port.get(), 119); // Default port
+        assert_eq!(server.name.as_str(), "Server 0"); // Default name
+        assert!(server.username.is_none());
+        assert!(server.password.is_none());
+    }
+
+    #[test]
+    fn test_parse_server_from_env_full() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "secure.example.com")
+            .set("NNTP_SERVER_0_PORT", "563")
+            .set("NNTP_SERVER_0_NAME", "Secure News")
+            .set("NNTP_SERVER_0_USERNAME", "testuser")
+            .set("NNTP_SERVER_0_PASSWORD", "testpass")
+            .set("NNTP_SERVER_0_MAX_CONNECTIONS", "20")
+            .set("NNTP_SERVER_0_USE_TLS", "true")
+            .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "false");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(server.host.as_str(), "secure.example.com");
+        assert_eq!(server.port.get(), 563);
+        assert_eq!(server.name.as_str(), "Secure News");
+        assert_eq!(server.username, Some("testuser".to_string()));
+        assert_eq!(server.password, Some("testpass".to_string()));
+        assert_eq!(server.max_connections.get(), 20);
+        assert!(server.use_tls);
+        assert!(!server.tls_verify_cert);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_no_host() {
+        let env = MockEnv::new();
+        let server = parse_server_from_env(0, &env);
+        assert!(server.is_none());
+    }
+
+    #[test]
+    fn test_parse_server_from_env_invalid_port() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_PORT", "invalid");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(server.port.get(), 119); // Falls back to default
+    }
+
+    #[test]
+    fn test_parse_server_from_env_invalid_max_connections() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_MAX_CONNECTIONS", "not_a_number");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(server.max_connections.get(), 10); // Default
+    }
+
+    #[test]
+    fn test_parse_server_from_env_zero_max_connections() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_MAX_CONNECTIONS", "0");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(server.max_connections.get(), 10); // Falls back to default (NonZero rejects 0)
+    }
+
+    #[test]
+    fn test_parse_server_from_env_keepalive() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_CONNECTION_KEEPALIVE", "300");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(
+            server.connection_keepalive,
+            Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn test_parse_server_from_env_health_check_config() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_HEALTH_CHECK_MAX_PER_CYCLE", "5")
+            .set("NNTP_SERVER_0_HEALTH_CHECK_POOL_TIMEOUT", "15");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(server.health_check_max_per_cycle, 5);
+        assert_eq!(
+            server.health_check_pool_timeout,
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn test_parse_server_from_env_tls_cert_path() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_USE_TLS", "true")
+            .set("NNTP_SERVER_0_TLS_CERT_PATH", "/path/to/ca.pem");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert!(server.use_tls);
+        assert_eq!(server.tls_cert_path, Some("/path/to/ca.pem".to_string()));
+    }
+
+    #[test]
+    fn test_load_servers_from_env_provider_empty() {
+        let env = MockEnv::new();
+        let servers = load_servers_from_env_provider(&env);
+        assert!(servers.is_none());
+    }
+
+    #[test]
+    fn test_load_servers_from_env_provider_single() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news1.example.com");
+
+        let servers = load_servers_from_env_provider(&env);
+        assert!(servers.is_some());
+
+        let servers = servers.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].host.as_str(), "news1.example.com");
+    }
+
+    #[test]
+    fn test_load_servers_from_env_provider_multiple() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news1.example.com")
+            .set("NNTP_SERVER_0_PORT", "119")
+            .set("NNTP_SERVER_1_HOST", "news2.example.com")
+            .set("NNTP_SERVER_1_PORT", "563")
+            .set("NNTP_SERVER_1_USE_TLS", "true")
+            .set("NNTP_SERVER_2_HOST", "news3.example.com");
+
+        let servers = load_servers_from_env_provider(&env);
+        assert!(servers.is_some());
+
+        let servers = servers.unwrap();
+        assert_eq!(servers.len(), 3);
+        assert_eq!(servers[0].host.as_str(), "news1.example.com");
+        assert_eq!(servers[1].host.as_str(), "news2.example.com");
+        assert_eq!(servers[2].host.as_str(), "news3.example.com");
+        assert!(servers[1].use_tls);
+        assert!(!servers[0].use_tls);
+    }
+
+    #[test]
+    fn test_load_servers_from_env_provider_gaps() {
+        let mut env = MockEnv::new();
+        // Server 0 and 2 defined, but not 1 - should stop at 1
+        env.set("NNTP_SERVER_0_HOST", "news1.example.com")
+            .set("NNTP_SERVER_2_HOST", "news3.example.com");
+
+        let servers = load_servers_from_env_provider(&env);
+        assert!(servers.is_some());
+
+        let servers = servers.unwrap();
+        // Should only get server 0, stops at first gap
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].host.as_str(), "news1.example.com");
+    }
+
+    #[test]
+    fn test_parse_server_from_env_bool_variations() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_USE_TLS", "True")
+            .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "FALSE");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        // Rust's parse::<bool>() requires exact "true"/"false" lowercase
+        // So these should fail to parse and use defaults
+        assert!(!server.use_tls); // Defaults to false
+        assert!(server.tls_verify_cert); // Defaults to true
+    }
+
+    #[test]
+    fn test_parse_server_from_env_correct_bool() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_USE_TLS", "true")
+            .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "false");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert!(server.use_tls);
+        assert!(!server.tls_verify_cert);
+    }
 
     #[test]
     fn test_config_source_description() {
@@ -326,6 +576,13 @@ mod tests {
             ConfigSource::DefaultCreated.description(),
             "default configuration (created)"
         );
+    }
+
+    #[test]
+    fn test_config_source_equality() {
+        assert_eq!(ConfigSource::File, ConfigSource::File);
+        assert_ne!(ConfigSource::File, ConfigSource::Environment);
+        assert_ne!(ConfigSource::Environment, ConfigSource::DefaultCreated);
     }
 
     #[test]
@@ -378,5 +635,14 @@ name = "Test Server"
         assert_eq!(source, ConfigSource::File);
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].host.as_str(), "test.example.com");
+    }
+
+    #[test]
+    fn test_create_default_config() {
+        let config = create_default_config();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].host.as_str(), "news.example.com");
+        assert_eq!(config.servers[0].port.get(), 119);
+        assert!(!config.servers[0].use_tls);
     }
 }

@@ -131,3 +131,111 @@ pub(crate) fn on_authentication_success(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_message_id_valid() {
+        let cmd = "ARTICLE <test@example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_with_extra_text() {
+        let cmd = "ARTICLE <msg@server.com> extra stuff";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<msg@server.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_no_brackets() {
+        let cmd = "ARTICLE 123";
+        let msgid = extract_message_id(cmd);
+        assert!(msgid.is_none());
+    }
+
+    #[test]
+    fn test_extract_message_id_empty_brackets() {
+        let cmd = "ARTICLE <>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_incomplete_open() {
+        let cmd = "ARTICLE <incomplete";
+        let msgid = extract_message_id(cmd);
+        assert!(msgid.is_none());
+    }
+
+    #[test]
+    fn test_extract_message_id_incomplete_close() {
+        let cmd = "ARTICLE incomplete>";
+        let msgid = extract_message_id(cmd);
+        assert!(msgid.is_none());
+    }
+
+    #[test]
+    fn test_extract_message_id_multiple_brackets() {
+        let cmd = "ARTICLE <first@example.com> <second@example.com>";
+        let msgid = extract_message_id(cmd);
+        // Should return first message-ID
+        assert_eq!(msgid, Some("<first@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_lowercase_command() {
+        let cmd = "article <test@example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_head_command() {
+        let cmd = "HEAD <msg@example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<msg@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_stat_command() {
+        let cmd = "STAT <article@news.server>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<article@news.server>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_complex() {
+        let cmd = "ARTICLE <CAFEBaBe_12345$@news.example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<CAFEBaBe_12345$@news.example.com>"));
+    }
+
+    #[test]
+    fn test_auth_result_equality() {
+        let auth1 = AuthResult::Authenticated(BytesTransferred::new(100));
+        let auth2 = AuthResult::Authenticated(BytesTransferred::new(100));
+        let not_auth = AuthResult::NotAuthenticated(BytesTransferred::new(100));
+
+        assert_eq!(auth1, auth2);
+        assert_ne!(auth1, not_auth);
+    }
+
+    #[test]
+    fn test_quit_status_equality() {
+        let quit1 = QuitStatus::Quit(BytesTransferred::new(50));
+        let quit2 = QuitStatus::Quit(BytesTransferred::new(50));
+        let cont = QuitStatus::Continue;
+
+        assert_eq!(quit1, quit2);
+        assert_ne!(quit1, cont);
+    }
+
+    #[test]
+    fn test_small_transfer_threshold() {
+        assert_eq!(SMALL_TRANSFER_THRESHOLD, 500);
+    }
+}
