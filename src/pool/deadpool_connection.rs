@@ -231,3 +231,216 @@ impl managed::Manager for TcpManager {
 
     fn detach(&self, _conn: &mut ConnectionStream) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tcp_manager_new() {
+        let manager = TcpManager::new(
+            "news.example.com".to_string(),
+            119,
+            "TestServer".to_string(),
+            Some("user".to_string()),
+            Some("pass".to_string()),
+        );
+
+        assert_eq!(manager.host, "news.example.com");
+        assert_eq!(manager.port, 119);
+        assert_eq!(manager.name, "TestServer");
+        assert_eq!(manager.username, Some("user".to_string()));
+        assert_eq!(manager.password, Some("pass".to_string()));
+        assert!(!manager.tls_config.use_tls);
+        assert!(manager.tls_manager.is_none());
+    }
+
+    #[test]
+    fn test_tcp_manager_new_without_auth() {
+        let manager = TcpManager::new(
+            "news.example.com".to_string(),
+            563,
+            "SecureServer".to_string(),
+            None,
+            None,
+        );
+
+        assert_eq!(manager.host, "news.example.com");
+        assert_eq!(manager.port, 563);
+        assert_eq!(manager.name, "SecureServer");
+        assert!(manager.username.is_none());
+        assert!(manager.password.is_none());
+    }
+
+    #[test]
+    fn test_tcp_manager_new_with_tls_disabled() {
+        let tls_config = TlsConfig::default(); // use_tls = false
+        let result = TcpManager::new_with_tls(
+            "news.example.com".to_string(),
+            119,
+            "PlainServer".to_string(),
+            Some("user".to_string()),
+            Some("pass".to_string()),
+            tls_config,
+        );
+
+        assert!(result.is_ok());
+        let manager = result.unwrap();
+        assert_eq!(manager.host, "news.example.com");
+        assert_eq!(manager.port, 119);
+        assert!(!manager.tls_config.use_tls);
+        assert!(manager.tls_manager.is_none());
+    }
+
+    #[test]
+    fn test_tcp_manager_new_with_tls_enabled() {
+        let tls_config = TlsConfig {
+            use_tls: true,
+            tls_verify_cert: true,
+            tls_cert_path: None,
+        };
+        let result = TcpManager::new_with_tls(
+            "secure.example.com".to_string(),
+            563,
+            "SecureServer".to_string(),
+            Some("user".to_string()),
+            Some("pass".to_string()),
+            tls_config,
+        );
+
+        assert!(result.is_ok());
+        let manager = result.unwrap();
+        assert_eq!(manager.host, "secure.example.com");
+        assert_eq!(manager.port, 563);
+        assert!(manager.tls_config.use_tls);
+        assert!(manager.tls_manager.is_some());
+    }
+
+    #[test]
+    fn test_tcp_manager_clone() {
+        let manager = TcpManager::new(
+            "news.example.com".to_string(),
+            119,
+            "TestServer".to_string(),
+            Some("user".to_string()),
+            Some("pass".to_string()),
+        );
+
+        let cloned = manager.clone();
+        assert_eq!(cloned.host, manager.host);
+        assert_eq!(cloned.port, manager.port);
+        assert_eq!(cloned.name, manager.name);
+        assert_eq!(cloned.username, manager.username);
+        assert_eq!(cloned.password, manager.password);
+    }
+
+    #[test]
+    fn test_authinfo_user_command() {
+        let cmd = authinfo_user("testuser");
+        assert_eq!(cmd, "AUTHINFO USER testuser\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_user_command_special_chars() {
+        let cmd = authinfo_user("user@example.com");
+        assert_eq!(cmd, "AUTHINFO USER user@example.com\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_user_command_spaces() {
+        let cmd = authinfo_user("user name");
+        assert_eq!(cmd, "AUTHINFO USER user name\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_pass_command() {
+        let cmd = authinfo_pass("secretpass");
+        assert_eq!(cmd, "AUTHINFO PASS secretpass\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_pass_command_special_chars() {
+        let cmd = authinfo_pass("p@ssw0rd!#$");
+        assert_eq!(cmd, "AUTHINFO PASS p@ssw0rd!#$\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_pass_command_spaces() {
+        let cmd = authinfo_pass("pass word");
+        assert_eq!(cmd, "AUTHINFO PASS pass word\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_commands_crlf_termination() {
+        let user_cmd = authinfo_user("user");
+        let pass_cmd = authinfo_pass("pass");
+
+        assert!(user_cmd.ends_with("\r\n"));
+        assert!(pass_cmd.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn test_tcp_manager_debug_format() {
+        let manager = TcpManager::new(
+            "news.example.com".to_string(),
+            119,
+            "TestServer".to_string(),
+            Some("user".to_string()),
+            Some("pass".to_string()),
+        );
+
+        let debug_str = format!("{:?}", manager);
+        assert!(debug_str.contains("TcpManager"));
+        assert!(debug_str.contains("news.example.com"));
+        assert!(debug_str.contains("119"));
+    }
+
+    #[test]
+    fn test_tcp_manager_with_tls_manager_is_some() {
+        let tls_config = TlsConfig {
+            use_tls: true,
+            tls_verify_cert: false,
+            tls_cert_path: None,
+        };
+        let manager = TcpManager::new_with_tls(
+            "secure.example.com".to_string(),
+            563,
+            "SecureServer".to_string(),
+            None,
+            None,
+            tls_config,
+        )
+        .unwrap();
+
+        assert!(manager.tls_manager.is_some());
+
+        // Verify TLS manager is an Arc (cheap clone)
+        let arc_clone = manager.tls_manager.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(
+            manager.tls_manager.as_ref().unwrap(),
+            &arc_clone
+        ));
+    }
+
+    #[test]
+    fn test_tcp_manager_with_tls_cert_path() {
+        let tls_config = TlsConfig {
+            use_tls: true,
+            tls_verify_cert: true,
+            tls_cert_path: Some("/path/to/ca.pem".to_string()),
+        };
+
+        // This will fail due to missing file, but tests the construction path
+        let result = TcpManager::new_with_tls(
+            "secure.example.com".to_string(),
+            563,
+            "SecureServer".to_string(),
+            None,
+            None,
+            tls_config,
+        );
+
+        // Should fail because cert file doesn't exist
+        assert!(result.is_err());
+    }
+}
