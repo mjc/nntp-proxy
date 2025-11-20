@@ -355,4 +355,157 @@ mod tests {
 
         assert_eq!(aggregator.connection_count("nonexistent"), None);
     }
+
+    #[test]
+    fn test_user_connection_stats_log_connection_single() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+
+        // Should not panic when logging
+        stats.log_connection("testuser");
+    }
+
+    #[test]
+    fn test_user_connection_stats_log_connection_plural() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("per-command".to_string(), now);
+        stats.record_event(now + Duration::from_secs(1));
+        stats.record_event(now + Duration::from_secs(2));
+
+        // Should use plural form "connections"
+        stats.log_connection("testuser");
+    }
+
+    #[test]
+    fn test_user_connection_stats_log_disconnection_single() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("stateful".to_string(), now);
+
+        // Should not panic when logging
+        stats.log_disconnection("testuser");
+    }
+
+    #[test]
+    fn test_user_connection_stats_log_disconnection_plural() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+        stats.record_event(now + Duration::from_secs(1));
+        stats.record_event(now + Duration::from_secs(2));
+
+        // Should use plural form "sessions"
+        stats.log_disconnection("testuser");
+    }
+
+    #[test]
+    fn test_record_connection_with_empty_username() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        // Empty string should be treated as distinct user
+        aggregator.record_connection(Some(""), "hybrid");
+
+        assert_eq!(aggregator.user_count(), 1);
+        assert_eq!(aggregator.connection_count(""), Some(1));
+    }
+
+    #[test]
+    fn test_multiple_disconnections_same_user() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_disconnection(Some("alice"), "hybrid");
+        aggregator.record_disconnection(Some("alice"), "hybrid");
+        aggregator.record_disconnection(Some("alice"), "hybrid");
+
+        // Disconnections tracked separately from connections
+        assert_eq!(aggregator.user_count(), 0); // No connections
+    }
+
+    #[test]
+    fn test_anonymous_user_constant() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(None, "per-command");
+        aggregator.record_connection(None, "per-command");
+
+        // Should aggregate under ANONYMOUS constant
+        assert_eq!(aggregator.connection_count(ANONYMOUS), Some(2));
+    }
+
+    #[test]
+    fn test_routing_mode_preserved() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("user1"), "hybrid");
+        aggregator.record_connection(Some("user2"), "stateful");
+        aggregator.record_connection(Some("user3"), "per-command");
+
+        // Each user should have their routing mode preserved
+        assert_eq!(aggregator.user_count(), 3);
+    }
+
+    #[test]
+    fn test_duration_zero_for_single_event() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+
+        // Single event should have near-zero duration
+        let duration = stats.duration_secs();
+        assert!(duration < 0.01);
+    }
+
+    #[test]
+    fn test_get_count_after_multiple_records() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("stateful".to_string(), now);
+
+        for i in 1..=10 {
+            stats.record_event(now + Duration::from_millis(i * 100));
+        }
+
+        assert_eq!(stats.get_count(), 11); // 1 initial + 10 records
+    }
+
+    #[test]
+    fn test_aggregator_flush_with_no_stats() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        // Flushing empty aggregator should not panic
+        aggregator.flush();
+
+        assert_eq!(aggregator.user_count(), 0);
+    }
+
+    #[test]
+    fn test_aggregator_clone_independence() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("alice"), "hybrid");
+
+        let cloned = aggregator.clone();
+
+        // Both should see the same data (shared Arc)
+        assert_eq!(aggregator.connection_count("alice"), Some(1));
+        assert_eq!(cloned.connection_count("alice"), Some(1));
+
+        // Adding to one affects the other (shared state)
+        aggregator.record_connection(Some("alice"), "hybrid");
+
+        assert_eq!(aggregator.connection_count("alice"), Some(2));
+        assert_eq!(cloned.connection_count("alice"), Some(2));
+    }
+
+    #[test]
+    fn test_flush_after_connection_and_disconnection() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("alice"), "hybrid");
+        aggregator.record_disconnection(Some("bob"), "stateful");
+
+        assert_eq!(aggregator.user_count(), 1); // Only connection tracked in connection_stats
+
+        aggregator.flush();
+
+        // Both should be cleared
+        assert_eq!(aggregator.user_count(), 0);
+        assert_eq!(aggregator.connection_count("alice"), None);
+    }
 }
