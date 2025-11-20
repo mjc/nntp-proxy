@@ -361,4 +361,187 @@ mod tests {
         assert_eq!(optimizer.recv_buffer_size, 1024);
         assert_eq!(optimizer.send_buffer_size, 2048);
     }
+
+    // Platform-specific description tests
+
+    #[test]
+    fn test_platform_optimization_desc() {
+        let desc = platform_optimization_desc();
+        // Check that it returns a valid string (platform-specific content)
+        #[cfg(target_os = "linux")]
+        assert!(desc.contains("tcp_user_timeout"));
+        #[cfg(target_os = "windows")]
+        assert!(desc.contains("Windows"));
+        // Just verify it doesn't panic on other platforms
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let _ = desc;
+    }
+
+    // Constructor tests
+
+    #[tokio::test]
+    async fn test_tcp_optimizer_new_uses_defaults() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let optimizer = TcpOptimizer::new(&stream);
+
+        assert_eq!(
+            optimizer.recv_buffer_size,
+            crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER
+        );
+        assert_eq!(
+            optimizer.send_buffer_size,
+            crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tcp_optimizer_with_custom_buffers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let recv_size = 512 * 1024;
+        let send_size = 1024 * 1024;
+        let optimizer = TcpOptimizer::with_buffer_sizes(&stream, recv_size, send_size);
+
+        assert_eq!(optimizer.recv_buffer_size, recv_size);
+        assert_eq!(optimizer.send_buffer_size, send_size);
+    }
+
+    // Description tests
+
+    #[tokio::test]
+    async fn test_tcp_optimizer_description() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let optimizer = TcpOptimizer::new(&stream);
+        assert_eq!(optimizer.description(), "TCP high-throughput optimization");
+    }
+
+    #[tokio::test]
+    async fn test_connection_optimizer_description_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = ConnectionStream::Plain(tcp);
+
+        let optimizer = ConnectionOptimizer::new(&stream);
+        assert_eq!(optimizer.description(), "Connection-level TCP optimization");
+    }
+
+    // ConnectionOptimizer buffer configuration tests
+
+    #[tokio::test]
+    async fn test_connection_optimizer_new_no_custom_buffers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = ConnectionStream::Plain(tcp);
+
+        let optimizer = ConnectionOptimizer::new(&stream);
+        assert!(optimizer.recv_buffer_size.is_none());
+        assert!(optimizer.send_buffer_size.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_connection_optimizer_with_custom_buffers_sets_sizes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = ConnectionStream::Plain(tcp);
+
+        let recv = 16384;
+        let send = 32768;
+        let optimizer = ConnectionOptimizer::with_buffer_sizes(&stream, recv, send);
+        assert_eq!(optimizer.recv_buffer_size, Some(recv));
+        assert_eq!(optimizer.send_buffer_size, Some(send));
+    }
+
+    // Edge case tests
+
+    #[tokio::test]
+    async fn test_tcp_optimizer_with_zero_buffers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Zero buffer sizes are technically allowed, though not recommended
+        let optimizer = TcpOptimizer::with_buffer_sizes(&stream, 0, 0);
+        assert_eq!(optimizer.recv_buffer_size, 0);
+        assert_eq!(optimizer.send_buffer_size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_optimizer_with_very_large_buffers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Very large buffer sizes (system may reject these, but we test the constructor)
+        let large_size = 128 * 1024 * 1024; // 128MB
+        let optimizer = TcpOptimizer::with_buffer_sizes(&stream, large_size, large_size);
+        assert_eq!(optimizer.recv_buffer_size, large_size);
+        assert_eq!(optimizer.send_buffer_size, large_size);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_optimizer_with_asymmetric_buffers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Asymmetric buffers (common for download-heavy workloads)
+        let recv_size = 32 * 1024 * 1024; // 32MB
+        let send_size = 1 * 1024 * 1024; // 1MB
+        let optimizer = TcpOptimizer::with_buffer_sizes(&stream, recv_size, send_size);
+        assert_eq!(optimizer.recv_buffer_size, recv_size);
+        assert_eq!(optimizer.send_buffer_size, send_size);
+    }
+
+    // NetworkOptimizer trait tests
+
+    #[tokio::test]
+    async fn test_tcp_optimizer_implements_network_optimizer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let optimizer = TcpOptimizer::new(&stream);
+        // Can be used as a trait object
+        let _trait_obj: &dyn NetworkOptimizer = &optimizer;
+    }
+
+    #[tokio::test]
+    async fn test_connection_optimizer_implements_network_optimizer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = ConnectionStream::Plain(tcp);
+
+        let optimizer = ConnectionOptimizer::new(&stream);
+        // Can be used as a trait object
+        let _trait_obj: &dyn NetworkOptimizer = &optimizer;
+    }
+
+    // Constants tests
+
+    #[test]
+    fn test_linger_timeout_constant() {
+        assert_eq!(LINGER_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_tcp_user_timeout_constant() {
+        assert_eq!(TCP_USER_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_tos_throughput_constant() {
+        assert_eq!(TOS_THROUGHPUT, 0x08);
+    }
 }
