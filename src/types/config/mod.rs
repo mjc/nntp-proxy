@@ -87,3 +87,127 @@ pub use network::Port;
 pub use timeout::{
     BackendReadTimeout, CommandExecutionTimeout, ConnectionTimeout, HealthCheckTimeout,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test that all exported types exist and are usable
+    #[test]
+    fn test_buffer_types_available() {
+        let _ = BufferSize::new(1024);
+        let _ = WindowSize::new(8192);
+    }
+
+    #[test]
+    fn test_cache_types_available() {
+        let _ = CacheCapacity::new(1000);
+    }
+
+    #[test]
+    fn test_limit_types_available() {
+        let _ = MaxConnections::new(10);
+        let _ = MaxErrors::new(3);
+        let _ = ThreadCount::from_value(4);
+    }
+
+    #[test]
+    fn test_network_types_available() {
+        let _ = Port::new(119);
+    }
+
+    #[test]
+    fn test_timeout_types_available() {
+        use std::time::Duration;
+        let _ = ConnectionTimeout::new(Duration::from_secs(30));
+        let _ = BackendReadTimeout::new(Duration::from_secs(60));
+        let _ = CommandExecutionTimeout::new(Duration::from_secs(120));
+        let _ = HealthCheckTimeout::new(Duration::from_secs(10));
+    }
+
+    // Test macro-generated implementations
+    #[test]
+    fn test_nonzero_newtype_basic_usage() {
+        // Test via BufferSize (uses the macro)
+        let size = BufferSize::new(4096).unwrap();
+        assert_eq!(size.get(), 4096);
+
+        // Test Display
+        assert_eq!(format!("{}", size), "4096");
+
+        // Test From
+        let val: usize = size.into();
+        assert_eq!(val, 4096);
+    }
+
+    #[test]
+    fn test_nonzero_newtype_zero_rejected() {
+        assert!(BufferSize::new(0).is_none());
+        assert!(WindowSize::new(0).is_none());
+        assert!(CacheCapacity::new(0).is_none());
+        assert!(MaxConnections::new(0).is_none());
+        assert!(MaxErrors::new(0).is_none());
+    }
+
+    #[test]
+    fn test_nonzero_newtype_serde() {
+        let size = BufferSize::new(8192).unwrap();
+
+        // Serialize
+        let json = serde_json::to_string(&size).unwrap();
+        assert_eq!(json, "8192");
+
+        // Deserialize
+        let parsed: BufferSize = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.get(), 8192);
+
+        // Zero rejected during deserialization
+        let result = serde_json::from_str::<BufferSize>("0");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("cannot be 0"));
+    }
+
+    #[test]
+    fn test_nonzero_newtype_clone_copy() {
+        let size1 = BufferSize::new(1024).unwrap();
+        let size2 = size1.clone();
+        let size3 = size1; // Copy
+
+        assert_eq!(size1, size2);
+        assert_eq!(size1, size3);
+    }
+
+    #[test]
+    fn test_nonzero_newtype_equality() {
+        let size1 = BufferSize::new(2048).unwrap();
+        let size2 = BufferSize::new(2048).unwrap();
+        let size3 = BufferSize::new(4096).unwrap();
+
+        assert_eq!(size1, size2);
+        assert_ne!(size1, size3);
+    }
+
+    #[test]
+    fn test_nonzero_newtype_hash() {
+        use std::collections::HashSet;
+
+        let size1 = BufferSize::new(512).unwrap();
+        let size2 = BufferSize::new(512).unwrap();
+        let size3 = BufferSize::new(1024).unwrap();
+
+        let mut set = HashSet::new();
+        set.insert(size1);
+        set.insert(size2); // Duplicate
+        set.insert(size3);
+
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_nonzero_newtype_debug() {
+        let size = BufferSize::new(16384).unwrap();
+        let debug = format!("{:?}", size);
+        assert!(debug.contains("BufferSize"));
+    }
+}
