@@ -247,4 +247,62 @@ mod tests {
             Err(ValidationError::EmptyConfigPath)
         ));
     }
+
+    // Test actual business logic - custom methods
+
+    #[test]
+    fn test_hostname_as_str() {
+        let hostname = HostName::new("example.com".to_string()).unwrap();
+        assert_eq!(hostname.as_str(), "example.com");
+    }
+
+    #[test]
+    fn test_config_path_as_path() {
+        let config = ConfigPath::try_from("/etc/config.toml").unwrap();
+        assert_eq!(config.as_path(), Path::new("/etc/config.toml"));
+    }
+
+    #[test]
+    fn test_config_path_as_str() {
+        let config = ConfigPath::try_from("config.toml").unwrap();
+        assert_eq!(config.as_str(), "config.toml");
+    }
+
+    // Test edge cases in validation logic
+
+    #[test]
+    fn test_username_whitespace_edge_cases() {
+        // Only whitespace should be rejected
+        assert!(Username::new("   ".to_string()).is_err());
+        assert!(Username::new("\t\n".to_string()).is_err());
+        // But username with spaces in content is valid (trim checks if empty)
+        assert!(Username::new("  user  ".to_string()).is_ok());
+        assert!(Username::new("user name".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_username_special_characters() {
+        assert!(Username::new("user@domain.com".to_string()).is_ok());
+        assert!(Username::new("user-123".to_string()).is_ok());
+        assert!(Username::new("user_name".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_password_edge_cases() {
+        assert!(Password::new("P@ssw0rd!".to_string()).is_ok());
+        // Whitespace only should be rejected
+        assert!(Password::new("   ".to_string()).is_err());
+        // Password with content and spaces is valid
+        assert!(Password::new("   pass   ".to_string()).is_ok());
+        assert!(Password::new("密码123".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_config_path_edge_cases() {
+        assert!(ConfigPath::try_from("my config.toml").is_ok());
+        assert!(ConfigPath::try_from("   ").is_err());
+        assert!(ConfigPath::try_from("/absolute/path/config.toml").is_ok());
+        assert!(ConfigPath::try_from("./relative/config.toml").is_ok());
+        assert!(ConfigPath::try_from("../parent/config.toml").is_ok());
+    }
 }
