@@ -180,4 +180,186 @@ mod tests {
         assert_eq!(recorded.as_u64(), 1024);
         assert_eq!(recorded.as_u64(), 1024);
     }
+
+    // MetricsBytes<Unrecorded> tests
+    #[test]
+    fn test_unrecorded_new() {
+        let bytes = MetricsBytes::<Unrecorded>::new(500);
+        assert_eq!(bytes.peek(), 500);
+    }
+
+    #[test]
+    fn test_unrecorded_new_zero() {
+        let bytes = MetricsBytes::<Unrecorded>::new(0);
+        assert_eq!(bytes.peek(), 0);
+    }
+
+    #[test]
+    fn test_unrecorded_from_usize() {
+        let bytes = MetricsBytes::<Unrecorded>::from_usize(1024);
+        assert_eq!(bytes.peek(), 1024);
+    }
+
+    #[test]
+    fn test_unrecorded_into_u64() {
+        let bytes = MetricsBytes::<Unrecorded>::new(2048);
+        assert_eq!(bytes.into_u64(), 2048);
+    }
+
+    #[test]
+    fn test_unrecorded_mark_recorded() {
+        let unrecorded = MetricsBytes::<Unrecorded>::new(1024);
+        let recorded = unrecorded.mark_recorded();
+        assert_eq!(recorded.as_u64(), 1024);
+    }
+
+    #[test]
+    fn test_unrecorded_clone() {
+        let bytes1 = MetricsBytes::<Unrecorded>::new(512);
+        let bytes2 = bytes1.clone();
+        assert_eq!(bytes1.peek(), bytes2.peek());
+    }
+
+    // MetricsBytes<Recorded> tests
+    #[test]
+    fn test_recorded_as_u64() {
+        let bytes = MetricsBytes::<Unrecorded>::new(4096).mark_recorded();
+        assert_eq!(bytes.as_u64(), 4096);
+    }
+
+    #[test]
+    fn test_recorded_clone() {
+        let bytes1 = MetricsBytes::<Unrecorded>::new(256).mark_recorded();
+        let bytes2 = bytes1.clone();
+        assert_eq!(bytes1.as_u64(), bytes2.as_u64());
+    }
+
+    #[test]
+    fn test_recorded_peek() {
+        let bytes = MetricsBytes::<Unrecorded>::new(1024).mark_recorded();
+        assert_eq!(bytes.peek(), 1024);
+        assert_eq!(bytes.as_u64(), 1024); // Both work
+    }
+
+    // TransferDirection tests
+    #[test]
+    fn test_transfer_direction_equality() {
+        assert_eq!(
+            TransferDirection::ClientToBackend,
+            TransferDirection::ClientToBackend
+        );
+        assert_eq!(
+            TransferDirection::BackendToClient,
+            TransferDirection::BackendToClient
+        );
+        assert_ne!(
+            TransferDirection::ClientToBackend,
+            TransferDirection::BackendToClient
+        );
+    }
+
+    #[test]
+    fn test_transfer_direction_clone() {
+        let dir1 = TransferDirection::ClientToBackend;
+        let dir2 = dir1.clone();
+        assert_eq!(dir1, dir2);
+    }
+
+    #[test]
+    fn test_transfer_direction_debug() {
+        let dir = TransferDirection::ClientToBackend;
+        let debug_str = format!("{:?}", dir);
+        assert!(debug_str.contains("ClientToBackend"));
+    }
+
+    // DirectionalBytes tests
+    #[test]
+    fn test_directional_client_to_backend() {
+        let bytes = DirectionalBytes::client_to_backend(1024);
+        assert_eq!(bytes.direction(), TransferDirection::ClientToBackend);
+        assert_eq!(bytes.into_bytes().peek(), 1024);
+    }
+
+    #[test]
+    fn test_directional_backend_to_client() {
+        let bytes = DirectionalBytes::backend_to_client(2048);
+        assert_eq!(bytes.direction(), TransferDirection::BackendToClient);
+        assert_eq!(bytes.into_bytes().peek(), 2048);
+    }
+
+    #[test]
+    fn test_directional_into_bytes() {
+        let directional = DirectionalBytes::client_to_backend(512);
+        let bytes = directional.into_bytes();
+        assert_eq!(bytes.into_u64(), 512);
+    }
+
+    #[test]
+    fn test_directional_direction_preserved() {
+        let cmd = DirectionalBytes::client_to_backend(100);
+        let resp = DirectionalBytes::backend_to_client(200);
+
+        assert_eq!(cmd.direction(), TransferDirection::ClientToBackend);
+        assert_eq!(resp.direction(), TransferDirection::BackendToClient);
+    }
+
+    #[test]
+    fn test_directional_clone() {
+        let bytes1 = DirectionalBytes::client_to_backend(768);
+        let bytes2 = bytes1.clone();
+
+        assert_eq!(bytes1.direction(), bytes2.direction());
+        assert_eq!(bytes1.into_bytes().peek(), bytes2.into_bytes().peek());
+    }
+
+    #[test]
+    fn test_directional_debug() {
+        let bytes = DirectionalBytes::client_to_backend(1024);
+        let debug_str = format!("{:?}", bytes);
+        assert!(debug_str.contains("DirectionalBytes"));
+    }
+
+    // Edge cases
+    #[test]
+    fn test_large_byte_counts() {
+        let bytes = MetricsBytes::<Unrecorded>::new(u64::MAX);
+        assert_eq!(bytes.peek(), u64::MAX);
+    }
+
+    #[test]
+    fn test_zero_bytes_both_directions() {
+        let cmd = DirectionalBytes::client_to_backend(0);
+        let resp = DirectionalBytes::backend_to_client(0);
+
+        assert_eq!(cmd.into_bytes().peek(), 0);
+        assert_eq!(resp.into_bytes().peek(), 0);
+    }
+
+    #[test]
+    fn test_usize_to_u64_conversion() {
+        let max_usize_as_u64 = usize::MAX as u64;
+        let bytes = MetricsBytes::<Unrecorded>::from_usize(usize::MAX);
+        assert_eq!(bytes.peek(), max_usize_as_u64);
+    }
+
+    #[test]
+    fn test_recording_workflow() {
+        // Typical workflow: create → record → read
+        let unrecorded = MetricsBytes::<Unrecorded>::new(1024);
+        let recorded = unrecorded.mark_recorded();
+        let value = recorded.as_u64();
+        assert_eq!(value, 1024);
+    }
+
+    #[test]
+    fn test_directional_workflow() {
+        // Typical directional workflow
+        let bytes = DirectionalBytes::client_to_backend(512);
+        let direction = bytes.direction();
+        let unrecorded = bytes.into_bytes();
+        let recorded = unrecorded.mark_recorded();
+
+        assert_eq!(direction, TransferDirection::ClientToBackend);
+        assert_eq!(recorded.as_u64(), 512);
+    }
 }
