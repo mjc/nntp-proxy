@@ -89,164 +89,100 @@ timeout_newtype! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    #[test]
-    fn test_backend_read_timeout() {
-        let timeout = BackendReadTimeout::DEFAULT;
-        assert_eq!(timeout.as_secs(), 30);
-        assert_eq!(timeout.as_duration(), Duration::from_secs(30));
+    // Property tests for all timeout types
+    proptest! {
+        #[test]
+        fn backend_read_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = BackendReadTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn connection_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = ConnectionTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn command_execution_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = CommandExecutionTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn health_check_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = HealthCheckTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn timeout_from_into_duration(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = BackendReadTimeout::from(duration);
+            let back: Duration = timeout.into();
+            prop_assert_eq!(back, duration);
+        }
+
+        #[test]
+        fn timeout_ordering_property(a in 0u64..1000u64, b in 0u64..1000u64) {
+            let t1 = ConnectionTimeout::new(Duration::from_secs(a));
+            let t2 = ConnectionTimeout::new(Duration::from_secs(b));
+            prop_assert_eq!(t1.cmp(&t2), a.cmp(&b));
+        }
+
+        #[test]
+        fn timeout_clone_equality(secs in 0u64..86400u64) {
+            let timeout = BackendReadTimeout::new(Duration::from_secs(secs));
+            let cloned = timeout;
+            prop_assert_eq!(timeout, cloned);
+        }
+
+        #[test]
+        fn timeout_debug_contains_name(secs in 0u64..100u64) {
+            let timeout = BackendReadTimeout::new(Duration::from_secs(secs));
+            let debug_str = format!("{:?}", timeout);
+            prop_assert!(debug_str.contains("BackendReadTimeout"));
+        }
     }
 
+    // Constant verification tests
     #[test]
-    fn test_connection_timeout() {
-        let timeout = ConnectionTimeout::new(Duration::from_secs(5));
-        assert_eq!(timeout.as_secs(), 5);
-    }
-
-    #[test]
-    fn test_backend_read_timeout_default() {
-        let timeout = BackendReadTimeout::DEFAULT;
-        assert_eq!(timeout.as_secs(), 30);
-    }
-
-    #[test]
-    fn test_backend_read_timeout_new() {
-        let timeout = BackendReadTimeout::new(Duration::from_secs(45));
-        assert_eq!(timeout.as_secs(), 45);
-        assert_eq!(timeout.as_duration(), Duration::from_secs(45));
-    }
-
-    #[test]
-    fn test_backend_read_timeout_from_duration() {
-        let duration = Duration::from_secs(60);
-        let timeout = BackendReadTimeout::from(duration);
-        assert_eq!(timeout.as_secs(), 60);
-    }
-
-    #[test]
-    fn test_backend_read_timeout_into_duration() {
-        let timeout = BackendReadTimeout::new(Duration::from_secs(20));
-        let duration: Duration = timeout.into();
-        assert_eq!(duration, Duration::from_secs(20));
-    }
-
-    #[test]
-    fn test_connection_timeout_default() {
-        let timeout = ConnectionTimeout::DEFAULT;
-        assert_eq!(timeout.as_secs(), 10);
-    }
-
-    #[test]
-    fn test_connection_timeout_new() {
-        let timeout = ConnectionTimeout::new(Duration::from_secs(15));
-        assert_eq!(timeout.as_secs(), 15);
-    }
-
-    #[test]
-    fn test_connection_timeout_from_duration() {
-        let duration = Duration::from_secs(8);
-        let timeout = ConnectionTimeout::from(duration);
-        assert_eq!(timeout.as_secs(), 8);
-    }
-
-    #[test]
-    fn test_connection_timeout_into_duration() {
-        let timeout = ConnectionTimeout::new(Duration::from_secs(12));
-        let duration: Duration = timeout.into();
-        assert_eq!(duration, Duration::from_secs(12));
-    }
-
-    #[test]
-    fn test_command_execution_timeout_default() {
-        let timeout = CommandExecutionTimeout::DEFAULT;
-        assert_eq!(timeout.as_secs(), 60);
-    }
-
-    #[test]
-    fn test_command_execution_timeout_new() {
-        let timeout = CommandExecutionTimeout::new(Duration::from_secs(90));
-        assert_eq!(timeout.as_secs(), 90);
-        assert_eq!(timeout.as_duration(), Duration::from_secs(90));
-    }
-
-    #[test]
-    fn test_command_execution_timeout_conversions() {
-        let duration = Duration::from_secs(120);
-        let timeout = CommandExecutionTimeout::from(duration);
-        let back: Duration = timeout.into();
-        assert_eq!(back, duration);
-    }
-
-    #[test]
-    fn test_health_check_timeout_default() {
-        let timeout = HealthCheckTimeout::DEFAULT;
-        assert_eq!(timeout.as_secs(), 2);
-    }
-
-    #[test]
-    fn test_health_check_timeout_new() {
-        let timeout = HealthCheckTimeout::new(Duration::from_secs(3));
-        assert_eq!(timeout.as_secs(), 3);
-    }
-
-    #[test]
-    fn test_health_check_timeout_conversions() {
-        let duration = Duration::from_secs(5);
-        let timeout = HealthCheckTimeout::from(duration);
-        assert_eq!(timeout.as_duration(), duration);
-    }
-
-    #[test]
-    fn test_timeout_ordering() {
-        let t1 = ConnectionTimeout::new(Duration::from_secs(5));
-        let t2 = ConnectionTimeout::new(Duration::from_secs(10));
-        assert!(t1 < t2);
-        assert!(t2 > t1);
-        assert_eq!(t1, t1);
-    }
-
-    #[test]
-    fn test_timeout_hash() {
-        use std::collections::HashSet;
-
-        let mut set = HashSet::new();
-        set.insert(BackendReadTimeout::DEFAULT);
-        assert!(set.contains(&BackendReadTimeout::DEFAULT));
-    }
-
-    #[test]
-    fn test_timeout_clone() {
-        let timeout = ConnectionTimeout::DEFAULT;
-        let cloned = timeout;
-        assert_eq!(timeout, cloned);
-    }
-
-    #[test]
-    fn test_timeout_debug() {
-        let timeout = BackendReadTimeout::DEFAULT;
-        let debug_str = format!("{:?}", timeout);
-        assert!(debug_str.contains("BackendReadTimeout"));
-    }
-
-    #[test]
-    fn test_all_default_constants() {
-        // Verify all timeout types have valid defaults
+    fn all_default_constants_correct() {
         assert_eq!(BackendReadTimeout::DEFAULT.as_secs(), 30);
         assert_eq!(ConnectionTimeout::DEFAULT.as_secs(), 10);
         assert_eq!(CommandExecutionTimeout::DEFAULT.as_secs(), 60);
         assert_eq!(HealthCheckTimeout::DEFAULT.as_secs(), 2);
     }
 
+    // Edge case tests
     #[test]
-    fn test_zero_timeout() {
+    fn zero_timeout_is_valid() {
         let timeout = BackendReadTimeout::new(Duration::from_secs(0));
         assert_eq!(timeout.as_secs(), 0);
     }
 
     #[test]
-    fn test_large_timeout() {
-        let large = Duration::from_secs(86400); // 1 day
+    fn large_timeout_one_day() {
+        let large = Duration::from_secs(86400);
         let timeout = CommandExecutionTimeout::new(large);
         assert_eq!(timeout.as_secs(), 86400);
+    }
+
+    #[test]
+    fn timeout_hash_works() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(BackendReadTimeout::DEFAULT);
+        assert!(set.contains(&BackendReadTimeout::DEFAULT));
     }
 }
