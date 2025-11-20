@@ -205,4 +205,59 @@ mod tests {
         };
         assert!(!err.is_network_error());
     }
+
+    #[test]
+    fn test_socket_config_error() {
+        let err = ConnectionError::SocketConfig {
+            operation: "set_nodelay".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid"),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("set_nodelay"));
+        assert!(msg.contains("invalid"));
+    }
+
+    #[test]
+    fn test_tls_handshake_error() {
+        let err = ConnectionError::TlsHandshake {
+            backend: "secure.server.com".to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "TLS handshake failed",
+            )),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("TLS handshake failed"));
+        assert!(msg.contains("secure.server.com"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn test_certificate_verification_error() {
+        let err = ConnectionError::CertificateVerification {
+            backend: "untrusted.example.com".to_string(),
+            reason: "Certificate expired".to_string(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("Certificate verification failed"));
+        assert!(msg.contains("untrusted.example.com"));
+        assert!(msg.contains("Certificate expired"));
+    }
+
+    #[test]
+    fn test_dns_resolution_error() {
+        let err = ConnectionError::DnsResolution {
+            address: "invalid.example.com".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "name not resolved"),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to resolve DNS"));
+        assert!(msg.contains("invalid.example.com"));
+        assert!(msg.contains("name not resolved"));
+        assert!(err.source().is_some());
+    }
 }
