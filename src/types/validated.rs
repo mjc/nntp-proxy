@@ -305,4 +305,324 @@ mod tests {
         assert!(ConfigPath::try_from("./relative/config.toml").is_ok());
         assert!(ConfigPath::try_from("../parent/config.toml").is_ok());
     }
+
+    // Test Display trait implementations
+    #[test]
+    fn test_hostname_display() {
+        let hostname = HostName::new("example.com".to_string()).unwrap();
+        assert_eq!(format!("{}", hostname), "example.com");
+        assert_eq!(hostname.to_string(), "example.com");
+    }
+
+    #[test]
+    fn test_server_name_display() {
+        let server = ServerName::new("backend-1".to_string()).unwrap();
+        assert_eq!(format!("{}", server), "backend-1");
+    }
+
+    #[test]
+    fn test_username_display() {
+        let username = Username::new("alice".to_string()).unwrap();
+        assert_eq!(format!("{}", username), "alice");
+    }
+
+    #[test]
+    fn test_password_display() {
+        let password = Password::new("secret123".to_string()).unwrap();
+        assert_eq!(format!("{}", password), "secret123");
+    }
+
+    #[test]
+    fn test_config_path_display() {
+        let config = ConfigPath::try_from("config.toml").unwrap();
+        assert_eq!(format!("{}", config), "config.toml");
+    }
+
+    // Test TryFrom implementations
+    #[test]
+    fn test_hostname_try_from_string() {
+        let result: Result<HostName, _> = "example.com".to_string().try_into();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "example.com");
+    }
+
+    #[test]
+    fn test_server_name_try_from_string() {
+        let result: Result<ServerName, _> = "server1".to_string().try_into();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_username_try_from_string() {
+        let result: Result<Username, _> = "bob".to_string().try_into();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_password_try_from_string() {
+        let result: Result<Password, _> = "password".to_string().try_into();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_path_try_from_str() {
+        let result: Result<ConfigPath, _> = "config.toml".try_into();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_path_try_from_string() {
+        let result: Result<ConfigPath, _> = "config.toml".to_string().try_into();
+        assert!(result.is_ok());
+    }
+
+    // Test FromStr implementation
+    #[test]
+    fn test_config_path_from_str() {
+        use std::str::FromStr;
+        let result = ConfigPath::from_str("config.toml");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "config.toml");
+    }
+
+    #[test]
+    fn test_config_path_from_str_empty() {
+        use std::str::FromStr;
+        let result = ConfigPath::from_str("");
+        assert!(result.is_err());
+    }
+
+    // Test AsRef<str> implementation
+    #[test]
+    fn test_hostname_as_ref_str() {
+        let hostname = HostName::new("example.com".to_string()).unwrap();
+        let s: &str = hostname.as_ref();
+        assert_eq!(s, "example.com");
+    }
+
+    #[test]
+    fn test_server_name_as_ref() {
+        let server = ServerName::new("server1".to_string()).unwrap();
+        let s: &str = server.as_ref();
+        assert_eq!(s, "server1");
+    }
+
+    #[test]
+    fn test_username_as_ref() {
+        let username = Username::new("alice".to_string()).unwrap();
+        let s: &str = username.as_ref();
+        assert_eq!(s, "alice");
+    }
+
+    #[test]
+    fn test_password_as_ref() {
+        let password = Password::new("secret".to_string()).unwrap();
+        let s: &str = password.as_ref();
+        assert_eq!(s, "secret");
+    }
+
+    // Test AsRef<Path> implementation
+    #[test]
+    fn test_config_path_as_ref_path() {
+        let config = ConfigPath::try_from("config.toml").unwrap();
+        let path: &Path = config.as_ref();
+        assert_eq!(path, Path::new("config.toml"));
+    }
+
+    // Test Deref implementation
+    #[test]
+    fn test_hostname_deref() {
+        let hostname = HostName::new("example.com".to_string()).unwrap();
+        assert_eq!(&*hostname, "example.com");
+        assert_eq!(hostname.len(), 11); // Deref allows calling str methods
+    }
+
+    #[test]
+    fn test_server_name_deref() {
+        let server = ServerName::new("backend-1".to_string()).unwrap();
+        assert_eq!(&*server, "backend-1");
+        assert!(server.contains("backend")); // Deref to str
+    }
+
+    #[test]
+    fn test_username_deref() {
+        let username = Username::new("alice".to_string()).unwrap();
+        assert_eq!(&*username, "alice");
+    }
+
+    #[test]
+    fn test_password_deref() {
+        let password = Password::new("secret".to_string()).unwrap();
+        assert_eq!(&*password, "secret");
+    }
+
+    // Test Clone and PartialEq
+    #[test]
+    fn test_hostname_clone() {
+        let hostname = HostName::new("example.com".to_string()).unwrap();
+        let cloned = hostname.clone();
+        assert_eq!(hostname, cloned);
+    }
+
+    #[test]
+    fn test_server_name_clone() {
+        let server = ServerName::new("server1".to_string()).unwrap();
+        let cloned = server.clone();
+        assert_eq!(server, cloned);
+    }
+
+    #[test]
+    fn test_username_clone() {
+        let username = Username::new("alice".to_string()).unwrap();
+        let cloned = username.clone();
+        assert_eq!(username, cloned);
+    }
+
+    #[test]
+    fn test_password_clone() {
+        let password = Password::new("secret".to_string()).unwrap();
+        let cloned = password.clone();
+        assert_eq!(password, cloned);
+    }
+
+    #[test]
+    fn test_config_path_clone() {
+        let config = ConfigPath::try_from("config.toml").unwrap();
+        let cloned = config.clone();
+        assert_eq!(config, cloned);
+    }
+
+    // Test Hash implementation (via HashSet usage)
+    #[test]
+    fn test_hostname_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(HostName::new("example.com".to_string()).unwrap());
+        assert!(set.contains(&HostName::new("example.com".to_string()).unwrap()));
+    }
+
+    #[test]
+    fn test_server_name_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ServerName::new("server1".to_string()).unwrap());
+        assert!(set.contains(&ServerName::new("server1".to_string()).unwrap()));
+    }
+
+    // Test Serialize/Deserialize
+    #[test]
+    fn test_hostname_serialize() {
+        let hostname = HostName::new("example.com".to_string()).unwrap();
+        let json = serde_json::to_string(&hostname).unwrap();
+        assert_eq!(json, "\"example.com\"");
+    }
+
+    #[test]
+    fn test_hostname_deserialize() {
+        let json = "\"example.com\"";
+        let hostname: HostName = serde_json::from_str(json).unwrap();
+        assert_eq!(hostname.as_str(), "example.com");
+    }
+
+    #[test]
+    fn test_hostname_deserialize_empty_fails() {
+        let json = "\"\"";
+        let result: Result<HostName, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_name_serialize() {
+        let server = ServerName::new("backend-1".to_string()).unwrap();
+        let json = serde_json::to_string(&server).unwrap();
+        assert_eq!(json, "\"backend-1\"");
+    }
+
+    #[test]
+    fn test_server_name_deserialize() {
+        let json = "\"backend-1\"";
+        let server: ServerName = serde_json::from_str(json).unwrap();
+        assert_eq!(server.as_str(), "backend-1");
+    }
+
+    #[test]
+    fn test_username_serialize() {
+        let username = Username::new("alice".to_string()).unwrap();
+        let json = serde_json::to_string(&username).unwrap();
+        assert_eq!(json, "\"alice\"");
+    }
+
+    #[test]
+    fn test_username_deserialize() {
+        let json = "\"alice\"";
+        let username: Username = serde_json::from_str(json).unwrap();
+        assert_eq!(username.as_str(), "alice");
+    }
+
+    #[test]
+    fn test_password_serialize() {
+        let password = Password::new("secret".to_string()).unwrap();
+        let json = serde_json::to_string(&password).unwrap();
+        assert_eq!(json, "\"secret\"");
+    }
+
+    #[test]
+    fn test_password_deserialize() {
+        let json = "\"secret\"";
+        let password: Password = serde_json::from_str(json).unwrap();
+        assert_eq!(password.as_str(), "secret");
+    }
+
+    #[test]
+    fn test_config_path_serialize() {
+        let config = ConfigPath::try_from("config.toml").unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(json, "\"config.toml\"");
+    }
+
+    #[test]
+    fn test_config_path_deserialize() {
+        let json = "\"config.toml\"";
+        let config: ConfigPath = serde_json::from_str(json).unwrap();
+        assert_eq!(config.as_str(), "config.toml");
+    }
+
+    #[test]
+    fn test_config_path_deserialize_empty_fails() {
+        let json = "\"\"";
+        let result: Result<ConfigPath, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // Test ValidationError types
+    #[test]
+    fn test_validation_error_display() {
+        assert_eq!(
+            ValidationError::EmptyHostName.to_string(),
+            "hostname cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyServerName.to_string(),
+            "server name cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyUsername.to_string(),
+            "username cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyPassword.to_string(),
+            "password cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyConfigPath.to_string(),
+            "config path cannot be empty"
+        );
+    }
+
+    #[test]
+    fn test_validation_error_clone() {
+        let err = ValidationError::EmptyHostName;
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
+    }
 }
