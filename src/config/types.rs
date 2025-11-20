@@ -460,3 +460,275 @@ impl Server {
         ServerBuilder::new(host, port)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RoutingMode tests
+    #[test]
+    fn test_routing_mode_default() {
+        assert_eq!(RoutingMode::default(), RoutingMode::Hybrid);
+    }
+
+    #[test]
+    fn test_routing_mode_supports_per_command() {
+        assert!(RoutingMode::PerCommand.supports_per_command_routing());
+        assert!(RoutingMode::Hybrid.supports_per_command_routing());
+        assert!(!RoutingMode::Stateful.supports_per_command_routing());
+    }
+
+    #[test]
+    fn test_routing_mode_supports_stateful() {
+        assert!(RoutingMode::Stateful.supports_stateful_commands());
+        assert!(RoutingMode::Hybrid.supports_stateful_commands());
+        assert!(!RoutingMode::PerCommand.supports_stateful_commands());
+    }
+
+    #[test]
+    fn test_routing_mode_as_str() {
+        assert_eq!(RoutingMode::Stateful.as_str(), "stateful 1:1 mode");
+        assert_eq!(
+            RoutingMode::PerCommand.as_str(),
+            "per-command routing mode (stateless)"
+        );
+        assert_eq!(RoutingMode::Hybrid.as_str(), "hybrid routing mode");
+    }
+
+    #[test]
+    fn test_routing_mode_display() {
+        assert_eq!(RoutingMode::Stateful.to_string(), "stateful 1:1 mode");
+        assert_eq!(RoutingMode::Hybrid.to_string(), "hybrid routing mode");
+    }
+
+    // Proxy tests
+    #[test]
+    fn test_proxy_default() {
+        let proxy = Proxy::default();
+        assert_eq!(proxy.host, "0.0.0.0");
+        assert_eq!(proxy.port.get(), 8119);
+    }
+
+    #[test]
+    fn test_proxy_default_host_constant() {
+        assert_eq!(Proxy::DEFAULT_HOST, "0.0.0.0");
+    }
+
+    // Cache tests
+    #[test]
+    fn test_cache_default() {
+        let cache = Cache::default();
+        assert_eq!(cache.max_capacity.get(), 10000);
+        assert_eq!(cache.ttl, Duration::from_secs(3600));
+    }
+
+    // HealthCheck tests
+    #[test]
+    fn test_health_check_default() {
+        let hc = HealthCheck::default();
+        assert_eq!(hc.interval, Duration::from_secs(30));
+        assert_eq!(hc.timeout, Duration::from_secs(5));
+        assert_eq!(hc.unhealthy_threshold.get(), 3);
+    }
+
+    // ClientAuth tests
+    #[test]
+    fn test_client_auth_is_enabled_legacy() {
+        let mut auth = ClientAuth::default();
+        assert!(!auth.is_enabled());
+
+        auth.username = Some("user".to_string());
+        auth.password = Some("pass".to_string());
+        assert!(auth.is_enabled());
+    }
+
+    #[test]
+    fn test_client_auth_is_enabled_multi_user() {
+        let mut auth = ClientAuth::default();
+        auth.users.push(UserCredentials {
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+        });
+        assert!(auth.is_enabled());
+    }
+
+    #[test]
+    fn test_client_auth_all_users_legacy() {
+        let mut auth = ClientAuth::default();
+        auth.username = Some("user".to_string());
+        auth.password = Some("pass".to_string());
+
+        let users = auth.all_users();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0], ("user", "pass"));
+    }
+
+    #[test]
+    fn test_client_auth_all_users_multi() {
+        let mut auth = ClientAuth::default();
+        auth.users.push(UserCredentials {
+            username: "alice".to_string(),
+            password: "alice_pw".to_string(),
+        });
+        auth.users.push(UserCredentials {
+            username: "bob".to_string(),
+            password: "bob_pw".to_string(),
+        });
+
+        let users = auth.all_users();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0], ("alice", "alice_pw"));
+        assert_eq!(users[1], ("bob", "bob_pw"));
+    }
+
+    #[test]
+    fn test_client_auth_all_users_combined() {
+        let mut auth = ClientAuth::default();
+        auth.username = Some("legacy".to_string());
+        auth.password = Some("legacy_pw".to_string());
+        auth.users.push(UserCredentials {
+            username: "alice".to_string(),
+            password: "alice_pw".to_string(),
+        });
+
+        let users = auth.all_users();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0], ("legacy", "legacy_pw"));
+        assert_eq!(users[1], ("alice", "alice_pw"));
+    }
+
+    // ServerBuilder tests
+    #[test]
+    fn test_server_builder_minimal() {
+        let server = Server::builder("news.example.com", 119).build().unwrap();
+
+        assert_eq!(server.host.as_str(), "news.example.com");
+        assert_eq!(server.port.get(), 119);
+        assert_eq!(server.name.as_str(), "news.example.com:119");
+        assert_eq!(server.max_connections.get(), 10);
+        assert!(!server.use_tls);
+        assert!(server.tls_verify_cert); // Secure by default
+    }
+
+    #[test]
+    fn test_server_builder_with_name() {
+        let server = Server::builder("localhost", 119)
+            .name("Test Server")
+            .build()
+            .unwrap();
+
+        assert_eq!(server.name.as_str(), "Test Server");
+    }
+
+    #[test]
+    fn test_server_builder_with_auth() {
+        let server = Server::builder("news.example.com", 119)
+            .username("testuser")
+            .password("testpass")
+            .build()
+            .unwrap();
+
+        assert_eq!(server.username.as_ref().unwrap(), "testuser");
+        assert_eq!(server.password.as_ref().unwrap(), "testpass");
+    }
+
+    #[test]
+    fn test_server_builder_with_max_connections() {
+        let server = Server::builder("localhost", 119)
+            .max_connections(20)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.max_connections.get(), 20);
+    }
+
+    #[test]
+    fn test_server_builder_with_tls() {
+        let server = Server::builder("secure.example.com", 563)
+            .use_tls(true)
+            .tls_verify_cert(false)
+            .tls_cert_path("/path/to/cert.pem")
+            .build()
+            .unwrap();
+
+        assert!(server.use_tls);
+        assert!(!server.tls_verify_cert);
+        assert_eq!(server.tls_cert_path.as_ref().unwrap(), "/path/to/cert.pem");
+    }
+
+    #[test]
+    fn test_server_builder_with_keepalive() {
+        let keepalive = Duration::from_secs(300);
+        let server = Server::builder("localhost", 119)
+            .connection_keepalive(keepalive)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.connection_keepalive, Some(keepalive));
+    }
+
+    #[test]
+    fn test_server_builder_with_health_check_settings() {
+        let timeout = Duration::from_millis(500);
+        let server = Server::builder("localhost", 119)
+            .health_check_max_per_cycle(5)
+            .health_check_pool_timeout(timeout)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.health_check_max_per_cycle, 5);
+        assert_eq!(server.health_check_pool_timeout, timeout);
+    }
+
+    #[test]
+    fn test_server_builder_chaining() {
+        let server = Server::builder("news.example.com", 563)
+            .name("Production Server")
+            .username("admin")
+            .password("secret")
+            .max_connections(25)
+            .use_tls(true)
+            .tls_verify_cert(true)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.name.as_str(), "Production Server");
+        assert_eq!(server.max_connections.get(), 25);
+        assert!(server.use_tls);
+    }
+
+    #[test]
+    fn test_server_builder_invalid_host() {
+        let result = Server::builder("", 119).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_builder_invalid_port() {
+        let result = Server::builder("localhost", 0).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_builder_invalid_max_connections() {
+        let result = Server::builder("localhost", 119).max_connections(0).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_builder_from_server_method() {
+        let builder = Server::builder("localhost", 119);
+        let server = builder.build().unwrap();
+        assert_eq!(server.host.as_str(), "localhost");
+    }
+
+    // Config tests
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert!(config.servers.is_empty());
+        assert_eq!(config.proxy.host, "0.0.0.0");
+        assert!(config.cache.is_none());
+        assert!(!config.client_auth.is_enabled());
+    }
+}
