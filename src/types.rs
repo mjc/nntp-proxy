@@ -98,6 +98,7 @@ impl std::fmt::Display for BackendId {
 mod tests {
     use super::*;
 
+    // ClientId tests
     #[test]
     fn test_client_id_unique() {
         let id1 = ClientId::new();
@@ -106,12 +107,173 @@ mod tests {
     }
 
     #[test]
+    fn test_client_id_default() {
+        let id1 = ClientId::default();
+        let id2 = ClientId::default();
+        assert_ne!(id1, id2); // Each default() creates unique ID
+    }
+
+    #[test]
+    fn test_client_id_as_uuid() {
+        let id = ClientId::new();
+        let uuid = id.as_uuid();
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+    }
+
+    #[test]
+    fn test_client_id_display() {
+        let id = ClientId::new();
+        let display = format!("{}", id);
+        assert!(!display.is_empty());
+        // UUID format: 8-4-4-4-12 hex characters
+        assert_eq!(display.len(), 36);
+        assert_eq!(display.chars().filter(|&c| c == '-').count(), 4);
+    }
+
+    #[test]
+    fn test_client_id_debug() {
+        let id = ClientId::new();
+        let debug = format!("{:?}", id);
+        assert!(debug.contains("ClientId"));
+    }
+
+    #[test]
+    fn test_client_id_clone() {
+        let id1 = ClientId::new();
+        let id2 = id1.clone();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_client_id_equality() {
+        let id1 = ClientId::new();
+        let id2 = id1.clone();
+        let id3 = ClientId::new();
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_client_id_hash() {
+        use std::collections::HashSet;
+
+        let id1 = ClientId::new();
+        let id2 = id1.clone();
+        let id3 = ClientId::new();
+
+        let mut set = HashSet::new();
+        set.insert(id1);
+        set.insert(id2); // Duplicate, should not increase size
+        set.insert(id3);
+
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_client_id_ordering() {
+        let id1 = ClientId::new();
+        let id2 = ClientId::new();
+
+        // Should have consistent ordering
+        assert!(id1 < id2 || id1 > id2 || id1 == id2);
+
+        let id3 = id1.clone();
+        assert!(id1 <= id3 && id1 >= id3);
+    }
+
+    // BackendId tests
+    #[test]
     fn test_backend_id() {
         let id1 = BackendId::from_index(0);
         let id2 = BackendId::from_index(1);
         assert_ne!(id1, id2);
         assert_eq!(id1.as_index(), 0);
         assert_eq!(id2.as_index(), 1);
+    }
+
+    #[test]
+    fn test_backend_id_from_usize() {
+        let id: BackendId = 42.into();
+        assert_eq!(id.as_index(), 42);
+    }
+
+    #[test]
+    fn test_backend_id_const_fn() {
+        // This tests that from_index is const (compile-time constant)
+        const ID: BackendId = BackendId::from_index(10);
+        assert_eq!(ID.as_index(), 10);
+    }
+
+    #[test]
+    fn test_backend_id_display() {
+        let id = BackendId::from_index(5);
+        assert_eq!(format!("{}", id), "Backend(5)");
+    }
+
+    #[test]
+    fn test_backend_id_debug() {
+        let id = BackendId::from_index(7);
+        let debug = format!("{:?}", id);
+        assert!(debug.contains("BackendId"));
+        assert!(debug.contains("7"));
+    }
+
+    #[test]
+    fn test_backend_id_clone() {
+        let id1 = BackendId::from_index(15);
+        let id2 = id1.clone();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_backend_id_equality() {
+        let id1 = BackendId::from_index(10);
+        let id2 = BackendId::from_index(10);
+        let id3 = BackendId::from_index(20);
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_backend_id_hash() {
+        use std::collections::HashSet;
+
+        let id1 = BackendId::from_index(1);
+        let id2 = BackendId::from_index(1);
+        let id3 = BackendId::from_index(2);
+
+        let mut set = HashSet::new();
+        set.insert(id1);
+        set.insert(id2); // Duplicate
+        set.insert(id3);
+
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_backend_id_ordering() {
+        let id1 = BackendId::from_index(1);
+        let id2 = BackendId::from_index(2);
+        let id3 = BackendId::from_index(3);
+
+        assert!(id1 < id2);
+        assert!(id2 < id3);
+        assert!(id1 < id3);
+        assert!(id2 > id1);
+    }
+
+    #[test]
+    fn test_backend_id_zero() {
+        let id = BackendId::from_index(0);
+        assert_eq!(id.as_index(), 0);
+    }
+
+    #[test]
+    fn test_backend_id_large_index() {
+        let id = BackendId::from_index(usize::MAX);
+        assert_eq!(id.as_index(), usize::MAX);
     }
 
     #[test]
