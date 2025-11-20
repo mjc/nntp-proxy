@@ -204,3 +204,155 @@ impl ConnectionStatsAggregator {
         self.connection_stats.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_user_connection_stats_new() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("per-command".to_string(), now);
+
+        assert_eq!(stats.get_count(), 1);
+        assert_eq!(stats.routing_mode, "per-command");
+        assert_eq!(stats.first_seen, now);
+    }
+
+    #[test]
+    fn test_user_connection_stats_record_event() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+
+        assert_eq!(stats.get_count(), 1);
+
+        let later = now + Duration::from_secs(5);
+        stats.record_event(later);
+
+        assert_eq!(stats.get_count(), 2);
+        assert!(stats.duration_secs() >= 5.0);
+    }
+
+    #[test]
+    fn test_user_connection_stats_duration_secs() {
+        let now = Instant::now();
+        let stats = UserConnectionStats::new("stateful".to_string(), now);
+
+        // Immediately after creation, duration should be near 0
+        assert!(stats.duration_secs() < 0.1);
+
+        // After recording an event 3 seconds later
+        let later = now + Duration::from_secs(3);
+        stats.record_event(later);
+
+        let duration = stats.duration_secs();
+        assert!(duration >= 3.0 && duration < 3.1);
+    }
+
+    #[test]
+    fn test_connection_stats_aggregator_new() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        assert_eq!(aggregator.user_count(), 0);
+        assert_eq!(aggregator.connection_count("test"), None);
+    }
+
+    #[test]
+    fn test_connection_stats_aggregator_default() {
+        let aggregator = ConnectionStatsAggregator::default();
+
+        assert_eq!(aggregator.user_count(), 0);
+    }
+
+    #[test]
+    fn test_record_connection_single_user() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("alice"), "per-command");
+
+        assert_eq!(aggregator.user_count(), 1);
+        assert_eq!(aggregator.connection_count("alice"), Some(1));
+    }
+
+    #[test]
+    fn test_record_connection_multiple_events_same_user() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("bob"), "hybrid");
+        aggregator.record_connection(Some("bob"), "hybrid");
+        aggregator.record_connection(Some("bob"), "hybrid");
+
+        assert_eq!(aggregator.user_count(), 1);
+        assert_eq!(aggregator.connection_count("bob"), Some(3));
+    }
+
+    #[test]
+    fn test_record_connection_multiple_users() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("alice"), "per-command");
+        aggregator.record_connection(Some("bob"), "hybrid");
+        aggregator.record_connection(Some("charlie"), "stateful");
+
+        assert_eq!(aggregator.user_count(), 3);
+        assert_eq!(aggregator.connection_count("alice"), Some(1));
+        assert_eq!(aggregator.connection_count("bob"), Some(1));
+        assert_eq!(aggregator.connection_count("charlie"), Some(1));
+    }
+
+    #[test]
+    fn test_record_connection_anonymous() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(None, "per-command");
+
+        assert_eq!(aggregator.user_count(), 1);
+        assert_eq!(aggregator.connection_count(ANONYMOUS), Some(1));
+    }
+
+    #[test]
+    fn test_record_disconnection() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_disconnection(Some("alice"), "per-command");
+
+        // Disconnections are tracked separately
+        assert_eq!(aggregator.user_count(), 0); // No connections
+    }
+
+    #[test]
+    fn test_flush_clears_stats() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("alice"), "per-command");
+        aggregator.record_connection(Some("bob"), "hybrid");
+
+        assert_eq!(aggregator.user_count(), 2);
+
+        aggregator.flush();
+
+        assert_eq!(aggregator.user_count(), 0);
+        assert_eq!(aggregator.connection_count("alice"), None);
+        assert_eq!(aggregator.connection_count("bob"), None);
+    }
+
+    #[test]
+    fn test_aggregator_clone() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        aggregator.record_connection(Some("alice"), "per-command");
+
+        let cloned = aggregator.clone();
+
+        // Clone shares the same underlying data (Arc)
+        assert_eq!(cloned.user_count(), 1);
+        assert_eq!(cloned.connection_count("alice"), Some(1));
+    }
+
+    #[test]
+    fn test_connection_count_nonexistent_user() {
+        let aggregator = ConnectionStatsAggregator::new();
+
+        assert_eq!(aggregator.connection_count("nonexistent"), None);
+    }
+}
