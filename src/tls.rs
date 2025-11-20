@@ -517,4 +517,93 @@ mod tests {
                 .any(|s| s.contains("Mozilla") || s.contains("system"))
         );
     }
+
+    #[test]
+    fn test_tls_config_builder_chaining() {
+        let config = TlsConfig::builder()
+            .enabled(false)
+            .verify_cert(true)
+            .enabled(true) // Override
+            .build();
+
+        assert!(config.use_tls);
+        assert!(config.tls_verify_cert);
+    }
+
+    #[test]
+    fn test_tls_config_clone() {
+        let config1 = TlsConfig::builder()
+            .enabled(true)
+            .cert_path("/test/path")
+            .build();
+
+        let config2 = config1.clone();
+        assert_eq!(config1.use_tls, config2.use_tls);
+        assert_eq!(config1.tls_verify_cert, config2.tls_verify_cert);
+        assert_eq!(config1.tls_cert_path, config2.tls_cert_path);
+    }
+
+    #[test]
+    fn test_tls_manager_clone() {
+        let config = TlsConfig::default();
+        let manager1 = TlsManager::new(config).unwrap();
+        let manager2 = manager1.clone();
+
+        // Both should share the same Arc<TlsConnector>
+        assert!(Arc::ptr_eq(
+            &manager1.cached_connector,
+            &manager2.cached_connector
+        ));
+    }
+
+    #[test]
+    fn test_tls_manager_debug() {
+        let config = TlsConfig::default();
+        let manager = TlsManager::new(config).unwrap();
+        let debug_str = format!("{:?}", manager);
+
+        assert!(debug_str.contains("TlsManager"));
+        assert!(debug_str.contains("<TlsConnector>"));
+    }
+
+    #[test]
+    fn test_tls_config_builder_cert_path_string_types() {
+        // Test with &str
+        let config1 = TlsConfig::builder().cert_path("/path/to/cert.pem").build();
+        assert_eq!(config1.tls_cert_path, Some("/path/to/cert.pem".to_string()));
+
+        // Test with String
+        let config2 = TlsConfig::builder()
+            .cert_path("/another/path.pem".to_string())
+            .build();
+        assert_eq!(config2.tls_cert_path, Some("/another/path.pem".to_string()));
+    }
+
+    #[test]
+    fn test_no_verifier_supported_schemes() {
+        use rustls_backend::NoVerifier;
+
+        let verifier = NoVerifier;
+        let schemes = verifier.supported_verify_schemes();
+
+        // Should support all major signature schemes
+        assert!(schemes.contains(&SignatureScheme::RSA_PKCS1_SHA256));
+        assert!(schemes.contains(&SignatureScheme::ECDSA_NISTP256_SHA256));
+        assert!(schemes.contains(&SignatureScheme::ED25519));
+        assert!(schemes.len() >= 10); // Should have many schemes
+    }
+
+    #[test]
+    fn test_certificate_load_result_sources() {
+        let config = TlsConfig::default();
+        let result = TlsManager::load_certificates_sync(&config).unwrap();
+
+        // Should have at least one source
+        assert!(!result.sources.is_empty());
+
+        // Sources should be descriptive strings
+        for source in &result.sources {
+            assert!(!source.is_empty());
+        }
+    }
 }
