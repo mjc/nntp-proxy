@@ -171,6 +171,21 @@ pub fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<an
     Ok(())
 }
 
+/// Validate DATE command response
+///
+/// Returns Ok(()) if the response starts with "111 " (EXPECTED_DATE_RESPONSE_PREFIX),
+/// otherwise returns an error with the actual response.
+///
+/// This is a pure function extracted for testability.
+#[inline]
+pub(crate) fn validate_date_response(response: &str) -> Result<(), HealthCheckError> {
+    if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
+        Ok(())
+    } else {
+        Err(HealthCheckError::UnexpectedResponse(response.to_string()))
+    }
+}
+
 /// Application-level health check using DATE command
 ///
 /// Sends DATE command and verifies response to ensure the NNTP connection
@@ -197,11 +212,7 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
 
         // Validate DATE response
         let response = String::from_utf8_lossy(&response_buf[..n]);
-        if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
-            Ok(())
-        } else {
-            Err(HealthCheckError::UnexpectedResponse(response.to_string()))
-        }
+        validate_date_response(&response)
     };
 
     // Apply timeout and convert errors
@@ -329,5 +340,101 @@ mod tests {
             err.to_string()
                 .contains("Failed to read health check response")
         );
+    }
+
+    // DATE response validation tests
+
+    #[test]
+    fn test_validate_date_response_success() {
+        // Standard DATE response format
+        assert!(validate_date_response("111 20231215120000\r\n").is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_response_success_minimal() {
+        // Minimal valid response (just "111 " prefix)
+        assert!(validate_date_response("111 \r\n").is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_response_success_with_extra() {
+        // Extra data after timestamp is OK
+        assert!(validate_date_response("111 20231215120000 extra info\r\n").is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_response_wrong_code() {
+        // Wrong status code
+        let result = validate_date_response("200 OK\r\n");
+        assert!(result.is_err());
+        match result {
+            Err(HealthCheckError::UnexpectedResponse(msg)) => {
+                assert_eq!(msg, "200 OK\r\n");
+            }
+            _ => panic!("Expected UnexpectedResponse error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_date_response_error_code() {
+        // Error codes (4xx, 5xx) should fail
+        assert!(validate_date_response("400 Bad Request\r\n").is_err());
+        assert!(validate_date_response("500 Server Error\r\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_date_response_empty() {
+        // Empty response
+        let result = validate_date_response("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_date_response_malformed() {
+        // Malformed responses
+        assert!(validate_date_response("not a valid response").is_err());
+        assert!(validate_date_response("1\r\n").is_err());
+        assert!(validate_date_response("11 \r\n").is_err()); // Too short prefix
+    }
+
+    #[test]
+    fn test_validate_date_response_partial_match() {
+        // Starts with "11" but not "111 "
+        assert!(validate_date_response("110 Info\r\n").is_err());
+        assert!(validate_date_response("112 Other\r\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_date_response_no_space() {
+        // Missing space after "111"
+        assert!(validate_date_response("11120231215120000\r\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_date_response_whitespace_prefix() {
+        // Leading whitespace should fail
+        assert!(validate_date_response(" 111 20231215120000\r\n").is_err());
+        assert!(validate_date_response("\r\n111 20231215120000\r\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_date_response_case_sensitivity() {
+        // Status codes are numeric, so no case issues, but test weird inputs
+        assert!(validate_date_response("111 lowercase\r\n").is_ok());
+        assert!(validate_date_response("111 UPPERCASE\r\n").is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_response_unicode() {
+        // Unicode in timestamp portion (unusual but should work if starts with "111 ")
+        assert!(validate_date_response("111 日本語\r\n").is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_response_realistic_examples() {
+        // Real-world examples from different NNTP servers
+        assert!(validate_date_response("111 20231215120530\r\n").is_ok());
+        assert!(validate_date_response("111 19700101000000\r\n").is_ok());
+        assert!(validate_date_response("111 20991231235959\r\n").is_ok());
     }
 }
