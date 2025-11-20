@@ -209,3 +209,125 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
         .await
         .map_err(|_| HealthCheckError::Timeout)?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_check_metrics_new() {
+        let metrics = HealthCheckMetrics::new();
+        assert_eq!(metrics.cycles_run(), 0);
+        assert_eq!(metrics.connections_checked(), 0);
+        assert_eq!(metrics.connections_failed(), 0);
+        assert_eq!(metrics.failure_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_health_check_metrics_record_cycle() {
+        let metrics = HealthCheckMetrics::new();
+
+        metrics.record_cycle(10, 2);
+        assert_eq!(metrics.cycles_run(), 1);
+        assert_eq!(metrics.connections_checked(), 10);
+        assert_eq!(metrics.connections_failed(), 2);
+        assert_eq!(metrics.failure_rate(), 0.2);
+
+        metrics.record_cycle(5, 1);
+        assert_eq!(metrics.cycles_run(), 2);
+        assert_eq!(metrics.connections_checked(), 15);
+        assert_eq!(metrics.connections_failed(), 3);
+        assert_eq!(metrics.failure_rate(), 0.2);
+    }
+
+    #[test]
+    fn test_health_check_metrics_failure_rate() {
+        let metrics = HealthCheckMetrics::new();
+
+        // No failures
+        metrics.record_cycle(10, 0);
+        assert_eq!(metrics.failure_rate(), 0.0);
+
+        // 50% failure rate
+        metrics.record_cycle(10, 5);
+        assert!((metrics.failure_rate() - 0.25).abs() < 0.01);
+
+        // 100% failure rate cycle
+        metrics.record_cycle(10, 10);
+        assert!((metrics.failure_rate() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_health_check_metrics_zero_checked() {
+        let metrics = HealthCheckMetrics::new();
+        assert_eq!(metrics.failure_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_health_check_metrics_multiple_cycles() {
+        let metrics = HealthCheckMetrics::new();
+
+        for i in 1..=5 {
+            metrics.record_cycle(10, 1);
+            assert_eq!(metrics.cycles_run(), i);
+        }
+
+        assert_eq!(metrics.connections_checked(), 50);
+        assert_eq!(metrics.connections_failed(), 5);
+        assert_eq!(metrics.failure_rate(), 0.1);
+    }
+
+    #[test]
+    fn test_health_check_error_display() {
+        assert_eq!(
+            HealthCheckError::TcpClosed.to_string(),
+            "TCP connection closed"
+        );
+        assert_eq!(
+            HealthCheckError::UnexpectedData.to_string(),
+            "Unexpected data in buffer"
+        );
+        assert_eq!(
+            HealthCheckError::Timeout.to_string(),
+            "Health check timeout"
+        );
+        assert_eq!(
+            HealthCheckError::ConnectionClosedDuringCheck.to_string(),
+            "Connection closed during health check"
+        );
+    }
+
+    #[test]
+    fn test_health_check_error_unexpected_response() {
+        let err = HealthCheckError::UnexpectedResponse("500 Error".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Unexpected health check response: 500 Error"
+        );
+    }
+
+    #[test]
+    fn test_health_check_error_tcp_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        let err = HealthCheckError::TcpError(io_err);
+        assert!(err.to_string().contains("TCP error"));
+        assert!(err.to_string().contains("reset"));
+    }
+
+    #[test]
+    fn test_health_check_error_write_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe");
+        let err = HealthCheckError::WriteError(io_err);
+        assert!(err.to_string().contains("Failed to write health check"));
+    }
+
+    #[test]
+    fn test_health_check_error_read_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
+        let err = HealthCheckError::ReadError(io_err);
+        assert!(
+            err.to_string()
+                .contains("Failed to read health check response")
+        );
+    }
+}
