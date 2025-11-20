@@ -606,4 +606,186 @@ mod tests {
             assert!(!source.is_empty());
         }
     }
+
+    #[test]
+    fn test_tls_config_builder_defaults_are_secure() {
+        // Builder should default to secure settings
+        let config = TlsConfig::builder().enabled(true).build();
+
+        assert!(config.use_tls);
+        assert!(config.tls_verify_cert); // Verification enabled by default - SECURE
+        assert!(config.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn test_tls_manager_with_verify_disabled() {
+        let config = TlsConfig::builder()
+            .enabled(true)
+            .verify_cert(false)
+            .build();
+        let manager = TlsManager::new(config);
+
+        // Should successfully create manager even with verification disabled
+        assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn test_tls_manager_with_verify_enabled() {
+        let config = TlsConfig::builder().enabled(true).verify_cert(true).build();
+        let manager = TlsManager::new(config);
+
+        // Should successfully create manager with verification enabled
+        assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn test_certificate_loading_fallback_to_mozilla_bundle() {
+        // Even with empty config, should fall back to Mozilla CA bundle
+        let config = TlsConfig::default();
+        let result = TlsManager::load_certificates_sync(&config).unwrap();
+
+        // Should have loaded certificates from some source
+        assert!(!result.root_store.is_empty());
+        assert!(!result.sources.is_empty());
+    }
+
+    #[test]
+    fn test_tls_config_debug_format() {
+        let config = TlsConfig::builder()
+            .enabled(true)
+            .verify_cert(false)
+            .cert_path("/test")
+            .build();
+
+        let debug_str = format!("{:?}", config);
+
+        assert!(debug_str.contains("TlsConfig"));
+        assert!(debug_str.contains("use_tls"));
+        assert!(debug_str.contains("tls_verify_cert"));
+    }
+
+    #[test]
+    fn test_tls_config_builder_debug_format() {
+        let builder = TlsConfig::builder().enabled(true).verify_cert(false);
+
+        let debug_str = format!("{:?}", builder);
+
+        assert!(debug_str.contains("TlsConfigBuilder"));
+    }
+
+    #[test]
+    fn test_no_verifier_debug_format() {
+        use rustls_backend::NoVerifier;
+
+        let verifier = NoVerifier;
+        let debug_str = format!("{:?}", verifier);
+
+        assert!(debug_str.contains("NoVerifier"));
+    }
+
+    #[test]
+    fn test_certificate_load_result_debug_format() {
+        let config = TlsConfig::default();
+        let result = TlsManager::load_certificates_sync(&config).unwrap();
+
+        let debug_str = format!("{:?}", result);
+
+        assert!(debug_str.contains("CertificateLoadResult"));
+        assert!(debug_str.contains("root_store"));
+        assert!(debug_str.contains("sources"));
+    }
+
+    #[test]
+    fn test_tls_config_builder_cert_path_empty_string() {
+        // Empty string is technically a valid path (current directory)
+        let config = TlsConfig::builder().cert_path("").build();
+
+        assert_eq!(config.tls_cert_path, Some(String::new()));
+    }
+
+    #[test]
+    fn test_tls_config_builder_cert_path_with_spaces() {
+        let config = TlsConfig::builder()
+            .cert_path("  /path/with spaces.pem  ")
+            .build();
+
+        // Should preserve exact string including spaces
+        assert_eq!(
+            config.tls_cert_path,
+            Some("  /path/with spaces.pem  ".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiple_tls_managers_from_same_config() {
+        let config = TlsConfig::builder()
+            .enabled(true)
+            .verify_cert(false)
+            .build();
+
+        let manager1 = TlsManager::new(config.clone()).unwrap();
+        let manager2 = TlsManager::new(config.clone()).unwrap();
+
+        // Both should successfully initialize
+        let debug1 = format!("{:?}", manager1);
+        let debug2 = format!("{:?}", manager2);
+
+        assert!(debug1.contains("TlsManager"));
+        assert!(debug2.contains("TlsManager"));
+    }
+
+    #[test]
+    fn test_tls_config_all_combinations() {
+        // Test all boolean combinations
+        for use_tls in [true, false] {
+            for verify_cert in [true, false] {
+                let config = TlsConfig::builder()
+                    .enabled(use_tls)
+                    .verify_cert(verify_cert)
+                    .build();
+
+                assert_eq!(config.use_tls, use_tls);
+                assert_eq!(config.tls_verify_cert, verify_cert);
+
+                // All configurations should create valid managers if TLS is enabled
+                if use_tls {
+                    let manager = TlsManager::new(config);
+                    assert!(manager.is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tls_config_builder_method_chaining_order() {
+        // Test that builder methods can be called in any order
+        let config1 = TlsConfig::builder()
+            .enabled(true)
+            .verify_cert(false)
+            .cert_path("/test")
+            .build();
+
+        let config2 = TlsConfig::builder()
+            .cert_path("/test")
+            .verify_cert(false)
+            .enabled(true)
+            .build();
+
+        assert_eq!(config1.use_tls, config2.use_tls);
+        assert_eq!(config1.tls_verify_cert, config2.tls_verify_cert);
+        assert_eq!(config1.tls_cert_path, config2.tls_cert_path);
+    }
+
+    #[test]
+    fn test_tls_config_default_matches_builder_default() {
+        let default_config = TlsConfig::default();
+        let builder_config = TlsConfig::builder().build();
+
+        assert_eq!(default_config.use_tls, builder_config.use_tls);
+        assert_eq!(
+            default_config.tls_verify_cert,
+            builder_config.tls_verify_cert
+        );
+        assert_eq!(default_config.tls_cert_path, builder_config.tls_cert_path);
+    }
 }
