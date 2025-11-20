@@ -63,5 +63,5 @@ pub use config::{
     load_config, load_config_from_env, load_config_with_fallback,
 };
 pub use network::SocketOptimizer;
-pub use proxy::{NntpProxy, NntpProxyBuilder};
+pub use proxy::{NntpProxy, NntpProxyBuilder, is_client_disconnect_error};
 pub use runtime::{RuntimeConfig, shutdown_signal};

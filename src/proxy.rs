@@ -232,6 +232,34 @@ pub struct NntpProxy {
     connection_stats: ConnectionStatsAggregator,
 }
 
+/// Classify an error as a client disconnect (broken pipe/connection reset)
+///
+/// Returns true for errors that indicate the client disconnected normally,
+/// which should be logged at DEBUG level rather than WARN.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Error, ErrorKind};
+/// use nntp_proxy::is_client_disconnect_error;
+///
+/// let broken_pipe = Error::from(ErrorKind::BrokenPipe);
+/// let wrapped = anyhow::Error::from(broken_pipe);
+/// assert!(is_client_disconnect_error(&wrapped));
+///
+/// let other_error = anyhow::anyhow!("some other error");
+/// assert!(!is_client_disconnect_error(&other_error));
+/// ```
+#[inline]
+pub fn is_client_disconnect_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        )
+    })
+}
+
 impl NntpProxy {
     // Helper methods for session management
 
@@ -303,14 +331,7 @@ impl NntpProxy {
 
     /// Handle session errors with appropriate logging
     fn handle_session_error(&self, e: anyhow::Error, client_addr: SocketAddr, session_id: &str) {
-        let is_broken_pipe = e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
-            matches!(
-                io_err.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-            )
-        });
-
-        if is_broken_pipe {
+        if is_client_disconnect_error(&e) {
             debug!(
                 "Client {} [{}] disconnected: {} (normal for test connections)",
                 client_addr, session_id, e
@@ -849,5 +870,87 @@ mod tests {
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.router.backend_count(), 3);
+    }
+
+    // Tests for is_client_disconnect_error function
+    mod error_classification {
+        use super::*;
+        use std::io::{Error, ErrorKind};
+
+        #[test]
+        fn test_broken_pipe_is_client_disconnect() {
+            let io_err = Error::from(ErrorKind::BrokenPipe);
+            let err = anyhow::Error::from(io_err);
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_connection_reset_is_client_disconnect() {
+            let io_err = Error::from(ErrorKind::ConnectionReset);
+            let err = anyhow::Error::from(io_err);
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_other_io_errors_not_client_disconnect() {
+            let error_kinds = vec![
+                ErrorKind::NotFound,
+                ErrorKind::PermissionDenied,
+                ErrorKind::ConnectionRefused,
+                ErrorKind::ConnectionAborted,
+                ErrorKind::AddrInUse,
+                ErrorKind::AddrNotAvailable,
+                ErrorKind::TimedOut,
+                ErrorKind::Interrupted,
+                ErrorKind::UnexpectedEof,
+                ErrorKind::WouldBlock,
+            ];
+
+            for kind in error_kinds {
+                let io_err = Error::from(kind);
+                let err = anyhow::Error::from(io_err);
+                assert!(
+                    !is_client_disconnect_error(&err),
+                    "{:?} should not be classified as client disconnect",
+                    kind
+                );
+            }
+        }
+
+        #[test]
+        fn test_non_io_error_not_client_disconnect() {
+            let err = anyhow::anyhow!("generic error message");
+            assert!(!is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_wrapped_broken_pipe_error() {
+            let io_err = Error::from(ErrorKind::BrokenPipe);
+            let err = anyhow::Error::from(io_err).context("failed to write to client");
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_wrapped_connection_reset_error() {
+            let io_err = Error::from(ErrorKind::ConnectionReset);
+            let err = anyhow::Error::from(io_err).context("failed to read from client");
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_deeply_wrapped_error() {
+            let io_err = Error::from(ErrorKind::BrokenPipe);
+            let err = anyhow::Error::from(io_err)
+                .context("inner context")
+                .context("outer context");
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_custom_io_error_message() {
+            let io_err = Error::new(ErrorKind::BrokenPipe, "custom broken pipe");
+            let err = anyhow::Error::from(io_err);
+            assert!(is_client_disconnect_error(&err));
+        }
     }
 }
