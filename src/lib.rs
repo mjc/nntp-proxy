@@ -43,6 +43,11 @@ mod proxy;
 pub mod stream;
 pub mod tui;
 
+// Test utilities (macros for reducing newtype test boilerplate)
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
+
 // Public modules for integration tests
 pub mod cache;
 pub mod command;
