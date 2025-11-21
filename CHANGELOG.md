@@ -5,9 +5,108 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-11-21
+
+### Added
+
+- **Terminal User Interface (TUI)** ([#38](https://github.com/mjc/nntp-proxy/pull/38), [#40](https://github.com/mjc/nntp-proxy/pull/40))
+  - New `nntp-proxy-tui` binary with real-time monitoring dashboard
+  - Live metrics: connections, throughput, backend health, user activity
+  - System resource monitoring: CPU usage, memory usage, peak tracking
+  - Interactive log viewer with fullscreen mode ('L' hotkey)
+  - Per-user statistics tracking with article counts
+  - Per-backend statistics with load balancing visualization
+  - Connection statistics and pool utilization graphs
+  - Built with ratatui for responsive terminal UI
+
+- **Comprehensive Metrics System**
+  - Lock-free metrics collection using DashMap for zero-allocation recording
+  - Modular metrics architecture: `MetricsCollector`, `MetricsSnapshot`
+  - Backend statistics: bytes transferred, command counts, error tracking
+  - User statistics: active users, commands per user, article tracking
+  - Connection statistics: pool utilization, connection lifecycle tracking
+  - Directional byte tracking: separate client-to-backend and backend-to-client metrics
+  - Snapshot-based metrics export for TUI consumption (zero-copy)
+
+- **Property-Based Testing** ([#40](https://github.com/mjc/nntp-proxy/pull/40))
+  - Comprehensive proptest integration for all newtype wrappers
+  - Reusable test macros: `test_nonzero_newtype_full!`, `test_validated_string!`
+  - 10,000+ generated test cases covering edge cases (0, MAX, overflow)
+  - Code reduction: 26% fewer test lines (571 lines) with 100x more coverage
+  - Integration property tests for routing modes and session handling
+
+- **Massive Test Coverage Improvements**
+  - Overall coverage: 74% → 85%+ across codebase
+  - 500+ new tests added across 30+ modules
+  - Module-specific improvements:
+    - `pool/buffer.rs`: 0% → 100% (+21 tests)
+    - `session/mod.rs`: 62.5% → 100% (+15 tests)
+    - `cache/article.rs`: 69% → 98.7% (+12 tests)
+    - `config/types.rs`: 31% → 99.8% (+35 tests)
+    - `types/protocol.rs`: 52% → 91% (+18 tests)
+    - `pool/deadpool_connection.rs`: 54.5% → 78.7% (+24 tests)
+  - New test suites: routing modes, session handling, metrics, cache helpers
+
+- **API Improvements**
+  - Shared CLI args module (`args.rs`) with `CommonArgs` and `CacheArgs`
+  - `PooledBuffer::as_mut_slice()` for better API discoverability
+  - `BufferPool::acquire()` replacing `get_buffer()` for clearer semantics
+  - Type-safe directional byte tracking (`BytesSentToBackend`, `BytesReceivedFromBackend`)
+  - Anonymous user constant centralization (`ANONYMOUS_USER`)
+
+### Changed
+
+- **Routing Mode Rename** - `RoutingMode::Standard` → `RoutingMode::Stateful` for clarity
+- **API Renames for Clarity**
+  - `CommandHandler::handle_command()` → `classify()`
+  - `NntpCommand::classify()` → `parse()`
+  - `ResponseCode` → `Response` (matches RFC 3977 terminology)
+  - `DeadpoolConnectionProviderBuilder` → `Builder`
+  - Removed `get_` prefixes, `_sync` suffixes from method names
+  - Removed redundant `Config` suffix from config types
+
+- **Code Quality & Refactoring**
+  - Integrated caching directly into `ClientSession` - eliminated `CachingSession` duplication
+  - Consolidated per-command routing handlers and shutdown signal handling
+  - Extracted testable pure functions from session handlers
+  - Functional style refactoring in cache logic
+  - AuthResult changed from struct to enum for better type safety
+  - Removed conditionals from match guards - pure pattern matching
+  - Eliminated duplicate command parsing in cache path
+  - Removed verbose debug logging to reduce code bloat (~200 lines)
+
+- **Configuration Enhancements**
+  - Added proxy config section with threading model configuration
+  - Environment variable support for all configuration options
+  - Extended timeout configuration options
+  - Enhanced validation with better error messages
+
+### Fixed
+
+- **Test Infrastructure**
+  - Fixed flaky tests and dead code warnings
+  - Added missing `#[tokio::test]` attribute to async tests
+  - Improved test isolation with random port allocation
+
+### Performance
+
+- **Lock-Free Metrics** - Zero-allocation metrics recording using atomic operations and DashMap
+- **TUI Optimizations** - Eliminated snapshot cloning, optimized data conversions
+- **Buffer Tuning** - Optimized for real-world article sizes (724KB average)
+
+### Technical Details
+
+- **Test Infrastructure**: Reusable test macros, property-based testing, MockNntpServer builder
+- **Metrics Architecture**: Modular design with snapshot isolation, lock-free recording
+- **TUI Stack**: ratatui + crossterm, system stats via sysinfo crate
+- **Code Reduction**: 571 lines of test code eliminated while increasing coverage 100x
+- **New Files**: 25+ new modules (metrics, TUI, test infrastructure)
+- **Total Changes**: 24,591 insertions, 3,038 deletions across 112 files
+
 ## [0.2.3] - 2025-11-12
 
 ### Added
+
 - **Domain Types Refactoring** ([#35](https://github.com/mjc/nntp-proxy/pull/35))
   - Comprehensive newtype pattern implementation across codebase
   - Type-safe newtypes for all domain values:
@@ -36,6 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Fixes**: [#32](https://github.com/mjc/nntp-proxy/pull/32) - Docker build issues
 
 ### Fixed
+
 - **Critical: Greeting Flush Bug** ([#37](https://github.com/mjc/nntp-proxy/pull/37))
   - Fixed connection resets for NNTP clients that send commands immediately after connecting
   - Root cause: greetings buffered in TCP send buffer without flush
@@ -58,6 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fail-fast behavior when required credentials missing
 
 ### Changed
+
 - **Domain Types Code Quality** ([#35](https://github.com/mjc/nntp-proxy/pull/35))
   - Comprehensive newtype pattern across codebase for type safety
   - Consolidated config/pool/protocol types with macros
@@ -71,6 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Updated function documentation for greeting handling
 
 ### Technical Details
+
 - **Greeting Flow**: Backend greetings consumed when connections created in pool; proxy sends own greeting with immediate flush to client
 - **Type Safety**: All domain values now use validated newtypes (Username, Password, StatusCode, TransferMetrics, etc.)
 - **Testing**: Added MockNntpServer builder, cargo-nextest CI, 25 config validation tests, random ports for parallel execution
@@ -78,6 +180,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.2] - 2025-11-07
 
 ### Added
+
 - **Client Authentication System** ([#29](https://github.com/mjc/nntp-proxy/pull/29))
   - Config-file based client authentication support
   - Credential validation against configured users
@@ -87,6 +190,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Closes**: [#28](https://github.com/mjc/nntp-proxy/issues/28) - Basic user auth/permissions
   
 ### Changed
+
 - **Performance Optimizations**
   - Introduced `PooledBuffer` type to eliminate repeated 64KB Vec allocations
   - Optimized authentication hot path to restore 80MB/s throughput
