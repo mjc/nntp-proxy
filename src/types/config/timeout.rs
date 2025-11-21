@@ -89,17 +89,100 @@ timeout_newtype! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
+    // Property tests for all timeout types
+    proptest! {
+        #[test]
+        fn backend_read_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = BackendReadTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn connection_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = ConnectionTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn command_execution_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = CommandExecutionTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn health_check_timeout_roundtrip(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = HealthCheckTimeout::new(duration);
+            prop_assert_eq!(timeout.as_duration(), duration);
+            prop_assert_eq!(timeout.as_secs(), secs);
+        }
+
+        #[test]
+        fn timeout_from_into_duration(secs in 0u64..86400u64) {
+            let duration = Duration::from_secs(secs);
+            let timeout = BackendReadTimeout::from(duration);
+            let back: Duration = timeout.into();
+            prop_assert_eq!(back, duration);
+        }
+
+        #[test]
+        fn timeout_ordering_property(a in 0u64..1000u64, b in 0u64..1000u64) {
+            let t1 = ConnectionTimeout::new(Duration::from_secs(a));
+            let t2 = ConnectionTimeout::new(Duration::from_secs(b));
+            prop_assert_eq!(t1.cmp(&t2), a.cmp(&b));
+        }
+
+        #[test]
+        fn timeout_clone_equality(secs in 0u64..86400u64) {
+            let timeout = BackendReadTimeout::new(Duration::from_secs(secs));
+            let cloned = timeout;
+            prop_assert_eq!(timeout, cloned);
+        }
+
+        #[test]
+        fn timeout_debug_contains_name(secs in 0u64..100u64) {
+            let timeout = BackendReadTimeout::new(Duration::from_secs(secs));
+            let debug_str = format!("{:?}", timeout);
+            prop_assert!(debug_str.contains("BackendReadTimeout"));
+        }
+    }
+
+    // Constant verification tests
     #[test]
-    fn test_backend_read_timeout() {
-        let timeout = BackendReadTimeout::DEFAULT;
-        assert_eq!(timeout.as_secs(), 30);
-        assert_eq!(timeout.as_duration(), Duration::from_secs(30));
+    fn all_default_constants_correct() {
+        assert_eq!(BackendReadTimeout::DEFAULT.as_secs(), 30);
+        assert_eq!(ConnectionTimeout::DEFAULT.as_secs(), 10);
+        assert_eq!(CommandExecutionTimeout::DEFAULT.as_secs(), 60);
+        assert_eq!(HealthCheckTimeout::DEFAULT.as_secs(), 2);
+    }
+
+    // Edge case tests
+    #[test]
+    fn zero_timeout_is_valid() {
+        let timeout = BackendReadTimeout::new(Duration::from_secs(0));
+        assert_eq!(timeout.as_secs(), 0);
     }
 
     #[test]
-    fn test_connection_timeout() {
-        let timeout = ConnectionTimeout::new(Duration::from_secs(5));
-        assert_eq!(timeout.as_secs(), 5);
+    fn large_timeout_one_day() {
+        let large = Duration::from_secs(86400);
+        let timeout = CommandExecutionTimeout::new(large);
+        assert_eq!(timeout.as_secs(), 86400);
+    }
+
+    #[test]
+    fn timeout_hash_works() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(BackendReadTimeout::DEFAULT);
+        assert!(set.contains(&BackendReadTimeout::DEFAULT));
     }
 }

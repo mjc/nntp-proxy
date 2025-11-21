@@ -20,18 +20,18 @@ fn test_backend_load_tracking() {
     assert_eq!(router.backend_load(backend_id), Some(0));
 
     // Route a command
-    router.route_command_sync(client_id, "LIST\r\n").unwrap();
+    router.route_command(client_id, "LIST\r\n").unwrap();
     assert_eq!(router.backend_load(backend_id), Some(1));
 
     // Route another
-    router.route_command_sync(client_id, "DATE\r\n").unwrap();
+    router.route_command(client_id, "DATE\r\n").unwrap();
     assert_eq!(router.backend_load(backend_id), Some(2));
 
     // Complete one
-    router.complete_command_sync(backend_id);
+    router.complete_command(backend_id);
     assert_eq!(router.backend_load(backend_id), Some(1));
 
     // Complete the other
-    router.complete_command_sync(backend_id);
+    router.complete_command(backend_id);
     assert_eq!(router.backend_load(backend_id), Some(0));
 }

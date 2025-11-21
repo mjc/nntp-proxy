@@ -90,7 +90,7 @@ async fn drain_until_terminator<R>(
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut chunk = buffer_pool.get_buffer().await;
+    let mut chunk = buffer_pool.acquire().await;
     let mut tail = TailBuffer::default();
     tail.update(initial_tail);
     loop {
@@ -133,8 +133,8 @@ where
 {
     let mut total_bytes = 0u64;
     // Prepare double buffering for pipelined streaming using buffer pool
-    let mut buffer1 = buffer_pool.get_buffer().await;
-    let mut buffer2 = buffer_pool.get_buffer().await;
+    let mut buffer1 = buffer_pool.acquire().await;
+    let mut buffer2 = buffer_pool.acquire().await;
 
     // Copy first chunk into buffer1 and mark it initialized
     buffer1.copy_from_slice(&first_chunk[..first_n]);

@@ -1,8 +1,8 @@
 //! Session handlers for different routing modes
 //!
 //! This module contains the core session handling logic split by routing mode:
-//! - `standard`: Standard 1:1 routing with dedicated backend connection
-//! - `per_command`: Per-command routing where each command can go to a different backend
+//! - `stateful`: Stateful 1:1 routing with dedicated backend connection
+//! - `per_command`: Per-command routing where each command can go to a different backend (stateless)
 //! - `hybrid`: Hybrid mode that starts with per-command routing and switches to stateful
 //!
 //! Shared utilities are in the parent `session::common` module.
@@ -12,4 +12,4 @@
 
 mod hybrid;
 mod per_command;
-mod standard;
+mod stateful;

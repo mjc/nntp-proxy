@@ -20,12 +20,12 @@ fn test_round_robin_selection() {
     }
 
     // Route 6 commands and verify round-robin
-    let backend1 = router.route_command_sync(client_id, "LIST\r\n").unwrap();
-    let backend2 = router.route_command_sync(client_id, "DATE\r\n").unwrap();
-    let backend3 = router.route_command_sync(client_id, "HELP\r\n").unwrap();
-    let backend4 = router.route_command_sync(client_id, "LIST\r\n").unwrap();
-    let backend5 = router.route_command_sync(client_id, "DATE\r\n").unwrap();
-    let backend6 = router.route_command_sync(client_id, "HELP\r\n").unwrap();
+    let backend1 = router.route_command(client_id, "LIST\r\n").unwrap();
+    let backend2 = router.route_command(client_id, "DATE\r\n").unwrap();
+    let backend3 = router.route_command(client_id, "HELP\r\n").unwrap();
+    let backend4 = router.route_command(client_id, "LIST\r\n").unwrap();
+    let backend5 = router.route_command(client_id, "DATE\r\n").unwrap();
+    let backend6 = router.route_command(client_id, "HELP\r\n").unwrap();
 
     // Should cycle through backends in order
     assert_eq!(backend1.as_index(), 0);
@@ -53,7 +53,7 @@ fn test_load_balancing_fairness() {
     // Route 9 commands
     let mut backend_counts = vec![0, 0, 0];
     for _ in 0..9 {
-        let backend_id = router.route_command_sync(client_id, "LIST\r\n").unwrap();
+        let backend_id = router.route_command(client_id, "LIST\r\n").unwrap();
         backend_counts[backend_id.as_index()] += 1;
     }
 

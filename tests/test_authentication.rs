@@ -22,7 +22,7 @@ use test_helpers::MockNntpServer;
 
 /// Create test config with client auth enabled
 fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
     Config {
         servers: backend_ports
             .into_iter()
@@ -31,7 +31,7 @@ fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &s
         proxy: Default::default(),
         health_check: Default::default(),
         cache: None,
-        client_auth: ClientAuthConfig {
+        client_auth: ClientAuth {
             users: vec![],
             username: Some(username.to_string()),
             password: Some(password.to_string()),
@@ -70,7 +70,7 @@ async fn test_auth_handler_validates_correct_credentials() {
     let handler =
         AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
-    assert!(handler.validate("alice", "secret123"));
+    assert!(handler.validate_credentials("alice", "secret123"));
 }
 
 #[tokio::test]
@@ -78,7 +78,7 @@ async fn test_auth_handler_rejects_wrong_password() {
     let handler =
         AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
-    assert!(!handler.validate("alice", "wrongpass"));
+    assert!(!handler.validate_credentials("alice", "wrongpass"));
 }
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn test_auth_handler_rejects_wrong_username() {
     let handler =
         AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
-    assert!(!handler.validate("bob", "secret123"));
+    assert!(!handler.validate_credentials("bob", "secret123"));
 }
 
 #[tokio::test]
@@ -94,16 +94,16 @@ async fn test_auth_handler_rejects_both_wrong() {
     let handler =
         AuthHandler::new(Some("alice".to_string()), Some("secret123".to_string())).unwrap();
 
-    assert!(!handler.validate("bob", "wrongpass"));
+    assert!(!handler.validate_credentials("bob", "wrongpass"));
 }
 
 #[tokio::test]
 async fn test_auth_disabled_accepts_any_credentials() {
     let handler = AuthHandler::new(None, None).unwrap();
 
-    assert!(handler.validate("anything", "works"));
-    assert!(handler.validate("", ""));
-    assert!(handler.validate("random", "stuff"));
+    assert!(handler.validate_credentials("anything", "works"));
+    assert!(handler.validate_credentials("", ""));
+    assert!(handler.validate_credentials("random", "stuff"));
 }
 
 #[tokio::test]
@@ -131,10 +131,10 @@ async fn test_auth_handler_empty_string_credentials() {
 async fn test_auth_handler_case_sensitive() {
     let handler = AuthHandler::new(Some("Alice".to_string()), Some("Secret".to_string())).unwrap();
 
-    assert!(handler.validate("Alice", "Secret"));
-    assert!(!handler.validate("alice", "Secret"));
-    assert!(!handler.validate("Alice", "secret"));
-    assert!(!handler.validate("ALICE", "SECRET"));
+    assert!(handler.validate_credentials("Alice", "Secret"));
+    assert!(!handler.validate_credentials("alice", "Secret"));
+    assert!(!handler.validate_credentials("Alice", "secret"));
+    assert!(!handler.validate_credentials("ALICE", "SECRET"));
 }
 
 #[tokio::test]
@@ -142,8 +142,8 @@ async fn test_auth_handler_whitespace_in_credentials() {
     let handler =
         AuthHandler::new(Some("user name".to_string()), Some("pass word".to_string())).unwrap();
 
-    assert!(handler.validate("user name", "pass word"));
-    assert!(!handler.validate("username", "password"));
+    assert!(handler.validate_credentials("user name", "pass word"));
+    assert!(!handler.validate_credentials("username", "password"));
 }
 
 #[tokio::test]
@@ -154,15 +154,15 @@ async fn test_auth_handler_special_characters() {
     )
     .unwrap();
 
-    assert!(handler.validate("user@example.com", "p@$$w0rd!#%"));
+    assert!(handler.validate_credentials("user@example.com", "p@$$w0rd!#%"));
 }
 
 #[tokio::test]
 async fn test_auth_handler_unicode_credentials() {
     let handler = AuthHandler::new(Some("用户".to_string()), Some("密码".to_string())).unwrap();
 
-    assert!(handler.validate("用户", "密码"));
-    assert!(!handler.validate("user", "password"));
+    assert!(handler.validate_credentials("用户", "密码"));
+    assert!(!handler.validate_credentials("user", "password"));
 }
 
 #[tokio::test]
@@ -196,14 +196,14 @@ async fn test_auth_command_sequence_valid() {
     use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 
     // AUTHINFO USER should request password
-    let user_action = CommandHandler::handle_command("AUTHINFO USER alice\r\n");
+    let user_action = CommandHandler::classify("AUTHINFO USER alice\r\n");
     assert!(matches!(
         user_action,
         CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) if u == "alice"
     ));
 
     // AUTHINFO PASS should validate and respond
-    let pass_action = CommandHandler::handle_command("AUTHINFO PASS secret\r\n");
+    let pass_action = CommandHandler::classify("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         pass_action,
         CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password == "secret"
@@ -277,10 +277,10 @@ async fn test_command_classification_for_stateless() {
     use nntp_proxy::command::{CommandAction, CommandHandler};
 
     // Test that stateless commands are classified correctly
-    let action = CommandHandler::handle_command("ARTICLE <msgid@example.com>\r\n");
+    let action = CommandHandler::classify("ARTICLE <msgid@example.com>\r\n");
     assert_eq!(action, CommandAction::ForwardStateless);
 
-    let action = CommandHandler::handle_command("LIST\r\n");
+    let action = CommandHandler::classify("LIST\r\n");
     assert_eq!(action, CommandAction::ForwardStateless);
 }
 
@@ -316,9 +316,9 @@ async fn test_session_with_disabled_auth() {
 
 #[tokio::test]
 async fn test_config_client_auth_is_enabled() {
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
 
-    let config = ClientAuthConfig {
+    let config = ClientAuth {
         users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
@@ -330,9 +330,9 @@ async fn test_config_client_auth_is_enabled() {
 
 #[tokio::test]
 async fn test_config_client_auth_disabled_missing_username() {
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
 
-    let config = ClientAuthConfig {
+    let config = ClientAuth {
         users: vec![],
         username: None,
         password: Some("pass".to_string()),
@@ -344,9 +344,9 @@ async fn test_config_client_auth_disabled_missing_username() {
 
 #[tokio::test]
 async fn test_config_client_auth_disabled_missing_password() {
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
 
-    let config = ClientAuthConfig {
+    let config = ClientAuth {
         users: vec![],
         username: Some("user".to_string()),
         password: None,
@@ -358,9 +358,9 @@ async fn test_config_client_auth_disabled_missing_password() {
 
 #[tokio::test]
 async fn test_config_client_auth_disabled_both_missing() {
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
 
-    let config = ClientAuthConfig {
+    let config = ClientAuth {
         users: vec![],
         username: None,
         password: None,
@@ -372,9 +372,9 @@ async fn test_config_client_auth_disabled_both_missing() {
 
 #[tokio::test]
 async fn test_config_default_client_auth_is_disabled() {
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
 
-    let config: ClientAuthConfig = Default::default();
+    let config: ClientAuth = Default::default();
     assert!(!config.is_enabled());
 }
 
@@ -385,9 +385,9 @@ async fn test_auth_handler_with_very_long_credentials() {
 
     let handler = AuthHandler::new(Some(long_user.clone()), Some(long_pass.clone())).unwrap();
 
-    assert!(handler.validate(&long_user, &long_pass));
-    assert!(!handler.validate(&long_user, "short"));
-    assert!(!handler.validate("short", &long_pass));
+    assert!(handler.validate_credentials(&long_user, &long_pass));
+    assert!(!handler.validate_credentials(&long_user, "short"));
+    assert!(!handler.validate_credentials("short", &long_pass));
 }
 
 #[tokio::test]
@@ -395,11 +395,11 @@ async fn test_multiple_auth_handlers_independent() {
     let handler1 = AuthHandler::new(Some("user1".to_string()), Some("pass1".to_string())).unwrap();
     let handler2 = AuthHandler::new(Some("user2".to_string()), Some("pass2".to_string())).unwrap();
 
-    assert!(handler1.validate("user1", "pass1"));
-    assert!(!handler1.validate("user2", "pass2"));
+    assert!(handler1.validate_credentials("user1", "pass1"));
+    assert!(!handler1.validate_credentials("user2", "pass2"));
 
-    assert!(handler2.validate("user2", "pass2"));
-    assert!(!handler2.validate("user1", "pass1"));
+    assert!(handler2.validate_credentials("user2", "pass2"));
+    assert!(!handler2.validate_credentials("user1", "pass1"));
 }
 
 #[tokio::test]
@@ -409,8 +409,8 @@ async fn test_auth_handler_clone_via_arc() {
     let handler = create_test_auth_handler();
     let handler_clone = handler.clone();
 
-    assert!(handler.validate("user", "pass"));
-    assert!(handler_clone.validate("user", "pass"));
+    assert!(handler.validate_credentials("user", "pass"));
+    assert!(handler_clone.validate_credentials("user", "pass"));
     assert_eq!(Arc::strong_count(&handler), 2);
 }
 
@@ -452,7 +452,7 @@ async fn test_proxy_creates_auth_handler_from_config() {
 
     let config = create_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
 
-    let proxy = NntpProxy::new(config, RoutingMode::Standard).unwrap();
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
 
     // Proxy should be created successfully with auth config
     assert!(!proxy.servers().is_empty());
@@ -462,7 +462,7 @@ async fn test_proxy_creates_auth_handler_from_config() {
 async fn test_auth_with_empty_command() {
     use nntp_proxy::command::CommandHandler;
 
-    let _action = CommandHandler::handle_command("");
+    let _action = CommandHandler::classify("");
     // Should be rejected or handled gracefully, not crash
 }
 
@@ -470,7 +470,7 @@ async fn test_auth_with_empty_command() {
 async fn test_auth_with_whitespace_only_command() {
     use nntp_proxy::command::CommandHandler;
 
-    let _action = CommandHandler::handle_command("   \r\n");
+    let _action = CommandHandler::classify("   \r\n");
     // Should be handled gracefully
 }
 
@@ -479,7 +479,7 @@ async fn test_auth_case_variations() {
     use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 
     // Test uppercase (most common)
-    let upper = CommandHandler::handle_command("AUTHINFO USER test\r\n");
+    let upper = CommandHandler::classify("AUTHINFO USER test\r\n");
     assert!(
         matches!(
             upper,
@@ -489,7 +489,7 @@ async fn test_auth_case_variations() {
     );
 
     // Test lowercase
-    let lower = CommandHandler::handle_command("authinfo user test\r\n");
+    let lower = CommandHandler::classify("authinfo user test\r\n");
     assert!(
         matches!(
             lower,
@@ -499,7 +499,7 @@ async fn test_auth_case_variations() {
     );
 
     // Test Titlecase (Authinfo with lowercase 'user')
-    let title = CommandHandler::handle_command("Authinfo user test\r\n");
+    let title = CommandHandler::classify("Authinfo user test\r\n");
     assert!(
         matches!(
             title,
@@ -509,13 +509,13 @@ async fn test_auth_case_variations() {
     );
 
     // AUTHINFO PASS variations
-    let upper_pass = CommandHandler::handle_command("AUTHINFO PASS secret\r\n");
+    let upper_pass = CommandHandler::classify("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         upper_pass,
         CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. })
     ));
 
-    let lower_pass = CommandHandler::handle_command("authinfo pass secret\r\n");
+    let lower_pass = CommandHandler::classify("authinfo pass secret\r\n");
     assert!(matches!(
         lower_pass,
         CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. })
@@ -535,9 +535,9 @@ async fn test_concurrent_auth_handlers() {
         let h = handler.clone();
         set.spawn(async move {
             if i % 2 == 0 {
-                h.validate("shared", "password")
+                h.validate_credentials("shared", "password")
             } else {
-                h.validate("wrong", "credentials")
+                h.validate_credentials("wrong", "credentials")
             }
         });
     }
@@ -577,8 +577,8 @@ async fn test_auth_with_newlines_in_credentials() {
     )
     .unwrap();
 
-    assert!(handler.validate("user\nname", "pass\nword"));
-    assert!(!handler.validate("username", "password"));
+    assert!(handler.validate_credentials("user\nname", "pass\nword"));
+    assert!(!handler.validate_credentials("username", "password"));
 }
 
 #[tokio::test]
@@ -590,7 +590,7 @@ async fn test_auth_with_null_bytes_in_credentials() {
     )
     .unwrap();
 
-    assert!(handler.validate("user\0name", "pass\0word"));
+    assert!(handler.validate_credentials("user\0name", "pass\0word"));
 }
 
 #[tokio::test]

@@ -68,6 +68,7 @@
           cargo-bloat
 
           # Utilities
+          tokei
           gh
 
           # Performance profiling

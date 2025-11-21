@@ -302,7 +302,7 @@ async fn test_validate_matches_handle_auth_command() {
 
     for (username, password, expected) in test_cases {
         // Test validate() directly
-        let validate_result = handler.validate(username, password);
+        let validate_result = handler.validate_credentials(username, password);
 
         // Test via handle_auth_command
         let mut output = Vec::new();
@@ -399,7 +399,7 @@ async fn property_auth_success_implies_valid_credentials() {
     if auth_success {
         // Double-check with validate()
         assert!(
-            handler.validate("validuser", "validpass"),
+            handler.validate_credentials("validuser", "validpass"),
             "If auth_success=true, validate() must also return true"
         );
     }

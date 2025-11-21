@@ -30,7 +30,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
     let mut authenticated = false;
 
     // First command: GROUP (stateful, will be rejected)
-    let action = CommandHandler::handle_command("GROUP misc.test\r\n");
+    let action = CommandHandler::classify("GROUP misc.test\r\n");
     match action {
         CommandAction::Reject(response) => {
             // Session sends rejection response
@@ -43,7 +43,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
 
     // Second command: LIST (stateless)
     // This should ALSO require authentication, proving no bypass
-    let action = CommandHandler::handle_command("LIST\r\n");
+    let action = CommandHandler::classify("LIST\r\n");
     match action {
         CommandAction::ForwardStateless => {
             // In the actual handler, this branch checks if auth is enabled
@@ -298,7 +298,7 @@ async fn test_buffer_pool_safety_across_cycles() {
 
     // Get buffer, use it, return it
     {
-        let mut buffer = pool.get_buffer().await;
+        let mut buffer = pool.acquire().await;
         let test_data = b"First use";
         buffer.copy_from_slice(test_data);
         assert_eq!(&buffer[..test_data.len()], test_data);
@@ -307,7 +307,7 @@ async fn test_buffer_pool_safety_across_cycles() {
 
     // Get buffer again (might be same buffer, might be new)
     {
-        let mut buffer = pool.get_buffer().await;
+        let mut buffer = pool.acquire().await;
         // Even if this is the same buffer from before, it's safe because:
         // 1. We'll overwrite it with new data via AsyncRead
         // 2. We only access buf[..n] where n is bytes actually read

@@ -102,7 +102,7 @@ impl std::fmt::Display for StatusCode {
 /// - **4xx**: Temporary failure
 /// - **5xx**: Permanent failure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseCode {
+pub enum Response {
     /// Server greeting - [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
     /// - 200: Posting allowed
     /// - 201: No posting allowed
@@ -134,7 +134,7 @@ pub enum ResponseCode {
     Invalid,
 }
 
-impl ResponseCode {
+impl Response {
     /// Parse response data into a categorized response code
     ///
     /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
@@ -300,27 +300,24 @@ impl NntpResponse {
     /// Benchmarks show this is **72% faster for small responses** (37ns → 13ns) and
     /// **64% faster for medium responses** (109ns → 40ns) compared to the manual loop
     /// that creates a new slice on each iteration.
+    ///
+    /// **Hot path optimization**: Check end first (99% case for streaming chunks),
+    /// then scan forward if needed. Compiler optimizes slice comparison to memcmp.
     #[inline]
     pub fn find_terminator_end(data: &[u8]) -> Option<usize> {
-        let n = data.len();
-        if n < 5 {
-            return None;
-        }
+        const TERMINATOR: [u8; 5] = *b"\r\n.\r\n";
 
-        // Use memchr::Memchr iterator to avoid repeated slice creation
-        for r_pos in memchr::memchr_iter(b'\r', data) {
-            // Not enough space for full terminator
-            if r_pos + 5 > n {
-                return None;
-            }
-
-            // Check for full terminator pattern
-            if &data[r_pos..r_pos + 5] == b"\r\n.\r\n" {
-                return Some(r_pos + 5);
-            }
-        }
-
-        None
+        // Fast path: check suffix, or slow path: scan for terminator mid-chunk
+        data.len()
+            .checked_sub(5)
+            .filter(|&start| data[start..] == TERMINATOR)
+            .map(|_| data.len())
+            .or_else(|| {
+                memchr::memchr_iter(b'\r', data)
+                    .take_while(|&pos| pos + 5 <= data.len())
+                    .find(|&pos| data[pos..pos + 5] == TERMINATOR)
+                    .map(|pos| pos + 5)
+            })
     }
 
     /// Check if a terminator spans across a boundary between tail and current chunk
@@ -479,28 +476,28 @@ impl ResponseParser {
     #[inline]
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
-        ResponseCode::parse(data).is_success()
+        Response::parse(data).is_success()
     }
 
     /// Check if response is a greeting (200 or 201)
     #[inline]
     #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
-        matches!(ResponseCode::parse(data), ResponseCode::Greeting(_))
+        matches!(Response::parse(data), Response::Greeting(_))
     }
 
     /// Check if response indicates authentication is required (381 or 480)
     #[inline]
     #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
-        matches!(ResponseCode::parse(data), ResponseCode::AuthRequired(_))
+        matches!(Response::parse(data), Response::AuthRequired(_))
     }
 
     /// Check if response indicates successful authentication (281)
     #[inline]
     #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
-        matches!(ResponseCode::parse(data), ResponseCode::AuthSuccess)
+        matches!(Response::parse(data), Response::AuthSuccess)
     }
 
     /// Check if response has a specific status code

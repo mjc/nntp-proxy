@@ -2,10 +2,10 @@
 
 use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
-use crate::tui::constants::{chart, layout, status, styles, text};
+use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::helpers::{
-    backend_display_info, build_chart_data, calculate_chart_bounds, create_sparkline,
-    format_summary_throughput, format_throughput_label,
+    build_chart_data, calculate_chart_bounds, create_sparkline, format_summary_throughput,
+    format_throughput_label,
 };
 use ratatui::{
     Frame,
@@ -22,9 +22,31 @@ use ratatui::{
 
 /// Render the main UI
 pub fn render_ui(f: &mut Frame, app: &TuiApp) {
+    use crate::tui::app::ViewMode;
     let snapshot = app.snapshot();
     let servers = app.servers();
 
+    // Check if we're in log fullscreen mode
+    if app.view_mode() == ViewMode::LogFullscreen {
+        // Fullscreen logs - show only title and logs
+        use ratatui::layout::Constraint;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(layout::TITLE_HEIGHT),
+                Constraint::Min(10), // Most of screen for logs
+                Constraint::Length(layout::FOOTER_HEIGHT),
+            ])
+            .split(f.area());
+
+        render_title(f, chunks[0], snapshot);
+        render_logs(f, chunks[1], app);
+        render_footer(f, chunks[2]);
+        return;
+    }
+
+    // Normal mode - show all panels
     // Determine if we have enough space for a log window
     // We need at least 40 lines total to fit everything comfortably
     const MIN_HEIGHT_FOR_LOGS: u16 = 40;
@@ -121,11 +143,22 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
 
 /// Render summary statistics
 fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let snapshot = app.snapshot();
+    let system_stats = app.system_stats();
+
     // Get latest throughput from history (extracted for testing)
     let (client_to_backend_str, backend_to_client_str) =
         format_summary_throughput(app.latest_client_throughput());
 
-    let summary = Paragraph::new(vec![
+    // Split summary box into two columns
+    use ratatui::layout::Constraint;
+    let summary_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Left half: Throughput and transfer stats
+    let left_summary = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Client → Backend: ", Style::default().fg(styles::LABEL)),
             Span::styled(
@@ -142,6 +175,24 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("Total Transferred: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(snapshot.total_bytes()),
+                Style::default().fg(styles::VALUE_PRIMARY),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Stateful Sessions: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{}", snapshot.stateful_sessions),
+                Style::default().fg(if snapshot.stateful_sessions > 0 {
+                    styles::VALUE_PRIMARY
+                } else {
+                    styles::VALUE_NEUTRAL
+                }),
+            ),
+        ]),
     ])
     .block(
         Block::default()
@@ -151,7 +202,51 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
     )
     .alignment(Alignment::Left);
 
-    f.render_widget(summary, area);
+    // Right half: System stats
+    let right_summary = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("CPU: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{:.1}%", system_stats.cpu_usage),
+                Style::default().fg(if system_stats.cpu_usage > 80.0 {
+                    Color::Red
+                } else if system_stats.cpu_usage > 50.0 {
+                    Color::Yellow
+                } else {
+                    styles::VALUE_INFO
+                }),
+            ),
+            Span::styled("  (peak: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{:.1}%", system_stats.peak_cpu_usage),
+                Style::default().fg(styles::VALUE_NEUTRAL),
+            ),
+            Span::styled(")", Style::default().fg(styles::LABEL)),
+        ]),
+        Line::from(vec![
+            Span::styled("Memory: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(system_stats.memory_bytes),
+                Style::default().fg(styles::VALUE_INFO),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Peak Memory: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(system_stats.peak_memory_bytes),
+                Style::default().fg(styles::VALUE_NEUTRAL),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
+    )
+    .alignment(Alignment::Left);
+
+    f.render_widget(left_summary, summary_chunks[0]);
+    f.render_widget(right_summary, summary_chunks[1]);
 }
 
 /// Render backend server visualization
@@ -159,7 +254,7 @@ fn render_backends(
     f: &mut Frame,
     area: Rect,
     snapshot: &crate::metrics::MetricsSnapshot,
-    servers: &[crate::config::ServerConfig],
+    servers: &[crate::config::Server],
     app: &TuiApp,
 ) {
     // Split into three columns: backend list, data flow chart, and top users
@@ -170,11 +265,7 @@ fn render_backends(
 
     render_backend_list(f, chunks[0], snapshot, servers, app);
     render_data_flow(f, chunks[1], servers, app);
-
-    // Render top users in the third column if we have user stats
-    if !snapshot.user_stats.is_empty() {
-        render_user_stats(f, chunks[2], snapshot);
-    }
+    render_user_stats(f, chunks[2], snapshot);
 }
 
 /// Render list of backend servers with their stats
@@ -182,7 +273,7 @@ fn render_backend_list(
     f: &mut Frame,
     area: Rect,
     snapshot: &crate::metrics::MetricsSnapshot,
-    servers: &[crate::config::ServerConfig],
+    servers: &[crate::config::Server],
     app: &crate::tui::TuiApp,
 ) {
     let items: Vec<ListItem> = snapshot
@@ -191,22 +282,53 @@ fn render_backend_list(
         .zip(servers.iter())
         .enumerate()
         .map(|(i, (stats, server))| {
-            // Use extracted helper for display info
-            let display_info = backend_display_info(stats.active_connections as u64, stats.errors);
+            use crate::metrics::HealthStatus;
+
+            // Determine health status indicator
+            let (health_icon, health_color) = match stats.health_status {
+                HealthStatus::Healthy => ("●", Color::Green),
+                HealthStatus::Degraded => ("◐", Color::Yellow),
+                HealthStatus::Down => ("○", Color::Red),
+            };
+
+            // Format error rate
+            let error_rate = stats.error_rate_percent();
+            let error_text = if error_rate > 5.0 {
+                format!(" ⚠ {:.1}%", error_rate)
+            } else if error_rate > 0.0 {
+                format!(" {:.1}%", error_rate)
+            } else {
+                String::new()
+            };
 
             // Get latest commands/sec from throughput history
             let cmd_per_sec = app
                 .latest_backend_throughput(i)
                 .and_then(|point| point.commands_per_sec())
-                .map(|cps| cps.to_string())
+                .map(|cps| format!("{:.0}", cps.get()))
                 .unwrap_or_else(|| String::from(text::DEFAULT_CMD_RATE));
+
+            // Format TTFB (time to first byte)
+            let ttfb_text = stats
+                .average_ttfb_ms()
+                .map(|ms| format!("{:.1}ms", ms))
+                .unwrap_or_else(|| "N/A".to_string());
+
+            // Format average article size
+            let avg_size_text = stats
+                .average_article_size()
+                .map(format_bytes)
+                .unwrap_or_else(|| "N/A".to_string());
 
             let content = vec![
                 Line::from(vec![
                     Span::styled(
-                        text::STATUS_INDICATOR,
-                        Style::default().fg(display_info.status_color),
+                        health_icon,
+                        Style::default()
+                            .fg(health_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
+                    Span::raw(" "),
                     Span::styled(
                         server.name.as_str(),
                         Style::default()
@@ -214,8 +336,12 @@ fn render_backend_list(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        display_info.error_indicator,
-                        Style::default().fg(status::ERROR),
+                        error_text,
+                        Style::default().fg(if error_rate > 5.0 {
+                            Color::Red
+                        } else {
+                            Color::Yellow
+                        }),
                     ),
                 ]),
                 Line::from(vec![
@@ -226,13 +352,15 @@ fn render_backend_list(
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Active: ", Style::default().fg(styles::LABEL)),
+                    Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
                     Span::styled(
-                        format!("{}", stats.active_connections),
+                        format!("{}/{}", stats.active_connections, server.max_connections),
                         Style::default().fg(styles::VALUE_SECONDARY),
                     ),
-                    Span::styled(" clients  |  Cmd/s: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
                     Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
+                    Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(ttfb_text, Style::default().fg(styles::VALUE_INFO)),
                 ]),
                 Line::from(vec![
                     Span::styled(
@@ -240,7 +368,7 @@ fn render_backend_list(
                         Style::default().fg(styles::VALUE_PRIMARY),
                     ),
                     Span::styled(
-                        format_bytes(stats.bytes_sent),
+                        format_bytes(stats.bytes_sent.as_u64()),
                         Style::default().fg(styles::VALUE_PRIMARY),
                     ),
                     Span::styled(
@@ -248,8 +376,37 @@ fn render_backend_list(
                         Style::default().fg(styles::VALUE_NEUTRAL),
                     ),
                     Span::styled(
-                        format_bytes(stats.bytes_received),
+                        format_bytes(stats.bytes_received.as_u64()),
                         Style::default().fg(styles::VALUE_NEUTRAL),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Avg Article: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(avg_size_text, Style::default().fg(styles::VALUE_INFO)),
+                    Span::styled(" | Articles: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(
+                        format!("{}", stats.article_count),
+                        Style::default().fg(styles::VALUE_NEUTRAL),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Errors: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(
+                        format!("4xx:{} 5xx:{}", stats.errors_4xx, stats.errors_5xx),
+                        Style::default().fg(if !stats.errors.is_zero() {
+                            Color::Yellow
+                        } else {
+                            styles::VALUE_NEUTRAL
+                        }),
+                    ),
+                    Span::styled(" | Conn Fails: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(
+                        format!("{}", stats.connection_failures),
+                        Style::default().fg(if stats.connection_failures.get() > 0 {
+                            Color::Red
+                        } else {
+                            styles::VALUE_NEUTRAL
+                        }),
                     ),
                 ]),
             ];
@@ -269,12 +426,7 @@ fn render_backend_list(
 }
 
 /// Render data flow visualization as line graphs
-fn render_data_flow(
-    f: &mut Frame,
-    area: Rect,
-    servers: &[crate::config::ServerConfig],
-    app: &TuiApp,
-) {
+fn render_data_flow(f: &mut Frame, area: Rect, servers: &[crate::config::Server], app: &TuiApp) {
     // Build chart data in single pass (no nested loops)
     let (chart_data, max_throughput) = build_chart_data(servers, app);
 
@@ -383,6 +535,20 @@ fn render_footer(f: &mut Frame, area: Rect) {
         ),
         Span::styled(" to exit  |  ", Style::default().fg(styles::LABEL)),
         Span::styled(
+            "L",
+            Style::default()
+                .fg(styles::VALUE_INFO)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" to toggle logs  |  ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            "d",
+            Style::default()
+                .fg(styles::VALUE_INFO)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" for details  |  ", Style::default().fg(styles::LABEL)),
+        Span::styled(
             "Ctrl+C",
             Style::default()
                 .fg(styles::VALUE_INFO)
@@ -435,10 +601,10 @@ fn render_logs(f: &mut Frame, area: Rect, app: &TuiApp) {
 /// Render per-user statistics panel
 fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
     // Sort users by total bytes transferred (sent + received) descending
-    let mut sorted_users = snapshot.user_stats.clone();
+    let mut sorted_users = snapshot.user_stats.iter().collect::<Vec<_>>();
     sorted_users.sort_by(|a, b| {
-        let a_total = a.bytes_sent + a.bytes_received;
-        let b_total = b.bytes_sent + b.bytes_received;
+        let a_total = a.total_bytes();
+        let b_total = b.total_bytes();
         b_total.cmp(&a_total)
     });
 
@@ -446,11 +612,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     let top_users: Vec<_> = sorted_users.iter().take(10).collect();
 
     // Find max total bytes for scaling sparkline
-    let max_total = top_users
-        .iter()
-        .map(|u| u.bytes_sent + u.bytes_received)
-        .max()
-        .unwrap_or(1);
+    let max_total = top_users.iter().map(|u| u.total_bytes()).max().unwrap_or(1);
 
     let mut items = Vec::with_capacity(top_users.len() + 1);
 
@@ -486,7 +648,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
             format!("{:<12}", user.username)
         };
 
-        let total_bytes = user.bytes_sent + user.bytes_received;
+        let total_bytes = user.total_bytes();
         let bar = create_sparkline(total_bytes, max_total);
 
         items.push(ListItem::new(vec![
@@ -503,18 +665,25 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
             Line::from(vec![
                 Span::raw("  ↑"),
                 Span::styled(
-                    format!("{:>8}", format_bytes(user.bytes_sent)),
+                    format!("{:>8}", format_bytes(user.bytes_sent.as_u64())),
                     Style::default().fg(Color::Blue),
                 ),
                 Span::raw("  ↓"),
                 Span::styled(
-                    format!("{:>8}", format_bytes(user.bytes_received)),
+                    format!("{:>8}", format_bytes(user.bytes_received.as_u64())),
                     Style::default().fg(Color::Magenta),
                 ),
-                Span::raw("  "),
+            ]),
+            Line::from(vec![
+                Span::raw("  Rate: "),
                 Span::styled(
-                    format!("{}cmd", user.total_commands),
-                    Style::default().fg(Color::DarkGray),
+                    format!("↑{}/s", format_bytes(user.bytes_sent_per_sec.get())),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("↓{}/s", format_bytes(user.bytes_received_per_sec.get())),
+                    Style::default().fg(Color::Yellow),
                 ),
             ]),
         ]));

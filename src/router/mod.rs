@@ -28,10 +28,10 @@
 //!
 //! // Route a command
 //! let client_id = ClientId::new();
-//! let backend_id = selector.route_command_sync(client_id, "LIST").unwrap();
+//! let backend_id = selector.route_command(client_id, "LIST").unwrap();
 //!
 //! // After command completes
-//! selector.complete_command_sync(backend_id);
+//! selector.complete_command(backend_id);
 //! ```
 
 use anyhow::Result;
@@ -89,7 +89,7 @@ struct BackendInfo {
 /// );
 ///
 /// // Route commands
-/// let backend = selector.route_command_sync(ClientId::new(), "LIST")?;
+/// let backend = selector.route_command(ClientId::new(), "LIST")?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 #[derive(Debug)]
@@ -146,7 +146,7 @@ impl BackendSelector {
 
     /// Select a backend for the given command using round-robin
     /// Returns the backend ID to use for this command
-    pub fn route_command_sync(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
+    pub fn route_command(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
         let backend = self.select_backend().ok_or_else(|| {
             anyhow::anyhow!(
                 "No backends available for routing (total backends: {})",
@@ -166,7 +166,7 @@ impl BackendSelector {
     }
 
     /// Mark a command as complete, decrementing the pending count
-    pub fn complete_command_sync(&self, backend_id: BackendId) {
+    pub fn complete_command(&self, backend_id: BackendId) {
         if let Some(backend) = self.backends.iter().find(|b| b.id == backend_id) {
             backend.pending_count.fetch_sub(1, Ordering::Relaxed);
         }
@@ -174,10 +174,7 @@ impl BackendSelector {
 
     /// Get the connection provider for a backend
     #[must_use]
-    pub fn get_backend_provider(
-        &self,
-        backend_id: BackendId,
-    ) -> Option<&DeadpoolConnectionProvider> {
+    pub fn backend_provider(&self, backend_id: BackendId) -> Option<&DeadpoolConnectionProvider> {
         self.backends
             .iter()
             .find(|b| b.id == backend_id)

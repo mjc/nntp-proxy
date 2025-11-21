@@ -195,5 +195,97 @@ mod tests {
                 .as_str(),
             "<test@example.com>"
         );
+        // Empty string should error
+        assert!(MessageId::from_str_or_wrap("").is_err());
+    }
+
+    #[test]
+    fn test_from_borrowed() {
+        let s = "<borrowed@example.com>";
+        let msgid = MessageId::from_borrowed(s).unwrap();
+        assert_eq!(msgid.as_str(), s);
+
+        // Invalid borrowed should error
+        assert!(MessageId::from_borrowed("no-brackets").is_err());
+        assert!(MessageId::from_borrowed("<>").is_err());
+    }
+
+    #[test]
+    fn test_as_str() {
+        let msgid = MessageId::new("<test@example.com>".to_string()).unwrap();
+        assert_eq!(msgid.as_str(), "<test@example.com>");
+    }
+
+    #[test]
+    fn test_into_owned() {
+        let s = "<borrowed@example.com>";
+        let msgid = MessageId::from_borrowed(s).unwrap();
+        let owned = msgid.into_owned();
+        assert_eq!(owned.as_str(), s);
+    }
+
+    #[test]
+    fn test_to_owned() {
+        let s = "<borrowed@example.com>";
+        let msgid = MessageId::from_borrowed(s).unwrap();
+        let owned = msgid.to_owned();
+        assert_eq!(owned.as_str(), s);
+        // Original still valid
+        assert_eq!(msgid.as_str(), s);
+    }
+
+    #[test]
+    fn test_from_str() {
+        let msgid: MessageId = "<test@example.com>".parse().unwrap();
+        assert_eq!(msgid.as_str(), "<test@example.com>");
+
+        assert!("invalid".parse::<MessageId>().is_err());
+    }
+
+    #[test]
+    fn test_try_from_string() {
+        let msgid = MessageId::try_from("<test@example.com>".to_string()).unwrap();
+        assert_eq!(msgid.as_str(), "<test@example.com>");
+
+        assert!(MessageId::try_from("invalid".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_into_string() {
+        let msgid = MessageId::new("<test@example.com>".to_string()).unwrap();
+        let s: String = msgid.into();
+        assert_eq!(s, "<test@example.com>");
+    }
+
+    #[test]
+    fn test_extract_from_command_edge_cases() {
+        // Multiple message IDs - should extract first
+        assert_eq!(
+            MessageId::extract_from_command("ARTICLE <first@test> <second@test>")
+                .unwrap()
+                .as_str(),
+            "<first@test>"
+        );
+
+        // No closing bracket
+        assert!(MessageId::extract_from_command("ARTICLE <incomplete").is_none());
+
+        // Empty command
+        assert!(MessageId::extract_from_command("").is_none());
+    }
+
+    #[test]
+    fn test_validation_edge_cases() {
+        // Too short (len < 3)
+        assert!(MessageId::new("<>".to_string()).is_err());
+        assert!(MessageId::new("<a".to_string()).is_err());
+        assert!(MessageId::new("a>".to_string()).is_err());
+
+        // Missing brackets
+        assert!(MessageId::new("<no-end".to_string()).is_err());
+        assert!(MessageId::new("no-start>".to_string()).is_err());
+
+        // Valid minimal
+        assert!(MessageId::new("<a>".to_string()).is_ok());
     }
 }

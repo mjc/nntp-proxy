@@ -72,9 +72,6 @@ pub const BACKEND_COLORS: &[Color] = &[
 pub mod status {
     use ratatui::style::Color;
 
-    pub const ACTIVE: Color = Color::Green;
-    pub const INACTIVE: Color = Color::Gray;
-    pub const ERROR: Color = Color::Red;
     #[allow(dead_code)] // May be used in future features
     pub const WARNING: Color = Color::Yellow;
 }
@@ -98,10 +95,8 @@ pub mod styles {
 
 /// UI text constants
 pub mod text {
-    pub const STATUS_INDICATOR: &str = "● ";
     pub const ARROW_UP: &str = "↑";
     pub const ARROW_DOWN: &str = "↓";
-    pub const WARNING_ICON: &str = " ⚠ ";
     pub const DEFAULT_CMD_RATE: &str = "0.0";
     #[allow(dead_code)] // Used in default values
     pub const DEFAULT_THROUGHPUT: &str = "0 B/s";
@@ -119,4 +114,118 @@ pub mod throughput {
     pub const HUNDRED_KB: f64 = 100_000.0;
     pub const TEN_KB: f64 = 10_000.0;
     pub const ONE_KB: f64 = 1_000.0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_layout_constants() {
+        assert_eq!(layout::TITLE_HEIGHT, 3);
+        assert_eq!(layout::SUMMARY_HEIGHT, 5);
+        assert_eq!(layout::FOOTER_HEIGHT, 3);
+        assert_eq!(layout::MIN_CHART_HEIGHT, 10);
+        assert_eq!(layout::BACKEND_LIST_WIDTH_PCT, 50);
+        assert_eq!(layout::CHART_WIDTH_PCT, 50);
+    }
+
+    #[test]
+    fn test_main_sections_constraints() {
+        let sections = layout::main_sections();
+        assert_eq!(sections.len(), 4);
+        // Verify structure is correct
+        assert!(matches!(
+            sections[0],
+            ratatui::layout::Constraint::Length(_)
+        ));
+    }
+
+    #[test]
+    fn test_backend_columns_constraints() {
+        let columns = layout::backend_columns();
+        assert_eq!(columns.len(), 3);
+        // Verify structure is correct
+        assert!(matches!(
+            columns[0],
+            ratatui::layout::Constraint::Percentage(_)
+        ));
+    }
+
+    #[test]
+    fn test_chart_constants() {
+        assert_eq!(chart::HISTORY_POINTS, 60.0);
+        assert_eq!(chart::MIN_THROUGHPUT, 1_000_000.0);
+        assert_eq!(chart::X_LABEL_0S, "0s");
+        assert_eq!(chart::X_LABEL_5S, "5s");
+        assert_eq!(chart::X_LABEL_10S, "10s");
+        assert_eq!(chart::X_LABEL_15S, "15s");
+        assert_eq!(chart::Y_LABEL_ZERO, "0");
+        assert_eq!(chart::TITLE, "Throughput (15s)");
+    }
+
+    #[test]
+    fn test_backend_colors() {
+        assert_eq!(BACKEND_COLORS.len(), 6);
+        assert_eq!(BACKEND_COLORS[0], Color::Green);
+        assert_eq!(BACKEND_COLORS[1], Color::Cyan);
+        assert_eq!(BACKEND_COLORS[2], Color::Yellow);
+        assert_eq!(BACKEND_COLORS[3], Color::Magenta);
+        assert_eq!(BACKEND_COLORS[4], Color::Red);
+        assert_eq!(BACKEND_COLORS[5], Color::Blue);
+    }
+
+    #[test]
+    fn test_status_colors() {
+        assert_eq!(status::WARNING, Color::Yellow);
+    }
+
+    #[test]
+    fn test_style_colors() {
+        assert_eq!(styles::LABEL, Color::Gray);
+        assert_eq!(styles::VALUE_PRIMARY, Color::Green);
+        assert_eq!(styles::VALUE_SECONDARY, Color::Yellow);
+        assert_eq!(styles::VALUE_INFO, Color::Cyan);
+        assert_eq!(styles::VALUE_NEUTRAL, Color::Blue);
+        assert_eq!(styles::BORDER_ACTIVE, Color::Cyan);
+        assert_eq!(styles::BORDER_NORMAL, Color::White);
+    }
+
+    #[test]
+    fn test_text_constants() {
+        assert_eq!(text::ARROW_UP, "↑");
+        assert_eq!(text::ARROW_DOWN, "↓");
+        assert_eq!(text::DEFAULT_CMD_RATE, "0.0");
+        assert_eq!(text::DEFAULT_THROUGHPUT, "0 B/s");
+    }
+
+    #[test]
+    fn test_throughput_constants() {
+        assert_eq!(throughput::HUNDRED_MB, 100_000_000.0);
+        assert_eq!(throughput::TEN_MB, 10_000_000.0);
+        assert_eq!(throughput::ONE_MB, 1_000_000.0);
+        assert_eq!(throughput::HUNDRED_KB, 100_000.0);
+        assert_eq!(throughput::TEN_KB, 10_000.0);
+        assert_eq!(throughput::ONE_KB, 1_000.0);
+    }
+
+    #[test]
+    fn test_throughput_constants_ordering() {
+        // Verify constants are in descending order
+        assert!(throughput::HUNDRED_MB > throughput::TEN_MB);
+        assert!(throughput::TEN_MB > throughput::ONE_MB);
+        assert!(throughput::ONE_MB > throughput::HUNDRED_KB);
+        assert!(throughput::HUNDRED_KB > throughput::TEN_KB);
+        assert!(throughput::TEN_KB > throughput::ONE_KB);
+    }
+
+    #[test]
+    fn test_throughput_relationships() {
+        // Verify mathematical relationships
+        assert_eq!(throughput::HUNDRED_MB, throughput::TEN_MB * 10.0);
+        assert_eq!(throughput::TEN_MB, throughput::ONE_MB * 10.0);
+        assert_eq!(throughput::ONE_MB, throughput::HUNDRED_KB * 10.0);
+        assert_eq!(throughput::HUNDRED_KB, throughput::TEN_KB * 10.0);
+        assert_eq!(throughput::TEN_KB, throughput::ONE_KB * 10.0);
+    }
 }

@@ -242,4 +242,117 @@ mod tests {
         assert!(!conn.is_encrypted(), "Plain TCP should not be encrypted");
         assert_eq!(conn.connection_type(), "TCP");
     }
+
+    // TLS-specific tests - test type system without I/O
+    #[tokio::test]
+    async fn test_tls_connection_type_methods() {
+        // We can't easily create a real TLS connection in unit tests without a server,
+        // but we can test the code paths by examining what methods would return
+
+        // For Plain TCP
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(tcp).unwrap();
+
+        let conn = ConnectionStream::plain(stream);
+
+        // Test Plain TCP type checks
+        assert!(conn.is_unencrypted());
+        assert!(!conn.is_encrypted());
+        assert_eq!(conn.connection_type(), "TCP");
+
+        // Test Plain TCP stream access
+        assert!(conn.as_tcp_stream().is_some());
+        assert!(conn.as_tls_stream().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_plain_tcp_stream_accessors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(tcp).unwrap();
+
+        let mut conn = ConnectionStream::plain(stream);
+
+        // Test immutable access
+        assert!(conn.as_tcp_stream().is_some());
+        assert!(conn.as_tls_stream().is_none());
+
+        // Test mutable access
+        assert!(conn.as_tcp_stream_mut().is_some());
+        assert!(conn.as_tls_stream_mut().is_none());
+
+        // Test underlying TCP access (works for plain TCP)
+        let _underlying = conn.underlying_tcp_stream();
+    }
+
+    #[tokio::test]
+    async fn test_connection_stream_enum_variants() {
+        // Test that ConnectionStream enum has the expected variants
+        // This ensures the type structure is correct
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(tcp).unwrap();
+
+        let plain_conn = ConnectionStream::plain(stream);
+
+        // Match on the enum to ensure Plain variant exists
+        match plain_conn {
+            ConnectionStream::Plain(_) => {
+                assert!(true, "Plain variant works");
+            }
+            ConnectionStream::Tls(_) => {
+                panic!("Should be Plain, not Tls");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_type_string_values() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(tcp).unwrap();
+
+        let conn = ConnectionStream::plain(stream);
+
+        // Test connection_type returns correct string
+        assert_eq!(conn.connection_type(), "TCP");
+
+        // Verify it's the correct static string for logging
+        let type_str = conn.connection_type();
+        assert!(!type_str.is_empty());
+        assert!(type_str.len() < 10); // Reasonable length for logging
+    }
+
+    #[tokio::test]
+    async fn test_plain_connection_debug_format() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(tcp).unwrap();
+
+        let conn = ConnectionStream::plain(stream);
+
+        // Test Debug implementation
+        let debug_str = format!("{:?}", conn);
+        assert!(
+            debug_str.contains("Plain"),
+            "Debug output should indicate Plain TCP"
+        );
+    }
 }

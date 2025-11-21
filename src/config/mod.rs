@@ -13,9 +13,7 @@ pub use loading::{
     ConfigSource, create_default_config, has_server_env_vars, load_config, load_config_from_env,
     load_config_with_fallback,
 };
-pub use types::{
-    CacheConfig, ClientAuthConfig, Config, HealthCheckConfig, RoutingMode, ServerConfig,
-};
+pub use types::{Cache, ClientAuth, Config, HealthCheck, RoutingMode, Server};
 
 // Re-export default functions for use in tests and other modules
 pub use defaults::{

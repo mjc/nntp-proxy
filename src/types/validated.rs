@@ -194,14 +194,162 @@ impl<'de> Deserialize<'de> for ConfigPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
 
+    // Property test strategies for non-empty strings
+    fn non_empty_string() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9._@-]{1,100}"
+    }
+
+    fn path_string() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9._/-]{1,100}"
+    }
+
+    // Property tests for HostName
+    proptest! {
+        #[test]
+        fn hostname_non_empty_accepts(s in non_empty_string()) {
+            let hostname = HostName::new(s.clone()).unwrap();
+            prop_assert_eq!(hostname.as_str(), &s);
+        }
+
+        #[test]
+        fn hostname_roundtrip_string(s in non_empty_string()) {
+            let hostname = HostName::new(s.clone()).unwrap();
+            let as_str: &str = hostname.as_ref();
+            prop_assert_eq!(as_str, &s);
+        }
+
+        #[test]
+        fn hostname_deref_works(s in non_empty_string()) {
+            let hostname = HostName::new(s.clone()).unwrap();
+            prop_assert_eq!(&*hostname, &s);
+            prop_assert_eq!(hostname.len(), s.len());
+        }
+
+        #[test]
+        fn hostname_display(s in non_empty_string()) {
+            let hostname = HostName::new(s.clone()).unwrap();
+            prop_assert_eq!(format!("{}", hostname), s);
+        }
+
+        #[test]
+        fn hostname_try_from(s in non_empty_string()) {
+            let result: Result<HostName, _> = s.clone().try_into();
+            prop_assert!(result.is_ok());
+            let hostname = result.unwrap();
+            prop_assert_eq!(hostname.as_str(), &s);
+        }
+
+        #[test]
+        fn hostname_serde_roundtrip(s in non_empty_string()) {
+            let hostname = HostName::new(s).unwrap();
+            let json = serde_json::to_string(&hostname).unwrap();
+            let deserialized: HostName = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(hostname, deserialized);
+        }
+
+        #[test]
+        fn hostname_clone_equality(s in non_empty_string()) {
+            let hostname = HostName::new(s).unwrap();
+            let cloned = hostname.clone();
+            prop_assert_eq!(hostname, cloned);
+        }
+    }
+
+    // Property tests for ServerName
+    proptest! {
+        #[test]
+        fn server_name_non_empty_accepts(s in non_empty_string()) {
+            let server = ServerName::new(s.clone()).unwrap();
+            prop_assert_eq!(server.as_str(), &s);
+        }
+
+        #[test]
+        fn server_name_deref_works(s in non_empty_string()) {
+            let server = ServerName::new(s.clone()).unwrap();
+            prop_assert_eq!(&*server, &s);
+        }
+
+        #[test]
+        fn server_name_serde_roundtrip(s in non_empty_string()) {
+            let server = ServerName::new(s).unwrap();
+            let json = serde_json::to_string(&server).unwrap();
+            let deserialized: ServerName = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(server, deserialized);
+        }
+    }
+
+    // Property tests for Username
+    proptest! {
+        #[test]
+        fn username_non_empty_accepts(s in non_empty_string()) {
+            let username = Username::new(s.clone()).unwrap();
+            prop_assert_eq!(username.as_str(), &s);
+        }
+
+        #[test]
+        fn username_serde_roundtrip(s in non_empty_string()) {
+            let username = Username::new(s).unwrap();
+            let json = serde_json::to_string(&username).unwrap();
+            let deserialized: Username = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(username, deserialized);
+        }
+    }
+
+    // Property tests for Password
+    proptest! {
+        #[test]
+        fn password_non_empty_accepts(s in non_empty_string()) {
+            let password = Password::new(s.clone()).unwrap();
+            prop_assert_eq!(password.as_str(), &s);
+        }
+
+        #[test]
+        fn password_serde_roundtrip(s in non_empty_string()) {
+            let password = Password::new(s).unwrap();
+            let json = serde_json::to_string(&password).unwrap();
+            let deserialized: Password = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(password, deserialized);
+        }
+    }
+
+    // Property tests for ConfigPath
+    proptest! {
+        #[test]
+        fn config_path_non_empty_accepts(s in path_string()) {
+            let config = ConfigPath::try_from(s.clone()).unwrap();
+            prop_assert_eq!(config.as_str(), &s);
+        }
+
+        #[test]
+        fn config_path_as_path_roundtrip(s in path_string()) {
+            let config = ConfigPath::try_from(s.clone()).unwrap();
+            let path: &Path = config.as_ref();
+            prop_assert_eq!(path, Path::new(&s));
+        }
+
+        #[test]
+        fn config_path_serde_roundtrip(s in path_string()) {
+            let config = ConfigPath::try_from(s).unwrap();
+            let json = serde_json::to_string(&config).unwrap();
+            let deserialized: ConfigPath = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(config, deserialized);
+        }
+    }
+
+    // Edge case tests - empty validation
     #[test]
-    fn test_hostname_validation() {
-        assert!(HostName::new("example.com".to_string()).is_ok());
+    fn hostname_empty_rejected() {
         assert!(matches!(
             HostName::new("".to_string()),
             Err(ValidationError::EmptyHostName)
         ));
+    }
+
+    #[test]
+    fn hostname_whitespace_rejected() {
         assert!(matches!(
             HostName::new("   ".to_string()),
             Err(ValidationError::EmptyHostName)
@@ -209,12 +357,15 @@ mod tests {
     }
 
     #[test]
-    fn test_server_name_validation() {
-        assert!(ServerName::new("backend-1".to_string()).is_ok());
+    fn server_name_empty_rejected() {
         assert!(matches!(
             ServerName::new("".to_string()),
             Err(ValidationError::EmptyServerName)
         ));
+    }
+
+    #[test]
+    fn server_name_whitespace_rejected() {
         assert!(matches!(
             ServerName::new("\t".to_string()),
             Err(ValidationError::EmptyServerName)
@@ -222,8 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_username_validation() {
-        assert!(Username::new("alice".to_string()).is_ok());
+    fn username_empty_rejected() {
         assert!(matches!(
             Username::new("".to_string()),
             Err(ValidationError::EmptyUsername)
@@ -231,8 +381,27 @@ mod tests {
     }
 
     #[test]
-    fn test_password_validation() {
-        assert!(Password::new("secret".to_string()).is_ok());
+    fn username_whitespace_only_rejected() {
+        assert!(Username::new("   ".to_string()).is_err());
+        assert!(Username::new("\t\n".to_string()).is_err());
+    }
+
+    #[test]
+    fn username_with_spaces_accepted() {
+        // Username with spaces in content is valid (trim checks if empty)
+        assert!(Username::new("  user  ".to_string()).is_ok());
+        assert!(Username::new("user name".to_string()).is_ok());
+    }
+
+    #[test]
+    fn username_special_characters_accepted() {
+        assert!(Username::new("user@domain.com".to_string()).is_ok());
+        assert!(Username::new("user-123".to_string()).is_ok());
+        assert!(Username::new("user_name".to_string()).is_ok());
+    }
+
+    #[test]
+    fn password_empty_rejected() {
         assert!(matches!(
             Password::new("".to_string()),
             Err(ValidationError::EmptyPassword)
@@ -240,11 +409,97 @@ mod tests {
     }
 
     #[test]
-    fn test_config_path_validation() {
-        assert!(ConfigPath::try_from("config.toml").is_ok());
+    fn password_whitespace_only_rejected() {
+        assert!(Password::new("   ".to_string()).is_err());
+    }
+
+    #[test]
+    fn password_with_spaces_accepted() {
+        assert!(Password::new("   pass   ".to_string()).is_ok());
+        assert!(Password::new("P@ssw0rd!".to_string()).is_ok());
+        assert!(Password::new("密码123".to_string()).is_ok());
+    }
+
+    #[test]
+    fn config_path_empty_rejected() {
         assert!(matches!(
             ConfigPath::try_from(""),
             Err(ValidationError::EmptyConfigPath)
         ));
+    }
+
+    #[test]
+    fn config_path_whitespace_rejected() {
+        assert!(ConfigPath::try_from("   ").is_err());
+    }
+
+    #[test]
+    fn config_path_with_spaces_accepted() {
+        assert!(ConfigPath::try_from("my config.toml").is_ok());
+        assert!(ConfigPath::try_from("/absolute/path/config.toml").is_ok());
+        assert!(ConfigPath::try_from("./relative/config.toml").is_ok());
+        assert!(ConfigPath::try_from("../parent/config.toml").is_ok());
+    }
+
+    // Deserialization failure tests
+    #[test]
+    fn hostname_deserialize_empty_fails() {
+        let json = "\"\"";
+        let result: Result<HostName, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_path_deserialize_empty_fails() {
+        let json = "\"\"";
+        let result: Result<ConfigPath, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // Hash implementation tests
+    #[test]
+    fn hostname_hash_works() {
+        let mut set = HashSet::new();
+        set.insert(HostName::new("example.com".to_string()).unwrap());
+        assert!(set.contains(&HostName::new("example.com".to_string()).unwrap()));
+    }
+
+    #[test]
+    fn server_name_hash_works() {
+        let mut set = HashSet::new();
+        set.insert(ServerName::new("server1".to_string()).unwrap());
+        assert!(set.contains(&ServerName::new("server1".to_string()).unwrap()));
+    }
+
+    // ValidationError tests
+    #[test]
+    fn validation_error_messages() {
+        assert_eq!(
+            ValidationError::EmptyHostName.to_string(),
+            "hostname cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyServerName.to_string(),
+            "server name cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyUsername.to_string(),
+            "username cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyPassword.to_string(),
+            "password cannot be empty or whitespace"
+        );
+        assert_eq!(
+            ValidationError::EmptyConfigPath.to_string(),
+            "config path cannot be empty"
+        );
+    }
+
+    #[test]
+    fn validation_error_clone() {
+        let err = ValidationError::EmptyHostName;
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
     }
 }

@@ -1,12 +1,22 @@
 //! TUI application state and logic
 
-use crate::config::ServerConfig;
+use crate::config::Server;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
 use crate::tui::log_capture::LogBuffer;
 use crate::types::tui::{BytesPerSecond, CommandsPerSecond, HistorySize, Timestamp};
 use std::collections::VecDeque;
 use std::sync::Arc;
+
+/// TUI view mode - controls what is displayed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Normal view - shows all panels
+    #[default]
+    Normal,
+    /// Log fullscreen - shows only title and logs (mostly fullscreen)
+    LogFullscreen,
+}
 
 /// Historical throughput data point (generic over traffic direction)
 #[derive(Debug, Clone)]
@@ -147,7 +157,7 @@ impl ThroughputHistory {
 pub struct TuiAppBuilder {
     metrics: MetricsCollector,
     router: Arc<BackendSelector>,
-    servers: Arc<Vec<ServerConfig>>,
+    servers: Arc<Vec<Server>>,
     log_buffer: Option<LogBuffer>,
     history_size: HistorySize,
 }
@@ -158,7 +168,7 @@ impl TuiAppBuilder {
     pub fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
     ) -> Self {
         Self {
             metrics,
@@ -186,7 +196,9 @@ impl TuiAppBuilder {
     /// Build the TuiApp
     #[must_use]
     pub fn build(self) -> TuiApp {
-        let snapshot = self.metrics.snapshot();
+        use crate::tui::SystemMonitor;
+
+        let snapshot = Arc::new(self.metrics.snapshot());
         let backend_count = self.servers.len();
 
         // Initialize empty history for each backend
@@ -205,6 +217,10 @@ impl TuiAppBuilder {
             last_update: Timestamp::now(),
             history_size: self.history_size,
             log_buffer: Arc::new(self.log_buffer.unwrap_or_default()),
+            view_mode: ViewMode::default(),
+            show_details: false,
+            system_monitor: SystemMonitor::new(),
+            system_stats: Default::default(),
         }
     }
 }
@@ -216,15 +232,15 @@ pub struct TuiApp {
     /// Router for getting pending command counts
     router: Arc<BackendSelector>,
     /// Server configurations for display names
-    servers: Arc<Vec<ServerConfig>>,
-    /// Current metrics snapshot
-    snapshot: MetricsSnapshot,
+    servers: Arc<Vec<Server>>,
+    /// Current metrics snapshot (Arc for zero-cost sharing)
+    snapshot: Arc<MetricsSnapshot>,
     /// Historical throughput data per backend
     backend_history: Vec<ThroughputHistory>,
     /// Historical client throughput (global)
     client_history: ThroughputHistory,
-    /// Previous snapshot for calculating deltas
-    previous_snapshot: Option<MetricsSnapshot>,
+    /// Previous snapshot for calculating deltas (Arc for zero-cost sharing)
+    previous_snapshot: Option<Arc<MetricsSnapshot>>,
     /// Last update time
     last_update: Timestamp,
     /// History capacity
@@ -232,6 +248,14 @@ pub struct TuiApp {
     history_size: HistorySize,
     /// Log buffer for displaying recent log messages
     log_buffer: Arc<LogBuffer>,
+    /// Current view mode (normal or log fullscreen)
+    view_mode: ViewMode,
+    /// Show detailed metrics (timing breakdown, etc.)
+    show_details: bool,
+    /// System resource monitor
+    system_monitor: crate::tui::SystemMonitor,
+    /// Current system stats (CPU, memory, threads)
+    system_stats: crate::tui::SystemStats,
 }
 
 impl TuiApp {
@@ -243,7 +267,7 @@ impl TuiApp {
     pub fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers).build()
     }
@@ -256,7 +280,7 @@ impl TuiApp {
     pub fn with_log_buffer(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
         log_buffer: LogBuffer,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers)
@@ -272,7 +296,7 @@ impl TuiApp {
     pub fn with_history_size(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<ServerConfig>>,
+        servers: Arc<Vec<Server>>,
         history_size: HistorySize,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers)
@@ -281,10 +305,11 @@ impl TuiApp {
     }
 
     /// Calculate throughput rate from byte delta and time delta
+    /// Calculate byte transfer rate
     #[inline]
     fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> BytesPerSecond {
         if time_delta_secs > 0.0 {
-            BytesPerSecond::new(byte_delta as f64 / time_delta_secs)
+            BytesPerSecond::new((byte_delta as f64) / time_delta_secs)
         } else {
             BytesPerSecond::zero()
         }
@@ -294,15 +319,59 @@ impl TuiApp {
     #[inline]
     fn calculate_command_rate(cmd_delta: u64, time_delta_secs: f64) -> CommandsPerSecond {
         if time_delta_secs > 0.0 {
-            CommandsPerSecond::new(cmd_delta as f64 / time_delta_secs)
+            CommandsPerSecond::new((cmd_delta as f64) / time_delta_secs)
         } else {
             CommandsPerSecond::zero()
         }
     }
 
+    /// Calculate per-user rates from deltas
+    #[inline]
+    fn calculate_user_rates(
+        &self,
+        current: &crate::metrics::UserStats,
+        prev_snapshot: &crate::metrics::MetricsSnapshot,
+        time_delta: f64,
+    ) -> crate::metrics::UserStats {
+        use crate::types::BytesPerSecondRate;
+
+        let (bytes_sent_per_sec, bytes_received_per_sec) = prev_snapshot
+            .user_stats
+            .iter()
+            .find(|u| u.username == current.username)
+            .map(|prev| {
+                let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
+                let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
+                (
+                    BytesPerSecondRate::new(
+                        Self::calculate_rate(sent_delta, time_delta).get() as u64
+                    ),
+                    BytesPerSecondRate::new(
+                        Self::calculate_rate(recv_delta, time_delta).get() as u64
+                    ),
+                )
+            })
+            .unwrap_or((BytesPerSecondRate::ZERO, BytesPerSecondRate::ZERO));
+
+        crate::metrics::UserStats {
+            username: current.username.clone(),
+            active_connections: current.active_connections,
+            total_connections: current.total_connections,
+            bytes_sent: current.bytes_sent,
+            bytes_received: current.bytes_received,
+            total_commands: current.total_commands,
+            errors: current.errors,
+            bytes_sent_per_sec,
+            bytes_received_per_sec,
+        }
+    }
+
     /// Update metrics snapshot and calculate throughput
     pub fn update(&mut self) {
-        let new_snapshot = self.metrics.snapshot().with_pool_status(&self.router);
+        // Update system stats (CPU, memory)
+        self.system_stats = self.system_monitor.update();
+
+        let new_snapshot = Arc::new(self.metrics.snapshot().with_pool_status(&self.router));
         let now = Timestamp::now();
         let time_delta = now.duration_since(self.last_update).as_secs_f64();
 
@@ -340,16 +409,32 @@ impl TuiApp {
 
                 let sent_rate = Self::calculate_rate(sent_delta, time_delta);
                 let recv_rate = Self::calculate_rate(recv_delta, time_delta);
-                let cmd_rate = Self::calculate_command_rate(cmd_delta, time_delta);
+                let cmd_rate = Self::calculate_command_rate(cmd_delta.get(), time_delta);
 
                 let point = ThroughputPoint::new_backend(now, sent_rate, recv_rate, cmd_rate);
                 self.backend_history[i].push(point);
             }
+
+            // Enrich user stats with calculated rates
+            let user_stats = new_snapshot
+                .user_stats
+                .iter()
+                .map(|stats| self.calculate_user_rates(stats, prev, time_delta))
+                .collect();
+
+            // Build enriched snapshot (shares backend_stats via Arc)
+            self.snapshot = Arc::new(crate::metrics::MetricsSnapshot {
+                user_stats,
+                backend_stats: Arc::clone(&new_snapshot.backend_stats),
+                ..*new_snapshot
+            });
+            self.previous_snapshot = Some(new_snapshot);
+        } else {
+            // First update - no previous snapshot
+            self.previous_snapshot = Some(Arc::clone(&new_snapshot));
+            self.snapshot = new_snapshot;
         }
 
-        // Update snapshots: new becomes previous for next iteration
-        self.previous_snapshot = Some(new_snapshot.clone());
-        self.snapshot = new_snapshot;
         self.last_update = now;
     }
 
@@ -361,7 +446,7 @@ impl TuiApp {
 
     /// Get server configurations
     #[must_use]
-    pub fn servers(&self) -> &[ServerConfig] {
+    pub fn servers(&self) -> &[Server] {
         &self.servers
     }
 
@@ -405,23 +490,54 @@ impl TuiApp {
     pub fn log_buffer(&self) -> &Arc<LogBuffer> {
         &self.log_buffer
     }
+
+    /// Get current view mode
+    #[must_use]
+    pub const fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    /// Toggle between normal and log fullscreen view
+    pub fn toggle_log_fullscreen(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Normal => ViewMode::LogFullscreen,
+            ViewMode::LogFullscreen => ViewMode::Normal,
+        };
+    }
+
+    /// Toggle detailed metrics display
+    pub fn toggle_details(&mut self) {
+        self.show_details = !self.show_details;
+    }
+
+    /// Get current details display state
+    #[must_use]
+    pub fn show_details(&self) -> bool {
+        self.show_details
+    }
+
+    /// Get current system stats (CPU, memory, threads)
+    #[must_use]
+    pub const fn system_stats(&self) -> &crate::tui::SystemStats {
+        &self.system_stats
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerConfig;
+    use crate::config::Server;
     use crate::metrics::MetricsCollector;
     use crate::router::BackendSelector;
     use std::sync::Arc;
     use std::time::Duration;
 
     /// Helper to create test servers
-    fn create_test_servers(count: usize) -> Arc<Vec<ServerConfig>> {
+    fn create_test_servers(count: usize) -> Arc<Vec<Server>> {
         Arc::new(
             (0..count)
                 .map(|i| {
-                    ServerConfig::builder(format!("backend{}.example.com", i), 119)
+                    Server::builder(format!("backend{}.example.com", i), 119)
                         .name(format!("Backend {}", i))
                         .build()
                         .unwrap()
@@ -449,7 +565,7 @@ mod tests {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
         let servers = Arc::new(vec![
-            ServerConfig::builder("test.example.com", 119)
+            Server::builder("test.example.com", 119)
                 .name("Test Server".to_string())
                 .build()
                 .unwrap(),
@@ -458,7 +574,7 @@ mod tests {
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
         // Update 1: 1000 bytes total
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
         app.update();
         assert_eq!(app.snapshot().backend_to_client_bytes.as_u64(), 1000);
         // After update 1, previous_snapshot should be snapshot from update 1 (1000)
@@ -472,7 +588,7 @@ mod tests {
         );
 
         // Update 2: 2000 bytes total
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
         app.update();
         assert_eq!(app.snapshot().backend_to_client_bytes.as_u64(), 2000);
         // After update 2, previous_snapshot should be snapshot from update 2 (2000)
@@ -488,7 +604,7 @@ mod tests {
         );
 
         // Update 3: 3000 bytes total
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
         app.update();
         assert_eq!(app.snapshot().backend_to_client_bytes.as_u64(), 3000);
         // After update 3, previous_snapshot should be snapshot from update 3 (3000)
@@ -539,7 +655,7 @@ mod tests {
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
         // Simulate some traffic
-        metrics.record_backend_to_client_bytes_for(0, 1000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
 
         // First update
         app.update();
@@ -564,7 +680,7 @@ mod tests {
 
         // Wait a bit and simulate traffic
         std::thread::sleep(Duration::from_millis(100));
-        metrics.record_backend_to_client_bytes_for(0, 100_000);
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 100_000);
 
         // Second update
         app.update();
@@ -595,7 +711,8 @@ mod tests {
         // Add more updates than history capacity
         for i in 0..10 {
             std::thread::sleep(Duration::from_millis(10));
-            metrics.record_backend_to_client_bytes_for(0, 1000);
+            metrics
+                .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1000);
             app.update();
 
             // History should cap at 5
@@ -625,9 +742,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // Different traffic per backend
-        metrics.record_backend_to_client_bytes_for(0, 1_000_000);
-        metrics.record_backend_to_client_bytes_for(1, 2_000_000);
-        metrics.record_backend_to_client_bytes_for(2, 3_000_000);
+        metrics
+            .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1_000_000);
+        metrics
+            .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(1), 2_000_000);
+        metrics
+            .record_backend_to_client_bytes_for(crate::types::BackendId::from_index(2), 3_000_000);
 
         app.update();
 

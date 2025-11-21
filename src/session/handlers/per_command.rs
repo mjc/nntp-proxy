@@ -10,14 +10,66 @@ use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use crate::command::{CommandHandler, NntpCommand};
+use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
-use crate::constants::buffer::COMMAND;
-use crate::protocol::{BACKEND_ERROR, PROXY_GREETING_PCR};
+use crate::constants::buffer::{COMMAND, READER_CAPACITY};
+use crate::protocol::PROXY_GREETING_PCR;
 use crate::router::BackendSelector;
 use crate::types::{BytesTransferred, TransferMetrics};
+
+/// Decision for how to handle a command in per-command routing mode
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CommandRoutingDecision {
+    /// Intercept and handle authentication locally
+    InterceptAuth,
+    /// Forward command to backend (authenticated or auth disabled)
+    Forward,
+    /// Require authentication first
+    RequireAuth,
+    /// Switch to stateful mode (hybrid mode only)
+    SwitchToStateful,
+    /// Reject the command
+    Reject,
+}
+
+/// Determine how to handle a command based on action, auth state, and routing mode
+///
+/// This is a pure function that can be easily tested without I/O dependencies.
+pub(super) fn decide_command_routing(
+    action: CommandAction,
+    is_authenticated: bool,
+    auth_enabled: bool,
+    routing_mode: RoutingMode,
+    command: &str,
+) -> CommandRoutingDecision {
+    use CommandAction::*;
+
+    match action {
+        // Auth commands - ALWAYS intercept
+        InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
+
+        // Stateless commands
+        ForwardStateless => {
+            if is_authenticated || !auth_enabled {
+                CommandRoutingDecision::Forward
+            } else {
+                CommandRoutingDecision::RequireAuth
+            }
+        }
+
+        // Rejected commands in hybrid mode with stateful command -> switch mode
+        Reject(_)
+            if routing_mode == RoutingMode::Hybrid && NntpCommand::parse(command).is_stateful() =>
+        {
+            CommandRoutingDecision::SwitchToStateful
+        }
+
+        // All other rejected commands
+        Reject(_) => CommandRoutingDecision::Reject,
+    }
+}
 
 impl ClientSession {
     /// Handle a client connection with per-command routing
@@ -38,7 +90,7 @@ impl ClientSession {
         };
 
         let (client_read, mut client_write) = client_stream.split();
-        let mut client_reader = BufReader::new(client_read);
+        let mut client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
 
         let mut client_to_backend_bytes = BytesTransferred::zero();
         let mut backend_to_client_bytes = BytesTransferred::zero();
@@ -46,40 +98,12 @@ impl ClientSession {
         // Auth state: username from AUTHINFO USER command
         let mut auth_username: Option<String> = None;
 
-        // Send initial greeting to client and flush immediately
-        // This ensures the client receives the greeting before we start reading commands
-        debug!(
-            "Client {} sending greeting: {} | hex: {:02x?}",
-            self.client_addr,
-            String::from_utf8_lossy(PROXY_GREETING_PCR),
-            PROXY_GREETING_PCR
-        );
-
-        if let Err(e) = client_write.write_all(PROXY_GREETING_PCR).await {
-            debug!(
-                "Client {} failed to send greeting: {} (kind: {:?}). \
-                 This suggests the client disconnected immediately after connecting.",
-                self.client_addr,
-                e,
-                e.kind()
-            );
-            return Err(e.into());
-        }
-
-        if let Err(e) = client_write.flush().await {
-            debug!(
-                "Client {} failed to flush greeting: {} (kind: {:?})",
-                self.client_addr,
-                e,
-                e.kind()
-            );
-            return Err(e.into());
-        }
-
-        backend_to_client_bytes.add(PROXY_GREETING_PCR.len());
+        // Send initial greeting to client
+        client_write.write_all(PROXY_GREETING_PCR).await?;
+        client_write.flush().await?;
 
         debug!(
-            "Client {} sent greeting successfully, entering command loop",
+            "Client {} sent greeting, entering command loop",
             self.client_addr
         );
 
@@ -106,8 +130,8 @@ impl ClientSession {
                         self.username().as_deref(),
                         &e,
                         TransferMetrics {
-                            client_to_backend: client_to_backend_bytes,
-                            backend_to_client: backend_to_client_bytes,
+                            client_to_backend: client_to_backend_bytes.into(),
+                            backend_to_client: backend_to_client_bytes.into(),
                         },
                     );
                     break;
@@ -117,151 +141,110 @@ impl ClientSession {
             client_to_backend_bytes.add(n);
             let trimmed = command.trim();
 
-            debug!(
-                "Client {} received command ({} bytes): {} | hex: {:02x?}",
-                self.client_addr,
-                n,
-                trimmed,
-                command.as_bytes()
-            );
-
             // Handle QUIT locally
-            match common::handle_quit_command(&command, &mut client_write).await? {
-                common::QuitStatus::Quit(bytes) => {
-                    backend_to_client_bytes += bytes;
-                    debug!("Client {} sent QUIT, closing connection", self.client_addr);
-                    break;
-                }
-                common::QuitStatus::Continue => {
-                    // Not a QUIT, continue processing
-                }
+            if let common::QuitStatus::Quit(bytes) =
+                common::handle_quit_command(&command, &mut client_write).await?
+            {
+                backend_to_client_bytes += bytes;
+                break;
             }
 
-            let action = CommandHandler::handle_command(&command);
-
-            // ALWAYS intercept auth commands, even when auth is disabled
-            // Auth commands must NEVER be forwarded to backend
-            if matches!(action, CommandAction::InterceptAuth(_)) {
-                match action {
-                    CommandAction::InterceptAuth(auth_action) => {
-                        let result = common::handle_auth_command(
-                            &self.auth_handler,
-                            auth_action,
-                            &mut client_write,
-                            &mut auth_username,
-                            &self.authenticated,
-                        )
-                        .await?;
-
-                        backend_to_client_bytes += result.bytes_written;
-                        if result.authenticated {
-                            // Store username after successful authentication
-                            self.set_username(auth_username.clone());
-
-                            // Record connection for aggregation (after auth so we have username)
-                            if let Some(stats) = self.connection_stats() {
-                                stats.record_connection(
-                                    auth_username.as_deref(),
-                                    &self.routing_mode.to_string().to_lowercase(),
-                                );
-                            }
-
-                            // Track user connection in metrics
-                            if let Some(metrics) = self.metrics.as_ref() {
-                                metrics.user_connection_opened(auth_username.as_deref());
-                            }
-
-                            skip_auth_check = true;
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                continue;
-            }
-
-            // PERFORMANCE OPTIMIZATION: Fast path after authentication
-            // Once authenticated, skip classification (just route everything)
-            // Cache check to avoid atomic load on hot path
+            let action = CommandHandler::classify(&command);
             skip_auth_check = skip_auth_check
                 || self
                     .authenticated
                     .load(std::sync::atomic::Ordering::Acquire);
-            if skip_auth_check {
-                // Already authenticated - just route the command (HOT PATH after auth)
-                self.route_command_with_error_handling(
-                    router,
-                    &command,
-                    &mut client_write,
-                    &mut client_to_backend_bytes,
-                    &mut backend_to_client_bytes,
-                    trimmed,
-                )
-                .await?;
-                continue;
-            }
 
-            // Not yet authenticated - need to check for auth/stateful commands
+            let decision = decide_command_routing(
+                action.clone(),
+                skip_auth_check,
+                self.auth_handler.is_enabled(),
+                self.routing_mode,
+                &command,
+            );
 
-            // In hybrid mode, stateful commands trigger a switch to stateful connection
-            if self.routing_mode == RoutingMode::Hybrid
-                && matches!(action, CommandAction::Reject(_))
-                && NntpCommand::classify(&command).is_stateful()
-            {
-                info!(
-                    "Client {} switching to stateful mode (command: {})",
-                    self.client_addr, trimmed
-                );
-                return self
-                    .switch_to_stateful_mode(
-                        client_reader,
-                        client_write,
-                        &command,
-                        client_to_backend_bytes,
-                        backend_to_client_bytes,
+            match decision {
+                CommandRoutingDecision::InterceptAuth => {
+                    // Extract auth action from the original CommandAction
+                    let auth_action = match action {
+                        CommandAction::InterceptAuth(a) => a,
+                        _ => unreachable!(
+                            "InterceptAuth decision must come from InterceptAuth action"
+                        ),
+                    };
+
+                    backend_to_client_bytes += match common::handle_auth_command(
+                        &self.auth_handler,
+                        auth_action,
+                        &mut client_write,
+                        &mut auth_username,
+                        &self.authenticated,
                     )
-                    .await;
-            }
-
-            // Handle the command - inline for performance
-            // Check ForwardStateless FIRST (70%+ of traffic)
-            use crate::command::CommandAction;
-            match action {
-                CommandAction::ForwardStateless => {
-                    // Check if auth is required but not completed
-                    if self.auth_handler.is_enabled() {
-                        // Reject all non-auth commands before authentication
-                        use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
-                        client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
-                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
-                    } else {
-                        // Auth disabled - forward to backend via router (HOT PATH - 70%+ of commands)
-                        self.route_command_with_error_handling(
-                            router,
-                            &command,
-                            &mut client_write,
-                            &mut client_to_backend_bytes,
-                            &mut backend_to_client_bytes,
-                            trimmed,
-                        )
-                        .await?;
-                    }
+                    .await?
+                    {
+                        common::AuthResult::Authenticated(bytes) => {
+                            common::on_authentication_success(
+                                self.client_addr,
+                                auth_username.clone(),
+                                &self.routing_mode,
+                                &self.metrics,
+                                self.connection_stats(),
+                                |username| self.set_username(username),
+                            );
+                            skip_auth_check = true;
+                            bytes
+                        }
+                        common::AuthResult::NotAuthenticated(bytes) => bytes,
+                    };
                 }
-                CommandAction::Reject(response) => {
-                    // Send rejection response inline
+
+                CommandRoutingDecision::Forward => {
+                    self.route_and_execute_command(
+                        router,
+                        &command,
+                        &mut client_write,
+                        &mut client_to_backend_bytes,
+                        &mut backend_to_client_bytes,
+                    )
+                    .await?;
+                }
+
+                CommandRoutingDecision::RequireAuth => {
+                    use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+                    client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+                    backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
+                }
+
+                CommandRoutingDecision::SwitchToStateful => {
+                    info!(
+                        "Client {} switching to stateful mode (command: {})",
+                        self.client_addr, trimmed
+                    );
+                    return self
+                        .switch_to_stateful_mode(
+                            client_reader,
+                            client_write,
+                            &command,
+                            client_to_backend_bytes.into(),
+                            backend_to_client_bytes.into(),
+                        )
+                        .await;
+                }
+
+                CommandRoutingDecision::Reject => {
+                    let response = match action {
+                        CommandAction::Reject(r) => r,
+                        _ => unreachable!("Reject decision must come from Reject action"),
+                    };
                     client_write.write_all(response.as_bytes()).await?;
                     backend_to_client_bytes.add(response.len());
-                }
-                CommandAction::InterceptAuth(_) => {
-                    // Already handled above before fast path check
-                    unreachable!("Auth commands should be handled before reaching here");
                 }
             }
         }
 
-        // Log session summary for debugging, especially useful for test connections
-        if (client_to_backend_bytes + backend_to_client_bytes).as_u64()
-            < common::SMALL_TRANSFER_THRESHOLD
-        {
+        // Log session summary and close user connection
+        let total_bytes = client_to_backend_bytes.as_u64() + backend_to_client_bytes.as_u64();
+        if total_bytes < common::SMALL_TRANSFER_THRESHOLD {
             debug!(
                 "Session summary {} | ↑{} ↓{} | Short session (likely test connection)",
                 self.client_addr,
@@ -269,36 +252,13 @@ impl ClientSession {
                 crate::formatting::format_bytes(backend_to_client_bytes.as_u64())
             );
         }
-
-        // Track final per-user metrics
-        if let Some(metrics) = self.metrics.as_ref() {
-            if let Some(username) = self.username() {
-                let c2b = client_to_backend_bytes.as_u64();
-                let b2c = backend_to_client_bytes.as_u64();
-                if c2b > 0 {
-                    metrics.user_bytes_sent(Some(&username), c2b);
-                }
-                if b2c > 0 {
-                    metrics.user_bytes_received(Some(&username), b2c);
-                }
-                metrics.user_connection_closed(Some(&username));
-            } else {
-                // Anonymous user
-                let c2b = client_to_backend_bytes.as_u64();
-                let b2c = backend_to_client_bytes.as_u64();
-                if c2b > 0 {
-                    metrics.user_bytes_sent(None, c2b);
-                }
-                if b2c > 0 {
-                    metrics.user_bytes_received(None, b2c);
-                }
-                metrics.user_connection_closed(None);
-            }
+        if let Some(ref m) = self.metrics {
+            m.user_connection_closed(self.username().as_deref());
         }
 
         Ok(TransferMetrics {
-            client_to_backend: client_to_backend_bytes,
-            backend_to_client: backend_to_client_bytes,
+            client_to_backend: client_to_backend_bytes.into(),
+            backend_to_client: backend_to_client_bytes.into(),
         })
     }
 
@@ -314,30 +274,27 @@ impl ClientSession {
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
-        use crate::pool::{is_connection_error, remove_from_pool};
+        // Check cache early - returns Some(backend_id) on cache hit, None otherwise
+        if let Some(backend_id) = self
+            .check_cache_and_serve(router, command, client_write, backend_to_client_bytes)
+            .await?
+        {
+            return Ok(backend_id);
+        }
+
+        // Determine if we need to cache this response after fetching
+        let should_cache = self.should_cache_command(command);
 
         // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
-        let mut buffer = self.buffer_pool.get_buffer().await;
+        let mut buffer = self.buffer_pool.acquire().await;
 
         // Route the command to get a backend (lock-free!)
-        let backend_id = router.route_command_sync(self.client_id, command)?;
-
-        debug!(
-            "Client {} routed command to backend {:?}: {}",
-            self.client_addr,
-            backend_id,
-            command.trim()
-        );
+        let backend_id = router.route_command(self.client_id, command)?;
 
         // Get a connection from the router's backend pool
-        let Some(provider) = router.get_backend_provider(backend_id) else {
+        let Some(provider) = router.backend_provider(backend_id) else {
             anyhow::bail!("Backend {:?} not found", backend_id);
         };
-
-        debug!(
-            "Client {} getting pooled connection for backend {:?}",
-            self.client_addr, backend_id
-        );
 
         let mut pooled_conn = provider.get_pooled_connection().await?;
 
@@ -347,20 +304,26 @@ impl ClientSession {
         );
 
         // Record command execution in metrics
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_command(backend_id.as_index());
-            // Track per-user command
-            if let Some(username) = self.username() {
-                metrics.user_command(Some(&username));
-            } else {
-                metrics.user_command(None);
-            }
-        }
+        self.record_command(backend_id);
+        self.user_command();
 
         // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
         // If got_backend_data is true, we successfully communicated with backend
-        let (result, got_backend_data, cmd_bytes, resp_bytes) = self
-            .execute_command_on_backend(
+        //
+        // Use caching path only for cache misses on ARTICLE by message-ID
+        let (result, got_backend_data, cmd_bytes, resp_bytes) = if should_cache {
+            self.execute_command_with_caching(
+                &mut pooled_conn,
+                command,
+                client_write,
+                backend_id,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+                &mut buffer,
+            )
+            .await
+        } else {
+            self.execute_command_on_backend(
                 &mut pooled_conn,
                 command,
                 client_write,
@@ -369,58 +332,48 @@ impl ClientSession {
                 backend_to_client_bytes,
                 &mut buffer, // Pass reusable buffer
             )
-            .await;
+            .await
+        };
 
         // Record metrics ONCE using type-safe API (prevents double-counting)
         if let Some(ref metrics) = self.metrics {
-            // Record per-backend metrics first (peek without consuming)
-            metrics.record_client_to_backend_bytes_for(backend_id.as_index(), cmd_bytes.peek());
-            metrics.record_backend_to_client_bytes_for(backend_id.as_index(), resp_bytes.peek());
+            // Peek byte counts before consuming
+            let cmd_size = cmd_bytes.peek();
+            let resp_size = resp_bytes.peek();
 
-            // Then record global metrics (consumes the Unrecorded bytes)
-            let _ = metrics.record_client_to_backend(cmd_bytes);
-            let _ = metrics.record_backend_to_client(resp_bytes);
+            // Record command + per-backend + global bytes in one call
+            let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
+
+            // Record per-user metrics
+            self.user_bytes_sent(cmd_size);
+            self.user_bytes_received(resp_size);
         }
 
-        // Return buffer to pool before handling result
-
-        // Only remove backend connection if error occurred AND we didn't get data from backend
-        // If we got data from backend, then any error is from writing to client
-        let _ = result
-            .as_ref()
-            .err()
-            .filter(|e| is_connection_error(e))
-            .inspect(|e| {
-                match got_backend_data {
-                    true => debug!(
-                        "Client {} disconnected while receiving data from backend {:?} - backend connection is healthy",
-                        self.client_addr, backend_id
-                    ),
-                    false => {
-                        warn!(
-                            "Backend connection error for client {}, backend {:?}: {} - removing connection from pool",
-                            self.client_addr, backend_id, e
-                        );
-                        // Record error in metrics
-                        if let Some(ref metrics) = self.metrics {
-                            metrics.record_error(backend_id.as_index());
-                            // Track per-user error
-                            if let Some(username) = self.username() {
-                                metrics.user_error(Some(&username));
-                            } else {
-                                metrics.user_error(None);
-                            }
-                        }
+        // Handle errors functionally - remove from pool if backend error
+        let result = if !got_backend_data {
+            result.inspect_err(|e| {
+                if crate::pool::is_connection_error(e) {
+                    warn!(
+                        "Backend {:?} connection error: {} - removing from pool",
+                        backend_id, e
+                    );
+                    if let Some(ref metrics) = self.metrics {
+                        metrics.record_error(backend_id);
+                        metrics.user_error(self.username().as_deref());
                     }
+                    crate::pool::remove_from_pool(pooled_conn);
                 }
             })
-            .filter(|_| !got_backend_data)
-            .is_some_and(|_| { remove_from_pool(pooled_conn); true });
+        } else {
+            result
+        };
 
         // Complete the request - decrement pending count (lock-free!)
-        router.complete_command_sync(backend_id);
+        router.complete_command(backend_id);
 
-        result.map(|_| backend_id)
+        result
+            .map(|_| backend_id)
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     /// Execute a command on a backend connection and stream the response to the client
@@ -470,28 +423,35 @@ impl ClientSession {
         let mut got_backend_data = false;
 
         // Send command and read first chunk into reusable buffer
-        let (n, _response_code, is_multiline) = match backend::send_command_and_read_first_chunk(
-            &mut **pooled_conn,
-            command,
-            backend_id,
-            self.client_addr,
-            chunk_buffer,
-        )
-        .await
-        {
-            Ok(result) => {
-                got_backend_data = true;
-                result
-            }
-            Err(e) => {
-                return (
-                    Err(e),
-                    got_backend_data,
-                    MetricsBytes::new(0),
-                    MetricsBytes::new(0),
-                );
-            }
-        };
+        let (n, _response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
+            match backend::send_command_and_read_first_chunk(
+                &mut **pooled_conn,
+                command,
+                backend_id,
+                self.client_addr,
+                chunk_buffer,
+            )
+            .await
+            {
+                Ok(result) => {
+                    got_backend_data = true;
+                    result
+                }
+                Err(e) => {
+                    return (
+                        Err(e),
+                        got_backend_data,
+                        MetricsBytes::new(0),
+                        MetricsBytes::new(0),
+                    );
+                }
+            };
+
+        // Record time to first byte and split timing
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_ttfb_micros(backend_id, ttfb_micros);
+            metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
+        }
 
         client_to_backend_bytes.add(command.len());
 
@@ -500,25 +460,6 @@ impl ClientSession {
 
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
-            let log_msg = if let Some(id) = msgid {
-                format!(
-                    "Client {} ARTICLE {} → multiline ({:?}), streaming {}",
-                    self.client_addr,
-                    id,
-                    _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64)
-                )
-            } else {
-                format!(
-                    "Client {} '{}' → multiline ({:?}), streaming {}",
-                    self.client_addr,
-                    command.trim(),
-                    _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64)
-                )
-            };
-            debug!("{}", log_msg);
-
             match streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
@@ -542,61 +483,17 @@ impl ClientSession {
             }
         } else {
             // Single-line response - just write the first chunk
-            let log_msg = if let Some(id) = msgid {
-                // 223 (No such article number), 430 (No such article), and other 4xx/5xx errors are expected single-line responses
-                if let Some(code) = _response_code.status_code() {
-                    let raw_code = code.as_u16();
-                    if raw_code == 223 || (400..600).contains(&raw_code) {
-                        format!(
-                            "Client {} ARTICLE {} → error {} (single-line), writing {}",
-                            self.client_addr,
-                            id,
-                            code,
-                            crate::formatting::format_bytes(n as u64)
-                        )
-                    } else {
-                        format!(
-                            "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
-                            self.client_addr,
-                            id,
-                            _response_code.status_code(),
-                            crate::formatting::format_bytes(n as u64),
-                            &chunk_buffer[..n.min(50)]
-                        )
-                    }
-                } else {
-                    format!(
-                        "Client {} ARTICLE {} → UNUSUAL single-line ({:?}), writing {}: {:02x?}",
-                        self.client_addr,
-                        id,
-                        _response_code.status_code(),
-                        crate::formatting::format_bytes(n as u64),
-                        &chunk_buffer[..n.min(50)]
-                    )
-                }
-            } else {
-                format!(
-                    "Client {} '{}' → single-line ({:?}), writing {}: {:02x?}",
-                    self.client_addr,
-                    command.trim(),
-                    _response_code.status_code(),
-                    crate::formatting::format_bytes(n as u64),
-                    &chunk_buffer[..n.min(50)]
-                )
-            };
-
-            // Only warn if it's truly unusual (not 223 or 4xx/5xx error responses)
             if let Some(code) = _response_code.status_code() {
                 let raw_code = code.as_u16();
-                if raw_code == 223 || code.is_error() {
-                    debug!("{}", log_msg); // 223 and errors are expected, just debug
-                } else if msgid.is_some() {
-                    warn!("{}", log_msg); // ARTICLE with other 2xx/3xx single-line is unusual
-                } else {
-                    debug!("{}", log_msg);
+                // Warn only for truly unusual responses (not 223 or errors)
+                if msgid.is_some() && raw_code != 223 && !code.is_error() {
+                    warn!(
+                        "Client {} ARTICLE {} got unusual single-line response: {}",
+                        self.client_addr,
+                        msgid.unwrap(),
+                        code
+                    );
                 }
-            } else {
-                debug!("{}", log_msg);
             }
 
             match client_write.write_all(&chunk_buffer[..n]).await {
@@ -614,6 +511,28 @@ impl ClientSession {
 
         backend_to_client_bytes.add(bytes_written as usize);
 
+        // Track metrics based on response code
+        if let Some(ref metrics) = self.metrics
+            && let Some(code) = _response_code.status_code()
+        {
+            let raw_code = code.as_u16();
+
+            // Track 4xx/5xx errors (excluding expected "not found" responses)
+            // 423 = No such article (normal when searching)
+            // 430 = No such article in group (normal when searching)
+            if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
+                metrics.record_error_4xx(backend_id);
+            } else if raw_code >= 500 {
+                metrics.record_error_5xx(backend_id);
+            }
+
+            // Track article size for successful article retrieval responses
+            // 220 = ARTICLE (full article), 221 = HEAD (headers only), 222 = BODY (body only)
+            if is_multiline && (raw_code == 220 || raw_code == 221 || raw_code == 222) {
+                metrics.record_article(backend_id, bytes_written);
+            }
+        }
+
         // Return unrecorded metrics bytes - caller MUST record to prevent double-counting
         let cmd_bytes = MetricsBytes::new(command.len() as u64);
         let resp_bytes = MetricsBytes::new(bytes_written);
@@ -628,77 +547,221 @@ impl ClientSession {
         (Ok(()), got_backend_data, cmd_bytes, resp_bytes)
     }
 
-    /// Route a command and handle any errors with appropriate logging and client responses
+    /// Execute a command with response caching
     ///
-    /// This helper consolidates the error handling logic that was duplicated in multiple places.
-    /// It routes the command via the router, and if an error occurs, it:
-    /// - Classifies the error (client disconnect vs auth error vs other)
-    /// - Logs appropriately based on error type
-    /// - Sends BACKEND_ERROR response to client (if not disconnected)
-    /// - Includes debug logging for small transfers
-    async fn route_command_with_error_handling(
+    /// Similar to `execute_command_on_backend` but buffers the entire response for caching.
+    /// Only call this for ARTICLE by message-ID commands when cache is enabled.
+    ///
+    /// **Performance trade-off**: Buffers entire response instead of streaming.
+    /// Acceptable for ARTICLE commands when using the caching proxy binary (`nntp-cache-proxy`).
+    /// The main `nntp-proxy` binary does not include caching - it's a separate optional binary.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn execute_command_with_caching(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_id: crate::types::BackendId,
+        client_to_backend_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BytesTransferred,
+        chunk_buffer: &mut PooledBuffer,
+    ) -> (
+        Result<()>,
+        bool,
+        crate::types::MetricsBytes<crate::types::Unrecorded>,
+        crate::types::MetricsBytes<crate::types::Unrecorded>,
+    ) {
+        use crate::types::MetricsBytes;
+        let mut got_backend_data = false;
+        let mut response_buffer = Vec::new();
+
+        // Send command and read first chunk
+        let (n, response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
+            match backend::send_command_and_read_first_chunk(
+                &mut **pooled_conn,
+                command,
+                backend_id,
+                self.client_addr,
+                chunk_buffer,
+            )
+            .await
+            {
+                Ok(result) => {
+                    got_backend_data = true;
+                    result
+                }
+                Err(e) => {
+                    return (
+                        Err(e),
+                        got_backend_data,
+                        MetricsBytes::new(0),
+                        MetricsBytes::new(0),
+                    );
+                }
+            };
+
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_ttfb_micros(backend_id, ttfb_micros);
+            metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
+        }
+
+        client_to_backend_bytes.add(command.len());
+
+        // Buffer first chunk
+        response_buffer.extend_from_slice(&chunk_buffer[..n]);
+
+        // For multiline, read and buffer all chunks
+        if is_multiline {
+            use tokio::io::AsyncReadExt;
+            loop {
+                let bytes_read = match pooled_conn.read(chunk_buffer.as_mut_slice()).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        return (
+                            Err(e.into()),
+                            got_backend_data,
+                            MetricsBytes::new(command.len() as u64),
+                            MetricsBytes::new(0),
+                        );
+                    }
+                };
+
+                let chunk = &chunk_buffer[..bytes_read];
+                response_buffer.extend_from_slice(chunk);
+
+                // Check for terminator
+                if crate::protocol::NntpResponse::has_terminator_at_end(chunk) {
+                    break;
+                }
+            }
+        }
+
+        // Write entire buffered response to client
+        let bytes_written = response_buffer.len() as u64;
+        if let Err(e) = client_write.write_all(&response_buffer).await {
+            return (
+                Err(e.into()),
+                got_backend_data,
+                MetricsBytes::new(command.len() as u64),
+                MetricsBytes::new(0),
+            );
+        }
+
+        backend_to_client_bytes.add(bytes_written as usize);
+
+        // Cache successful ARTICLE responses (2xx status codes)
+        if let Some(ref cache) = self.cache
+            && let Some(message_id) = crate::protocol::NntpResponse::extract_message_id(command)
+            && let Some(code) = response_code.status_code()
+            && code.is_success()
+        {
+            info!(
+                "Caching response for message-ID: {} ({} bytes)",
+                message_id, bytes_written
+            );
+            cache
+                .insert(
+                    message_id,
+                    crate::cache::CachedArticle {
+                        response: std::sync::Arc::new(response_buffer),
+                    },
+                )
+                .await;
+        }
+
+        // Track metrics
+        if let Some(ref metrics) = self.metrics
+            && let Some(code) = response_code.status_code()
+        {
+            let raw_code = code.as_u16();
+
+            if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
+                metrics.record_error_4xx(backend_id);
+            } else if raw_code >= 500 {
+                metrics.record_error_5xx(backend_id);
+            }
+
+            if is_multiline && (raw_code == 220 || raw_code == 221 || raw_code == 222) {
+                metrics.record_article(backend_id, bytes_written);
+            }
+        }
+
+        (
+            Ok(()),
+            got_backend_data,
+            MetricsBytes::new(command.len() as u64),
+            MetricsBytes::new(bytes_written),
+        )
+    }
+
+    /// Check cache and serve if hit, return backend_id on hit, None on miss
+    #[inline]
+    async fn check_cache_and_serve(
         &self,
         router: &BackendSelector,
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
-        trimmed: &str,
-    ) -> Result<()> {
-        if let Err(e) = self
-            .route_and_execute_command(
-                router,
-                command,
-                client_write,
-                client_to_backend_bytes,
-                backend_to_client_bytes,
-            )
-            .await
-        {
-            use crate::session::error_classification::ErrorClassifier;
-            let (up, down) = (
-                crate::formatting::format_bytes(client_to_backend_bytes.as_u64()),
-                crate::formatting::format_bytes(backend_to_client_bytes.as_u64()),
-            );
+    ) -> Result<Option<crate::types::BackendId>> {
+        // Functional pipeline: cache → is ARTICLE → extract ID
+        let Some((cache, message_id)) = self
+            .cache
+            .as_ref()
+            .filter(|_| matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId))
+            .zip(crate::protocol::NntpResponse::extract_message_id(command))
+        else {
+            return Ok(None);
+        };
 
-            // Log based on error type, send error response if client still connected
-            if ErrorClassifier::is_client_disconnect(&e) {
-                debug!(
-                    "Client {} command '{}' resulted in disconnect (already logged by streaming layer) | ↑{} ↓{}",
-                    self.client_addr, trimmed, up, down
+        self.serve_from_cache_or_miss(
+            cache,
+            message_id,
+            router,
+            command,
+            client_write,
+            backend_to_client_bytes,
+        )
+        .await
+    }
+
+    /// Serve cached article or return None on miss
+    #[inline]
+    async fn serve_from_cache_or_miss(
+        &self,
+        cache: &crate::cache::ArticleCache,
+        message_id: crate::types::protocol::MessageId<'_>,
+        router: &BackendSelector,
+        command: &str,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BytesTransferred,
+    ) -> Result<Option<crate::types::BackendId>> {
+        match cache.get(&message_id).await {
+            Some(cached) => {
+                info!(
+                    "Cache HIT for message-ID: {} (size: {} bytes)",
+                    message_id,
+                    cached.response.len()
                 );
-            } else {
-                if ErrorClassifier::is_authentication_error(&e) {
-                    error!(
-                        "Client {} command '{}' authentication error: {} | ↑{} ↓{}",
-                        self.client_addr, trimmed, e, up, down
-                    );
-                } else {
-                    warn!(
-                        "Client {} error routing '{}': {} | ↑{} ↓{}",
-                        self.client_addr, trimmed, e, up, down
-                    );
-                }
-                let _ = client_write.write_all(BACKEND_ERROR).await;
-                backend_to_client_bytes.add(BACKEND_ERROR.len());
-            }
+                client_write.write_all(&cached.response).await?;
+                backend_to_client_bytes.add(cached.response.len());
 
-            // Debug logging for small transfers
-            if (*client_to_backend_bytes + *backend_to_client_bytes).as_u64()
-                < common::SMALL_TRANSFER_THRESHOLD
-            {
-                debug!(
-                    "ERROR SUMMARY for small transfer - Client {}: Command '{}' failed with {}. \
-                     Total session: {} bytes to backend, {} bytes from backend. \
-                     This appears to be a short session (test connection?). \
-                     Check debug logs above for full command/response hex dumps.",
-                    self.client_addr, trimmed, e, client_to_backend_bytes, backend_to_client_bytes
-                );
+                let backend_id = router.route_command(self.client_id, command)?;
+                router.complete_command(backend_id);
+                Ok(Some(backend_id))
             }
-
-            return Err(e);
+            None => {
+                info!("Cache MISS for message-ID: {}", message_id);
+                Ok(None)
+            }
         }
-        Ok(())
+    }
+
+    /// Determine if command should be cached (cache miss on ARTICLE by message-ID)
+    #[inline]
+    fn should_cache_command(&self, command: &str) -> bool {
+        self.cache.is_some()
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
     }
 }
 
@@ -774,5 +837,317 @@ mod tests {
         let command = "BoDy <TeSt@ExAmPlE.cOm>";
         let msgid = common::extract_message_id(command);
         assert_eq!(msgid, Some("<TeSt@ExAmPlE.cOm>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_with_cache_enabled() {
+        let session = create_test_session_with_cache();
+        assert!(session.should_cache_command("ARTICLE <test@example.com>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_with_cache_disabled() {
+        let session = create_test_session_without_cache();
+        assert!(!session.should_cache_command("ARTICLE <test@example.com>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_non_article_command() {
+        let session = create_test_session_with_cache();
+        assert!(!session.should_cache_command("GROUP alt.test"));
+        assert!(!session.should_cache_command("LIST"));
+        assert!(!session.should_cache_command("QUIT"));
+    }
+
+    #[test]
+    fn test_should_cache_command_article_by_number() {
+        let session = create_test_session_with_cache();
+        // ARTICLE by number (not message-ID) should not be cached
+        assert!(!session.should_cache_command("ARTICLE 123"));
+    }
+
+    #[test]
+    fn test_should_cache_command_variations() {
+        let session = create_test_session_with_cache();
+        // Only ARTICLE, BODY, HEAD, STAT with message-ID are cacheable
+        assert!(session.should_cache_command("ARTICLE <msg@host>"));
+        assert!(session.should_cache_command("BODY <msg@host>"));
+        assert!(session.should_cache_command("HEAD <msg@host>"));
+        assert!(session.should_cache_command("STAT <msg@host>"));
+    }
+
+    // Tests for decide_command_routing pure function
+
+    #[test]
+    fn test_decide_routing_auth_commands_always_intercepted() {
+        use crate::command::AuthAction;
+
+        // Auth commands should always be intercepted regardless of other flags
+        let action = CommandAction::InterceptAuth(AuthAction::RequestPassword("test".to_string()));
+
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                true,
+                true,
+                RoutingMode::PerCommand,
+                "AUTHINFO USER test"
+            ),
+            CommandRoutingDecision::InterceptAuth
+        );
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                true,
+                RoutingMode::PerCommand,
+                "AUTHINFO USER test"
+            ),
+            CommandRoutingDecision::InterceptAuth
+        );
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                false,
+                RoutingMode::Stateful,
+                "AUTHINFO USER test"
+            ),
+            CommandRoutingDecision::InterceptAuth
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_forward_when_authenticated() {
+        let action = CommandAction::ForwardStateless;
+
+        // Should forward when authenticated, regardless of auth_enabled
+        assert_eq!(
+            decide_command_routing(action.clone(), true, true, RoutingMode::PerCommand, "LIST"),
+            CommandRoutingDecision::Forward
+        );
+        assert_eq!(
+            decide_command_routing(action.clone(), true, false, RoutingMode::PerCommand, "LIST"),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_forward_when_auth_disabled() {
+        let action = CommandAction::ForwardStateless;
+
+        // Should forward when auth is disabled, even if not authenticated
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                false,
+                RoutingMode::PerCommand,
+                "LIST"
+            ),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_require_auth_when_needed() {
+        let action = CommandAction::ForwardStateless;
+
+        // Should require auth when auth is enabled but not authenticated
+        assert_eq!(
+            decide_command_routing(action, false, true, RoutingMode::PerCommand, "LIST"),
+            CommandRoutingDecision::RequireAuth
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_switch_to_stateful_in_hybrid_mode() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Hybrid mode with stateful command should switch to stateful
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                true,
+                false,
+                RoutingMode::Hybrid,
+                "GROUP alt.test"
+            ),
+            CommandRoutingDecision::SwitchToStateful
+        );
+
+        // Also works when not authenticated
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                false,
+                false,
+                RoutingMode::Hybrid,
+                "XOVER 1-100"
+            ),
+            CommandRoutingDecision::SwitchToStateful
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_reject_in_per_command_mode() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Per-command mode should reject stateful commands
+        assert_eq!(
+            decide_command_routing(
+                action.clone(),
+                true,
+                false,
+                RoutingMode::PerCommand,
+                "GROUP alt.test"
+            ),
+            CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_reject_in_stateful_mode() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Stateful mode should reject (though this shouldn't happen in practice)
+        assert_eq!(
+            decide_command_routing(action, true, false, RoutingMode::Stateful, "INVALID"),
+            CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_hybrid_mode_stateless_forwarded() {
+        let action = CommandAction::ForwardStateless;
+
+        // Hybrid mode with stateless command should forward
+        assert_eq!(
+            decide_command_routing(action, true, false, RoutingMode::Hybrid, "LIST"),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_hybrid_mode_reject_non_stateful() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+
+        // Hybrid mode with rejected but non-stateful command should just reject
+        assert_eq!(
+            decide_command_routing(action, true, false, RoutingMode::Hybrid, "INVALIDCMD"),
+            CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_all_modes_with_stateful_commands() {
+        let action = CommandAction::Reject("502 Command not supported\r\n");
+        let stateful_commands = vec!["GROUP alt.test", "NEXT", "LAST", "XOVER 1-100"];
+
+        for cmd in stateful_commands {
+            // Hybrid mode: switch to stateful
+            assert_eq!(
+                decide_command_routing(action.clone(), true, false, RoutingMode::Hybrid, cmd),
+                CommandRoutingDecision::SwitchToStateful,
+                "Failed for command: {}",
+                cmd
+            );
+
+            // Per-command mode: reject
+            assert_eq!(
+                decide_command_routing(action.clone(), true, false, RoutingMode::PerCommand, cmd),
+                CommandRoutingDecision::Reject,
+                "Failed for command: {}",
+                cmd
+            );
+
+            // Stateful mode: reject (though shouldn't reach this in practice)
+            assert_eq!(
+                decide_command_routing(action.clone(), true, false, RoutingMode::Stateful, cmd),
+                CommandRoutingDecision::Reject,
+                "Failed for command: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_routing_auth_flow_progression() {
+        let stateless_action = CommandAction::ForwardStateless;
+
+        // Step 1: Not authenticated, auth enabled -> require auth
+        assert_eq!(
+            decide_command_routing(
+                stateless_action.clone(),
+                false,
+                true,
+                RoutingMode::PerCommand,
+                "LIST"
+            ),
+            CommandRoutingDecision::RequireAuth
+        );
+
+        // Step 2: Authenticated, auth enabled -> forward
+        assert_eq!(
+            decide_command_routing(
+                stateless_action.clone(),
+                true,
+                true,
+                RoutingMode::PerCommand,
+                "LIST"
+            ),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_should_cache_command_body_and_head() {
+        let session = create_test_session_with_cache();
+        // BODY and HEAD by message-ID should also be cached
+        assert!(session.should_cache_command("BODY <test@example.com>"));
+        assert!(session.should_cache_command("HEAD <msg@host>"));
+        assert!(session.should_cache_command("STAT <stat@test>"));
+    }
+
+    #[test]
+    fn test_should_cache_command_edge_cases() {
+        let session = create_test_session_with_cache();
+        // Empty or malformed commands should not be cached
+        assert!(!session.should_cache_command(""));
+        assert!(!session.should_cache_command("ARTICLE"));
+        // Incomplete message-ID is still recognized by classifier
+        // but won't be cached because extraction will fail later
+        assert!(session.should_cache_command("ARTICLE <incomplete"));
+    }
+
+    // Helper functions for tests
+    fn create_test_session_with_cache() -> ClientSession {
+        use crate::auth::AuthHandler;
+        use crate::cache::ArticleCache;
+        use crate::types::BufferSize;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+
+        ClientSession::builder(addr, buffer_pool, auth_handler)
+            .with_cache(Arc::new(ArticleCache::new(100, Duration::from_secs(3600))))
+            .build()
+    }
+
+    fn create_test_session_without_cache() -> ClientSession {
+        use crate::auth::AuthHandler;
+        use crate::types::BufferSize;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+
+        ClientSession::builder(addr, buffer_pool, auth_handler).build()
     }
 }

@@ -6,7 +6,7 @@ use super::constants::{BACKEND_COLORS, throughput};
 use super::types::{
     BackendChartData, BackendIndex, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec,
 };
-use crate::config::ServerConfig;
+use crate::config::Server;
 use crate::tui::TuiApp;
 use crate::tui::app::ThroughputPoint;
 
@@ -53,7 +53,7 @@ type PointAccumulator = ((PointVec, PointVec), ChartY);
 /// 2. For each server, fold over history to build points and track backend max
 ///
 /// Returns (chart_data, global_max_throughput)
-pub fn build_chart_data(servers: &[ServerConfig], app: &TuiApp) -> (ChartDataVec, f64) {
+pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64) {
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
         let x = ChartX::from(idx);
@@ -91,12 +91,12 @@ pub fn build_chart_data(servers: &[ServerConfig], app: &TuiApp) -> (ChartDataVec
                     accumulate_points,
                 );
 
-            chart_data.push(BackendChartData {
-                name: server.name.as_str().to_string(),
-                color: backend_color(BackendIndex::from(index)),
+            chart_data.push(BackendChartData::new(
+                server.name.as_str().to_string(),
+                backend_color(BackendIndex::from(index)),
                 sent_points,
                 recv_points,
-            });
+            ));
 
             (chart_data, global_max.max(backend_max.get()))
         },
@@ -145,51 +145,6 @@ pub fn format_throughput_label(value: f64) -> String {
         format!("{:.0} KB/s", value / throughput::ONE_KB)
     } else {
         format!("{:.0} B/s", value)
-    }
-}
-
-// ============================================================================
-// Backend List Helpers
-// ============================================================================
-
-/// Backend display information (extracted for testing)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendDisplayInfo {
-    pub status_color: Color,
-    pub error_indicator: String,
-}
-
-/// Calculate backend status color based on active connections
-#[inline]
-#[must_use]
-pub fn backend_status_color(active_connections: u64) -> Color {
-    use super::constants::status;
-
-    if active_connections > 0 {
-        status::ACTIVE
-    } else {
-        status::INACTIVE
-    }
-}
-
-/// Format error indicator for backend
-#[must_use]
-pub fn format_error_indicator(errors: u64) -> String {
-    use super::constants::text;
-
-    if errors > 0 {
-        format!("{}{}", text::WARNING_ICON, errors)
-    } else {
-        String::new()
-    }
-}
-
-/// Get backend display information
-#[must_use]
-pub fn backend_display_info(active_connections: u64, errors: u64) -> BackendDisplayInfo {
-    BackendDisplayInfo {
-        status_color: backend_status_color(active_connections),
-        error_indicator: format_error_indicator(errors),
     }
 }
 
@@ -316,12 +271,12 @@ mod tests {
 
         // Add 8 backends (at SmallVec capacity)
         for i in 0..8 {
-            chart_data.push(BackendChartData {
-                name: format!("Server {}", i),
-                color: backend_color(BackendIndex::from(i)),
-                sent_points: PointVec::new(),
-                recv_points: PointVec::new(),
-            });
+            chart_data.push(BackendChartData::new(
+                format!("Server {}", i),
+                backend_color(BackendIndex::from(i)),
+                PointVec::new(),
+                PointVec::new(),
+            ));
         }
 
         assert_eq!(chart_data.len(), 8);
@@ -331,65 +286,17 @@ mod tests {
 
     #[test]
     fn test_backend_chart_data_structure() {
-        let data = BackendChartData {
-            name: "Test Server".to_string(),
-            color: backend_color(BackendIndex::from(0)),
-            sent_points: PointVec::new(),
-            recv_points: PointVec::new(),
-        };
+        let data = BackendChartData::new(
+            "Test Server".to_string(),
+            backend_color(BackendIndex::from(0)),
+            PointVec::new(),
+            PointVec::new(),
+        );
 
         assert_eq!(data.name, "Test Server");
-        assert_eq!(data.sent_points.len(), 0);
-        assert_eq!(data.recv_points.len(), 0);
-    }
-
-    // ========================================================================
-    // Backend Display Tests
-    // ========================================================================
-
-    #[test]
-    fn test_backend_status_color_active() {
-        use super::super::constants::status;
-        assert_eq!(backend_status_color(1), status::ACTIVE);
-        assert_eq!(backend_status_color(5), status::ACTIVE);
-        assert_eq!(backend_status_color(100), status::ACTIVE);
-    }
-
-    #[test]
-    fn test_backend_status_color_inactive() {
-        use super::super::constants::status;
-        assert_eq!(backend_status_color(0), status::INACTIVE);
-    }
-
-    #[test]
-    fn test_format_error_indicator_no_errors() {
-        assert_eq!(format_error_indicator(0), "");
-    }
-
-    #[test]
-    fn test_format_error_indicator_with_errors() {
-        use super::super::constants::text;
-        assert_eq!(
-            format_error_indicator(1),
-            format!("{}1", text::WARNING_ICON)
-        );
-        assert_eq!(
-            format_error_indicator(5),
-            format!("{}5", text::WARNING_ICON)
-        );
-    }
-
-    #[test]
-    fn test_backend_display_info() {
-        use super::super::constants::status;
-
-        let info = backend_display_info(3, 0);
-        assert_eq!(info.status_color, status::ACTIVE);
-        assert_eq!(info.error_indicator, "");
-
-        let info_with_errors = backend_display_info(0, 5);
-        assert_eq!(info_with_errors.status_color, status::INACTIVE);
-        assert!(info_with_errors.error_indicator.contains('5'));
+        // Verify pre-computed tuples are empty
+        assert_eq!(data.sent_points_as_tuples().len(), 0);
+        assert_eq!(data.recv_points_as_tuples().len(), 0);
     }
 
     // ========================================================================

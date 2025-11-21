@@ -245,39 +245,37 @@ async fn test_date_health_check_connection_closed() -> Result<()> {
 fn test_health_check_metrics_initialization() {
     let metrics = HealthCheckMetrics::new();
 
-    assert_eq!(metrics.cycles_run, 0);
-    assert_eq!(metrics.connections_checked, 0);
-    assert_eq!(metrics.connections_failed, 0);
-    assert!(metrics.last_check_time.is_none());
+    assert_eq!(metrics.cycles_run(), 0);
+    assert_eq!(metrics.connections_checked(), 0);
+    assert_eq!(metrics.connections_failed(), 0);
     assert_eq!(metrics.failure_rate(), 0.0);
 }
 
 /// Test health check metrics recording a cycle
 #[test]
 fn test_health_check_metrics_record_cycle() {
-    let mut metrics = HealthCheckMetrics::new();
+    let metrics = HealthCheckMetrics::new();
 
     metrics.record_cycle(10, 2);
 
-    assert_eq!(metrics.cycles_run, 1);
-    assert_eq!(metrics.connections_checked, 10);
-    assert_eq!(metrics.connections_failed, 2);
-    assert!(metrics.last_check_time.is_some());
+    assert_eq!(metrics.cycles_run(), 1);
+    assert_eq!(metrics.connections_checked(), 10);
+    assert_eq!(metrics.connections_failed(), 2);
     assert_eq!(metrics.failure_rate(), 0.2);
 }
 
 /// Test health check metrics multiple cycles
 #[test]
 fn test_health_check_metrics_multiple_cycles() {
-    let mut metrics = HealthCheckMetrics::new();
+    let metrics = HealthCheckMetrics::new();
 
     metrics.record_cycle(10, 1);
     metrics.record_cycle(5, 0);
     metrics.record_cycle(8, 2);
 
-    assert_eq!(metrics.cycles_run, 3);
-    assert_eq!(metrics.connections_checked, 23);
-    assert_eq!(metrics.connections_failed, 3);
+    assert_eq!(metrics.cycles_run(), 3);
+    assert_eq!(metrics.connections_checked(), 23);
+    assert_eq!(metrics.connections_failed(), 3);
 
     // 3 failures out of 23 checks
     let expected_rate = 3.0 / 23.0;
@@ -305,29 +303,15 @@ fn test_health_check_metrics_failure_rate_edge_cases() {
 /// Test health check metrics with only failures
 #[test]
 fn test_health_check_metrics_all_failures() {
-    let mut metrics = HealthCheckMetrics::new();
+    let metrics = HealthCheckMetrics::new();
 
     metrics.record_cycle(10, 10);
     metrics.record_cycle(5, 5);
 
-    assert_eq!(metrics.cycles_run, 2);
-    assert_eq!(metrics.connections_checked, 15);
-    assert_eq!(metrics.connections_failed, 15);
+    assert_eq!(metrics.cycles_run(), 2);
+    assert_eq!(metrics.connections_checked(), 15);
+    assert_eq!(metrics.connections_failed(), 15);
     assert_eq!(metrics.failure_rate(), 1.0);
-}
-
-/// Test health check metrics clone
-#[test]
-fn test_health_check_metrics_clone() {
-    let mut metrics = HealthCheckMetrics::new();
-    metrics.record_cycle(10, 3);
-
-    let cloned = metrics.clone();
-
-    assert_eq!(cloned.cycles_run, metrics.cycles_run);
-    assert_eq!(cloned.connections_checked, metrics.connections_checked);
-    assert_eq!(cloned.connections_failed, metrics.connections_failed);
-    assert_eq!(cloned.failure_rate(), metrics.failure_rate());
 }
 
 /// Test DATE command is correctly formatted

@@ -6,39 +6,13 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use nntp_proxy::{
-    NntpProxy, RoutingMode, RuntimeConfig, load_config_with_fallback, tui,
-    types::{ConfigPath, Port, ThreadCount},
-};
+use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback, tui};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Proxy with TUI Dashboard", long_about = None)]
 struct Args {
-    /// Port to listen on (overrides config file)
-    #[arg(short, long, env = "NNTP_PROXY_PORT")]
-    port: Option<Port>,
-
-    /// Host to bind to (overrides config file)
-    #[arg(long, env = "NNTP_PROXY_HOST")]
-    host: Option<String>,
-
-    /// Routing mode: standard, per-command, or hybrid
-    #[arg(
-        short = 'm',
-        long = "routing-mode",
-        value_enum,
-        default_value = "hybrid",
-        env = "NNTP_PROXY_ROUTING_MODE"
-    )]
-    routing_mode: RoutingMode,
-
-    /// Configuration file path
-    #[arg(short, long, default_value = "config.toml", env = "NNTP_PROXY_CONFIG")]
-    config: ConfigPath,
-
-    /// Number of worker threads (default: 1, use 0 for CPU cores)
-    #[arg(short, long, env = "NNTP_PROXY_THREADS")]
-    threads: Option<ThreadCount>,
+    #[command(flatten)]
+    common: CommonArgs,
 
     /// Disable TUI and run in headless mode
     #[arg(long, default_value = "false")]
@@ -81,7 +55,7 @@ fn main() -> Result<()> {
     };
 
     // Build and configure runtime
-    let runtime_config = RuntimeConfig::from_args(args.threads);
+    let runtime_config = RuntimeConfig::from_args(args.common.threads);
     let rt = runtime_config.build_runtime()?;
 
     rt.block_on(run_proxy(args, log_buffer))
@@ -89,7 +63,7 @@ fn main() -> Result<()> {
 
 async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -> Result<()> {
     // Load configuration with automatic fallback
-    let (config, source) = load_config_with_fallback(args.config.as_str())?;
+    let (config, source) = load_config_with_fallback(args.common.config.as_str())?;
 
     info!("Loaded configuration from {}", source.description());
     info!("Loaded {} backend servers:", config.servers.len());
@@ -98,13 +72,16 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
     }
 
     // Extract listen address before moving config
-    let listen_host = args.host.unwrap_or_else(|| config.proxy.host.clone());
-    let listen_port = args.port.unwrap_or(config.proxy.port);
+    let listen_host = args
+        .common
+        .host
+        .unwrap_or_else(|| config.proxy.host.clone());
+    let listen_port = args.common.port.unwrap_or(config.proxy.port);
 
     // Create proxy with metrics enabled for TUI
     let proxy = Arc::new(
         NntpProxy::builder(config)
-            .with_routing_mode(args.routing_mode)
+            .with_routing_mode(args.common.routing_mode)
             .with_metrics() // Enable metrics for TUI (causes ~45% perf penalty)
             .build()?,
     );
@@ -162,7 +139,7 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP proxy listening on {} ({})",
-        listen_addr, args.routing_mode
+        listen_addr, args.common.routing_mode
     );
 
     // Wait for prewarming to complete before accepting connections
@@ -204,7 +181,7 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
     });
 
     // Accept connections
-    let uses_per_command_routing = args.routing_mode.supports_per_command_routing();
+    let uses_per_command_routing = args.common.routing_mode.supports_per_command_routing();
 
     loop {
         tokio::select! {

@@ -4,7 +4,7 @@
 //! in integration tests.
 
 use anyhow::Result;
-use nntp_proxy::config::{Config, ServerConfig};
+use nntp_proxy::config::{Config, Server};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -243,7 +243,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     Config {
         servers: server_ports
             .into_iter()
-            .map(|(port, name)| ServerConfig {
+            .map(|(port, name)| Server {
                 host: HostName::new("127.0.0.1".to_string()).unwrap(),
                 port: Port::new(port).unwrap(),
                 name: ServerName::new(name.to_string()).unwrap(),
@@ -278,7 +278,7 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
     Config {
         servers: server_ports
             .into_iter()
-            .map(|(port, name, user, pass)| ServerConfig {
+            .map(|(port, name, user, pass)| Server {
                 host: HostName::new("127.0.0.1".to_string()).unwrap(),
                 port: Port::new(port).unwrap(),
                 name: ServerName::new(name.to_string()).unwrap(),
@@ -618,16 +618,16 @@ mod tests {
     fn test_create_test_auth_handler() {
         let auth = create_test_auth_handler();
         assert!(auth.is_enabled());
-        assert!(auth.validate("user", "pass"));
-        assert!(!auth.validate("wrong", "credentials"));
+        assert!(auth.validate_credentials("user", "pass"));
+        assert!(!auth.validate_credentials("wrong", "credentials"));
     }
 
     #[test]
     fn test_create_test_auth_handler_with() {
         let auth = create_test_auth_handler_with("alice", "secret123");
         assert!(auth.is_enabled());
-        assert!(auth.validate("alice", "secret123"));
-        assert!(!auth.validate("alice", "wrong"));
+        assert!(auth.validate_credentials("alice", "secret123"));
+        assert!(!auth.validate_credentials("alice", "wrong"));
     }
 
     #[test]
@@ -635,7 +635,7 @@ mod tests {
         let auth = create_test_auth_handler_disabled();
         assert!(!auth.is_enabled());
         // Disabled auth accepts anything
-        assert!(auth.validate("any", "thing"));
+        assert!(auth.validate_credentials("any", "thing"));
     }
 
     #[test]

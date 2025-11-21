@@ -13,22 +13,11 @@ pub(crate) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
 
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AuthResult {
-    /// Number of bytes written to client
-    pub bytes_written: BytesTransferred,
-    /// Whether authentication succeeded
-    pub authenticated: bool,
-}
-
-impl AuthResult {
-    /// Create a new auth result
-    #[inline]
-    pub const fn new(bytes_written: BytesTransferred, authenticated: bool) -> Self {
-        Self {
-            bytes_written,
-            authenticated,
-        }
-    }
+pub(crate) enum AuthResult {
+    /// Authentication succeeded
+    Authenticated(BytesTransferred),
+    /// Authentication failed or not required yet
+    NotAuthenticated(BytesTransferred),
 }
 
 /// Result of checking for QUIT command
@@ -49,25 +38,6 @@ pub(crate) fn extract_message_id(command: &str) -> Option<&str> {
 }
 
 /// Handle AUTHINFO command and update auth state
-///
-/// This function encapsulates the common auth handling logic used across
-/// all routing modes. It:
-/// 1. Stores username if AUTHINFO USER command
-/// 2. Calls the auth handler to process the command
-/// 3. Updates the authenticated flag on success
-/// 4. Returns bytes written and success status
-///
-/// # Arguments
-///
-/// * `auth_handler` - The authentication handler to use
-/// * `auth_action` - The parsed auth action from command classification
-/// * `client_write` - Write half of client connection for responses
-/// * `auth_username` - Mutable reference to Option<String> that stores username between USER and PASS
-/// * `authenticated` - AtomicBool flag to set when auth succeeds
-///
-/// # Returns
-///
-/// `AuthResult` containing bytes written and whether authentication succeeded
 pub(crate) async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction,
@@ -78,12 +48,10 @@ pub(crate) async fn handle_auth_command<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    // Store username if this is AUTHINFO USER
     if let AuthAction::RequestPassword(ref username) = auth_action {
         *auth_username = Some(username.clone());
     }
 
-    // Handle auth and validate
     let (bytes, auth_success) = auth_handler
         .handle_auth_command(auth_action, client_write, auth_username.as_deref())
         .await?;
@@ -95,15 +63,14 @@ where
     let mut bytes_written = BytesTransferred::zero();
     bytes_written.add(bytes);
 
-    Ok(AuthResult::new(bytes_written, auth_success))
+    Ok(if auth_success {
+        AuthResult::Authenticated(bytes_written)
+    } else {
+        AuthResult::NotAuthenticated(bytes_written)
+    })
 }
 
-/// Check if command is QUIT and send closing response if so
-///
-/// # Returns
-///
-/// `QuitStatus::Quit(bytes)` if QUIT was detected and response sent
-/// `QuitStatus::Continue` if not a QUIT command
+/// Check if command is QUIT and send closing response
 pub(crate) async fn handle_quit_command<W>(
     command: &str,
     client_write: &mut W,
@@ -126,5 +93,149 @@ where
         Ok(QuitStatus::Quit(bytes))
     } else {
         Ok(QuitStatus::Continue)
+    }
+}
+
+/// Handle successful authentication with all side effects
+///
+/// Sets username, records connection stats, updates metrics
+pub(crate) fn on_authentication_success(
+    client_addr: std::net::SocketAddr,
+    username: Option<String>,
+    routing_mode: &crate::config::RoutingMode,
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
+    set_username_fn: impl FnOnce(Option<String>),
+) {
+    use tracing::debug;
+
+    debug!("Client {} authenticated as: {:?}", client_addr, username);
+
+    // Store username in session
+    set_username_fn(username.clone());
+
+    // Record connection for aggregation (after auth so we have username)
+    if let Some(stats) = connection_stats {
+        stats.record_connection(
+            username.as_deref(),
+            &routing_mode.to_string().to_lowercase(),
+        );
+    }
+
+    // Track user connection in metrics
+    if let Some(m) = metrics {
+        m.user_connection_opened(username.as_deref());
+        debug!(
+            "Client {} opened connection for user: {:?}",
+            client_addr, username
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_message_id_valid() {
+        let cmd = "ARTICLE <test@example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_with_extra_text() {
+        let cmd = "ARTICLE <msg@server.com> extra stuff";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<msg@server.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_no_brackets() {
+        let cmd = "ARTICLE 123";
+        let msgid = extract_message_id(cmd);
+        assert!(msgid.is_none());
+    }
+
+    #[test]
+    fn test_extract_message_id_empty_brackets() {
+        let cmd = "ARTICLE <>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_incomplete_open() {
+        let cmd = "ARTICLE <incomplete";
+        let msgid = extract_message_id(cmd);
+        assert!(msgid.is_none());
+    }
+
+    #[test]
+    fn test_extract_message_id_incomplete_close() {
+        let cmd = "ARTICLE incomplete>";
+        let msgid = extract_message_id(cmd);
+        assert!(msgid.is_none());
+    }
+
+    #[test]
+    fn test_extract_message_id_multiple_brackets() {
+        let cmd = "ARTICLE <first@example.com> <second@example.com>";
+        let msgid = extract_message_id(cmd);
+        // Should return first message-ID
+        assert_eq!(msgid, Some("<first@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_lowercase_command() {
+        let cmd = "article <test@example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<test@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_head_command() {
+        let cmd = "HEAD <msg@example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<msg@example.com>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_stat_command() {
+        let cmd = "STAT <article@news.server>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<article@news.server>"));
+    }
+
+    #[test]
+    fn test_extract_message_id_complex() {
+        let cmd = "ARTICLE <CAFEBaBe_12345$@news.example.com>";
+        let msgid = extract_message_id(cmd);
+        assert_eq!(msgid, Some("<CAFEBaBe_12345$@news.example.com>"));
+    }
+
+    #[test]
+    fn test_auth_result_equality() {
+        let auth1 = AuthResult::Authenticated(BytesTransferred::new(100));
+        let auth2 = AuthResult::Authenticated(BytesTransferred::new(100));
+        let not_auth = AuthResult::NotAuthenticated(BytesTransferred::new(100));
+
+        assert_eq!(auth1, auth2);
+        assert_ne!(auth1, not_auth);
+    }
+
+    #[test]
+    fn test_quit_status_equality() {
+        let quit1 = QuitStatus::Quit(BytesTransferred::new(50));
+        let quit2 = QuitStatus::Quit(BytesTransferred::new(50));
+        let cont = QuitStatus::Continue;
+
+        assert_eq!(quit1, quit2);
+        assert_ne!(quit1, cont);
+    }
+
+    #[test]
+    fn test_small_transfer_threshold() {
+        assert_eq!(SMALL_TRANSFER_THRESHOLD, 500);
     }
 }

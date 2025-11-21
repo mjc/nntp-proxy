@@ -32,6 +32,7 @@
 //!   but commands are still processed serially (NNTP is synchronous)
 
 // Module declarations
+pub mod args;
 pub mod auth;
 pub mod connection_error;
 pub mod formatting;
@@ -41,6 +42,11 @@ pub mod protocol;
 mod proxy;
 pub mod stream;
 pub mod tui;
+
+// Test utilities (macros for reducing newtype test boilerplate)
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
 
 // Public modules for integration tests
 pub mod cache;
@@ -56,10 +62,11 @@ pub mod tls;
 pub mod types;
 
 // Public exports
+pub use args::{CacheArgs, CommonArgs};
 pub use config::{
-    CacheConfig, Config, ConfigSource, RoutingMode, ServerConfig, create_default_config,
-    has_server_env_vars, load_config, load_config_from_env, load_config_with_fallback,
+    Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
+    load_config, load_config_from_env, load_config_with_fallback,
 };
 pub use network::SocketOptimizer;
-pub use proxy::{NntpProxy, NntpProxyBuilder};
-pub use runtime::RuntimeConfig;
+pub use proxy::{NntpProxy, NntpProxyBuilder, is_client_disconnect_error};
+pub use runtime::{RuntimeConfig, shutdown_signal};

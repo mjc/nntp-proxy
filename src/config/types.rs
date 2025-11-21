@@ -2,6 +2,7 @@
 //!
 //! This module contains all the core configuration structures used by the proxy.
 
+use super::defaults;
 use crate::types::{
     CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, ThreadCount,
     duration_serde, option_duration_serde,
@@ -13,8 +14,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutingMode {
-    /// Standard 1:1 mode - each client gets a dedicated backend connection
-    Standard,
+    /// Stateful 1:1 mode - each client gets a dedicated backend connection
+    Stateful,
     /// Per-command routing - each command can use a different backend (stateless only)
     PerCommand,
     /// Hybrid mode - starts in per-command routing, auto-switches to stateful on first stateful command
@@ -40,15 +41,15 @@ impl RoutingMode {
     /// Check if this mode can handle stateful commands
     #[must_use]
     pub const fn supports_stateful_commands(&self) -> bool {
-        matches!(self, Self::Standard | Self::Hybrid)
+        matches!(self, Self::Stateful | Self::Hybrid)
     }
 
     /// Get a human-readable description of this routing mode
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::Standard => "standard 1:1 mode",
-            Self::PerCommand => "per-command routing mode",
+            Self::Stateful => "stateful 1:1 mode",
+            Self::PerCommand => "per-command routing mode (stateless)",
             Self::Hybrid => "hybrid routing mode",
         }
     }
@@ -65,25 +66,25 @@ impl std::fmt::Display for RoutingMode {
 pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
-    pub servers: Vec<ServerConfig>,
+    pub servers: Vec<Server>,
     /// Proxy server settings
     #[serde(default)]
-    pub proxy: ProxyConfig,
+    pub proxy: Proxy,
     /// Health check configuration
     #[serde(default)]
-    pub health_check: HealthCheckConfig,
+    pub health_check: HealthCheck,
     /// Cache configuration (optional, for caching proxy)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache: Option<CacheConfig>,
+    pub cache: Option<Cache>,
     /// Client authentication configuration
     #[serde(default)]
-    pub client_auth: ClientAuthConfig,
+    pub client_auth: ClientAuth,
 }
 
 /// Proxy server settings
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ProxyConfig {
+pub struct Proxy {
     /// Host/IP to bind to (default: 0.0.0.0)
     pub host: String,
     /// Port to listen on (default: 8119)
@@ -92,12 +93,12 @@ pub struct ProxyConfig {
     pub threads: ThreadCount,
 }
 
-impl ProxyConfig {
+impl Proxy {
     /// Default listen host (all interfaces)
     pub const DEFAULT_HOST: &'static str = "0.0.0.0";
 }
 
-impl Default for ProxyConfig {
+impl Default for Proxy {
     fn default() -> Self {
         Self {
             host: Self::DEFAULT_HOST.to_string(),
@@ -109,7 +110,7 @@ impl Default for ProxyConfig {
 
 /// Cache configuration for article caching
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CacheConfig {
+pub struct Cache {
     /// Maximum number of articles to cache
     #[serde(default = "super::defaults::cache_max_capacity")]
     pub max_capacity: CacheCapacity,
@@ -118,18 +119,18 @@ pub struct CacheConfig {
     pub ttl: Duration,
 }
 
-impl Default for CacheConfig {
+impl Default for Cache {
     fn default() -> Self {
         Self {
-            max_capacity: super::defaults::cache_max_capacity(),
-            ttl: super::defaults::cache_ttl(),
+            max_capacity: defaults::cache_max_capacity(),
+            ttl: defaults::cache_ttl(),
         }
     }
 }
 
 /// Health check configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HealthCheckConfig {
+pub struct HealthCheck {
     /// Interval between health checks
     #[serde(
         with = "duration_serde",
@@ -147,7 +148,7 @@ pub struct HealthCheckConfig {
     pub unhealthy_threshold: MaxErrors,
 }
 
-impl Default for HealthCheckConfig {
+impl Default for HealthCheck {
     fn default() -> Self {
         Self {
             interval: super::defaults::health_check_interval(),
@@ -159,7 +160,7 @@ impl Default for HealthCheckConfig {
 
 /// Client authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct ClientAuthConfig {
+pub struct ClientAuth {
     /// Required username for client authentication (if set, auth is enabled)
     /// DEPRECATED: Use `users` instead for multi-user support
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,7 +184,7 @@ pub struct UserCredentials {
     pub password: String,
 }
 
-impl ClientAuthConfig {
+impl ClientAuth {
     /// Check if authentication is enabled
     pub fn is_enabled(&self) -> bool {
         // Auth is enabled if either the legacy single-user config or multi-user list is populated
@@ -210,7 +211,7 @@ impl ClientAuthConfig {
 
 /// Configuration for a single backend server
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ServerConfig {
+pub struct Server {
     pub host: HostName,
     pub port: Port,
     pub name: ServerName,
@@ -252,23 +253,23 @@ pub struct ServerConfig {
     pub health_check_pool_timeout: Duration,
 }
 
-/// Builder for constructing `ServerConfig` instances
+/// Builder for constructing `Server` instances
 ///
 /// Provides a fluent API for creating server configurations, especially useful in tests
-/// where creating ServerConfig with all 11+ fields is verbose.
+/// where creating Server with all 11+ fields is verbose.
 ///
 /// # Examples
 ///
 /// ```
-/// use nntp_proxy::config::ServerConfig;
+/// use nntp_proxy::config::Server;
 ///
 /// // Minimal configuration
-/// let config = ServerConfig::builder("news.example.com", 119)
+/// let config = Server::builder("news.example.com", 119)
 ///     .build()
 ///     .unwrap();
 ///
 /// // With authentication and TLS
-/// let config = ServerConfig::builder("secure.example.com", 563)
+/// let config = Server::builder("secure.example.com", 563)
 ///     .name("Secure Server")
 ///     .username("user")
 ///     .password("pass")
@@ -277,7 +278,7 @@ pub struct ServerConfig {
 ///     .build()
 ///     .unwrap();
 /// ```
-pub struct ServerConfigBuilder {
+pub struct ServerBuilder {
     host: String,
     port: u16,
     name: Option<String>,
@@ -292,7 +293,7 @@ pub struct ServerConfigBuilder {
     health_check_pool_timeout: Option<Duration>,
 }
 
-impl ServerConfigBuilder {
+impl ServerBuilder {
     /// Create a new builder with required parameters
     ///
     /// # Arguments
@@ -386,7 +387,7 @@ impl ServerConfigBuilder {
         self
     }
 
-    /// Build the ServerConfig
+    /// Build the Server
     ///
     /// # Errors
     ///
@@ -395,7 +396,7 @@ impl ServerConfigBuilder {
     /// - Port is 0
     /// - Name is empty (when explicitly set)
     /// - Max connections is 0 (when explicitly set)
-    pub fn build(self) -> Result<ServerConfig, anyhow::Error> {
+    pub fn build(self) -> Result<Server, anyhow::Error> {
         use crate::types::{HostName, MaxConnections, Port, ServerName};
 
         let host = HostName::new(self.host.clone())?;
@@ -423,7 +424,7 @@ impl ServerConfigBuilder {
             .health_check_pool_timeout
             .unwrap_or_else(super::defaults::health_check_pool_timeout);
 
-        Ok(ServerConfig {
+        Ok(Server {
             host,
             port,
             name,
@@ -440,22 +441,294 @@ impl ServerConfigBuilder {
     }
 }
 
-impl ServerConfig {
-    /// Create a builder for constructing a ServerConfig
+impl Server {
+    /// Create a builder for constructing a Server
     ///
     /// # Examples
     ///
     /// ```
-    /// use nntp_proxy::config::ServerConfig;
+    /// use nntp_proxy::config::Server;
     ///
-    /// let config = ServerConfig::builder("news.example.com", 119)
+    /// let config = Server::builder("news.example.com", 119)
     ///     .name("Example Server")
     ///     .max_connections(15)
     ///     .build()
     ///     .unwrap();
     /// ```
     #[must_use]
-    pub fn builder(host: impl Into<String>, port: u16) -> ServerConfigBuilder {
-        ServerConfigBuilder::new(host, port)
+    pub fn builder(host: impl Into<String>, port: u16) -> ServerBuilder {
+        ServerBuilder::new(host, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RoutingMode tests
+    #[test]
+    fn test_routing_mode_default() {
+        assert_eq!(RoutingMode::default(), RoutingMode::Hybrid);
+    }
+
+    #[test]
+    fn test_routing_mode_supports_per_command() {
+        assert!(RoutingMode::PerCommand.supports_per_command_routing());
+        assert!(RoutingMode::Hybrid.supports_per_command_routing());
+        assert!(!RoutingMode::Stateful.supports_per_command_routing());
+    }
+
+    #[test]
+    fn test_routing_mode_supports_stateful() {
+        assert!(RoutingMode::Stateful.supports_stateful_commands());
+        assert!(RoutingMode::Hybrid.supports_stateful_commands());
+        assert!(!RoutingMode::PerCommand.supports_stateful_commands());
+    }
+
+    #[test]
+    fn test_routing_mode_as_str() {
+        assert_eq!(RoutingMode::Stateful.as_str(), "stateful 1:1 mode");
+        assert_eq!(
+            RoutingMode::PerCommand.as_str(),
+            "per-command routing mode (stateless)"
+        );
+        assert_eq!(RoutingMode::Hybrid.as_str(), "hybrid routing mode");
+    }
+
+    #[test]
+    fn test_routing_mode_display() {
+        assert_eq!(RoutingMode::Stateful.to_string(), "stateful 1:1 mode");
+        assert_eq!(RoutingMode::Hybrid.to_string(), "hybrid routing mode");
+    }
+
+    // Proxy tests
+    #[test]
+    fn test_proxy_default() {
+        let proxy = Proxy::default();
+        assert_eq!(proxy.host, "0.0.0.0");
+        assert_eq!(proxy.port.get(), 8119);
+    }
+
+    #[test]
+    fn test_proxy_default_host_constant() {
+        assert_eq!(Proxy::DEFAULT_HOST, "0.0.0.0");
+    }
+
+    // Cache tests
+    #[test]
+    fn test_cache_default() {
+        let cache = Cache::default();
+        assert_eq!(cache.max_capacity.get(), 10000);
+        assert_eq!(cache.ttl, Duration::from_secs(3600));
+    }
+
+    // HealthCheck tests
+    #[test]
+    fn test_health_check_default() {
+        let hc = HealthCheck::default();
+        assert_eq!(hc.interval, Duration::from_secs(30));
+        assert_eq!(hc.timeout, Duration::from_secs(5));
+        assert_eq!(hc.unhealthy_threshold.get(), 3);
+    }
+
+    // ClientAuth tests
+    #[test]
+    fn test_client_auth_is_enabled_legacy() {
+        let mut auth = ClientAuth::default();
+        assert!(!auth.is_enabled());
+
+        auth.username = Some("user".to_string());
+        auth.password = Some("pass".to_string());
+        assert!(auth.is_enabled());
+    }
+
+    #[test]
+    fn test_client_auth_is_enabled_multi_user() {
+        let mut auth = ClientAuth::default();
+        auth.users.push(UserCredentials {
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+        });
+        assert!(auth.is_enabled());
+    }
+
+    #[test]
+    fn test_client_auth_all_users_legacy() {
+        let mut auth = ClientAuth::default();
+        auth.username = Some("user".to_string());
+        auth.password = Some("pass".to_string());
+
+        let users = auth.all_users();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0], ("user", "pass"));
+    }
+
+    #[test]
+    fn test_client_auth_all_users_multi() {
+        let mut auth = ClientAuth::default();
+        auth.users.push(UserCredentials {
+            username: "alice".to_string(),
+            password: "alice_pw".to_string(),
+        });
+        auth.users.push(UserCredentials {
+            username: "bob".to_string(),
+            password: "bob_pw".to_string(),
+        });
+
+        let users = auth.all_users();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0], ("alice", "alice_pw"));
+        assert_eq!(users[1], ("bob", "bob_pw"));
+    }
+
+    #[test]
+    fn test_client_auth_all_users_combined() {
+        let mut auth = ClientAuth::default();
+        auth.username = Some("legacy".to_string());
+        auth.password = Some("legacy_pw".to_string());
+        auth.users.push(UserCredentials {
+            username: "alice".to_string(),
+            password: "alice_pw".to_string(),
+        });
+
+        let users = auth.all_users();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0], ("legacy", "legacy_pw"));
+        assert_eq!(users[1], ("alice", "alice_pw"));
+    }
+
+    // ServerBuilder tests
+    #[test]
+    fn test_server_builder_minimal() {
+        let server = Server::builder("news.example.com", 119).build().unwrap();
+
+        assert_eq!(server.host.as_str(), "news.example.com");
+        assert_eq!(server.port.get(), 119);
+        assert_eq!(server.name.as_str(), "news.example.com:119");
+        assert_eq!(server.max_connections.get(), 10);
+        assert!(!server.use_tls);
+        assert!(server.tls_verify_cert); // Secure by default
+    }
+
+    #[test]
+    fn test_server_builder_with_name() {
+        let server = Server::builder("localhost", 119)
+            .name("Test Server")
+            .build()
+            .unwrap();
+
+        assert_eq!(server.name.as_str(), "Test Server");
+    }
+
+    #[test]
+    fn test_server_builder_with_auth() {
+        let server = Server::builder("news.example.com", 119)
+            .username("testuser")
+            .password("testpass")
+            .build()
+            .unwrap();
+
+        assert_eq!(server.username.as_ref().unwrap(), "testuser");
+        assert_eq!(server.password.as_ref().unwrap(), "testpass");
+    }
+
+    #[test]
+    fn test_server_builder_with_max_connections() {
+        let server = Server::builder("localhost", 119)
+            .max_connections(20)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.max_connections.get(), 20);
+    }
+
+    #[test]
+    fn test_server_builder_with_tls() {
+        let server = Server::builder("secure.example.com", 563)
+            .use_tls(true)
+            .tls_verify_cert(false)
+            .tls_cert_path("/path/to/cert.pem")
+            .build()
+            .unwrap();
+
+        assert!(server.use_tls);
+        assert!(!server.tls_verify_cert);
+        assert_eq!(server.tls_cert_path.as_ref().unwrap(), "/path/to/cert.pem");
+    }
+
+    #[test]
+    fn test_server_builder_with_keepalive() {
+        let keepalive = Duration::from_secs(300);
+        let server = Server::builder("localhost", 119)
+            .connection_keepalive(keepalive)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.connection_keepalive, Some(keepalive));
+    }
+
+    #[test]
+    fn test_server_builder_with_health_check_settings() {
+        let timeout = Duration::from_millis(500);
+        let server = Server::builder("localhost", 119)
+            .health_check_max_per_cycle(5)
+            .health_check_pool_timeout(timeout)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.health_check_max_per_cycle, 5);
+        assert_eq!(server.health_check_pool_timeout, timeout);
+    }
+
+    #[test]
+    fn test_server_builder_chaining() {
+        let server = Server::builder("news.example.com", 563)
+            .name("Production Server")
+            .username("admin")
+            .password("secret")
+            .max_connections(25)
+            .use_tls(true)
+            .tls_verify_cert(true)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.name.as_str(), "Production Server");
+        assert_eq!(server.max_connections.get(), 25);
+        assert!(server.use_tls);
+    }
+
+    #[test]
+    fn test_server_builder_invalid_host() {
+        let result = Server::builder("", 119).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_builder_invalid_port() {
+        let result = Server::builder("localhost", 0).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_builder_invalid_max_connections() {
+        let result = Server::builder("localhost", 119).max_connections(0).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_builder_from_server_method() {
+        let builder = Server::builder("localhost", 119);
+        let server = builder.build().unwrap();
+        assert_eq!(server.host.as_str(), "localhost");
+    }
+
+    // Config tests
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert!(config.servers.is_empty());
+        assert_eq!(config.proxy.host, "0.0.0.0");
+        assert!(config.cache.is_none());
+        assert!(!config.client_auth.is_enabled());
     }
 }

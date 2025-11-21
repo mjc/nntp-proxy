@@ -242,11 +242,13 @@ impl From<usize> for ConnectionCount {
 mod tests {
     use super::*;
 
+    // HistorySize tests
     #[test]
     fn test_history_size() {
         let size = HistorySize::new(60);
         assert_eq!(size.get(), 60);
         assert_eq!(HistorySize::DEFAULT.get(), 60);
+        assert_eq!(HistorySize::default().get(), 60);
     }
 
     #[test]
@@ -255,6 +257,14 @@ mod tests {
         let _ = HistorySize::new(0);
     }
 
+    #[test]
+    fn test_history_size_custom_values() {
+        assert_eq!(HistorySize::new(100).get(), 100);
+        assert_eq!(HistorySize::new(1).get(), 1);
+        assert_eq!(HistorySize::new(1000).get(), 1000);
+    }
+
+    // BytesPerSecond tests
     #[test]
     fn test_bytes_per_second() {
         let bps = BytesPerSecond::new(1_500_000.0);
@@ -270,6 +280,40 @@ mod tests {
     }
 
     #[test]
+    fn test_bytes_per_second_format_boundaries() {
+        // Just over 1 MB/s
+        assert_eq!(BytesPerSecond::new(1_000_001.0).format(), "1.00 MB/s");
+        // Just under 1 MB/s
+        assert_eq!(BytesPerSecond::new(999_999.0).format(), "1000.00 KB/s");
+        // Just over 1 KB/s
+        assert_eq!(BytesPerSecond::new(1_001.0).format(), "1.00 KB/s");
+        // Just under 1 KB/s
+        assert_eq!(BytesPerSecond::new(999.0).format(), "999 B/s");
+        // Zero
+        assert_eq!(BytesPerSecond::zero().format(), "0 B/s");
+    }
+
+    #[test]
+    fn test_bytes_per_second_default() {
+        let bps = BytesPerSecond::default();
+        assert_eq!(bps.get(), 0.0);
+    }
+
+    #[test]
+    fn test_bytes_per_second_display() {
+        assert_eq!(BytesPerSecond::new(1_500_000.0).to_string(), "1.50 MB/s");
+        assert_eq!(BytesPerSecond::new(2_500.0).to_string(), "2.50 KB/s");
+        assert_eq!(BytesPerSecond::new(500.0).to_string(), "500 B/s");
+    }
+
+    #[test]
+    fn test_bytes_per_second_from_f64() {
+        let bps = BytesPerSecond::from(1234.5);
+        assert_eq!(bps.get(), 1234.5);
+    }
+
+    // CommandsPerSecond tests
+    #[test]
     fn test_commands_per_second() {
         let cps = CommandsPerSecond::new(123.456);
         assert_eq!(cps.to_string(), "123.5");
@@ -278,16 +322,82 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_count() {
-        let count = ConnectionCount::new(42);
-        assert_eq!(count.to_string(), "42");
-        assert_eq!(ConnectionCount::zero().get(), 0);
+    fn test_commands_per_second_default() {
+        let cps = CommandsPerSecond::default();
+        assert_eq!(cps.get(), 0.0);
     }
 
+    #[test]
+    fn test_commands_per_second_display() {
+        assert_eq!(CommandsPerSecond::new(0.0).to_string(), "0.0");
+        assert_eq!(CommandsPerSecond::new(1.5).to_string(), "1.5");
+        assert_eq!(CommandsPerSecond::new(99.99).to_string(), "100.0");
+    }
+
+    #[test]
+    fn test_commands_per_second_from_f64() {
+        let cps = CommandsPerSecond::from(42.7);
+        assert_eq!(cps.get(), 42.7);
+    }
+
+    // Timestamp tests
     #[test]
     fn test_timestamp() {
         let ts = Timestamp::now();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(ts.elapsed() >= std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_timestamp_duration_since() {
+        let ts1 = Timestamp::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let ts2 = Timestamp::now();
+
+        let duration = ts2.duration_since(ts1);
+        assert!(duration >= std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_timestamp_from_instant() {
+        let instant = Instant::now();
+        let ts = Timestamp::from(instant);
+        assert_eq!(ts.into_inner(), instant);
+    }
+
+    #[test]
+    fn test_timestamp_into_instant() {
+        let instant = Instant::now();
+        let ts = Timestamp::new(instant);
+        let instant2: Instant = ts.into();
+        assert_eq!(instant, instant2);
+    }
+
+    // ConnectionCount tests - using test macros
+    #[test]
+    fn test_connection_count_zero() {
+        assert_eq!(ConnectionCount::zero().get(), 0);
+        assert_eq!(ConnectionCount::default().get(), 0);
+    }
+
+    #[test]
+    fn test_connection_count_get() {
+        assert_eq!(ConnectionCount::new(42).get(), 42);
+        assert_eq!(ConnectionCount::new(0).get(), 0);
+        assert_eq!(ConnectionCount::new(1000).get(), 1000);
+    }
+
+    #[test]
+    fn test_connection_count_display() {
+        assert_eq!(ConnectionCount::new(0).to_string(), "0");
+        assert_eq!(ConnectionCount::new(1).to_string(), "1");
+        assert_eq!(ConnectionCount::new(42).to_string(), "42");
+        assert_eq!(ConnectionCount::new(1000).to_string(), "1000");
+    }
+
+    #[test]
+    fn test_connection_count_from_usize() {
+        let count = ConnectionCount::from(123);
+        assert_eq!(count.get(), 123);
     }
 }

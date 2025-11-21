@@ -4,7 +4,7 @@ use nntp_proxy::config::RoutingMode;
 use nntp_proxy::metrics::MetricsCollector;
 use nntp_proxy::pool::{ConnectionProvider, DeadpoolConnectionProvider};
 use nntp_proxy::router::BackendSelector;
-use nntp_proxy::types::{BackendId, ServerName};
+use nntp_proxy::types::{BackendId, BytesReceived, BytesSent, ServerName};
 
 #[test]
 fn test_metrics_with_pool_status_standard_mode() {
@@ -33,15 +33,21 @@ fn test_metrics_with_pool_status_standard_mode() {
     );
 
     // Simulate standard mode behavior: record bytes only
-    metrics.record_client_to_backend_bytes_for(0, 1000);
-    metrics.record_backend_to_client_bytes_for(0, 5000);
+    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);
+    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
 
     let snapshot = metrics.snapshot().with_pool_status(&router);
 
     // Verify metrics
-    assert_eq!(snapshot.backend_stats[0].bytes_sent, 1000);
-    assert_eq!(snapshot.backend_stats[0].bytes_received, 5000);
-    assert_eq!(snapshot.backend_stats[0].total_commands, 0); // Not counted in standard mode
+    assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(1000));
+    assert_eq!(
+        snapshot.backend_stats[0].bytes_received,
+        BytesReceived::new(5000)
+    );
+    assert_eq!(
+        snapshot.backend_stats[0].total_commands,
+        nntp_proxy::metrics::CommandCount::new(0)
+    ); // Not counted in standard mode
 
     // Pool utilization should work
     let pool_status = provider.status();
@@ -51,7 +57,7 @@ fn test_metrics_with_pool_status_standard_mode() {
         .saturating_sub(pool_status.available.get());
     assert_eq!(
         snapshot.backend_stats[0].active_connections,
-        expected_active
+        nntp_proxy::metrics::ActiveConnections::new(expected_active)
     );
 }
 
@@ -97,26 +103,32 @@ fn test_metrics_with_pool_status_per_command_mode() {
     );
 
     // Simulate per-command mode: round-robin distribution
-    metrics.record_command(0);
-    metrics.record_client_to_backend_bytes_for(0, 50);
-    metrics.record_backend_to_client_bytes_for(0, 1000);
+    metrics.record_command(BackendId::from(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 1000);
 
-    metrics.record_command(1);
-    metrics.record_client_to_backend_bytes_for(1, 50);
-    metrics.record_backend_to_client_bytes_for(1, 1000);
+    metrics.record_command(BackendId::from(1));
+    metrics.record_client_to_backend_bytes_for(BackendId::from(1), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from(1), 1000);
 
-    metrics.record_command(0);
-    metrics.record_client_to_backend_bytes_for(0, 50);
-    metrics.record_backend_to_client_bytes_for(0, 1000);
+    metrics.record_command(BackendId::from(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 1000);
 
     let snapshot = metrics.snapshot().with_pool_status(&router);
 
     // Verify round-robin distribution
-    assert_eq!(snapshot.backend_stats[0].total_commands, 2);
-    assert_eq!(snapshot.backend_stats[1].total_commands, 1);
+    assert_eq!(
+        snapshot.backend_stats[0].total_commands,
+        nntp_proxy::metrics::CommandCount::new(2)
+    );
+    assert_eq!(
+        snapshot.backend_stats[1].total_commands,
+        nntp_proxy::metrics::CommandCount::new(1)
+    );
 
-    assert_eq!(snapshot.backend_stats[0].bytes_sent, 100);
-    assert_eq!(snapshot.backend_stats[1].bytes_sent, 50);
+    assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(100));
+    assert_eq!(snapshot.backend_stats[1].bytes_sent, BytesSent::new(50));
 
     // Pool utilization should work for both backends
     let status1 = provider1.status();
@@ -133,11 +145,11 @@ fn test_metrics_with_pool_status_per_command_mode() {
 
     assert_eq!(
         snapshot.backend_stats[0].active_connections,
-        expected_active1
+        nntp_proxy::metrics::ActiveConnections::new(expected_active1)
     );
     assert_eq!(
         snapshot.backend_stats[1].active_connections,
-        expected_active2
+        nntp_proxy::metrics::ActiveConnections::new(expected_active2)
     );
 }
 
@@ -168,25 +180,31 @@ fn test_metrics_with_pool_status_hybrid_mode() {
     );
 
     // Simulate hybrid mode: start with per-command
-    metrics.record_command(0);
-    metrics.record_client_to_backend_bytes_for(0, 50);
-    metrics.record_backend_to_client_bytes_for(0, 200);
+    metrics.record_command(BackendId::from(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 200);
 
-    metrics.record_command(0);
-    metrics.record_client_to_backend_bytes_for(0, 50);
-    metrics.record_backend_to_client_bytes_for(0, 200);
+    metrics.record_command(BackendId::from(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 200);
 
     // Switch to stateful (GROUP command) - bytes continue accumulating
-    metrics.record_command(0);
-    metrics.record_client_to_backend_bytes_for(0, 100);
-    metrics.record_backend_to_client_bytes_for(0, 5000);
+    metrics.record_command(BackendId::from(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 100);
+    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
 
     let snapshot = metrics.snapshot().with_pool_status(&router);
 
     // Verify metrics accumulated across both modes
-    assert_eq!(snapshot.backend_stats[0].total_commands, 3);
-    assert_eq!(snapshot.backend_stats[0].bytes_sent, 200);
-    assert_eq!(snapshot.backend_stats[0].bytes_received, 5400);
+    assert_eq!(
+        snapshot.backend_stats[0].total_commands,
+        nntp_proxy::metrics::CommandCount::new(3)
+    );
+    assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(200));
+    assert_eq!(
+        snapshot.backend_stats[0].bytes_received,
+        BytesReceived::new(5400)
+    );
 
     // Pool utilization should work
     let pool_status = provider.status();
@@ -196,7 +214,7 @@ fn test_metrics_with_pool_status_hybrid_mode() {
         .saturating_sub(pool_status.available.get());
     assert_eq!(
         snapshot.backend_stats[0].active_connections,
-        expected_active
+        nntp_proxy::metrics::ActiveConnections::new(expected_active)
     );
 }
 
@@ -206,7 +224,7 @@ fn test_all_modes_show_meaningful_metrics() {
     // for monitoring and debugging purposes
 
     let test_cases = vec![
-        (RoutingMode::Standard, "Standard mode"),
+        (RoutingMode::Stateful, "Standard mode"),
         (RoutingMode::PerCommand, "Per-command mode"),
         (RoutingMode::Hybrid, "Hybrid mode"),
     ];
@@ -231,12 +249,12 @@ fn test_all_modes_show_meaningful_metrics() {
         );
 
         // Record some activity
-        metrics.record_client_to_backend_bytes_for(0, 1000);
-        metrics.record_backend_to_client_bytes_for(0, 5000);
+        metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);
+        metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
 
         if matches!(mode, RoutingMode::PerCommand | RoutingMode::Hybrid) {
             // These modes track commands
-            metrics.record_command(0);
+            metrics.record_command(BackendId::from(0));
         }
 
         let snapshot = metrics.snapshot().with_pool_status(&router);
@@ -244,12 +262,14 @@ fn test_all_modes_show_meaningful_metrics() {
         // All modes should show:
         // 1. Bytes transferred
         assert_eq!(
-            snapshot.backend_stats[0].bytes_sent, 1000,
+            snapshot.backend_stats[0].bytes_sent,
+            BytesSent::new(1000),
             "{} should track bytes sent",
             mode_name
         );
         assert_eq!(
-            snapshot.backend_stats[0].bytes_received, 5000,
+            snapshot.backend_stats[0].bytes_received,
+            BytesReceived::new(5000),
             "{} should track bytes received",
             mode_name
         );
@@ -261,20 +281,27 @@ fn test_all_modes_show_meaningful_metrics() {
             .get()
             .saturating_sub(pool_status.available.get());
         assert_eq!(
-            snapshot.backend_stats[0].active_connections, expected_active,
+            snapshot.backend_stats[0].active_connections,
+            nntp_proxy::metrics::ActiveConnections::new(expected_active),
             "{} should show pool utilization",
             mode_name
         );
 
         // 3. Commands (per-command and hybrid only)
         match mode {
-            RoutingMode::Standard => {
+            RoutingMode::Stateful => {
                 // Standard mode doesn't parse commands
-                assert_eq!(snapshot.backend_stats[0].total_commands, 0);
+                assert_eq!(
+                    snapshot.backend_stats[0].total_commands,
+                    nntp_proxy::metrics::CommandCount::new(0)
+                );
             }
             RoutingMode::PerCommand | RoutingMode::Hybrid => {
                 // These modes count commands
-                assert_eq!(snapshot.backend_stats[0].total_commands, 1);
+                assert_eq!(
+                    snapshot.backend_stats[0].total_commands,
+                    nntp_proxy::metrics::CommandCount::new(1)
+                );
             }
         }
     }

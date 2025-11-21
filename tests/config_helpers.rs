@@ -1,12 +1,12 @@
 //! Test configuration helpers to reduce boilerplate and improve maintainability
 //!
-//! These helpers use the ServerConfig builder pattern for cleaner, more maintainable test code.
+//! These helpers use the Server builder pattern for cleaner, more maintainable test code.
 
-use nntp_proxy::config::ServerConfig;
+use nntp_proxy::config::Server;
 
 /// Create a basic server configuration for testing (no TLS)
-pub fn create_test_server_config(host: &str, port: u16, name: &str) -> ServerConfig {
-    ServerConfig::builder(host, port)
+pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
+    Server::builder(host, port)
         .name(name)
         .max_connections(5)
         .build()
@@ -20,8 +20,8 @@ pub fn create_test_server_config_with_auth(
     name: &str,
     username: &str,
     password: &str,
-) -> ServerConfig {
-    ServerConfig::builder(host, port)
+) -> Server {
+    Server::builder(host, port)
         .name(name)
         .username(username)
         .password(password)
@@ -37,8 +37,8 @@ pub fn create_test_server_config_with_tls(
     name: &str,
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
-) -> ServerConfig {
-    let mut builder = ServerConfig::builder(host, port)
+) -> Server {
+    let mut builder = Server::builder(host, port)
         .name(name)
         .max_connections(5)
         .use_tls(true)
@@ -57,8 +57,8 @@ pub fn create_test_server_config_with_max_connections(
     port: u16,
     name: &str,
     max_connections: usize,
-) -> ServerConfig {
-    ServerConfig::builder(host, port)
+) -> Server {
+    Server::builder(host, port)
         .name(name)
         .max_connections(max_connections)
         .build()

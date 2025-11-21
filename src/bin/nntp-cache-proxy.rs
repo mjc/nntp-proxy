@@ -3,55 +3,24 @@ use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::cache::ArticleCache;
-use nntp_proxy::cache::CachingSession;
-use nntp_proxy::config::CacheConfig;
-use nntp_proxy::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
-use nntp_proxy::protocol::BACKEND_UNAVAILABLE;
-use nntp_proxy::types::{CacheCapacity, ClientId, ConfigPath, Port, ThreadCount};
-use nntp_proxy::{NntpProxy, RuntimeConfig, load_config_with_fallback};
+use nntp_proxy::config::Cache;
+use nntp_proxy::network::{NetworkOptimizer, TcpOptimizer};
+use nntp_proxy::{
+    CacheArgs, CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback, shutdown_signal,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Caching Proxy Server", long_about = None)]
 struct Args {
-    /// Port to listen on
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_PORT environment variable
-    #[arg(short, long, default_value = "8120", env = "NNTP_CACHE_PROXY_PORT")]
-    port: Port,
+    #[command(flatten)]
+    common: CommonArgs,
 
-    /// Configuration file path
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_CONFIG environment variable
-    #[arg(
-        short,
-        long,
-        default_value = "cache-config.toml",
-        env = "NNTP_CACHE_PROXY_CONFIG"
-    )]
-    config: ConfigPath,
-
-    /// Number of worker threads (default: 1, use 0 for CPU cores)
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_THREADS environment variable
-    #[arg(short, long, env = "NNTP_CACHE_PROXY_THREADS")]
-    threads: Option<ThreadCount>,
-
-    /// Cache max capacity (number of articles)
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_CAPACITY environment variable
-    #[arg(long, default_value = "10000", env = "NNTP_CACHE_PROXY_CACHE_CAPACITY")]
-    cache_capacity: CacheCapacity,
-
-    /// Cache TTL in seconds
-    ///
-    /// Can be overridden with NNTP_CACHE_PROXY_CACHE_TTL environment variable
-    #[arg(long, default_value = "3600", env = "NNTP_CACHE_PROXY_CACHE_TTL")]
-    cache_ttl: u64,
+    #[command(flatten)]
+    cache: CacheArgs,
 }
 
 fn main() -> Result<()> {
@@ -66,7 +35,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Build and configure runtime
-    let runtime_config = RuntimeConfig::from_args(args.threads);
+    let runtime_config = RuntimeConfig::from_args(args.common.threads);
     let rt = runtime_config.build_runtime()?;
 
     rt.block_on(run_caching_proxy(args))
@@ -74,14 +43,14 @@ fn main() -> Result<()> {
 
 async fn run_caching_proxy(args: Args) -> Result<()> {
     // Load configuration with automatic fallback
-    let (config, source) = load_config_with_fallback(args.config.as_str())?;
+    let (config, source) = load_config_with_fallback(args.common.config.as_str())?;
 
     info!("Loaded configuration from {}", source.description());
 
     // Set up cache configuration
-    let cache_config = config.cache.clone().unwrap_or_else(|| CacheConfig {
-        max_capacity: args.cache_capacity,
-        ttl: Duration::from_secs(args.cache_ttl),
+    let cache_config = config.cache.clone().unwrap_or_else(|| Cache {
+        max_capacity: args.cache.cache_capacity,
+        ttl: args.cache.ttl(),
     });
 
     info!(
@@ -106,10 +75,10 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
         );
     }
 
-    // Create proxy (cache proxy always uses Standard/1:1 mode)
+    // Create proxy with per-command routing for load balancing
     let proxy = Arc::new(NntpProxy::new(
         config.clone(),
-        nntp_proxy::RoutingMode::Standard,
+        nntp_proxy::RoutingMode::PerCommand, // Use per-command routing for caching
     )?);
 
     // Create auth handler from config
@@ -126,7 +95,7 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
     );
 
     // Start listening
-    let listen_addr = format!("0.0.0.0:{}", args.port.get());
+    let listen_addr = args.common.listen_addr(Some(config.proxy.port));
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP caching proxy listening on {} (caching mode)",
@@ -188,45 +157,13 @@ async fn run_caching_proxy(args: Args) -> Result<()> {
 async fn handle_caching_client(
     proxy: Arc<NntpProxy>,
     cache: Arc<ArticleCache>,
-    auth_handler: Arc<AuthHandler>,
-    mut client_stream: tokio::net::TcpStream,
+    _auth_handler: Arc<AuthHandler>,
+    client_stream: tokio::net::TcpStream,
     client_addr: std::net::SocketAddr,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     use tracing::debug;
 
     debug!("New caching client connection from {}", client_addr);
-
-    // Select backend using round-robin
-    let client_id = ClientId::new();
-    let backend_id = proxy.router().route_command_sync(client_id, "")?;
-    let server_idx = backend_id.as_index();
-    let servers = proxy.servers();
-    let server = &servers[server_idx];
-
-    info!(
-        "Routing client {} to backend {:?} ({}:{})",
-        client_addr, backend_id, server.host, server.port
-    );
-
-    // Send greeting
-    nntp_proxy::protocol::send_proxy_greeting(&mut client_stream, client_addr).await?;
-
-    // Get pooled backend connection
-    let mut backend_conn = match proxy.connection_providers()[server_idx]
-        .get_pooled_connection()
-        .await
-    {
-        Ok(conn) => {
-            debug!("Got pooled connection for {}", server.name);
-            conn
-        }
-        Err(e) => {
-            error!("Failed to get pooled connection for {}: {}", server.name, e);
-            let _ = client_stream.write_all(BACKEND_UNAVAILABLE).await;
-            return Err(e);
-        }
-    };
 
     // Apply socket optimizations
     let client_optimizer = TcpOptimizer::new(&client_stream);
@@ -234,65 +171,8 @@ async fn handle_caching_client(
         debug!("Failed to optimize client socket: {}", e);
     }
 
-    let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
-    if let Err(e) = backend_optimizer.optimize() {
-        debug!("Failed to optimize backend socket: {}", e);
-    }
-
-    // Create caching session and handle connection
-    let session = CachingSession::new(client_addr, cache, auth_handler);
-
-    debug!("Starting caching session for client {}", client_addr);
-
-    let copy_result = session
-        .handle_with_pooled_backend(client_stream, &mut *backend_conn)
-        .await;
-
-    debug!("Caching session completed for client {}", client_addr);
-
-    // Complete the routing
-    proxy.router().complete_command_sync(backend_id);
-
-    // Log session results
-    match copy_result {
-        Ok(metrics) => {
-            info!(
-                "Connection closed for client {}: {} bytes sent, {} bytes received",
-                client_addr,
-                metrics.client_to_backend.as_u64(),
-                metrics.backend_to_client.as_u64()
-            );
-        }
-        Err(e) => {
-            warn!("Session error for client {}: {}", client_addr, e);
-        }
-    }
-
-    debug!("Connection returned to pool for {}", server.name);
-    Ok(())
-}
-
-/// Wait for shutdown signal
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
+    // Handle client using standard proxy with cache enabled
+    proxy
+        .handle_client_with_cache(client_stream, client_addr, cache)
+        .await
 }

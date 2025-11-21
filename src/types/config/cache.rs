@@ -34,3 +34,25 @@ impl Ord for CacheCapacity {
         self.get().cmp(&other.get())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Use consolidated test macros for common patterns
+    test_nonzero_newtype_full!(
+        CacheCapacity,
+        default: 1000,
+        test_value: 5000,
+        ordering: (100, 1000),
+        from_str: ("2000", 2000, "not_a_number")
+    );
+
+    // Special test for zero defaulting to DEFAULT
+    #[test]
+    fn test_from_str_zero_defaults() {
+        // Zero values should default to DEFAULT (1000)
+        let capacity: CacheCapacity = "0".parse().unwrap();
+        assert_eq!(capacity.get(), 1000);
+    }
+}

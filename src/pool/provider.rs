@@ -17,7 +17,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 /// Connection provider using deadpool for connection pooling
@@ -32,8 +32,8 @@ pub struct DeadpoolConnectionProvider {
     /// Kept alive to enable graceful shutdown when the provider is dropped
     #[allow(dead_code)]
     shutdown_tx: Option<broadcast::Sender<()>>,
-    /// Metrics for health check operations
-    pub health_check_metrics: Arc<Mutex<HealthCheckMetrics>>,
+    /// Metrics for health check operations (lock-free)
+    pub health_check_metrics: Arc<HealthCheckMetrics>,
 }
 
 /// Builder for constructing `DeadpoolConnectionProvider` instances
@@ -68,7 +68,7 @@ pub struct DeadpoolConnectionProvider {
 ///     .build()
 ///     .unwrap();
 /// ```
-pub struct DeadpoolConnectionProviderBuilder {
+pub struct Builder {
     host: String,
     port: u16,
     name: Option<String>,
@@ -78,7 +78,7 @@ pub struct DeadpoolConnectionProviderBuilder {
     tls_config: Option<TlsConfig>,
 }
 
-impl DeadpoolConnectionProviderBuilder {
+impl Builder {
     /// Create a new builder with required connection parameters
     ///
     /// # Arguments
@@ -162,7 +162,7 @@ impl DeadpoolConnectionProviderBuilder {
                 name,
                 keepalive_interval: None,
                 shutdown_tx: None,
-                health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+                health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
         } else {
             // Build without TLS
@@ -183,7 +183,7 @@ impl DeadpoolConnectionProviderBuilder {
                 name,
                 keepalive_interval: None,
                 shutdown_tx: None,
-                health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+                health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
         }
     }
@@ -204,8 +204,8 @@ impl DeadpoolConnectionProvider {
     ///     .unwrap();
     /// ```
     #[must_use]
-    pub fn builder(host: impl Into<String>, port: u16) -> DeadpoolConnectionProviderBuilder {
-        DeadpoolConnectionProviderBuilder::new(host, port)
+    pub fn builder(host: impl Into<String>, port: u16) -> Builder {
+        Builder::new(host, port)
     }
     /// Create a new connection provider
     pub fn new(
@@ -227,7 +227,7 @@ impl DeadpoolConnectionProvider {
             name,
             keepalive_interval: None,
             shutdown_tx: None,
-            health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+            health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         }
     }
 
@@ -253,14 +253,14 @@ impl DeadpoolConnectionProvider {
             name,
             keepalive_interval: None,
             shutdown_tx: None,
-            health_check_metrics: Arc::new(Mutex::new(HealthCheckMetrics::new())),
+            health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         })
     }
 
     /// Create a connection provider from a server configuration
     ///
     /// This avoids unnecessary cloning of individual fields.
-    pub fn from_server_config(server: &crate::config::ServerConfig) -> Result<Self> {
+    pub fn from_server_config(server: &crate::config::Server) -> Result<Self> {
         let tls_builder = TlsConfig::builder()
             .enabled(server.use_tls)
             .verify_cert(server.tls_verify_cert);
@@ -290,7 +290,7 @@ impl DeadpoolConnectionProvider {
         let keepalive_interval = server.connection_keepalive;
 
         // Create metrics and shutdown channel if keepalive is enabled
-        let metrics = Arc::new(Mutex::new(HealthCheckMetrics::new()));
+        let metrics = Arc::new(HealthCheckMetrics::new());
         let shutdown_tx = if let Some(interval) = keepalive_interval {
             let (tx, rx) = broadcast::channel(1);
 
@@ -338,9 +338,9 @@ impl DeadpoolConnectionProvider {
         self.pool.status().max_size
     }
 
-    /// Get a snapshot of the current health check metrics
-    pub async fn get_health_check_metrics(&self) -> HealthCheckMetrics {
-        self.health_check_metrics.lock().await.clone()
+    /// Get a reference to the health check metrics
+    pub fn health_check_metrics(&self) -> &HealthCheckMetrics {
+        &self.health_check_metrics
     }
 
     /// Gracefully shutdown the periodic health check task
@@ -363,7 +363,7 @@ impl DeadpoolConnectionProvider {
         name: String,
         interval: std::time::Duration,
         mut shutdown_rx: broadcast::Receiver<()>,
-        metrics: Arc<Mutex<HealthCheckMetrics>>,
+        metrics: Arc<HealthCheckMetrics>,
     ) {
         use crate::constants::pool::{
             HEALTH_CHECK_POOL_TIMEOUT_MS, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE,
@@ -432,11 +432,8 @@ impl DeadpoolConnectionProvider {
             }
 
             if checked > 0 {
-                // Record metrics
-                {
-                    let mut m = metrics.lock().await;
-                    m.record_cycle(checked, failed);
-                }
+                // Record metrics (lock-free)
+                metrics.record_cycle(checked, failed);
 
                 debug!(
                     pool = %name,
@@ -528,5 +525,248 @@ impl ConnectionPool for DeadpoolConnectionProvider {
 
     fn port(&self) -> u16 {
         self.pool.manager().port
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builder_new() {
+        let builder = Builder::new("news.example.com", 119);
+        assert_eq!(builder.host, "news.example.com");
+        assert_eq!(builder.port, 119);
+        assert_eq!(builder.max_size, 10); // Default
+        assert!(builder.name.is_none());
+        assert!(builder.username.is_none());
+        assert!(builder.password.is_none());
+        assert!(builder.tls_config.is_none());
+    }
+
+    #[test]
+    fn test_builder_with_name() {
+        let builder = Builder::new("example.com", 119).name("Test Server");
+        assert_eq!(builder.name, Some("Test Server".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_max_connections() {
+        let builder = Builder::new("example.com", 119).max_connections(25);
+        assert_eq!(builder.max_size, 25);
+    }
+
+    #[test]
+    fn test_builder_with_username() {
+        let builder = Builder::new("example.com", 119).username("testuser");
+        assert_eq!(builder.username, Some("testuser".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_password() {
+        let builder = Builder::new("example.com", 119).password("testpass");
+        assert_eq!(builder.password, Some("testpass".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_tls_config() {
+        let tls_config = TlsConfig::builder().enabled(true).build();
+        let builder = Builder::new("example.com", 563).tls_config(tls_config.clone());
+        assert!(builder.tls_config.is_some());
+    }
+
+    #[test]
+    fn test_builder_chaining() {
+        let builder = Builder::new("news.example.com", 119)
+            .name("Chained Server")
+            .max_connections(30)
+            .username("user")
+            .password("pass");
+
+        assert_eq!(builder.name, Some("Chained Server".to_string()));
+        assert_eq!(builder.max_size, 30);
+        assert_eq!(builder.username, Some("user".to_string()));
+        assert_eq!(builder.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_builder_default_name_from_host_port() {
+        let provider = Builder::new("test.example.com", 8119)
+            .max_connections(5)
+            .build()
+            .unwrap();
+
+        // Default name should be "host:port"
+        assert_eq!(provider.name(), "test.example.com:8119");
+    }
+
+    #[test]
+    fn test_builder_custom_name_used() {
+        let provider = Builder::new("test.example.com", 8119)
+            .name("Custom Name")
+            .build()
+            .unwrap();
+
+        assert_eq!(provider.name(), "Custom Name");
+    }
+
+    #[test]
+    fn test_provider_builder_method() {
+        let builder = DeadpoolConnectionProvider::builder("example.com", 119);
+        assert_eq!(builder.host, "example.com");
+        assert_eq!(builder.port, 119);
+    }
+
+    #[test]
+    fn test_provider_status_conversion() {
+        let provider = DeadpoolConnectionProvider::builder("localhost", 119)
+            .max_connections(15)
+            .build()
+            .unwrap();
+
+        let status = ConnectionProvider::status(&provider);
+        assert_eq!(status.max_size.get(), 15);
+        // Initially no connections created
+        assert_eq!(status.created.get(), 0);
+    }
+
+    #[test]
+    fn test_provider_implements_connection_pool_trait() {
+        let provider = DeadpoolConnectionProvider::builder("localhost", 119)
+            .build()
+            .unwrap();
+
+        // Should implement ConnectionPool trait methods
+        assert_eq!(provider.name(), "localhost:119");
+        assert_eq!(provider.host(), "localhost");
+        assert_eq!(provider.port(), 119);
+    }
+
+    #[test]
+    fn test_provider_with_all_builder_options() {
+        let tls_config = TlsConfig::builder().enabled(false).build();
+
+        let provider = DeadpoolConnectionProvider::builder("news.test.com", 563)
+            .name("Full Test")
+            .max_connections(42)
+            .username("testuser")
+            .password("testpass")
+            .tls_config(tls_config)
+            .build()
+            .unwrap();
+
+        assert_eq!(provider.name(), "Full Test");
+        assert_eq!(provider.host(), "news.test.com");
+        assert_eq!(provider.port(), 563);
+
+        let status = ConnectionPool::status(&provider);
+        assert_eq!(status.max_size.get(), 42);
+    }
+
+    #[test]
+    fn test_health_check_metrics_initialization() {
+        let provider = DeadpoolConnectionProvider::builder("localhost", 119)
+            .build()
+            .unwrap();
+
+        let metrics = &provider.health_check_metrics;
+        assert_eq!(metrics.cycles_run(), 0);
+        assert_eq!(metrics.connections_checked(), 0);
+        assert_eq!(metrics.connections_failed(), 0);
+        assert_eq!(metrics.failure_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_builder_accepts_string_types() {
+        // Test that builder accepts &str
+        let _ = Builder::new("example.com", 119);
+
+        // Test that builder accepts String
+        let _ = Builder::new(String::from("example.com"), 119);
+
+        // Test that name accepts &str
+        let _ = Builder::new("example.com", 119).name("test");
+
+        // Test that name accepts String
+        let _ = Builder::new("example.com", 119).name(String::from("test"));
+    }
+
+    #[test]
+    fn test_builder_zero_max_connections() {
+        // Should allow zero (deadpool will handle it)
+        let provider = Builder::new("localhost", 119)
+            .max_connections(0)
+            .build()
+            .unwrap();
+
+        let status = ConnectionProvider::status(&provider);
+        assert_eq!(status.max_size.get(), 0);
+    }
+
+    #[test]
+    fn test_builder_large_max_connections() {
+        let provider = Builder::new("localhost", 119)
+            .max_connections(1000)
+            .build()
+            .unwrap();
+
+        let status = ConnectionProvider::status(&provider);
+        assert_eq!(status.max_size.get(), 1000);
+    }
+
+    #[test]
+    fn test_connection_pool_trait_status_consistency() {
+        let provider = DeadpoolConnectionProvider::builder("localhost", 119)
+            .max_connections(20)
+            .build()
+            .unwrap();
+
+        // Both trait implementations should return same status
+        let status1 = <DeadpoolConnectionProvider as ConnectionProvider>::status(&provider);
+        let status2 = <DeadpoolConnectionProvider as ConnectionPool>::status(&provider);
+
+        assert_eq!(status1.max_size, status2.max_size);
+        assert_eq!(status1.available, status2.available);
+        assert_eq!(status1.created, status2.created);
+    }
+
+    #[test]
+    fn test_provider_name_special_characters() {
+        let provider = Builder::new("example.com", 119)
+            .name("Server-123_Test.Name")
+            .build()
+            .unwrap();
+
+        assert_eq!(provider.name(), "Server-123_Test.Name");
+    }
+
+    #[test]
+    fn test_provider_name_unicode() {
+        let provider = Builder::new("example.com", 119)
+            .name("测试服务器")
+            .build()
+            .unwrap();
+
+        assert_eq!(provider.name(), "测试服务器");
+    }
+
+    #[test]
+    fn test_provider_empty_name() {
+        let provider = Builder::new("example.com", 119).name("").build().unwrap();
+
+        assert_eq!(provider.name(), "");
+    }
+
+    #[test]
+    fn test_builder_idempotent_chaining() {
+        // Setting the same value multiple times should use the last value
+        let builder = Builder::new("example.com", 119)
+            .name("First")
+            .name("Second")
+            .max_connections(10)
+            .max_connections(20);
+
+        assert_eq!(builder.name, Some("Second".to_string()));
+        assert_eq!(builder.max_size, 20);
     }
 }

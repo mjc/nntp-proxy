@@ -2,8 +2,8 @@
 
 This document provides comprehensive guidance for understanding and working with the NNTP Proxy codebase. It is optimized for GitHub Copilot to provide better context-aware suggestions.
 
-**Last Updated:** November 10, 2025  
-**Version:** 0.2.2  
+**Last Updated:** November 20, 2025  
+**Version:** 0.2.3  
 **Rust Edition:** 2024  
 **MSRV:** 1.85+
 
@@ -39,7 +39,7 @@ A high-performance NNTP (Network News Transfer Protocol) proxy server written in
 1. **Performance-first** - Lock-free routing, zero-allocation hot paths, SIMD-optimized parsing
 2. **Type safety** - Newtype pattern for all domain values (Port, ServerName, MessageId, etc.)
 3. **RFC compliance** - Strict adherence to RFC 3977 (NNTP), RFC 4643 (Auth), RFC 5536 (Message-ID)
-4. **Testability** - 74%+ code coverage, integration tests, mock servers, property-based testing
+4. **Testability** - 82%+ library code coverage, property-based testing, integration tests, mock servers
 5. **Observability** - Structured logging with tracing, detailed metrics, error classification
 
 ### Binary Targets
@@ -102,7 +102,7 @@ Client → Proxy (Routing Logic) → Backend Pool → Backend Server(s)
 2. Proxy sends greeting
 3. Start in per-command mode
 4. For each command:
-   a. Classify command (stateful vs stateless)
+   a. Parse command (stateful vs stateless)
    b. If stateless → route per-command
    c. If stateful → switch to dedicated backend
 5. Once switched, remain in stateful mode
@@ -268,7 +268,7 @@ fn connect(host: HostName, port: Port) -> Result<()> { ... }
 ```rust
 // classifier.rs - 70%+ of all NNTP traffic
 impl NntpCommand {
-    pub fn classify(command: &str) -> Self {
+    pub fn parse(command: &str) -> Self {
         // Direct byte comparisons, no allocations
         let bytes = command.as_bytes();
         
@@ -595,7 +595,7 @@ debug!("Processing {}", cmd); // OK: Filtered out in production
 /// - Zero allocations
 /// - SIMD-friendly byte comparisons
 /// - Branch prediction optimized (UPPERCASE first)
-pub fn classify(command: &str) -> Self {
+pub fn parse(command: &str) -> Self {
     let bytes = command.as_bytes();
     
     // Fast path: Check for message-ID (70%+ hit rate)
@@ -845,7 +845,7 @@ pub fn create_test_config() -> Config {
 ```rust
 #[test]
 fn test_article_by_message_id() {
-    let cmd = NntpCommand::classify("ARTICLE <test@example.com>");
+    let cmd = NntpCommand::parse("ARTICLE <test@example.com>");
     assert_eq!(cmd, NntpCommand::ArticleByMessageId);
     assert!(!cmd.is_stateful());
 }
@@ -854,7 +854,7 @@ fn test_article_by_message_id() {
 fn test_stateful_commands() {
     let commands = vec!["GROUP alt.test", "NEXT", "LAST", "XOVER 1-100"];
     for cmd in commands {
-        let classified = NntpCommand::classify(cmd);
+        let classified = NntpCommand::parse(cmd);
         assert!(classified.is_stateful(), "Command '{}' should be stateful", cmd);
     }
 }
@@ -896,7 +896,68 @@ async fn test_auth_required() {
 }
 ```
 
-#### 4. Testing Connection Pool
+#### 4. Property-Based Testing
+
+**Critical for newtype wrappers and domain types**. Use `proptest` to generate 100+ random test cases per property.
+
+```rust
+use proptest::prelude::*;
+
+// Test newtype invariants
+proptest! {
+    #[test]
+    fn port_rejects_zero(port in 0u16..=0) {
+        assert!(Port::new(port).is_err());
+    }
+    
+    #[test]
+    fn port_accepts_valid_range(port in 1u16..=65535) {
+        let result = Port::new(port);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().get(), port);
+    }
+    
+    #[test]
+    fn hostname_rejects_empty(s in "\\s*") {
+        assert!(HostName::new(s).is_err());
+    }
+}
+
+// Integration property tests
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+    
+    #[test]
+    fn prop_message_id_parsing(
+        local in "[a-zA-Z0-9]{1,20}",
+        domain in "[a-zA-Z0-9]{1,20}\\.[a-z]{2,5}"
+    ) {
+        let msg_id = format!("<{}@{}>", local, domain);
+        // Verify parser handles all valid message IDs
+    }
+}
+```
+
+**Test Macros** (for common newtype patterns):
+
+```rust
+// src/test_macros.rs - Reusable test generation
+test_nonzero_newtype_full!(BufferSize, 1, 1024, 65536);
+
+// Expands to:
+// - Zero rejection test
+// - Valid range test
+// - Ordering tests
+// - Display/Debug tests
+```
+
+**Benefits:**
+- 100+ random cases vs single hardcoded value
+- Catches edge cases (0, MAX, overflow)
+- Reduces test code by 26% (571 lines in this project)
+- Massive thoroughness increase (10,000+ test cases)
+
+#### 5. Testing Connection Pool
 
 ```rust
 #[tokio::test]
@@ -909,7 +970,7 @@ async fn test_pool_prewarming() {
 }
 ```
 
-#### 5. Testing Routing
+#### 6. Testing Routing
 
 ```rust
 #[test]
@@ -1005,7 +1066,7 @@ use divan::Bencher;
 #[divan::bench]
 fn classify_article_command(bencher: Bencher) {
     bencher.bench(|| {
-        NntpCommand::classify("ARTICLE <msg@example.com>")
+        NntpCommand::parse("ARTICLE <msg@example.com>")
     });
 }
 
@@ -1089,7 +1150,7 @@ command_cases!(
 );
 
 // Add to classify() function
-pub fn classify(command: &str) -> Self {
+pub fn parse(command: &str) -> Self {
     // ... existing code
     
     if matches_any(cmd, NEWCMD_CASES) {
@@ -1113,7 +1174,7 @@ pub enum NntpCommand {
 
 impl CommandHandler {
     pub fn handle_command(command: &str) -> CommandAction {
-        match NntpCommand::classify(command) {
+        match NntpCommand::parse(command) {
             // ... existing cases
             NntpCommand::NewCommand => CommandAction::ForwardStateless,
         }
@@ -1127,7 +1188,7 @@ impl CommandHandler {
 #[test]
 fn test_new_command_classification() {
     assert_eq!(
-        NntpCommand::classify("NEWCMD"),
+        NntpCommand::parse("NEWCMD"),
         NntpCommand::NewCommand
     );
 }
@@ -1356,6 +1417,24 @@ sudo systemctl status nntp-proxy
    cargo clippy --all-targets --all-features
    cargo test
    ```
+
+### Pre-1.0 Development
+
+**IMPORTANT:** This project has NOT reached 1.0 yet and is a binary application, not a library.
+
+**Do NOT:**
+- Keep deprecated methods/functions around "for backwards compatibility"
+- Add `#[deprecated]` attributes - just delete old code
+- Maintain multiple versions of the same functionality
+- Preserve old APIs - refactor directly
+
+**DO:**
+- Delete unused code immediately
+- Rename methods directly without deprecation warnings
+- Refactor aggressively - no need for stability guarantees
+- Keep only one way to do things
+
+**Rationale:** We're building toward 1.0, not maintaining a stable API. Clean, focused code is more important than backwards compatibility. Once we hit 1.0, we'll adopt proper deprecation practices.
 
 **Note:** This project has Git pre-commit hooks that automatically run `cargo fmt` and `cargo clippy --all-targets --all-features`. If clippy finds issues or formatting is incorrect, the commit will be rejected. Fix all issues before committing.
 

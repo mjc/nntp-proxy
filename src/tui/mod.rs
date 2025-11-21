@@ -6,13 +6,15 @@ mod app;
 mod constants;
 mod helpers;
 pub mod log_capture;
+mod system_stats;
 mod types;
 mod ui;
 #[cfg(test)]
 mod ui_tests;
 
-pub use app::{TuiApp, TuiAppBuilder};
+pub use app::{TuiApp, TuiAppBuilder, ViewMode};
 pub use log_capture::{LogBuffer, LogMakeWriter};
+pub use system_stats::{SystemMonitor, SystemStats};
 pub use ui::render_ui;
 
 use anyhow::Result;
@@ -99,36 +101,57 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Create update interval (4 times per second for responsive UI)
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
 
-    loop {
-        // Render the UI
-        terminal.draw(|f| ui::render_ui(f, app))?;
+    // Initial render
+    terminal.draw(|f| ui::render_ui(f, app))?;
 
+    let mut should_quit = false;
+
+    loop {
         tokio::select! {
             // External shutdown signal
             _ = shutdown_rx.recv() => {
-                // External shutdown (e.g., Ctrl+C from signal handler)
                 break;
             }
-            // Update timer
+            // Update timer - check for events only on ticks to reduce overhead
             _ = update_interval.tick() => {
                 app.update();
+                terminal.draw(|f| ui::render_ui(f, app))?;
 
-                // Check for keyboard input (non-blocking)
-                if event::poll(Duration::from_millis(0))?
-                    && let Event::Key(key) = event::read()?
-                    && key.kind == KeyEventKind::Press
-                {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            // User pressed 'q' - exit TUI and shut down app
-                            break;
+                // Check events on blocking thread pool to not block async runtime
+                let has_events = tokio::task::spawn_blocking(|| {
+                    event::poll(Duration::from_millis(0))
+                }).await??;
+
+                if has_events {
+                    let key_event = tokio::task::spawn_blocking(|| {
+                        event::read()
+                    }).await??;
+
+                    if let Event::Key(key) = key_event
+                        && key.kind == KeyEventKind::Press
+                    {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                should_quit = true;
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                should_quit = true;
+                            }
+                            KeyCode::Char('l') => {
+                                app.toggle_log_fullscreen();
+                                terminal.draw(|f| ui::render_ui(f, app))?;
+                            }
+                            KeyCode::Char('d') => {
+                                app.toggle_details();
+                                terminal.draw(|f| ui::render_ui(f, app))?;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                            // Ctrl-C pressed - exit TUI and shut down app
-                            break;
-                        }
-                        _ => {}
                     }
+                }
+
+                if should_quit {
+                    break;
                 }
             }
         }

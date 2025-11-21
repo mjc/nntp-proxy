@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthHandler;
-use crate::config::{Config, RoutingMode, ServerConfig};
+use crate::config::{Config, RoutingMode, Server};
 use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
@@ -69,7 +69,7 @@ impl NntpProxyBuilder {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            routing_mode: RoutingMode::Standard,
+            routing_mode: RoutingMode::Stateful,
             buffer_size: None,
             buffer_count: None,
             enable_metrics: false, // Default to disabled for performance
@@ -213,7 +213,7 @@ impl NntpProxyBuilder {
 
 #[derive(Debug, Clone)]
 pub struct NntpProxy {
-    servers: Arc<Vec<ServerConfig>>,
+    servers: Arc<Vec<Server>>,
     /// Backend selector for round-robin load balancing
     router: Arc<router::BackendSelector>,
     /// Connection providers per server - easily swappable implementation
@@ -232,7 +232,115 @@ pub struct NntpProxy {
     connection_stats: ConnectionStatsAggregator,
 }
 
+/// Classify an error as a client disconnect (broken pipe/connection reset)
+///
+/// Returns true for errors that indicate the client disconnected normally,
+/// which should be logged at DEBUG level rather than WARN.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Error, ErrorKind};
+/// use nntp_proxy::is_client_disconnect_error;
+///
+/// let broken_pipe = Error::from(ErrorKind::BrokenPipe);
+/// let wrapped = anyhow::Error::from(broken_pipe);
+/// assert!(is_client_disconnect_error(&wrapped));
+///
+/// let other_error = anyhow::anyhow!("some other error");
+/// assert!(!is_client_disconnect_error(&other_error));
+/// ```
+#[inline]
+pub fn is_client_disconnect_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        )
+    })
+}
+
 impl NntpProxy {
+    // Helper methods for session management
+
+    #[inline]
+    fn record_connection_opened(&self) {
+        if self.enable_metrics {
+            self.metrics.connection_opened();
+        }
+    }
+
+    #[inline]
+    fn record_connection_closed(&self) {
+        if self.enable_metrics {
+            self.metrics.connection_closed();
+        }
+    }
+
+    /// Build a session with standard configuration (conditionally enables metrics)
+    fn build_session(
+        &self,
+        client_addr: SocketAddr,
+        router: Option<Arc<router::BackendSelector>>,
+        routing_mode: RoutingMode,
+        cache: Option<Arc<crate::cache::ArticleCache>>,
+    ) -> ClientSession {
+        let mut builder = ClientSession::builder(
+            client_addr,
+            self.buffer_pool.clone(),
+            self.auth_handler.clone(),
+        )
+        .with_routing_mode(routing_mode)
+        .with_connection_stats(self.connection_stats.clone());
+
+        if let Some(r) = router {
+            builder = builder.with_router(r);
+        }
+
+        if let Some(c) = cache {
+            builder = builder.with_cache(c);
+        }
+
+        if self.enable_metrics {
+            builder = builder.with_metrics(self.metrics.clone());
+        }
+
+        builder.build()
+    }
+
+    /// Log session completion and record stats
+    fn log_session_completion(
+        &self,
+        client_addr: SocketAddr,
+        session_id: &str,
+        session: &ClientSession,
+        routing_mode_str: &str,
+        metrics: &types::TransferMetrics,
+    ) {
+        self.connection_stats
+            .record_disconnection(session.username().as_deref(), routing_mode_str);
+
+        debug!(
+            "Session {} [{}] ↑{} ↓{}",
+            client_addr,
+            session_id,
+            crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
+            crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
+        );
+    }
+
+    /// Handle session errors with appropriate logging
+    fn handle_session_error(&self, e: anyhow::Error, client_addr: SocketAddr, session_id: &str) {
+        if is_client_disconnect_error(&e) {
+            debug!(
+                "Client {} [{}] disconnected: {} (normal for test connections)",
+                client_addr, session_id, e
+            );
+        } else {
+            warn!("Session error {} [{}]: {}", client_addr, session_id, e);
+        }
+    }
+
     /// Create a new `NntpProxy` with the given configuration and routing mode
     ///
     /// This is a convenience method that uses the builder internally.
@@ -296,7 +404,7 @@ impl NntpProxy {
     /// Get the list of servers
     #[must_use]
     #[inline]
-    pub fn servers(&self) -> &[ServerConfig] {
+    pub fn servers(&self) -> &[Server] {
         &self.servers
     }
 
@@ -357,16 +465,14 @@ impl NntpProxy {
         debug!("New client connection from {}", client_addr);
 
         // Record connection metrics
-        if self.enable_metrics {
-            self.metrics.connection_opened();
-        }
+        self.record_connection_opened();
 
         // Use a dummy ClientId and command for routing (synchronous 1:1 mapping)
         use types::ClientId;
         let client_id = ClientId::new();
 
         // Select backend using router's round-robin
-        let backend_id = self.router.route_command_sync(client_id, "")?;
+        let backend_id = self.router.route_command(client_id, "")?;
         let server_idx = backend_id.as_index();
         let server = &self.servers[server_idx];
 
@@ -421,24 +527,17 @@ impl NntpProxy {
         }
 
         // Create session and handle connection
-        let session = ClientSession::builder(
-            client_addr,
-            self.buffer_pool.clone(),
-            self.auth_handler.clone(),
-        )
-        .with_metrics(self.metrics.clone())
-        .with_connection_stats(self.connection_stats.clone())
-        .build();
+        let session = self.build_session(client_addr, None, self.routing_mode, None);
+        let session_id = crate::formatting::short_id(session.client_id().as_uuid());
 
         debug!("Starting session for client {}", client_addr);
-
         let copy_result = if self.enable_metrics {
             // Use metrics-enabled version for periodic reporting
             session
                 .handle_with_pooled_backend_and_metrics(
                     client_stream,
                     &mut *backend_conn,
-                    server_idx,
+                    backend_id,
                 )
                 .await
         } else {
@@ -448,46 +547,43 @@ impl NntpProxy {
                 .await
         };
 
-        debug!("Session completed for client {}", client_addr);
-
-        // Record connection statistics (aggregated logging)
-        let username = session.username();
-        let routing_mode_str = match session.mode() {
-            crate::session::SessionMode::PerCommand => "per-command",
-            crate::session::SessionMode::Stateful => match self.routing_mode {
-                RoutingMode::Standard => "standard",
-                RoutingMode::Hybrid => "hybrid",
-                _ => "stateful",
-            },
-        };
-        self.connection_stats
-            .record_connection(username.as_deref(), routing_mode_str);
+        // Record connection statistics if not already recorded during auth
+        // (on_authentication_success already records for authenticated sessions)
+        if !self.auth_handler.is_enabled() || session.username().is_none() {
+            let routing_mode_str = match session.mode() {
+                crate::session::SessionMode::PerCommand => "per-command",
+                crate::session::SessionMode::Stateful => match self.routing_mode {
+                    RoutingMode::Stateful => "standard",
+                    RoutingMode::Hybrid => "hybrid",
+                    _ => "stateful",
+                },
+            };
+            self.connection_stats
+                .record_connection(session.username().as_deref(), routing_mode_str);
+        }
 
         // Complete the routing (decrement pending count)
-        self.router.complete_command_sync(backend_id);
+        self.router.complete_command(backend_id);
 
         // Log session results and handle backend connection errors
         match copy_result {
             Ok(metrics) => {
-                // Record disconnection for aggregation
-                self.connection_stats
-                    .record_disconnection(session.username().as_deref(), "standard");
-
-                debug!(
-                    "Connection {} ↑{} ↓{}",
+                self.log_session_completion(
                     client_addr,
-                    metrics.client_to_backend.as_u64(),
-                    metrics.backend_to_client.as_u64()
+                    &session_id,
+                    &session,
+                    "standard",
+                    &metrics,
                 );
 
                 // Record transfer metrics
                 if self.enable_metrics {
                     self.metrics.record_client_to_backend_bytes_for(
-                        server_idx,
+                        backend_id,
                         metrics.client_to_backend.as_u64(),
                     );
                     self.metrics.record_backend_to_client_bytes_for(
-                        server_idx,
+                        backend_id,
                         metrics.backend_to_client.as_u64(),
                     );
                 }
@@ -495,7 +591,7 @@ impl NntpProxy {
             Err(e) => {
                 // Record error
                 if self.enable_metrics {
-                    self.metrics.record_error(server_idx);
+                    self.metrics.record_error(backend_id);
                 }
 
                 // Check if this is a backend I/O error - if so, remove connection from pool
@@ -505,20 +601,26 @@ impl NntpProxy {
                         client_addr, e
                     );
                     crate::pool::remove_from_pool(backend_conn);
-                    if self.enable_metrics {
-                        self.metrics.connection_closed();
-                    }
+                    self.record_connection_closed();
                     return Err(e);
                 }
                 warn!("Session error for client {}: {}", client_addr, e);
             }
         }
 
-        if self.enable_metrics {
-            self.metrics.connection_closed();
-        }
-        debug!("Connection returned to pool for {}", server.name);
+        self.record_connection_closed();
         Ok(())
+    }
+
+    /// Handle client connection using per-command routing with article caching
+    pub async fn handle_client_with_cache(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        cache: Arc<crate::cache::ArticleCache>,
+    ) -> Result<()> {
+        self.handle_per_command_routing_internal(client_stream, client_addr, Some(cache), "caching")
+            .await
     }
 
     /// Handle client connection using per-command routing mode
@@ -530,40 +632,38 @@ impl NntpProxy {
         client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
+        self.handle_per_command_routing_internal(client_stream, client_addr, None, "per-command")
+            .await
+    }
+
+    /// Internal implementation for per-command routing (with optional caching)
+    async fn handle_per_command_routing_internal(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        cache: Option<Arc<crate::cache::ArticleCache>>,
+        mode_label: &str,
+    ) -> Result<()> {
         debug!(
-            "New per-command routing client connection from {}",
-            client_addr
+            "New {} routing client connection from {}",
+            mode_label, client_addr
         );
 
         // Record connection metrics
-        if self.enable_metrics {
-            self.metrics.connection_opened();
-        }
+        self.record_connection_opened();
 
         // Enable TCP_NODELAY for low latency
         if let Err(e) = client_stream.set_nodelay(true) {
             debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
         }
 
-        // NOTE: handle_per_command_routing sends its own greeting immediately
-        // ("200 NNTP Proxy Ready (Per-Command Routing)")
-        // All backend greetings are consumed when connections are created
-
-        // Create session - conditionally enable metrics (causes ~45% performance penalty)
-        let mut session_builder = ClientSession::builder(
+        // Create session with optional cache
+        let session = self.build_session(
             client_addr,
-            self.buffer_pool.clone(),
-            self.auth_handler.clone(),
-        )
-        .with_router(self.router.clone())
-        .with_routing_mode(self.routing_mode)
-        .with_connection_stats(self.connection_stats.clone());
-
-        if self.enable_metrics {
-            session_builder = session_builder.with_metrics(self.metrics.clone());
-        }
-
-        let session = session_builder.build();
+            Some(self.router.clone()),
+            self.routing_mode,
+            cache,
+        );
 
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
 
@@ -573,55 +673,28 @@ impl NntpProxy {
             .await
             .with_context(|| {
                 format!(
-                    "Per-command routing session failed for {} [{}]",
-                    client_addr, session_id
+                    "{} routing session failed for {} [{}]",
+                    mode_label, client_addr, session_id
                 )
             });
 
         // Log session results
         match result {
             Ok(metrics) => {
-                // Record disconnection for aggregation
-                self.connection_stats.record_disconnection(
-                    session.username().as_deref(),
-                    &self.routing_mode.to_string().to_lowercase(),
-                );
-
-                debug!(
-                    "Session {} [{}] ↑{} ↓{}",
+                self.log_session_completion(
                     client_addr,
-                    session_id,
-                    crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
-                    crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
+                    &session_id,
+                    &session,
+                    &self.routing_mode.to_string().to_lowercase(),
+                    &metrics,
                 );
             }
             Err(e) => {
-                // Check if this is a broken pipe error (normal for quick disconnections like SABnzbd tests)
-                let is_broken_pipe = e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
-                    matches!(
-                        io_err.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                    )
-                });
-
-                if is_broken_pipe {
-                    debug!(
-                        "Client {} [{}] disconnected: {} (normal for test connections)",
-                        client_addr, session_id, e
-                    );
-                } else {
-                    warn!("Session error {} [{}]: {}", client_addr, session_id, e);
-                }
+                self.handle_session_error(e, client_addr, &session_id);
             }
         }
 
-        if self.enable_metrics {
-            self.metrics.connection_closed();
-        }
-        debug!(
-            "Per-command routing connection closed for {} (ID: {})",
-            client_addr, session_id
-        );
+        self.record_connection_closed();
         Ok(())
     }
 }
@@ -636,7 +709,7 @@ mod tests {
         use crate::types::{HostName, MaxConnections, Port, ServerName};
         Config {
             servers: vec![
-                ServerConfig {
+                Server {
                     host: HostName::new("server1.example.com".to_string()).unwrap(),
                     port: Port::new(119).unwrap(),
                     name: ServerName::new("Test Server 1".to_string()).unwrap(),
@@ -650,7 +723,7 @@ mod tests {
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
                 },
-                ServerConfig {
+                Server {
                     host: HostName::new("server2.example.com".to_string()).unwrap(),
                     port: Port::new(119).unwrap(),
                     name: ServerName::new("Test Server 2".to_string()).unwrap(),
@@ -664,7 +737,7 @@ mod tests {
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
                 },
-                ServerConfig {
+                Server {
                     host: HostName::new("server3.example.com".to_string()).unwrap(),
                     port: Port::new(119).unwrap(),
                     name: ServerName::new("Test Server 3".to_string()).unwrap(),
@@ -687,7 +760,7 @@ mod tests {
     fn test_proxy_creation_with_servers() {
         let config = create_test_config();
         let proxy = Arc::new(
-            NntpProxy::new(config, RoutingMode::Standard).expect("Failed to create proxy"),
+            NntpProxy::new(config, RoutingMode::Stateful).expect("Failed to create proxy"),
         );
 
         assert_eq!(proxy.servers().len(), 3);
@@ -700,7 +773,7 @@ mod tests {
             servers: vec![],
             ..Default::default()
         };
-        let result = NntpProxy::new(config, RoutingMode::Standard);
+        let result = NntpProxy::new(config, RoutingMode::Stateful);
 
         assert!(result.is_err());
         assert!(
@@ -715,7 +788,7 @@ mod tests {
     fn test_proxy_has_router() {
         let config = create_test_config();
         let proxy = Arc::new(
-            NntpProxy::new(config, RoutingMode::Standard).expect("Failed to create proxy"),
+            NntpProxy::new(config, RoutingMode::Stateful).expect("Failed to create proxy"),
         );
 
         // Proxy should have a router with backends
@@ -792,10 +865,92 @@ mod tests {
     fn test_backward_compatibility_new() {
         // Ensure NntpProxy::new() still works (it uses builder internally)
         let config = create_test_config();
-        let proxy = NntpProxy::new(config, RoutingMode::Standard)
+        let proxy = NntpProxy::new(config, RoutingMode::Stateful)
             .expect("Failed to create proxy with new()");
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.router.backend_count(), 3);
+    }
+
+    // Tests for is_client_disconnect_error function
+    mod error_classification {
+        use super::*;
+        use std::io::{Error, ErrorKind};
+
+        #[test]
+        fn test_broken_pipe_is_client_disconnect() {
+            let io_err = Error::from(ErrorKind::BrokenPipe);
+            let err = anyhow::Error::from(io_err);
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_connection_reset_is_client_disconnect() {
+            let io_err = Error::from(ErrorKind::ConnectionReset);
+            let err = anyhow::Error::from(io_err);
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_other_io_errors_not_client_disconnect() {
+            let error_kinds = vec![
+                ErrorKind::NotFound,
+                ErrorKind::PermissionDenied,
+                ErrorKind::ConnectionRefused,
+                ErrorKind::ConnectionAborted,
+                ErrorKind::AddrInUse,
+                ErrorKind::AddrNotAvailable,
+                ErrorKind::TimedOut,
+                ErrorKind::Interrupted,
+                ErrorKind::UnexpectedEof,
+                ErrorKind::WouldBlock,
+            ];
+
+            for kind in error_kinds {
+                let io_err = Error::from(kind);
+                let err = anyhow::Error::from(io_err);
+                assert!(
+                    !is_client_disconnect_error(&err),
+                    "{:?} should not be classified as client disconnect",
+                    kind
+                );
+            }
+        }
+
+        #[test]
+        fn test_non_io_error_not_client_disconnect() {
+            let err = anyhow::anyhow!("generic error message");
+            assert!(!is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_wrapped_broken_pipe_error() {
+            let io_err = Error::from(ErrorKind::BrokenPipe);
+            let err = anyhow::Error::from(io_err).context("failed to write to client");
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_wrapped_connection_reset_error() {
+            let io_err = Error::from(ErrorKind::ConnectionReset);
+            let err = anyhow::Error::from(io_err).context("failed to read from client");
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_deeply_wrapped_error() {
+            let io_err = Error::from(ErrorKind::BrokenPipe);
+            let err = anyhow::Error::from(io_err)
+                .context("inner context")
+                .context("outer context");
+            assert!(is_client_disconnect_error(&err));
+        }
+
+        #[test]
+        fn test_custom_io_error_message() {
+            let io_err = Error::new(ErrorKind::BrokenPipe, "custom broken pipe");
+            let err = anyhow::Error::from(io_err);
+            assert!(is_client_disconnect_error(&err));
+        }
     }
 }

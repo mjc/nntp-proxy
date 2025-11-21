@@ -26,11 +26,11 @@ async fn test_auth_flow_complete_with_valid_credentials() {
         .unwrap();
 
     // Create config with auth
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
     use test_helpers::create_test_config;
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
-    config.client_auth = ClientAuthConfig {
+    config.client_auth = ClientAuth {
         users: vec![],
         username: Some("testuser".to_string()),
         password: Some("testpass".to_string()),
@@ -39,7 +39,7 @@ async fn test_auth_flow_complete_with_valid_credentials() {
 
     // Start proxy
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -110,7 +110,7 @@ async fn test_auth_disabled_allows_immediate_commands() {
 
     // Start proxy
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -153,11 +153,11 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
         .await
         .unwrap();
 
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
     use test_helpers::create_test_config;
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
-    config.client_auth = ClientAuthConfig {
+    config.client_auth = ClientAuth {
         users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
@@ -165,7 +165,7 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
     };
 
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -206,7 +206,7 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
 async fn test_multiple_clients_with_auth() {
     let backend_port = 19122;
 
-    use nntp_proxy::config::ClientAuthConfig;
+    use nntp_proxy::config::ClientAuth;
     use test_helpers::create_test_config;
     use tokio::task::JoinSet;
 
@@ -217,7 +217,7 @@ async fn test_multiple_clients_with_auth() {
         .unwrap();
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
-    config.client_auth = ClientAuthConfig {
+    config.client_auth = ClientAuth {
         users: vec![],
         username: Some("user".to_string()),
         password: Some("pass".to_string()),
@@ -225,7 +225,7 @@ async fn test_multiple_clients_with_auth() {
     };
 
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Standard).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -283,25 +283,6 @@ async fn test_multiple_clients_with_auth() {
 }
 
 #[tokio::test]
-async fn test_auth_handler_in_cache_session() {
-    use nntp_proxy::auth::AuthHandler;
-    use nntp_proxy::cache::{ArticleCache, CachingSession};
-    use std::time::Duration;
-
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600)));
-    let auth_handler = Arc::new(
-        AuthHandler::new(Some("cacheuser".to_string()), Some("cachepass".to_string())).unwrap(),
-    );
-
-    let addr = "127.0.0.1:9999".parse().unwrap();
-    let _session = CachingSession::new(addr, cache, auth_handler.clone());
-
-    // Verify auth handler is configured
-    assert!(auth_handler.is_enabled());
-    assert!(auth_handler.validate("cacheuser", "cachepass"));
-}
-
-#[tokio::test]
 async fn test_auth_handler_integration() {
     use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
     use test_helpers::create_test_auth_handler_with;
@@ -309,16 +290,16 @@ async fn test_auth_handler_integration() {
     let handler = create_test_auth_handler_with("alice", "secret");
 
     // Test command classification
-    let action = CommandHandler::handle_command("LIST\r\n");
+    let action = CommandHandler::classify("LIST\r\n");
     assert_eq!(action, CommandAction::ForwardStateless);
 
-    let action = CommandHandler::handle_command("AUTHINFO USER alice\r\n");
+    let action = CommandHandler::classify("AUTHINFO USER alice\r\n");
     assert!(matches!(
         action,
         CommandAction::InterceptAuth(AuthAction::RequestPassword(_))
     ));
 
-    let action = CommandHandler::handle_command("GROUP misc.test\r\n");
+    let action = CommandHandler::classify("GROUP misc.test\r\n");
     assert!(matches!(action, CommandAction::Reject(_)));
 
     // Test auth handler responses
@@ -352,7 +333,7 @@ async fn test_auth_handler_integration() {
 
 #[tokio::test]
 async fn test_config_auth_round_trip() {
-    use nntp_proxy::config::{ClientAuthConfig, Config};
+    use nntp_proxy::config::{ClientAuth, Config};
 
     // Create config with auth
     let config = Config {
@@ -360,7 +341,7 @@ async fn test_config_auth_round_trip() {
         proxy: Default::default(),
         health_check: Default::default(),
         cache: None,
-        client_auth: ClientAuthConfig {
+        client_auth: ClientAuth {
             users: vec![],
             username: Some("testuser".to_string()),
             password: Some("testpass".to_string()),

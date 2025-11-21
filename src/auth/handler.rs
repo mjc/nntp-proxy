@@ -92,12 +92,6 @@ impl AuthHandler {
         }
     }
 
-    /// Validate client credentials (alias for validate_credentials)
-    #[inline]
-    pub fn validate(&self, username: &str, password: &str) -> bool {
-        self.validate_credentials(username, password)
-    }
-
     /// Handle an auth command - writes response to client and returns (bytes_written, auth_success)
     /// This is the ONE place where auth interception happens
     pub async fn handle_auth_command<W>(
@@ -118,7 +112,7 @@ impl AuthHandler {
             AuthAction::ValidateAndRespond { password } => {
                 // Validate credentials
                 let auth_success = if let Some(username) = stored_username {
-                    self.validate(username, &password)
+                    self.validate_credentials(username, &password)
                 } else {
                     // No username was stored (client sent AUTHINFO PASS without USER)
                     false
@@ -199,19 +193,19 @@ mod tests {
             ];
             let handler = AuthHandler::with_users(users).unwrap();
             assert!(handler.is_enabled());
-            assert!(handler.validate("alice", "secret1"));
-            assert!(handler.validate("bob", "secret2"));
-            assert!(handler.validate("charlie", "secret3"));
-            assert!(!handler.validate("alice", "wrong"));
-            assert!(!handler.validate("bob", "secret1")); // Wrong password for bob
-            assert!(!handler.validate("dave", "anything")); // Unknown user
+            assert!(handler.validate_credentials("alice", "secret1"));
+            assert!(handler.validate_credentials("bob", "secret2"));
+            assert!(handler.validate_credentials("charlie", "secret3"));
+            assert!(!handler.validate_credentials("alice", "wrong"));
+            assert!(!handler.validate_credentials("bob", "secret1")); // Wrong password for bob
+            assert!(!handler.validate_credentials("dave", "anything")); // Unknown user
         }
 
         #[test]
         fn test_with_users_empty() {
             let handler = AuthHandler::with_users(vec![]).unwrap();
             assert!(!handler.is_enabled());
-            assert!(handler.validate("anyone", "anything")); // No auth, allow all
+            assert!(handler.validate_credentials("anyone", "anything")); // No auth, allow all
         }
 
         #[test]
@@ -267,19 +261,19 @@ mod tests {
         #[test]
         fn test_validate_when_disabled() {
             let handler = AuthHandler::new(None, None).unwrap();
-            assert!(handler.validate("any", "thing"));
-            assert!(handler.validate("", ""));
-            assert!(handler.validate("foo", "bar"));
+            assert!(handler.validate_credentials("any", "thing"));
+            assert!(handler.validate_credentials("", ""));
+            assert!(handler.validate_credentials("foo", "bar"));
         }
 
         #[test]
         fn test_validate_when_enabled() {
             let handler =
                 AuthHandler::new(Some("alice".to_string()), Some("secret".to_string())).unwrap();
-            assert!(handler.validate("alice", "secret"));
-            assert!(!handler.validate("alice", "wrong"));
-            assert!(!handler.validate("bob", "secret"));
-            assert!(!handler.validate("bob", "wrong"));
+            assert!(handler.validate_credentials("alice", "secret"));
+            assert!(!handler.validate_credentials("alice", "wrong"));
+            assert!(!handler.validate_credentials("bob", "secret"));
+            assert!(!handler.validate_credentials("bob", "wrong"));
         }
 
         #[test]
@@ -355,14 +349,14 @@ mod tests {
     fn test_auth_disabled_by_default() {
         let handler = AuthHandler::default();
         assert!(!handler.is_enabled());
-        assert!(handler.validate("any", "thing")); // Should accept anything
+        assert!(handler.validate_credentials("any", "thing")); // Should accept anything
     }
 
     #[test]
     fn test_auth_new_none_none() {
         let handler = AuthHandler::new(None, None).unwrap();
         assert!(!handler.is_enabled());
-        assert!(handler.validate("any", "thing"));
+        assert!(handler.validate_credentials("any", "thing"));
     }
 
     #[test]
@@ -370,9 +364,9 @@ mod tests {
         let handler =
             AuthHandler::new(Some("mjc".to_string()), Some("nntp1337".to_string())).unwrap();
         assert!(handler.is_enabled());
-        assert!(handler.validate("mjc", "nntp1337"));
-        assert!(!handler.validate("mjc", "wrong"));
-        assert!(!handler.validate("wrong", "nntp1337"));
+        assert!(handler.validate_credentials("mjc", "nntp1337"));
+        assert!(!handler.validate_credentials("mjc", "wrong"));
+        assert!(!handler.validate_credentials("wrong", "nntp1337"));
     }
 
     #[test]

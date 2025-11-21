@@ -132,6 +132,33 @@ fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
     Ok(())
 }
 
+/// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix)
+///
+/// This is a common utility for all binary targets.
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +223,191 @@ mod tests {
         // Should not panic even if pinning fails
         let result = pin_to_cpu_cores(1);
         assert!(result.is_ok());
+    }
+
+    // Edge case tests
+
+    #[test]
+    fn test_runtime_config_zero_threads_auto() {
+        // ThreadCount(0) means auto-detect CPUs
+        // We can't test ThreadCount::new(0) directly as it returns None,
+        // but we can test the from_args behavior
+        let config = RuntimeConfig::from_args(None);
+        assert_eq!(config.worker_threads(), 1); // Defaults to 1
+    }
+
+    #[test]
+    fn test_runtime_config_large_thread_count() {
+        let thread_count = ThreadCount::new(128).unwrap();
+        let config = RuntimeConfig::from_args(Some(thread_count));
+
+        assert_eq!(config.worker_threads(), 128);
+        assert!(!config.is_single_threaded());
+    }
+
+    #[test]
+    fn test_runtime_config_clone() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap()));
+        let cloned = config.clone();
+
+        assert_eq!(cloned.worker_threads(), config.worker_threads());
+        assert_eq!(cloned.enable_cpu_pinning, config.enable_cpu_pinning);
+    }
+
+    #[test]
+    fn test_runtime_config_debug() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(2).unwrap()));
+        let debug_str = format!("{:?}", config);
+
+        assert!(debug_str.contains("RuntimeConfig"));
+        assert!(debug_str.contains("worker_threads"));
+        assert!(debug_str.contains("enable_cpu_pinning"));
+    }
+
+    // Builder pattern tests
+
+    #[test]
+    fn test_runtime_config_builder_chaining() {
+        let config =
+            RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap())).without_cpu_pinning();
+
+        assert_eq!(config.worker_threads(), 4);
+        assert!(!config.enable_cpu_pinning);
+    }
+
+    #[test]
+    fn test_runtime_config_builder_multiple_calls() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(8).unwrap()))
+            .without_cpu_pinning()
+            .without_cpu_pinning(); // Idempotent
+
+        assert!(!config.enable_cpu_pinning);
+    }
+
+    // Getter tests
+
+    #[test]
+    fn test_worker_threads_getter() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(6).unwrap()));
+        assert_eq!(config.worker_threads(), 6);
+    }
+
+    #[test]
+    fn test_is_single_threaded_true() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(1).unwrap()));
+        assert!(config.is_single_threaded());
+    }
+
+    #[test]
+    fn test_is_single_threaded_false() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(2).unwrap()));
+        assert!(!config.is_single_threaded());
+    }
+
+    #[test]
+    fn test_is_single_threaded_false_for_large() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(100).unwrap()));
+        assert!(!config.is_single_threaded());
+    }
+
+    // CPU pinning platform-specific tests
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pin_to_cpu_cores_linux_single_core() {
+        let result = pin_to_cpu_cores(1);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pin_to_cpu_cores_linux_multi_core() {
+        let result = pin_to_cpu_cores(4);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pin_to_cpu_cores_linux_zero_cores() {
+        // Edge case: 0 cores should still succeed (no-op)
+        let result = pin_to_cpu_cores(0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pin_to_cpu_cores_linux_many_cores() {
+        // Try to pin to more cores than available - should not panic
+        let result = pin_to_cpu_cores(1024);
+        assert!(result.is_ok()); // Best-effort, won't fail
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn test_pin_to_cpu_cores_non_linux() {
+        // Non-Linux platforms should gracefully no-op
+        let result = pin_to_cpu_cores(4);
+        assert!(result.is_ok());
+    }
+
+    // Default implementation tests
+
+    #[test]
+    fn test_default_matches_from_args_none() {
+        let default_config = RuntimeConfig::default();
+        let explicit_config = RuntimeConfig::from_args(None);
+
+        assert_eq!(
+            default_config.worker_threads(),
+            explicit_config.worker_threads()
+        );
+        assert_eq!(
+            default_config.enable_cpu_pinning,
+            explicit_config.enable_cpu_pinning
+        );
+    }
+
+    #[test]
+    fn test_default_is_single_threaded() {
+        let config = RuntimeConfig::default();
+        assert!(config.is_single_threaded());
+    }
+
+    #[test]
+    fn test_default_has_cpu_pinning_enabled() {
+        let config = RuntimeConfig::default();
+        assert!(config.enable_cpu_pinning);
+    }
+
+    // Configuration combination tests
+
+    #[test]
+    fn test_config_single_threaded_with_pinning() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(1).unwrap()));
+        assert!(config.is_single_threaded());
+        assert!(config.enable_cpu_pinning);
+    }
+
+    #[test]
+    fn test_config_single_threaded_without_pinning() {
+        let config =
+            RuntimeConfig::from_args(Some(ThreadCount::new(1).unwrap())).without_cpu_pinning();
+        assert!(config.is_single_threaded());
+        assert!(!config.enable_cpu_pinning);
+    }
+
+    #[test]
+    fn test_config_multi_threaded_with_pinning() {
+        let config = RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap()));
+        assert!(!config.is_single_threaded());
+        assert!(config.enable_cpu_pinning);
+    }
+
+    #[test]
+    fn test_config_multi_threaded_without_pinning() {
+        let config =
+            RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap())).without_cpu_pinning();
+        assert!(!config.is_single_threaded());
+        assert!(!config.enable_cpu_pinning);
     }
 }
