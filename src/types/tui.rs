@@ -373,24 +373,25 @@ mod tests {
         assert_eq!(instant, instant2);
     }
 
-    // ConnectionCount tests
+    // ConnectionCount tests - using test macros
     #[test]
-    fn test_connection_count() {
-        let count = ConnectionCount::new(42);
-        assert_eq!(count.to_string(), "42");
+    fn test_connection_count_zero() {
         assert_eq!(ConnectionCount::zero().get(), 0);
+        assert_eq!(ConnectionCount::default().get(), 0);
     }
 
     #[test]
-    fn test_connection_count_default() {
-        let count = ConnectionCount::default();
-        assert_eq!(count.get(), 0);
+    fn test_connection_count_get() {
+        assert_eq!(ConnectionCount::new(42).get(), 42);
+        assert_eq!(ConnectionCount::new(0).get(), 0);
+        assert_eq!(ConnectionCount::new(1000).get(), 1000);
     }
 
     #[test]
     fn test_connection_count_display() {
         assert_eq!(ConnectionCount::new(0).to_string(), "0");
         assert_eq!(ConnectionCount::new(1).to_string(), "1");
+        assert_eq!(ConnectionCount::new(42).to_string(), "42");
         assert_eq!(ConnectionCount::new(1000).to_string(), "1000");
     }
 
