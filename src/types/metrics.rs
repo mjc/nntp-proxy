@@ -331,242 +331,261 @@ impl fmt::Display for TransferMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    // BytesTransferred tests
+    // ============================================================================
+    // Property Tests - BytesTransferred
+    // ============================================================================
+
+    proptest! {
+        /// Property: new() and as_u64() round-trip correctly
+        #[test]
+        fn prop_bytes_transferred_roundtrip(value in 0u64..=u64::MAX / 2) {
+            let bytes = BytesTransferred::new(value);
+            prop_assert_eq!(bytes.as_u64(), value);
+        }
+
+        /// Property: add() increments correctly (using explicit method call)
+        #[test]
+        fn prop_bytes_transferred_add(initial in 0u64..1000000, increment in 0usize..1000000) {
+            let mut bytes = BytesTransferred::new(initial);
+            BytesTransferred::add(&mut bytes, increment);
+            prop_assert_eq!(bytes.as_u64(), initial + increment as u64);
+        }
+
+        /// Property: add_u64() increments correctly
+        #[test]
+        fn prop_bytes_transferred_add_u64(initial in 0u64..1000000, increment in 0u64..1000000) {
+            let mut bytes = BytesTransferred::new(initial);
+            bytes.add_u64(increment);
+            prop_assert_eq!(bytes.as_u64(), initial + increment);
+        }
+
+        /// Property: Addition operator is commutative
+        #[test]
+        fn prop_bytes_transferred_add_commutative(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = BytesTransferred::new(a);
+            let bytes_b = BytesTransferred::new(b);
+            prop_assert_eq!(bytes_a + bytes_b, bytes_b + bytes_a);
+        }
+
+        /// Property: From<u64> conversion
+        #[test]
+        fn prop_bytes_transferred_from_u64(value in 0u64..=u64::MAX / 2) {
+            let bytes = BytesTransferred::from(value);
+            prop_assert_eq!(bytes.as_u64(), value);
+        }
+    }
+
+    // Edge cases for BytesTransferred
     #[test]
-    fn test_bytes_transferred_basic() {
-        assert_eq!(BytesTransferred::new(1024).as_u64(), 1024);
+    fn test_bytes_transferred_zero() {
         assert_eq!(BytesTransferred::zero().as_u64(), 0);
         assert_eq!(BytesTransferred::ZERO.as_u64(), 0);
     }
 
     #[test]
-    fn test_bytes_transferred_add() {
+    fn test_bytes_transferred_add_assign() {
         let mut bytes = BytesTransferred::new(100);
-        BytesTransferred::add(&mut bytes, 50);
+        bytes += BytesTransferred::new(50);
         assert_eq!(bytes.as_u64(), 150);
+    }
 
-        bytes.add_u64(200);
-        assert_eq!(bytes.as_u64(), 350);
+    // ============================================================================
+    // Property Tests - ClientBytes
+    // ============================================================================
+
+    proptest! {
+        /// Property: saturating_sub never underflows
+        #[test]
+        fn prop_client_bytes_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = ClientBytes::new(a);
+            let bytes_b = ClientBytes::new(b);
+            let result = bytes_a.saturating_sub(bytes_b);
+
+            if a >= b {
+                prop_assert_eq!(result, a - b);
+            } else {
+                prop_assert_eq!(result, 0);
+            }
+        }
+
+        /// Property: ClientBytes round-trip
+        #[test]
+        fn prop_client_bytes_roundtrip(value in 0u64..=u64::MAX / 2) {
+            let bytes = ClientBytes::new(value);
+            prop_assert_eq!(bytes.as_u64(), value);
+        }
     }
 
     #[test]
-    fn test_bytes_transferred_operators() {
-        let a = BytesTransferred::new(100);
-        let b = BytesTransferred::new(50);
-        assert_eq!((a + b).as_u64(), 150);
-
-        let mut c = BytesTransferred::new(100);
-        c += BytesTransferred::new(50);
-        assert_eq!(c.as_u64(), 150);
-    }
-
-    // ClientBytes tests
-    #[test]
-    fn test_client_bytes() {
-        let bytes = ClientBytes::new(1024);
-        assert_eq!(bytes.as_u64(), 1024);
+    fn test_client_bytes_zero() {
         assert_eq!(ClientBytes::ZERO.as_u64(), 0);
     }
 
-    #[test]
-    fn test_client_bytes_saturating_sub() {
-        let a = ClientBytes::new(100);
-        let b = ClientBytes::new(30);
-        assert_eq!(a.saturating_sub(b), 70);
+    // ============================================================================
+    // Property Tests - ClientToBackendBytes
+    // ============================================================================
 
-        // Underflow protection
-        assert_eq!(b.saturating_sub(a), 0);
+    proptest! {
+        /// Property: add() works correctly
+        #[test]
+        fn prop_client_to_backend_add(initial in 0u64..1000000, increment in 0usize..1000000) {
+            let mut bytes = ClientToBackendBytes::new(initial);
+            ClientToBackendBytes::add(&mut bytes, increment);
+            prop_assert_eq!(bytes.as_u64(), initial + increment as u64);
+        }
+
+        /// Property: add_u64() works correctly
+        #[test]
+        fn prop_client_to_backend_add_u64(initial in 0u64..1000000, increment in 0u64..1000000) {
+            let mut bytes = ClientToBackendBytes::new(initial);
+            bytes.add_u64(increment);
+            prop_assert_eq!(bytes.as_u64(), initial + increment);
+        }
+
+        /// Property: Addition operators work
+        #[test]
+        fn prop_client_to_backend_operators(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = ClientToBackendBytes::new(a);
+            let bytes_b = ClientToBackendBytes::new(b);
+
+            // Test + operator
+            let sum1 = bytes_a + bytes_b;
+            prop_assert_eq!(sum1.as_u64(), a + b);
+
+            // Test += operator
+            let mut sum2 = bytes_a;
+            sum2 += bytes_b;
+            prop_assert_eq!(sum2.as_u64(), a + b);
+        }
+
+        /// Property: saturating_sub never underflows
+        #[test]
+        fn prop_client_to_backend_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = ClientToBackendBytes::new(a);
+            let bytes_b = ClientToBackendBytes::new(b);
+            let result = bytes_a.saturating_sub(bytes_b);
+            prop_assert_eq!(result, a.saturating_sub(b));
+        }
     }
 
-    // ClientToBackendBytes tests
     #[test]
-    fn test_client_to_backend_bytes() {
-        let bytes = ClientToBackendBytes::new(512);
-        assert_eq!(bytes.as_u64(), 512);
+    fn test_client_to_backend_zero() {
         assert_eq!(ClientToBackendBytes::zero().as_u64(), 0);
     }
 
-    #[test]
-    fn test_client_to_backend_add() {
-        let mut bytes = ClientToBackendBytes::new(100);
-        ClientToBackendBytes::add(&mut bytes, 50);
-        assert_eq!(bytes.as_u64(), 150);
+    // ============================================================================
+    // Property Tests - BackendToClientBytes
+    // ============================================================================
 
-        ClientToBackendBytes::add_u64(&mut bytes, 25);
-        assert_eq!(bytes.as_u64(), 175);
+    proptest! {
+        /// Property: add() works correctly
+        #[test]
+        fn prop_backend_to_client_add(initial in 0u64..1000000, increment in 0usize..1000000) {
+            let mut bytes = BackendToClientBytes::new(initial);
+            BackendToClientBytes::add(&mut bytes, increment);
+            prop_assert_eq!(bytes.as_u64(), initial + increment as u64);
+        }
+
+        /// Property: Addition operators work
+        #[test]
+        fn prop_backend_to_client_operators(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = BackendToClientBytes::new(a);
+            let bytes_b = BackendToClientBytes::new(b);
+
+            let sum1 = bytes_a + bytes_b;
+            prop_assert_eq!(sum1.as_u64(), a + b);
+
+            let mut sum2 = bytes_a;
+            sum2 += bytes_b;
+            prop_assert_eq!(sum2.as_u64(), a + b);
+        }
+
+        /// Property: saturating_sub never underflows
+        #[test]
+        fn prop_backend_to_client_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = BackendToClientBytes::new(a);
+            let bytes_b = BackendToClientBytes::new(b);
+            prop_assert_eq!(bytes_a.saturating_sub(bytes_b), a.saturating_sub(b));
+        }
     }
 
-    #[test]
-    fn test_client_to_backend_operators() {
-        let a = ClientToBackendBytes::new(100);
-        let b = ClientToBackendBytes::new(50);
-        assert_eq!((a + b).as_u64(), 150);
+    // ============================================================================
+    // Property Tests - BytesSent & BytesReceived
+    // ============================================================================
 
-        let mut c = ClientToBackendBytes::new(100);
-        c += ClientToBackendBytes::new(50);
-        assert_eq!(c.as_u64(), 150);
+    proptest! {
+        /// Property: BytesSent saturating_sub
+        #[test]
+        fn prop_bytes_sent_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = BytesSent::new(a);
+            let bytes_b = BytesSent::new(b);
+            prop_assert_eq!(bytes_a.saturating_sub(bytes_b), a.saturating_sub(b));
+        }
+
+        /// Property: BytesReceived saturating_sub
+        #[test]
+        fn prop_bytes_received_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
+            let bytes_a = BytesReceived::new(a);
+            let bytes_b = BytesReceived::new(b);
+            prop_assert_eq!(bytes_a.saturating_sub(bytes_b), a.saturating_sub(b));
+        }
     }
 
-    #[test]
-    fn test_client_to_backend_saturating_sub() {
-        let a = ClientToBackendBytes::new(100);
-        let b = ClientToBackendBytes::new(30);
-        assert_eq!(a.saturating_sub(b), 70);
-        assert_eq!(b.saturating_sub(a), 0);
+    // ============================================================================
+    // Property Tests - From Conversions
+    // ============================================================================
+
+    proptest! {
+        /// Property: All From<u64> conversions work
+        #[test]
+        fn prop_from_u64_conversions(value in 0u64..1000000) {
+            prop_assert_eq!(BytesTransferred::from(value).as_u64(), value);
+            prop_assert_eq!(ClientBytes::from(value).as_u64(), value);
+            prop_assert_eq!(ClientToBackendBytes::from(value).as_u64(), value);
+            prop_assert_eq!(BackendToClientBytes::from(value).as_u64(), value);
+            prop_assert_eq!(BytesSent::from(value).as_u64(), value);
+            prop_assert_eq!(BytesReceived::from(value).as_u64(), value);
+            prop_assert_eq!(TotalConnections::from(value).get(), value);
+            prop_assert_eq!(BytesPerSecondRate::from(value).get(), value);
+            prop_assert_eq!(ArticleBytesTotal::from(value).get(), value);
+            prop_assert_eq!(TimingMeasurementCount::from(value).get(), value);
+        }
+
+        /// Property: Into<u64> conversion
+        #[test]
+        fn prop_into_u64(value in 0u64..1000000) {
+            let bytes = BytesTransferred::new(value);
+            let converted: u64 = bytes.into();
+            prop_assert_eq!(converted, value);
+        }
     }
 
-    // BackendToClientBytes tests
-    #[test]
-    fn test_backend_to_client_bytes() {
-        let bytes = BackendToClientBytes::new(2048);
-        assert_eq!(bytes.as_u64(), 2048);
-        assert_eq!(BackendToClientBytes::zero().as_u64(), 0);
+    // ============================================================================
+    // Property Tests - Display Implementations
+    // ============================================================================
+
+    proptest! {
+        /// Property: Display implementations contain the value
+        #[test]
+        fn prop_display_implementations(value in 0u64..10000) {
+            let value_str = value.to_string();
+
+            prop_assert!(BytesTransferred::new(value).to_string().contains(&value_str));
+            prop_assert!(ClientBytes::new(value).to_string().contains(&value_str));
+            prop_assert!(ClientToBackendBytes::new(value).to_string().contains(&value_str));
+            prop_assert!(BackendToClientBytes::new(value).to_string().contains(&value_str));
+            prop_assert!(BytesSent::new(value).to_string().contains(&value_str));
+            prop_assert!(BytesReceived::new(value).to_string().contains(&value_str));
+            prop_assert!(TotalConnections::new(value).to_string().contains(&value_str));
+            prop_assert!(ArticleBytesTotal::new(value).to_string().contains(&value_str));
+        }
     }
 
-    #[test]
-    fn test_backend_to_client_add() {
-        let mut bytes = BackendToClientBytes::new(100);
-        BackendToClientBytes::add(&mut bytes, 50);
-        assert_eq!(bytes.as_u64(), 150);
-
-        BackendToClientBytes::add_u64(&mut bytes, 25);
-        assert_eq!(bytes.as_u64(), 175);
-    }
-
-    #[test]
-    fn test_backend_to_client_operators() {
-        let a = BackendToClientBytes::new(200);
-        let b = BackendToClientBytes::new(100);
-        assert_eq!((a + b).as_u64(), 300);
-
-        let mut c = BackendToClientBytes::new(200);
-        c += BackendToClientBytes::new(100);
-        assert_eq!(c.as_u64(), 300);
-    }
-
-    #[test]
-    fn test_backend_to_client_saturating_sub() {
-        let a = BackendToClientBytes::new(200);
-        let b = BackendToClientBytes::new(50);
-        assert_eq!(a.saturating_sub(b), 150);
-        assert_eq!(b.saturating_sub(a), 0);
-    }
-
-    // TransferMetrics tests
-    #[test]
-    fn test_transfer_metrics_basic() {
-        let metrics = TransferMetrics::new(1024, 2048);
-        assert_eq!(metrics.client_to_backend.as_u64(), 1024);
-        assert_eq!(metrics.backend_to_client.as_u64(), 2048);
-        assert_eq!(metrics.total(), 3072);
-    }
-
-    #[test]
-    fn test_transfer_metrics_zero() {
-        let metrics = TransferMetrics::zero();
-        assert_eq!(metrics.total(), 0);
-    }
-
-    // BytesSent tests
-    #[test]
-    fn test_bytes_sent() {
-        let bytes = BytesSent::new(512);
-        assert_eq!(bytes.as_u64(), 512);
-        assert_eq!(BytesSent::ZERO.as_u64(), 0);
-    }
-
-    #[test]
-    fn test_bytes_sent_saturating_sub() {
-        let a = BytesSent::new(100);
-        let b = BytesSent::new(30);
-        assert_eq!(a.saturating_sub(b), 70);
-        assert_eq!(b.saturating_sub(a), 0);
-    }
-
-    // BytesReceived tests
-    #[test]
-    fn test_bytes_received() {
-        let bytes = BytesReceived::new(1024);
-        assert_eq!(bytes.as_u64(), 1024);
-        assert_eq!(BytesReceived::ZERO.as_u64(), 0);
-    }
-
-    #[test]
-    fn test_bytes_received_saturating_sub() {
-        let a = BytesReceived::new(200);
-        let b = BytesReceived::new(50);
-        assert_eq!(a.saturating_sub(b), 150);
-        assert_eq!(b.saturating_sub(a), 0);
-    }
-
-    // TotalConnections tests
-    #[test]
-    fn test_total_connections() {
-        let conn = TotalConnections::new(42);
-        assert_eq!(conn.get(), 42);
-        assert_eq!(TotalConnections::ZERO.get(), 0);
-    }
-
-    // BytesPerSecondRate tests
-    #[test]
-    fn test_bytes_per_second_rate() {
-        let rate = BytesPerSecondRate::new(1024);
-        assert_eq!(rate.get(), 1024);
-        assert_eq!(BytesPerSecondRate::ZERO.get(), 0);
-    }
-
-    // ArticleBytesTotal tests
-    #[test]
-    fn test_article_bytes_total() {
-        let bytes = ArticleBytesTotal::new(5120);
-        assert_eq!(bytes.get(), 5120);
-        assert_eq!(ArticleBytesTotal::ZERO.get(), 0);
-    }
-
-    // TimingMeasurementCount tests
-    #[test]
-    fn test_timing_measurement_count() {
-        let count = TimingMeasurementCount::new(100);
-        assert_eq!(count.get(), 100);
-        assert_eq!(TimingMeasurementCount::ZERO.get(), 0);
-    }
-
-    // Display trait tests
-    #[test]
-    fn test_display_implementations() {
-        assert_eq!(BytesTransferred::new(1024).to_string(), "1024 bytes");
-        assert_eq!(ClientBytes::new(512).to_string(), "512 bytes");
-        assert_eq!(ClientToBackendBytes::new(256).to_string(), "256 bytes");
-        assert_eq!(BackendToClientBytes::new(128).to_string(), "128 bytes");
-        assert_eq!(BytesSent::new(64).to_string(), "64 bytes");
-        assert_eq!(BytesReceived::new(32).to_string(), "32 bytes");
-        assert_eq!(TotalConnections::new(10).to_string(), "10 connections");
-        assert_eq!(BytesPerSecondRate::new(1024).to_string(), "1024 B/s");
-        assert_eq!(ArticleBytesTotal::new(2048).to_string(), "2048 bytes");
-    }
-
-    // From/Into conversions
-    #[test]
-    fn test_from_conversions() {
-        assert_eq!(BytesTransferred::from(100u64).as_u64(), 100);
-        assert_eq!(ClientBytes::from(200u64).as_u64(), 200);
-        assert_eq!(ClientToBackendBytes::from(300u64).as_u64(), 300);
-        assert_eq!(BackendToClientBytes::from(400u64).as_u64(), 400);
-        assert_eq!(BytesSent::from(500u64).as_u64(), 500);
-        assert_eq!(BytesReceived::from(600u64).as_u64(), 600);
-        assert_eq!(TotalConnections::from(10u64).get(), 10);
-        assert_eq!(BytesPerSecondRate::from(1024u64).get(), 1024);
-        assert_eq!(ArticleBytesTotal::from(2048u64).get(), 2048);
-        assert_eq!(TimingMeasurementCount::from(50u64).get(), 50);
-    }
-
-    #[test]
-    fn test_into_u64() {
-        let bytes = BytesTransferred::new(1024);
-        let value: u64 = bytes.into();
-        assert_eq!(value, 1024);
-    }
+    // ============================================================================
+    // Edge Cases & Cross-Type Conversions
+    // ============================================================================
 
     #[test]
     fn test_bytes_transferred_from_conversion() {
@@ -576,6 +595,16 @@ mod tests {
 
         let backend_to_client = BackendToClientBytes::from(transferred);
         assert_eq!(backend_to_client.as_u64(), 100);
+    }
+
+    #[test]
+    fn test_zero_constants() {
+        assert_eq!(BytesSent::ZERO.as_u64(), 0);
+        assert_eq!(BytesReceived::ZERO.as_u64(), 0);
+        assert_eq!(TotalConnections::ZERO.get(), 0);
+        assert_eq!(BytesPerSecondRate::ZERO.get(), 0);
+        assert_eq!(ArticleBytesTotal::ZERO.get(), 0);
+        assert_eq!(TimingMeasurementCount::ZERO.get(), 0);
     }
 }
 
