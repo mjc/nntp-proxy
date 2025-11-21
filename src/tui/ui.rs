@@ -144,29 +144,26 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
 /// Render summary statistics
 fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
     let snapshot = app.snapshot();
+    let system_stats = app.system_stats();
 
     // Get latest throughput from history (extracted for testing)
     let (client_to_backend_str, backend_to_client_str) =
         format_summary_throughput(app.latest_client_throughput());
 
-    let summary = Paragraph::new(vec![
+    // Split summary box into two columns
+    use ratatui::layout::Constraint;
+    let summary_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Left half: Throughput and transfer stats
+    let left_summary = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Client → Backend: ", Style::default().fg(styles::LABEL)),
             Span::styled(
                 &client_to_backend_str,
                 Style::default().fg(styles::VALUE_SECONDARY),
-            ),
-            Span::styled(
-                "  |  Stateful Sessions: ",
-                Style::default().fg(styles::LABEL),
-            ),
-            Span::styled(
-                format!("{}", snapshot.stateful_sessions),
-                Style::default().fg(if snapshot.stateful_sessions > 0 {
-                    styles::VALUE_PRIMARY
-                } else {
-                    styles::VALUE_NEUTRAL
-                }),
             ),
         ]),
         Line::from(vec![
@@ -178,6 +175,24 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("Total Transferred: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(snapshot.total_bytes()),
+                Style::default().fg(styles::VALUE_PRIMARY),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Stateful Sessions: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{}", snapshot.stateful_sessions),
+                Style::default().fg(if snapshot.stateful_sessions > 0 {
+                    styles::VALUE_PRIMARY
+                } else {
+                    styles::VALUE_NEUTRAL
+                }),
+            ),
+        ]),
     ])
     .block(
         Block::default()
@@ -187,7 +202,51 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
     )
     .alignment(Alignment::Left);
 
-    f.render_widget(summary, area);
+    // Right half: System stats
+    let right_summary = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("CPU: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{:.1}%", system_stats.cpu_usage),
+                Style::default().fg(if system_stats.cpu_usage > 80.0 {
+                    Color::Red
+                } else if system_stats.cpu_usage > 50.0 {
+                    Color::Yellow
+                } else {
+                    styles::VALUE_INFO
+                }),
+            ),
+            Span::styled("  (peak: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{:.1}%", system_stats.peak_cpu_usage),
+                Style::default().fg(styles::VALUE_NEUTRAL),
+            ),
+            Span::styled(")", Style::default().fg(styles::LABEL)),
+        ]),
+        Line::from(vec![
+            Span::styled("Memory: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(system_stats.memory_bytes),
+                Style::default().fg(styles::VALUE_INFO),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Peak Memory: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(system_stats.peak_memory_bytes),
+                Style::default().fg(styles::VALUE_NEUTRAL),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
+    )
+    .alignment(Alignment::Left);
+
+    f.render_widget(left_summary, summary_chunks[0]);
+    f.render_widget(right_summary, summary_chunks[1]);
 }
 
 /// Render backend server visualization
@@ -255,24 +314,6 @@ fn render_backend_list(
                 .map(|ms| format!("{:.1}ms", ms))
                 .unwrap_or_else(|| "N/A".to_string());
 
-            // Format timing breakdown (send/recv/overhead) - only in details mode
-            let timing_breakdown = if app.show_details() {
-                if let (Some(send), Some(recv), Some(overhead)) = (
-                    stats.average_send_ms(),
-                    stats.average_recv_ms(),
-                    stats.average_overhead_ms(),
-                ) {
-                    Some(format!(
-                        " (S:{:.1} R:{:.1} O:{:.1}ms)",
-                        send, recv, overhead
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
             // Format average article size
             let avg_size_text = stats
                 .average_article_size()
@@ -311,20 +352,15 @@ fn render_backend_list(
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Active: ", Style::default().fg(styles::LABEL)),
+                    Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
                     Span::styled(
-                        format!("{}", stats.active_connections),
+                        format!("{}/{}", stats.active_connections, server.max_connections),
                         Style::default().fg(styles::VALUE_SECONDARY),
                     ),
                     Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
                     Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
                     Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
                     Span::styled(ttfb_text, Style::default().fg(styles::VALUE_INFO)),
-                    // Only show timing breakdown if in details mode
-                    Span::styled(
-                        timing_breakdown.unwrap_or_default(),
-                        Style::default().fg(styles::VALUE_SECONDARY),
-                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(
@@ -347,11 +383,27 @@ fn render_backend_list(
                 Line::from(vec![
                     Span::styled("  Avg Article: ", Style::default().fg(styles::LABEL)),
                     Span::styled(avg_size_text, Style::default().fg(styles::VALUE_INFO)),
-                    Span::styled(" | Errors: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(" | Articles: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(
+                        format!("{}", stats.article_count),
+                        Style::default().fg(styles::VALUE_NEUTRAL),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Errors: ", Style::default().fg(styles::LABEL)),
                     Span::styled(
                         format!("4xx:{} 5xx:{}", stats.errors_4xx, stats.errors_5xx),
                         Style::default().fg(if !stats.errors.is_zero() {
                             Color::Yellow
+                        } else {
+                            styles::VALUE_NEUTRAL
+                        }),
+                    ),
+                    Span::styled(" | Conn Fails: ", Style::default().fg(styles::LABEL)),
+                    Span::styled(
+                        format!("{}", stats.connection_failures),
+                        Style::default().fg(if stats.connection_failures.get() > 0 {
+                            Color::Red
                         } else {
                             styles::VALUE_NEUTRAL
                         }),

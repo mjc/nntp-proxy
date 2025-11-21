@@ -196,6 +196,8 @@ impl TuiAppBuilder {
     /// Build the TuiApp
     #[must_use]
     pub fn build(self) -> TuiApp {
+        use crate::tui::SystemMonitor;
+
         let snapshot = Arc::new(self.metrics.snapshot());
         let backend_count = self.servers.len();
 
@@ -217,6 +219,8 @@ impl TuiAppBuilder {
             log_buffer: Arc::new(self.log_buffer.unwrap_or_default()),
             view_mode: ViewMode::default(),
             show_details: false,
+            system_monitor: SystemMonitor::new(),
+            system_stats: Default::default(),
         }
     }
 }
@@ -248,6 +252,10 @@ pub struct TuiApp {
     view_mode: ViewMode,
     /// Show detailed metrics (timing breakdown, etc.)
     show_details: bool,
+    /// System resource monitor
+    system_monitor: crate::tui::SystemMonitor,
+    /// Current system stats (CPU, memory, threads)
+    system_stats: crate::tui::SystemStats,
 }
 
 impl TuiApp {
@@ -360,6 +368,9 @@ impl TuiApp {
 
     /// Update metrics snapshot and calculate throughput
     pub fn update(&mut self) {
+        // Update system stats (CPU, memory)
+        self.system_stats = self.system_monitor.update();
+
         let new_snapshot = Arc::new(self.metrics.snapshot().with_pool_status(&self.router));
         let now = Timestamp::now();
         let time_delta = now.duration_since(self.last_update).as_secs_f64();
@@ -503,6 +514,12 @@ impl TuiApp {
     #[must_use]
     pub fn show_details(&self) -> bool {
         self.show_details
+    }
+
+    /// Get current system stats (CPU, memory, threads)
+    #[must_use]
+    pub const fn system_stats(&self) -> &crate::tui::SystemStats {
+        &self.system_stats
     }
 }
 

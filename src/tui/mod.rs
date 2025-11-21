@@ -6,6 +6,7 @@ mod app;
 mod constants;
 mod helpers;
 pub mod log_capture;
+mod system_stats;
 mod types;
 mod ui;
 #[cfg(test)]
@@ -13,6 +14,7 @@ mod ui_tests;
 
 pub use app::{TuiApp, TuiAppBuilder, ViewMode};
 pub use log_capture::{LogBuffer, LogMakeWriter};
+pub use system_stats::{SystemMonitor, SystemStats};
 pub use ui::render_ui;
 
 use anyhow::Result;
