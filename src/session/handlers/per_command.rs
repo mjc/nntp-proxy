@@ -553,7 +553,8 @@ impl ClientSession {
     /// Only call this for ARTICLE by message-ID commands when cache is enabled.
     ///
     /// **Performance trade-off**: Buffers entire response instead of streaming.
-    /// Acceptable for ARTICLE commands since users want caching, but don't use for other commands.
+    /// Acceptable for ARTICLE commands when using the caching proxy binary (`nntp-cache-proxy`).
+    /// The main `nntp-proxy` binary does not include caching - it's a separate optional binary.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_command_with_caching(
         &self,

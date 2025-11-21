@@ -307,21 +307,17 @@ impl NntpResponse {
     pub fn find_terminator_end(data: &[u8]) -> Option<usize> {
         const TERMINATOR: [u8; 5] = *b"\r\n.\r\n";
 
-        let n = data.len();
-        if n < 5 {
-            return None;
-        }
-
-        // Fast path: terminator at end (99% of streaming chunks)
-        if data[n - 5..n] == TERMINATOR {
-            return Some(n);
-        }
-
-        // Slow path: scan for terminator mid-chunk (rare - only when responses batched)
-        memchr::memchr_iter(b'\r', data)
-            .take_while(|&pos| pos + 5 <= n)
-            .find(|&pos| data[pos..pos + 5] == TERMINATOR)
-            .map(|pos| pos + 5)
+        // Fast path: check suffix, or slow path: scan for terminator mid-chunk
+        data.len()
+            .checked_sub(5)
+            .filter(|&start| data[start..] == TERMINATOR)
+            .map(|_| data.len())
+            .or_else(|| {
+                memchr::memchr_iter(b'\r', data)
+                    .take_while(|&pos| pos + 5 <= data.len())
+                    .find(|&pos| data[pos..pos + 5] == TERMINATOR)
+                    .map(|pos| pos + 5)
+            })
     }
 
     /// Check if a terminator spans across a boundary between tail and current chunk
