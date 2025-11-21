@@ -194,6 +194,7 @@ async fn test_auth_handler_disabled() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
 async fn test_concurrent_auth_sessions() -> Result<()> {
     // Setup proxy with auth
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
