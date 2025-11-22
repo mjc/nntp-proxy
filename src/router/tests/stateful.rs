@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 #[test]
 fn test_stateful_connection_reservation() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     // Create test provider with max_connections = 3 (so max stateful = 2)
@@ -45,7 +45,7 @@ fn test_stateful_connection_reservation() {
 
 #[test]
 fn test_stateful_connection_concurrent_access() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
@@ -83,7 +83,7 @@ fn test_stateful_connection_concurrent_access() {
 
 #[test]
 fn test_stateful_connection_multiple_backends() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
 
     // Add multiple backends
     let backend1 = BackendId::from_index(0);
@@ -143,7 +143,7 @@ fn test_stateful_connection_multiple_backends() {
 
 #[test]
 fn test_stateful_connection_invalid_backend() {
-    let router = BackendSelector::new();
+    let router = BackendSelector::default();
     let invalid_backend = BackendId::from_index(999);
 
     // Operations on non-existent backend should handle gracefully
@@ -156,7 +156,7 @@ fn test_stateful_connection_invalid_backend() {
 
 #[test]
 fn test_stateful_reservation_edge_cases() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     let provider = DeadpoolConnectionProvider::new(

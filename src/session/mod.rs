@@ -145,7 +145,7 @@ pub struct ClientSession {
 ///     .build();
 ///
 /// // Per-command routing mode
-/// let router = Arc::new(BackendSelector::new());
+/// let router = Arc::new(BackendSelector::default());
 /// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
 ///     .with_router(router)
 ///     .with_routing_mode(RoutingMode::PerCommand)
@@ -548,7 +548,7 @@ mod tests {
     fn test_session_with_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let session = ClientSession::new_with_router(
             addr,
             buffer_pool,
@@ -588,7 +588,7 @@ mod tests {
     fn test_hybrid_session_creation() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         let session = ClientSession::new_with_router(
             addr,
@@ -607,7 +607,7 @@ mod tests {
     fn test_routing_mode_configurations() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         // Stateful mode
         let session = ClientSession::new_with_router(
@@ -649,7 +649,7 @@ mod tests {
     fn test_hybrid_mode_initial_state() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         let session = ClientSession::new_with_router(
             addr,
@@ -668,7 +668,7 @@ mod tests {
     fn test_is_per_command_routing_logic() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         // Stateful mode has router capability
         let session = ClientSession::new_with_router(
@@ -725,7 +725,7 @@ mod tests {
     fn test_builder_with_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
             .with_router(router)
@@ -741,7 +741,7 @@ mod tests {
     fn test_builder_with_hybrid_mode() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
             .with_router(router)
@@ -757,7 +757,7 @@ mod tests {
     fn test_builder_with_stateful_mode() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         // Builder with router but Stateful mode requested
         let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
@@ -852,7 +852,7 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let metrics = MetricsCollector::new(1); // 1 backend
 
         // Chain all builder methods
@@ -874,7 +874,7 @@ mod tests {
     fn test_mode_getter() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
 
         // Per-command mode
         let session = ClientSession::new_with_router(

@@ -549,7 +549,7 @@ mod tests {
     /// Helper to create test TuiApp
     fn create_test_app(backend_count: usize) -> TuiApp {
         let metrics = MetricsCollector::new(backend_count);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(backend_count);
         TuiApp::new(metrics, router, servers)
     }
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn test_previous_snapshot_uses_new_snapshot_not_old() {
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = Arc::new(vec![
             Server::builder("test.example.com", 119)
                 .name("Test Server".to_string())
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn test_first_update_establishes_baseline() {
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(1);
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn test_throughput_calculation_with_time_delta() {
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(1);
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     fn test_history_buffer_circular() {
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(1);
         let mut app = TuiApp::with_history_size(
             metrics.clone(),
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn test_per_backend_throughput_independence() {
         let metrics = MetricsCollector::new(3);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(3);
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
@@ -811,7 +811,7 @@ mod tests {
         log_buffer.push("Test log 2".to_string());
 
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(1);
 
         let app = TuiApp::with_log_buffer(metrics, router, servers, log_buffer.clone());
@@ -878,7 +878,7 @@ mod tests {
     #[test]
     fn test_builder_basic() {
         let metrics = MetricsCollector::new(2);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(2);
 
         let app = TuiAppBuilder::new(metrics, router, servers).build();
@@ -895,7 +895,7 @@ mod tests {
         log_buffer.push("Test log".to_string());
 
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(1);
 
         let app = TuiAppBuilder::new(metrics, router, servers)
@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn test_builder_with_custom_history_size() {
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(1);
 
         let custom_size = HistorySize::new(120);
@@ -928,7 +928,7 @@ mod tests {
 
         let log_buffer = LogBuffer::new();
         let metrics = MetricsCollector::new(3);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(3);
 
         let app = TuiAppBuilder::new(metrics, router, servers)
@@ -945,7 +945,7 @@ mod tests {
         use crate::tui::log_capture::LogBuffer;
 
         let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
+        let router = Arc::new(BackendSelector::default());
         let servers = create_test_servers(1);
 
         // new() should work

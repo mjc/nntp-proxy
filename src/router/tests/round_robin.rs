@@ -5,7 +5,7 @@ use crate::types::ServerName;
 
 #[test]
 fn test_round_robin_selection() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let client_id = ClientId::new();
 
     // Add 3 backends
@@ -38,7 +38,7 @@ fn test_round_robin_selection() {
 
 #[test]
 fn test_load_balancing_fairness() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let client_id = ClientId::new();
 
     // Add 3 backends

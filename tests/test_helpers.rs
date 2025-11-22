@@ -258,6 +258,8 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
             })
             .collect(),
+        routing_strategy: Default::default(),
+        precheck_enabled: false,
         proxy: Default::default(),
         health_check: Default::default(),
         cache: Default::default(),
@@ -293,6 +295,8 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
                 health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
             })
             .collect(),
+        routing_strategy: Default::default(),
+        precheck_enabled: false,
         proxy: Default::default(),
         health_check: Default::default(),
         cache: None,
@@ -422,7 +426,7 @@ pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::A
 
 /// Create a test backend selector (router)
 ///
-/// Use this instead of repeating `Arc::new(BackendSelector::new())`.
+/// Use this instead of repeating `Arc::new(BackendSelector::default())`.
 ///
 /// # Examples
 /// ```ignore
@@ -433,7 +437,7 @@ pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelecto
     use nntp_proxy::router::BackendSelector;
     use std::sync::Arc;
 
-    Arc::new(BackendSelector::new())
+    Arc::new(BackendSelector::default())
 }
 
 /// Create a test socket address (127.0.0.1:9999)

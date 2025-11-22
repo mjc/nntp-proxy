@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info};
 
+use crate::config::RoutingStrategy;
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
 
@@ -98,22 +99,29 @@ pub struct BackendSelector {
     backends: Vec<BackendInfo>,
     /// Current backend index for round-robin selection
     current_backend: AtomicUsize,
+    /// Routing strategy to use for backend selection
+    routing_strategy: RoutingStrategy,
 }
 
 impl Default for BackendSelector {
     fn default() -> Self {
-        Self::new()
+        Self::new(RoutingStrategy::default())
     }
 }
 
 impl BackendSelector {
-    /// Create a new backend selector
+    /// Create a new backend selector with the specified routing strategy
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(routing_strategy: RoutingStrategy) -> Self {
+        info!(
+            "Initializing backend selector with {} strategy",
+            routing_strategy
+        );
         Self {
             // Pre-allocate for typical number of backend servers (most setups have 2-8)
             backends: Vec::with_capacity(4),
             current_backend: AtomicUsize::new(0),
+            routing_strategy,
         }
     }
 
@@ -134,14 +142,38 @@ impl BackendSelector {
         });
     }
 
-    /// Select the next backend using round-robin strategy
+    /// Select the next backend using the configured routing strategy
     fn select_backend(&self) -> Option<&BackendInfo> {
         if self.backends.is_empty() {
             return None;
         }
 
+        match self.routing_strategy {
+            RoutingStrategy::RoundRobin => self.select_backend_round_robin(),
+            RoutingStrategy::AdaptiveWeighted => self.select_backend_adaptive(),
+        }
+    }
+
+    /// Select backend using round-robin strategy
+    fn select_backend_round_robin(&self) -> Option<&BackendInfo> {
         let index = self.current_backend.fetch_add(1, Ordering::Relaxed) % self.backends.len();
         Some(&self.backends[index])
+    }
+
+    /// Select backend using adaptive weighted strategy
+    ///
+    /// Chooses the backend with the lowest score based on:
+    /// - Pending request count (40% weight)
+    /// - Average TTFB (30% weight) - TODO: needs metrics integration
+    /// - Error rate (20% weight) - TODO: needs metrics integration
+    /// - Cache hit rate (10% weight) - TODO: needs metrics integration
+    ///
+    /// For now, falls back to round-robin until metrics are integrated
+    fn select_backend_adaptive(&self) -> Option<&BackendInfo> {
+        // TODO: Implement adaptive weighted selection using backend metrics
+        // For now, fall back to round-robin
+        // This will be implemented in Phase 2 once metrics are wired in
+        self.select_backend_round_robin()
     }
 
     /// Select a backend for the given command using round-robin

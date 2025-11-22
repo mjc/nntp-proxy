@@ -5,7 +5,7 @@ use crate::types::ServerName;
 
 #[test]
 fn test_backend_load_tracking() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let client_id = ClientId::new();
     let backend_id = BackendId::from_index(0);
     let provider = create_test_provider();

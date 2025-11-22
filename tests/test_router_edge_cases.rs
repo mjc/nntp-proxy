@@ -19,7 +19,7 @@ fn create_test_provider() -> DeadpoolConnectionProvider {
 
 #[test]
 fn test_complete_command_on_empty_router() {
-    let router = BackendSelector::new();
+    let router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     // Should not panic when completing command on non-existent backend
@@ -28,7 +28,7 @@ fn test_complete_command_on_empty_router() {
 
 #[test]
 fn test_complete_command_on_wrong_backend() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
@@ -47,7 +47,7 @@ fn test_complete_command_on_wrong_backend() {
 
 #[test]
 fn test_backend_load_for_nonexistent_backend() {
-    let router = BackendSelector::new();
+    let router = BackendSelector::default();
     let backend_id = BackendId::from_index(999);
 
     assert_eq!(router.backend_load(backend_id), None);
@@ -55,7 +55,7 @@ fn test_backend_load_for_nonexistent_backend() {
 
 #[test]
 fn test_stateful_count_for_nonexistent_backend() {
-    let router = BackendSelector::new();
+    let router = BackendSelector::default();
     let backend_id = BackendId::from_index(999);
 
     assert_eq!(router.stateful_count(backend_id), None);
@@ -63,7 +63,7 @@ fn test_stateful_count_for_nonexistent_backend() {
 
 #[test]
 fn test_release_stateful_when_count_is_zero() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
@@ -84,7 +84,7 @@ fn test_release_stateful_when_count_is_zero() {
 
 #[test]
 fn test_release_stateful_on_nonexistent_backend() {
-    let router = BackendSelector::new();
+    let router = BackendSelector::default();
     let backend_id = BackendId::from_index(999);
 
     // Should not panic
@@ -93,7 +93,7 @@ fn test_release_stateful_on_nonexistent_backend() {
 
 #[test]
 fn test_excessive_complete_command_calls() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let client_id = ClientId::new();
     let backend_id = BackendId::from_index(0);
 
@@ -124,7 +124,7 @@ fn test_excessive_complete_command_calls() {
 
 #[test]
 fn test_large_number_of_backends() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let client_id = ClientId::new();
 
     // Add 100 backends
@@ -147,7 +147,7 @@ fn test_large_number_of_backends() {
 
 #[test]
 fn test_backend_provider_retrieval() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
@@ -166,7 +166,7 @@ fn test_backend_provider_retrieval() {
 
 #[test]
 fn test_single_backend_round_robin() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let client_id = ClientId::new();
     let backend_id = BackendId::from_index(0);
 
@@ -185,7 +185,7 @@ fn test_single_backend_round_robin() {
 
 #[test]
 fn test_stateful_acquisition_with_max_connections_1() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     // max_connections = 1 means max_stateful = 0 (need to reserve 1 for PCR)
@@ -211,7 +211,7 @@ fn test_stateful_acquisition_with_max_connections_1() {
 
 #[test]
 fn test_concurrent_route_command_calls() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
 
     // Add 3 backends
     for i in 0..3 {
@@ -255,7 +255,7 @@ fn test_concurrent_route_command_calls() {
 
 #[test]
 fn test_backend_count_with_no_backends() {
-    let router = BackendSelector::new();
+    let router = BackendSelector::default();
     assert_eq!(router.backend_count(), 0);
 }
 
@@ -267,7 +267,7 @@ fn test_default_constructor() {
 
 #[test]
 fn test_stateful_acquire_release_interleaved() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let backend_id = BackendId::from_index(0);
 
     let provider = DeadpoolConnectionProvider::new(
@@ -305,7 +305,7 @@ fn test_stateful_acquire_release_interleaved() {
 
 #[test]
 fn test_wrap_around_with_large_counter() {
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
     let client_id = ClientId::new();
 
     // Add 2 backends

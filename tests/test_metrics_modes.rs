@@ -15,7 +15,7 @@ fn test_metrics_with_pool_status_standard_mode() {
     // - total_commands = 0 (not parsed in standard mode)
 
     let metrics = MetricsCollector::new(1);
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
 
     let provider = DeadpoolConnectionProvider::new(
         "localhost".to_string(),
@@ -70,7 +70,7 @@ fn test_metrics_with_pool_status_per_command_mode() {
     // - active_connections (from pool utilization)
 
     let metrics = MetricsCollector::new(2);
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
 
     let provider1 = DeadpoolConnectionProvider::new(
         "localhost".to_string(),
@@ -162,7 +162,7 @@ fn test_metrics_with_pool_status_hybrid_mode() {
     // - active_connections (from pool utilization)
 
     let metrics = MetricsCollector::new(1);
-    let mut router = BackendSelector::new();
+    let mut router = BackendSelector::default();
 
     let provider = DeadpoolConnectionProvider::new(
         "localhost".to_string(),
@@ -231,7 +231,7 @@ fn test_all_modes_show_meaningful_metrics() {
 
     for (mode, mode_name) in test_cases {
         let metrics = MetricsCollector::new(1);
-        let mut router = BackendSelector::new();
+        let mut router = BackendSelector::default();
 
         let provider = DeadpoolConnectionProvider::new(
             "localhost".to_string(),
