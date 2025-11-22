@@ -35,7 +35,7 @@ impl SystemMonitor {
     #[must_use]
     pub fn new() -> Self {
         let mut system = System::new_with_specifics(
-            RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
         );
 
         // Get current process PID
