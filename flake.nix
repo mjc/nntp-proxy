@@ -61,7 +61,6 @@
           cargo-tarpaulin
           cargo-nextest
           cargo-mutants
-          cargo-llvm-cov
 
           # Build & dependencies
           cargo-outdated
@@ -76,6 +75,7 @@
         ]
         ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           perf
+          cargo-llvm-cov
         ];
 
       # Cross-compilation tools (separate to avoid environment pollution)
