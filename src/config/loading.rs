@@ -206,6 +206,50 @@ pub fn load_config(config_path: &str) -> Result<Config> {
         config.servers = env_servers;
     }
 
+    // Check for routing strategy override
+    if let Ok(strategy_str) = std::env::var("NNTP_PROXY_ROUTING_STRATEGY") {
+        match strategy_str.to_lowercase().as_str() {
+            "round-robin" => {
+                tracing::info!(
+                    "Routing strategy overridden to round-robin via environment variable"
+                );
+                config.routing_strategy = super::types::RoutingStrategy::RoundRobin;
+            }
+            "adaptive-weighted" => {
+                tracing::info!(
+                    "Routing strategy overridden to adaptive-weighted via environment variable"
+                );
+                config.routing_strategy = super::types::RoutingStrategy::AdaptiveWeighted;
+            }
+            other => {
+                tracing::warn!(
+                    "Invalid routing strategy '{}' in NNTP_PROXY_ROUTING_STRATEGY (valid: round-robin, adaptive-weighted)",
+                    other
+                );
+            }
+        }
+    }
+
+    // Check for precheck detection override
+    if let Ok(precheck_str) = std::env::var("NNTP_PROXY_PRECHECK_ENABLED") {
+        match precheck_str.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => {
+                tracing::info!("Precheck detection enabled via environment variable");
+                config.precheck_enabled = true;
+            }
+            "false" | "0" | "no" | "off" => {
+                tracing::info!("Precheck detection disabled via environment variable");
+                config.precheck_enabled = false;
+            }
+            other => {
+                tracing::warn!(
+                    "Invalid precheck enabled value '{}' in NNTP_PROXY_PRECHECK_ENABLED (valid: true/false, 1/0, yes/no, on/off)",
+                    other
+                );
+            }
+        }
+    }
+
     // Validate the loaded configuration
     config.validate()?;
 

@@ -61,6 +61,54 @@ impl std::fmt::Display for RoutingMode {
     }
 }
 
+/// Routing strategy for backend selection
+///
+/// Determines how the proxy selects which backend server to route requests to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingStrategy {
+    /// Round-robin load balancing (default)
+    ///
+    /// Distributes requests evenly across all backends in rotation.
+    /// Simple, predictable, and works well for homogeneous backend pools.
+    RoundRobin,
+
+    /// Adaptive weighted routing based on backend performance
+    ///
+    /// Selects backends based on real-time metrics:
+    /// - Pending request count (40% weight)
+    /// - Average TTFB (30% weight)
+    /// - Error rate (20% weight)
+    /// - Cache hit rate (10% weight)
+    ///
+    /// Routes more traffic to faster, more reliable backends.
+    AdaptiveWeighted,
+}
+
+impl Default for RoutingStrategy {
+    /// Default routing strategy is RoundRobin for predictable load distribution
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+impl RoutingStrategy {
+    /// Get a human-readable description of this routing strategy
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round-robin load balancing",
+            Self::AdaptiveWeighted => "adaptive weighted routing",
+        }
+    }
+}
+
+impl std::fmt::Display for RoutingStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct Config {
@@ -70,6 +118,18 @@ pub struct Config {
     /// Proxy server settings
     #[serde(default)]
     pub proxy: Proxy,
+    /// Routing strategy for backend selection
+    #[serde(default)]
+    pub routing_strategy: RoutingStrategy,
+    /// Enable precheck detection (STAT/HEAD pattern analysis)
+    ///
+    /// When enabled, the proxy monitors for SABnzbd-style precheck patterns where
+    /// clients send STAT/HEAD commands before requesting articles. This can optimize
+    /// routing by avoiding unnecessary ARTICLE requests for missing content.
+    ///
+    /// Default: false (disabled for compatibility with all clients)
+    #[serde(default)]
+    pub precheck_enabled: bool,
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheck,

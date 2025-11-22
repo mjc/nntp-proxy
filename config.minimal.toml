@@ -13,3 +13,5 @@ name = "News Server"
 # - Health checks every 30 seconds
 # - No TLS
 # - Hybrid routing mode (automatic per-command to stateful switching)
+# - Round-robin load balancing
+# - Precheck detection disabled

@@ -11,6 +11,29 @@ host = "0.0.0.0"
 # Can be overridden with --port or NNTP_PROXY_PORT
 port = 8119
 
+# Routing Configuration
+# Determines how the proxy selects which backend server to route requests to
+
+# Routing strategy: "round-robin" or "adaptive-weighted"
+# - round-robin: Distributes requests evenly across all backends (default)
+#   Simple, predictable, works well for homogeneous backend pools
+#
+# - adaptive-weighted: Routes based on real-time performance metrics
+#   Sends more traffic to faster, more reliable backends
+#   Weights: pending_count (40%), TTFB (30%), error_rate (20%), hit_rate (10%)
+#
+# Can be overridden with NNTP_PROXY_ROUTING_STRATEGY environment variable
+routing_strategy = "round-robin"
+
+# Enable precheck detection (STAT/HEAD pattern analysis)
+# When enabled, monitors for SABnzbd-style prechecks where clients send
+# STAT/HEAD commands before requesting articles. Can optimize routing by
+# avoiding unnecessary ARTICLE requests for missing content.
+#
+# Default: false (disabled for compatibility with all clients)
+# Can be overridden with NNTP_PROXY_PRECHECK_ENABLED environment variable
+precheck_enabled = false
+
 # Client Authentication Configuration
 # Two formats supported:
 #
