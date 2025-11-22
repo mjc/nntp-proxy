@@ -550,3 +550,189 @@ name = "Test Server"
     let result: Result<Config, _> = toml::from_str(toml);
     assert!(result.is_err(), "Empty hostname should be rejected");
 }
+
+// ============================================================================
+// Routing Strategy Tests
+// ============================================================================
+
+/// Test default routing strategy is round-robin
+#[test]
+fn test_routing_strategy_default() -> Result<()> {
+    let toml = r#"
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let config: Config = toml::from_str(toml)?;
+    assert_eq!(
+        config.routing_strategy,
+        nntp_proxy::config::RoutingStrategy::RoundRobin
+    );
+    Ok(())
+}
+
+/// Test routing_strategy = "round-robin" parses correctly
+#[test]
+fn test_routing_strategy_round_robin() -> Result<()> {
+    let toml = r#"
+routing_strategy = "round-robin"
+
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let config: Config = toml::from_str(toml)?;
+    assert_eq!(
+        config.routing_strategy,
+        nntp_proxy::config::RoutingStrategy::RoundRobin
+    );
+    Ok(())
+}
+
+/// Test routing_strategy = "adaptive-weighted" parses correctly
+#[test]
+fn test_routing_strategy_adaptive_weighted() -> Result<()> {
+    let toml = r#"
+routing_strategy = "adaptive-weighted"
+
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let config: Config = toml::from_str(toml)?;
+    assert_eq!(
+        config.routing_strategy,
+        nntp_proxy::config::RoutingStrategy::AdaptiveWeighted
+    );
+    Ok(())
+}
+
+/// Test invalid routing_strategy is rejected
+#[test]
+fn test_routing_strategy_invalid_rejected() {
+    let toml = r#"
+routing_strategy = "invalid-strategy"
+
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let result: Result<Config, _> = toml::from_str(toml);
+    assert!(
+        result.is_err(),
+        "Invalid routing strategy should be rejected"
+    );
+}
+
+/// Test RoutingStrategy Display impl
+#[test]
+fn test_routing_strategy_display() {
+    use nntp_proxy::config::RoutingStrategy;
+
+    assert_eq!(
+        RoutingStrategy::RoundRobin.to_string(),
+        "round-robin load balancing"
+    );
+    assert_eq!(
+        RoutingStrategy::AdaptiveWeighted.to_string(),
+        "adaptive weighted routing"
+    );
+}
+
+/// Test RoutingStrategy as_str method
+#[test]
+fn test_routing_strategy_as_str() {
+    use nntp_proxy::config::RoutingStrategy;
+
+    assert_eq!(
+        RoutingStrategy::RoundRobin.as_str(),
+        "round-robin load balancing"
+    );
+    assert_eq!(
+        RoutingStrategy::AdaptiveWeighted.as_str(),
+        "adaptive weighted routing"
+    );
+}
+
+// ============================================================================
+// Precheck Detection Tests
+// ============================================================================
+
+/// Test default precheck_enabled is false
+#[test]
+fn test_precheck_enabled_default() -> Result<()> {
+    let toml = r#"
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let config: Config = toml::from_str(toml)?;
+    assert!(!config.precheck_enabled);
+    Ok(())
+}
+
+/// Test precheck_enabled = true parses correctly
+#[test]
+fn test_precheck_enabled_true() -> Result<()> {
+    let toml = r#"
+precheck_enabled = true
+
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let config: Config = toml::from_str(toml)?;
+    assert!(config.precheck_enabled);
+    Ok(())
+}
+
+/// Test precheck_enabled = false parses correctly
+#[test]
+fn test_precheck_enabled_false() -> Result<()> {
+    let toml = r#"
+precheck_enabled = false
+
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let config: Config = toml::from_str(toml)?;
+    assert!(!config.precheck_enabled);
+    Ok(())
+}
+
+/// Test combined routing_strategy and precheck_enabled
+#[test]
+fn test_routing_and_precheck_combined() -> Result<()> {
+    let toml = r#"
+routing_strategy = "adaptive-weighted"
+precheck_enabled = true
+
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Test Server"
+"#;
+
+    let config: Config = toml::from_str(toml)?;
+    assert_eq!(
+        config.routing_strategy,
+        nntp_proxy::config::RoutingStrategy::AdaptiveWeighted
+    );
+    assert!(config.precheck_enabled);
+    Ok(())
+}
