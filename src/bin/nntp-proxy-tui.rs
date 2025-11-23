@@ -95,20 +95,27 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
     // Launch TUI FIRST if enabled (before prewarming for faster startup)
     // This allows seeing the dashboard immediately
     let tui_handle = if !args.no_tui {
-        let tui_app = if let Some(log_buffer) = log_buffer {
-            tui::TuiApp::with_log_buffer(
+        let mut tui_builder = if let Some(log_buffer) = log_buffer {
+            tui::TuiAppBuilder::new(
                 proxy.metrics().clone(),
                 proxy.router().clone(),
                 proxy.servers().to_vec().into(),
-                log_buffer,
             )
+            .with_log_buffer(log_buffer)
         } else {
-            tui::TuiApp::new(
+            tui::TuiAppBuilder::new(
                 proxy.metrics().clone(),
                 proxy.router().clone(),
                 proxy.servers().to_vec().into(),
             )
         };
+
+        // Add location cache if enabled
+        if let Some(cache) = proxy.location_cache() {
+            tui_builder = tui_builder.with_location_cache(cache.clone());
+        }
+
+        let tui_app = tui_builder.build();
 
         let shutdown_tx_for_tui = shutdown_tx.clone();
         Some(tokio::spawn(async move {

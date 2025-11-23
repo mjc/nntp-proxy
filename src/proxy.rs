@@ -164,6 +164,7 @@ impl NntpProxyBuilder {
         // Create metrics collector (before moving servers)
         let metrics = MetricsCollector::new(self.config.servers.len());
 
+        let num_backends = self.config.servers.len();
         let servers = Arc::new(self.config.servers);
 
         // Create backend selector and add all backends
@@ -211,6 +212,15 @@ impl NntpProxyBuilder {
             enable_metrics: self.enable_metrics,
             connection_stats: ConnectionStatsAggregator::new(),
             precheck_enabled: self.precheck_enabled,
+            location_cache: if self.config.routing.adaptive_precheck {
+                let capacity = self.config.routing.precheck_cache_size;
+                Some(Arc::new(crate::cache::ArticleLocationCache::new(
+                    capacity,
+                    num_backends,
+                )))
+            } else {
+                None
+            },
         })
     }
 }
@@ -236,6 +246,8 @@ pub struct NntpProxy {
     connection_stats: ConnectionStatsAggregator,
     /// Enable precheck detection for STAT/HEAD pattern analysis
     precheck_enabled: bool,
+    /// Article location cache for adaptive routing (None if disabled)
+    location_cache: Option<Arc<crate::cache::ArticleLocationCache>>,
 }
 
 /// Classify an error as a client disconnect (broken pipe/connection reset)
@@ -305,6 +317,10 @@ impl NntpProxy {
 
         if let Some(c) = cache {
             builder = builder.with_cache(c);
+        }
+
+        if let Some(lc) = &self.location_cache {
+            builder = builder.with_location_cache(lc.clone());
         }
 
         builder = builder.with_precheck(self.precheck_enabled);
@@ -421,6 +437,13 @@ impl NntpProxy {
     #[inline]
     pub fn router(&self) -> &Arc<router::BackendSelector> {
         &self.router
+    }
+
+    /// Get reference to location cache (if enabled)
+    #[must_use]
+    #[inline]
+    pub fn location_cache(&self) -> Option<&Arc<crate::cache::ArticleLocationCache>> {
+        self.location_cache.as_ref()
     }
 
     /// Get the connection providers

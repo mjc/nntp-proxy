@@ -160,6 +160,7 @@ pub struct TuiAppBuilder {
     servers: Arc<Vec<Server>>,
     log_buffer: Option<LogBuffer>,
     history_size: HistorySize,
+    location_cache: Option<Arc<crate::cache::ArticleLocationCache>>,
 }
 
 impl TuiAppBuilder {
@@ -176,6 +177,7 @@ impl TuiAppBuilder {
             servers,
             log_buffer: None,
             history_size: HistorySize::DEFAULT,
+            location_cache: None,
         }
     }
 
@@ -190,6 +192,13 @@ impl TuiAppBuilder {
     #[must_use]
     pub fn with_history_size(mut self, history_size: HistorySize) -> Self {
         self.history_size = history_size;
+        self
+    }
+
+    /// Set location cache for displaying stats in summary
+    #[must_use]
+    pub fn with_location_cache(mut self, cache: Arc<crate::cache::ArticleLocationCache>) -> Self {
+        self.location_cache = Some(cache);
         self
     }
 
@@ -221,6 +230,7 @@ impl TuiAppBuilder {
             show_details: false,
             system_monitor: SystemMonitor::new(),
             system_stats: Default::default(),
+            location_cache: self.location_cache,
         }
     }
 }
@@ -256,6 +266,8 @@ pub struct TuiApp {
     system_monitor: crate::tui::SystemMonitor,
     /// Current system stats (CPU, memory, threads)
     system_stats: crate::tui::SystemStats,
+    /// Optional location cache for displaying stats
+    location_cache: Option<Arc<crate::cache::ArticleLocationCache>>,
 }
 
 impl TuiApp {
@@ -520,6 +532,13 @@ impl TuiApp {
     #[must_use]
     pub const fn system_stats(&self) -> &crate::tui::SystemStats {
         &self.system_stats
+    }
+
+    /// Get location cache if available
+    #[must_use]
+    #[inline]
+    pub fn location_cache(&self) -> Option<&Arc<crate::cache::ArticleLocationCache>> {
+        self.location_cache.as_ref()
     }
 }
 

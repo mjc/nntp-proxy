@@ -4,6 +4,7 @@
 //! When adaptive_precheck is enabled, performs parallel STAT to all backends
 //! on cache miss to discover article availability.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use moka::sync::Cache;
@@ -76,8 +77,10 @@ impl Default for BackendAvailability {
 /// Thread-safe: Uses Arc<Cache> internally, safe to clone and share across threads
 #[derive(Debug, Clone)]
 pub struct ArticleLocationCache {
-    cache: Arc<Cache<Arc<str>, BackendAvailability>>,
+    pub(crate) cache: Arc<Cache<Arc<str>, BackendAvailability>>,
     num_backends: usize,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
 }
 
 impl ArticleLocationCache {
@@ -95,6 +98,8 @@ impl ArticleLocationCache {
         Self {
             cache: Arc::new(cache),
             num_backends,
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -104,7 +109,13 @@ impl ArticleLocationCache {
     #[must_use]
     pub fn get(&self, message_id: &MessageId<'_>) -> Option<BackendAvailability> {
         let key: Arc<str> = Arc::from(message_id.as_str());
-        self.cache.get(&key)
+        let result = self.cache.get(&key);
+        if result.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Update cache with article availability for a backend
@@ -150,6 +161,25 @@ impl ArticleLocationCache {
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.cache.policy().max_capacity().unwrap_or(0)
+    }
+
+    /// Get cache hit rate as percentage (0.0 - 100.0)
+    #[must_use]
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            (hits as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// Get total number of cache lookups
+    #[must_use]
+    pub fn total_lookups(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed) + self.misses.load(Ordering::Relaxed)
     }
 }
 

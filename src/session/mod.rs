@@ -118,6 +118,9 @@ pub struct ClientSession {
 
     /// Optional article cache for ARTICLE responses
     cache: Option<Arc<crate::cache::ArticleCache>>,
+
+    /// Optional article location cache for smart routing
+    location_cache: Option<Arc<crate::cache::ArticleLocationCache>>,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -160,6 +163,7 @@ pub struct ClientSessionBuilder {
     metrics: Option<MetricsCollector>,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: Option<Arc<crate::cache::ArticleCache>>,
+    location_cache: Option<Arc<crate::cache::ArticleLocationCache>>,
     precheck_enabled: bool,
 }
 
@@ -217,6 +221,13 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Add article location cache for smart routing
+    #[must_use]
+    pub fn with_location_cache(mut self, cache: Arc<crate::cache::ArticleLocationCache>) -> Self {
+        self.location_cache = Some(cache);
+        self
+    }
+
     /// Enable precheck detection for STAT/HEAD pattern analysis
     #[must_use]
     pub fn with_precheck(mut self, enabled: bool) -> Self {
@@ -254,6 +265,7 @@ impl ClientSessionBuilder {
             metrics: self.metrics,
             connection_stats: self.connection_stats,
             cache: self.cache,
+            location_cache: self.location_cache,
         }
     }
 }
@@ -279,6 +291,7 @@ impl ClientSession {
             metrics: None,
             connection_stats: None,
             cache: None,
+            location_cache: None,
         }
     }
 
@@ -307,6 +320,7 @@ impl ClientSession {
             metrics: None,
             connection_stats: None,
             cache: None,
+            location_cache: None,
         }
     }
 
@@ -344,6 +358,7 @@ impl ClientSession {
             metrics: None,
             connection_stats: None,
             cache: None,
+            location_cache: None,
             precheck_enabled: false,
         }
     }
@@ -389,6 +404,13 @@ impl ClientSession {
     #[inline]
     pub(crate) fn connection_stats(&self) -> Option<&crate::metrics::ConnectionStatsAggregator> {
         self.connection_stats.as_ref()
+    }
+
+    /// Get the article location cache (if enabled)
+    #[must_use]
+    #[inline]
+    pub(crate) fn location_cache(&self) -> Option<&Arc<crate::cache::ArticleLocationCache>> {
+        self.location_cache.as_ref()
     }
 
     // Metrics helper methods - encapsulate Option checks for cleaner handler code
@@ -1096,5 +1118,103 @@ mod tests {
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.stateful_sessions, 0);
+    }
+
+    // ==================== Location Cache Tests ====================
+
+    #[test]
+    fn test_builder_with_location_cache() {
+        use crate::cache::ArticleLocationCache;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let location_cache = Arc::new(ArticleLocationCache::new(1000, 4));
+
+        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+            .with_location_cache(location_cache.clone())
+            .build();
+
+        assert!(session.location_cache().is_some());
+        // Verify it's the same Arc instance
+        assert!(Arc::ptr_eq(
+            session.location_cache().unwrap(),
+            &location_cache
+        ));
+    }
+
+    #[test]
+    fn test_location_cache_none_by_default() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+
+        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler()).build();
+
+        assert!(session.location_cache().is_none());
+    }
+
+    #[test]
+    fn test_location_cache_with_router_and_cache() {
+        use crate::cache::ArticleLocationCache;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let router = Arc::new(BackendSelector::default());
+        let location_cache = Arc::new(ArticleLocationCache::new(10000, 4));
+
+        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+            .with_router(router)
+            .with_routing_mode(RoutingMode::Hybrid)
+            .with_location_cache(location_cache.clone())
+            .build();
+
+        assert!(session.is_per_command_routing());
+        assert!(session.location_cache().is_some());
+        assert_eq!(session.location_cache().unwrap().capacity(), 10000);
+    }
+
+    #[test]
+    fn test_location_cache_capacity() {
+        use crate::cache::ArticleLocationCache;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+
+        // Test different cache sizes
+        for capacity in [100, 1000, 10000, 100000] {
+            let location_cache = Arc::new(ArticleLocationCache::new(capacity, 4));
+
+            let session = ClientSession::builder(addr, buffer_pool.clone(), test_auth_handler())
+                .with_location_cache(location_cache.clone())
+                .build();
+
+            assert_eq!(session.location_cache().unwrap().capacity(), capacity);
+            assert_eq!(session.location_cache().unwrap().entry_count(), 0);
+        }
+    }
+
+    #[test]
+    fn test_location_cache_builder_chaining() {
+        use crate::cache::{ArticleCache, ArticleLocationCache};
+        use crate::metrics::MetricsCollector;
+        use std::time::Duration;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let router = Arc::new(BackendSelector::default());
+        let article_cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600)));
+        let location_cache = Arc::new(ArticleLocationCache::new(1000, 4));
+        let metrics = MetricsCollector::new(4);
+
+        // Build with all optional features
+        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+            .with_router(router)
+            .with_routing_mode(RoutingMode::Hybrid)
+            .with_cache(article_cache)
+            .with_location_cache(location_cache)
+            .with_metrics(metrics)
+            .build();
+
+        assert!(session.is_per_command_routing());
+        assert!(session.location_cache().is_some());
     }
 }

@@ -288,7 +288,15 @@ impl ClientSession {
         // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
         let mut buffer = self.buffer_pool.acquire().await;
 
+        // Check location cache for smart routing (STAT/ARTICLE/BODY/HEAD with message-ID)
+        let message_id = if matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
+            crate::protocol::NntpResponse::extract_message_id(command)
+        } else {
+            None
+        };
+
         // Route the command to get a backend (lock-free!)
+        // TODO: Use location cache to prefer backends that have the article
         let backend_id = router.route_command(self.client_id, command)?;
 
         // Get a connection from the router's backend pool
@@ -347,6 +355,19 @@ impl ClientSession {
             // Record per-user metrics
             self.user_bytes_sent(cmd_size);
             self.user_bytes_received(resp_size);
+        }
+
+        // Update location cache if we have a message-ID (for ARTICLE/BODY/HEAD/STAT)
+        // This helps future requests route directly to the right backend
+        if let (Some(msg_id), Some(location_cache)) = (message_id, self.location_cache()) {
+            if result.is_ok() {
+                // Update cache: this backend has the article (true = available)
+                location_cache.update(&msg_id, backend_id, true);
+                debug!(
+                    "Updated location cache: {} -> backend {:?} (available)",
+                    msg_id, backend_id
+                );
+            }
         }
 
         // Handle errors functionally - remove from pool if backend error
@@ -1149,5 +1170,133 @@ mod tests {
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 
         ClientSession::builder(addr, buffer_pool, auth_handler).build()
+    }
+
+    // Location cache tests
+
+    #[test]
+    fn test_location_cache_passed_through_builder() {
+        use crate::auth::AuthHandler;
+        use crate::cache::ArticleLocationCache;
+        use crate::types::BufferSize;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let location_cache = Arc::new(ArticleLocationCache::new(1000, 4));
+
+        let session = ClientSession::builder(addr, buffer_pool, auth_handler)
+            .with_location_cache(location_cache.clone())
+            .build();
+
+        assert!(session.location_cache().is_some());
+        // Verify it's the same Arc
+        assert!(Arc::ptr_eq(
+            session.location_cache().unwrap(),
+            &location_cache
+        ));
+    }
+
+    #[test]
+    fn test_location_cache_not_set_by_default() {
+        let session = create_test_session_without_cache();
+        assert!(session.location_cache().is_none());
+    }
+
+    #[test]
+    fn test_message_id_extraction_for_all_article_commands() {
+        use crate::protocol::NntpResponse;
+
+        // Test all article retrieval commands
+        let test_cases = vec![
+            ("ARTICLE <test@example.com>", Some("<test@example.com>")),
+            ("BODY <body@test.org>", Some("<body@test.org>")),
+            ("HEAD <head@domain.net>", Some("<head@domain.net>")),
+            ("STAT <stat@server.com>", Some("<stat@server.com>")),
+            // Case insensitive
+            ("article <msg@host>", Some("<msg@host>")),
+            ("body <msg@host>", Some("<msg@host>")),
+            ("head <msg@host>", Some("<msg@host>")),
+            ("stat <msg@host>", Some("<msg@host>")),
+            // No message-ID
+            ("ARTICLE 123", None),
+            ("GROUP alt.test", None),
+            ("LIST", None),
+        ];
+
+        for (command, expected) in test_cases {
+            let result = NntpResponse::extract_message_id(command);
+            assert_eq!(
+                result.as_ref().map(|m| m.as_str()),
+                expected,
+                "Failed for command: {}",
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn test_location_cache_update_requires_message_id() {
+        use crate::auth::AuthHandler;
+        use crate::cache::ArticleLocationCache;
+        use crate::types::BufferSize;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let location_cache = Arc::new(ArticleLocationCache::new(1000, 4));
+
+        let _session = ClientSession::builder(addr, buffer_pool, auth_handler)
+            .with_location_cache(location_cache.clone())
+            .build();
+
+        // Verify cache starts empty
+        assert_eq!(location_cache.entry_count(), 0);
+
+        // Update cache with a test article
+        use crate::types::protocol::MessageId;
+        let msg_id = MessageId::try_from("<test@example.com>".to_string()).unwrap();
+        location_cache.update(&msg_id, crate::types::BackendId::from_index(0), true);
+
+        // Moka cache is async - need to sync it
+        location_cache.cache.run_pending_tasks();
+
+        // Verify cache was updated
+        assert_eq!(location_cache.entry_count(), 1);
+
+        // Verify we can retrieve it
+        let availability = location_cache.get(&msg_id);
+        assert!(availability.is_some());
+        assert!(
+            availability
+                .unwrap()
+                .has_article(crate::types::BackendId::from_index(0))
+        );
+    }
+
+    #[test]
+    fn test_article_by_message_id_classification() {
+        use crate::command::NntpCommand;
+
+        // All these should be classified as ArticleByMessageId
+        let commands = vec![
+            "ARTICLE <test@example.com>",
+            "BODY <test@example.com>",
+            "HEAD <test@example.com>",
+            "STAT <test@example.com>",
+        ];
+
+        for cmd in commands {
+            assert_eq!(
+                NntpCommand::parse(cmd),
+                NntpCommand::ArticleByMessageId,
+                "Failed for: {}",
+                cmd
+            );
+        }
     }
 }

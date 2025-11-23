@@ -203,7 +203,7 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
     .alignment(Alignment::Left);
 
     // Right half: System stats
-    let right_summary = Paragraph::new(vec![
+    let mut right_lines = vec![
         Line::from(vec![
             Span::styled("CPU: ", Style::default().fg(styles::LABEL)),
             Span::styled(
@@ -237,13 +237,33 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
                 Style::default().fg(styles::VALUE_NEUTRAL),
             ),
         ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
-    )
-    .alignment(Alignment::Left);
+    ];
+
+    // Add location cache stats if enabled
+    if let Some(cache) = app.location_cache() {
+        let hit_rate = cache.hit_rate();
+        right_lines.push(Line::from(vec![
+            Span::styled("Location Cache: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{}/{} ({:.1}%)", cache.entry_count(), cache.capacity(), hit_rate),
+                Style::default().fg(if hit_rate > 80.0 {
+                    Color::Green
+                } else if hit_rate > 50.0 {
+                    Color::Yellow
+                } else {
+                    styles::VALUE_INFO
+                }),
+            ),
+        ]));
+    }
+
+    let right_summary = Paragraph::new(right_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(styles::BORDER_NORMAL)),
+        )
+        .alignment(Alignment::Left);
 
     f.render_widget(left_summary, summary_chunks[0]);
     f.render_widget(right_summary, summary_chunks[1]);
