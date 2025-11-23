@@ -28,6 +28,7 @@ fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &s
             .into_iter()
             .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
             .collect(),
+        routing: Default::default(),
         proxy: Default::default(),
         health_check: Default::default(),
         cache: None,

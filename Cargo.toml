@@ -44,7 +44,7 @@ deadpool = "0.12.3"
 async-trait = "0.1.89"
 memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
-moka = { version = "0.12", features = ["future"], default-features = false }  # Async LRU cache, minimal features
+moka = { version = "0.12", features = ["future", "sync"], default-features = false }  # Async+Sync LRU cache
 bytes = "1.0"  # Efficient byte buffer for zero-copy operations
 ratatui = "0.29"  # Terminal UI framework
 crossterm = "0.29"  # Cross-platform terminal manipulation

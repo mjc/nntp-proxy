@@ -109,6 +109,58 @@ impl std::fmt::Display for RoutingStrategy {
     }
 }
 
+/// Routing configuration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Routing {
+    /// Routing strategy for backend selection
+    #[serde(default)]
+    pub strategy: RoutingStrategy,
+
+    /// Enable adaptive precheck (parallel STAT to all backends on cache miss)
+    ///
+    /// When enabled, if an ARTICLE request has no cached location information,
+    /// the proxy will STAT all backends in parallel to discover which have the article,
+    /// cache the results, and route to the best available backend.
+    ///
+    /// This is similar to SABnzbd's "precheck" feature but more intelligent:
+    /// - Only triggers on cache miss (not for every article)
+    /// - Caches results for future requests
+    /// - Works with adaptive routing to choose the best backend
+    ///
+    /// Default: true (enabled for optimal performance)
+    #[serde(default = "default_adaptive_precheck")]
+    pub adaptive_precheck: bool,
+
+    /// Article location cache size (number of message IDs)
+    ///
+    /// The cache tracks which backends have which articles to optimize routing.
+    /// Uses ~100 bytes per entry. Default 640,000 entries = ~64 MB.
+    ///
+    /// Set to 0 to disable location caching (not recommended).
+    #[serde(default = "default_precheck_cache_size")]
+    pub precheck_cache_size: u64,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Self {
+            strategy: RoutingStrategy::default(),
+            adaptive_precheck: default_adaptive_precheck(),
+            precheck_cache_size: default_precheck_cache_size(),
+        }
+    }
+}
+
+/// Default: adaptive precheck disabled (opt-in to avoid latency increase)
+const fn default_adaptive_precheck() -> bool {
+    false
+}
+
+/// Default: 640,000 entries (~64 MB)
+const fn default_precheck_cache_size() -> u64 {
+    640_000
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct Config {
@@ -118,18 +170,9 @@ pub struct Config {
     /// Proxy server settings
     #[serde(default)]
     pub proxy: Proxy,
-    /// Routing strategy for backend selection
+    /// Routing configuration
     #[serde(default)]
-    pub routing_strategy: RoutingStrategy,
-    /// Enable precheck detection (STAT/HEAD pattern analysis)
-    ///
-    /// When enabled, the proxy monitors for SABnzbd-style precheck patterns where
-    /// clients send STAT/HEAD commands before requesting articles. This can optimize
-    /// routing by avoiding unnecessary ARTICLE requests for missing content.
-    ///
-    /// Default: false (disabled for compatibility with all clients)
-    #[serde(default)]
-    pub precheck_enabled: bool,
+    pub routing: Routing,
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheck,

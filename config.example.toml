@@ -13,7 +13,7 @@ port = 8119
 
 # Routing Configuration
 # Determines how the proxy selects which backend server to route requests to
-
+[routing]
 # Routing strategy: "round-robin" or "adaptive-weighted"
 # - round-robin: Distributes requests evenly across all backends (default)
 #   Simple, predictable, works well for homogeneous backend pools
@@ -21,18 +21,29 @@ port = 8119
 # - adaptive-weighted: Routes based on real-time performance metrics
 #   Sends more traffic to faster, more reliable backends
 #   Weights: pending_count (40%), TTFB (30%), error_rate (20%), hit_rate (10%)
-#
-# Can be overridden with NNTP_PROXY_ROUTING_STRATEGY environment variable
-routing_strategy = "round-robin"
+strategy = "round-robin"
 
-# Enable precheck detection (STAT/HEAD pattern analysis)
-# When enabled, monitors for SABnzbd-style prechecks where clients send
-# STAT/HEAD commands before requesting articles. Can optimize routing by
-# avoiding unnecessary ARTICLE requests for missing content.
+# Smart article discovery (opt-in for performance optimization)
+# Automatically finds which backend has each article and remembers the result.
+# When you request an article, the proxy checks all backends in parallel to find it,
+# then caches that information. Future requests for the same article go directly
+# to the right backend. Similar to SABnzbd's "precheck" but smarter.
 #
-# Default: false (disabled for compatibility with all clients)
-# Can be overridden with NNTP_PROXY_PRECHECK_ENABLED environment variable
-precheck_enabled = false
+# TRADEOFF: Adds latency to first request (waits for all N backends to respond)
+# but improves overall throughput (subsequent requests skip the search).
+# BENEFIT: Finds older/rare content that may only exist on some backends.
+#
+# Best for: Multiple backends with different content, repeated downloads, old content
+# Skip if: Single backend, low-latency priority, mostly unique articles
+#
+# Memory usage: ~64 MB for 640,000 cached articles
+# Default: false (opt-in to avoid unexpected latency increase)
+adaptive_precheck = false
+
+# How many articles to remember (each uses ~100 bytes)
+# 640,000 articles = ~64 MB memory
+# 1,000,000 articles = ~100 MB memory
+precheck_cache_size = 640_000
 
 # Client Authentication Configuration
 # Two formats supported:

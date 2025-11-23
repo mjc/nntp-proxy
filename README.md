@@ -317,6 +317,37 @@ unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 | `tls_cert_path` | string | No | - | Path to additional CA certificate (PEM format) |
 | `connection_keepalive` | integer | No | - | Send DATE command every N seconds on idle connections (omit to disable) |
 
+#### Routing Configuration
+
+The proxy supports different routing strategies and optimizations for load balancing across backends.
+
+```toml
+[routing]
+strategy = "round-robin"        # Routing algorithm: "round-robin" or "adaptive-weighted" (default: "round-robin")
+adaptive_precheck = false       # Smart article discovery - finds which backend has each article (default: false)
+precheck_cache_size = 640000    # Number of articles to track (default: 640,000 ≈ 64 MB)
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `strategy` | string | No | "round-robin" | Load balancing algorithm. Options:<br>• `"round-robin"` - Evenly distribute requests across all backends<br>• `"adaptive-weighted"` - Route to backend with lowest pending requests |
+| `adaptive_precheck` | boolean | No | false | **Smart article discovery** - When enabled, checks all backends in parallel to find which has each article, then routes to the best backend. This helps find older content that may only exist on some servers, but adds latency to the first request for each article. |
+| `precheck_cache_size` | integer | No | 640000 | Number of articles to remember when using `adaptive_precheck`. Larger values use more memory (~100 bytes per article) but improve cache hit rate. |
+
+**When to enable `adaptive_precheck`:**
+
+✅ **Good for:**
+- Finding older articles that may only exist on some backends
+- Improving cache hit rates when backends have different retention policies
+- Maximizing content availability across multiple servers
+
+⚠️ **Trade-offs:**
+- Adds latency to first request for each new article (parallel STAT to all backends)
+- Increases backend load (N × STAT commands per cache miss)
+- Better throughput after warm-up, slower on cache misses
+
+💡 **Recommendation:** Leave disabled (default) for most deployments. Enable only if you frequently need to find older content across servers with different retention.
+
 ### TLS/SSL Support
 
 The proxy supports TLS/SSL encrypted connections to backend servers using **rustls** - a modern, memory-safe TLS implementation written in pure Rust.

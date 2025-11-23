@@ -160,6 +160,7 @@ pub struct ClientSessionBuilder {
     metrics: Option<MetricsCollector>,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: Option<Arc<crate::cache::ArticleCache>>,
+    precheck_enabled: bool,
 }
 
 impl ClientSessionBuilder {
@@ -213,6 +214,13 @@ impl ClientSessionBuilder {
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<crate::cache::ArticleCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Enable precheck detection for STAT/HEAD pattern analysis
+    #[must_use]
+    pub fn with_precheck(mut self, enabled: bool) -> Self {
+        self.precheck_enabled = enabled;
         self
     }
 
@@ -336,6 +344,7 @@ impl ClientSession {
             metrics: None,
             connection_stats: None,
             cache: None,
+            precheck_enabled: false,
         }
     }
 }

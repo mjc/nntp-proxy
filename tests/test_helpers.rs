@@ -258,8 +258,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
             })
             .collect(),
-        routing_strategy: Default::default(),
-        precheck_enabled: false,
+        routing: Default::default(),
         proxy: Default::default(),
         health_check: Default::default(),
         cache: Default::default(),
@@ -295,8 +294,7 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
                 health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
             })
             .collect(),
-        routing_strategy: Default::default(),
-        precheck_enabled: false,
+        routing: Default::default(),
         proxy: Default::default(),
         health_check: Default::default(),
         cache: None,

@@ -59,6 +59,7 @@ pub struct NntpProxyBuilder {
     buffer_size: Option<usize>,
     buffer_count: Option<usize>,
     enable_metrics: bool,
+    precheck_enabled: bool,
 }
 
 impl NntpProxyBuilder {
@@ -67,12 +68,14 @@ impl NntpProxyBuilder {
     /// The routing mode defaults to `Standard` (1:1) mode.
     #[must_use]
     pub fn new(config: Config) -> Self {
+        let precheck_enabled = config.routing.adaptive_precheck;
         Self {
             config,
             routing_mode: RoutingMode::Stateful,
             buffer_size: None,
             buffer_count: None,
             enable_metrics: false, // Default to disabled for performance
+            precheck_enabled,
         }
     }
 
@@ -167,7 +170,7 @@ impl NntpProxyBuilder {
         let router = Arc::new({
             use types::BackendId;
             connection_providers.iter().enumerate().fold(
-                router::BackendSelector::new(self.config.routing_strategy),
+                router::BackendSelector::new(self.config.routing.strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
                     r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
@@ -207,6 +210,7 @@ impl NntpProxyBuilder {
             metrics,
             enable_metrics: self.enable_metrics,
             connection_stats: ConnectionStatsAggregator::new(),
+            precheck_enabled: self.precheck_enabled,
         })
     }
 }
@@ -230,6 +234,8 @@ pub struct NntpProxy {
     enable_metrics: bool,
     /// Connection statistics aggregator (reduces log spam)
     connection_stats: ConnectionStatsAggregator,
+    /// Enable precheck detection for STAT/HEAD pattern analysis
+    precheck_enabled: bool,
 }
 
 /// Classify an error as a client disconnect (broken pipe/connection reset)
@@ -300,6 +306,8 @@ impl NntpProxy {
         if let Some(c) = cache {
             builder = builder.with_cache(c);
         }
+
+        builder = builder.with_precheck(self.precheck_enabled);
 
         if self.enable_metrics {
             builder = builder.with_metrics(self.metrics.clone());

@@ -41,6 +41,8 @@ impl Drop for EnvVarGuard {
 
 /// Test loading a single backend server from environment variables
 #[test]
+#[serial_test::serial]
+#[serial_test::serial]
 fn test_load_single_server_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -62,6 +64,8 @@ fn test_load_single_server_from_env() -> Result<()> {
 
 /// Test loading multiple backend servers from environment variables
 #[test]
+#[serial_test::serial]
+#[serial_test::serial]
 fn test_load_multiple_servers_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -94,8 +98,10 @@ fn test_load_multiple_servers_from_env() -> Result<()> {
     Ok(())
 }
 
-/// Test server with authentication credentials
+/// Test loading server with authentication credentials
 #[test]
+#[serial_test::serial]
+#[serial_test::serial]
 fn test_load_server_with_auth_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -116,6 +122,7 @@ fn test_load_server_with_auth_from_env() -> Result<()> {
 
 /// Test server with TLS configuration
 #[test]
+#[serial_test::serial]
 fn test_load_server_with_tls_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -136,6 +143,7 @@ fn test_load_server_with_tls_from_env() -> Result<()> {
 
 /// Test server with custom max_connections
 #[test]
+#[serial_test::serial]
 fn test_load_server_with_max_connections_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -154,6 +162,7 @@ fn test_load_server_with_max_connections_from_env() -> Result<()> {
 
 /// Test default port is used when PORT not specified
 #[test]
+#[serial_test::serial]
 fn test_default_port_when_missing() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -171,6 +180,7 @@ fn test_default_port_when_missing() -> Result<()> {
 
 /// Test default name is used when NAME not specified
 #[test]
+#[serial_test::serial]
 fn test_default_name_when_missing() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -186,8 +196,10 @@ fn test_default_name_when_missing() -> Result<()> {
     Ok(())
 }
 
-/// Test has_server_env_vars() detection
+/// Test has_server_env_vars detection
 #[test]
+#[serial_test::serial]
+#[serial_test::serial]
 fn test_has_server_env_vars() {
     let mut guard = EnvVarGuard::new();
 
@@ -203,6 +215,7 @@ fn test_has_server_env_vars() {
 
 /// Test no servers configured returns error
 #[test]
+#[serial_test::serial]
 fn test_no_servers_returns_error() {
     let _guard = EnvVarGuard::new();
     // No env vars set
@@ -219,6 +232,7 @@ fn test_no_servers_returns_error() {
 
 /// Test loading from TOML file
 #[test]
+#[serial_test::serial]
 fn test_load_config_from_file() -> Result<()> {
     let mut temp_file = NamedTempFile::new()?;
 
@@ -247,6 +261,7 @@ name = "File Server"
 
 /// Test invalid TOML returns error
 #[test]
+#[serial_test::serial]
 fn test_invalid_toml_returns_error() -> Result<()> {
     let mut temp_file = NamedTempFile::new()?;
 
@@ -265,6 +280,7 @@ fn test_invalid_toml_returns_error() -> Result<()> {
 
 /// Test missing file returns error
 #[test]
+#[serial_test::serial]
 fn test_missing_file_returns_error() {
     let result = load_config("/nonexistent/path.toml");
 
@@ -274,6 +290,7 @@ fn test_missing_file_returns_error() {
 
 /// Test create_default_config generates valid config
 #[test]
+#[serial_test::serial]
 fn test_create_default_config() {
     let config = create_default_config();
 
@@ -285,6 +302,7 @@ fn test_create_default_config() {
 
 /// Test ConfigSource descriptions
 #[test]
+#[serial_test::serial]
 fn test_config_source_descriptions() {
     assert_eq!(ConfigSource::File.description(), "configuration file");
     assert_eq!(
@@ -299,6 +317,7 @@ fn test_config_source_descriptions() {
 
 /// Test load_config_with_fallback: file exists
 #[test]
+#[serial_test::serial]
 fn test_fallback_uses_existing_file() -> Result<()> {
     let mut temp_file = NamedTempFile::new()?;
 
@@ -322,6 +341,7 @@ name = "Existing"
 
 /// Test load_config_with_fallback: no file, uses env vars
 #[test]
+#[serial_test::serial]
 fn test_fallback_uses_env_when_no_file() -> Result<()> {
     let temp_file = NamedTempFile::new()?;
     let path = temp_file.path().to_str().unwrap().to_string();
@@ -345,6 +365,7 @@ fn test_fallback_uses_env_when_no_file() -> Result<()> {
 
 /// Test load_config_with_fallback: creates default when nothing exists
 #[test]
+#[serial_test::serial]
 fn test_fallback_creates_default() -> Result<()> {
     let temp_file = NamedTempFile::new()?;
     let path = temp_file.path().to_str().unwrap().to_string();
@@ -369,6 +390,7 @@ fn test_fallback_creates_default() -> Result<()> {
 
 /// Test health check configuration from env vars
 #[test]
+#[serial_test::serial]
 fn test_health_check_config_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -391,6 +413,7 @@ fn test_health_check_config_from_env() -> Result<()> {
 
 /// Test connection keepalive from env vars
 #[test]
+#[serial_test::serial]
 fn test_connection_keepalive_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 
@@ -411,6 +434,7 @@ fn test_connection_keepalive_from_env() -> Result<()> {
 
 /// Test TLS cert path from env vars
 #[test]
+#[serial_test::serial]
 fn test_tls_cert_path_from_env() -> Result<()> {
     let mut guard = EnvVarGuard::new();
 

@@ -347,6 +347,7 @@ async fn test_config_auth_round_trip() {
             password: Some("testpass".to_string()),
             greeting: Some("Custom Auth Required".to_string()),
         },
+        routing: Default::default(),
     };
 
     // Verify config

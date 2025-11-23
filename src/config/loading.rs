@@ -213,13 +213,13 @@ pub fn load_config(config_path: &str) -> Result<Config> {
                 tracing::info!(
                     "Routing strategy overridden to round-robin via environment variable"
                 );
-                config.routing_strategy = super::types::RoutingStrategy::RoundRobin;
+                config.routing.strategy = super::types::RoutingStrategy::RoundRobin;
             }
             "adaptive-weighted" => {
                 tracing::info!(
                     "Routing strategy overridden to adaptive-weighted via environment variable"
                 );
-                config.routing_strategy = super::types::RoutingStrategy::AdaptiveWeighted;
+                config.routing.strategy = super::types::RoutingStrategy::AdaptiveWeighted;
             }
             other => {
                 tracing::warn!(
@@ -230,20 +230,20 @@ pub fn load_config(config_path: &str) -> Result<Config> {
         }
     }
 
-    // Check for precheck detection override
-    if let Ok(precheck_str) = std::env::var("NNTP_PROXY_PRECHECK_ENABLED") {
+    // Check for adaptive precheck override
+    if let Ok(precheck_str) = std::env::var("NNTP_PROXY_ADAPTIVE_PRECHECK") {
         match precheck_str.to_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => {
-                tracing::info!("Precheck detection enabled via environment variable");
-                config.precheck_enabled = true;
+                tracing::info!("Adaptive precheck enabled via environment variable");
+                config.routing.adaptive_precheck = true;
             }
             "false" | "0" | "no" | "off" => {
-                tracing::info!("Precheck detection disabled via environment variable");
-                config.precheck_enabled = false;
+                tracing::info!("Adaptive precheck disabled via environment variable");
+                config.routing.adaptive_precheck = false;
             }
             other => {
                 tracing::warn!(
-                    "Invalid precheck enabled value '{}' in NNTP_PROXY_PRECHECK_ENABLED (valid: true/false, 1/0, yes/no, on/off)",
+                    "Invalid adaptive precheck value '{}' in NNTP_PROXY_ADAPTIVE_PRECHECK (valid: true/false, 1/0, yes/no, on/off)",
                     other
                 );
             }

@@ -567,7 +567,7 @@ name = "Test Server"
 
     let config: Config = toml::from_str(toml)?;
     assert_eq!(
-        config.routing_strategy,
+        config.routing.strategy,
         nntp_proxy::config::RoutingStrategy::RoundRobin
     );
     Ok(())
@@ -587,7 +587,7 @@ name = "Test Server"
 
     let config: Config = toml::from_str(toml)?;
     assert_eq!(
-        config.routing_strategy,
+        config.routing.strategy,
         nntp_proxy::config::RoutingStrategy::RoundRobin
     );
     Ok(())
@@ -597,7 +597,8 @@ name = "Test Server"
 #[test]
 fn test_routing_strategy_adaptive_weighted() -> Result<()> {
     let toml = r#"
-routing_strategy = "adaptive-weighted"
+[routing]
+strategy = "adaptive-weighted"
 
 [[servers]]
 host = "news.example.com"
@@ -607,7 +608,7 @@ name = "Test Server"
 
     let config: Config = toml::from_str(toml)?;
     assert_eq!(
-        config.routing_strategy,
+        config.routing.strategy,
         nntp_proxy::config::RoutingStrategy::AdaptiveWeighted
     );
     Ok(())
@@ -617,7 +618,8 @@ name = "Test Server"
 #[test]
 fn test_routing_strategy_invalid_rejected() {
     let toml = r#"
-routing_strategy = "invalid-strategy"
+[routing]
+strategy = "invalid-strategy"
 
 [[servers]]
 host = "news.example.com"
@@ -677,15 +679,17 @@ name = "Test Server"
 "#;
 
     let config: Config = toml::from_str(toml)?;
-    assert!(!config.precheck_enabled);
+    assert!(!config.routing.adaptive_precheck); // Default is false
+    assert_eq!(config.routing.precheck_cache_size, 640_000); // Default cache size
     Ok(())
 }
 
-/// Test precheck_enabled = true parses correctly
+/// Test adaptive_precheck = true parses correctly
 #[test]
 fn test_precheck_enabled_true() -> Result<()> {
     let toml = r#"
-precheck_enabled = true
+[routing]
+adaptive_precheck = true
 
 [[servers]]
 host = "news.example.com"
@@ -694,15 +698,16 @@ name = "Test Server"
 "#;
 
     let config: Config = toml::from_str(toml)?;
-    assert!(config.precheck_enabled);
+    assert!(config.routing.adaptive_precheck);
     Ok(())
 }
 
-/// Test precheck_enabled = false parses correctly
+/// Test adaptive_precheck = false parses correctly
 #[test]
 fn test_precheck_enabled_false() -> Result<()> {
     let toml = r#"
-precheck_enabled = false
+[routing]
+adaptive_precheck = false
 
 [[servers]]
 host = "news.example.com"
@@ -711,16 +716,18 @@ name = "Test Server"
 "#;
 
     let config: Config = toml::from_str(toml)?;
-    assert!(!config.precheck_enabled);
+    assert!(!config.routing.adaptive_precheck);
     Ok(())
 }
 
-/// Test combined routing_strategy and precheck_enabled
+/// Test combined routing_strategy and adaptive_precheck
 #[test]
 fn test_routing_and_precheck_combined() -> Result<()> {
     let toml = r#"
-routing_strategy = "adaptive-weighted"
-precheck_enabled = true
+[routing]
+strategy = "adaptive-weighted"
+adaptive_precheck = true
+precheck_cache_size = 1_000_000
 
 [[servers]]
 host = "news.example.com"
@@ -730,9 +737,10 @@ name = "Test Server"
 
     let config: Config = toml::from_str(toml)?;
     assert_eq!(
-        config.routing_strategy,
+        config.routing.strategy,
         nntp_proxy::config::RoutingStrategy::AdaptiveWeighted
     );
-    assert!(config.precheck_enabled);
+    assert!(config.routing.adaptive_precheck);
+    assert_eq!(config.routing.precheck_cache_size, 1_000_000);
     Ok(())
 }
