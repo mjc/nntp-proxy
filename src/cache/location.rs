@@ -4,10 +4,10 @@
 //! When adaptive_precheck is enabled, performs parallel STAT to all backends
 //! on cache miss to discover article availability.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use moka::sync::Cache;
+use moka::future::Cache;
 
 use crate::types::{BackendId, MessageId};
 
@@ -106,42 +106,47 @@ impl ArticleLocationCache {
     /// Look up article location in cache
     ///
     /// Returns None if not in cache, otherwise returns backend availability bitmap
-    #[must_use]
-    pub fn get(&self, message_id: &MessageId<'_>) -> Option<BackendAvailability> {
-        let key: Arc<str> = Arc::from(message_id.as_str());
-        let result = self.cache.get(&key);
-        if result.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+    ///
+    /// **Zero-allocation**: Uses `Borrow<str>` trait to lookup Arc<str> keys with &str
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<BackendAvailability> {
+        // moka::future::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
+        // This is zero-allocation: no Arc<str> is created for the lookup
+        self.cache
+            .get(message_id.without_brackets())
+            .await
+            .inspect(|_| {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            })
+            .or_else(|| {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            })
     }
 
     /// Update cache with article availability for a backend
     ///
     /// If the article already exists in cache, updates the bitmap.
     /// Otherwise, creates a new entry.
-    pub fn update(&self, message_id: &MessageId<'_>, backend: BackendId, available: bool) {
-        let key: Arc<str> = Arc::from(message_id.as_str());
+    pub async fn update(&self, message_id: &MessageId<'_>, backend: BackendId, available: bool) {
+        let key: Arc<str> = message_id.without_brackets().into();
 
-        let mut availability = self.cache.get(&key).unwrap_or_default();
+        let mut availability = self.cache.get(&key).await.unwrap_or_default();
 
-        if available {
-            availability.mark_available(backend);
-        } else {
-            availability.mark_unavailable(backend);
+        match available {
+            true => availability.mark_available(backend),
+            false => availability.mark_unavailable(backend),
         }
 
-        self.cache.insert(key, availability);
+        self.cache.insert(key, availability).await;
     }
 
     /// Insert complete availability map for an article
     ///
     /// Used after parallel STAT to all backends
-    pub fn insert(&self, message_id: &MessageId<'_>, availability: BackendAvailability) {
-        let key: Arc<str> = Arc::from(message_id.as_str());
-        self.cache.insert(key, availability);
+    pub async fn insert(&self, message_id: &MessageId<'_>, availability: BackendAvailability) {
+        self.cache
+            .insert(message_id.without_brackets().into(), availability)
+            .await;
     }
 
     /// Get number of backends tracked by this cache
@@ -163,23 +168,35 @@ impl ArticleLocationCache {
         self.cache.policy().max_capacity().unwrap_or(0)
     }
 
+    /// Run pending background tasks (for testing)
+    ///
+    /// Moka performs maintenance tasks (eviction, expiration) asynchronously.
+    /// This method ensures all pending tasks complete, useful for deterministic testing.
+    pub async fn sync(&self) {
+        self.cache.run_pending_tasks().await;
+    }
+
     /// Get cache hit rate as percentage (0.0 - 100.0)
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
-        if total == 0 {
-            0.0
-        } else {
+        // Use saturating_add to prevent overflow
+        let total = hits.saturating_add(misses);
+        // Functional: map zero to 0.0, otherwise calculate percentage
+        if total != 0 {
             (hits as f64 / total as f64) * 100.0
+        } else {
+            0.0
         }
     }
 
     /// Get total number of cache lookups
     #[must_use]
     pub fn total_lookups(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed) + self.misses.load(Ordering::Relaxed)
+        self.hits
+            .load(Ordering::Relaxed)
+            .saturating_add(self.misses.load(Ordering::Relaxed))
     }
 }
 
@@ -236,36 +253,38 @@ mod tests {
         assert!(backends.contains(&BackendId::from_index(5)));
     }
 
-    #[test]
-    fn test_cache_get_miss() {
+    #[tokio::test]
+    async fn test_cache_get_miss() {
         let cache = ArticleLocationCache::new(100, 3);
         let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
 
-        assert!(cache.get(&msg_id).is_none());
+        assert!(cache.get(&msg_id).await.is_none());
     }
 
-    #[test]
-    fn test_cache_update() {
+    #[tokio::test]
+    async fn test_cache_update() {
         let cache = ArticleLocationCache::new(100, 3);
         let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
 
         // Update with backend 0 has it
-        cache.update(&msg_id, BackendId::from_index(0), true);
+        cache.update(&msg_id, BackendId::from_index(0), true).await;
+        cache.sync().await;
 
-        let avail = cache.get(&msg_id).unwrap();
+        let avail = cache.get(&msg_id).await.unwrap();
         assert!(avail.has_article(BackendId::from_index(0)));
         assert!(!avail.has_article(BackendId::from_index(1)));
 
         // Update with backend 1 also has it
-        cache.update(&msg_id, BackendId::from_index(1), true);
+        cache.update(&msg_id, BackendId::from_index(1), true).await;
+        cache.sync().await;
 
-        let avail = cache.get(&msg_id).unwrap();
+        let avail = cache.get(&msg_id).await.unwrap();
         assert!(avail.has_article(BackendId::from_index(0)));
         assert!(avail.has_article(BackendId::from_index(1)));
     }
 
-    #[test]
-    fn test_cache_insert() {
+    #[tokio::test]
+    async fn test_cache_insert() {
         let cache = ArticleLocationCache::new(100, 3);
         let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
 
@@ -273,9 +292,10 @@ mod tests {
         avail.mark_available(BackendId::from_index(0));
         avail.mark_available(BackendId::from_index(2));
 
-        cache.insert(&msg_id, avail);
+        cache.insert(&msg_id, avail).await;
+        cache.sync().await;
 
-        let cached = cache.get(&msg_id).unwrap();
+        let cached = cache.get(&msg_id).await.unwrap();
         assert!(cached.has_article(BackendId::from_index(0)));
         assert!(!cached.has_article(BackendId::from_index(1)));
         assert!(cached.has_article(BackendId::from_index(2)));
@@ -288,17 +308,17 @@ mod tests {
         assert_eq!(cache.entry_count(), 0);
     }
 
-    #[test]
-    fn test_cache_lru_eviction() {
+    #[tokio::test]
+    async fn test_cache_lru_eviction() {
         let cache = ArticleLocationCache::new(2, 3); // Only 2 entries
 
         let msg1 = MessageId::new("<msg1@example.com>".to_string()).unwrap();
         let msg2 = MessageId::new("<msg2@example.com>".to_string()).unwrap();
         let msg3 = MessageId::new("<msg3@example.com>".to_string()).unwrap();
 
-        cache.update(&msg1, BackendId::from_index(0), true);
-        cache.update(&msg2, BackendId::from_index(1), true);
-        cache.update(&msg3, BackendId::from_index(2), true);
+        cache.update(&msg1, BackendId::from_index(0), true).await;
+        cache.update(&msg2, BackendId::from_index(1), true).await;
+        cache.update(&msg3, BackendId::from_index(2), true).await;
 
         // msg1 should be evicted (LRU)
         // Note: moka eviction may be async, so we can't strictly test this

@@ -2,8 +2,8 @@
 
 use crate::types::MessageId;
 use moka::future::Cache;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Cached article data
@@ -54,22 +54,25 @@ impl ArticleCache {
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<CachedArticle> {
         // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
         // This is zero-allocation: no Arc<str> is created for the lookup
-        let result = self.cache.get(message_id.without_brackets()).await;
-        if result.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        self.cache
+            .get(message_id.without_brackets())
+            .await
+            .inspect(|_| {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            })
+            .or_else(|| {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            })
     }
 
     /// Store an article in the cache
     ///
     /// Accepts any lifetime MessageId and stores using the ID content (without brackets) as key.
     pub async fn insert<'a>(&self, message_id: MessageId<'a>, article: CachedArticle) {
-        // Store using the message ID content without brackets as Arc<str>
-        let key: Arc<str> = message_id.without_brackets().into();
-        self.cache.insert(key, article).await;
+        self.cache
+            .insert(message_id.without_brackets().into(), article)
+            .await;
     }
 
     /// Get cache statistics
@@ -93,18 +96,22 @@ impl ArticleCache {
     pub fn hit_rate(&self) -> f64 {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
-        if total == 0 {
-            0.0
-        } else {
+        // Use saturating_add to prevent overflow
+        let total = hits.saturating_add(misses);
+        // Functional: map zero to 0.0, otherwise calculate percentage
+        if total != 0 {
             (hits as f64 / total as f64) * 100.0
+        } else {
+            0.0
         }
     }
 
     /// Get total number of cache lookups
     #[must_use]
     pub fn total_lookups(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed) + self.misses.load(Ordering::Relaxed)
+        self.hits
+            .load(Ordering::Relaxed)
+            .saturating_add(self.misses.load(Ordering::Relaxed))
     }
 }
 
@@ -175,6 +182,7 @@ mod tests {
         };
 
         cache.insert(msgid.clone(), article).await;
+        cache.sync().await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
         assert_eq!(retrieved.response.as_ref(), &response_data);

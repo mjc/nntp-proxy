@@ -359,15 +359,15 @@ impl ClientSession {
 
         // Update location cache if we have a message-ID (for ARTICLE/BODY/HEAD/STAT)
         // This helps future requests route directly to the right backend
-        if let (Some(msg_id), Some(location_cache)) = (message_id, self.location_cache()) {
-            if result.is_ok() {
-                // Update cache: this backend has the article (true = available)
-                location_cache.update(&msg_id, backend_id, true);
-                debug!(
-                    "Updated location cache: {} -> backend {:?} (available)",
-                    msg_id, backend_id
-                );
-            }
+        if let (Some(msg_id), Some(location_cache)) = (message_id, self.location_cache())
+            && result.is_ok()
+        {
+            // Update cache: this backend has the article (true = available)
+            location_cache.update(&msg_id, backend_id, true).await;
+            debug!(
+                "Updated location cache: {} -> backend {:?} (available)",
+                msg_id, backend_id
+            );
         }
 
         // Handle errors functionally - remove from pool if backend error
@@ -1174,8 +1174,8 @@ mod tests {
 
     // Location cache tests
 
-    #[test]
-    fn test_location_cache_passed_through_builder() {
+    #[tokio::test]
+    async fn test_location_cache_passed_through_builder() {
         use crate::auth::AuthHandler;
         use crate::cache::ArticleLocationCache;
         use crate::types::BufferSize;
@@ -1197,6 +1197,18 @@ mod tests {
             session.location_cache().unwrap(),
             &location_cache
         ));
+
+        // Test that cache operations work
+        use crate::types::BackendId;
+        use crate::types::protocol::MessageId;
+        let msg_id = MessageId::try_from("<test@example.com>".to_string()).unwrap();
+        location_cache
+            .update(&msg_id, BackendId::from_index(0), true)
+            .await;
+
+        let availability = location_cache.get(&msg_id).await;
+        assert!(availability.is_some());
+        assert!(availability.unwrap().has_article(BackendId::from_index(0)));
     }
 
     #[test]
@@ -1237,8 +1249,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_location_cache_update_requires_message_id() {
+    #[tokio::test]
+    async fn test_location_cache_update_requires_message_id() {
         use crate::auth::AuthHandler;
         use crate::cache::ArticleLocationCache;
         use crate::types::BufferSize;
@@ -1260,16 +1272,16 @@ mod tests {
         // Update cache with a test article
         use crate::types::protocol::MessageId;
         let msg_id = MessageId::try_from("<test@example.com>".to_string()).unwrap();
-        location_cache.update(&msg_id, crate::types::BackendId::from_index(0), true);
-
-        // Moka cache is async - need to sync it
-        location_cache.cache.run_pending_tasks();
+        location_cache
+            .update(&msg_id, crate::types::BackendId::from_index(0), true)
+            .await;
+        location_cache.sync().await;
 
         // Verify cache was updated
         assert_eq!(location_cache.entry_count(), 1);
 
         // Verify we can retrieve it
-        let availability = location_cache.get(&msg_id);
+        let availability = location_cache.get(&msg_id).await;
         assert!(availability.is_some());
         assert!(
             availability

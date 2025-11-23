@@ -241,18 +241,26 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
 
     // Add location cache stats if enabled
     if let Some(cache) = app.location_cache() {
+        const EXCELLENT_HIT_RATE: f64 = 80.0;
+        const GOOD_HIT_RATE: f64 = 50.0;
+
         let hit_rate = cache.hit_rate();
+        let color = match hit_rate {
+            r if r > EXCELLENT_HIT_RATE => Color::Green,
+            r if r > GOOD_HIT_RATE => Color::Yellow,
+            _ => styles::VALUE_INFO,
+        };
+
         right_lines.push(Line::from(vec![
             Span::styled("Location Cache: ", Style::default().fg(styles::LABEL)),
             Span::styled(
-                format!("{}/{} ({:.1}%)", cache.entry_count(), cache.capacity(), hit_rate),
-                Style::default().fg(if hit_rate > 80.0 {
-                    Color::Green
-                } else if hit_rate > 50.0 {
-                    Color::Yellow
-                } else {
-                    styles::VALUE_INFO
-                }),
+                format!(
+                    "{}/{} ({:.1}%)",
+                    cache.entry_count(),
+                    cache.capacity(),
+                    hit_rate
+                ),
+                Style::default().fg(color),
             ),
         ]));
     }
