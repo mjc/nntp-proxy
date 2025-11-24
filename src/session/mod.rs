@@ -46,6 +46,7 @@ pub(crate) mod common;
 pub mod connection;
 pub mod error_classification;
 pub mod handlers;
+pub mod precheck;
 pub mod streaming;
 
 use std::net::SocketAddr;
@@ -121,6 +122,9 @@ pub struct ClientSession {
 
     /// Optional article location cache for smart routing
     location_cache: Option<Arc<crate::cache::ArticleLocationCache>>,
+
+    /// Whether adaptive precheck is enabled (parallel STAT on cache miss)
+    precheck_enabled: bool,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -266,6 +270,7 @@ impl ClientSessionBuilder {
             connection_stats: self.connection_stats,
             cache: self.cache,
             location_cache: self.location_cache,
+            precheck_enabled: self.precheck_enabled,
         }
     }
 }
@@ -292,6 +297,7 @@ impl ClientSession {
             connection_stats: None,
             cache: None,
             location_cache: None,
+            precheck_enabled: false,
         }
     }
 
@@ -321,6 +327,7 @@ impl ClientSession {
             connection_stats: None,
             cache: None,
             location_cache: None,
+            precheck_enabled: false,
         }
     }
 
@@ -411,6 +418,13 @@ impl ClientSession {
     #[inline]
     pub(crate) fn location_cache(&self) -> Option<&Arc<crate::cache::ArticleLocationCache>> {
         self.location_cache.as_ref()
+    }
+
+    /// Check if adaptive precheck is enabled
+    #[must_use]
+    #[inline]
+    pub(crate) fn precheck_enabled(&self) -> bool {
+        self.precheck_enabled
     }
 
     // Metrics helper methods - encapsulate Option checks for cleaner handler code

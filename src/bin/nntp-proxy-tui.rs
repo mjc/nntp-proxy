@@ -5,6 +5,8 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback, tui};
 
@@ -24,7 +26,7 @@ fn main() -> Result<()> {
 
     // If TUI is enabled, we need special logging setup
     // If TUI is disabled, use normal logging
-    let log_buffer = if args.no_tui {
+    let (_guard, log_buffer) = if args.no_tui {
         // Normal logging to stderr
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -32,26 +34,40 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
             )
             .init();
-        None
+        (None, None)
     } else {
-        // For TUI mode, capture logs in memory
+        // For TUI mode, capture logs in memory AND write to debug.log file
         use nntp_proxy::tui::{LogBuffer, LogMakeWriter};
 
         let log_buffer = LogBuffer::new();
         let log_writer = LogMakeWriter::new(log_buffer.clone());
 
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        // Use RUST_LOG or default to "info" (NOT "debug")
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+        // Create file appender for debug.log
+        let file_appender = tracing_appender::rolling::never(".", "debug.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        // Dual output: TUI log buffer + debug.log file (both respect RUST_LOG)
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(log_writer)
+                    .with_ansi(false)
+                    .with_target(false)
+                    .compact(),
             )
-            .with_writer(log_writer)
-            .with_ansi(false) // No ANSI codes in TUI logs
-            .with_target(false) // Remove module paths (nntp_proxy::proxy)
-            .compact() // Compact format: HH:MM:SS.microseconds
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false),
+            )
             .init();
 
-        Some(log_buffer)
+        (Some(guard), Some(log_buffer))
     };
 
     // Build and configure runtime

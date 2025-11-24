@@ -58,7 +58,7 @@ impl BackendAvailability {
         self.0 != 0
     }
 
-    /// Get raw bitmap value
+    /// Get the raw bitmap value (for debugging)
     #[must_use]
     #[inline]
     pub const fn as_u64(&self) -> u64 {

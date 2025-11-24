@@ -1,13 +1,13 @@
 //! Backend server selection and load balancing
 //!
-//! This module handles selecting backend servers using round-robin
-//! with simple load tracking for monitoring.
+//! This module provides pluggable routing strategies:
+//! - **Round-robin**: Even distribution across backends
+//! - **Adaptive**: Weighted selection based on load, availability, and saturation
 //!
 //! # Overview
 //!
 //! The `BackendSelector` provides thread-safe backend selection for routing
-//! NNTP commands across multiple backend servers. It uses a lock-free
-//! round-robin algorithm with atomic operations for concurrent access.
+//! NNTP commands across multiple backend servers.
 //!
 //! # Usage
 //!
@@ -34,6 +34,12 @@
 //! selector.complete_command(backend_id);
 //! ```
 
+mod adaptive;
+mod round_robin;
+
+pub use adaptive::AdaptiveStrategy;
+pub use round_robin::RoundRobinStrategy;
+
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,17 +51,17 @@ use crate::types::{BackendId, ClientId, ServerName};
 
 /// Backend connection information
 #[derive(Debug, Clone)]
-struct BackendInfo {
+pub(crate) struct BackendInfo {
     /// Backend identifier
-    id: BackendId,
+    pub(crate) id: BackendId,
     /// Server name for logging
-    name: ServerName,
+    pub(crate) name: ServerName,
     /// Connection provider for this backend
-    provider: DeadpoolConnectionProvider,
+    pub(crate) provider: DeadpoolConnectionProvider,
     /// Number of pending requests on this backend (for load balancing)
-    pending_count: Arc<AtomicUsize>,
+    pub(crate) pending_count: Arc<AtomicUsize>,
     /// Number of connections in stateful mode (for hybrid routing reservation)
-    stateful_count: Arc<AtomicUsize>,
+    pub(crate) stateful_count: Arc<AtomicUsize>,
 }
 
 /// Selects backend servers using round-robin with load tracking
@@ -97,8 +103,10 @@ struct BackendInfo {
 pub struct BackendSelector {
     /// Backend connection providers
     backends: Vec<BackendInfo>,
-    /// Current backend index for round-robin selection
-    current_backend: AtomicUsize,
+    /// Round-robin strategy
+    round_robin: RoundRobinStrategy,
+    /// Adaptive weighted routing strategy
+    adaptive: AdaptiveStrategy,
     /// Routing strategy to use for backend selection
     routing_strategy: RoutingStrategy,
 }
@@ -120,7 +128,8 @@ impl BackendSelector {
         Self {
             // Pre-allocate for typical number of backend servers (most setups have 2-8)
             backends: Vec::with_capacity(4),
-            current_backend: AtomicUsize::new(0),
+            round_robin: RoundRobinStrategy::new(),
+            adaptive: AdaptiveStrategy::new(),
             routing_strategy,
         }
     }
@@ -149,34 +158,12 @@ impl BackendSelector {
         }
 
         match self.routing_strategy {
-            RoutingStrategy::RoundRobin => self.select_backend_round_robin(),
-            RoutingStrategy::AdaptiveWeighted => self.select_backend_adaptive(),
+            RoutingStrategy::RoundRobin => self.round_robin.select(&self.backends),
+            RoutingStrategy::AdaptiveWeighted => self.adaptive.select(&self.backends),
         }
     }
 
-    /// Select backend using round-robin strategy
-    fn select_backend_round_robin(&self) -> Option<&BackendInfo> {
-        let index = self.current_backend.fetch_add(1, Ordering::Relaxed) % self.backends.len();
-        Some(&self.backends[index])
-    }
-
-    /// Select backend using adaptive weighted strategy
-    ///
-    /// Chooses the backend with the lowest score based on:
-    /// - Pending request count (40% weight)
-    /// - Average TTFB (30% weight) - TODO: needs metrics integration
-    /// - Error rate (20% weight) - TODO: needs metrics integration
-    /// - Cache hit rate (10% weight) - TODO: needs metrics integration
-    ///
-    /// For now, falls back to round-robin until metrics are integrated
-    fn select_backend_adaptive(&self) -> Option<&BackendInfo> {
-        // TODO: Implement adaptive weighted selection using backend metrics
-        // For now, fall back to round-robin
-        // This will be implemented in Phase 2 once metrics are wired in
-        self.select_backend_round_robin()
-    }
-
-    /// Select a backend for the given command using round-robin
+    /// Select a backend for the given command using the configured strategy
     /// Returns the backend ID to use for this command
     pub fn route_command(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
         let backend = self.select_backend().ok_or_else(|| {
@@ -211,6 +198,19 @@ impl BackendSelector {
             .iter()
             .find(|b| b.id == backend_id)
             .map(|b| &b.provider)
+    }
+
+    /// Get all backends with their providers for parallel operations
+    ///
+    /// Returns a vector of (BackendId, Arc<DeadpoolConnectionProvider>) pairs
+    /// for all configured backends. This is used by parallel STAT checks to
+    /// query all backends concurrently.
+    #[must_use]
+    pub fn all_backend_providers(&self) -> Vec<(BackendId, Arc<DeadpoolConnectionProvider>)> {
+        self.backends
+            .iter()
+            .map(|b| (b.id, Arc::new(b.provider.clone())))
+            .collect()
     }
 
     /// Get the number of backends

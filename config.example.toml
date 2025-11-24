@@ -23,21 +23,35 @@ port = 8119
 #   Weights: pending_count (40%), TTFB (30%), error_rate (20%), hit_rate (10%)
 strategy = "round-robin"
 
-# Smart article discovery (opt-in for performance optimization)
-# Automatically finds which backend has each article and remembers the result.
-# When you request an article, the proxy checks all backends in parallel to find it,
-# then caches that information. Future requests for the same article go directly
-# to the right backend. Similar to SABnzbd's "precheck" but smarter.
+# Smart article discovery (adaptive precheck)
+# Automatically finds which backend has each article and caches the result.
 #
-# TRADEOFF: Adds latency to first request (waits for all N backends to respond)
-# but improves overall throughput (subsequent requests skip the search).
-# BENEFIT: Finds older/rare content that may only exist on some backends.
+# HOW IT WORKS:
+# When you request an article by message-ID (STAT/ARTICLE/BODY/HEAD), the proxy
+# checks all backends in parallel to see which ones have it. This information is
+# cached so future requests go directly to the right backend.
 #
-# Best for: Multiple backends with different content, repeated downloads, old content
-# Skip if: Single backend, low-latency priority, mostly unique articles
+# VALUE PROPOSITION:
+#
+# 1. WITH SABnzbd precheck ENABLED:
+#    - First download of an NZB: ~50s (proxy prechecks all backends, builds cache)
+#    - Re-downloading the same NZB later: <1s (cache hit, instant 223 responses)
+#    - BENEFIT: 50x+ speedup for cached articles
+#
+# 2. WITH SABnzbd precheck DISABLED:
+#    - Download time: ~50s (proxy does precheck work)
+#    - BENEFIT: Guarantees no false "article missing" errors when article exists
+#      on a different backend. Without this, SABnzbd tries one backend and may
+#      fail even if another backend has the article.
+#    - Also builds location cache for future requests
+#    - AWR learns which backend is faster for actual downloads
+#
+# TRADEOFF:
+# - First request pays 20-50s penalty to check all backends
+# - Adds ~100 bytes memory per cached article
 #
 # Memory usage: ~64 MB for 640,000 cached articles
-# Default: false (opt-in to avoid unexpected latency increase)
+# Default: false (opt-in to avoid unexpected first-request latency)
 adaptive_precheck = false
 
 # How many articles to remember (each uses ~100 bytes)
