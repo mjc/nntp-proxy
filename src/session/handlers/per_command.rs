@@ -716,12 +716,13 @@ impl ClientSession {
             if let Some(code) = _response_code.status_code() {
                 let raw_code = code.as_u16();
                 // Warn only for truly unusual responses (not 223 or errors)
-                if msgid.is_some() && raw_code != 223 && !code.is_error() {
+                if let Some(id) = msgid
+                    && raw_code != 223
+                    && !code.is_error()
+                {
                     warn!(
                         "Client {} ARTICLE {} got unusual single-line response: {}",
-                        self.client_addr,
-                        msgid.unwrap(),
-                        code
+                        self.client_addr, id, code
                     );
                 }
             }

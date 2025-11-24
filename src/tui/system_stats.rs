@@ -1,7 +1,11 @@
 //! System resource monitoring for TUI display
 //!
 //! Tracks CPU usage, memory consumption, and thread count for the proxy process.
+//! Runs sysinfo polling on a background thread to avoid blocking the TUI.
 
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 /// System resource statistics for the current process
@@ -21,88 +25,92 @@ pub struct SystemStats {
 
 /// System resource monitor
 ///
-/// Efficiently tracks process-specific metrics using sysinfo.
-/// Call `update()` periodically (e.g., every TUI frame) to refresh stats.
+/// Spawns a background thread that polls sysinfo every 2 seconds.
+/// The main thread retrieves stats via non-blocking channel receive.
 pub struct SystemMonitor {
-    system: System,
-    pid: sysinfo::Pid,
+    stats_rx: mpsc::Receiver<SystemStats>,
     peak_cpu: f32,
     peak_memory: u64,
+    cached_stats: SystemStats,
 }
 
 impl SystemMonitor {
     /// Create a new system monitor for the current process
+    ///
+    /// Spawns a background thread that polls sysinfo every 2 seconds.
     #[must_use]
     pub fn new() -> Self {
-        let mut system = System::new_with_specifics(
-            RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
-        );
+        let (stats_tx, stats_rx) = mpsc::channel();
 
-        // Get current process PID
-        let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
+        // Spawn background polling thread
+        thread::spawn(move || {
+            let mut system = System::new_with_specifics(
+                RefreshKind::new()
+                    .with_processes(ProcessRefreshKind::new().with_cpu().with_memory()),
+            );
 
-        // Initial refresh
-        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
+
+            loop {
+                // Refresh our process stats
+                system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+
+                if let Some(process) = system.process(pid) {
+                    let stats = SystemStats {
+                        cpu_usage: process.cpu_usage(),
+                        peak_cpu_usage: 0.0, // Will be calculated by receiver
+                        memory_bytes: process.memory(),
+                        peak_memory_bytes: 0, // Will be calculated by receiver
+                        thread_count: process.tasks().map_or(1, |t| t.len()),
+                    };
+
+                    // Send stats (non-blocking, drops if receiver is slow)
+                    let _ = stats_tx.send(stats);
+                }
+
+                // Sleep for 2 seconds before next poll
+                thread::sleep(Duration::from_secs(2));
+            }
+        });
 
         Self {
-            system,
-            pid,
+            stats_rx,
             peak_cpu: 0.0,
             peak_memory: 0,
+            cached_stats: SystemStats::default(),
         }
     }
 
     /// Update and retrieve current system stats
     ///
-    /// Should be called at regular intervals (e.g., TUI update rate of ~4Hz).
-    /// First call may return zero for CPU usage - sysinfo needs 2+ samples.
+    /// Non-blocking receive from background thread. Returns cached stats if no new data.
     #[must_use]
     pub fn update(&mut self) -> SystemStats {
-        // Refresh only our process (efficient)
-        self.system
-            .refresh_processes(ProcessesToUpdate::Some(&[self.pid]), true);
-
-        if let Some(process) = self.system.process(self.pid) {
-            let cpu = process.cpu_usage();
-            let memory = process.memory();
-
+        // Try to receive latest stats (non-blocking)
+        if let Ok(mut stats) = self.stats_rx.try_recv() {
             // Update peaks
-            if cpu > self.peak_cpu {
-                self.peak_cpu = cpu;
+            if stats.cpu_usage > self.peak_cpu {
+                self.peak_cpu = stats.cpu_usage;
             }
-            if memory > self.peak_memory {
-                self.peak_memory = memory;
+            if stats.memory_bytes > self.peak_memory {
+                self.peak_memory = stats.memory_bytes;
             }
 
-            SystemStats {
-                cpu_usage: cpu,
-                peak_cpu_usage: self.peak_cpu,
-                memory_bytes: memory,
-                peak_memory_bytes: self.peak_memory,
-                thread_count: process.tasks().map_or(1, |tasks| tasks.len()),
-            }
-        } else {
-            // Process not found (shouldn't happen for our own PID)
-            SystemStats::default()
+            stats.peak_cpu_usage = self.peak_cpu;
+            stats.peak_memory_bytes = self.peak_memory;
+
+            self.cached_stats = stats;
         }
+
+        self.cached_stats.clone()
     }
 
     /// Get current stats without refreshing
     ///
-    /// Returns the last refreshed stats. Useful if you just called `update()`.
+    /// Returns the last cached stats. Useful if you just called `update()`.
     #[must_use]
     pub fn current(&self) -> SystemStats {
-        if let Some(process) = self.system.process(self.pid) {
-            SystemStats {
-                cpu_usage: process.cpu_usage(),
-                peak_cpu_usage: self.peak_cpu,
-                memory_bytes: process.memory(),
-                peak_memory_bytes: self.peak_memory,
-                thread_count: process.tasks().map_or(1, |tasks| tasks.len()),
-            }
-        } else {
-            SystemStats::default()
-        }
+        self.cached_stats.clone()
     }
 }
 
