@@ -529,54 +529,56 @@ impl ClientSession {
             router.route_command(self.client_id, command)?
         };
 
-        // Retry on 430 or timeout - try up to 3 backends before giving up
-        const MAX_ATTEMPTS: usize = 3;
+        // Retry on 430 or timeout - try backends until we find one with the article
         const BACKEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
         let mut attempts_made = 0;
         let mut last_error: Option<anyhow::Error> = None;
-        let mut tried_backends = std::collections::HashSet::new();
+
+        // Track which backends have been tried by updating the availability bitmap
+        let mut remaining_backends = if let Some(avail) = backend_availability {
+            avail
+        } else {
+            // No cache - create bitmap with all backends available
+            let mut bitmap = crate::cache::BackendAvailability::new();
+            for i in 0..router.backend_count() {
+                bitmap.mark_available(crate::types::BackendId::from_index(i));
+            }
+            bitmap
+        };
+
         let (result, cmd_bytes, resp_bytes, successful_backend);
 
         loop {
             attempts_made += 1;
 
-            if attempts_made > MAX_ATTEMPTS {
-                // Exhausted retries
+            // Check if any backends remain to try
+            if !remaining_backends.has_any() {
                 if let Some(e) = last_error {
                     return Err(e);
                 } else {
-                    anyhow::bail!("All backends exhausted after {} attempts", MAX_ATTEMPTS);
+                    anyhow::bail!(
+                        "All {} backends tried, article not found",
+                        router.backend_count()
+                    );
                 }
             }
 
-            // Select backend (first attempt uses AWR, subsequent use round-robin)
-            // Skip backends we've already tried
-            let tried_backend = loop {
-                let candidate = if attempts_made == 1 {
-                    backend_id
-                } else {
-                    router.route_command(self.client_id, command)?
-                };
-
-                if !tried_backends.contains(&candidate) {
-                    break candidate;
-                }
-
-                // All backends tried - give up
-                if tried_backends.len() >= router.backend_count() {
-                    if let Some(e) = last_error {
-                        return Err(e);
-                    } else {
-                        anyhow::bail!(
-                            "All {} backends tried, article not found",
-                            router.backend_count()
-                        );
+            // Select backend - use AWR scoring among remaining backends
+            let tried_backend = if attempts_made == 1 {
+                backend_id
+            } else {
+                // Find next available backend using round-robin among remaining
+                let mut found = None;
+                for i in 0..router.backend_count() {
+                    let candidate = crate::types::BackendId::from_index(i);
+                    if remaining_backends.has_article(candidate) {
+                        found = Some(candidate);
+                        break;
                     }
                 }
+                found.ok_or_else(|| anyhow::anyhow!("No backends remaining"))?
             };
-
-            tried_backends.insert(tried_backend);
 
             // Get a connection from the router's backend pool
             let Some(provider) = router.backend_provider(tried_backend) else {
@@ -589,18 +591,20 @@ impl ClientSession {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => {
                         warn!(
-                            "Backend {:?} pool error (attempt {}/{}): {}",
-                            tried_backend, attempts_made, MAX_ATTEMPTS, e
+                            "Backend {:?} pool error (attempt {}): {}",
+                            tried_backend, attempts_made, e
                         );
                         last_error = Some(anyhow::anyhow!("Pool connection failed: {}", e));
+                        remaining_backends.mark_unavailable(tried_backend);
                         continue; // Try next backend
                     }
                     Err(_) => {
                         warn!(
-                            "Backend {:?} pool timeout (attempt {}/{})",
-                            tried_backend, attempts_made, MAX_ATTEMPTS
+                            "Backend {:?} pool timeout (attempt {})",
+                            tried_backend, attempts_made
                         );
                         last_error = Some(anyhow::anyhow!("Pool connection timeout"));
+                        remaining_backends.mark_unavailable(tried_backend);
                         continue; // Try next backend
                     }
                 };
@@ -646,11 +650,12 @@ impl ClientSession {
                 Ok(result) => result,
                 Err(_) => {
                     warn!(
-                        "Backend {:?} execution timeout (attempt {}/{})",
-                        tried_backend, attempts_made, MAX_ATTEMPTS
+                        "Backend {:?} execution timeout (attempt {})",
+                        tried_backend, attempts_made
                     );
                     last_error = Some(anyhow::anyhow!("Backend execution timeout"));
                     router.complete_command(tried_backend);
+                    remaining_backends.mark_unavailable(tried_backend);
                     continue; // Try next backend
                 }
             };
@@ -661,6 +666,9 @@ impl ClientSession {
             if let Err(ref e) = exec_res {
                 let error_str = format!("{}", e).to_lowercase();
                 if error_str.contains("430") {
+                    // Mark this backend as not having the article
+                    remaining_backends.mark_unavailable(tried_backend);
+
                     // Update location cache to mark this backend as NOT having the article
                     if let Some(ref msg_id) = message_id
                         && let Some(location_cache) = self.location_cache()
