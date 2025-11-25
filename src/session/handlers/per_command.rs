@@ -4,8 +4,7 @@
 //! can be routed to a different backend. It includes the core command execution
 //! logic used by all routing modes.
 
-use crate::pool::ConnectionProvider;
-use crate::pool::PooledBuffer;
+use crate::pool::{ConnectionProvider, PooledBuffer};
 use crate::session::common;
 use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
@@ -289,6 +288,262 @@ impl ClientSession {
         })
     }
 
+    /// Get backend availability from location cache or run precheck
+    async fn get_backend_availability(
+        &self,
+        router: &BackendSelector,
+        message_id: Option<&crate::types::protocol::MessageId<'_>>,
+    ) -> Option<crate::cache::BackendAvailability> {
+        if !self.precheck_enabled() {
+            return None;
+        }
+
+        let msg_id = message_id?;
+        let location_cache = self.location_cache()?;
+
+        // Check cache first
+        match location_cache.get(msg_id).await {
+            Some(availability) => {
+                debug!(
+                    "Location cache hit for {}: availability={:064b}",
+                    msg_id,
+                    availability.as_u64()
+                );
+                Some(availability)
+            }
+            None => {
+                // Cache miss - precheck backends
+                debug!("Location cache miss for {} - prechecking backends", msg_id);
+
+                let backends = router.all_backend_providers();
+                let num_backends = router.backend_count();
+
+                // Fast-fail optimization: For all message-ID based commands (STAT/ARTICLE/BODY/HEAD),
+                // return as soon as we find ONE backend with the article. The background task will
+                // complete the full precheck and update cache for future requests.
+                let fast_fail = true;
+
+                match crate::session::precheck::precheck_article_availability(
+                    msg_id,
+                    &backends,
+                    location_cache,
+                    num_backends,
+                    fast_fail,
+                    self.metrics.as_ref(),
+                )
+                .await
+                {
+                    Ok(availability) => {
+                        debug!(
+                            "Precheck complete for {}: availability={:064b}",
+                            msg_id,
+                            availability.as_u64()
+                        );
+                        Some(availability)
+                    }
+                    Err(e) => {
+                        warn!("Precheck failed for {}: {}", msg_id, e);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Select best backend using Adaptive Weighted Routing or round-robin
+    async fn select_backend_for_command(
+        &self,
+        router: &BackendSelector,
+        command: &str,
+        backend_availability: Option<&crate::cache::BackendAvailability>,
+        message_id: Option<&crate::types::protocol::MessageId<'_>>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BytesTransferred,
+    ) -> Result<crate::types::BackendId> {
+        let Some(availability) = backend_availability else {
+            // No availability info - use standard routing
+            return router.route_command(self.client_id, command);
+        };
+
+        // Check if any backend has the article
+        if !availability.has_any() {
+            // No backend has this article - return 430 immediately instead of trying backends
+            debug!(
+                "Precheck shows no backend has article {} - returning 430",
+                message_id.unwrap()
+            );
+            let error_msg = crate::protocol::error_response(430, "No such article");
+            client_write.write_all(error_msg.as_bytes()).await?;
+            backend_to_client_bytes.add(error_msg.len());
+
+            // Complete routing even though we didn't use a backend
+            // (no backend to complete since we didn't route)
+            return Ok(crate::types::BackendId::from_index(0)); // Dummy backend ID
+        }
+
+        // Select best available backend using Adaptive Weighted Routing (AWR)
+        self.select_backend_with_awr(router, availability)
+    }
+
+    /// Apply Adaptive Weighted Routing algorithm to select best backend
+    fn select_backend_with_awr(
+        &self,
+        router: &BackendSelector,
+        availability: &crate::cache::BackendAvailability,
+    ) -> Result<crate::types::BackendId> {
+        let mut selected_backend: Option<(crate::types::BackendId, f64)> = None;
+
+        for i in 0..router.backend_count() {
+            let backend_id = crate::types::BackendId::from_index(i);
+
+            // Skip backends that don't have the article
+            if !availability.has_article(backend_id) {
+                continue;
+            }
+
+            // Calculate adaptive score for this backend
+            if let Some(provider) = router.backend_provider(backend_id) {
+                let status = provider.status();
+                let max_size = status.max_size.get() as f64;
+                let available = status.available.get() as f64;
+                let pending = router.backend_load(backend_id).unwrap_or(0) as f64;
+
+                // Prevent division by zero
+                if max_size == 0.0 {
+                    continue;
+                }
+
+                let used = max_size - available;
+
+                // Get historical transfer performance if available
+                let transfer_penalty = self.calculate_transfer_penalty(backend_id);
+
+                // AWR scoring (lower is better):
+                // - 30% connection availability
+                // - 20% current load
+                // - 20% saturation penalty (quadratic)
+                // - 30% transfer speed penalty (prefer faster backends)
+                let availability_score = 1.0 - (available / max_size);
+                let load_score = pending / max_size;
+                let saturation_ratio = used / max_size;
+                let saturation_score = saturation_ratio * saturation_ratio;
+
+                let score = (availability_score * 0.30)
+                    + (load_score * 0.20)
+                    + (saturation_score * 0.20)
+                    + (transfer_penalty * 0.30);
+
+                debug!(
+                    "Backend {:?}: available={}/{}, pending={}, transfer_penalty={:.3}, score={:.3} (lower=better)",
+                    backend_id,
+                    available as usize,
+                    max_size as usize,
+                    pending as usize,
+                    transfer_penalty,
+                    score
+                );
+
+                // Select backend with lowest score
+                if selected_backend.is_none() || score < selected_backend.unwrap().1 {
+                    selected_backend = Some((backend_id, score));
+                }
+            }
+        }
+
+        // Extract the selected backend
+        selected_backend
+            .map(|(id, score)| {
+                debug!("AWR selected backend {:?} with score {:.3}", id, score);
+                Ok(id)
+            })
+            .unwrap_or_else(|| {
+                warn!("Logic error: has_any() was true but no backend found - using round-robin");
+                Err(anyhow::anyhow!("No backend available"))
+            })
+    }
+
+    /// Calculate transfer penalty based on historical performance metrics
+    fn calculate_transfer_penalty(&self, backend_id: crate::types::BackendId) -> f64 {
+        let Some(ref metrics) = self.metrics else {
+            return 0.5; // No metrics - neutral penalty
+        };
+
+        let snapshot = metrics.snapshot();
+        let Some(backend_stats) = snapshot.backend_stats.get(backend_id.as_index()) else {
+            return 0.5; // Unknown - neutral penalty
+        };
+
+        // Calculate bytes/sec from backend's historical performance
+        // Higher transfer rate = lower penalty
+        let uptime_secs = snapshot.uptime.as_secs_f64().max(1.0);
+        let bytes_received = backend_stats.bytes_received.as_u64() as f64;
+        let transfer_rate = bytes_received / uptime_secs;
+
+        // Normalize: 0 MB/s = 1.0 penalty, 10+ MB/s = 0.0 penalty
+        let mb_per_sec = transfer_rate / 1_000_000.0;
+        1.0 - (mb_per_sec / 10.0).min(1.0)
+    }
+
+    /// Try to serve STAT command directly from cache without backend query
+    #[allow(clippy::too_many_arguments)] // All parameters are necessary for this operation
+    async fn try_serve_stat_from_cache(
+        &self,
+        backend_availability: Option<&crate::cache::BackendAvailability>,
+        command: &str,
+        message_id: Option<&crate::types::protocol::MessageId<'_>>,
+        backend_id: crate::types::BackendId,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_to_backend_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BytesTransferred,
+    ) -> Result<Option<crate::types::BackendId>> {
+        // Only optimize STAT commands with cache hits
+        if backend_availability.is_none()
+            || !matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
+            || !command.trim_start().to_uppercase().starts_with("STAT ")
+        {
+            return Ok(None);
+        }
+
+        debug!(
+            "Cache hit for STAT {}: responding 223 without backend query (attributing to {:?})",
+            message_id.unwrap(),
+            backend_id
+        );
+
+        let response = b"223 0 <article> Article exists\r\n";
+        client_write.write_all(response).await?;
+        backend_to_client_bytes.add(response.len());
+        client_to_backend_bytes.add(command.len());
+
+        // Record metrics for cached response
+        if let Some(ref metrics) = self.metrics {
+            use crate::types::MetricsBytes;
+            let cmd_bytes = MetricsBytes::new(command.len() as u64);
+            let resp_bytes = MetricsBytes::new(response.len() as u64);
+
+            let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
+            self.user_bytes_sent(command.len() as u64);
+            self.user_bytes_received(response.len() as u64);
+        }
+
+        self.record_command(backend_id);
+        self.user_command();
+
+        Ok(Some(backend_id))
+    }
+
+    /// Extract message-ID from article commands for location cache routing
+    #[inline]
+    fn extract_message_id_for_routing(
+        command: &str,
+    ) -> Option<crate::types::protocol::MessageId<'_>> {
+        if matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
+            crate::protocol::NntpResponse::extract_message_id(command)
+        } else {
+            None
+        }
+    }
+
     /// Route a single command to a backend and execute it
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
@@ -316,216 +571,40 @@ impl ClientSession {
         let mut buffer = self.buffer_pool.acquire().await;
 
         // Check location cache for smart routing (STAT/ARTICLE/BODY/HEAD with message-ID)
-        let message_id = if matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
-            crate::protocol::NntpResponse::extract_message_id(command)
-        } else {
-            None
-        };
+        let message_id = Self::extract_message_id_for_routing(command);
 
         // Adaptive routing: If precheck enabled and we have a message-ID but no cached location,
         // precheck all backends to find which ones have the article
-        let backend_availability = if self.precheck_enabled()
-            && let Some(ref msg_id) = message_id
-            && let Some(location_cache) = self.location_cache()
-        {
-            // Check cache first
-            match location_cache.get(msg_id).await {
-                Some(availability) => {
-                    debug!(
-                        "Location cache hit for {}: availability={:064b}",
-                        msg_id,
-                        availability.as_u64()
-                    );
-                    Some(availability)
-                }
-                None => {
-                    // Cache miss - precheck backends
-                    debug!("Location cache miss for {} - prechecking backends", msg_id);
-
-                    let backends = router.all_backend_providers();
-                    let num_backends = router.backend_count();
-
-                    // Fast-fail optimization: For all message-ID based commands (STAT/ARTICLE/BODY/HEAD),
-                    // return as soon as we find ONE backend with the article. The background task will
-                    // complete the full precheck and update cache for future requests.
-                    let fast_fail = true;
-
-                    match crate::session::precheck::precheck_article_availability(
-                        msg_id,
-                        &backends,
-                        location_cache,
-                        num_backends,
-                        fast_fail,
-                        self.metrics.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(availability) => {
-                            debug!(
-                                "Precheck complete for {}: availability={:064b}",
-                                msg_id,
-                                availability.as_u64()
-                            );
-                            Some(availability)
-                        }
-                        Err(e) => {
-                            warn!("Precheck failed for {}: {}", msg_id, e);
-                            None
-                        }
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        let backend_availability = self
+            .get_backend_availability(router, message_id.as_ref())
+            .await;
 
         // Route the command to get a backend
-        // If we have backend availability from precheck, check if ANY backend has the article
-        let backend_id = if let Some(availability) = backend_availability {
-            // Check if any backend has the article
-            if !availability.has_any() {
-                // No backend has this article - return 430 immediately instead of trying backends
-                debug!(
-                    "Precheck shows no backend has article {} - returning 430",
-                    message_id.as_ref().unwrap()
-                );
-                let error_msg = crate::protocol::error_response(430, "No such article");
-                client_write.write_all(error_msg.as_bytes()).await?;
-                backend_to_client_bytes.add(error_msg.len());
-
-                // Complete routing even though we didn't use a backend
-                // (no backend to complete since we didn't route)
-                return Ok(crate::types::BackendId::from_index(0)); // Dummy backend ID
-            }
-
-            // Select best available backend using Adaptive Weighted Routing (AWR)
-            // Considers: article availability + pool capacity + current load + saturation
-            let mut selected_backend: Option<(crate::types::BackendId, f64)> = None;
-
-            for i in 0..router.backend_count() {
-                let backend_id = crate::types::BackendId::from_index(i);
-
-                // Skip backends that don't have the article
-                if !availability.has_article(backend_id) {
-                    continue;
-                }
-
-                // Calculate adaptive score for this backend
-                if let Some(provider) = router.backend_provider(backend_id) {
-                    let status = provider.status();
-                    let max_size = status.max_size.get() as f64;
-                    let available = status.available.get() as f64;
-                    let pending = router.backend_load(backend_id).unwrap_or(0) as f64;
-
-                    // Prevent division by zero
-                    if max_size == 0.0 {
-                        continue;
-                    }
-
-                    let used = max_size - available;
-
-                    // Get historical transfer performance if available
-                    let transfer_penalty = if let Some(ref metrics) = self.metrics {
-                        let snapshot = metrics.snapshot();
-                        if let Some(backend_stats) =
-                            snapshot.backend_stats.get(backend_id.as_index())
-                        {
-                            // Calculate bytes/sec from backend's historical performance
-                            // Higher transfer rate = lower penalty
-                            let uptime_secs = snapshot.uptime.as_secs_f64().max(1.0);
-                            let bytes_received = backend_stats.bytes_received.as_u64() as f64;
-                            let transfer_rate = bytes_received / uptime_secs;
-
-                            // Normalize: 0 MB/s = 1.0 penalty, 10+ MB/s = 0.0 penalty
-                            let mb_per_sec = transfer_rate / 1_000_000.0;
-                            1.0 - (mb_per_sec / 10.0).min(1.0)
-                        } else {
-                            0.5 // Unknown - neutral penalty
-                        }
-                    } else {
-                        0.5 // No metrics - neutral penalty
-                    };
-
-                    // AWR scoring (lower is better):
-                    // - 30% connection availability
-                    // - 20% current load
-                    // - 20% saturation penalty (quadratic)
-                    // - 30% transfer speed penalty (prefer faster backends)
-                    let availability_score = 1.0 - (available / max_size);
-                    let load_score = pending / max_size;
-                    let saturation_ratio = used / max_size;
-                    let saturation_score = saturation_ratio * saturation_ratio;
-
-                    let score = (availability_score * 0.30)
-                        + (load_score * 0.20)
-                        + (saturation_score * 0.20)
-                        + (transfer_penalty * 0.30);
-
-                    debug!(
-                        "Backend {:?}: available={}/{}, pending={}, transfer_penalty={:.3}, score={:.3} (lower=better)",
-                        backend_id,
-                        available as usize,
-                        max_size as usize,
-                        pending as usize,
-                        transfer_penalty,
-                        score
-                    );
-
-                    // Select backend with lowest score
-                    if selected_backend.is_none() || score < selected_backend.unwrap().1 {
-                        selected_backend = Some((backend_id, score));
-                    }
-                }
-            }
-
-            // Extract the selected backend
-            selected_backend
-                .map(|(id, score)| {
-                    debug!("AWR selected backend {:?} with score {:.3}", id, score);
-                    id
-                })
-                .unwrap_or_else(|| {
-                    warn!(
-                        "Logic error: has_any() was true but no backend found - using round-robin"
-                    );
-                    router.route_command(self.client_id, command).unwrap()
-                })
-        } else {
-            // No availability info - use standard routing
-            router.route_command(self.client_id, command)?
-        };
+        let backend_id = self
+            .select_backend_for_command(
+                router,
+                command,
+                backend_availability.as_ref(),
+                message_id.as_ref(),
+                client_write,
+                backend_to_client_bytes,
+            )
+            .await?;
 
         // For STAT commands with cache hit, answer directly without backend query
-        if backend_availability.is_some()
-            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
-            && command.trim_start().to_uppercase().starts_with("STAT ")
+        if let Some(backend) = self
+            .try_serve_stat_from_cache(
+                backend_availability.as_ref(),
+                command,
+                message_id.as_ref(),
+                backend_id,
+                client_write,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+            )
+            .await?
         {
-            debug!(
-                "Cache hit for STAT {}: responding 223 without backend query (attributing to {:?})",
-                message_id.as_ref().unwrap(),
-                backend_id
-            );
-
-            let response = b"223 0 <article> Article exists\r\n";
-            client_write.write_all(response).await?;
-            backend_to_client_bytes.add(response.len());
-            client_to_backend_bytes.add(command.len());
-
-            // Record metrics for cached response
-            if let Some(ref metrics) = self.metrics {
-                use crate::types::MetricsBytes;
-                let cmd_bytes = MetricsBytes::new(command.len() as u64);
-                let resp_bytes = MetricsBytes::new(response.len() as u64);
-
-                let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
-                self.user_bytes_sent(command.len() as u64);
-                self.user_bytes_received(response.len() as u64);
-            }
-
-            self.record_command(backend_id);
-            self.user_command();
-
-            return Ok(backend_id);
+            return Ok(backend);
         }
 
         // Retry on 430 or timeout - try backends until we find one with the article
