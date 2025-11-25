@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info};
 
 use crate::config::RoutingStrategy;
-use crate::pool::DeadpoolConnectionProvider;
+use crate::pool::{ConnectionProvider, DeadpoolConnectionProvider};
 use crate::types::{BackendId, ClientId, ServerName};
 
 /// Backend connection information
@@ -62,6 +62,46 @@ pub(crate) struct BackendInfo {
     pub(crate) pending_count: Arc<AtomicUsize>,
     /// Number of connections in stateful mode (for hybrid routing reservation)
     pub(crate) stateful_count: Arc<AtomicUsize>,
+}
+
+/// RAII guard for pending count management
+///
+/// Automatically increments pending count on creation and decrements on drop.
+/// This prevents manual tracking errors and ensures cleanup even on early returns or panics.
+///
+/// # Example
+/// ```no_run
+/// # use nntp_proxy::router::BackendSelector;
+/// # use nntp_proxy::types::BackendId;
+/// # let selector = BackendSelector::default();
+/// # let backend_id = BackendId::from_index(0);
+/// let _guard = selector.pending_guard(backend_id);
+/// // pending count incremented
+///
+/// // ... do work ...
+///
+/// // pending count auto-decremented when guard drops
+/// ```
+pub struct PendingGuard<'a> {
+    selector: &'a BackendSelector,
+    backend_id: BackendId,
+}
+
+impl<'a> PendingGuard<'a> {
+    /// Create a new pending guard (private - use BackendSelector::pending_guard)
+    fn new(selector: &'a BackendSelector, backend_id: BackendId) -> Self {
+        selector.increment_pending(backend_id);
+        Self {
+            selector,
+            backend_id,
+        }
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.selector.complete_command(self.backend_id);
+    }
 }
 
 /// Selects backend servers using round-robin with load tracking
@@ -176,10 +216,24 @@ impl BackendSelector {
         // Increment pending count for load tracking
         backend.pending_count.fetch_add(1, Ordering::Relaxed);
 
-        debug!(
-            "Selected backend {:?} ({}) for command",
-            backend.id, backend.name
-        );
+        let pending = backend.pending_count.load(Ordering::Relaxed);
+        let score = if self.routing_strategy == RoutingStrategy::AdaptiveWeighted {
+            Some(self.adaptive.calculate_score(backend))
+        } else {
+            None
+        };
+
+        if let Some(s) = score {
+            debug!(
+                "Selected backend {:?} ({}) - pending: {}, AWR score: {:.3}",
+                backend.id, backend.name, pending, s
+            );
+        } else {
+            debug!(
+                "Selected backend {:?} ({}) - pending: {}",
+                backend.id, backend.name, pending
+            );
+        }
 
         Ok(backend.id)
     }
@@ -187,8 +241,41 @@ impl BackendSelector {
     /// Mark a command as complete, decrementing the pending count
     pub fn complete_command(&self, backend_id: BackendId) {
         if let Some(backend) = self.backends.iter().find(|b| b.id == backend_id) {
-            backend.pending_count.fetch_sub(1, Ordering::Relaxed);
+            // Use fetch_update to prevent underflow
+            let _ = backend.pending_count.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| current.checked_sub(1),
+            );
         }
+    }
+
+    /// Manually increment pending count (for bypassing route_command)
+    pub fn increment_pending(&self, backend_id: BackendId) {
+        if let Some(backend) = self.backends.iter().find(|b| b.id == backend_id) {
+            backend.pending_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Create a RAII guard that manages pending count automatically
+    ///
+    /// The guard increments the pending count on creation and decrements it on drop.
+    /// This ensures proper cleanup even on early returns or panics.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use nntp_proxy::router::BackendSelector;
+    /// # use nntp_proxy::types::BackendId;
+    /// # let selector = BackendSelector::default();
+    /// # let backend_id = BackendId::from_index(0);
+    /// {
+    ///     let _guard = selector.pending_guard(backend_id);
+    ///     // Work with backend - pending count is tracked
+    /// } // Guard drops, pending count decremented
+    /// ```
+    #[must_use]
+    pub fn pending_guard(&self, backend_id: BackendId) -> PendingGuard<'_> {
+        PendingGuard::new(self, backend_id)
     }
 
     /// Get the connection provider for a backend
@@ -227,6 +314,108 @@ impl BackendSelector {
             .iter()
             .find(|b| b.id == backend_id)
             .map(|b| b.pending_count.load(Ordering::Relaxed))
+    }
+
+    /// Route command using Adaptive Weighted Routing (AWR) with availability bitmap
+    ///
+    /// Selects the best backend considering:
+    /// - Article availability (from cache)
+    /// - Pool capacity and current utilization
+    /// - Current load (pending requests)
+    /// - Saturation (quadratic penalty)
+    /// - Transfer performance (from metrics)
+    ///
+    /// # Arguments
+    /// * `availability` - Backend availability bitmap from cache
+    /// * `metrics` - Optional metrics collector for transfer performance data
+    ///
+    /// # Returns
+    /// Backend ID with lowest AWR score, or None if no backends have the article
+    #[must_use]
+    pub fn route_command_with_availability(
+        &self,
+        availability: &crate::cache::BackendAvailability,
+        metrics: Option<&crate::metrics::MetricsCollector>,
+    ) -> Option<BackendId> {
+        use tracing::debug;
+
+        let mut selected_backend: Option<(BackendId, f64)> = None;
+
+        for backend in &self.backends {
+            // Skip backends that don't have the article
+            if !availability.has_article(backend.id) {
+                continue;
+            }
+
+            // Get pool status
+            let status = backend.provider.status();
+            let max_size = status.max_size.get() as f64;
+            let available = status.available.get() as f64;
+            let pending = backend.pending_count.load(Ordering::Relaxed) as f64;
+
+            // Prevent division by zero
+            if max_size == 0.0 {
+                continue;
+            }
+
+            let used = max_size - available;
+
+            // Get historical transfer performance if available
+            let transfer_penalty = if let Some(metrics_ref) = metrics {
+                let snapshot = metrics_ref.snapshot();
+                if let Some(backend_stats) = snapshot.backend_stats.get(backend.id.as_index()) {
+                    // Calculate bytes/sec from backend's historical performance
+                    // Higher transfer rate = lower penalty
+                    let uptime_secs = snapshot.uptime.as_secs_f64().max(1.0);
+                    let bytes_received = backend_stats.bytes_received.as_u64() as f64;
+                    let transfer_rate = bytes_received / uptime_secs;
+
+                    // Normalize: 0 MB/s = 1.0 penalty, 10+ MB/s = 0.0 penalty
+                    let mb_per_sec = transfer_rate / 1_000_000.0;
+                    1.0 - (mb_per_sec / 10.0).min(1.0)
+                } else {
+                    0.5 // Unknown - neutral penalty
+                }
+            } else {
+                0.5 // No metrics - neutral penalty
+            };
+
+            // AWR scoring (lower is better):
+            // - 30% connection availability
+            // - 20% current load
+            // - 20% saturation penalty (quadratic)
+            // - 30% transfer speed penalty (prefer faster backends)
+            let availability_score = 1.0 - (available / max_size);
+            let load_score = pending / max_size;
+            let saturation_ratio = used / max_size;
+            let saturation_score = saturation_ratio * saturation_ratio;
+
+            let score = (availability_score * 0.30)
+                + (load_score * 0.20)
+                + (saturation_score * 0.20)
+                + (transfer_penalty * 0.30);
+
+            debug!(
+                "Backend {:?} ({}): available={}/{}, pending={}, transfer_penalty={:.3}, score={:.3} (lower=better)",
+                backend.id,
+                backend.name,
+                available as usize,
+                max_size as usize,
+                pending as usize,
+                transfer_penalty,
+                score
+            );
+
+            // Select backend with lowest score
+            if selected_backend.is_none() || score < selected_backend.unwrap().1 {
+                selected_backend = Some((backend.id, score));
+            }
+        }
+
+        selected_backend.map(|(id, score)| {
+            debug!("AWR selected backend {:?} with score {:.3}", id, score);
+            id
+        })
     }
 
     /// Try to acquire a stateful connection slot for hybrid mode
@@ -320,6 +509,53 @@ impl BackendSelector {
             .find(|b| b.id == backend_id)
             .map(|b| b.stateful_count.load(Ordering::Relaxed))
     }
+
+    /// Get backend info for display (pending, pool status, score)
+    #[must_use]
+    pub fn backend_routing_info(&self, backend_id: BackendId) -> Option<BackendRoutingInfo> {
+        self.backends
+            .iter()
+            .find(|b| b.id == backend_id)
+            .map(|backend| {
+                let status = backend.provider.status();
+                let pending = backend.pending_count.load(Ordering::Relaxed);
+                let stateful = backend.stateful_count.load(Ordering::Relaxed);
+                let score = if self.routing_strategy == RoutingStrategy::AdaptiveWeighted {
+                    Some(self.adaptive.calculate_score(backend))
+                } else {
+                    None
+                };
+
+                BackendRoutingInfo {
+                    pending,
+                    stateful,
+                    available: status.available.get(),
+                    max_size: status.max_size.get(),
+                    adaptive_score: score,
+                }
+            })
+    }
+
+    /// Get the current routing strategy
+    #[must_use]
+    pub fn routing_strategy(&self) -> RoutingStrategy {
+        self.routing_strategy
+    }
+}
+
+/// Backend routing information for TUI display
+#[derive(Debug, Clone, Copy)]
+pub struct BackendRoutingInfo {
+    /// Number of pending requests
+    pub pending: usize,
+    /// Number of stateful (hybrid mode) connections
+    pub stateful: usize,
+    /// Number of available connections in pool
+    pub available: usize,
+    /// Maximum pool size
+    pub max_size: usize,
+    /// Adaptive routing score (if using AWR)
+    pub adaptive_score: Option<f64>,
 }
 
 #[cfg(test)]

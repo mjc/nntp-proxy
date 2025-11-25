@@ -203,9 +203,7 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
         }
     });
 
-    // Accept connections
-    let uses_per_command_routing = args.common.routing_mode.supports_per_command_routing();
-
+    // Accept connections (automatic dispatch based on routing mode)
     loop {
         tokio::select! {
             // Check for shutdown signal from TUI
@@ -218,22 +216,12 @@ async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -
                 match accept_result {
                     Ok((stream, addr)) => {
                         let proxy_clone = proxy.clone();
-                        if uses_per_command_routing {
-                            tokio::spawn(async move {
-                                if let Err(e) = proxy_clone
-                                    .handle_client_per_command_routing(stream, addr)
-                                    .await
-                                {
-                                    error!("Error handling client {}: {}", addr, e);
-                                }
-                            });
-                        } else {
-                            tokio::spawn(async move {
-                                if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                                    error!("Error handling client {}: {}", addr, e);
-                                }
-                            });
-                        }
+                        // Automatic dispatch based on routing mode
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy_clone.handle_client(stream, addr).await {
+                                error!("Error handling client {}: {}", addr, e);
+                            }
+                        });
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {}", e);

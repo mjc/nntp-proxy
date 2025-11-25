@@ -304,6 +304,8 @@ fn render_backend_list(
     servers: &[crate::config::Server],
     app: &crate::tui::TuiApp,
 ) {
+    use crate::types::BackendId;
+
     let items: Vec<ListItem> = snapshot
         .backend_stats
         .iter()
@@ -342,13 +344,69 @@ fn render_backend_list(
                 .map(|ms| format!("{:.1}ms", ms))
                 .unwrap_or_else(|| "N/A".to_string());
 
+            // Format timing breakdown (send/recv/overhead) - only in details mode
+            let timing_breakdown = if app.show_details() {
+                if let (Some(send), Some(recv), Some(overhead)) = (
+                    stats.average_send_ms(),
+                    stats.average_recv_ms(),
+                    stats.average_overhead_ms(),
+                ) {
+                    Some(format!(
+                        " (S:{:.1} R:{:.1} O:{:.1}ms)",
+                        send, recv, overhead
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Get routing info (pending, pool status, AWR score) - only in details mode
+            let backend_id = BackendId::from_index(i);
+            let routing_info = if app.show_details() {
+                app.router().backend_routing_info(backend_id)
+            } else {
+                None
+            };
+
+            let routing_text = if let Some(info) = routing_info {
+                // Detect underflow in pending count
+                let pending_display = if info.pending > (usize::MAX / 2) {
+                    "ERR".to_string() // Underflow detected
+                } else {
+                    info.pending.to_string()
+                };
+
+                if let Some(score) = info.adaptive_score {
+                    // Detect invalid scores
+                    let score_display = if score.is_infinite() || score.is_nan() || score > 1000.0 {
+                        "ERR".to_string()
+                    } else {
+                        format!("{:.3}", score)
+                    };
+
+                    Some(format!(
+                        "  Pend: {} | Pool: {}/{} | AWR: {}",
+                        pending_display, info.available, info.max_size, score_display
+                    ))
+                } else {
+                    Some(format!(
+                        "  Pend: {} | Pool: {}/{}",
+                        pending_display, info.available, info.max_size
+                    ))
+                }
+            } else {
+                None
+            };
+
             // Format average article size
             let avg_size_text = stats
                 .average_article_size()
                 .map(format_bytes)
                 .unwrap_or_else(|| "N/A".to_string());
 
-            let content = vec![
+            let mut content = vec![
                 Line::from(vec![
                     Span::styled(
                         health_icon,
@@ -379,17 +437,27 @@ fn render_backend_list(
                         Style::default().fg(styles::LABEL),
                     ),
                 ]),
-                Line::from(vec![
-                    Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("{}/{}", stats.active_connections, server.max_connections),
-                        Style::default().fg(styles::VALUE_SECONDARY),
-                    ),
-                    Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
-                    Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(ttfb_text, Style::default().fg(styles::VALUE_INFO)),
-                ]),
+                Line::from({
+                    let mut spans = vec![
+                        Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
+                        Span::styled(
+                            format!("{}/{}", stats.active_connections, server.max_connections),
+                            Style::default().fg(styles::VALUE_SECONDARY),
+                        ),
+                        Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
+                        Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
+                        Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
+                        Span::styled(ttfb_text, Style::default().fg(styles::VALUE_INFO)),
+                    ];
+                    // Add timing breakdown if in details mode
+                    if let Some(breakdown) = timing_breakdown {
+                        spans.push(Span::styled(
+                            breakdown,
+                            Style::default().fg(styles::VALUE_SECONDARY),
+                        ));
+                    }
+                    spans
+                }),
                 Line::from(vec![
                     Span::styled(
                         format!("  {} ", text::ARROW_UP),
@@ -438,6 +506,11 @@ fn render_backend_list(
                     ),
                 ]),
             ];
+
+            // Add routing info line if in details mode
+            if let Some(text) = routing_text {
+                content.push(Line::from(text).style(Style::default().fg(styles::VALUE_SECONDARY)));
+            }
 
             ListItem::new(content)
         })

@@ -60,9 +60,7 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone
-                        .handle_client_per_command_routing(stream, addr)
-                        .await;
+                    let _ = proxy_clone.handle_client(stream, addr).await;
                 });
             }
         }
@@ -177,9 +175,7 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone
-                        .handle_client_per_command_routing(stream, addr)
-                        .await;
+                    let _ = proxy_clone.handle_client(stream, addr).await;
                 });
             }
         }

@@ -30,7 +30,7 @@ async fn setup_proxy_with_mode(
     // Start mock backend
     let mock = MockNntpServer::new(backend_port)
         .with_name("Test Backend")
-        .on_command("HELP", "100 Help text\r\n")
+        .on_command("HELP", "100 Help text\r\n.\r\n")
         .on_command("DATE", "111 20251120120000\r\n")
         .on_command("LIST", "215 List follows\r\n.\r\n")
         .on_command("QUIT", "205 Goodbye\r\n")

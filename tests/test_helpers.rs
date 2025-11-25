@@ -135,6 +135,13 @@ impl MockNntpServer {
                         let cmd_str = String::from_utf8_lossy(&buffer[..n]);
                         let cmd_upper = cmd_str.trim().to_uppercase();
 
+                        // Debug logging for command matching
+                        eprintln!(
+                            "[MockServer:{}] Received command: {:?}",
+                            name,
+                            cmd_str.trim()
+                        );
+
                         // Handle QUIT
                         if cmd_upper.starts_with("QUIT") {
                             let _ = stream.write_all(b"205 Goodbye\r\n").await;
@@ -173,6 +180,12 @@ impl MockNntpServer {
                         let mut handled = false;
                         for (prefix, response) in &handlers {
                             if cmd_upper.starts_with(prefix) {
+                                eprintln!(
+                                    "[MockServer:{}] Matched handler: prefix={:?}, returning: {:?}",
+                                    name,
+                                    prefix,
+                                    response.lines().next().unwrap_or("")
+                                );
                                 let _ = stream.write_all(response.as_bytes()).await;
                                 handled = true;
                                 break;
@@ -181,6 +194,10 @@ impl MockNntpServer {
 
                         // Default response
                         if !handled {
+                            eprintln!(
+                                "[MockServer:{}] No handler matched, returning default 200 OK",
+                                name
+                            );
                             let _ = stream.write_all(b"200 OK\r\n").await;
                         }
                     }

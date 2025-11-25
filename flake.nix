@@ -61,7 +61,7 @@
           cargo-tarpaulin
           cargo-nextest
           cargo-mutants
-          cargo-llvm-cov
+          # cargo-llvm-cov
 
           # Build & dependencies
           cargo-outdated

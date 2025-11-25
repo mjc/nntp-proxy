@@ -111,15 +111,18 @@ fn test_excessive_complete_command_calls() {
     router.complete_command(backend_id);
     assert_eq!(router.backend_load(backend_id), Some(0));
 
-    // Excessive completes can cause the atomic counter to underflow (wrapping behavior)
-    // This is known behavior for AtomicUsize - it will wrap around
+    // Excessive completes are now protected against underflow (via checked_sub)
+    // The counter should stay at 0 instead of wrapping
     router.complete_command(backend_id);
     router.complete_command(backend_id);
 
-    // After underflow, load will be very large (close to usize::MAX)
+    // After the fix, load should remain at 0 (no underflow)
     let load = router.backend_load(backend_id).unwrap();
-    // Check that it wrapped (should be > usize::MAX - 10)
-    assert!(load > usize::MAX - 10, "Expected underflow, got {}", load);
+    assert_eq!(
+        load, 0,
+        "Expected 0 (protected from underflow), got {}",
+        load
+    );
 }
 
 #[test]

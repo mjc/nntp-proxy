@@ -81,7 +81,7 @@ impl AdaptiveStrategy {
     ///
     /// # Returns
     /// Score where **lower is better**. Typical range: 0.0 (idle) to 3.0+ (saturated)
-    fn calculate_score(&self, backend: &BackendInfo) -> f64 {
+    pub(crate) fn calculate_score(&self, backend: &BackendInfo) -> f64 {
         const AVAILABILITY_WEIGHT: f64 = 0.40;
         const LOAD_WEIGHT: f64 = 0.30;
         const SATURATION_WEIGHT: f64 = 0.30;
@@ -89,7 +89,15 @@ impl AdaptiveStrategy {
         let status = backend.provider.status();
         let max_size = status.max_size.get() as f64;
         let available = status.available.get() as f64;
-        let pending = backend.pending_count.load(Ordering::Relaxed) as f64;
+        let pending_raw = backend.pending_count.load(Ordering::Relaxed);
+
+        // Detect underflow (pending > half of usize::MAX is impossible)
+        let pending = if pending_raw > (usize::MAX / 2) {
+            0.0 // Underflow detected, treat as zero
+        } else {
+            pending_raw as f64
+        };
+
         let used = max_size - available;
 
         // Prevent division by zero

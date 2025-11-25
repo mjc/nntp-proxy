@@ -162,8 +162,8 @@ impl Response {
             381 | 480 => Self::AuthRequired(code),
 
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
-            // All 1xx are informational multiline
-            100..=199 => Self::MultilineData(code),
+            // Most 1xx are informational multiline, but DATE (111) is single-line
+            100..=199 if code.as_u16() != 111 => Self::MultilineData(code),
             // Specific 2xx multiline responses
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
 
@@ -256,13 +256,15 @@ impl NntpResponse {
     /// certain status codes indicate multiline data follows.
     ///
     /// # Multiline Response Codes
-    /// - **1xx**: All informational responses (100-199)
+    /// - **1xx**: Most informational responses (100-199), except DATE (111)
     /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
+    ///
+    /// Per RFC 3977 §7.1, DATE returns single-line response: `111 yyyymmddhhmmss`
     #[inline]
     pub fn is_multiline_response(status_code: StatusCode) -> bool {
         let code = status_code.as_u16();
         match code {
-            100..=199 => true, // All 1xx are multiline
+            100..=199 => code != 111, // All 1xx except DATE (111) are multiline
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
             _ => false,
         }

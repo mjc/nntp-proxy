@@ -540,6 +540,13 @@ impl TuiApp {
     pub fn location_cache(&self) -> Option<&Arc<crate::cache::ArticleLocationCache>> {
         self.location_cache.as_ref()
     }
+
+    /// Get router for accessing routing info
+    #[must_use]
+    #[inline]
+    pub fn router(&self) -> &BackendSelector {
+        &self.router
+    }
 }
 
 #[cfg(test)]

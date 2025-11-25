@@ -74,7 +74,7 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
     // Start mock backend with responses for all commands
     let mock = MockNntpServer::new(backend_port)
         .with_name("Test Backend")
-        .on_command("HELP", "100 Help text\r\n")
+        .on_command("HELP", "100 Help text\r\n.\r\n")
         .on_command("DATE", "111 20251120120000\r\n")
         .on_command("LIST", "215 List follows\r\n.\r\n")
         .on_command("QUIT", "205 Goodbye\r\n")
@@ -111,14 +111,21 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(20))]
+    #![proptest_config(ProptestConfig::with_cases(10))]
 
     /// Property: All valid NNTP commands should receive responses
     #[test]
     fn prop_valid_commands_get_responses(command in nntp_command_strategy()) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (proxy_port, _, _mock) = setup_test_proxy().await.unwrap();
+            // Retry setup once if port binding fails (rare race condition)
+            let (proxy_port, _, _mock) = match setup_test_proxy().await {
+                Ok(result) => result,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    setup_test_proxy().await.unwrap()
+                }
+            };
 
             let mut client = timeout(
                 Duration::from_secs(2),

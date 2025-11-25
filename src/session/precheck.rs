@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_stat_timeout_constant() {
-        assert_eq!(STAT_TIMEOUT, Duration::from_millis(500));
+        assert_eq!(STAT_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]
@@ -548,7 +548,7 @@ mod tests {
         // This is a bit tricky to test without actual backends
         // We'd need integration tests for the full flow
         // For now, just verify the constant
-        assert_eq!(STAT_TIMEOUT.as_millis(), 500);
+        assert_eq!(STAT_TIMEOUT.as_millis(), 30000);
     }
 }
 

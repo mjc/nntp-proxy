@@ -201,14 +201,39 @@ impl ClientSession {
                 }
 
                 CommandRoutingDecision::Forward => {
-                    self.route_and_execute_command(
-                        router,
-                        &command,
-                        &mut client_write,
-                        &mut client_to_backend_bytes,
-                        &mut backend_to_client_bytes,
-                    )
-                    .await?;
+                    if let Err(e) = self
+                        .route_and_execute_command(
+                            router,
+                            &command,
+                            &mut client_write,
+                            &mut client_to_backend_bytes,
+                            &mut backend_to_client_bytes,
+                        )
+                        .await
+                    {
+                        // Log error but continue session - don't terminate on single command failure
+                        // Use debug level for 430 (article not found) as it's a normal operational event
+                        let error_str = format!("{}", e);
+                        if error_str.contains("430") {
+                            debug!(
+                                "Article not found after retries for client {}: {}",
+                                self.client_addr, trimmed
+                            );
+                        } else {
+                            warn!(
+                                "Command {:?} failed for client {}: {}",
+                                trimmed, self.client_addr, e
+                            );
+                        }
+
+                        // Send error response to client
+                        let error_response = b"503 Command failed\r\n";
+                        if let Err(write_err) = client_write.write_all(error_response).await {
+                            // If we can't write the error, the connection is broken - terminate
+                            return Err(write_err.into());
+                        }
+                        backend_to_client_bytes.add(error_response.len());
+                    }
                 }
 
                 CommandRoutingDecision::RequireAuth => {
@@ -504,49 +529,129 @@ impl ClientSession {
             router.route_command(self.client_id, command)?
         };
 
-        // Get a connection from the router's backend pool
-        let Some(provider) = router.backend_provider(backend_id) else {
-            anyhow::bail!("Backend {:?} not found", backend_id);
-        };
+        // Retry on 430 or timeout - try up to 3 backends before giving up
+        const MAX_ATTEMPTS: usize = 3;
+        const BACKEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-        let mut pooled_conn = provider.get_pooled_connection().await?;
+        let mut attempts_made = 0;
+        let mut last_error: Option<anyhow::Error> = None;
+        let (result, cmd_bytes, resp_bytes, successful_backend);
 
-        debug!(
-            "Client {} got pooled connection for backend {:?}",
-            self.client_addr, backend_id
-        );
+        loop {
+            attempts_made += 1;
 
-        // Record command execution in metrics
-        self.record_command(backend_id);
-        self.user_command();
+            if attempts_made > MAX_ATTEMPTS {
+                // Exhausted retries
+                if let Some(e) = last_error {
+                    return Err(e);
+                } else {
+                    anyhow::bail!("All backends exhausted after {} attempts", MAX_ATTEMPTS);
+                }
+            }
 
-        // Execute the command - returns (result, got_backend_data, unrecorded_cmd_bytes, unrecorded_resp_bytes)
-        // If got_backend_data is true, we successfully communicated with backend
-        //
-        // Use caching path only for cache misses on ARTICLE by message-ID
-        let (result, got_backend_data, cmd_bytes, resp_bytes) = if should_cache {
-            self.execute_command_with_caching(
-                &mut pooled_conn,
-                command,
-                client_write,
-                backend_id,
-                client_to_backend_bytes,
-                backend_to_client_bytes,
-                &mut buffer,
-            )
-            .await
-        } else {
-            self.execute_command_on_backend(
-                &mut pooled_conn,
-                command,
-                client_write,
-                backend_id,
-                client_to_backend_bytes,
-                backend_to_client_bytes,
-                &mut buffer, // Pass reusable buffer
-            )
-            .await
-        };
+            // Select backend (first attempt uses AWR, subsequent use round-robin)
+            let tried_backend = if attempts_made == 1 {
+                backend_id
+            } else {
+                router.route_command(self.client_id, command)?
+            };
+
+            // Get a connection from the router's backend pool
+            let Some(provider) = router.backend_provider(tried_backend) else {
+                anyhow::bail!("Backend {:?} not found", tried_backend);
+            };
+
+            let mut pooled_conn =
+                match tokio::time::timeout(BACKEND_TIMEOUT, provider.get_pooled_connection()).await
+                {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(e)) => {
+                        warn!(
+                            "Backend {:?} pool error (attempt {}/{}): {}",
+                            tried_backend, attempts_made, MAX_ATTEMPTS, e
+                        );
+                        last_error = Some(anyhow::anyhow!("Pool connection failed: {}", e));
+                        continue; // Try next backend
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Backend {:?} pool timeout (attempt {}/{})",
+                            tried_backend, attempts_made, MAX_ATTEMPTS
+                        );
+                        last_error = Some(anyhow::anyhow!("Pool connection timeout"));
+                        continue; // Try next backend
+                    }
+                };
+
+            debug!(
+                "Client {} got pooled connection for backend {:?}",
+                self.client_addr, tried_backend
+            );
+
+            // Record command execution in metrics
+            self.record_command(tried_backend);
+            self.user_command();
+
+            // Execute the command with timeout
+            let execution_result = tokio::time::timeout(BACKEND_TIMEOUT, async {
+                if should_cache {
+                    self.execute_command_with_caching(
+                        &mut pooled_conn,
+                        command,
+                        client_write,
+                        tried_backend,
+                        client_to_backend_bytes,
+                        backend_to_client_bytes,
+                        &mut buffer,
+                    )
+                    .await
+                } else {
+                    self.execute_command_on_backend(
+                        &mut pooled_conn,
+                        command,
+                        client_write,
+                        tried_backend,
+                        client_to_backend_bytes,
+                        backend_to_client_bytes,
+                        &mut buffer,
+                    )
+                    .await
+                }
+            })
+            .await;
+
+            let exec_result = match execution_result {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        "Backend {:?} execution timeout (attempt {}/{})",
+                        tried_backend, attempts_made, MAX_ATTEMPTS
+                    );
+                    last_error = Some(anyhow::anyhow!("Backend execution timeout"));
+                    router.complete_command(tried_backend);
+                    continue; // Try next backend
+                }
+            };
+
+            let (exec_res, _exec_got_backend_data, exec_cmd_bytes, exec_resp_bytes) = exec_result;
+
+            // Check if we got 430 (article not found) - retry with another backend
+            if let Err(ref e) = exec_res {
+                let error_str = format!("{}", e).to_lowercase();
+                if error_str.contains("430") {
+                    last_error = Some(anyhow::anyhow!("Backend returned 430"));
+                    router.complete_command(tried_backend);
+                    continue; // Try next backend
+                }
+            }
+
+            // Success or non-retryable error
+            result = exec_res;
+            cmd_bytes = exec_cmd_bytes;
+            resp_bytes = exec_resp_bytes;
+            successful_backend = tried_backend; // Use the backend that succeeded
+            break;
+        }
 
         // Record metrics ONCE using type-safe API (prevents double-counting)
         if let Some(ref metrics) = self.metrics {
@@ -555,7 +660,7 @@ impl ClientSession {
             let resp_size = resp_bytes.peek();
 
             // Record command + per-backend + global bytes in one call
-            let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
+            let _ = metrics.record_command_execution(successful_backend, cmd_bytes, resp_bytes);
 
             // Record per-user metrics
             self.user_bytes_sent(cmd_size);
@@ -571,38 +676,31 @@ impl ClientSession {
             let cache = Arc::clone(location_cache);
             let msg_id_owned = msg_id.to_owned();
             tokio::spawn(async move {
-                cache.update(&msg_id_owned, backend_id, true).await;
+                cache.update(&msg_id_owned, successful_backend, true).await;
             });
             debug!(
                 "Updating location cache: {} -> backend {:?} (available)",
-                msg_id, backend_id
+                msg_id, successful_backend
             );
         }
 
-        // Handle errors functionally - remove from pool if backend error
-        let result = if !got_backend_data {
-            result.inspect_err(|e| {
-                if crate::pool::is_connection_error(e) {
-                    warn!(
-                        "Backend {:?} connection error: {} - removing from pool",
-                        backend_id, e
-                    );
-                    if let Some(ref metrics) = self.metrics {
-                        metrics.record_error(backend_id);
-                        metrics.user_error(self.username().as_deref());
-                    }
-                    crate::pool::remove_from_pool(pooled_conn);
-                }
-            })
-        } else {
-            result
-        };
+        // Record errors to metrics if execution failed
+        if let Err(ref e) = result {
+            if let Some(ref metrics) = self.metrics {
+                metrics.record_error(successful_backend);
+                metrics.user_error(self.username().as_deref());
+            }
+            debug!(
+                "Command execution error on backend {:?}: {}",
+                successful_backend, e
+            );
+        }
 
         // Complete the request - decrement pending count (lock-free!)
-        router.complete_command(backend_id);
+        router.complete_command(successful_backend);
 
         result
-            .map(|_| backend_id)
+            .map(|_| successful_backend)
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
@@ -653,7 +751,7 @@ impl ClientSession {
         let mut got_backend_data = false;
 
         // Send command and read first chunk into reusable buffer
-        let (n, _response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
+        let (n, response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
             match backend::send_command_and_read_first_chunk(
                 &mut **pooled_conn,
                 command,
@@ -676,6 +774,22 @@ impl ClientSession {
                     );
                 }
             };
+
+        // Check for 430 (no such article) - DON'T stream, return error for retry
+        if let Some(code) = response_code.status_code()
+            && code.as_u16() == 430
+        {
+            debug!(
+                "Backend {:?} returned 430 (no such article), returning for retry",
+                backend_id
+            );
+            return (
+                Err(anyhow::anyhow!("Backend returned 430 (no such article)")),
+                got_backend_data,
+                MetricsBytes::new(0),
+                MetricsBytes::new(0),
+            );
+        }
 
         // Record time to first byte and split timing
         if let Some(ref metrics) = self.metrics {
@@ -713,7 +827,7 @@ impl ClientSession {
             }
         } else {
             // Single-line response - just write the first chunk
-            if let Some(code) = _response_code.status_code() {
+            if let Some(code) = response_code.status_code() {
                 let raw_code = code.as_u16();
                 // Warn only for truly unusual responses (not 223 or errors)
                 if let Some(id) = msgid
@@ -744,7 +858,7 @@ impl ClientSession {
 
         // Track metrics based on response code
         if let Some(ref metrics) = self.metrics
-            && let Some(code) = _response_code.status_code()
+            && let Some(code) = response_code.status_code()
         {
             let raw_code = code.as_u16();
 
@@ -834,6 +948,22 @@ impl ClientSession {
         if let Some(ref metrics) = self.metrics {
             metrics.record_ttfb_micros(backend_id, ttfb_micros);
             metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
+        }
+
+        // Check for 430 (no such article) - DON'T cache or stream, return error for retry
+        if let Some(code) = response_code.status_code()
+            && code.as_u16() == 430
+        {
+            debug!(
+                "Backend {:?} returned 430 (no such article) in caching path, returning for retry",
+                backend_id
+            );
+            return (
+                Err(anyhow::anyhow!("Backend returned 430 (no such article)")),
+                got_backend_data,
+                MetricsBytes::new(0),
+                MetricsBytes::new(0),
+            );
         }
 
         client_to_backend_bytes.add(command.len());

@@ -488,7 +488,35 @@ impl NntpProxy {
         crate::protocol::send_proxy_greeting(client_stream, client_addr).await
     }
 
+    /// Handle client connection - automatically dispatches based on routing mode
+    ///
+    /// This is the ONLY public entry point for handling clients. The routing mode
+    /// determines which internal handler is used, making it impossible to call
+    /// the wrong handler for a given routing mode.
+    ///
+    /// # Routing Mode Dispatch
+    /// - `RoutingMode::Stateful` → Standard 1:1 client-backend mapping
+    /// - `RoutingMode::PerCommand` → Per-command routing (each command routes independently)
+    /// - `RoutingMode::Hybrid` → Per-command routing (starts stateless, switches to stateful)
     pub async fn handle_client(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+    ) -> Result<()> {
+        match self.routing_mode {
+            RoutingMode::Stateful => {
+                self.handle_client_standard(client_stream, client_addr)
+                    .await
+            }
+            RoutingMode::PerCommand | RoutingMode::Hybrid => {
+                self.handle_client_per_command(client_stream, client_addr)
+                    .await
+            }
+        }
+    }
+
+    /// Internal handler for Standard (1:1) routing mode
+    async fn handle_client_standard(
         &self,
         mut client_stream: TcpStream,
         client_addr: SocketAddr,
@@ -644,6 +672,9 @@ impl NntpProxy {
     }
 
     /// Handle client connection using per-command routing with article caching
+    ///
+    /// NOTE: This is a specialized variant for the caching proxy binary.
+    /// Most callers should use `handle_client()` which dispatches automatically.
     pub async fn handle_client_with_cache(
         &self,
         client_stream: TcpStream,
@@ -654,11 +685,8 @@ impl NntpProxy {
             .await
     }
 
-    /// Handle client connection using per-command routing mode
-    ///
-    /// This creates a session with the router, allowing commands from this client
-    /// to be routed to different backends based on load balancing.
-    pub async fn handle_client_per_command_routing(
+    /// Internal handler for per-command routing modes (PerCommand and Hybrid)
+    async fn handle_client_per_command(
         &self,
         client_stream: TcpStream,
         client_addr: SocketAddr,

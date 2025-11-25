@@ -104,31 +104,17 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
         }
     });
 
-    // Determine which handler to use based on routing mode
-    let uses_per_command_routing = args.common.routing_mode.supports_per_command_routing();
-
+    // Accept connections and dispatch based on routing mode (automatic)
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let proxy_clone = proxy.clone();
-                if uses_per_command_routing {
-                    // Per-command or Hybrid mode
-                    tokio::spawn(async move {
-                        if let Err(e) = proxy_clone
-                            .handle_client_per_command_routing(stream, addr)
-                            .await
-                        {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
-                } else {
-                    // Standard 1:1 mode
-                    tokio::spawn(async move {
-                        if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
-                }
+                // Automatic dispatch based on routing mode
+                tokio::spawn(async move {
+                    if let Err(e) = proxy_clone.handle_client(stream, addr).await {
+                        error!("Error handling client {}: {}", addr, e);
+                    }
+                });
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);
