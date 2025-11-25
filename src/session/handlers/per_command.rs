@@ -479,7 +479,7 @@ impl ClientSession {
             }
 
             // Extract the selected backend
-            let backend_id = selected_backend
+            selected_backend
                 .map(|(id, score)| {
                     debug!("AWR selected backend {:?} with score {:.3}", id, score);
                     id
@@ -489,123 +489,144 @@ impl ClientSession {
                         "Logic error: has_any() was true but no backend found - using round-robin"
                     );
                     router.route_command(self.client_id, command).unwrap()
-                });
-
-            // For STAT commands with cache hit, answer directly without backend query
-            if matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
-                && command.trim_start().to_uppercase().starts_with("STAT ")
-            {
-                debug!(
-                    "Cache hit for STAT {}: responding 223 without backend query (attributing to {:?})",
-                    message_id.as_ref().unwrap(),
-                    backend_id
-                );
-
-                let response = b"223 0 <article> Article exists\r\n";
-                client_write.write_all(response).await?;
-                backend_to_client_bytes.add(response.len());
-                client_to_backend_bytes.add(command.len());
-
-                // Record metrics for cached response
-                if let Some(ref metrics) = self.metrics {
-                    use crate::types::MetricsBytes;
-                    let cmd_bytes = MetricsBytes::new(command.len() as u64);
-                    let resp_bytes = MetricsBytes::new(response.len() as u64);
-
-                    let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
-                    self.user_bytes_sent(command.len() as u64);
-                    self.user_bytes_received(response.len() as u64);
-                }
-
-                self.record_command(backend_id);
-                self.user_command();
-
-                return Ok(backend_id);
-            }
-
-            backend_id
+                })
         } else {
             // No availability info - use standard routing
             router.route_command(self.client_id, command)?
         };
 
+        // For STAT commands with cache hit, answer directly without backend query
+        if backend_availability.is_some()
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
+            && command.trim_start().to_uppercase().starts_with("STAT ")
+        {
+            debug!(
+                "Cache hit for STAT {}: responding 223 without backend query (attributing to {:?})",
+                message_id.as_ref().unwrap(),
+                backend_id
+            );
+
+            let response = b"223 0 <article> Article exists\r\n";
+            client_write.write_all(response).await?;
+            backend_to_client_bytes.add(response.len());
+            client_to_backend_bytes.add(command.len());
+
+            // Record metrics for cached response
+            if let Some(ref metrics) = self.metrics {
+                use crate::types::MetricsBytes;
+                let cmd_bytes = MetricsBytes::new(command.len() as u64);
+                let resp_bytes = MetricsBytes::new(response.len() as u64);
+
+                let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
+                self.user_bytes_sent(command.len() as u64);
+                self.user_bytes_received(response.len() as u64);
+            }
+
+            self.record_command(backend_id);
+            self.user_command();
+
+            return Ok(backend_id);
+        }
+
         // Retry on 430 or timeout - try backends until we find one with the article
         const BACKEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-        let mut attempts_made = 0;
-        let mut last_error: Option<anyhow::Error> = None;
+        // Helper: Find next available backend from bitmap
+        #[inline]
+        fn find_next_available_backend(
+            remaining: &crate::cache::BackendAvailability,
+            backend_count: usize,
+        ) -> Option<crate::types::BackendId> {
+            (0..backend_count)
+                .map(crate::types::BackendId::from_index)
+                .find(|&id| remaining.has_article(id))
+        }
+
+        // Helper: Acquire pooled connection with timeout
+        #[inline]
+        async fn acquire_connection_with_timeout(
+            provider: &crate::pool::DeadpoolConnectionProvider,
+            backend: crate::types::BackendId,
+            timeout: std::time::Duration,
+        ) -> anyhow::Result<deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>>
+        {
+            tokio::time::timeout(timeout, provider.get_pooled_connection())
+                .await
+                .map_err(|_| anyhow::anyhow!("Backend {:?} pool timeout", backend))?
+                .map_err(|e| anyhow::anyhow!("Backend {:?} pool error: {}", backend, e))
+        }
+
+        // Helper: Check if error is retryable (430 article not found)
+        #[inline]
+        fn is_article_not_found_error(result: &anyhow::Result<()>) -> bool {
+            result
+                .as_ref()
+                .err()
+                .map(|e| format!("{}", e).to_lowercase().contains("430"))
+                .unwrap_or(false)
+        }
+
+        // Helper: Update location cache for failed backend
+        #[inline]
+        fn update_cache_for_failed_backend(
+            message_id: Option<&crate::types::protocol::MessageId<'_>>,
+            location_cache: Option<&Arc<crate::cache::ArticleLocationCache>>,
+            backend: crate::types::BackendId,
+        ) {
+            if let (Some(msg_id), Some(cache)) = (message_id, location_cache) {
+                let cache = Arc::clone(cache);
+                let msg_id_owned = msg_id.to_owned();
+                tokio::spawn(async move {
+                    cache.update(&msg_id_owned, backend, false).await;
+                });
+                debug!(
+                    "Updating location cache: {} -> backend {:?} (NOT available)",
+                    msg_id, backend
+                );
+            }
+        }
 
         // Track which backends have been tried by updating the availability bitmap
-        let mut remaining_backends = if let Some(avail) = backend_availability {
-            avail
-        } else {
+        let mut remaining_backends = backend_availability.unwrap_or_else(|| {
             // No cache - create bitmap with all backends available
-            let mut bitmap = crate::cache::BackendAvailability::new();
-            for i in 0..router.backend_count() {
-                bitmap.mark_available(crate::types::BackendId::from_index(i));
-            }
-            bitmap
-        };
+            (0..router.backend_count())
+                .map(crate::types::BackendId::from_index)
+                .fold(
+                    crate::cache::BackendAvailability::new(),
+                    |mut bitmap, id| {
+                        bitmap.mark_available(id);
+                        bitmap
+                    },
+                )
+        });
 
-        let (result, cmd_bytes, resp_bytes, successful_backend);
+        // Retry loop - try backends until one succeeds or all fail
+        let (result, cmd_bytes, resp_bytes, successful_backend) = 'retry: loop {
+            // Find next available backend
+            let tried_backend =
+                find_next_available_backend(&remaining_backends, router.backend_count())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "All {} backends tried, article not found",
+                            router.backend_count()
+                        )
+                    })?;
 
-        loop {
-            attempts_made += 1;
-
-            // Check if any backends remain to try
-            if !remaining_backends.has_any() {
-                if let Some(e) = last_error {
-                    return Err(e);
-                } else {
-                    anyhow::bail!(
-                        "All {} backends tried, article not found",
-                        router.backend_count()
-                    );
-                }
-            }
-
-            // Select backend - use AWR scoring among remaining backends
-            let tried_backend = if attempts_made == 1 {
-                backend_id
-            } else {
-                // Find next available backend using round-robin among remaining
-                let mut found = None;
-                for i in 0..router.backend_count() {
-                    let candidate = crate::types::BackendId::from_index(i);
-                    if remaining_backends.has_article(candidate) {
-                        found = Some(candidate);
-                        break;
-                    }
-                }
-                found.ok_or_else(|| anyhow::anyhow!("No backends remaining"))?
-            };
-
-            // Get a connection from the router's backend pool
+            // Get connection from pool with timeout
             let Some(provider) = router.backend_provider(tried_backend) else {
-                anyhow::bail!("Backend {:?} not found", tried_backend);
+                remaining_backends.mark_unavailable(tried_backend);
+                continue;
             };
 
             let mut pooled_conn =
-                match tokio::time::timeout(BACKEND_TIMEOUT, provider.get_pooled_connection()).await
+                match acquire_connection_with_timeout(provider, tried_backend, BACKEND_TIMEOUT)
+                    .await
                 {
-                    Ok(Ok(conn)) => conn,
-                    Ok(Err(e)) => {
-                        warn!(
-                            "Backend {:?} pool error (attempt {}): {}",
-                            tried_backend, attempts_made, e
-                        );
-                        last_error = Some(anyhow::anyhow!("Pool connection failed: {}", e));
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        warn!("{}", e);
                         remaining_backends.mark_unavailable(tried_backend);
-                        continue; // Try next backend
-                    }
-                    Err(_) => {
-                        warn!(
-                            "Backend {:?} pool timeout (attempt {})",
-                            tried_backend, attempts_made
-                        );
-                        last_error = Some(anyhow::anyhow!("Pool connection timeout"));
-                        remaining_backends.mark_unavailable(tried_backend);
-                        continue; // Try next backend
+                        continue;
                     }
                 };
 
@@ -613,13 +634,11 @@ impl ClientSession {
                 "Client {} got pooled connection for backend {:?}",
                 self.client_addr, tried_backend
             );
-
-            // Record command execution in metrics
             self.record_command(tried_backend);
             self.user_command();
 
-            // Execute the command with timeout
-            let execution_result = tokio::time::timeout(BACKEND_TIMEOUT, async {
+            // Execute command with timeout
+            let exec_result = tokio::time::timeout(BACKEND_TIMEOUT, async {
                 if should_cache {
                     self.execute_command_with_caching(
                         &mut pooled_conn,
@@ -646,57 +665,31 @@ impl ClientSession {
             })
             .await;
 
-            let exec_result = match execution_result {
+            let (exec_res, _, exec_cmd_bytes, exec_resp_bytes) = match exec_result {
                 Ok(result) => result,
                 Err(_) => {
-                    warn!(
-                        "Backend {:?} execution timeout (attempt {})",
-                        tried_backend, attempts_made
-                    );
-                    last_error = Some(anyhow::anyhow!("Backend execution timeout"));
+                    warn!("Backend {:?} execution timeout", tried_backend);
                     router.complete_command(tried_backend);
                     remaining_backends.mark_unavailable(tried_backend);
-                    continue; // Try next backend
+                    continue;
                 }
             };
 
-            let (exec_res, _exec_got_backend_data, exec_cmd_bytes, exec_resp_bytes) = exec_result;
-
-            // Check if we got 430 (article not found) - retry with another backend
-            if let Err(ref e) = exec_res {
-                let error_str = format!("{}", e).to_lowercase();
-                if error_str.contains("430") {
-                    // Mark this backend as not having the article
-                    remaining_backends.mark_unavailable(tried_backend);
-
-                    // Update location cache to mark this backend as NOT having the article
-                    if let Some(ref msg_id) = message_id
-                        && let Some(location_cache) = self.location_cache()
-                    {
-                        let cache = Arc::clone(location_cache);
-                        let msg_id_owned = msg_id.to_owned();
-                        tokio::spawn(async move {
-                            cache.update(&msg_id_owned, tried_backend, false).await;
-                        });
-                        debug!(
-                            "Updating location cache: {} -> backend {:?} (NOT available)",
-                            msg_id, tried_backend
-                        );
-                    }
-
-                    last_error = Some(anyhow::anyhow!("Backend returned 430"));
-                    router.complete_command(tried_backend);
-                    continue; // Try next backend
-                }
+            // Check for 430 (article not found) - retry with another backend
+            if is_article_not_found_error(&exec_res) {
+                remaining_backends.mark_unavailable(tried_backend);
+                update_cache_for_failed_backend(
+                    message_id.as_ref(),
+                    self.location_cache(),
+                    tried_backend,
+                );
+                router.complete_command(tried_backend);
+                continue;
             }
 
-            // Success or non-retryable error
-            result = exec_res;
-            cmd_bytes = exec_cmd_bytes;
-            resp_bytes = exec_resp_bytes;
-            successful_backend = tried_backend; // Use the backend that succeeded
-            break;
-        }
+            // Success or non-retryable error - break out with result
+            break 'retry (exec_res, exec_cmd_bytes, exec_resp_bytes, tried_backend);
+        };
 
         // Record metrics ONCE using type-safe API (prevents double-counting)
         if let Some(ref metrics) = self.metrics {
