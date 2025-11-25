@@ -657,9 +657,11 @@ mod tests {
 
     #[test]
     fn test_client_auth_all_users_legacy() {
-        let mut auth = ClientAuth::default();
-        auth.username = Some("user".to_string());
-        auth.password = Some("pass".to_string());
+        let auth = ClientAuth {
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            ..Default::default()
+        };
 
         let users = auth.all_users();
         assert_eq!(users.len(), 1);
@@ -686,9 +688,11 @@ mod tests {
 
     #[test]
     fn test_client_auth_all_users_combined() {
-        let mut auth = ClientAuth::default();
-        auth.username = Some("legacy".to_string());
-        auth.password = Some("legacy_pw".to_string());
+        let mut auth = ClientAuth {
+            username: Some("legacy".to_string()),
+            password: Some("legacy_pw".to_string()),
+            ..Default::default()
+        };
         auth.users.push(UserCredentials {
             username: "alice".to_string(),
             password: "alice_pw".to_string(),

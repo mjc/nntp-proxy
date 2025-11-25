@@ -241,7 +241,7 @@ mod tests {
         let validated = validate_backend_response(data, data.len(), 7);
 
         // Should have both short response AND unusual status
-        assert!(validated.warnings.len() >= 1);
+        assert!(!validated.warnings.is_empty());
         assert!(
             validated
                 .warnings

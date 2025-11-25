@@ -74,7 +74,7 @@ mod tests {
         #[test]
         fn buffer_size_clone_equality(size in 1usize..10_000_000usize) {
             let original = BufferSize::new(size).unwrap();
-            let cloned = original.clone();
+            let cloned = original;
             prop_assert_eq!(original, cloned);
             prop_assert_eq!(original.get(), cloned.get());
         }
@@ -113,7 +113,7 @@ mod tests {
         #[test]
         fn window_size_clone_equality(size in 1u64..100_000u64) {
             let original = WindowSize::new(size).unwrap();
-            let cloned = original.clone();
+            let cloned = original;
             prop_assert_eq!(original, cloned);
         }
     }

@@ -182,12 +182,12 @@ async fn test_retry_exhausts_when_all_backends_return_430() -> Result<()> {
     let result = timeout(Duration::from_secs(60), client.read(&mut buffer)).await;
 
     // Either gets an error response or connection closes (both acceptable)
-    if let Ok(Ok(n)) = result {
-        if n > 0 {
-            let response = String::from_utf8_lossy(&buffer[..n]);
-            // Should be an error response (4xx or disconnected)
-            println!("Got response after retries: {}", response);
-        }
+    if let Ok(Ok(n)) = result
+        && n > 0
+    {
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        // Should be an error response (4xx or disconnected)
+        println!("Got response after retries: {}", response);
     }
 
     Ok(())

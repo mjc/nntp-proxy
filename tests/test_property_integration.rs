@@ -206,8 +206,8 @@ proptest! {
 
                 // Either we get a response, or the connection closes
                 // (both are acceptable for malformed input)
-                if let Ok(Ok(n)) = read_result {
-                    if n > 0 {
+                if let Ok(Ok(n)) = read_result
+                    && n > 0 {
                         let response = String::from_utf8_lossy(&buffer[..n]);
                         // Should be valid NNTP response format
                         let first_line = response.lines().next().unwrap_or("");
@@ -219,7 +219,6 @@ proptest! {
                             );
                         }
                     }
-                }
             }
         });
     }

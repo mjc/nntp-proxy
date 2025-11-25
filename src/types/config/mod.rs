@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn test_nonzero_newtype_clone_copy() {
         let size1 = BufferSize::new(1024).unwrap();
-        let size2 = size1.clone();
+        let size2 = size1;
         let size3 = size1; // Copy
 
         assert_eq!(size1, size2);

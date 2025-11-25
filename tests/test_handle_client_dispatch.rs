@@ -68,11 +68,7 @@ async fn setup_proxy(routing_mode: RoutingMode) -> Result<(u16, u16, tokio::task
     Ok((proxy_port, backend_port, mock))
 }
 
-async fn send_command(
-    client: &mut TcpStream,
-    command: &str,
-    buffer: &mut Vec<u8>,
-) -> Result<String> {
+async fn send_command(client: &mut TcpStream, command: &str, buffer: &mut [u8]) -> Result<String> {
     client.write_all(command.as_bytes()).await?;
     let n = timeout(Duration::from_secs(2), client.read(buffer)).await??;
     Ok(String::from_utf8_lossy(&buffer[..n]).to_string())
@@ -453,7 +449,7 @@ async fn test_rapid_commands_per_command() -> Result<()> {
             _ => "LIST\r\n",
         };
         let response = send_command(&mut client, cmd, &mut buffer).await?;
-        assert!(response.len() > 0, "Command {} should get response", i);
+        assert!(!response.is_empty(), "Command {} should get response", i);
     }
 
     Ok(())

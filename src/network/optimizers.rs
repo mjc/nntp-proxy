@@ -497,7 +497,7 @@ mod tests {
 
         // Asymmetric buffers (common for download-heavy workloads)
         let recv_size = 32 * 1024 * 1024; // 32MB
-        let send_size = 1 * 1024 * 1024; // 1MB
+        let send_size = 1024 * 1024; // 1MB
         let optimizer = TcpOptimizer::with_buffer_sizes(&stream, recv_size, send_size);
         assert_eq!(optimizer.recv_buffer_size, recv_size);
         assert_eq!(optimizer.send_buffer_size, send_size);

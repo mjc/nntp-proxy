@@ -205,7 +205,7 @@ mod tests {
         #[test]
         fn prop_max_connections_clone(value in 1usize..=10000) {
             let max = MaxConnections::new(value).unwrap();
-            let cloned = max.clone();
+            let cloned = max;
             prop_assert_eq!(max, cloned);
         }
     }
@@ -258,7 +258,7 @@ mod tests {
         #[test]
         fn prop_max_errors_clone(value in 1u32..=1000) {
             let max = MaxErrors::new(value).unwrap();
-            let cloned = max.clone();
+            let cloned = max;
             prop_assert_eq!(max, cloned);
         }
     }
@@ -334,7 +334,7 @@ mod tests {
         #[test]
         fn prop_thread_count_clone(value in 1usize..=128) {
             let threads = ThreadCount::new(value).unwrap();
-            let cloned = threads.clone();
+            let cloned = threads;
             prop_assert_eq!(threads, cloned);
         }
     }

@@ -307,7 +307,7 @@ mod tests {
         // Match on the enum to ensure Plain variant exists
         match plain_conn {
             ConnectionStream::Plain(_) => {
-                assert!(true, "Plain variant works");
+                // Plain variant works - no assertion needed
             }
             ConnectionStream::Tls(_) => {
                 panic!("Should be Plain, not Tls");

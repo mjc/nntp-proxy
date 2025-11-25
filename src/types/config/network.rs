@@ -114,7 +114,7 @@ mod tests {
         #[test]
         fn port_clone_equality(port in 1u16..=65535u16) {
             let p1 = Port::new(port).unwrap();
-            let p2 = p1.clone();
+            let p2 = p1;
             prop_assert_eq!(p1, p2);
         }
 

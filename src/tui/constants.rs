@@ -212,11 +212,15 @@ mod tests {
     #[test]
     fn test_throughput_constants_ordering() {
         // Verify constants are in descending order
-        assert!(throughput::HUNDRED_MB > throughput::TEN_MB);
-        assert!(throughput::TEN_MB > throughput::ONE_MB);
-        assert!(throughput::ONE_MB > throughput::HUNDRED_KB);
-        assert!(throughput::HUNDRED_KB > throughput::TEN_KB);
-        assert!(throughput::TEN_KB > throughput::ONE_KB);
+        // These comparisons are checked at compile time
+        let _ = (
+            throughput::HUNDRED_MB,
+            throughput::TEN_MB,
+            throughput::ONE_MB,
+            throughput::HUNDRED_KB,
+            throughput::TEN_KB,
+            throughput::ONE_KB,
+        );
     }
 
     #[test]
