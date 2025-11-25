@@ -535,6 +535,7 @@ impl ClientSession {
 
         let mut attempts_made = 0;
         let mut last_error: Option<anyhow::Error> = None;
+        let mut tried_backends = std::collections::HashSet::new();
         let (result, cmd_bytes, resp_bytes, successful_backend);
 
         loop {
@@ -550,11 +551,32 @@ impl ClientSession {
             }
 
             // Select backend (first attempt uses AWR, subsequent use round-robin)
-            let tried_backend = if attempts_made == 1 {
-                backend_id
-            } else {
-                router.route_command(self.client_id, command)?
+            // Skip backends we've already tried
+            let tried_backend = loop {
+                let candidate = if attempts_made == 1 {
+                    backend_id
+                } else {
+                    router.route_command(self.client_id, command)?
+                };
+
+                if !tried_backends.contains(&candidate) {
+                    break candidate;
+                }
+
+                // All backends tried - give up
+                if tried_backends.len() >= router.backend_count() {
+                    if let Some(e) = last_error {
+                        return Err(e);
+                    } else {
+                        anyhow::bail!(
+                            "All {} backends tried, article not found",
+                            router.backend_count()
+                        );
+                    }
+                }
             };
+
+            tried_backends.insert(tried_backend);
 
             // Get a connection from the router's backend pool
             let Some(provider) = router.backend_provider(tried_backend) else {
@@ -639,6 +661,21 @@ impl ClientSession {
             if let Err(ref e) = exec_res {
                 let error_str = format!("{}", e).to_lowercase();
                 if error_str.contains("430") {
+                    // Update location cache to mark this backend as NOT having the article
+                    if let Some(ref msg_id) = message_id
+                        && let Some(location_cache) = self.location_cache()
+                    {
+                        let cache = Arc::clone(location_cache);
+                        let msg_id_owned = msg_id.to_owned();
+                        tokio::spawn(async move {
+                            cache.update(&msg_id_owned, tried_backend, false).await;
+                        });
+                        debug!(
+                            "Updating location cache: {} -> backend {:?} (NOT available)",
+                            msg_id, tried_backend
+                        );
+                    }
+
                     last_error = Some(anyhow::anyhow!("Backend returned 430"));
                     router.complete_command(tried_backend);
                     continue; // Try next backend
