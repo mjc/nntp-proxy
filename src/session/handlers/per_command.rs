@@ -567,9 +567,6 @@ impl ClientSession {
         // Determine if we need to cache this response after fetching
         let should_cache = self.should_cache_command(command);
 
-        // Get reusable buffer from pool (eliminates 64KB Vec allocation on every command!)
-        let mut buffer = self.buffer_pool.acquire().await;
-
         // Check location cache for smart routing (STAT/ARTICLE/BODY/HEAD with message-ID)
         let message_id = Self::extract_message_id_for_routing(command);
 
@@ -715,6 +712,9 @@ impl ClientSession {
             );
             self.record_command(tried_backend);
             self.user_command();
+
+            // Get fresh buffer for this attempt (prevents corruption from retries)
+            let mut buffer = self.buffer_pool.acquire().await;
 
             // Execute command with timeout
             let exec_result = tokio::time::timeout(BACKEND_TIMEOUT, async {
