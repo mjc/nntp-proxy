@@ -283,3 +283,133 @@ async fn test_different_message_ids_route_correctly() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_buffer_corruption_between_retries() -> Result<()> {
+    // This test demonstrates the buffer corruption bug that occurs when
+    // the same buffer is reused across retry attempts.
+    //
+    // Bug scenario:
+    // 1. Backend1 returns 430 error (30 bytes)
+    // 2. Same buffer used for Backend2's response
+    // 3. If Backend2's response overlaps with old data, corruption occurs
+    //
+    // With the fix (fresh buffer per retry), this should pass.
+    // Without the fix (reused buffer), the response may contain fragments
+    // of the 430 error mixed with the actual article data.
+
+    let mock_port1 = find_available_port().await;
+    let mock_port2 = find_available_port().await;
+    let proxy_port = find_available_port().await;
+
+    // Backend1: Returns 430 error (short response)
+    let _mock1 = MockNntpServer::new(mock_port1)
+        .with_name("Backend1")
+        .on_command(
+            "ARTICLE <test@example.com>",
+            "430 No such article\r\n", // 21 bytes
+        )
+        .spawn();
+
+    // Backend2: Returns actual article with distinctive content
+    let article_response = concat!(
+        "220 0 <test@example.com>\r\n",
+        "Path: example.com\r\n",
+        "From: test@example.com\r\n",
+        "Newsgroups: alt.test\r\n",
+        "Subject: Test Article SUCCESS\r\n",
+        "Message-ID: <test@example.com>\r\n",
+        "Date: Mon, 25 Nov 2025 12:00:00 GMT\r\n",
+        "\r\n",
+        "This is a test article body that should be clean.\r\n",
+        "MARKER_SUCCESS_MARKER\r\n",
+        ".\r\n",
+    );
+
+    let _mock2 = MockNntpServer::new(mock_port2)
+        .with_name("Backend2")
+        .on_command("ARTICLE <test@example.com>", article_response)
+        .spawn();
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Create proxy configuration
+    let config = Config {
+        servers: vec![
+            create_test_server_config("127.0.0.1", mock_port1, "Backend1"),
+            create_test_server_config("127.0.0.1", mock_port2, "Backend2"),
+        ],
+        ..Default::default()
+    };
+
+    // Start proxy
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let listener = TcpListener::bind(&proxy_addr).await?;
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = listener.accept().await {
+                let proxy_clone = proxy.clone();
+                tokio::spawn(async move {
+                    let _ = proxy_clone.handle_client(stream, addr).await;
+                });
+            }
+        }
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Connect as client
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+    let mut buffer = vec![0u8; 8192];
+
+    // Read greeting
+    let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
+    assert!(n > 0, "Should receive greeting");
+
+    // Request article - Backend1 will 430, Backend2 will succeed
+    client.write_all(b"ARTICLE <test@example.com>\r\n").await?;
+
+    // Read full response
+    let mut full_response = Vec::new();
+    loop {
+        let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
+        if n == 0 {
+            break;
+        }
+        full_response.extend_from_slice(&buffer[..n]);
+
+        // Check if we got the terminator
+        if full_response.ends_with(b".\r\n") {
+            break;
+        }
+    }
+
+    let response = String::from_utf8_lossy(&full_response);
+
+    // Verify the response is clean and doesn't contain corruption
+    // The response should start with 220 (success)
+    assert!(
+        response.starts_with("220"),
+        "Should start with 220 success code, got: {}",
+        &response[..response.len().min(50)]
+    );
+
+    // Critical check: Look for "No such article" fragment from 430 error
+    // If buffer was corrupted, this phrase from Backend1's error might appear
+    assert!(
+        !response.contains("No such article"),
+        "Article should not contain '430 No such article' error fragments! Got:\n{}",
+        response
+    );
+
+    // Verify the expected content is present
+    assert!(
+        response.contains("MARKER_SUCCESS_MARKER"),
+        "Should contain success marker (proves we got Backend2's response): {}",
+        response
+    );
+
+    Ok(())
+}
