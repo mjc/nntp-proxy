@@ -285,55 +285,52 @@ async fn test_different_message_ids_route_correctly() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_buffer_corruption_between_retries() -> Result<()> {
-    // This test demonstrates the buffer corruption bug that occurs when
-    // the same buffer is reused across retry attempts.
+async fn test_retry_buffer_corruption_prevented() -> Result<()> {
+    // This test demonstrates that buffer corruption is prevented during retries.
+    // Without the fix (buffer reuse), this scenario would cause corruption:
     //
-    // Bug scenario:
-    // 1. Backend1 returns 430 error (30 bytes)
-    // 2. Same buffer used for Backend2's response
-    // 3. If Backend2's response overlaps with old data, corruption occurs
+    // 1. Backend1 returns "430 No such article\r\n" (30 bytes)
+    // 2. Backend2 returns a longer response (e.g., 100+ bytes)
+    // 3. BUG: If buffer wasn't cleared, Backend2's response could contain
+    //    remnants of Backend1's 430 response mixed with the new data
     //
-    // With the fix (fresh buffer per retry), this should pass.
-    // Without the fix (reused buffer), the response may contain fragments
-    // of the 430 error mixed with the actual article data.
+    // With the fix (fresh buffer per retry), each backend gets a clean buffer
+    // and no corruption occurs.
 
     let mock_port1 = find_available_port().await;
     let mock_port2 = find_available_port().await;
     let proxy_port = find_available_port().await;
 
-    // Backend1: Returns 430 error (short response)
+    // Backend1: Returns short 430 error
     let _mock1 = MockNntpServer::new(mock_port1)
         .with_name("Backend1")
-        .on_command(
-            "ARTICLE <test@example.com>",
-            "430 No such article\r\n", // 21 bytes
-        )
+        .on_command("ARTICLE <test@example.com>", "430 No such article\r\n")
         .spawn();
 
-    // Backend2: Returns actual article with distinctive content
-    let article_response = concat!(
-        "220 0 <test@example.com>\r\n",
-        "Path: example.com\r\n",
-        "From: test@example.com\r\n",
-        "Newsgroups: alt.test\r\n",
-        "Subject: Test Article SUCCESS\r\n",
-        "Message-ID: <test@example.com>\r\n",
-        "Date: Mon, 25 Nov 2025 12:00:00 GMT\r\n",
-        "\r\n",
-        "This is a test article body that should be clean.\r\n",
-        "MARKER_SUCCESS_MARKER\r\n",
-        ".\r\n",
+    // Backend2: Returns longer success response with specific content
+    // This response is longer than Backend1's 430 to trigger potential corruption
+    let article_body = "Subject: Test Article\r\n\
+                        From: test@example.com\r\n\
+                        Content-Type: text/plain\r\n\
+                        \r\n\
+                        This is a test article body with enough content\r\n\
+                        to ensure the response is significantly longer than\r\n\
+                        the error from the first backend. This helps detect any\r\n\
+                        buffer corruption where old data might remain.\r\n";
+
+    let full_response = format!(
+        "220 0 <test@example.com> Article follows\r\n{}\r\n.\r\n",
+        article_body
     );
 
     let _mock2 = MockNntpServer::new(mock_port2)
         .with_name("Backend2")
-        .on_command("ARTICLE <test@example.com>", article_response)
+        .on_command("ARTICLE <test@example.com>", &full_response)
         .spawn();
 
     sleep(Duration::from_millis(200)).await;
 
-    // Create proxy configuration
+    // Create proxy
     let config = Config {
         servers: vec![
             create_test_server_config("127.0.0.1", mock_port1, "Backend1"),
@@ -342,8 +339,9 @@ async fn test_buffer_corruption_between_retries() -> Result<()> {
         ..Default::default()
     };
 
-    // Start proxy
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+
+    // Start proxy
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let listener = TcpListener::bind(&proxy_addr).await?;
 
@@ -360,55 +358,99 @@ async fn test_buffer_corruption_between_retries() -> Result<()> {
 
     sleep(Duration::from_millis(200)).await;
 
-    // Connect as client
+    // Connect to proxy
     let mut client = TcpStream::connect(&proxy_addr).await?;
-    let mut buffer = vec![0u8; 8192];
 
     // Read greeting
-    let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
-    assert!(n > 0, "Should receive greeting");
+    let mut buffer = vec![0u8; 8192];
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let greeting = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        greeting.contains("200"),
+        "Expected greeting, got: {}",
+        greeting
+    );
 
-    // Request article - Backend1 will 430, Backend2 will succeed
+    // Request article - Backend1 will fail with 430, Backend2 will succeed
     client.write_all(b"ARTICLE <test@example.com>\r\n").await?;
 
-    // Read full response
-    let mut full_response = Vec::new();
+    // Read entire response
+    let mut full_response_buf = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+
     loop {
-        let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
+        let n = timeout(Duration::from_secs(5), client.read(&mut chunk)).await??;
         if n == 0 {
             break;
         }
-        full_response.extend_from_slice(&buffer[..n]);
+        full_response_buf.extend_from_slice(&chunk[..n]);
 
-        // Check if we got the terminator
-        if full_response.ends_with(b".\r\n") {
+        // Check if we've received the complete article (ends with .\r\n)
+        if full_response_buf.ends_with(b".\r\n") {
             break;
         }
     }
 
-    let response = String::from_utf8_lossy(&full_response);
+    let response = String::from_utf8_lossy(&full_response_buf);
 
-    // Verify the response is clean and doesn't contain corruption
-    // The response should start with 220 (success)
+    // Verify no corruption:
+    // 1. Response should start with 220 (success), NOT 430
     assert!(
         response.starts_with("220"),
-        "Should start with 220 success code, got: {}",
+        "Expected 220 response, got: {}",
         &response[..response.len().min(50)]
     );
 
-    // Critical check: Look for "No such article" fragment from 430 error
-    // If buffer was corrupted, this phrase from Backend1's error might appear
+    // 2. Response should contain the full article content
     assert!(
-        !response.contains("No such article"),
-        "Article should not contain '430 No such article' error fragments! Got:\n{}",
+        response.contains("Subject: Test Article"),
+        "Missing article subject: {}",
+        response
+    );
+    assert!(
+        response.contains("This is a test article body"),
+        "Missing article body: {}",
         response
     );
 
-    // Verify the expected content is present
+    // 3. Critical: Verify the status line doesn't contain error codes
+    // If buffer corruption occurred, we might see "430" in the first line
+    let first_line = response.lines().next().unwrap_or("");
     assert!(
-        response.contains("MARKER_SUCCESS_MARKER"),
-        "Should contain success marker (proves we got Backend2's response): {}",
+        !first_line.contains("430"),
+        "Status line should not contain 430 error: {}",
+        first_line
+    );
+    assert!(
+        first_line.starts_with("220"),
+        "First line should be 220 success: {}",
+        first_line
+    );
+
+    // 4. Response should NOT contain the exact error message from Backend1
+    // (This would indicate buffer reuse corruption)
+    assert!(
+        !response.contains("No such article"),
+        "Response should NOT contain Backend1's error message: {}",
         response
+    );
+
+    // 5. Verify response ends with proper terminator
+    assert!(
+        response.trim_end().ends_with(".\r\n") || response.trim_end().ends_with('.'),
+        "Response should end with proper terminator: {:?}",
+        &response[response.len().saturating_sub(10)..]
+    );
+
+    println!("✅ Buffer corruption test passed - no data mixing detected");
+    println!("Response length: {} bytes", response.len());
+    println!(
+        "First 100 chars: {:?}",
+        &response[..response.len().min(100)]
+    );
+    println!(
+        "Last 50 chars: {:?}",
+        &response[response.len().saturating_sub(50)..]
     );
 
     Ok(())
