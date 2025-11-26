@@ -1,6 +1,6 @@
 //! Backend server selection and load balancing
 //!
-//! This module provides pluggable routing strategies:
+//! Provides two routing strategies:
 //! - **Round-robin**: Even distribution across backends
 //! - **Adaptive**: Weighted selection based on load, availability, and saturation
 //!
@@ -34,11 +34,9 @@
 //! selector.complete_command(backend_id);
 //! ```
 
-mod adaptive;
-mod round_robin;
+mod strategy;
 
-pub use adaptive::AdaptiveStrategy;
-pub use round_robin::RoundRobinStrategy;
+pub use strategy::{AdaptiveStrategy, RoundRobinStrategy};
 
 use anyhow::Result;
 use std::sync::Arc;

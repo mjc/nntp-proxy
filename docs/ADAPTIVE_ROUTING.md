@@ -1,8 +1,8 @@
 # Adaptive Routing and Tiered Backend Strategy
 
-**Status:** Design Phase  
-**Version:** 0.1.0  
-**Last Updated:** 2024-11-21
+**Status:** Partial Implementation  
+**Version:** 0.2.0  
+**Last Updated:** 2024-11-26
 
 ---
 
@@ -36,6 +36,12 @@ SABnzbd and similar clients can enable **"Check before download" (precheck)** mo
 - **Zero-cost article age detection** - No need to download full articles
 - **Retention boundary learning** - 430 responses teach us which servers have which articles
 - **Smart routing opportunities** - Route old articles to archive servers, recent to fast servers
+
+**IMPORTANT:** The proxy only performs parallel precheck when it detects the client is sending `STAT` commands. If the client directly sends `ARTICLE`/`BODY`/`HEAD` commands without prechecking, the proxy **skips** the parallel precheck phase and routes directly. This prevents:
+
+1. **Server lying issues** - Some servers incorrectly return 430 for STAT but successfully serve the article
+2. **Performance overhead** - No wasted parallel queries for clients that don't precheck
+3. **Backward compatibility** - Works seamlessly with clients that don't use precheck mode
 
 ---
 
@@ -342,6 +348,27 @@ pub fn handle_article_not_found(&self, backend_id: BackendId, article: &str) -> 
 
 ## Precheck Detection
 
+### Implementation Decision: STAT-Triggered Precheck Only
+
+**IMPORTANT:** The proxy only performs parallel precheck probing when it receives **STAT commands** from the client. It does NOT proactively precheck for ARTICLE, BODY, or HEAD commands.
+
+**Rationale:**
+
+1. **Precheck is Client-Initiated:**
+   - If the client sends STAT first, it's explicitly checking article existence before downloading
+   - Proxy respects this workflow and can use parallel probing to learn backend availability
+   - If the client sends ARTICLE directly, it's not using precheck - proxy shouldn't add it
+
+2. **Avoids Performance Overhead:**
+   - ARTICLE/BODY commands already transfer the article - adding precheck could slow things down
+   - STAT is lightweight (small response), so parallel probing is cheap when client initiates it
+   - Only beneficial when client is already using precheck mode (SABnzbd with adaptive_precheck)
+
+3. **Maintains Backward Compatibility:**
+   - Clients that don't use precheck (download directly with ARTICLE) see no behavior change
+   - Clients that use precheck (SABnzbd with adaptive_precheck) get optimized routing
+   - No risk of breaking existing workflows
+
 ### Automatic Detection
 
 The proxy can detect when clients are using precheck mode by observing command patterns:
@@ -372,7 +399,7 @@ impl PrecheckDetector {
 
 ### Parallel Precheck Probing
 
-When a STAT/HEAD command is received, send it to **one backend from each tier in parallel**:
+When a **STAT command** is received (and precheck mode is detected), send it to **one backend from each tier in parallel**:
 
 ```rust
 pub async fn probe_backends_parallel(&self, message_id: &str) -> Vec<(BackendId, bool)> {
@@ -398,9 +425,10 @@ pub async fn probe_backends_parallel(&self, message_id: &str) -> Vec<(BackendId,
 ```
 
 **Benefits:**
-- Learn which backends have the article
-- Update retention boundaries
-- Route subsequent ARTICLE commands to backends that responded 223
+- Learn which backends have the article (for STAT commands only)
+- Update retention boundaries based on STAT responses
+- Route subsequent ARTICLE commands to backends that responded 223 to STAT
+- Only activate when client demonstrates precheck workflow
 
 ---
 

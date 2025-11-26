@@ -4,7 +4,7 @@ use super::*;
 
 mod basic;
 mod load_tracking;
-mod round_robin;
+mod selection;
 mod stateful;
 
 /// Helper function to create a test provider for use in tests

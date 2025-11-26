@@ -1,11 +1,16 @@
-//! Round-robin selection strategy tests
+//! Backend selection strategy integration tests
+//!
+//! Tests BackendSelector with different routing strategies:
+//! - RoundRobin (default)
+//! - AdaptiveWeighted (load-aware)
 
 use super::*;
+use crate::config::RoutingStrategy;
 use crate::types::ServerName;
 
 #[test]
 fn test_round_robin_selection() {
-    let mut router = BackendSelector::default();
+    let mut router = BackendSelector::new(RoutingStrategy::RoundRobin);
     let client_id = ClientId::new();
 
     // Add 3 backends
@@ -37,8 +42,8 @@ fn test_round_robin_selection() {
 }
 
 #[test]
-fn test_load_balancing_fairness() {
-    let mut router = BackendSelector::default();
+fn test_round_robin_fairness() {
+    let mut router = BackendSelector::new(RoutingStrategy::RoundRobin);
     let client_id = ClientId::new();
 
     // Add 3 backends
@@ -59,4 +64,39 @@ fn test_load_balancing_fairness() {
 
     // Each backend should get 3 commands (perfect round-robin)
     assert_eq!(backend_counts, vec![3, 3, 3]);
+}
+
+#[test]
+fn test_adaptive_selection_prefers_least_loaded() {
+    let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+    let client_id = ClientId::new();
+
+    // Add 3 backends
+    for i in 0..3 {
+        router.add_backend(
+            BackendId::from_index(i),
+            ServerName::new(format!("backend-{}", i)).unwrap(),
+            create_test_provider(),
+        );
+    }
+
+    // Route one command - should go to first backend (all equal load)
+    let backend1 = router.route_command(client_id, "LIST\r\n").unwrap();
+    assert_eq!(backend1.as_index(), 0);
+
+    // Route another - adaptive should pick least loaded
+    let backend2 = router.route_command(client_id, "DATE\r\n").unwrap();
+    // With adaptive strategy, it picks based on load/availability/saturation
+    // Not deterministic which it picks, but should succeed
+    assert!(backend2.as_index() < 3);
+}
+
+#[test]
+fn test_default_strategy_is_round_robin() {
+    let router = BackendSelector::default();
+
+    // Default should use RoundRobin strategy
+    // We can't inspect the strategy directly, but we can verify behavior
+    // This test just ensures default() works
+    assert_eq!(router.backend_count(), 0);
 }

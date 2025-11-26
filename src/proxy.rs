@@ -474,6 +474,16 @@ impl NntpProxy {
         &self.connection_stats
     }
 
+    /// Get backend load (pending requests) for monitoring
+    ///
+    /// Returns the number of pending requests for the given backend.
+    /// This is useful for debugging connection leaks and load balancing.
+    #[must_use]
+    #[inline]
+    pub fn backend_load(&self, backend_id: types::BackendId) -> Option<usize> {
+        self.router.backend_load(backend_id)
+    }
+
     /// Common setup for client connections
     ///
     /// Sends the proxy's greeting immediately to the client.

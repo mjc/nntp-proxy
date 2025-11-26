@@ -690,11 +690,13 @@ impl ClientSession {
                         router.complete_command(tried_backend);
                         continue;
                     }
-                    // Success or non-retryable error - return result
+                    // Success or non-retryable error - complete command and return result
+                    router.complete_command(tried_backend);
                     return Ok((exec_result, cmd_bytes, resp_bytes, tried_backend));
                 }
                 Err(e) => {
-                    // Connection/timeout error - log and try next backend
+                    // Connection/timeout error - complete command, log, and try next backend
+                    router.complete_command(tried_backend);
                     warn!("{}", e);
                     continue;
                 }

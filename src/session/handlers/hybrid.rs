@@ -94,6 +94,7 @@ impl ClientSession {
                 "Failed to execute initial command after switching to stateful mode: {}",
                 e
             );
+            // Complete command on error - connection will be returned to pool
             router.complete_command(backend_id);
             return result.map(|_| TransferMetrics {
                 client_to_backend: client_to_backend_bytes,
@@ -102,8 +103,9 @@ impl ClientSession {
         }
         // Client disconnected while receiving data, backend is healthy - continue
 
-        // Mark this command as complete (skipped if early return above)
-        router.complete_command(backend_id);
+        // DO NOT call complete_command here - we're entering stateful mode
+        // The connection will remain checked out for the entire session
+        // and will be returned to pool automatically when pooled_conn drops
 
         // Now enter standard stateful mode with the dedicated backend connection
         // This is the same as the standard 1:1 routing mode
@@ -241,6 +243,9 @@ impl ClientSession {
 
         // Track stateful session end
         self.stateful_session_ended();
+
+        // Mark command as complete - connection will be returned to pool when pooled_conn drops
+        router.complete_command(backend_id);
 
         Ok(TransferMetrics {
             client_to_backend,
