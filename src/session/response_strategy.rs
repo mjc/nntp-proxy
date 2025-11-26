@@ -185,8 +185,9 @@ impl ResponseStrategy {
         if let Some(code) = response_code.status_code() {
             let raw_code = code.as_u16();
             if let Some(msgid) = crate::session::common::extract_message_id(command) {
-                // Warn only for truly unusual responses (not 223 or errors)
-                if raw_code != 223 && !code.is_error() {
+                // Warn only for truly unusual responses (not 220/222/223 or errors)
+                // 220 = ARTICLE, 222 = BODY, 223 = HEAD
+                if !matches!(raw_code, 220 | 222 | 223) && !code.is_error() {
                     warn!(
                         "Client {} ARTICLE {} got unusual single-line response: {}",
                         client_addr, msgid, code
@@ -200,6 +201,7 @@ impl ResponseStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn test_streaming_strategy_creation() {
@@ -210,5 +212,73 @@ mod tests {
     fn test_caching_strategy_creation() {
         let cache = Arc::new(ArticleCache::new(100, std::time::Duration::from_secs(3600)));
         let _strategy = ResponseStrategy::Caching { cache };
+    }
+
+    #[test]
+    fn test_check_unusual_response_normal_codes() {
+        use crate::protocol::StatusCode;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        // These should NOT trigger warnings (normal article retrieval responses)
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(220)),
+            addr,
+            "ARTICLE <test@example.com>",
+        );
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(222)),
+            addr,
+            "BODY <test@example.com>",
+        );
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(223)),
+            addr,
+            "STAT <test@example.com>",
+        );
+
+        // Error codes should also not trigger warnings
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(430)),
+            addr,
+            "ARTICLE <test@example.com>",
+        );
+    }
+
+    #[test]
+    fn test_check_unusual_response_unusual_codes() {
+        use crate::protocol::StatusCode;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        // These SHOULD trigger warnings (unusual success codes for article commands)
+        // Note: This test just verifies the function runs without panicking
+        // Actual warning verification would require log capture
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(200)),
+            addr,
+            "ARTICLE <test@example.com>",
+        );
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(211)),
+            addr,
+            "BODY <test@example.com>",
+        );
+    }
+
+    #[test]
+    fn test_check_unusual_response_no_message_id() {
+        use crate::protocol::StatusCode;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        // Commands without message-ID should not trigger warnings
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(200)),
+            addr,
+            "GROUP alt.test",
+        );
+        ResponseStrategy::check_unusual_response(
+            Response::SingleLine(StatusCode::new(211)),
+            addr,
+            "LIST",
+        );
     }
 }
