@@ -11,7 +11,7 @@ use crate::cache::{ArticleCache, CachedArticle};
 use crate::pool::PooledBuffer;
 use crate::protocol::{NntpResponse, Response};
 use crate::session::streaming;
-use crate::types::{BackendId, MessageId};
+use crate::types::{BackendId, BytesTransferred, MessageId};
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,7 +47,7 @@ impl ResponseStrategy {
     /// * `chunk_buffer` - Reusable buffer for reading additional chunks
     ///
     /// # Returns
-    /// Number of bytes written to client
+    /// Number of bytes written to client (type-safe)
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_response(
         &self,
@@ -62,8 +62,8 @@ impl ResponseStrategy {
         buffer_pool: &crate::pool::BufferPool,
         command: &str,
         chunk_buffer: &mut PooledBuffer,
-    ) -> Result<u64> {
-        match self {
+    ) -> Result<BytesTransferred> {
+        let bytes_written = match self {
             Self::Streaming => {
                 Self::stream_response(
                     pooled_conn,
@@ -95,10 +95,12 @@ impl ResponseStrategy {
         // Log warnings for unusual responses
         Self::check_unusual_response(response_code, client_addr, command);
 
-        Ok(first_n as u64)
+        Ok(bytes_written)
     }
 
     /// Stream response directly to client
+    ///
+    /// Returns total bytes written to client (type-safe)
     #[allow(clippy::too_many_arguments)]
     async fn stream_response(
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
@@ -109,12 +111,10 @@ impl ResponseStrategy {
         backend_id: BackendId,
         client_addr: SocketAddr,
         buffer_pool: &crate::pool::BufferPool,
-    ) -> Result<()> {
-        // Write first chunk
-        client_write.write_all(&first_chunk[..first_n]).await?;
-
+    ) -> Result<BytesTransferred> {
         if is_multiline {
-            // Continue streaming remaining chunks
+            // stream_multiline_response handles the first chunk AND remaining chunks
+            // It returns the total bytes written including the first chunk
             streaming::stream_multiline_response(
                 &mut **pooled_conn,
                 client_write,
@@ -124,13 +124,17 @@ impl ResponseStrategy {
                 backend_id,
                 buffer_pool,
             )
-            .await?;
+            .await
+        } else {
+            // Single-line response - just write the first chunk
+            client_write.write_all(&first_chunk[..first_n]).await?;
+            Ok(BytesTransferred::new(first_n as u64))
         }
-
-        Ok(())
     }
 
     /// Cache response before sending to client
+    ///
+    /// Returns total bytes written to client (type-safe)
     #[allow(clippy::too_many_arguments)]
     async fn cache_response(
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
@@ -141,7 +145,7 @@ impl ResponseStrategy {
         command: &str,
         chunk_buffer: &mut PooledBuffer,
         cache: &Arc<ArticleCache>,
-    ) -> Result<()> {
+    ) -> Result<BytesTransferred> {
         use tokio::io::AsyncReadExt;
 
         // Buffer entire response
@@ -162,6 +166,8 @@ impl ResponseStrategy {
             }
         }
 
+        let total_bytes = BytesTransferred::new(response_buffer.len() as u64);
+
         // Send to client
         client_write.write_all(&response_buffer).await?;
 
@@ -177,7 +183,7 @@ impl ResponseStrategy {
             }
         }
 
-        Ok(())
+        Ok(total_bytes)
     }
 
     /// Check for unusual responses and log warnings

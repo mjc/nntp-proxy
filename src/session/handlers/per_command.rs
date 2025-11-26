@@ -948,7 +948,7 @@ impl ClientSession {
             }
         };
 
-        backend_to_client_bytes.add(bytes_written as usize);
+        backend_to_client_bytes.add_u64(bytes_written.as_u64());
 
         // Track metrics based on response code
         if let Some(ref metrics) = self.metrics
@@ -968,13 +968,13 @@ impl ClientSession {
             // Track article size for successful article retrieval responses
             // 220 = ARTICLE (full article), 221 = HEAD (headers only), 222 = BODY (body only)
             if is_multiline && (raw_code == 220 || raw_code == 221 || raw_code == 222) {
-                metrics.record_article(backend_id, bytes_written);
+                metrics.record_article(backend_id, bytes_written.as_u64());
             }
         }
 
         // Return unrecorded metrics bytes - caller MUST record to prevent double-counting
         let cmd_bytes = MetricsBytes::new(command.len() as u64);
-        let resp_bytes = MetricsBytes::new(bytes_written);
+        let resp_bytes = MetricsBytes::new(bytes_written.as_u64());
 
         if let Some(msgid) = common::extract_message_id(command) {
             debug!(

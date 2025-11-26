@@ -3,6 +3,7 @@
 //! Handles streaming response data from backend to client with pipelined I/O.
 //! Uses double-buffering for optimal performance on large transfers.
 
+use crate::types::BytesTransferred;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -151,7 +152,7 @@ pub async fn stream_multiline_response<R, W>(
     client_addr: std::net::SocketAddr,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
-) -> Result<u64>
+) -> Result<BytesTransferred>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -205,7 +206,7 @@ where
                 client_addr,
                 crate::formatting::format_bytes(total_bytes)
             );
-            return Ok(total_bytes);
+            return Ok(BytesTransferred::new(total_bytes));
         }
 
         // Read next chunk into alternate buffer
@@ -223,7 +224,7 @@ where
                 client_addr,
                 crate::formatting::format_bytes(total_bytes)
             );
-            return Ok(total_bytes);
+            return Ok(BytesTransferred::new(total_bytes));
         }
     }
 }
@@ -303,7 +304,10 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), response.len() as u64);
+        assert_eq!(
+            result.unwrap(),
+            BytesTransferred::new(response.len() as u64)
+        );
         assert_eq!(&writer[..], response);
     }
 
@@ -333,7 +337,7 @@ mod tests {
 
         assert!(result.is_ok());
         // Should only write up to and including terminator (position 22)
-        assert_eq!(result.unwrap(), 22);
+        assert_eq!(result.unwrap(), BytesTransferred::new(22));
         assert_eq!(&writer[..], b"220 Article\r\nData\r\n.\r\n");
     }
 
@@ -360,7 +364,10 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), response.len() as u64);
+        assert_eq!(
+            result.unwrap(),
+            BytesTransferred::new(response.len() as u64)
+        );
         assert_eq!(&writer[..], response);
     }
 
@@ -398,7 +405,10 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), full_response.len() as u64);
+        assert_eq!(
+            result.unwrap(),
+            BytesTransferred::new(full_response.len() as u64)
+        );
         assert_eq!(&writer[..], &full_response[..]);
     }
 
