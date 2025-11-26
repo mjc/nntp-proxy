@@ -114,6 +114,31 @@ where
     Ok(())
 }
 
+/// Process a single chunk: detect terminator and write to client
+async fn process_chunk<W>(
+    chunk_data: &[u8],
+    client_write: &mut W,
+    tail: &mut TailBuffer,
+) -> Result<(usize, bool)>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let status = tail.detect_terminator(chunk_data);
+    let write_len = status.write_len(chunk_data.len());
+
+    client_write
+        .write_all(&chunk_data[..write_len])
+        .await
+        .context("Failed to write chunk to client")?;
+
+    let is_complete = status.is_found();
+    if !is_complete {
+        tail.update(&chunk_data[..write_len]);
+    }
+
+    Ok((write_len, is_complete))
+}
+
 /// Stream multiline response from backend to client using pipelined double-buffering
 ///
 /// This uses two buffers to enable concurrent read/write operations for maximum throughput.
@@ -131,88 +156,76 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let mut total_bytes = 0u64;
-    // Prepare double buffering for pipelined streaming using buffer pool
+    // Acquire double buffers for pipelined streaming
     let mut buffer1 = buffer_pool.acquire().await;
     let mut buffer2 = buffer_pool.acquire().await;
-
-    // Copy first chunk into buffer1 and mark it initialized
     buffer1.copy_from_slice(&first_chunk[..first_n]);
 
-    let mut current_n = first_n;
-    let mut use_buffer1 = true; // Track which buffer is current
-
-    // Track tail for spanning terminator detection
     let mut tail = TailBuffer::default();
-    // Main streaming loop - processes first chunk and all subsequent chunks uniformly
+    let mut total_bytes = 0u64;
+    let mut current_n = first_n;
+    let mut use_buffer1 = true;
+
     loop {
-        let data = if use_buffer1 {
-            &buffer1[..current_n]
+        // Get current buffer slice
+        let chunk_data = if use_buffer1 {
+            &buffer1.as_ref()[..current_n]
         } else {
-            &buffer2[..current_n]
+            &buffer2.as_ref()[..current_n]
         };
 
-        // Detect terminator location: within chunk or spanning boundary
-        let status = tail.detect_terminator(data);
-        let write_len = status.write_len(current_n);
-        // Write current chunk (or portion up to terminator) to client
-        if let Err(e) = client_write.write_all(&data[..write_len]).await {
-            return Err(handle_client_write_error(
-                e,
-                backend_read,
-                ClientWriteErrorContext {
-                    write_len,
-                    current_n,
-                    total_bytes,
-                    partial_data: &data[..write_len],
-                    terminator_found: status.is_found(),
-                    client_addr,
-                    backend_id,
-                    buffer_pool,
-                },
-            )
-            .await);
-        }
+        // Process chunk with functional error handling
+        let (write_len, is_complete) =
+            match process_chunk(chunk_data, client_write, &mut tail).await {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(handle_client_write_error(
+                        std::io::Error::other(e),
+                        backend_read,
+                        ClientWriteErrorContext {
+                            write_len: chunk_data.len(),
+                            current_n,
+                            total_bytes,
+                            partial_data: chunk_data,
+                            terminator_found: false,
+                            client_addr,
+                            backend_id,
+                            buffer_pool,
+                        },
+                    )
+                    .await);
+                }
+            };
+
         total_bytes += write_len as u64;
-        // If terminator found, we're done
-        if status.is_found() {
+
+        if is_complete {
             debug!(
                 "Client {} multiline response complete ({})",
                 client_addr,
                 crate::formatting::format_bytes(total_bytes)
             );
-            break;
+            return Ok(total_bytes);
         }
-        // Update tail for next iteration
-        tail.update(&data[..write_len]);
 
         // Read next chunk into alternate buffer
         use_buffer1 = !use_buffer1;
-        let next_n = if use_buffer1 {
-            buffer1
-                .read_from(backend_read)
-                .await
-                .context("Failed to read next chunk from backend")?
+        current_n = if use_buffer1 {
+            buffer1.read_from(backend_read).await
         } else {
-            buffer2
-                .read_from(backend_read)
-                .await
-                .context("Failed to read next chunk from backend")?
-        };
+            buffer2.read_from(backend_read).await
+        }
+        .context("Failed to read next chunk from backend")?;
 
-        if next_n == 0 {
+        if current_n == 0 {
             debug!(
                 "Client {} multiline streaming complete ({}, EOF)",
                 client_addr,
                 crate::formatting::format_bytes(total_bytes)
             );
-            break; // EOF
+            return Ok(total_bytes);
         }
-        // Swap to current buffer for next iteration
-        current_n = next_n;
     }
-
-    Ok(total_bytes)
 }
 
 #[cfg(test)]
