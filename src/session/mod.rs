@@ -48,6 +48,7 @@ pub mod error_classification;
 pub mod handlers;
 pub mod precheck;
 mod response_strategy;
+mod retry;
 pub mod streaming;
 
 use std::net::SocketAddr;

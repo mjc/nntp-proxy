@@ -1,0 +1,153 @@
+//! Retry logic for backend command execution
+//!
+//! Handles 430 (article not found) retries across multiple backends.
+//! Uses availability bitmaps to track which backends have been tried.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Result, anyhow};
+use tracing::debug;
+
+use crate::cache::{ArticleLocationCache, BackendAvailability};
+use crate::pool::DeadpoolConnectionProvider;
+use crate::router::BackendSelector;
+use crate::types::{BackendId, protocol::MessageId};
+
+/// Default timeout for backend operations
+pub const BACKEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Find next available backend from availability bitmap
+#[inline]
+pub fn find_next_available_backend(
+    remaining: &BackendAvailability,
+    backend_count: usize,
+) -> Option<BackendId> {
+    (0..backend_count)
+        .map(BackendId::from_index)
+        .find(|&id| remaining.has_article(id))
+}
+
+/// Acquire pooled connection with timeout
+#[inline]
+pub async fn acquire_connection_with_timeout(
+    provider: &DeadpoolConnectionProvider,
+    backend: BackendId,
+    timeout: Duration,
+) -> Result<deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>> {
+    tokio::time::timeout(timeout, provider.get_pooled_connection())
+        .await
+        .map_err(|_| anyhow!("Backend {:?} pool timeout", backend))?
+        .map_err(|e| anyhow!("Backend {:?} pool error: {}", backend, e))
+}
+
+/// Check if error is retryable (430 article not found)
+#[inline]
+pub fn is_article_not_found_error(result: &Result<()>) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.to_string().to_lowercase().contains("430"))
+}
+
+/// Update location cache for backend availability
+#[inline]
+fn spawn_cache_update(
+    message_id: &MessageId<'_>,
+    cache: &Arc<ArticleLocationCache>,
+    backend: BackendId,
+    available: bool,
+) {
+    let cache = Arc::clone(cache);
+    let msg_id_owned = message_id.to_owned();
+    tokio::spawn(async move {
+        cache.update(&msg_id_owned, backend, available).await;
+    });
+}
+
+/// Update location cache for failed backend
+#[inline]
+pub fn update_cache_for_failed_backend(
+    message_id: Option<&MessageId<'_>>,
+    location_cache: Option<&Arc<ArticleLocationCache>>,
+    backend: BackendId,
+) {
+    message_id.zip(location_cache).inspect(|(msg_id, cache)| {
+        spawn_cache_update(msg_id, cache, backend, false);
+        debug!(
+            "Updating location cache: {} -> backend {:?} (NOT available)",
+            msg_id, backend
+        );
+    });
+}
+
+/// Update location cache for successful backend
+#[inline]
+pub fn update_cache_for_successful_backend(
+    message_id: Option<&MessageId<'_>>,
+    location_cache: Option<&Arc<ArticleLocationCache>>,
+    backend: BackendId,
+) {
+    message_id.zip(location_cache).inspect(|(msg_id, cache)| {
+        spawn_cache_update(msg_id, cache, backend, true);
+        debug!(
+            "Updating location cache: {} -> backend {:?} (available)",
+            msg_id, backend
+        );
+    });
+}
+
+/// Initialize backend availability bitmap
+///
+/// If availability is already known (from precheck), use it.
+/// Otherwise, create bitmap with all backends marked as available.
+pub fn initialize_backend_bitmap(
+    backend_availability: Option<BackendAvailability>,
+    router: &BackendSelector,
+) -> BackendAvailability {
+    backend_availability.unwrap_or_else(|| {
+        // No cache - create bitmap with all backends available
+        (0..router.backend_count()).map(BackendId::from_index).fold(
+            BackendAvailability::new(),
+            |mut bitmap, id| {
+                bitmap.mark_available(id);
+                bitmap
+            },
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_article_not_found_error() {
+        let ok_result: Result<()> = Ok(());
+        assert!(!is_article_not_found_error(&ok_result));
+
+        let not_found: Result<()> = Err(anyhow!("430 article not found"));
+        assert!(is_article_not_found_error(&not_found));
+
+        let other_error: Result<()> = Err(anyhow!("500 internal error"));
+        assert!(!is_article_not_found_error(&other_error));
+    }
+
+    #[test]
+    fn test_find_next_available_backend() {
+        let mut bitmap = BackendAvailability::new();
+        bitmap.mark_available(BackendId::from_index(0));
+        bitmap.mark_available(BackendId::from_index(2));
+
+        let next = find_next_available_backend(&bitmap, 3);
+        assert_eq!(next, Some(BackendId::from_index(0)));
+
+        bitmap.mark_unavailable(BackendId::from_index(0));
+        let next = find_next_available_backend(&bitmap, 3);
+        assert_eq!(next, Some(BackendId::from_index(2)));
+
+        bitmap.mark_unavailable(BackendId::from_index(2));
+        let next = find_next_available_backend(&bitmap, 3);
+        assert_eq!(next, None);
+    }
+}
