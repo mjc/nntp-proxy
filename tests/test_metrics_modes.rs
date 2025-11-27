@@ -1,10 +1,13 @@
 //! Integration tests for metrics in different routing modes
 
+mod test_helpers;
+
 use nntp_proxy::config::RoutingMode;
 use nntp_proxy::metrics::MetricsCollector;
 use nntp_proxy::pool::{ConnectionProvider, DeadpoolConnectionProvider};
 use nntp_proxy::router::BackendSelector;
-use nntp_proxy::types::{BackendId, BytesReceived, BytesSent, ServerName};
+use nntp_proxy::types::{BackendId, BytesReceived, BytesSent};
+use test_helpers::add_test_backend;
 
 #[test]
 fn test_metrics_with_pool_status_standard_mode() {
@@ -26,11 +29,7 @@ fn test_metrics_with_pool_status_standard_mode() {
         None,
     );
 
-    router.add_backend(
-        BackendId::from_index(0),
-        ServerName::new("standard-backend".to_string()).unwrap(),
-        provider.clone(),
-    );
+    add_test_backend(&mut router, 0, "standard-backend", provider.clone());
 
     // Simulate standard mode behavior: record bytes only
     metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);
@@ -90,17 +89,9 @@ fn test_metrics_with_pool_status_per_command_mode() {
         None,
     );
 
-    router.add_backend(
-        BackendId::from_index(0),
-        ServerName::new("backend1".to_string()).unwrap(),
-        provider1.clone(),
-    );
+    add_test_backend(&mut router, 0, "backend1", provider1.clone());
 
-    router.add_backend(
-        BackendId::from_index(1),
-        ServerName::new("backend2".to_string()).unwrap(),
-        provider2.clone(),
-    );
+    add_test_backend(&mut router, 1, "backend2", provider2.clone());
 
     // Simulate per-command mode: round-robin distribution
     metrics.record_command(BackendId::from(0));
@@ -173,11 +164,7 @@ fn test_metrics_with_pool_status_hybrid_mode() {
         None,
     );
 
-    router.add_backend(
-        BackendId::from_index(0),
-        ServerName::new("hybrid-backend".to_string()).unwrap(),
-        provider.clone(),
-    );
+    add_test_backend(&mut router, 0, "hybrid-backend", provider.clone());
 
     // Simulate hybrid mode: start with per-command
     metrics.record_command(BackendId::from(0));
@@ -242,11 +229,7 @@ fn test_all_modes_show_meaningful_metrics() {
             None,
         );
 
-        router.add_backend(
-            BackendId::from_index(0),
-            ServerName::new("test-backend".to_string()).unwrap(),
-            provider.clone(),
-        );
+        add_test_backend(&mut router, 0, "test-backend", provider.clone());
 
         // Record some activity
         metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);

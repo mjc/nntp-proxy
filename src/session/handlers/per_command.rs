@@ -484,7 +484,11 @@ impl ClientSession {
         1.0 - (mb_per_sec / 10.0).min(1.0)
     }
 
-    /// Try to serve STAT command directly from cache without backend query
+    /// Try to serve STAT command directly from precheck results
+    ///
+    /// When precheck has determined article availability (using STAT or HEAD on backend),
+    /// we can respond immediately to client's STAT command without forwarding.
+    /// Always responds with 223 (STAT success) regardless of whether backend used HEAD (221) or STAT (223).
     #[allow(clippy::too_many_arguments)] // All parameters are necessary for this operation
     async fn try_serve_stat_from_cache(
         &self,
@@ -496,7 +500,7 @@ impl ClientSession {
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<Option<crate::types::BackendId>> {
-        // Only optimize STAT commands with cache hits
+        // Only handle STAT commands when we have availability info from precheck
         if backend_availability.is_none()
             || !matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
             || !command.trim_start().to_uppercase().starts_with("STAT ")
@@ -505,17 +509,18 @@ impl ClientSession {
         }
 
         debug!(
-            "Cache hit for STAT {}: responding 223 without backend query (attributing to {:?})",
+            "Precheck completed for STAT {}: responding 223 without forwarding (attributing to {:?})",
             message_id.unwrap(),
             backend_id
         );
 
+        // Always respond with 223 for STAT, even if backend used HEAD (221) for precheck
         let response = b"223 0 <article> Article exists\r\n";
         client_write.write_all(response).await?;
         backend_to_client_bytes.add(response.len());
         client_to_backend_bytes.add(command.len());
 
-        // Record metrics for cached response
+        // Record metrics for precheck-based response
         if let Some(ref metrics) = self.metrics {
             use crate::types::MetricsBytes;
             let cmd_bytes = MetricsBytes::new(command.len() as u64);

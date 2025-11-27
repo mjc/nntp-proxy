@@ -273,6 +273,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 connection_keepalive: None,
                 health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
+                precheck_command: nntp_proxy::config::PrecheckCommand::default(),
             })
             .collect(),
         routing: Default::default(),
@@ -309,6 +310,7 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
                 connection_keepalive: None,
                 health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
+                precheck_command: nntp_proxy::config::PrecheckCommand::default(),
             })
             .collect(),
         routing: Default::default(),
@@ -466,6 +468,34 @@ pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelecto
 /// ```
 pub fn create_test_addr() -> std::net::SocketAddr {
     "127.0.0.1:9999".parse().unwrap()
+}
+
+/// Add a test backend to a router with default configuration
+///
+/// Helper to avoid repeating the same add_backend call with all parameters.
+/// Uses default PrecheckCommand.
+///
+/// # Examples
+/// ```ignore
+/// let mut router = BackendSelector::default();
+/// add_test_backend(&mut router, 0, "backend-1", create_test_provider());
+/// ```
+#[allow(dead_code)]
+pub fn add_test_backend(
+    router: &mut nntp_proxy::router::BackendSelector,
+    index: usize,
+    name: &str,
+    provider: nntp_proxy::pool::DeadpoolConnectionProvider,
+) {
+    use nntp_proxy::types::BackendId;
+    use nntp_proxy::types::validated::ServerName;
+
+    router.add_backend(
+        BackendId::from_index(index),
+        ServerName::new(name.to_string()).unwrap(),
+        provider,
+        nntp_proxy::config::PrecheckCommand::default(),
+    );
 }
 
 #[cfg(test)]

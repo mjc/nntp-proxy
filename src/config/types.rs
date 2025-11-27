@@ -109,6 +109,37 @@ impl std::fmt::Display for RoutingStrategy {
     }
 }
 
+/// Precheck command to use for article availability detection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrecheckCommand {
+    /// Use STAT command (default - less bandwidth)
+    Stat,
+    /// Use HEAD command (returns headers)
+    Head,
+    /// Auto-detect: use both initially, then switch to whichever gives negative response on disagreement
+    #[default]
+    Auto,
+}
+
+impl PrecheckCommand {
+    /// Get a human-readable description
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stat => "STAT command",
+            Self::Head => "HEAD command",
+            Self::Auto => "auto-detect (both commands until disagreement)",
+        }
+    }
+}
+
+impl std::fmt::Display for PrecheckCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Routing configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Routing {
@@ -354,6 +385,10 @@ pub struct Server {
         default = "super::defaults::health_check_pool_timeout"
     )]
     pub health_check_pool_timeout: Duration,
+    /// Command to use for precheck (STAT, HEAD, or Auto)
+    /// Auto mode uses both commands initially, then switches to whichever gives negative response on disagreement
+    #[serde(default)]
+    pub precheck_command: PrecheckCommand,
 }
 
 /// Builder for constructing `Server` instances
@@ -394,6 +429,7 @@ pub struct ServerBuilder {
     connection_keepalive: Option<Duration>,
     health_check_max_per_cycle: Option<usize>,
     health_check_pool_timeout: Option<Duration>,
+    precheck_command: Option<PrecheckCommand>,
 }
 
 impl ServerBuilder {
@@ -417,6 +453,7 @@ impl ServerBuilder {
             connection_keepalive: None,
             health_check_max_per_cycle: None,
             health_check_pool_timeout: None,
+            precheck_command: None,
         }
     }
 
@@ -490,6 +527,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Set precheck command (STAT, HEAD, or Auto)
+    #[must_use]
+    pub fn precheck_command(mut self, command: PrecheckCommand) -> Self {
+        self.precheck_command = Some(command);
+        self
+    }
+
     /// Build the Server
     ///
     /// # Errors
@@ -527,6 +571,8 @@ impl ServerBuilder {
             .health_check_pool_timeout
             .unwrap_or_else(super::defaults::health_check_pool_timeout);
 
+        let precheck_command = self.precheck_command.unwrap_or_default();
+
         Ok(Server {
             host,
             port,
@@ -540,6 +586,7 @@ impl ServerBuilder {
             connection_keepalive: self.connection_keepalive,
             health_check_max_per_cycle,
             health_check_pool_timeout,
+            precheck_command,
         })
     }
 }

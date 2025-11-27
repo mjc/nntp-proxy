@@ -21,6 +21,7 @@ fn test_round_robin_selection() {
             backend_id,
             ServerName::new(format!("backend-{}", i)).unwrap(),
             provider,
+            crate::config::PrecheckCommand::default(),
         );
     }
 
@@ -52,6 +53,7 @@ fn test_round_robin_fairness() {
             BackendId::from_index(i),
             ServerName::new(format!("backend-{}", i)).unwrap(),
             create_test_provider(),
+            crate::config::PrecheckCommand::default(),
         );
     }
 
@@ -77,6 +79,7 @@ fn test_adaptive_selection_prefers_least_loaded() {
             BackendId::from_index(i),
             ServerName::new(format!("backend-{}", i)).unwrap(),
             create_test_provider(),
+            crate::config::PrecheckCommand::default(),
         );
     }
 

@@ -507,6 +507,24 @@ fn render_backend_list(
                 ]),
             ];
 
+            // Add precheck disagreements line if in details mode and count > 0
+            if app.show_details() && stats.precheck_disagreements > 0 {
+                content.push(Line::from(vec![
+                    Span::styled(
+                        "  Precheck Disagreements: ",
+                        Style::default().fg(styles::LABEL),
+                    ),
+                    Span::styled(
+                        format!("{}", stats.precheck_disagreements),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        " (STAT vs HEAD)",
+                        Style::default().fg(styles::VALUE_SECONDARY),
+                    ),
+                ]));
+            }
+
             // Add routing info line if in details mode
             if let Some(text) = routing_text {
                 content.push(Line::from(text).style(Style::default().fg(styles::VALUE_SECONDARY)));

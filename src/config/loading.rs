@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use super::defaults;
-use super::types::{Config, Server};
+use super::types::{Config, PrecheckCommand, Server};
 
 /// Environment variable getter trait for dependency injection
 pub trait EnvProvider {
@@ -116,6 +116,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         connection_keepalive,
         health_check_max_per_cycle,
         health_check_pool_timeout,
+        precheck_command: PrecheckCommand::default(),
     })
 }
 
@@ -375,6 +376,7 @@ pub fn create_default_config() -> Config {
             connection_keepalive: None,
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
+            precheck_command: PrecheckCommand::default(),
         }],
         ..Default::default()
     }

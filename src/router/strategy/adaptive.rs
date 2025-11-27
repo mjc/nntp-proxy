@@ -109,6 +109,7 @@ mod tests {
             provider,
             pending_count: Arc::new(AtomicUsize::new(0)),
             stateful_count: Arc::new(AtomicUsize::new(0)),
+            precheck_command: crate::config::PrecheckCommand::default(),
         }
     }
 

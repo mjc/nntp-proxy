@@ -23,6 +23,7 @@ fn test_stateful_connection_reservation() {
         backend_id,
         ServerName::new("test-backend".to_string()).unwrap(),
         provider,
+        crate::config::PrecheckCommand::default(),
     );
 
     // Should be able to acquire 2 stateful connections
@@ -52,6 +53,7 @@ fn test_stateful_connection_concurrent_access() {
         backend_id,
         ServerName::new("test-backend".to_string()).unwrap(),
         create_test_provider(),
+        crate::config::PrecheckCommand::default(),
     );
 
     // Simulate concurrent access with multiple threads
@@ -111,11 +113,13 @@ fn test_stateful_connection_multiple_backends() {
         backend1,
         ServerName::new("backend-1".to_string()).unwrap(),
         provider1,
+        crate::config::PrecheckCommand::default(),
     );
     router.add_backend(
         backend2,
         ServerName::new("backend-2".to_string()).unwrap(),
         provider2,
+        crate::config::PrecheckCommand::default(),
     );
 
     // Each backend should have independent stateful counters
@@ -172,6 +176,7 @@ fn test_stateful_reservation_edge_cases() {
         backend_id,
         ServerName::new("test-backend".to_string()).unwrap(),
         provider,
+        crate::config::PrecheckCommand::default(),
     );
 
     // Test multiple releases (should not go negative)

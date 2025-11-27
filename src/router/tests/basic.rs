@@ -19,6 +19,7 @@ fn test_add_backend() {
         backend_id,
         ServerName::new("test-backend".to_string()).unwrap(),
         provider,
+        crate::config::PrecheckCommand::default(),
     );
 
     assert_eq!(router.backend_count(), 1);
@@ -35,6 +36,7 @@ fn test_add_multiple_backends() {
             backend_id,
             ServerName::new(format!("backend-{}", i)).unwrap(),
             provider,
+            crate::config::PrecheckCommand::default(),
         );
     }
 
@@ -60,6 +62,7 @@ fn test_get_backend_provider() {
         backend_id,
         ServerName::new("test".to_string()).unwrap(),
         provider,
+        crate::config::PrecheckCommand::default(),
     );
 
     let retrieved = router.backend_provider(backend_id);

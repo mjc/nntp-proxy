@@ -16,7 +16,7 @@
 //! use nntp_proxy::types::{BackendId, ClientId, ServerName};
 //! # use nntp_proxy::pool::DeadpoolConnectionProvider;
 //!
-//! let mut selector = BackendSelector::new();
+//! let mut selector = BackendSelector::default();
 //! # let provider = DeadpoolConnectionProvider::new(
 //! #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
 //! # );
@@ -24,6 +24,7 @@
 //!     BackendId::from_index(0),
 //!     ServerName::new("server1".to_string()).unwrap(),
 //!     provider,
+//!     nntp_proxy::config::PrecheckCommand::default(),
 //! );
 //!
 //! // Route a command
@@ -56,6 +57,8 @@ pub(crate) struct BackendInfo {
     pub(crate) name: ServerName,
     /// Connection provider for this backend
     pub(crate) provider: DeadpoolConnectionProvider,
+    /// Precheck command to use for this backend
+    pub(crate) precheck_command: crate::config::PrecheckCommand,
     /// Number of pending requests on this backend (for load balancing)
     pub(crate) pending_count: Arc<AtomicUsize>,
     /// Number of connections in stateful mode (for hybrid routing reservation)
@@ -122,7 +125,7 @@ impl Drop for PendingGuard<'_> {
 /// # use nntp_proxy::router::BackendSelector;
 /// # use nntp_proxy::types::{BackendId, ClientId, ServerName};
 /// # use nntp_proxy::pool::DeadpoolConnectionProvider;
-/// let mut selector = BackendSelector::new();
+/// let mut selector = BackendSelector::default();
 ///
 /// # let provider = DeadpoolConnectionProvider::new(
 /// #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
@@ -131,6 +134,7 @@ impl Drop for PendingGuard<'_> {
 ///     BackendId::from_index(0),
 ///     ServerName::new("backend-1".to_string()).unwrap(),
 ///     provider,
+///     nntp_proxy::config::PrecheckCommand::default(),
 /// );
 ///
 /// // Route commands
@@ -178,12 +182,14 @@ impl BackendSelector {
         backend_id: BackendId,
         name: ServerName,
         provider: DeadpoolConnectionProvider,
+        precheck_command: crate::config::PrecheckCommand,
     ) {
         info!("Added backend {:?} ({})", backend_id, name);
         self.backends.push(BackendInfo {
             id: backend_id,
             name,
             provider,
+            precheck_command,
             pending_count: Arc::new(AtomicUsize::new(0)),
             stateful_count: Arc::new(AtomicUsize::new(0)),
         });
@@ -285,16 +291,22 @@ impl BackendSelector {
             .map(|b| &b.provider)
     }
 
-    /// Get all backends with their providers for parallel operations
+    /// Get all backends with their providers and precheck commands for parallel operations
     ///
-    /// Returns a vector of (BackendId, Arc<DeadpoolConnectionProvider>) pairs
-    /// for all configured backends. This is used by parallel STAT checks to
+    /// Returns a vector of (BackendId, Arc<DeadpoolConnectionProvider>, PrecheckCommand) tuples
+    /// for all configured backends. This is used by parallel STAT/HEAD checks to
     /// query all backends concurrently.
     #[must_use]
-    pub fn all_backend_providers(&self) -> Vec<(BackendId, Arc<DeadpoolConnectionProvider>)> {
+    pub fn all_backend_providers(
+        &self,
+    ) -> Vec<(
+        BackendId,
+        Arc<DeadpoolConnectionProvider>,
+        crate::config::PrecheckCommand,
+    )> {
         self.backends
             .iter()
-            .map(|b| (b.id, Arc::new(b.provider.clone())))
+            .map(|b| (b.id, Arc::new(b.provider.clone()), b.precheck_command))
             .collect()
     }
 

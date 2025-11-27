@@ -111,7 +111,7 @@ impl BackendCheckResult {
 ///
 /// # Arguments
 /// * `message_id` - The message-ID to check (with brackets)
-/// * `backends` - List of backend providers to check
+/// * `backends` - List of (backend_id, provider, precheck_command) tuples
 /// * `location_cache` - Cache to update with results
 /// * `num_backends` - Total number of backends
 /// * `fast_fail` - If true, return as soon as first backend responds with article
@@ -126,7 +126,11 @@ impl BackendCheckResult {
 /// - With fast_fail=true, returns immediately on first success
 pub async fn precheck_article_availability(
     message_id: &MessageId<'_>,
-    backends: &[(BackendId, Arc<DeadpoolConnectionProvider>)],
+    backends: &[(
+        BackendId,
+        Arc<DeadpoolConnectionProvider>,
+        crate::config::PrecheckCommand,
+    )],
     location_cache: &Arc<ArticleLocationCache>,
     num_backends: usize,
     fast_fail: bool,
@@ -161,20 +165,31 @@ pub async fn precheck_article_availability(
 /// Spawn concurrent check tasks for all backends
 fn spawn_check_tasks(
     message_id: &MessageId<'_>,
-    backends: &[(BackendId, Arc<DeadpoolConnectionProvider>)],
+    backends: &[(
+        BackendId,
+        Arc<DeadpoolConnectionProvider>,
+        crate::config::PrecheckCommand,
+    )],
     metrics: Option<&crate::metrics::MetricsCollector>,
 ) -> FuturesUnordered<tokio::task::JoinHandle<Result<BackendCheckResult>>> {
     backends
         .iter()
-        .map(|(backend_id, provider)| {
+        .map(|(backend_id, provider, precheck_cmd)| {
             let backend_id = *backend_id;
             let provider = Arc::clone(provider);
             let msg_id = message_id.to_owned();
+            let precheck_cmd = *precheck_cmd;
             let metrics_clone = metrics.cloned(); // Clone the MetricsCollector (cheap - just clones Arc)
 
             tokio::spawn(async move {
-                check_backend_has_article(backend_id, &msg_id, &provider, metrics_clone.as_ref())
-                    .await
+                check_backend_has_article(
+                    backend_id,
+                    &msg_id,
+                    &provider,
+                    precheck_cmd,
+                    metrics_clone.as_ref(),
+                )
+                .await
             })
         })
         .collect()
@@ -325,12 +340,14 @@ fn update_cache_async(
     });
 }
 
-/// Check if a single backend has an article using STAT command
+/// Check if a single backend has an article using STAT or HEAD command
 ///
 /// # Arguments
 /// * `backend_id` - Backend to check
 /// * `message_id` - Article message-ID
 /// * `provider` - Connection provider for this backend
+/// * `precheck_cmd` - Command to use (STAT, HEAD, or Auto)
+/// * `metrics` - Optional metrics collector
 ///
 /// # Returns
 /// `BackendCheckResult` indicating whether backend has the article
@@ -345,6 +362,7 @@ async fn check_backend_has_article(
     backend_id: BackendId,
     message_id: &MessageId<'_>,
     provider: &DeadpoolConnectionProvider,
+    precheck_cmd: crate::config::PrecheckCommand,
     metrics: Option<&crate::metrics::MetricsCollector>,
 ) -> Result<BackendCheckResult> {
     // Retry pool acquisition with timeout to handle pool exhaustion gracefully
@@ -389,20 +407,32 @@ async fn check_backend_has_article(
 
     let mut conn = conn.ok_or_else(|| anyhow::anyhow!("Failed to acquire connection"))?;
 
-    // Now run the actual STAT with its own timeout
+    // Now run the actual precheck with its own timeout
     let result = timeout(STAT_TIMEOUT, async {
-        // Send STAT command (TCP_NODELAY ensures immediate send)
-        let stat_command = stat_by_msgid(message_id.as_str());
-        debug!(
-            "Backend {:?} sending STAT command: {}",
-            backend_id,
-            stat_command.trim()
-        );
-        conn.write_all(stat_command.as_bytes())
-            .await
-            .context("Failed to write STAT command")?;
+        // Select command based on configuration
+        use crate::config::PrecheckCommand;
+        let (command, expected_code, cmd_name) = match precheck_cmd {
+            PrecheckCommand::Stat | PrecheckCommand::Auto => {
+                (stat_by_msgid(message_id.as_str()), 223, "STAT")
+            }
+            PrecheckCommand::Head => (
+                crate::protocol::head_by_msgid(message_id.as_str()),
+                221,
+                "HEAD",
+            ),
+        };
 
-        let cmd_len = stat_command.len() as u64;
+        debug!(
+            "Backend {:?} sending {} command: {}",
+            backend_id,
+            cmd_name,
+            command.trim()
+        );
+        conn.write_all(command.as_bytes())
+            .await
+            .with_context(|| format!("Failed to write {} command", cmd_name))?;
+
+        let cmd_len = command.len() as u64;
 
         // Read response
         let mut reader = BufReader::new(&mut *conn);
@@ -410,11 +440,24 @@ async fn check_backend_has_article(
         reader
             .read_line(&mut response)
             .await
-            .context("Failed to read STAT response")?;
+            .with_context(|| format!("Failed to read {} response", cmd_name))?;
+
+        // For HEAD command, we need to drain the multiline response
+        if matches!(precheck_cmd, PrecheckCommand::Head) {
+            // Read until terminator (".\r\n")
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await?;
+                if line == ".\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+        }
 
         let resp_len = response.len() as u64;
 
-        // Record metrics for precheck STAT
+        // Record metrics for precheck command
         if let Some(metrics) = metrics {
             use crate::types::MetricsBytes;
             let cmd_bytes = MetricsBytes::new(cmd_len);
@@ -422,15 +465,16 @@ async fn check_backend_has_article(
             let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
         }
 
-        // Parse status code (223 = article exists)
+        // Parse status code (223 for STAT, 221 for HEAD)
         let status_code = NntpResponse::parse_status_code(response.as_bytes());
         let has_article = status_code
-            .map(|code| code.as_u16() == 223)
+            .map(|code| code.as_u16() == expected_code)
             .unwrap_or(false);
 
         debug!(
-            "Backend {:?} STAT response for {}: '{}' (status_code={:?}, has_article={})",
+            "Backend {:?} {} response for {}: '{}' (status_code={:?}, has_article={})",
             backend_id,
+            cmd_name,
             message_id,
             response.trim(),
             status_code,
@@ -453,19 +497,34 @@ async fn check_backend_has_article(
             })
         }
         Ok(Err(e)) => {
+            let cmd_name = match precheck_cmd {
+                crate::config::PrecheckCommand::Stat | crate::config::PrecheckCommand::Auto => {
+                    "STAT"
+                }
+                crate::config::PrecheckCommand::Head => "HEAD",
+            };
             warn!(
-                "Backend {:?} STAT check FAILED for {}: {}",
-                backend_id, message_id, e
+                "Backend {:?} {} check FAILED for {}: {}",
+                backend_id, cmd_name, message_id, e
             );
-            Err(e.context(format!("Backend {:?} STAT check failed", backend_id)))
+            Err(e.context(format!(
+                "Backend {:?} {} check failed",
+                backend_id, cmd_name
+            )))
         }
         Err(_) => {
             // Timeout - likely pool exhaustion during bulk operations
             // Don't mark as not-having-article, just skip this backend in bitmap
             // (AWR will still consider it if no other backend is marked)
+            let cmd_name = match precheck_cmd {
+                crate::config::PrecheckCommand::Stat | crate::config::PrecheckCommand::Auto => {
+                    "STAT"
+                }
+                crate::config::PrecheckCommand::Head => "HEAD",
+            };
             warn!(
-                "Backend {:?} STAT TIMED OUT after {:?} for {} (pool likely exhausted, skipping)",
-                backend_id, STAT_TIMEOUT, message_id
+                "Backend {:?} {} TIMED OUT after {:?} for {} (pool likely exhausted, skipping)",
+                backend_id, cmd_name, STAT_TIMEOUT, message_id
             );
             // Return error so this backend isn't marked in availability bitmap
             Err(anyhow::anyhow!("Timeout - pool exhausted"))

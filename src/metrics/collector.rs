@@ -29,6 +29,8 @@ struct BackendMetrics {
     recv_micros_total: AtomicU64,
     connection_failures: AtomicU64,
     health_status: AtomicU8,
+    /// Precheck disagreements between STAT and HEAD
+    precheck_disagreements: AtomicU64,
 }
 
 impl BackendMetrics {
@@ -60,6 +62,7 @@ impl BackendMetrics {
                 self.connection_failures.load(Ordering::Relaxed),
             ),
             health_status: self.health_status.load(Ordering::Relaxed).into(),
+            precheck_disagreements: self.precheck_disagreements.load(Ordering::Relaxed),
         }
     }
 }
@@ -371,6 +374,13 @@ impl MetricsCollector {
     pub fn set_backend_health(&self, backend_id: BackendId, health: HealthStatus) {
         self.with_backend(backend_id, |b| {
             b.health_status.store(health.into(), Ordering::Relaxed);
+        });
+    }
+
+    #[inline]
+    pub fn record_precheck_disagreement(&self, backend_id: BackendId) {
+        self.with_backend(backend_id, |b| {
+            b.precheck_disagreements.fetch_add(1, Ordering::Relaxed);
         });
     }
 

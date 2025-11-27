@@ -366,7 +366,7 @@ async fn test_connection_error_handling() -> Result<()> {
 #[tokio::test]
 async fn test_per_command_pending_count_release() -> Result<()> {
     use std::sync::Arc;
-    
+
     // Setup mock backend
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -378,9 +378,18 @@ async fn test_per_command_pending_count_release() -> Result<()> {
     // Mock that responds to ARTICLE commands
     let mock = MockNntpServer::new(backend_port)
         .with_name("Test Backend")
-        .on_command("ARTICLE <test1@example.com>", "220 0 <test1@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n")
-        .on_command("ARTICLE <test2@example.com>", "220 0 <test2@example.com>\r\nSubject: Test2\r\n\r\nBody2\r\n.\r\n")
-        .on_command("ARTICLE <test3@example.com>", "220 0 <test3@example.com>\r\nSubject: Test3\r\n\r\nBody3\r\n.\r\n")
+        .on_command(
+            "ARTICLE <test1@example.com>",
+            "220 0 <test1@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        )
+        .on_command(
+            "ARTICLE <test2@example.com>",
+            "220 0 <test2@example.com>\r\nSubject: Test2\r\n\r\nBody2\r\n.\r\n",
+        )
+        .on_command(
+            "ARTICLE <test3@example.com>",
+            "220 0 <test3@example.com>\r\nSubject: Test3\r\n\r\nBody3\r\n.\r\n",
+        )
         .on_command("DATE", "111 20251120120000\r\n")
         .on_command("QUIT", "205 Goodbye\r\n")
         .spawn();
@@ -389,12 +398,14 @@ async fn test_per_command_pending_count_release() -> Result<()> {
 
     // Create proxy with small connection pool to make leak obvious
     let config = Config {
-        servers: vec![config_helpers::create_test_server_config_with_max_connections(
-            "127.0.0.1",
-            backend_port,
-            "backend",
-            3, // Small pool to trigger leak faster
-        )],
+        servers: vec![
+            config_helpers::create_test_server_config_with_max_connections(
+                "127.0.0.1",
+                backend_port,
+                "backend",
+                3, // Small pool to trigger leak faster
+            ),
+        ],
         ..Default::default()
     };
 
@@ -418,11 +429,15 @@ async fn test_per_command_pending_count_release() -> Result<()> {
     // Connect client
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
     let mut buffer = vec![0u8; 8192];
-    
+
     // Read greeting
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
-    assert!(greeting.contains("200"), "Expected greeting, got: {}", greeting);
+    assert!(
+        greeting.contains("200"),
+        "Expected greeting, got: {}",
+        greeting
+    );
 
     // Execute multiple successful commands and check pending count after each
     // Before the fix, pending count would increment on each command
@@ -430,11 +445,11 @@ async fn test_per_command_pending_count_release() -> Result<()> {
     for i in 1..=5 {
         let msg_id = format!("test{}@example.com", if i <= 3 { i } else { (i % 3) + 1 });
         let command = format!("ARTICLE <{}>\r\n", msg_id);
-        
+
         client.write_all(command.as_bytes()).await?;
         let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
         let response = String::from_utf8_lossy(&buffer[..n]);
-        
+
         // Should succeed
         assert!(
             response.contains("220"),
@@ -442,10 +457,10 @@ async fn test_per_command_pending_count_release() -> Result<()> {
             i,
             response
         );
-        
+
         // Wait for command to fully complete
         tokio::time::sleep(Duration::from_millis(50)).await;
-        
+
         // Check pending count - should be 0 after command completes
         // BUG: Without the fix, pending count will be `i` (leaked count)
         // FIX: With the fix, pending count should be 0
@@ -460,7 +475,7 @@ async fn test_per_command_pending_count_release() -> Result<()> {
     }
 
     // If we got here, pending counts were properly released
-    
+
     client.write_all(b"QUIT\r\n").await?;
     let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await;
 

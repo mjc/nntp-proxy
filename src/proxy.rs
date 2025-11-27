@@ -174,7 +174,12 @@ impl NntpProxyBuilder {
                 router::BackendSelector::new(self.config.routing.strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
+                    r.add_backend(
+                        backend_id,
+                        servers[idx].name.clone(),
+                        provider.clone(),
+                        servers[idx].precheck_command,
+                    );
                     r
                 },
             )
@@ -791,6 +796,7 @@ mod tests {
                     connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
+                    precheck_command: crate::config::PrecheckCommand::default(),
                 },
                 Server {
                     host: HostName::new("server2.example.com".to_string()).unwrap(),
@@ -805,6 +811,7 @@ mod tests {
                     connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
+                    precheck_command: crate::config::PrecheckCommand::default(),
                 },
                 Server {
                     host: HostName::new("server3.example.com".to_string()).unwrap(),
@@ -819,6 +826,7 @@ mod tests {
                     connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
+                    precheck_command: crate::config::PrecheckCommand::default(),
                 },
             ],
             ..Default::default()

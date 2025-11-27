@@ -14,6 +14,7 @@ fn test_backend_load_tracking() {
         backend_id,
         ServerName::new("test".to_string()).unwrap(),
         provider,
+        crate::config::PrecheckCommand::default(),
     );
 
     // Initially no load
