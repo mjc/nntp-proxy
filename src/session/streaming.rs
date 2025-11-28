@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 mod tail_buffer;
-use tail_buffer::TailBuffer;
+pub use tail_buffer::{TailBuffer, TerminatorStatus};
 
 /// Context for handling client write errors during streaming
 struct ClientWriteErrorContext<'a> {

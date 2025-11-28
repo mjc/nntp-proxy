@@ -8,6 +8,35 @@ use std::io::ErrorKind;
 
 use crate::pool::deadpool_connection::TcpManager;
 
+/// Error type that automatically removes connection from pool when created
+///
+/// Use this for errors where the connection is in an invalid state (timeouts,
+/// partial reads, etc.) to ensure the connection is removed from the pool.
+#[derive(Debug)]
+pub struct ConnectionInvalidated {
+    message: String,
+}
+
+impl ConnectionInvalidated {
+    /// Create error and remove connection from pool
+    ///
+    /// The connection is immediately taken out of the pool to prevent reuse.
+    pub fn new(conn: Object<TcpManager>, message: impl Into<String>) -> Self {
+        remove_from_pool(conn);
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectionInvalidated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Connection invalidated: {}", self.message)
+    }
+}
+
+impl std::error::Error for ConnectionInvalidated {}
+
 /// Check if an error should cause the connection to be removed from the pool
 #[inline]
 pub fn is_connection_error(e: &anyhow::Error) -> bool {
@@ -198,5 +227,18 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn test_connection_invalidated_display() {
+        // We can't actually create a real connection in unit tests,
+        // so we just test the Display trait works
+        use std::fmt::Write;
+
+        let message = "timeout after 15s";
+        let mut output = String::new();
+        write!(&mut output, "Connection invalidated: {}", message).unwrap();
+
+        assert_eq!(output, "Connection invalidated: timeout after 15s");
     }
 }

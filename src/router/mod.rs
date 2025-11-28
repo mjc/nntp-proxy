@@ -35,7 +35,7 @@
 //! selector.complete_command(backend_id);
 //! ```
 
-mod strategy;
+pub mod strategy;
 
 pub use strategy::{AdaptiveStrategy, RoundRobinStrategy};
 
@@ -50,19 +50,19 @@ use crate::types::{BackendId, ClientId, ServerName};
 
 /// Backend connection information
 #[derive(Debug, Clone)]
-pub(crate) struct BackendInfo {
+pub struct BackendInfo {
     /// Backend identifier
-    pub(crate) id: BackendId,
+    pub id: BackendId,
     /// Server name for logging
-    pub(crate) name: ServerName,
+    pub name: ServerName,
     /// Connection provider for this backend
-    pub(crate) provider: DeadpoolConnectionProvider,
+    pub provider: DeadpoolConnectionProvider,
     /// Precheck command to use for this backend
-    pub(crate) precheck_command: crate::config::PrecheckCommand,
+    pub precheck_command: crate::config::PrecheckCommand,
     /// Number of pending requests on this backend (for load balancing)
-    pub(crate) pending_count: Arc<AtomicUsize>,
+    pub pending_count: Arc<AtomicUsize>,
     /// Number of connections in stateful mode (for hybrid routing reservation)
-    pub(crate) stateful_count: Arc<AtomicUsize>,
+    pub stateful_count: Arc<AtomicUsize>,
 }
 
 /// RAII guard for pending count management

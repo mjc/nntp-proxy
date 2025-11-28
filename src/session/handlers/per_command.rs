@@ -316,19 +316,13 @@ impl ClientSession {
                 debug!("Location cache miss for {} - prechecking backends", msg_id);
 
                 let backends = router.all_backend_providers();
-                let num_backends = router.backend_count();
 
-                // Fast-fail optimization: For all message-ID based commands (STAT/ARTICLE/BODY/HEAD),
-                // return as soon as we find ONE backend with the article. The background task will
-                // complete the full precheck and update cache for future requests.
-                let fast_fail = true;
-
+                // Check ALL backends concurrently to build complete availability bitmap
+                // This ensures AWR has accurate data about which backends have the article
                 match crate::session::precheck::precheck_article_availability(
                     msg_id,
                     &backends,
                     location_cache,
-                    num_backends,
-                    fast_fail,
                     self.metrics.as_ref(),
                 )
                 .await
@@ -360,44 +354,60 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
-        let Some(availability) = backend_availability else {
-            // No availability info - use standard routing
-            return router.route_command(self.client_id, command);
-        };
+        use crate::config::RoutingStrategy;
 
-        // Check if any backend has the article
-        if !availability.has_any() {
-            // No backend has this article - return 430 immediately instead of trying backends
-            debug!(
-                "Precheck shows no backend has article {} - returning 430",
-                message_id.unwrap()
-            );
-            let error_msg = crate::protocol::error_response(430, "No such article");
-            client_write.write_all(error_msg.as_bytes()).await?;
-            backend_to_client_bytes.add(error_msg.len());
+        // Check routing strategy
+        match router.routing_strategy() {
+            RoutingStrategy::RoundRobin => {
+                // Round-robin: ignore availability bitmap, just use round-robin selection
+                router.route_command(self.client_id, command)
+            }
+            RoutingStrategy::AdaptiveWeighted => {
+                if let Some(availability) = backend_availability {
+                    // We have bitmap info from precheck
+                    if !availability.has_any() {
+                        // No backend has this article - return 430 immediately instead of trying backends
+                        debug!(
+                            "Precheck shows no backend has article {} - returning 430",
+                            message_id.unwrap()
+                        );
+                        let error_msg = crate::protocol::error_response(430, "No such article");
+                        client_write.write_all(error_msg.as_bytes()).await?;
+                        backend_to_client_bytes.add(error_msg.len());
 
-            // Complete routing even though we didn't use a backend
-            // (no backend to complete since we didn't route)
-            return Ok(crate::types::BackendId::from_index(0)); // Dummy backend ID
+                        // Complete routing even though we didn't use a backend
+                        // (no backend to complete since we didn't route)
+                        return Ok(crate::types::BackendId::from_index(0)); // Dummy backend ID
+                    }
+
+                    // Select best available backend using AWR filtered by bitmap
+                    return self.select_backend_with_awr(router, Some(availability));
+                }
+
+                // No bitmap (cache miss) - use AWR without bitmap filtering (consider all backends)
+                self.select_backend_with_awr(router, None)
+            }
         }
-
-        // Select best available backend using Adaptive Weighted Routing (AWR)
-        self.select_backend_with_awr(router, availability)
     }
 
     /// Apply Adaptive Weighted Routing algorithm to select best backend
+    ///
+    /// When availability bitmap is provided, only considers backends that have the article.
+    /// When None, considers all backends (for cache miss scenarios).
     fn select_backend_with_awr(
         &self,
         router: &BackendSelector,
-        availability: &crate::cache::BackendAvailability,
+        availability: Option<&crate::cache::BackendAvailability>,
     ) -> Result<crate::types::BackendId> {
         let mut selected_backend: Option<(crate::types::BackendId, f64)> = None;
 
         for i in 0..router.backend_count() {
             let backend_id = crate::types::BackendId::from_index(i);
 
-            // Skip backends that don't have the article
-            if !availability.has_article(backend_id) {
+            // Skip backends that don't have the article (when bitmap available)
+            if let Some(avail) = availability
+                && !avail.has_article(backend_id)
+            {
                 continue;
             }
 
@@ -735,6 +745,18 @@ impl ClientSession {
     )> {
         use crate::session::retry::{BACKEND_TIMEOUT, acquire_connection_with_timeout};
 
+        // Calculate adaptive timeout based on backend's historical performance
+        let timeout = if let Some(metrics) = &self.metrics {
+            let snapshot = metrics.snapshot();
+            if let Some(stats) = snapshot.backend_stats.get(backend_id.as_index()) {
+                stats.adaptive_timeout(BACKEND_TIMEOUT)
+            } else {
+                BACKEND_TIMEOUT
+            }
+        } else {
+            BACKEND_TIMEOUT
+        };
+
         // Get connection from pool with timeout
         let Some(provider) = router.backend_provider(backend_id) else {
             return Err(anyhow::anyhow!(
@@ -744,7 +766,7 @@ impl ClientSession {
         };
 
         let mut pooled_conn =
-            acquire_connection_with_timeout(provider, backend_id, BACKEND_TIMEOUT).await?;
+            acquire_connection_with_timeout(provider, backend_id, timeout).await?;
 
         debug!(
             "Client {} got pooled connection for backend {:?}",
@@ -756,8 +778,8 @@ impl ClientSession {
         // Get fresh buffer for this attempt
         let mut buffer = self.buffer_pool.acquire().await;
 
-        // Execute command with timeout
-        let exec_result = tokio::time::timeout(BACKEND_TIMEOUT, async {
+        // Execute command with adaptive timeout
+        let exec_result = tokio::time::timeout(timeout, async {
             if should_cache {
                 self.execute_command_with_caching(
                     &mut pooled_conn,
@@ -789,12 +811,24 @@ impl ClientSession {
                 Ok((exec_res, exec_cmd_bytes, exec_resp_bytes))
             }
             Err(_) => {
-                warn!("Backend {:?} execution timeout", backend_id);
+                let cmd_name = command.split_whitespace().next().unwrap_or("UNKNOWN");
+                warn!(
+                    "Backend {:?} command execution timeout after {:?} (command: {}) - removing connection from pool",
+                    backend_id, timeout, cmd_name
+                );
+
+                // Create error that automatically removes connection from pool
+                // Connection has unread data in buffers and cannot be reused
+                let err = crate::pool::connection_guard::ConnectionInvalidated::new(
+                    pooled_conn,
+                    format!(
+                        "Backend {:?} {} timeout after {:?}",
+                        backend_id, cmd_name, timeout
+                    ),
+                );
+
                 router.complete_command(backend_id);
-                Err(anyhow::anyhow!(
-                    "Backend {:?} execution timeout",
-                    backend_id
-                ))
+                Err(err.into())
             }
         }
     }
@@ -1679,5 +1713,140 @@ mod tests {
                 cmd
             );
         }
+    }
+
+    #[test]
+    fn test_routing_strategy_selection_respects_config() {
+        use crate::config::RoutingStrategy;
+        use crate::router::BackendSelector;
+
+        // Test round-robin strategy
+        let rr_selector = BackendSelector::new(RoutingStrategy::RoundRobin);
+        assert_eq!(rr_selector.routing_strategy(), RoutingStrategy::RoundRobin);
+
+        // Test adaptive-weighted strategy
+        let awr_selector = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+        assert_eq!(
+            awr_selector.routing_strategy(),
+            RoutingStrategy::AdaptiveWeighted
+        );
+    }
+
+    #[test]
+    fn test_select_backend_with_awr_all_backends_when_no_bitmap() {
+        use crate::config::RoutingStrategy;
+        use crate::pool::DeadpoolConnectionProvider;
+        use crate::router::BackendSelector;
+        use crate::types::{BackendId, ServerName};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(crate::auth::AuthHandler::new(None, None).unwrap());
+
+        let session = ClientSession::builder(addr, buffer_pool, auth_handler).build();
+
+        // Create router with adaptive strategy
+        let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+
+        // Add two backends
+        let provider1 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "backend1".to_string(),
+            10,
+            None,
+            None,
+        );
+        let provider2 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "backend2".to_string(),
+            10,
+            None,
+            None,
+        );
+
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::new("backend1".to_string()).unwrap(),
+            provider1,
+            crate::config::PrecheckCommand::default(),
+        );
+        router.add_backend(
+            BackendId::from_index(1),
+            ServerName::new("backend2".to_string()).unwrap(),
+            provider2,
+            crate::config::PrecheckCommand::default(),
+        );
+
+        // Without availability bitmap (None), AWR should consider all backends
+        let result = session.select_backend_with_awr(&router, None);
+        assert!(result.is_ok());
+        let backend_id = result.unwrap();
+        assert!(backend_id.as_index() < 2);
+    }
+
+    #[test]
+    fn test_select_backend_with_awr_filtered_by_bitmap() {
+        use crate::cache::BackendAvailability;
+        use crate::config::RoutingStrategy;
+        use crate::pool::DeadpoolConnectionProvider;
+        use crate::router::BackendSelector;
+        use crate::types::{BackendId, ServerName};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let buffer_pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::new(1024).unwrap(), 4);
+        let auth_handler = Arc::new(crate::auth::AuthHandler::new(None, None).unwrap());
+
+        let session = ClientSession::builder(addr, buffer_pool, auth_handler).build();
+
+        // Create router with adaptive strategy
+        let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+
+        // Add two backends
+        let provider1 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "backend1".to_string(),
+            10,
+            None,
+            None,
+        );
+        let provider2 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "backend2".to_string(),
+            10,
+            None,
+            None,
+        );
+
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::new("backend1".to_string()).unwrap(),
+            provider1,
+            crate::config::PrecheckCommand::default(),
+        );
+        router.add_backend(
+            BackendId::from_index(1),
+            ServerName::new("backend2".to_string()).unwrap(),
+            provider2,
+            crate::config::PrecheckCommand::default(),
+        );
+
+        // Create availability bitmap with only backend 1 having the article
+        let mut availability = BackendAvailability::new();
+        availability.mark_available(BackendId::from_index(1));
+
+        // AWR should only select backend 1
+        let result = session.select_backend_with_awr(&router, Some(&availability));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), BackendId::from_index(1));
     }
 }

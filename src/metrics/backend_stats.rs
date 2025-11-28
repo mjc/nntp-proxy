@@ -141,6 +141,46 @@ impl BackendStats {
             .saturating_add(self.bytes_received.as_u64())
     }
 
+    /// Calculate adaptive timeout based on backend performance
+    ///
+    /// Returns timeout = mean + 3*mean (approximates mean + 2*stddev for normal distribution)
+    /// Falls back to 60 seconds if no measurements available.
+    ///
+    /// This prevents timeouts on legitimately slow backends while catching servers
+    /// that deliberately delay 430 responses.
+    #[must_use]
+    pub fn adaptive_timeout(&self, _default_timeout: std::time::Duration) -> std::time::Duration {
+        use std::time::Duration;
+
+        // Need at least 10 measurements for reasonable estimate
+        const MIN_MEASUREMENTS: u64 = 10;
+
+        // Start with conservative 60s timeout until we have data
+        const FALLBACK_TIMEOUT_SECS: u64 = 60;
+
+        if self.ttfb_count.get() < MIN_MEASUREMENTS {
+            return Duration::from_secs(FALLBACK_TIMEOUT_SECS);
+        }
+
+        // Calculate mean TTFB in seconds
+        if let Some(mean_ms) = self.average_ttfb_ms() {
+            let mean_secs = mean_ms / 1000.0;
+
+            // Use 3x mean as approximation of mean + 2*stddev
+            // (for normal distribution, ~95% of values fall within mean ± 2*stddev)
+            let adaptive_secs = mean_secs * 3.0;
+
+            // Clamp to reasonable bounds: [5s, 120s]
+            const MIN_TIMEOUT_SECS: f64 = 5.0;
+            const MAX_TIMEOUT_SECS: f64 = 120.0;
+
+            let clamped_secs = adaptive_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
+            Duration::from_secs_f64(clamped_secs)
+        } else {
+            Duration::from_secs(FALLBACK_TIMEOUT_SECS)
+        }
+    }
+
     /// Check if backend has any activity
     #[must_use]
     #[inline]
@@ -415,5 +455,89 @@ mod tests {
         assert_eq!(stats.total_commands.get(), cloned.total_commands.get());
         assert_eq!(stats.total_bytes(), cloned.total_bytes());
         assert_eq!(stats.health_status, cloned.health_status);
+    }
+
+    #[test]
+    fn test_adaptive_timeout_with_sufficient_measurements() {
+        use std::time::Duration;
+
+        // Backend with 1ms average TTFB (1000 microseconds)
+        let stats = BackendStats {
+            ttfb_micros_total: TtfbMicros::new(10_000), // 10 measurements * 1000 micros each
+            ttfb_count: TimingMeasurementCount::new(10),
+            ..Default::default()
+        };
+
+        let default = Duration::from_secs(15);
+        let timeout = stats.adaptive_timeout(default);
+
+        // Should be 3x mean = 3ms, but clamped to min 5s
+        assert_eq!(timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_adaptive_timeout_slow_backend() {
+        use std::time::Duration;
+
+        // Slow backend: 10s average TTFB
+        let stats = BackendStats {
+            ttfb_micros_total: TtfbMicros::new(100_000_000), // 10 * 10,000,000 micros
+            ttfb_count: TimingMeasurementCount::new(10),
+            ..Default::default()
+        };
+
+        let default = Duration::from_secs(15);
+        let timeout = stats.adaptive_timeout(default);
+
+        // 3x mean = 30s
+        assert_eq!(timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_adaptive_timeout_very_slow_backend_clamped() {
+        use std::time::Duration;
+
+        // Very slow backend: 50s average TTFB
+        let stats = BackendStats {
+            ttfb_micros_total: TtfbMicros::new(500_000_000), // 10 * 50,000,000 micros
+            ttfb_count: TimingMeasurementCount::new(10),
+            ..Default::default()
+        };
+
+        let default = Duration::from_secs(15);
+        let timeout = stats.adaptive_timeout(default);
+
+        // 3x mean = 150s, but clamped to max 120s
+        assert_eq!(timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_adaptive_timeout_insufficient_measurements() {
+        use std::time::Duration;
+
+        // Only 5 measurements - not enough for reliable estimate
+        let stats = BackendStats {
+            ttfb_micros_total: TtfbMicros::new(5000),
+            ttfb_count: TimingMeasurementCount::new(5),
+            ..Default::default()
+        };
+
+        let default = Duration::from_secs(15);
+        let timeout = stats.adaptive_timeout(default);
+
+        // Should return 60s fallback (conservative for BODY/ARTICLE)
+        assert_eq!(timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_adaptive_timeout_no_measurements() {
+        use std::time::Duration;
+
+        let stats = BackendStats::default();
+        let default = Duration::from_secs(15);
+        let timeout = stats.adaptive_timeout(default);
+
+        // Should return 60s fallback (conservative for BODY/ARTICLE)
+        assert_eq!(timeout, Duration::from_secs(60));
     }
 }

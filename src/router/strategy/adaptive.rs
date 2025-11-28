@@ -6,6 +6,7 @@
 //! - Pool saturation (30%)
 
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
 use tracing::debug;
 
 use crate::pool::ConnectionProvider;
@@ -23,59 +24,107 @@ impl AdaptiveStrategy {
         Self {}
     }
 
-    /// Select backend with lowest adaptive score
-    pub(crate) fn select<'a>(&self, backends: &'a [BackendInfo]) -> Option<&'a BackendInfo> {
-        backends
-            .iter()
-            .min_by(|a, b| {
-                let score_a = self.calculate_score(a);
-                let score_b = self.calculate_score(b);
-                score_a
-                    .partial_cmp(&score_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .inspect(|backend| {
-                let score = self.calculate_score(backend);
-                debug!(
-                    "Adaptive selected backend {:?} ({}) with score {:.3}",
-                    backend.id, backend.name, score
-                );
-            })
+    /// Select backend using weighted random distribution
+    ///
+    /// Lower scores receive exponentially higher selection probability,
+    /// ensuring load distribution while preferring less-loaded backends.
+    pub fn select<'a>(&self, backends: &'a [BackendInfo]) -> Option<&'a BackendInfo> {
+        if backends.is_empty() {
+            return None;
+        }
+
+        let scores: Vec<_> = backends.iter().map(|b| self.calculate_score(b)).collect();
+        let weights = scores.iter().map(score_to_weight).collect::<Vec<_>>();
+        let total_weight: f64 = weights.iter().sum();
+
+        if total_weight == 0.0 {
+            return Some(&backends[0]);
+        }
+
+        let selection_point = generate_random_point() * total_weight;
+        select_by_weighted_roulette(backends, &weights, &scores, selection_point)
     }
 
-    /// Calculate adaptive weighted score for a backend (lower is better)
-    pub(crate) fn calculate_score(&self, backend: &BackendInfo) -> f64 {
-        let status = backend.provider.status();
-        let max_size = status.max_size.get() as f64;
-        let available = status.available.get() as f64;
-        let pending_raw = backend.pending_count.load(Ordering::Relaxed);
+    /// Calculate backend load score (lower is better)
+    ///
+    /// Weighted components:
+    /// - Pool saturation (40%): Inverse of available connections
+    /// - Active requests (30%): Normalized pending count
+    /// - Pool pressure (30%): Quadratic penalty for high utilization
+    pub fn calculate_score(&self, backend: &BackendInfo) -> f64 {
+        let pool_status = backend.provider.status();
+        let max_conns = pool_status.max_size.get() as f64;
 
-        // Detect underflow (pending > half of usize::MAX is impossible)
-        let pending = if pending_raw > (usize::MAX / 2) {
-            0.0
-        } else {
-            pending_raw as f64
-        };
-
-        // Prevent division by zero
-        if max_size == 0.0 {
+        if max_conns == 0.0 {
             return f64::INFINITY;
         }
 
-        let used = max_size - available;
+        let available_conns = pool_status.available.get() as f64;
+        let pending_requests =
+            sanitize_pending_count(backend.pending_count.load(Ordering::Relaxed));
+        let used_conns = max_conns - available_conns;
 
-        // Weighted scoring components:
-        // 1. Availability (40%) - inverse of available connections
-        let availability_score = 1.0 - (available / max_size);
+        let saturation = 1.0 - (available_conns / max_conns);
+        let load = pending_requests / max_conns;
+        let pressure = (used_conns / max_conns).powi(2);
 
-        // 2. Load (30%) - pending requests normalized
-        let load_score = pending / max_size;
+        (saturation * 0.40) + (load * 0.30) + (pressure * 0.30)
+    }
+}
 
-        // 3. Saturation (30%) - quadratic penalty for pool usage
-        let saturation_ratio = used / max_size;
-        let saturation_score = saturation_ratio * saturation_ratio;
+/// Convert score to selection weight (lower score = higher weight)
+#[inline]
+fn score_to_weight(score: &f64) -> f64 {
+    (-score).exp()
+}
 
-        (availability_score * 0.40) + (load_score * 0.30) + (saturation_score * 0.30)
+/// Generate random point in [0, 1) using SystemTime entropy
+#[inline]
+fn generate_random_point() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    // Fast LCG for pseudo-randomness
+    let lcg_output = nanos.wrapping_mul(1103515245).wrapping_add(12345) >> 16;
+    lcg_output as f64 / u64::MAX as f64
+}
+
+/// Select backend using weighted roulette wheel selection
+fn select_by_weighted_roulette<'a>(
+    backends: &'a [BackendInfo],
+    weights: &[f64],
+    scores: &[f64],
+    mut selection_point: f64,
+) -> Option<&'a BackendInfo> {
+    weights
+        .iter()
+        .enumerate()
+        .find_map(|(idx, &weight)| {
+            selection_point -= weight;
+            if selection_point <= 0.0 {
+                let backend = &backends[idx];
+                let total_weight: f64 = weights.iter().sum();
+                debug!(
+                    "AWR selected backend {:?} ({}) - score: {:.3}, weight: {:.3}/{:.3}",
+                    backend.id, backend.name, scores[idx], weight, total_weight
+                );
+                Some(backend)
+            } else {
+                None
+            }
+        })
+        .or_else(|| backends.last())
+}
+
+/// Detect and sanitize underflowed pending counts
+#[inline]
+fn sanitize_pending_count(raw: usize) -> f64 {
+    if raw > (usize::MAX / 2) {
+        0.0 // Underflow detected
+    } else {
+        raw as f64
     }
 }
 

@@ -387,14 +387,11 @@ fn render_backend_list(
                     };
 
                     Some(format!(
-                        "  Pend: {} | Pool: {}/{} | AWR: {}",
-                        pending_display, info.available, info.max_size, score_display
+                        "  Pend: {} AWR: {}",
+                        pending_display, score_display
                     ))
                 } else {
-                    Some(format!(
-                        "  Pend: {} | Pool: {}/{}",
-                        pending_display, info.available, info.max_size
-                    ))
+                    Some(format!("  Pend: {}", pending_display))
                 }
             } else {
                 None

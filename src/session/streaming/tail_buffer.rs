@@ -6,7 +6,7 @@ use crate::protocol::{NntpResponse, TERMINATOR_TAIL_SIZE};
 
 /// Status of terminator detection in a chunk
 #[derive(Debug, Clone, Copy)]
-pub(super) enum TerminatorStatus {
+pub enum TerminatorStatus {
     /// Complete terminator found at this position (position is after terminator)
     FoundAt(usize),
     /// Terminator spans the boundary between tail and current chunk
@@ -17,11 +17,11 @@ pub(super) enum TerminatorStatus {
 
 impl TerminatorStatus {
     /// Returns true if a terminator was found (either complete or spanning)
-    pub(super) fn is_found(self) -> bool {
+    pub fn is_found(self) -> bool {
         !matches!(self, Self::NotFound)
     }
     /// Get the number of bytes to write from the chunk
-    pub(super) fn write_len(self, chunk_size: usize) -> usize {
+    pub fn write_len(self, chunk_size: usize) -> usize {
         match self {
             Self::FoundAt(pos) => pos,
             Self::Spanning | Self::NotFound => chunk_size,
@@ -33,14 +33,14 @@ impl TerminatorStatus {
 ///
 /// Used to detect terminators that span across chunk boundaries.
 #[derive(Default)]
-pub(super) struct TailBuffer {
+pub struct TailBuffer {
     data: [u8; TERMINATOR_TAIL_SIZE],
     len: usize,
 }
 
 impl TailBuffer {
     /// Update tail with the last bytes from a chunk
-    pub(super) fn update(&mut self, chunk: &[u8]) {
+    pub fn update(&mut self, chunk: &[u8]) {
         if chunk.len() >= TERMINATOR_TAIL_SIZE {
             self.data
                 .copy_from_slice(&chunk[chunk.len() - TERMINATOR_TAIL_SIZE..]);
@@ -75,7 +75,7 @@ impl TailBuffer {
     /// **Performance**: find_terminator_end() checks end first (O(1)),
     /// only scans with memchr if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
-    pub(super) fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
+    pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
         if let Some(pos) = NntpResponse::find_terminator_end(chunk) {
             TerminatorStatus::FoundAt(pos)
         } else if self.has_spanning_terminator(chunk) {

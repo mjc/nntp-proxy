@@ -15,6 +15,7 @@ use crate::router::BackendSelector;
 use crate::types::{BackendId, protocol::MessageId};
 
 /// Default timeout for backend operations
+/// Back to 15s - precheck now uses separate runtime to avoid contention
 pub const BACKEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Find next available backend from availability bitmap
@@ -35,9 +36,21 @@ pub async fn acquire_connection_with_timeout(
     backend: BackendId,
     timeout: Duration,
 ) -> Result<deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>> {
+    use crate::pool::ConnectionProvider;
+    let pool_status = provider.status();
     tokio::time::timeout(timeout, provider.get_pooled_connection())
         .await
-        .map_err(|_| anyhow!("Backend {:?} pool timeout", backend))?
+        .map_err(|_| {
+            let waiting = pool_status.max_size.get() - pool_status.available.get();
+            anyhow!(
+                "Backend {:?} pool acquire timeout after {:?} (pool: {}/{} available, {} waiting)",
+                backend,
+                timeout,
+                pool_status.available,
+                pool_status.max_size,
+                waiting
+            )
+        })?
         .map_err(|e| anyhow!("Backend {:?} pool error: {}", backend, e))
 }
 
