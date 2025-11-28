@@ -4,7 +4,7 @@
 //! can be routed to a different backend. It includes the core command execution
 //! logic used by all routing modes.
 
-use crate::pool::{ConnectionProvider, PooledBuffer};
+use crate::pool::PooledBuffer;
 use crate::session::common;
 use crate::session::{ClientSession, backend, connection};
 use anyhow::Result;
@@ -344,154 +344,14 @@ impl ClientSession {
         }
     }
 
-    /// Select best backend using Adaptive Weighted Routing or round-robin
-    async fn select_backend_for_command(
+    /// Select backend using the router's configured strategy
+    fn select_backend_for_command(
         &self,
         router: &BackendSelector,
         command: &str,
-        backend_availability: Option<&crate::cache::BackendAvailability>,
-        message_id: Option<&crate::types::protocol::MessageId<'_>>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_to_client_bytes: &mut BytesTransferred,
     ) -> Result<crate::types::BackendId> {
-        use crate::config::RoutingStrategy;
-
-        // Check routing strategy
-        match router.routing_strategy() {
-            RoutingStrategy::RoundRobin => {
-                // Round-robin: ignore availability bitmap, just use round-robin selection
-                router.route_command(self.client_id, command)
-            }
-            RoutingStrategy::AdaptiveWeighted => {
-                if let Some(availability) = backend_availability {
-                    // We have bitmap info from precheck
-                    if !availability.has_any() {
-                        // No backend has this article - return 430 immediately instead of trying backends
-                        debug!(
-                            "Precheck shows no backend has article {} - returning 430",
-                            message_id.unwrap()
-                        );
-                        let error_msg = crate::protocol::error_response(430, "No such article");
-                        client_write.write_all(error_msg.as_bytes()).await?;
-                        backend_to_client_bytes.add(error_msg.len());
-
-                        // Complete routing even though we didn't use a backend
-                        // (no backend to complete since we didn't route)
-                        return Ok(crate::types::BackendId::from_index(0)); // Dummy backend ID
-                    }
-
-                    // Select best available backend using AWR filtered by bitmap
-                    return self.select_backend_with_awr(router, Some(availability));
-                }
-
-                // No bitmap (cache miss) - use AWR without bitmap filtering (consider all backends)
-                self.select_backend_with_awr(router, None)
-            }
-        }
-    }
-
-    /// Apply Adaptive Weighted Routing algorithm to select best backend
-    ///
-    /// When availability bitmap is provided, only considers backends that have the article.
-    /// When None, considers all backends (for cache miss scenarios).
-    fn select_backend_with_awr(
-        &self,
-        router: &BackendSelector,
-        availability: Option<&crate::cache::BackendAvailability>,
-    ) -> Result<crate::types::BackendId> {
-        let mut selected_backend: Option<(crate::types::BackendId, f64)> = None;
-
-        for i in 0..router.backend_count() {
-            let backend_id = crate::types::BackendId::from_index(i);
-
-            // Skip backends that don't have the article (when bitmap available)
-            if let Some(avail) = availability
-                && !avail.has_article(backend_id)
-            {
-                continue;
-            }
-
-            // Calculate adaptive score for this backend
-            if let Some(provider) = router.backend_provider(backend_id) {
-                let status = provider.status();
-                let max_size = status.max_size.get() as f64;
-                let available = status.available.get() as f64;
-                let pending = router.backend_load(backend_id).unwrap_or(0) as f64;
-
-                // Prevent division by zero
-                if max_size == 0.0 {
-                    continue;
-                }
-
-                let used = max_size - available;
-
-                // Get historical transfer performance if available
-                let transfer_penalty = self.calculate_transfer_penalty(backend_id);
-
-                // AWR scoring (lower is better):
-                // - 30% connection availability
-                // - 20% current load
-                // - 20% saturation penalty (quadratic)
-                // - 30% transfer speed penalty (prefer faster backends)
-                let availability_score = 1.0 - (available / max_size);
-                let load_score = pending / max_size;
-                let saturation_ratio = used / max_size;
-                let saturation_score = saturation_ratio * saturation_ratio;
-
-                let score = (availability_score * 0.30)
-                    + (load_score * 0.20)
-                    + (saturation_score * 0.20)
-                    + (transfer_penalty * 0.30);
-
-                debug!(
-                    "Backend {:?}: available={}/{}, pending={}, transfer_penalty={:.3}, score={:.3} (lower=better)",
-                    backend_id,
-                    available as usize,
-                    max_size as usize,
-                    pending as usize,
-                    transfer_penalty,
-                    score
-                );
-
-                // Select backend with lowest score
-                if selected_backend.is_none() || score < selected_backend.unwrap().1 {
-                    selected_backend = Some((backend_id, score));
-                }
-            }
-        }
-
-        // Extract the selected backend
-        selected_backend
-            .map(|(id, score)| {
-                debug!("AWR selected backend {:?} with score {:.3}", id, score);
-                Ok(id)
-            })
-            .unwrap_or_else(|| {
-                warn!("Logic error: has_any() was true but no backend found - using round-robin");
-                Err(anyhow::anyhow!("No backend available"))
-            })
-    }
-
-    /// Calculate transfer penalty based on historical performance metrics
-    fn calculate_transfer_penalty(&self, backend_id: crate::types::BackendId) -> f64 {
-        let Some(ref metrics) = self.metrics else {
-            return 0.5; // No metrics - neutral penalty
-        };
-
-        let snapshot = metrics.snapshot();
-        let Some(backend_stats) = snapshot.backend_stats.get(backend_id.as_index()) else {
-            return 0.5; // Unknown - neutral penalty
-        };
-
-        // Calculate bytes/sec from backend's historical performance
-        // Higher transfer rate = lower penalty
-        let uptime_secs = snapshot.uptime.as_secs_f64().max(1.0);
-        let bytes_received = backend_stats.bytes_received.as_u64() as f64;
-        let transfer_rate = bytes_received / uptime_secs;
-
-        // Normalize: 0 MB/s = 1.0 penalty, 10+ MB/s = 0.0 penalty
-        let mb_per_sec = transfer_rate / 1_000_000.0;
-        1.0 - (mb_per_sec / 10.0).min(1.0)
+        // Router handles all strategy logic (round-robin, AWR, etc.)
+        router.route_command(self.client_id, command)
     }
 
     /// Try to serve STAT command directly from precheck results
@@ -587,16 +447,7 @@ impl ClientSession {
             .await;
 
         // Initial routing decision
-        let backend_id = self
-            .select_backend_for_command(
-                router,
-                command,
-                backend_availability.as_ref(),
-                message_id.as_ref(),
-                client_write,
-                backend_to_client_bytes,
-            )
-            .await?;
+        let backend_id = self.select_backend_for_command(router, command)?;
 
         // Try to serve STAT from cache
         if let Some(backend) = self
@@ -1730,123 +1581,5 @@ mod tests {
             awr_selector.routing_strategy(),
             RoutingStrategy::AdaptiveWeighted
         );
-    }
-
-    #[test]
-    fn test_select_backend_with_awr_all_backends_when_no_bitmap() {
-        use crate::config::RoutingStrategy;
-        use crate::pool::DeadpoolConnectionProvider;
-        use crate::router::BackendSelector;
-        use crate::types::{BackendId, ServerName};
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::sync::Arc;
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool =
-            crate::pool::BufferPool::new(crate::types::BufferSize::new(1024).unwrap(), 4);
-        let auth_handler = Arc::new(crate::auth::AuthHandler::new(None, None).unwrap());
-
-        let session = ClientSession::builder(addr, buffer_pool, auth_handler).build();
-
-        // Create router with adaptive strategy
-        let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
-
-        // Add two backends
-        let provider1 = DeadpoolConnectionProvider::new(
-            "localhost".to_string(),
-            119,
-            "backend1".to_string(),
-            10,
-            None,
-            None,
-        );
-        let provider2 = DeadpoolConnectionProvider::new(
-            "localhost".to_string(),
-            119,
-            "backend2".to_string(),
-            10,
-            None,
-            None,
-        );
-
-        router.add_backend(
-            BackendId::from_index(0),
-            ServerName::new("backend1".to_string()).unwrap(),
-            provider1,
-            crate::config::PrecheckCommand::default(),
-        );
-        router.add_backend(
-            BackendId::from_index(1),
-            ServerName::new("backend2".to_string()).unwrap(),
-            provider2,
-            crate::config::PrecheckCommand::default(),
-        );
-
-        // Without availability bitmap (None), AWR should consider all backends
-        let result = session.select_backend_with_awr(&router, None);
-        assert!(result.is_ok());
-        let backend_id = result.unwrap();
-        assert!(backend_id.as_index() < 2);
-    }
-
-    #[test]
-    fn test_select_backend_with_awr_filtered_by_bitmap() {
-        use crate::cache::BackendAvailability;
-        use crate::config::RoutingStrategy;
-        use crate::pool::DeadpoolConnectionProvider;
-        use crate::router::BackendSelector;
-        use crate::types::{BackendId, ServerName};
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::sync::Arc;
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool =
-            crate::pool::BufferPool::new(crate::types::BufferSize::new(1024).unwrap(), 4);
-        let auth_handler = Arc::new(crate::auth::AuthHandler::new(None, None).unwrap());
-
-        let session = ClientSession::builder(addr, buffer_pool, auth_handler).build();
-
-        // Create router with adaptive strategy
-        let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
-
-        // Add two backends
-        let provider1 = DeadpoolConnectionProvider::new(
-            "localhost".to_string(),
-            119,
-            "backend1".to_string(),
-            10,
-            None,
-            None,
-        );
-        let provider2 = DeadpoolConnectionProvider::new(
-            "localhost".to_string(),
-            119,
-            "backend2".to_string(),
-            10,
-            None,
-            None,
-        );
-
-        router.add_backend(
-            BackendId::from_index(0),
-            ServerName::new("backend1".to_string()).unwrap(),
-            provider1,
-            crate::config::PrecheckCommand::default(),
-        );
-        router.add_backend(
-            BackendId::from_index(1),
-            ServerName::new("backend2".to_string()).unwrap(),
-            provider2,
-            crate::config::PrecheckCommand::default(),
-        );
-
-        // Create availability bitmap with only backend 1 having the article
-        let mut availability = BackendAvailability::new();
-        availability.mark_available(BackendId::from_index(1));
-
-        // AWR should only select backend 1
-        let result = session.select_backend_with_awr(&router, Some(&availability));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), BackendId::from_index(1));
     }
 }

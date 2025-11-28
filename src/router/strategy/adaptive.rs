@@ -5,12 +5,22 @@
 //! - Current pending load (30%)
 //! - Pool saturation (30%)
 
+use std::cell::RefCell;
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
 use tracing::debug;
 
 use crate::pool::ConnectionProvider;
 use crate::router::BackendInfo;
+
+thread_local! {
+    static RNG_STATE: RefCell<u64> = RefCell::new({
+        use std::time::SystemTime;
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    });
+}
 
 /// Adaptive weighted routing strategy
 #[derive(Debug)]
@@ -78,17 +88,24 @@ fn score_to_weight(score: &f64) -> f64 {
     (-score).exp()
 }
 
-/// Generate random point in [0, 1) using SystemTime entropy
+/// Generate random point in [0, 1) using thread-local xorshift64*
+///
+/// Uses xorshift64* PRNG with thread-local state to ensure high-quality
+/// randomness even under high-frequency calls (1M+ calls/sec).
 #[inline]
 fn generate_random_point() -> f64 {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-
-    // Fast LCG for pseudo-randomness
-    let lcg_output = nanos.wrapping_mul(1103515245).wrapping_add(12345) >> 16;
-    lcg_output as f64 / u64::MAX as f64
+    RNG_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        
+        // xorshift64* algorithm
+        *s ^= *s >> 12;
+        *s ^= *s << 25;
+        *s ^= *s >> 27;
+        let result = s.wrapping_mul(0x2545F4914F6CDD1D);
+        
+        // Convert to [0, 1)
+        (result >> 11) as f64 / (1u64 << 53) as f64
+    })
 }
 
 /// Select backend using weighted roulette wheel selection
