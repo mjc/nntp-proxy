@@ -434,6 +434,9 @@ impl BackendSelector {
     ) -> Option<BackendId> {
         use tracing::debug;
 
+        // Take metrics snapshot ONCE for all backends (avoid repeated snapshot() calls)
+        let metrics_snapshot = metrics.map(|m| m.snapshot());
+
         let mut selected_backend: Option<(BackendId, f64)> = None;
 
         for backend in &self.backends {
@@ -456,8 +459,7 @@ impl BackendSelector {
             let used = max_size - available;
 
             // Get historical transfer performance if available
-            let transfer_penalty = if let Some(metrics_ref) = metrics {
-                let snapshot = metrics_ref.snapshot();
+            let transfer_penalty = if let Some(ref snapshot) = metrics_snapshot {
                 if let Some(backend_stats) = snapshot.backend_stats.get(backend.id.as_index()) {
                     // Calculate bytes/sec from backend's historical performance
                     // Higher transfer rate = lower penalty
