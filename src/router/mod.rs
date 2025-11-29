@@ -84,8 +84,9 @@ pub struct BackendInfo {
 /// // pending count auto-decremented when guard drops
 /// ```
 pub struct PendingGuard<'a> {
-    selector: &'a BackendSelector,
-    backend_id: BackendId,
+    pub(self) selector: &'a BackendSelector,
+    pub(self) backend_id: BackendId,
+    pub(self) skip_decrement: bool,
 }
 
 impl<'a> PendingGuard<'a> {
@@ -95,13 +96,25 @@ impl<'a> PendingGuard<'a> {
         Self {
             selector,
             backend_id,
+            skip_decrement: false,
+        }
+    }
+
+    /// Create guard without incrementing (for wrapping already-incremented backend)
+    fn wrap_existing(selector: &'a BackendSelector, backend_id: BackendId) -> Self {
+        Self {
+            selector,
+            backend_id,
+            skip_decrement: false,
         }
     }
 }
 
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
-        self.selector.complete_command(self.backend_id);
+        if !self.skip_decrement {
+            self.selector.complete_command(self.backend_id);
+        }
     }
 }
 
@@ -209,6 +222,8 @@ impl BackendSelector {
 
     /// Select a backend for the given command using the configured strategy
     /// Returns the backend ID to use for this command
+    ///
+    /// DEPRECATED: Use route_command_guarded() instead to ensure pending count is properly managed
     pub fn route_command(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
         let backend = self.select_backend().ok_or_else(|| {
             anyhow::anyhow!(
@@ -240,6 +255,35 @@ impl BackendSelector {
         }
 
         Ok(backend.id)
+    }
+
+    /// Select a backend and return a RAII guard that manages pending count
+    ///
+    /// Returns (BackendId, PendingGuard) where the guard automatically decrements
+    /// pending_count on drop. This prevents pending count leaks from early returns.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use nntp_proxy::router::BackendSelector;
+    /// # use nntp_proxy::types::ClientId;
+    /// # let selector = BackendSelector::default();
+    /// # let client_id = ClientId::new();
+    /// let (backend_id, _guard) = selector.route_command_guarded(client_id, "LIST")?;
+    /// // Use backend_id...
+    /// // _guard automatically decrements pending_count on drop
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn route_command_guarded(
+        &self,
+        client_id: ClientId,
+        command: &str,
+    ) -> Result<(BackendId, PendingGuard<'_>)> {
+        let backend_id = self.route_command(client_id, command)?;
+
+        // Wrap the already-incremented backend (don't double-increment!)
+        let guard = PendingGuard::wrap_existing(self, backend_id);
+
+        Ok((backend_id, guard))
     }
 
     /// Mark a command as complete, decrementing the pending count

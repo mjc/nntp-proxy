@@ -53,7 +53,7 @@ fn test_awr_distributes_across_backends() -> Result<()> {
     for _ in 0..100 {
         let backend_id = router.route_command(client_id, "ARTICLE <test@example.com>")?;
         *selections.entry(backend_id.as_index()).or_insert(0) += 1;
-        
+
         // Complete command to reset pending count
         router.complete_command(backend_id);
     }
@@ -64,7 +64,7 @@ fn test_awr_distributes_across_backends() -> Result<()> {
         "Expected 2 backends used, got: {:?}",
         selections
     );
-    
+
     let backend0_count = selections.get(&0).copied().unwrap_or(0);
     let backend1_count = selections.get(&1).copied().unwrap_or(0);
 
@@ -135,7 +135,7 @@ fn test_awr_prefers_idle_backend() -> Result<()> {
     }
 
     let backend1_count = selections.get(&1).copied().unwrap_or(0);
-    
+
     // Backend 1 (idle) should get significant majority with larger sample
     // Backend 0 has 10 pending, backend 1 has 0, so expect ~60-80% to backend 1
     assert!(
@@ -240,6 +240,205 @@ fn test_pending_count_increments_and_decrements() -> Result<()> {
 
     // Should not underflow
     router.complete_command(backend_id);
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_pending_guard_auto_decrements_on_success() -> Result<()> {
+    let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+
+    let provider = DeadpoolConnectionProvider::new(
+        "localhost".to_string(),
+        119,
+        "backend1".to_string(),
+        50,
+        None,
+        None,
+    );
+
+    router.add_backend(
+        BackendId::from_index(0),
+        ServerName::new("backend1".to_string())?,
+        provider,
+        nntp_proxy::config::PrecheckCommand::default(),
+    );
+
+    let backend_id = BackendId::from_index(0);
+
+    // Initially zero
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    {
+        let _guard = router.pending_guard(backend_id);
+        // Guard incremented
+        assert_eq!(router.backend_load(backend_id).unwrap(), 1);
+
+        // Do work...
+    } // Guard drops here
+
+    // Auto-decremented
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_pending_guard_auto_decrements_on_early_return() -> Result<()> {
+    let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+
+    let provider = DeadpoolConnectionProvider::new(
+        "localhost".to_string(),
+        119,
+        "backend1".to_string(),
+        50,
+        None,
+        None,
+    );
+
+    router.add_backend(
+        BackendId::from_index(0),
+        ServerName::new("backend1".to_string())?,
+        provider,
+        nntp_proxy::config::PrecheckCommand::default(),
+    );
+
+    let backend_id = BackendId::from_index(0);
+
+    fn do_work_with_early_return(router: &BackendSelector, backend_id: BackendId) -> Result<()> {
+        let _guard = router.pending_guard(backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap(), 1);
+
+        // Early return - guard should still decrement
+        return Ok(());
+    }
+
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+    do_work_with_early_return(&router, backend_id)?;
+
+    // Guard auto-decremented despite early return
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_pending_guard_auto_decrements_on_panic() -> Result<()> {
+    let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+
+    let provider = DeadpoolConnectionProvider::new(
+        "localhost".to_string(),
+        119,
+        "backend1".to_string(),
+        50,
+        None,
+        None,
+    );
+
+    router.add_backend(
+        BackendId::from_index(0),
+        ServerName::new("backend1".to_string())?,
+        provider,
+        nntp_proxy::config::PrecheckCommand::default(),
+    );
+
+    let backend_id = BackendId::from_index(0);
+
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    // Catch panic to verify guard still decrements
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = router.pending_guard(backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap(), 1);
+        panic!("Simulated panic");
+    }));
+
+    assert!(result.is_err());
+
+    // Guard auto-decremented despite panic
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_multiple_guards_stack_correctly() -> Result<()> {
+    let mut router = BackendSelector::new(RoutingStrategy::AdaptiveWeighted);
+
+    let provider = DeadpoolConnectionProvider::new(
+        "localhost".to_string(),
+        119,
+        "backend1".to_string(),
+        50,
+        None,
+        None,
+    );
+
+    router.add_backend(
+        BackendId::from_index(0),
+        ServerName::new("backend1".to_string())?,
+        provider,
+        nntp_proxy::config::PrecheckCommand::default(),
+    );
+
+    let backend_id = BackendId::from_index(0);
+
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    {
+        let _guard1 = router.pending_guard(backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap(), 1);
+
+        {
+            let _guard2 = router.pending_guard(backend_id);
+            assert_eq!(router.backend_load(backend_id).unwrap(), 2);
+
+            {
+                let _guard3 = router.pending_guard(backend_id);
+                assert_eq!(router.backend_load(backend_id).unwrap(), 3);
+            }
+            assert_eq!(router.backend_load(backend_id).unwrap(), 2);
+        }
+        assert_eq!(router.backend_load(backend_id).unwrap(), 1);
+    }
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_route_command_guarded_returns_guard() -> Result<()> {
+    let mut router = BackendSelector::new(RoutingStrategy::RoundRobin);
+
+    let provider = DeadpoolConnectionProvider::new(
+        "localhost".to_string(),
+        119,
+        "backend1".to_string(),
+        50,
+        None,
+        None,
+    );
+
+    router.add_backend(
+        BackendId::from_index(0),
+        ServerName::new("backend1".to_string())?,
+        provider,
+        nntp_proxy::config::PrecheckCommand::default(),
+    );
+
+    let client_id = ClientId::new();
+    let backend_id = BackendId::from_index(0);
+
+    assert_eq!(router.backend_load(backend_id).unwrap(), 0);
+
+    {
+        let (selected_backend, _guard) = router.route_command_guarded(client_id, "LIST")?;
+        assert_eq!(selected_backend, backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap(), 1);
+    }
+
+    // Guard auto-decremented
     assert_eq!(router.backend_load(backend_id).unwrap(), 0);
 
     Ok(())

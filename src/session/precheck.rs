@@ -161,9 +161,18 @@ async fn precheck_article_availability_impl(
         tasks.push((backend_id, task));
     }
 
-    // Wait for ALL tasks to complete
-    for (backend_id, task) in tasks {
-        match task.await {
+    // Wait for ALL tasks to complete concurrently using join_all
+    // This ensures we don't favor any backend based on spawn order
+    let results = futures::future::join_all(
+        tasks
+            .into_iter()
+            .map(|(backend_id, task)| async move { (backend_id, task.await) }),
+    )
+    .await;
+
+    // Process all results
+    for (backend_id, task_result) in results {
+        match task_result {
             Ok(Ok(result)) => {
                 debug!(
                     "Backend {:?} precheck result: has_article={}",

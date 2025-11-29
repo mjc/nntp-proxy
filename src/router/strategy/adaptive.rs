@@ -96,13 +96,13 @@ fn score_to_weight(score: &f64) -> f64 {
 fn generate_random_point() -> f64 {
     RNG_STATE.with(|state| {
         let mut s = state.borrow_mut();
-        
+
         // xorshift64* algorithm
         *s ^= *s >> 12;
         *s ^= *s << 25;
         *s ^= *s >> 27;
         let result = s.wrapping_mul(0x2545F4914F6CDD1D);
-        
+
         // Convert to [0, 1)
         (result >> 11) as f64 / (1u64 << 53) as f64
     })
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_selects_least_loaded_backend() {
+    fn test_prefers_less_loaded_backend() {
         let strategy = AdaptiveStrategy::new();
 
         let backend1 = create_test_backend(0, 10);
@@ -190,9 +190,23 @@ mod tests {
         backend2.pending_count.store(2, Ordering::Relaxed);
 
         let backends = vec![backend1, backend2];
-        let selected = strategy.select(&backends).unwrap();
 
-        assert_eq!(selected.id.as_index(), 1);
+        // AWR is probabilistic - check distribution over many selections
+        let mut backend2_selections = 0;
+        for _ in 0..200 {
+            let selected = strategy.select(&backends).unwrap();
+            if selected.id.as_index() == 1 {
+                backend2_selections += 1;
+            }
+        }
+
+        // Backend 2 (less loaded) should be selected majority of the time
+        // With larger sample, expect >=100/200 (50%+)
+        assert!(
+            backend2_selections >= 100,
+            "Less loaded backend should be selected >=100/200 times, got {}",
+            backend2_selections
+        );
     }
 
     #[test]

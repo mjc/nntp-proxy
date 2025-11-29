@@ -344,16 +344,6 @@ impl ClientSession {
         }
     }
 
-    /// Select backend using the router's configured strategy
-    fn select_backend_for_command(
-        &self,
-        router: &BackendSelector,
-        command: &str,
-    ) -> Result<crate::types::BackendId> {
-        // Router handles all strategy logic (round-robin, AWR, etc.)
-        router.route_command(self.client_id, command)
-    }
-
     /// Try to serve STAT command directly from precheck results
     ///
     /// When precheck has determined article availability (using STAT or HEAD on backend),
@@ -365,7 +355,6 @@ impl ClientSession {
         backend_availability: Option<&crate::cache::BackendAvailability>,
         command: &str,
         message_id: Option<&crate::types::protocol::MessageId<'_>>,
-        backend_id: crate::types::BackendId,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut BytesTransferred,
         backend_to_client_bytes: &mut BytesTransferred,
@@ -377,6 +366,16 @@ impl ClientSession {
         {
             return Ok(None);
         }
+
+        // Pick first available backend from bitmap for attribution
+        let backend_id = backend_availability
+            .and_then(|avail| {
+                (0..64).find_map(|i| {
+                    let id = crate::types::BackendId::from_index(i);
+                    avail.has_article(id).then_some(id)
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("No backend has article despite availability check"))?;
 
         debug!(
             "Precheck completed for STAT {}: responding 223 without forwarding (attributing to {:?})",
@@ -446,16 +445,13 @@ impl ClientSession {
             .get_backend_availability(router, message_id.as_ref())
             .await;
 
-        // Initial routing decision
-        let backend_id = self.select_backend_for_command(router, command)?;
-
-        // Try to serve STAT from cache
+        // Try to serve STAT from cache BEFORE routing
+        // (execute_with_retry manages its own pending_count with guards)
         if let Some(backend) = self
             .try_serve_stat_from_cache(
                 backend_availability.as_ref(),
                 command,
                 message_id.as_ref(),
-                backend_id,
                 client_write,
                 client_to_backend_bytes,
                 backend_to_client_bytes,
@@ -466,6 +462,7 @@ impl ClientSession {
         }
 
         // Execute with retry on 430 (article not found)
+        // NOTE: execute_with_retry does its OWN backend selection and pending_count management
         let (result, cmd_bytes, resp_bytes, successful_backend) = self
             .execute_with_retry(
                 router,
@@ -533,6 +530,9 @@ impl ClientSession {
         });
 
         for tried_backend in backend_iter {
+            // Increment pending count for this backend
+            let _guard = router.pending_guard(tried_backend);
+
             match self
                 .try_execute_on_backend(
                     router,
@@ -553,16 +553,14 @@ impl ClientSession {
                             self.location_cache(),
                             tried_backend,
                         );
-                        router.complete_command(tried_backend);
+                        // Guard auto-decrements on continue
                         continue;
                     }
-                    // Success or non-retryable error - complete command and return result
-                    router.complete_command(tried_backend);
+                    // Success or non-retryable error - guard auto-decrements on return
                     return Ok((exec_result, cmd_bytes, resp_bytes, tried_backend));
                 }
                 Err(e) => {
-                    // Connection/timeout error - complete command, log, and try next backend
-                    router.complete_command(tried_backend);
+                    // Connection/timeout error - guard auto-decrements on continue
                     warn!("{}", e);
                     continue;
                 }
