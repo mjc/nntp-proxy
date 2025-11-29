@@ -370,23 +370,64 @@ impl BackendSelector {
             .map(|b| b.pending_count.load(Ordering::Relaxed))
     }
 
-    /// Route command using Adaptive Weighted Routing (AWR) with availability bitmap
+    /// Route command with availability bitmap
     ///
-    /// Selects the best backend considering:
-    /// - Article availability (from cache)
-    /// - Pool capacity and current utilization
-    /// - Current load (pending requests)
-    /// - Saturation (quadratic penalty)
-    /// - Transfer performance (from metrics)
+    /// For AWR: Selects best backend based on load, saturation, and transfer speed
+    /// For Round-Robin: Selects next backend in rotation that has the article
     ///
     /// # Arguments
     /// * `availability` - Backend availability bitmap from cache
     /// * `metrics` - Optional metrics collector for transfer performance data
     ///
     /// # Returns
-    /// Backend ID with lowest AWR score, or None if no backends have the article
+    /// Backend ID, or None if no backends have the article
     #[must_use]
     pub fn route_command_with_availability(
+        &self,
+        availability: &crate::cache::BackendAvailability,
+        metrics: Option<&crate::metrics::MetricsCollector>,
+    ) -> Option<BackendId> {
+        match self.routing_strategy {
+            RoutingStrategy::RoundRobin => self.round_robin_with_availability(availability),
+            RoutingStrategy::AdaptiveWeighted => {
+                self.adaptive_with_availability(availability, metrics)
+            }
+        }
+    }
+
+    /// Round-robin selection filtered by availability
+    fn round_robin_with_availability(
+        &self,
+        availability: &crate::cache::BackendAvailability,
+    ) -> Option<BackendId> {
+        use tracing::debug;
+
+        // Filter backends to only those that have the article
+        let available_backends: Vec<BackendInfo> = self
+            .backends
+            .iter()
+            .filter(|b| availability.has_article(b.id))
+            .cloned()
+            .collect();
+
+        if available_backends.is_empty() {
+            return None;
+        }
+
+        // Use round-robin strategy on filtered list
+        self.round_robin.select(&available_backends).map(|backend| {
+            debug!(
+                "Round-robin selected backend {:?} ({}) from {} backends with article",
+                backend.id,
+                backend.name,
+                available_backends.len()
+            );
+            backend.id
+        })
+    }
+
+    /// AWR selection filtered by availability
+    fn adaptive_with_availability(
         &self,
         availability: &crate::cache::BackendAvailability,
         metrics: Option<&crate::metrics::MetricsCollector>,
