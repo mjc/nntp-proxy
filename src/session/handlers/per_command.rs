@@ -289,9 +289,13 @@ impl ClientSession {
     }
 
     /// Get backend availability from location cache or run precheck
+    ///
+    /// For HEAD/STAT commands: checks cache first, runs precheck on miss
+    /// For BODY/ARTICLE commands: only checks cache, never runs new precheck
     async fn get_backend_availability(
         &self,
         router: &BackendSelector,
+        command: &str,
         message_id: Option<&crate::types::protocol::MessageId<'_>>,
     ) -> Option<crate::cache::BackendAvailability> {
         if !self.precheck_enabled() {
@@ -312,6 +316,15 @@ impl ClientSession {
                 Some(availability)
             }
             None => {
+                // Only run precheck for HEAD/STAT, not BODY/ARTICLE
+                let first_byte = command.as_bytes().first().copied();
+                let is_precheck_command = matches!(first_byte, Some(b'H' | b'h' | b'S' | b's'));
+
+                if !is_precheck_command {
+                    // BODY/ARTICLE with no cache entry - let it try backends normally
+                    return None;
+                }
+
                 // Cache miss - precheck backends
                 debug!("Location cache miss for {} - prechecking backends", msg_id);
 
@@ -406,23 +419,13 @@ impl ClientSession {
         Ok(Some(backend_id))
     }
 
-    /// Check if command should trigger precheck (HEAD/STAT with message-ID)
-    #[inline]
-    fn should_precheck_command(command: &str) -> bool {
-        if !matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
-            return false;
-        }
-        let bytes = command.as_bytes();
-        // Only precheck HEAD and STAT (not ARTICLE/BODY which download)
-        matches!(bytes.first(), Some(b'H' | b'h' | b'S' | b's'))
-    }
-
     /// Extract message-ID from article commands for location cache routing
     #[inline]
     fn extract_message_id_for_routing(
         command: &str,
     ) -> Option<crate::types::protocol::MessageId<'_>> {
-        if Self::should_precheck_command(command) {
+        // Extract message-ID from any article command to check cache
+        if matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
             crate::protocol::NntpResponse::extract_message_id(command)
         } else {
             None
@@ -453,7 +456,7 @@ impl ClientSession {
         let should_cache = self.should_cache_command(command);
         let message_id = Self::extract_message_id_for_routing(command);
         let backend_availability = self
-            .get_backend_availability(router, message_id.as_ref())
+            .get_backend_availability(router, command, message_id.as_ref())
             .await;
 
         // Determine which precheck command was used (for logging accuracy)
@@ -469,9 +472,23 @@ impl ClientSession {
             None
         };
 
-        // NOTE: We intentionally don't early-exit when cache says "no backends have it"
-        // Precheck results (HEAD/STAT) can give false negatives, so we let retry logic
-        // verify by actually attempting the request. The cache is a routing hint, not truth.
+        // If cache shows article unavailable on ALL backends, return 430 immediately
+        if let Some(availability) = backend_availability.as_ref()
+            && !availability.has_any()
+        {
+            debug!(
+                "Cache: {} unavailable on all backends - returning 430",
+                message_id
+                    .as_ref()
+                    .map(|m| m.as_str())
+                    .unwrap_or("<unknown>")
+            );
+            client_write.write_all(b"430 No such article\r\n").await?;
+            backend_to_client_bytes.add(24);
+            client_to_backend_bytes.add(command.len());
+            // Return fake backend to satisfy type system
+            return Ok(crate::types::BackendId::from_index(0));
+        }
 
         // Try to serve STAT from cache BEFORE routing
         // (execute_with_retry manages its own pending_count with guards)
