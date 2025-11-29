@@ -18,15 +18,20 @@ use crate::types::{BackendId, protocol::MessageId};
 /// Back to 15s - precheck now uses separate runtime to avoid contention
 pub const BACKEND_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Find next available backend from availability bitmap
+/// Find next available backend using AWR scoring
+///
+/// Selects the best backend from remaining available backends based on:
+/// - Connection pool availability
+/// - Current load (pending requests)
+/// - Pool saturation
+/// - Transfer performance (if metrics available)
 #[inline]
 pub fn find_next_available_backend(
     remaining: &BackendAvailability,
-    backend_count: usize,
+    router: &BackendSelector,
+    metrics: Option<&crate::metrics::MetricsCollector>,
 ) -> Option<BackendId> {
-    (0..backend_count)
-        .map(BackendId::from_index)
-        .find(|&id| remaining.has_article(id))
+    router.route_command_with_availability(remaining, metrics)
 }
 
 /// Acquire pooled connection with timeout
@@ -148,19 +153,58 @@ mod tests {
 
     #[test]
     fn test_find_next_available_backend() {
+        use crate::pool::DeadpoolConnectionProvider;
+        use crate::types::ServerName;
+
+        // Create test router with 2 backends
+        let mut router = BackendSelector::new(crate::config::RoutingStrategy::AdaptiveWeighted);
+
+        let provider1 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "server1".to_string(),
+            10,
+            None,
+            None,
+        );
+        let provider2 = DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "server2".to_string(),
+            10,
+            None,
+            None,
+        );
+
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::new("server1".to_string()).unwrap(),
+            provider1,
+            crate::config::PrecheckCommand::default(),
+        );
+        router.add_backend(
+            BackendId::from_index(1),
+            ServerName::new("server2".to_string()).unwrap(),
+            provider2,
+            crate::config::PrecheckCommand::default(),
+        );
+
+        // Test: both backends available, AWR should pick one
         let mut bitmap = BackendAvailability::new();
         bitmap.mark_available(BackendId::from_index(0));
-        bitmap.mark_available(BackendId::from_index(2));
+        bitmap.mark_available(BackendId::from_index(1));
 
-        let next = find_next_available_backend(&bitmap, 3);
-        assert_eq!(next, Some(BackendId::from_index(0)));
+        let next = find_next_available_backend(&bitmap, &router, None);
+        assert!(next.is_some());
 
+        // Test: only backend 1 available
         bitmap.mark_unavailable(BackendId::from_index(0));
-        let next = find_next_available_backend(&bitmap, 3);
-        assert_eq!(next, Some(BackendId::from_index(2)));
+        let next = find_next_available_backend(&bitmap, &router, None);
+        assert_eq!(next, Some(BackendId::from_index(1)));
 
-        bitmap.mark_unavailable(BackendId::from_index(2));
-        let next = find_next_available_backend(&bitmap, 3);
+        // Test: no backends available
+        bitmap.mark_unavailable(BackendId::from_index(1));
+        let next = find_next_available_backend(&bitmap, &router, None);
         assert_eq!(next, None);
     }
 }

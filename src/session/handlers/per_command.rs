@@ -523,9 +523,9 @@ impl ClientSession {
 
         let mut remaining_backends = initialize_backend_bitmap(backend_availability, router);
 
-        // Functional retry: generate backend iterator and try each until success
+        // Functional retry: use AWR to select best available backend each iteration
         let backend_iter = std::iter::from_fn(|| {
-            find_next_available_backend(&remaining_backends, router.backend_count())
+            find_next_available_backend(&remaining_backends, router, self.metrics.as_ref())
                 .inspect(|&backend| remaining_backends.mark_unavailable(backend))
         });
 
