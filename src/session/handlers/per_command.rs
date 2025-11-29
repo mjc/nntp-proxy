@@ -445,6 +445,21 @@ impl ClientSession {
             .get_backend_availability(router, message_id.as_ref())
             .await;
 
+        // Early exit if cache says NO backends have this article
+        if let Some(ref availability) = backend_availability
+            && !availability.has_any()
+        {
+            debug!(
+                "Cache indicates article {} not available on any backend - returning 430",
+                message_id.as_ref().map(|m| m.as_str()).unwrap_or("unknown")
+            );
+            let error_response = b"430 No such article\r\n";
+            client_write.write_all(error_response).await?;
+            backend_to_client_bytes.add(error_response.len());
+            // Return first backend for attribution (doesn't matter which since none have it)
+            return Ok(crate::types::BackendId::from_index(0));
+        }
+
         // Try to serve STAT from cache BEFORE routing
         // (execute_with_retry manages its own pending_count with guards)
         if let Some(backend) = self
