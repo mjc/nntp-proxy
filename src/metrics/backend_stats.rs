@@ -24,8 +24,14 @@ pub struct BackendStats {
     pub recv_micros_total: RecvMicros,
     pub connection_failures: FailureCount,
     pub health_status: HealthStatus,
-    /// Number of times STAT and HEAD disagreed during precheck
-    pub precheck_disagreements: u64,
+    /// Precheck false positives (said available, got 430) - STAT command
+    pub precheck_stat_false_positives: u64,
+    /// Precheck false negatives (said unavailable, download succeeded) - STAT command
+    pub precheck_stat_false_negatives: u64,
+    /// Precheck false positives (said available, got 430) - HEAD command
+    pub precheck_head_false_positives: u64,
+    /// Precheck false negatives (said unavailable, download succeeded) - HEAD command
+    pub precheck_head_false_negatives: u64,
 }
 
 impl Default for BackendStats {
@@ -47,7 +53,10 @@ impl Default for BackendStats {
             recv_micros_total: RecvMicros::default(),
             connection_failures: FailureCount::default(),
             health_status: HealthStatus::Healthy,
-            precheck_disagreements: 0,
+            precheck_stat_false_positives: 0,
+            precheck_stat_false_negatives: 0,
+            precheck_head_false_positives: 0,
+            precheck_head_false_negatives: 0,
         }
     }
 }

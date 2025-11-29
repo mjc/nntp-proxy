@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::cache::{ArticleLocationCache, BackendAvailability};
 use crate::pool::DeadpoolConnectionProvider;
@@ -83,8 +83,9 @@ fn spawn_cache_update(
     });
 }
 
-/// Update location cache for failed backend
+/// Update location cache for failed backend (deprecated - use with_precheck version)
 #[inline]
+#[allow(dead_code)]
 pub fn update_cache_for_failed_backend(
     message_id: Option<&MessageId<'_>>,
     location_cache: Option<&Arc<ArticleLocationCache>>,
@@ -99,8 +100,47 @@ pub fn update_cache_for_failed_backend(
     });
 }
 
-/// Update location cache for successful backend
+/// Update location cache for failed backend with precheck comparison
 #[inline]
+pub fn update_cache_for_failed_backend_with_precheck(
+    message_id: Option<&MessageId<'_>>,
+    location_cache: Option<&Arc<ArticleLocationCache>>,
+    backend: BackendId,
+    precheck_said_available: bool,
+    precheck_command: Option<crate::config::PrecheckCommand>,
+    metrics: Option<&crate::metrics::MetricsCollector>,
+) {
+    message_id.zip(location_cache).inspect(|(msg_id, cache)| {
+        spawn_cache_update(msg_id, cache, backend, false);
+        if precheck_said_available {
+            let cmd_str = precheck_command
+                .map(|c| format!(" ({})", c))
+                .unwrap_or_default();
+            warn!(
+                "PRECHECK FALSE POSITIVE{}: {} -> backend {:?} - precheck said AVAILABLE but download returned 430",
+                cmd_str, msg_id, backend
+            );
+            // Record metric based on which command was used
+            if let Some(m) = metrics {
+                use crate::config::PrecheckCommand;
+                match precheck_command {
+                    Some(PrecheckCommand::Stat) => m.record_precheck_stat_false_positive(backend),
+                    Some(PrecheckCommand::Head) => m.record_precheck_head_false_positive(backend),
+                    _ => {} // Auto mode or unknown - don't record
+                }
+            }
+        } else {
+            debug!(
+                "Updating location cache: {} -> backend {:?} (NOT available, precheck was correct)",
+                msg_id, backend
+            );
+        }
+    });
+}
+
+/// Update location cache for successful backend (deprecated - use with_precheck version)
+#[inline]
+#[allow(dead_code)]
 pub fn update_cache_for_successful_backend(
     message_id: Option<&MessageId<'_>>,
     location_cache: Option<&Arc<ArticleLocationCache>>,
@@ -112,6 +152,44 @@ pub fn update_cache_for_successful_backend(
             "Updating location cache: {} -> backend {:?} (available)",
             msg_id, backend
         );
+    });
+}
+
+/// Update location cache for successful backend with precheck comparison
+#[inline]
+pub fn update_cache_for_successful_backend_with_precheck(
+    message_id: Option<&MessageId<'_>>,
+    location_cache: Option<&Arc<ArticleLocationCache>>,
+    backend: BackendId,
+    precheck_said_unavailable: bool,
+    precheck_command: Option<crate::config::PrecheckCommand>,
+    metrics: Option<&crate::metrics::MetricsCollector>,
+) {
+    message_id.zip(location_cache).inspect(|(msg_id, cache)| {
+        spawn_cache_update(msg_id, cache, backend, true);
+        if precheck_said_unavailable {
+            let cmd_str = precheck_command
+                .map(|c| format!(" ({})", c))
+                .unwrap_or_default();
+            warn!(
+                "PRECHECK FALSE NEGATIVE{}: {} -> backend {:?} - precheck said UNAVAILABLE but download SUCCEEDED",
+                cmd_str, msg_id, backend
+            );
+            // Record metric based on which command was used
+            if let Some(m) = metrics {
+                use crate::config::PrecheckCommand;
+                match precheck_command {
+                    Some(PrecheckCommand::Stat) => m.record_precheck_stat_false_negative(backend),
+                    Some(PrecheckCommand::Head) => m.record_precheck_head_false_negative(backend),
+                    _ => {} // Auto mode or unknown - don't record
+                }
+            }
+        } else {
+            debug!(
+                "Updating location cache: {} -> backend {:?} (available, precheck was correct)",
+                msg_id, backend
+            );
+        }
     });
 }
 

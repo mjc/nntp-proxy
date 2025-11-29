@@ -154,15 +154,16 @@ fn test_has_spanning_terminator_false_positives() {
         1
     ));
 
-    // Current too long - terminator would be in one chunk
-    assert!(!NntpResponse::has_spanning_terminator(
+    // Current has extra data after terminator - still a spanning terminator!
+    // tail="\r", current="\n.\r\nmore" - the \r\n.\r\n spans the boundary
+    assert!(NntpResponse::has_spanning_terminator(
         b"data\r",
         5,
         b"\n.\r\nmore",
         8
     ));
 
-    // Tail too short
+    // Tail too short to form a valid spanning terminator
     assert!(!NntpResponse::has_spanning_terminator(
         b"d", 1, b"\n.\r\n", 4
     ));

@@ -211,7 +211,10 @@ mod tests {
             send_micros_total: SendMicros::new(500),
             recv_micros_total: RecvMicros::new(1500),
             connection_failures: FailureCount::new(0),
-            precheck_disagreements: 0,
+            precheck_stat_false_positives: 0,
+            precheck_stat_false_negatives: 0,
+            precheck_head_false_positives: 0,
+            precheck_head_false_negatives: 0,
         };
 
         let backend2 = BackendStats {
@@ -231,7 +234,10 @@ mod tests {
             send_micros_total: SendMicros::new(250),
             recv_micros_total: RecvMicros::new(750),
             connection_failures: FailureCount::new(1),
-            precheck_disagreements: 0,
+            precheck_stat_false_positives: 0,
+            precheck_stat_false_negatives: 0,
+            precheck_head_false_positives: 0,
+            precheck_head_false_negatives: 0,
         };
 
         MetricsSnapshot {

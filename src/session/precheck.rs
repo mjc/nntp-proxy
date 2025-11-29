@@ -137,13 +137,16 @@ async fn precheck_article_availability_impl(
 
     let mut availability = BackendAvailability::new();
 
-    // Check all backends CONCURRENTLY - spawn tasks and wait for all
-    let mut tasks = Vec::with_capacity(backends.len());
+    // Shuffle backend order to avoid all clients hitting the same backend first
+    // This prevents connection pool starvation when many clients precheck concurrently
+    let mut shuffled_backends: Vec<_> = backends.to_vec();
+    fastrand::shuffle(&mut shuffled_backends);
 
-    for (backend_id, provider, precheck_cmd) in backends {
-        let backend_id = *backend_id;
-        let provider = Arc::clone(provider);
-        let precheck_cmd = *precheck_cmd;
+    // Check all backends CONCURRENTLY - spawn tasks and wait for all
+    let mut tasks = Vec::with_capacity(shuffled_backends.len());
+
+    for (backend_id, provider, precheck_cmd) in shuffled_backends {
+        let provider = Arc::clone(&provider);
         let msg_id = message_id.to_owned();
         let metrics_clone = metrics.cloned();
 
@@ -295,25 +298,9 @@ async fn check_backend_has_article(
         // Compare results
         if stat_has_article != head_has_article {
             warn!(
-                "Backend {:?} DISCREPANCY for {}: STAT={}, HEAD={} - incrementing counter",
+                "Backend {:?} DISCREPANCY for {}: STAT={}, HEAD={} (will be tracked later during actual download verification)",
                 backend_id, message_id, stat_has_article, head_has_article
             );
-            if let Some(metrics) = metrics {
-                metrics.record_precheck_disagreement(backend_id);
-                // Verify counter was incremented
-                let snapshot = metrics.snapshot();
-                if let Some(backend_stats) = snapshot.backend_stats.get(backend_id.as_index()) {
-                    debug!(
-                        "Backend {:?} disagreement counter now: {}",
-                        backend_id, backend_stats.precheck_disagreements
-                    );
-                }
-            } else {
-                warn!(
-                    "Backend {:?} DISCREPANCY but NO METRICS COLLECTOR!",
-                    backend_id
-                );
-            }
         }
 
         // Decision logic for AUTO mode:

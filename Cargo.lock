@@ -912,6 +912,7 @@ dependencies = [
  "dashmap",
  "deadpool",
  "divan",
+ "fastrand",
  "futures",
  "memchr",
  "moka",

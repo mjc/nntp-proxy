@@ -406,12 +406,23 @@ impl ClientSession {
         Ok(Some(backend_id))
     }
 
+    /// Check if command should trigger precheck (HEAD/STAT with message-ID)
+    #[inline]
+    fn should_precheck_command(command: &str) -> bool {
+        if !matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
+            return false;
+        }
+        let bytes = command.as_bytes();
+        // Only precheck HEAD and STAT (not ARTICLE/BODY which download)
+        matches!(bytes.first(), Some(b'H' | b'h' | b'S' | b's'))
+    }
+
     /// Extract message-ID from article commands for location cache routing
     #[inline]
     fn extract_message_id_for_routing(
         command: &str,
     ) -> Option<crate::types::protocol::MessageId<'_>> {
-        if matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
+        if Self::should_precheck_command(command) {
             crate::protocol::NntpResponse::extract_message_id(command)
         } else {
             None
@@ -445,20 +456,22 @@ impl ClientSession {
             .get_backend_availability(router, message_id.as_ref())
             .await;
 
-        // Early exit if cache says NO backends have this article
-        if let Some(ref availability) = backend_availability
-            && !availability.has_any()
-        {
-            debug!(
-                "Cache indicates article {} not available on any backend - returning 430",
-                message_id.as_ref().map(|m| m.as_str()).unwrap_or("unknown")
-            );
-            let error_response = b"430 No such article\r\n";
-            client_write.write_all(error_response).await?;
-            backend_to_client_bytes.add(error_response.len());
-            // Return first backend for attribution (doesn't matter which since none have it)
-            return Ok(crate::types::BackendId::from_index(0));
-        }
+        // Determine which precheck command was used (for logging accuracy)
+        let precheck_command = if backend_availability.is_some() {
+            // Precheck ran - determine which command type
+            let first_byte = command.as_bytes().first().copied();
+            match first_byte {
+                Some(b'H') | Some(b'h') => Some(crate::config::PrecheckCommand::Head),
+                Some(b'S') | Some(b's') => Some(crate::config::PrecheckCommand::Stat),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // NOTE: We intentionally don't early-exit when cache says "no backends have it"
+        // Precheck results (HEAD/STAT) can give false negatives, so we let retry logic
+        // verify by actually attempting the request. The cache is a routing hint, not truth.
 
         // Try to serve STAT from cache BEFORE routing
         // (execute_with_retry manages its own pending_count with guards)
@@ -488,6 +501,7 @@ impl ClientSession {
                 should_cache,
                 backend_availability,
                 message_id.as_ref(),
+                precheck_command,
             )
             .await?;
 
@@ -528,6 +542,7 @@ impl ClientSession {
         should_cache: bool,
         backend_availability: Option<crate::cache::BackendAvailability>,
         message_id: Option<&crate::types::protocol::MessageId<'_>>,
+        precheck_command: Option<crate::config::PrecheckCommand>,
     ) -> Result<(
         Result<()>,
         crate::types::MetricsBytes<crate::types::Unrecorded>,
@@ -536,6 +551,7 @@ impl ClientSession {
     )> {
         use crate::session::retry::*;
 
+        let original_availability = backend_availability; // Keep for precheck comparison
         let mut remaining_backends = initialize_backend_bitmap(backend_availability, router);
 
         // Functional retry: use AWR to select best available backend each iteration
@@ -547,6 +563,12 @@ impl ClientSession {
         for tried_backend in backend_iter {
             // Increment pending count for this backend
             let _guard = router.pending_guard(tried_backend);
+
+            // Check if precheck said this backend had the article
+            let precheck_said_available = original_availability
+                .as_ref()
+                .map(|av| av.has_article(tried_backend))
+                .unwrap_or(false);
 
             match self
                 .try_execute_on_backend(
@@ -563,15 +585,31 @@ impl ClientSession {
                 Ok((exec_result, cmd_bytes, resp_bytes)) => {
                     // Check for 430 (article not found) - continue to next backend
                     if is_article_not_found_error(&exec_result) {
-                        update_cache_for_failed_backend(
+                        update_cache_for_failed_backend_with_precheck(
                             message_id,
                             self.location_cache(),
                             tried_backend,
+                            precheck_said_available,
+                            precheck_command,
+                            self.metrics.as_ref(),
                         );
                         // Guard auto-decrements on continue
                         continue;
                     }
-                    // Success or non-retryable error - guard auto-decrements on return
+                    // Success or non-retryable error
+                    let precheck_said_unavailable = original_availability
+                        .as_ref()
+                        .map(|av| !av.has_article(tried_backend))
+                        .unwrap_or(false);
+                    update_cache_for_successful_backend_with_precheck(
+                        message_id,
+                        self.location_cache(),
+                        tried_backend,
+                        precheck_said_unavailable,
+                        precheck_command,
+                        self.metrics.as_ref(),
+                    );
+                    // Guard auto-decrements on return
                     return Ok((exec_result, cmd_bytes, resp_bytes, tried_backend));
                 }
                 Err(e) => {
@@ -1048,8 +1086,16 @@ impl ClientSession {
     /// Determine if command should be cached (cache miss on ARTICLE by message-ID)
     #[inline]
     fn should_cache_command(&self, command: &str) -> bool {
-        self.cache.is_some()
-            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
+        // Only cache ARTICLE downloads, not HEAD/STAT checks
+        if self.cache.is_none() {
+            return false;
+        }
+        if !matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId) {
+            return false;
+        }
+        let bytes = command.as_bytes();
+        // Only ARTICLE and BODY should be cached (A/B), not HEAD/STAT (H/S)
+        matches!(bytes.first(), Some(b'A' | b'a' | b'B' | b'b'))
     }
 }
 
@@ -1157,11 +1203,12 @@ mod tests {
     #[test]
     fn test_should_cache_command_variations() {
         let session = create_test_session_with_cache();
-        // Only ARTICLE, BODY, HEAD, STAT with message-ID are cacheable
+        // Only ARTICLE and BODY with message-ID are cacheable
+        // HEAD and STAT are used for precheck, not caching
         assert!(session.should_cache_command("ARTICLE <msg@host>"));
         assert!(session.should_cache_command("BODY <msg@host>"));
-        assert!(session.should_cache_command("HEAD <msg@host>"));
-        assert!(session.should_cache_command("STAT <msg@host>"));
+        assert!(!session.should_cache_command("HEAD <msg@host>")); // Used for precheck
+        assert!(!session.should_cache_command("STAT <msg@host>")); // Used for precheck
     }
 
     // Tests for decide_command_routing pure function
@@ -1391,10 +1438,11 @@ mod tests {
     #[test]
     fn test_should_cache_command_body_and_head() {
         let session = create_test_session_with_cache();
-        // BODY and HEAD by message-ID should also be cached
+        // Only BODY and ARTICLE by message-ID should be cached
+        // HEAD and STAT are for precheck, not caching
         assert!(session.should_cache_command("BODY <test@example.com>"));
-        assert!(session.should_cache_command("HEAD <msg@host>"));
-        assert!(session.should_cache_command("STAT <stat@test>"));
+        assert!(!session.should_cache_command("HEAD <msg@host>")); // Used for precheck
+        assert!(!session.should_cache_command("STAT <stat@test>")); // Used for precheck
     }
 
     #[test]

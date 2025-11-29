@@ -27,6 +27,11 @@ impl TerminatorStatus {
             Self::Spanning | Self::NotFound => chunk_size,
         }
     }
+
+    /// Returns true if terminator spans to next chunk (need to read more to complete it)
+    pub fn is_spanning(self) -> bool {
+        matches!(self, Self::Spanning)
+    }
 }
 
 /// Helper for tracking the last few bytes of streamed data
@@ -209,8 +214,9 @@ mod tests {
     fn test_has_spanning_terminator_complete_in_chunk() {
         let mut tail = TailBuffer::default();
         tail.update(b"data\r");
-        // Terminator completely in next chunk
-        assert!(!tail.has_spanning_terminator(b"\n.\r\nmore"));
+        // Terminator spans: tail ends with \r, current starts with \n.\r\n
+        // This IS a spanning terminator, even though there's more data after
+        assert!(tail.has_spanning_terminator(b"\n.\r\nmore"));
     }
 
     #[test]

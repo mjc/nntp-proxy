@@ -336,8 +336,8 @@ impl NntpResponse {
         current: &[u8],
         current_len: usize,
     ) -> bool {
-        // Only check if we have a tail and current chunk is small enough for spanning
-        if tail_len < 1 || !(1..=4).contains(&current_len) {
+        // Only check if we have a tail (need at least 1 byte in tail)
+        if tail_len < 1 {
             return false;
         }
 

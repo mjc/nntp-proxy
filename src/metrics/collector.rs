@@ -29,8 +29,14 @@ struct BackendMetrics {
     recv_micros_total: AtomicU64,
     connection_failures: AtomicU64,
     health_status: AtomicU8,
-    /// Precheck disagreements between STAT and HEAD
-    precheck_disagreements: AtomicU64,
+    /// Precheck false positives - STAT command
+    precheck_stat_false_positives: AtomicU64,
+    /// Precheck false negatives - STAT command
+    precheck_stat_false_negatives: AtomicU64,
+    /// Precheck false positives - HEAD command
+    precheck_head_false_positives: AtomicU64,
+    /// Precheck false negatives - HEAD command
+    precheck_head_false_negatives: AtomicU64,
 }
 
 impl BackendMetrics {
@@ -62,7 +68,18 @@ impl BackendMetrics {
                 self.connection_failures.load(Ordering::Relaxed),
             ),
             health_status: self.health_status.load(Ordering::Relaxed).into(),
-            precheck_disagreements: self.precheck_disagreements.load(Ordering::Relaxed),
+            precheck_stat_false_positives: self
+                .precheck_stat_false_positives
+                .load(Ordering::Relaxed),
+            precheck_stat_false_negatives: self
+                .precheck_stat_false_negatives
+                .load(Ordering::Relaxed),
+            precheck_head_false_positives: self
+                .precheck_head_false_positives
+                .load(Ordering::Relaxed),
+            precheck_head_false_negatives: self
+                .precheck_head_false_negatives
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -378,9 +395,34 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn record_precheck_disagreement(&self, backend_id: BackendId) {
+    pub fn record_precheck_stat_false_positive(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
-            b.precheck_disagreements.fetch_add(1, Ordering::Relaxed);
+            b.precheck_stat_false_positives
+                .fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    #[inline]
+    pub fn record_precheck_stat_false_negative(&self, backend_id: BackendId) {
+        self.with_backend(backend_id, |b| {
+            b.precheck_stat_false_negatives
+                .fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    #[inline]
+    pub fn record_precheck_head_false_positive(&self, backend_id: BackendId) {
+        self.with_backend(backend_id, |b| {
+            b.precheck_head_false_positives
+                .fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    #[inline]
+    pub fn record_precheck_head_false_negative(&self, backend_id: BackendId) {
+        self.with_backend(backend_id, |b| {
+            b.precheck_head_false_negatives
+                .fetch_add(1, Ordering::Relaxed);
         });
     }
 
