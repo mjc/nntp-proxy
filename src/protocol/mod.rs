@@ -8,11 +8,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
+mod article;
 mod commands;
 mod response;
 mod responses;
 
 pub use response::ResponseParser;
+
+// Re-export article parsing types
+pub use article::{Article, HeaderIter, Headers, ParseError};
 
 // Re-export response types and utilities
 pub use response::{
