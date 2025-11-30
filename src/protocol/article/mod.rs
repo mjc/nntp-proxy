@@ -5,11 +5,13 @@
 
 mod error;
 mod headers;
+mod yenc;
 
 pub use error::ParseError;
 pub use headers::{HeaderIter, Headers};
 
 use crate::types::protocol::MessageId;
+use yenc::validate_yenc_structure;
 
 /// Parsed NNTP article response (zero-copy)
 ///
@@ -66,7 +68,14 @@ impl<'a> Article<'a> {
 
         // Find terminator
         let terminator_start = find_terminator(buf, body_start)?;
-        let body = Some(&buf[body_start..terminator_start]);
+        let body_data = &buf[body_start..terminator_start];
+
+        // Validate yenc if present
+        if body_data.starts_with(b"=ybegin") {
+            validate_yenc_structure(body_data)?;
+        }
+
+        let body = Some(body_data);
 
         Ok(Article {
             message_id,
@@ -121,7 +130,14 @@ impl<'a> Article<'a> {
 
         // Find terminator
         let terminator_start = find_terminator(buf, body_start)?;
-        let body = Some(&buf[body_start..terminator_start]);
+        let body_data = &buf[body_start..terminator_start];
+
+        // Validate yenc if present
+        if body_data.starts_with(b"=ybegin") {
+            validate_yenc_structure(body_data)?;
+        }
+
+        let body = Some(body_data);
 
         Ok(Article {
             message_id,

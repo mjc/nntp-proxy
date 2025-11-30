@@ -22,16 +22,15 @@ This is the article body.\r\n\
 Multiple lines of text.\r\n\
 .\r\n";
 
-/// Valid ARTICLE response with yenc binary
+/// Valid ARTICLE response with yenc binary (real yenc-encoded "Hello, yEnc!")
 const VALID_ARTICLE_YENC: &[u8] = b"220 54321 <binary@example.com>\r\n\
-Subject: test.jpg (1/1)\r\n\
+Subject: test.txt (1/1)\r\n\
 From: poster@example.com\r\n\
 Message-ID: <binary@example.com>\r\n\
 \r\n\
-=ybegin part=1 line=128 size=5000 name=test.jpg\r\n\
-=ypart begin=1 end=5000\r\n\
-<binary data would go here>\r\n\
-=yend size=5000 part=1 pcrc32=12345678\r\n\
+=ybegin line=128 size=12 name=test.txt\r\n\
+r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n\
+=yend size=12 crc32=0337ab3d\r\n\
 .\r\n";
 
 /// Valid HEAD response
@@ -111,8 +110,8 @@ const WRONG_STATUS_CODE: &[u8] = b"430 No such article\r\n";
 const INVALID_YENC: &[u8] = b"220 12345 <test@example.com>\r\n\
 Subject: Binary\r\n\
 \r\n\
-=ybegin part=1 size=1000 name=test.bin\r\n\
-<data>\r\n\
+=ybegin line=128 size=12 name=test.bin\r\n\
+r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n\
 .\r\n";
 
 #[test]
@@ -142,9 +141,8 @@ fn test_parse_valid_article_yenc() {
 
     let body = article.body.unwrap();
     assert!(body.starts_with(b"=ybegin"));
-    // Check if body contains "=yend" substring
-    let body_str = std::str::from_utf8(body).unwrap();
-    assert!(body_str.contains("=yend"));
+    // Check if body contains "=yend" footer (search as bytes, not UTF-8)
+    assert!(body.windows(5).any(|w| w == b"=yend"));
 }
 
 #[test]
@@ -245,7 +243,6 @@ fn test_wrong_status_code() {
 }
 
 #[test]
-#[ignore] // TODO: Implement yenc validation
 fn test_invalid_yenc() {
     let result: Result<Article, _> = INVALID_YENC.try_into();
     // yenc without proper =yend should fail validation
