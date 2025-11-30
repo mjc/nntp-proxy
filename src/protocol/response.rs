@@ -31,8 +31,6 @@
 //! CRLF "." CRLF
 //! ```
 
-use crate::types::MessageId;
-
 /// Raw NNTP status code (3-digit number)
 ///
 /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
@@ -102,7 +100,7 @@ impl std::fmt::Display for StatusCode {
 /// - **4xx**: Temporary failure
 /// - **5xx**: Permanent failure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Response {
+pub enum NntpResponse {
     /// Server greeting - [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
     /// - 200: Posting allowed
     /// - 201: No posting allowed
@@ -134,7 +132,7 @@ pub enum Response {
     Invalid,
 }
 
-impl Response {
+impl NntpResponse {
     /// Parse response data into a categorized response code
     ///
     /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
@@ -143,7 +141,7 @@ impl Response {
     /// **Optimization**: Direct byte-to-digit conversion avoids UTF-8 overhead.
     #[inline]
     pub fn parse(data: &[u8]) -> Self {
-        let code = match NntpResponse::parse_status_code(data) {
+        let code = match parse_status_code(data) {
             Some(c) => c,
             None => return Self::Invalid,
         };
@@ -209,263 +207,62 @@ impl Response {
     }
 }
 
-/// Represents a parsed NNTP response
-#[derive(Debug, Clone, PartialEq)]
-pub struct NntpResponse {
-    /// Status code (e.g., 200, 381, 500)
-    pub status_code: StatusCode,
-    /// Whether this is a multiline response
-    pub is_multiline: bool,
-    /// Complete response data including status line
-    pub data: Vec<u8>,
+/// Parse a status code from response data
+///
+/// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
+/// responses begin with a 3-digit status code (ASCII digits '0'-'9').
+///
+/// **Optimization**: Direct byte-to-digit conversion without UTF-8 validation.
+/// Status codes are guaranteed to be ASCII digits per the RFC.
+#[inline]
+pub fn parse_status_code(data: &[u8]) -> Option<StatusCode> {
+    if data.len() < 3 {
+        return None;
+    }
+
+    // Fast path: Direct ASCII digit conversion without UTF-8 overhead
+    // Per RFC 3977, status codes are exactly 3 ASCII digits
+    let d0 = data[0].wrapping_sub(b'0');
+    let d1 = data[1].wrapping_sub(b'0');
+    let d2 = data[2].wrapping_sub(b'0');
+
+    // Validate all three are digits (0-9)
+    if d0 > 9 || d1 > 9 || d2 > 9 {
+        return None;
+    }
+
+    // Combine into u16: d0*100 + d1*10 + d2
+    let code = (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16);
+    Some(StatusCode::new(code))
 }
 
-impl NntpResponse {
-    /// Parse a status code from response data
-    ///
-    /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
-    /// responses begin with a 3-digit status code (ASCII digits '0'-'9').
-    ///
-    /// **Optimization**: Direct byte-to-digit conversion without UTF-8 validation.
-    /// Status codes are guaranteed to be ASCII digits per the RFC.
-    #[inline]
-    pub fn parse_status_code(data: &[u8]) -> Option<StatusCode> {
-        if data.len() < 3 {
-            return None;
-        }
-
-        // Fast path: Direct ASCII digit conversion without UTF-8 overhead
-        // Per RFC 3977, status codes are exactly 3 ASCII digits
-        let d0 = data[0].wrapping_sub(b'0');
-        let d1 = data[1].wrapping_sub(b'0');
-        let d2 = data[2].wrapping_sub(b'0');
-
-        // Validate all three are digits (0-9)
-        if d0 > 9 || d1 > 9 || d2 > 9 {
-            return None;
-        }
-
-        // Combine into u16: d0*100 + d1*10 + d2
-        let code = (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16);
-        Some(StatusCode::new(code))
+/// Check if a response indicates a multiline response
+///
+/// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
+/// certain status codes indicate multiline data follows.
+///
+/// # Multiline Response Codes
+/// - **1xx**: All informational responses (100-199)
+/// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
+#[inline]
+pub fn is_multiline_response(status_code: StatusCode) -> bool {
+    let code = status_code.as_u16();
+    match code {
+        100..=199 => true, // All 1xx are multiline
+        215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
+        _ => false,
     }
+}
 
-    /// Check if a response indicates a multiline response
-    ///
-    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
-    /// certain status codes indicate multiline data follows.
-    ///
-    /// # Multiline Response Codes
-    /// - **1xx**: All informational responses (100-199)
-    /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
-    #[inline]
-    pub fn is_multiline_response(status_code: StatusCode) -> bool {
-        let code = status_code.as_u16();
-        match code {
-            100..=199 => true, // All 1xx are multiline
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
-            _ => false,
-        }
-    }
-
-    /// Check if data ends with the NNTP multiline terminator
-    ///
-    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
-    /// ```text
-    /// Multiline blocks are terminated by a line containing only a period:
-    /// CRLF "." CRLF
-    /// Which appears in the data stream as: \r\n.\r\n
-    /// ```
-    ///
-    /// **Optimization**: Single suffix check, no scanning.
-    #[inline]
-    pub fn has_terminator_at_end(data: &[u8]) -> bool {
-        let n = data.len();
-        // Only check for proper RFC 3977 terminator: \r\n.\r\n
-        n >= 5 && data[n - 5..n] == *b"\r\n.\r\n"
-    }
-
-    /// Find the position of the NNTP multiline terminator in data
-    ///
-    /// Returns the position AFTER the terminator (exclusive end), or None if not found.
-    /// This handles the case where extra data appears after the terminator in the same chunk.
-    ///
-    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
-    /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
-    ///
-    /// **Optimization**: Uses `memchr::memchr_iter()` to find '\r' bytes (SIMD-accelerated),
-    /// then validates the full 5-byte pattern. This eliminates the need to create new slices
-    /// on each iteration (which the manual loop approach requires with `&data[pos..]`).
-    ///
-    /// Benchmarks show this is **72% faster for small responses** (37ns → 13ns) and
-    /// **64% faster for medium responses** (109ns → 40ns) compared to the manual loop
-    /// that creates a new slice on each iteration.
-    ///
-    /// **Hot path optimization**: Check end first (99% case for streaming chunks),
-    /// then scan forward if needed. Compiler optimizes slice comparison to memcmp.
-    #[inline]
-    pub fn find_terminator_end(data: &[u8]) -> Option<usize> {
-        const TERMINATOR: [u8; 5] = *b"\r\n.\r\n";
-
-        // Fast path: check suffix, or slow path: scan for terminator mid-chunk
-        data.len()
-            .checked_sub(5)
-            .filter(|&start| data[start..] == TERMINATOR)
-            .map(|_| data.len())
-            .or_else(|| {
-                memchr::memchr_iter(b'\r', data)
-                    .take_while(|&pos| pos + 5 <= data.len())
-                    .find(|&pos| data[pos..pos + 5] == TERMINATOR)
-                    .map(|pos| pos + 5)
-            })
-    }
-
-    /// Check if a terminator spans across a boundary between tail and current chunk
-    ///
-    /// This handles the case where a multiline terminator is split across two read chunks.
-    /// For example: previous chunk ends with "\r\n." and current starts with "\r\n"
-    ///
-    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
-    /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
-    #[inline]
-    pub fn has_spanning_terminator(
-        tail: &[u8],
-        tail_len: usize,
-        current: &[u8],
-        current_len: usize,
-    ) -> bool {
-        // Only check if we have a tail and current chunk is small enough for spanning
-        if tail_len < 1 || !(1..=4).contains(&current_len) {
-            return false;
-        }
-
-        // Check all possible split positions of the 5-byte terminator "\r\n.\r\n"
-        // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n"
-        if tail_len >= 1
-            && current_len >= 4
-            && tail[tail_len - 1] == b'\r'
-            && current[..4] == *b"\n.\r\n"
-        {
-            return true;
-        }
-        // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n"
-        if tail_len >= 2
-            && current_len >= 3
-            && tail[tail_len - 2..tail_len] == *b"\r\n"
-            && current[..3] == *b".\r\n"
-        {
-            return true;
-        }
-        // Split after byte 3: tail ends with "\r\n.", current starts with "\r\n"
-        if tail_len >= 3
-            && current_len >= 2
-            && tail[tail_len - 3..tail_len] == *b"\r\n."
-            && current[..2] == *b"\r\n"
-        {
-            return true;
-        }
-        // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n"
-        if tail_len >= 4
-            && current_len >= 1
-            && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
-            && current[0] == b'\n'
-        {
-            return true;
-        }
-
-        false
-    }
-
-    /// Check if response is a disconnect/goodbye (205)
-    ///
-    /// Per [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4),
-    /// code 205 indicates "Connection closing" / "Goodbye".
-    ///
-    /// **Optimization**: Direct byte prefix check, no parsing.
-    #[inline]
-    pub fn is_disconnect(data: &[u8]) -> bool {
-        data.len() >= 3 && data.starts_with(b"205")
-    }
-
-    /// Extract message-ID from command arguments using fast byte searching
-    ///
-    /// Per [RFC 5536 §3.1.3](https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3),
-    /// message-IDs have the format `<local-part@domain>`.
-    ///
-    /// Examples:
-    /// - `<article123@news.example.com>`
-    /// - `<20231014.123456@server.domain>`
-    ///
-    /// **Optimization**: Uses `memchr` for fast '<' and '>' detection.
-    #[inline]
-    pub fn extract_message_id(command: &str) -> Option<MessageId<'_>> {
-        let trimmed = command.trim();
-        let bytes = trimmed.as_bytes();
-
-        // Find opening '<' using fast memchr
-        let start = memchr::memchr(b'<', bytes)?;
-
-        // Find closing '>' after the '<'
-        // Since end is relative to &bytes[start..], the actual position is start + end
-        let end = memchr::memchr(b'>', &bytes[start + 1..])?;
-        let msgid_end = start + end + 2; // +1 for the slice offset, +1 to include '>'
-
-        // Safety: Message-IDs are ASCII, so no need for is_char_boundary checks
-        // We already know msgid_end is valid since memchr found '>' at that position
-        MessageId::from_borrowed(&trimmed[start..msgid_end]).ok()
-    }
-
-    /// Validate message-ID format according to [RFC 5536 §3.1.3](https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3)
-    ///
-    /// A valid message-ID must:
-    /// - Start with '<' and end with '>'
-    /// - Contain exactly one '@' character
-    /// - Have content before and after the '@' (local-part and domain)
-    ///
-    /// Per [RFC 5536 §3.1.3](https://datatracker.ietf.org/doc/html/rfc5536#section-3.1.3):
-    /// ```text
-    /// msg-id = [CFWS] "<" id-left "@" id-right ">" [CFWS]
-    /// ```
-    ///
-    /// **Note**: This is a basic validation - full RFC 5536 validation is more complex.
-    #[inline]
-    pub fn validate_message_id(msgid: &str) -> bool {
-        let trimmed = msgid.trim();
-
-        // Must start with < and end with >
-        if !trimmed.starts_with('<') || !trimmed.ends_with('>') {
-            return false;
-        }
-
-        // Extract content between < and >
-        let content = &trimmed[1..trimmed.len() - 1];
-
-        // Must contain exactly one @
-        let at_count = content.bytes().filter(|&b| b == b'@').count();
-        if at_count != 1 {
-            return false;
-        }
-
-        // Must have content before and after @
-        if let Some(at_pos) = content.find('@') {
-            at_pos > 0 && at_pos < content.len() - 1
-        } else {
-            false
-        }
-    }
-
-    /// Check if data contains the end-of-multiline marker (legacy method)
-    #[inline]
-    #[allow(dead_code)]
-    pub fn has_multiline_terminator(data: &[u8]) -> bool {
-        // NNTP multiline responses end with "\r\n.\r\n"
-        if data.len() < 5 {
-            return false;
-        }
-
-        // Look for the terminator at the end
-        data.ends_with(b"\r\n.\r\n") || data.ends_with(b"\n.\r\n")
-    }
+/// Check if response is a disconnect/goodbye (205)
+///
+/// Per [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4),
+/// code 205 indicates "Connection closing" / "Goodbye".
+///
+/// **Optimization**: Direct byte prefix check, no parsing.
+#[inline]
+pub fn is_disconnect(data: &[u8]) -> bool {
+    data.len() >= 3 && data.starts_with(b"205")
 }
 
 /// Response parser for NNTP protocol
@@ -476,28 +273,28 @@ impl ResponseParser {
     #[inline]
     #[allow(dead_code)]
     pub fn is_success_response(data: &[u8]) -> bool {
-        Response::parse(data).is_success()
+        NntpResponse::parse(data).is_success()
     }
 
     /// Check if response is a greeting (200 or 201)
     #[inline]
     #[allow(dead_code)]
     pub fn is_greeting(data: &[u8]) -> bool {
-        matches!(Response::parse(data), Response::Greeting(_))
+        matches!(NntpResponse::parse(data), NntpResponse::Greeting(_))
     }
 
     /// Check if response indicates authentication is required (381 or 480)
     #[inline]
     #[allow(dead_code)]
     pub fn is_auth_required(data: &[u8]) -> bool {
-        matches!(Response::parse(data), Response::AuthRequired(_))
+        matches!(NntpResponse::parse(data), NntpResponse::AuthRequired(_))
     }
 
     /// Check if response indicates successful authentication (281)
     #[inline]
     #[allow(dead_code)]
     pub fn is_auth_success(data: &[u8]) -> bool {
-        matches!(Response::parse(data), Response::AuthSuccess)
+        matches!(NntpResponse::parse(data), NntpResponse::AuthSuccess)
     }
 
     /// Check if response has a specific status code
@@ -506,7 +303,7 @@ impl ResponseParser {
     /// or any other specific code that doesn't have a dedicated helper.
     #[inline]
     pub fn is_response_code(data: &[u8], code: u16) -> bool {
-        NntpResponse::parse_status_code(data).is_some_and(|c| c.as_u16() == code)
+        parse_status_code(data).is_some_and(|c| c.as_u16() == code)
     }
 }
 

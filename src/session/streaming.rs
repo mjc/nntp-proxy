@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-mod tail_buffer;
+pub(crate) mod tail_buffer;
 use tail_buffer::TailBuffer;
 
 /// Context for handling client write errors during streaming

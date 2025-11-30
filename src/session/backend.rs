@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 
 use crate::pool::PooledBuffer;
-use crate::protocol::{MIN_RESPONSE_LENGTH, Response};
+use crate::protocol::{MIN_RESPONSE_LENGTH, NntpResponse};
 use crate::types::BackendId;
 
 /// Response validation warnings (pure data)
@@ -25,7 +25,7 @@ pub enum ResponseWarning {
 /// Validated backend response (pure data)
 #[derive(Debug)]
 pub struct ValidatedResponse {
-    pub response: Response,
+    pub response: NntpResponse,
     pub is_multiline: bool,
     pub warnings: Vec<ResponseWarning>,
 }
@@ -61,11 +61,11 @@ pub fn validate_backend_response(
     }
 
     // Parse response code
-    let response = Response::parse(&chunk[..bytes_read]);
+    let response = NntpResponse::parse(&chunk[..bytes_read]);
     let is_multiline = response.is_multiline();
 
     // Check for invalid response
-    if response == Response::Invalid {
+    if response == NntpResponse::Invalid {
         warnings.push(ResponseWarning::InvalidResponse);
     } else if let Some(code) = response.status_code() {
         // Check for unusual status codes
@@ -92,7 +92,7 @@ pub async fn send_command_and_read_first_chunk<T>(
     backend_id: BackendId,
     client_addr: std::net::SocketAddr,
     chunk: &mut PooledBuffer,
-) -> Result<(usize, Response, bool, u64, u64, u64)>
+) -> Result<(usize, NntpResponse, bool, u64, u64, u64)>
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -172,7 +172,7 @@ mod tests {
         let data = b"200 OK\r\n";
         let validated = validate_backend_response(data, data.len(), 7);
 
-        assert!(matches!(validated.response, Response::Greeting(_)));
+        assert!(matches!(validated.response, NntpResponse::Greeting(_)));
         assert!(!validated.is_multiline);
         assert!(validated.warnings.is_empty());
     }
@@ -194,7 +194,7 @@ mod tests {
         let data = b"garbage response";
         let validated = validate_backend_response(data, data.len(), 7);
 
-        assert_eq!(validated.response, Response::Invalid);
+        assert_eq!(validated.response, NntpResponse::Invalid);
         assert!(
             validated
                 .warnings
@@ -261,7 +261,7 @@ mod tests {
 
         for data in test_cases {
             let validated = validate_backend_response(data, data.len(), 7);
-            assert!(!matches!(validated.response, Response::Invalid));
+            assert!(!matches!(validated.response, NntpResponse::Invalid));
             assert!(
                 validated
                     .warnings

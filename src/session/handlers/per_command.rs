@@ -631,7 +631,7 @@ impl ClientSession {
                 response_buffer.extend_from_slice(chunk);
 
                 // Check for terminator
-                if crate::protocol::NntpResponse::has_terminator_at_end(chunk) {
+                if crate::session::streaming::tail_buffer::has_terminator_at_end(chunk) {
                     break;
                 }
             }
@@ -652,7 +652,8 @@ impl ClientSession {
 
         // Cache successful ARTICLE responses (2xx status codes)
         if let Some(ref cache) = self.cache
-            && let Some(message_id) = crate::protocol::NntpResponse::extract_message_id(command)
+            && let Some(message_id_str) = crate::session::common::extract_message_id(command)
+            && let Ok(message_id) = crate::types::MessageId::from_borrowed(message_id_str)
             && let Some(code) = response_code.status_code()
             && code.is_success()
         {
@@ -709,7 +710,12 @@ impl ClientSession {
             .cache
             .as_ref()
             .filter(|_| matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId))
-            .zip(crate::protocol::NntpResponse::extract_message_id(command))
+            .zip(crate::session::common::extract_message_id(command))
+            .and_then(|(cache, msg_id_str)| {
+                crate::types::MessageId::from_borrowed(msg_id_str)
+                    .ok()
+                    .map(|msg_id| (cache, msg_id))
+            })
         else {
             return Ok(None);
         };

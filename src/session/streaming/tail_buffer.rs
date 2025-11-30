@@ -2,7 +2,7 @@
 //!
 //! Used to detect NNTP terminators that span across chunk boundaries.
 
-use crate::protocol::{NntpResponse, TERMINATOR_TAIL_SIZE};
+use crate::protocol::TERMINATOR_TAIL_SIZE;
 
 /// Status of terminator detection in a chunk
 #[derive(Debug, Clone, Copy)]
@@ -68,7 +68,7 @@ impl TailBuffer {
         if self.is_empty() {
             return false;
         }
-        NntpResponse::has_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
+        has_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
     }
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
@@ -76,7 +76,7 @@ impl TailBuffer {
     /// only scans with memchr if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
     pub(super) fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        if let Some(pos) = NntpResponse::find_terminator_end(chunk) {
+        if let Some(pos) = find_terminator_end(chunk) {
             TerminatorStatus::FoundAt(pos)
         } else if self.has_spanning_terminator(chunk) {
             TerminatorStatus::Spanning
@@ -84,6 +84,114 @@ impl TailBuffer {
             TerminatorStatus::NotFound
         }
     }
+}
+
+/// Find the position of the NNTP multiline terminator in data
+///
+/// Returns the position AFTER the terminator (exclusive end), or None if not found.
+/// This handles the case where extra data appears after the terminator in the same chunk.
+///
+/// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
+/// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
+///
+/// **Optimization**: Uses `memchr::memchr_iter()` to find '\r' bytes (SIMD-accelerated),
+/// then validates the full 5-byte pattern. This eliminates the need to create new slices
+/// on each iteration (which the manual loop approach requires with `&data[pos..]`).
+///
+/// Benchmarks show this is **72% faster for small responses** (37ns → 13ns) and
+/// **64% faster for medium responses** (109ns → 40ns) compared to the manual loop
+/// that creates a new slice on each iteration.
+///
+/// **Hot path optimization**: Check end first (99% case for streaming chunks),
+/// then scan forward if needed. Compiler optimizes slice comparison to memcmp.
+#[inline]
+fn find_terminator_end(data: &[u8]) -> Option<usize> {
+    const TERMINATOR: [u8; 5] = *b"\r\n.\r\n";
+
+    // Fast path: check suffix, or slow path: scan for terminator mid-chunk
+    data.len()
+        .checked_sub(5)
+        .filter(|&start| data[start..] == TERMINATOR)
+        .map(|_| data.len())
+        .or_else(|| {
+            memchr::memchr_iter(b'\r', data)
+                .take_while(|&pos| pos + 5 <= data.len())
+                .find(|&pos| data[pos..pos + 5] == TERMINATOR)
+                .map(|pos| pos + 5)
+        })
+}
+
+/// Check if a terminator spans across a boundary between tail and current chunk
+///
+/// This handles the case where a multiline terminator is split across two read chunks.
+/// For example: previous chunk ends with "\r\n." and current starts with "\r\n"
+///
+/// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
+/// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
+#[inline]
+fn has_spanning_terminator(
+    tail: &[u8],
+    tail_len: usize,
+    current: &[u8],
+    current_len: usize,
+) -> bool {
+    // Only check if we have a tail and current chunk is small enough for spanning
+    if tail_len < 1 || !(1..=4).contains(&current_len) {
+        return false;
+    }
+
+    // Check all possible split positions of the 5-byte terminator "\r\n.\r\n"
+    // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n"
+    if tail_len >= 1
+        && current_len >= 4
+        && tail[tail_len - 1] == b'\r'
+        && current[..4] == *b"\n.\r\n"
+    {
+        return true;
+    }
+    // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n"
+    if tail_len >= 2
+        && current_len >= 3
+        && tail[tail_len - 2..tail_len] == *b"\r\n"
+        && current[..3] == *b".\r\n"
+    {
+        return true;
+    }
+    // Split after byte 3: tail ends with "\r\n.", current starts with "\r\n"
+    if tail_len >= 3
+        && current_len >= 2
+        && tail[tail_len - 3..tail_len] == *b"\r\n."
+        && current[..2] == *b"\r\n"
+    {
+        return true;
+    }
+    // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n"
+    if tail_len >= 4
+        && current_len >= 1
+        && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
+        && current[0] == b'\n'
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Check if data ends with the NNTP multiline terminator
+///
+/// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
+/// ```text
+/// Multiline blocks are terminated by a line containing only a period:
+/// CRLF "." CRLF
+/// Which appears in the data stream as: \r\n.\r\n
+/// ```
+///
+/// **Optimization**: Single suffix check, no scanning.
+#[inline]
+pub(crate) fn has_terminator_at_end(data: &[u8]) -> bool {
+    let n = data.len();
+    // Only check for proper RFC 3977 terminator: \r\n.\r\n
+    n >= 5 && data[n - 5..n] == *b"\r\n.\r\n"
 }
 
 #[cfg(test)]

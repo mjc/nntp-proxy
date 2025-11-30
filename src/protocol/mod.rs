@@ -14,9 +14,10 @@ mod responses;
 
 pub use response::ResponseParser;
 
-// Re-export for future use
-#[allow(unused_imports)]
-pub use response::{NntpResponse, Response, StatusCode};
+// Re-export response types and utilities
+pub use response::{
+    NntpResponse, StatusCode, is_disconnect, is_multiline_response, parse_status_code,
+};
 
 // Re-export command construction helpers
 pub use commands::{
