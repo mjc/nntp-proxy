@@ -99,6 +99,11 @@ pub mod timeout {
     /// Timeout for executing a command on backend
     pub const COMMAND_EXECUTION: Duration = Duration::from_secs(60);
 
+    /// Timeout for acquiring a connection from the pool
+    /// Short timeout prevents blocking when all connections are stuck waiting for slow backends
+    /// If we can't get a connection in 2 seconds, the pool is likely exhausted
+    pub const POOL_GET: Duration = Duration::from_secs(2);
+
     /// Connection timeout for backend connections
     pub const CONNECTION: Duration = Duration::from_secs(10);
 }

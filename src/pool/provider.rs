@@ -325,9 +325,15 @@ impl DeadpoolConnectionProvider {
 
     /// Get a connection from the pool (automatically returned when dropped)
     pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
-        self.pool
-            .get()
+        use crate::constants::timeout::POOL_GET;
+        use tokio::time::timeout;
+
+        timeout(POOL_GET, self.pool.get())
             .await
+            .map_err(|_| anyhow::anyhow!(
+                "Timeout acquiring connection from {} (pool likely exhausted or connections stuck)",
+                self.name
+            ))?
             .map_err(|e| anyhow::anyhow!("Failed to get connection from {}: {}", self.name, e))
     }
 

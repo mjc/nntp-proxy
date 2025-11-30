@@ -6,6 +6,7 @@ mod basic;
 mod load_tracking;
 mod round_robin;
 mod stateful;
+mod weighted;
 
 /// Helper function to create a test provider for use in tests
 pub(crate) fn create_test_provider() -> DeadpoolConnectionProvider {
