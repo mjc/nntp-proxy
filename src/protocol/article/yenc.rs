@@ -26,7 +26,7 @@ const DOT: u8 = b'.';
 /// - Leading `..` collapses to `.` (NNTP dot-stuffing)
 /// - CR, LF, NUL are ignored
 #[inline]
-fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
+pub fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut iter = input.iter().copied().enumerate();
 

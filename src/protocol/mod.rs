@@ -16,7 +16,7 @@ mod responses;
 pub use response::ResponseParser;
 
 // Re-export article parsing types
-pub use article::{Article, HeaderIter, Headers, ParseError};
+pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
 pub use response::{

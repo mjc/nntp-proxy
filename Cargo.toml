@@ -68,6 +68,7 @@ serial_test = "3.2"
 serde_json = "1.0"  # For testing serde implementations
 divan = "0.1"  # Modern benchmarking framework
 proptest = "1.5"  # Property-based testing for comprehensive coverage
+iai-callgrind = "0.16.1"
 
 [[bench]]
 name = "command_parsing"
@@ -75,6 +76,14 @@ harness = false
 
 [[bench]]
 name = "response_parsing"
+harness = false
+
+[[bench]]
+name = "yenc_decoding"
+harness = false
+
+[[bench]]
+name = "yenc_decoding_iai"
 harness = false
 
 

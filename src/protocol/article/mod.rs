@@ -5,7 +5,7 @@
 
 mod error;
 mod headers;
-mod yenc;
+pub mod yenc;
 
 pub use error::ParseError;
 pub use headers::{HeaderIter, Headers};
