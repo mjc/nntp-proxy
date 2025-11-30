@@ -5,15 +5,6 @@
 
 use super::*;
 
-/// Helper to create a test backend with specified max_connections
-fn create_backend(name: &str, max_connections: usize) -> DeadpoolConnectionProvider {
-    DeadpoolConnectionProvider::builder("localhost", 119)
-        .name(name)
-        .max_connections(max_connections)
-        .build()
-        .unwrap()
-}
-
 #[test]
 fn test_total_weight_accumulation() {
     let mut selector = BackendSelector::new();

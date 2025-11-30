@@ -5,6 +5,7 @@ use nntp_proxy::router::BackendSelector;
 use nntp_proxy::types::{BackendId, ClientId, ServerName};
 
 mod basic;
+mod least_loaded;
 mod load_tracking;
 mod round_robin;
 mod stateful;
@@ -20,4 +21,13 @@ fn create_test_provider() -> DeadpoolConnectionProvider {
         None,
         None,
     )
+}
+
+/// Helper to create a test backend with specified max_connections
+fn create_backend(name: &str, max_connections: usize) -> DeadpoolConnectionProvider {
+    DeadpoolConnectionProvider::builder("localhost", 119)
+        .name(name)
+        .max_connections(max_connections)
+        .build()
+        .unwrap()
 }

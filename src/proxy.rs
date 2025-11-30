@@ -166,8 +166,9 @@ impl NntpProxyBuilder {
         // Create backend selector and add all backends
         let router = Arc::new({
             use types::BackendId;
+            let backend_strategy = self.config.proxy.backend_selection;
             connection_providers.iter().enumerate().fold(
-                router::BackendSelector::new(),
+                router::BackendSelector::with_strategy(backend_strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
                     r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());

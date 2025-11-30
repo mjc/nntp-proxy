@@ -56,6 +56,30 @@ impl WeightedRoundRobin {
     }
 }
 
+/// Strategy for selecting backends based on current load
+///
+/// Routes requests to the backend with the fewest pending requests,
+/// accounting for backend capacity (max_connections).
+///
+/// Algorithm: Calculate load_ratio = pending / max_connections for each backend,
+/// select the one with lowest ratio. Breaks ties by choosing first occurrence.
+#[derive(Debug)]
+pub struct LeastLoaded;
+
+impl LeastLoaded {
+    /// Create a new least-loaded strategy
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for LeastLoaded {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

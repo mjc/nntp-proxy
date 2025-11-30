@@ -61,6 +61,40 @@ impl std::fmt::Display for RoutingMode {
     }
 }
 
+/// Backend selection strategy for load balancing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendSelectionStrategy {
+    /// Weighted round-robin - distributes requests proportionally to max_connections
+    WeightedRoundRobin,
+    /// Least-loaded - routes to backend with fewest pending requests
+    LeastLoaded,
+}
+
+impl Default for BackendSelectionStrategy {
+    /// Default is weighted round-robin for predictable distribution
+    fn default() -> Self {
+        Self::WeightedRoundRobin
+    }
+}
+
+impl BackendSelectionStrategy {
+    /// Get a human-readable description
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::WeightedRoundRobin => "weighted round-robin",
+            Self::LeastLoaded => "least-loaded",
+        }
+    }
+}
+
+impl std::fmt::Display for BackendSelectionStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct Config {
@@ -91,6 +125,8 @@ pub struct Proxy {
     pub port: Port,
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     pub threads: ThreadCount,
+    /// Backend selection strategy for load balancing
+    pub backend_selection: BackendSelectionStrategy,
 }
 
 impl Proxy {
@@ -104,6 +140,7 @@ impl Default for Proxy {
             host: Self::DEFAULT_HOST.to_string(),
             port: Port::default(),
             threads: ThreadCount::default(),
+            backend_selection: BackendSelectionStrategy::default(),
         }
     }
 }
