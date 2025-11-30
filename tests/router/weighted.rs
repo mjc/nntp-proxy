@@ -4,8 +4,6 @@
 //! proportionally based on backend pool sizes (max_connections).
 
 use super::*;
-use crate::pool::DeadpoolConnectionProvider;
-use crate::types::ServerName;
 
 /// Helper to create a test backend with specified max_connections
 fn create_backend(name: &str, max_connections: usize) -> DeadpoolConnectionProvider {

@@ -1,7 +1,6 @@
 //! Round-robin selection strategy tests
 
 use super::*;
-use crate::types::ServerName;
 
 #[test]
 fn test_round_robin_selection() {

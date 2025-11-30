@@ -1,6 +1,8 @@
-//! Tests for the router module
+//! Router integration tests
 
-use super::*;
+use nntp_proxy::pool::DeadpoolConnectionProvider;
+use nntp_proxy::router::BackendSelector;
+use nntp_proxy::types::{BackendId, ClientId, ServerName};
 
 mod basic;
 mod load_tracking;
@@ -9,7 +11,7 @@ mod stateful;
 mod weighted;
 
 /// Helper function to create a test provider for use in tests
-pub(crate) fn create_test_provider() -> DeadpoolConnectionProvider {
+fn create_test_provider() -> DeadpoolConnectionProvider {
     DeadpoolConnectionProvider::new(
         "localhost".to_string(),
         9999,

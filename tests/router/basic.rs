@@ -1,7 +1,6 @@
 //! Basic router functionality tests
 
 use super::*;
-use crate::types::ServerName;
 
 #[test]
 fn test_router_creation() {

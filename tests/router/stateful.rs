@@ -1,7 +1,6 @@
 //! Stateful connection reservation tests
 
 use super::*;
-use crate::types::ServerName;
 use std::sync::Arc;
 
 #[test]

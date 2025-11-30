@@ -328,6 +328,3 @@ impl BackendSelector {
             .map(|b| b.stateful_count.load(Ordering::Relaxed))
     }
 }
-
-#[cfg(test)]
-mod tests;
