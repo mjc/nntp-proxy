@@ -59,7 +59,6 @@ rustls-native-certs = "0.8"  # Load system CA certificates
 rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
 rustls-pki-types = "1.8"  # PKI types for rustls
 webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
-yenc = "0.2.2"
 crc32fast = "1.5.0"
 
 

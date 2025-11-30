@@ -937,7 +937,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots",
- "yenc",
 ]
 
 [[package]]
@@ -2228,15 +2227,6 @@ name = "wit-bindgen"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
-
-[[package]]
-name = "yenc"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b18d9bd0fdec2bda9866bd18dcef7f99c08f051a0a660ea2de08daa2514b21"
-dependencies = [
- "crc32fast",
-]
 
 [[package]]
 name = "zerocopy"

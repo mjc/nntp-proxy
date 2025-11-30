@@ -1,9 +1,199 @@
 //! yEnc validation utilities
 //!
-//! Validates yenc-encoded binary data structure and checksums.
+//! Validates yenc-encoded binary data structure and checksums using
+//! functional composition and iterator-based parsing.
+//!
+//! yEnc encoding is simple: each byte is `(input - 42) % 256`, with `=` as escape
+//! for special bytes (followed by `byte - 64`), and leading `..` for dot-stuffing.
 
 use super::ParseError;
 use std::io::{BufRead, BufReader};
+
+/// yEnc escape character (signals next byte needs special handling)
+const ESCAPE: u8 = b'=';
+/// CR/LF and NUL are skipped in yenc data
+const CR: u8 = b'\r';
+const LF: u8 = b'\n';
+const NUL: u8 = b'\0';
+/// Dot at start of line (NNTP dot-stuffing)
+const DOT: u8 = b'.';
+
+/// Decode yenc-encoded line to raw bytes
+///
+/// yEnc encoding: `encoded = (original + 42) % 256`
+/// Special handling:
+/// - `=` is escape: next byte uses `(byte - 64) % 256` instead of 42
+/// - Leading `..` collapses to `.` (NNTP dot-stuffing)
+/// - CR, LF, NUL are ignored
+#[inline]
+fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut iter = input.iter().copied().enumerate();
+
+    while let Some((col, byte)) = iter.next() {
+        match byte {
+            // Skip control characters
+            NUL | CR | LF => continue,
+
+            // Handle NNTP dot-stuffing (.. at start becomes .)
+            DOT if col == 0 => {
+                if let Some((_, DOT)) = iter.next() {
+                    output.push(DOT.wrapping_sub(42));
+                } else {
+                    output.push(DOT.wrapping_sub(42));
+                }
+            }
+
+            // Escape character: next byte uses different offset
+            ESCAPE => {
+                if let Some((_, escaped_byte)) = iter.next() {
+                    output.push(escaped_byte.wrapping_sub(64).wrapping_sub(42));
+                }
+            }
+
+            // Normal yenc byte: subtract 42
+            _ => output.push(byte.wrapping_sub(42)),
+        }
+    }
+
+    output
+}
+
+/// yEnc header metadata extracted from =ybegin line
+#[derive(Debug, Clone)]
+struct YencHeader {
+    expected_size: usize,
+    is_multipart: bool,
+}
+
+impl YencHeader {
+    /// Parse from line bytes
+    #[inline]
+    fn parse(line: &[u8]) -> Result<Self, ParseError> {
+        let line_str = String::from_utf8_lossy(line);
+
+        let expected_size = extract_param(&line_str, "size")
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| {
+                ParseError::InvalidYenc("Missing 'size' parameter in =ybegin".to_string())
+            })?;
+
+        let is_multipart = extract_param(&line_str, "part").is_some();
+
+        Ok(Self {
+            expected_size,
+            is_multipart,
+        })
+    }
+
+    /// Validate footer size matches header
+    #[inline]
+    fn validate_size(&self, footer: &YencFooter) -> Result<(), ParseError> {
+        footer
+            .size
+            .filter(|&size| size != self.expected_size)
+            .map(|size| {
+                Err(ParseError::InvalidYenc(format!(
+                    "Size mismatch: header={}, footer={}",
+                    self.expected_size, size
+                )))
+            })
+            .unwrap_or(Ok(()))
+    }
+}
+
+/// yEnc footer metadata extracted from =yend line
+#[derive(Debug, Clone)]
+struct YencFooter {
+    size: Option<usize>,
+    crc32: Option<u32>,
+}
+
+impl YencFooter {
+    /// Parse from line bytes
+    #[inline]
+    fn parse(line: &[u8], is_multipart: bool) -> Result<Self, ParseError> {
+        let line_str = String::from_utf8_lossy(line);
+
+        let size = extract_param(&line_str, "size").and_then(|s| s.parse().ok());
+
+        let crc_param = if is_multipart { "pcrc32" } else { "crc32" };
+        let crc32 =
+            extract_param(&line_str, crc_param).and_then(|s| u32::from_str_radix(s, 16).ok());
+
+        Ok(Self { size, crc32 })
+    }
+
+    /// Validate CRC32 checksum if provided
+    #[inline]
+    fn validate_checksum(&self, checksum: &crc32fast::Hasher) -> Result<(), ParseError> {
+        self.crc32
+            .filter(|&expected| checksum.clone().finalize() != expected)
+            .map(|expected| {
+                Err(ParseError::InvalidYenc(format!(
+                    "CRC mismatch: expected={:08x}, actual={:08x}",
+                    expected,
+                    checksum.clone().finalize()
+                )))
+            })
+            .unwrap_or(Ok(()))
+    }
+}
+
+/// yEnc line classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YencLine {
+    Part,
+    End,
+    Data,
+}
+
+impl YencLine {
+    /// Classify a yenc line by its prefix
+    #[inline]
+    fn classify(line: &[u8]) -> Self {
+        if line.starts_with(b"=ypart ") {
+            Self::Part
+        } else if line.starts_with(b"=yend ") {
+            Self::End
+        } else {
+            Self::Data
+        }
+    }
+}
+
+/// Iterator adapter for reading lines from BufReader
+struct YencLines<'a> {
+    reader: &'a mut BufReader<&'a [u8]>,
+    line_buf: Vec<u8>,
+}
+
+impl<'a> YencLines<'a> {
+    #[inline]
+    fn new(reader: &'a mut BufReader<&'a [u8]>) -> Self {
+        Self {
+            reader,
+            line_buf: Vec::new(),
+        }
+    }
+}
+
+impl Iterator for YencLines<'_> {
+    type Item = Result<Vec<u8>, ParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.line_buf.clear();
+        match self
+            .reader
+            .read_until(b'\n', &mut self.line_buf)
+            .map_err(|e| ParseError::InvalidYenc(format!("Failed to read yenc: {}", e)))
+        {
+            Ok(0) => None,
+            Ok(_) => Some(Ok(self.line_buf.clone())),
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
 
 /// Validate yenc structure in article body
 ///
@@ -17,139 +207,77 @@ use std::io::{BufRead, BufReader};
 /// Does NOT write to disk - validates in-memory only.
 pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
     let mut reader = BufReader::new(body);
-    let mut line_buf = Vec::new();
+    let mut lines = YencLines::new(&mut reader);
 
-    // Find =ybegin header
-    let mut header_found = false;
-    let mut expected_size: Option<usize> = None;
-    let mut expected_crc: Option<u32> = None;
-    let mut is_multipart = false;
+    let header = lines
+        .by_ref()
+        .find_map(|line| {
+            line.ok()
+                .filter(|l| l.starts_with(b"=ybegin "))
+                .and_then(|l| YencHeader::parse(&l).ok())
+        })
+        .ok_or_else(|| ParseError::InvalidYenc("Missing =ybegin header".to_string()))?;
 
-    while reader
-        .read_until(b'\n', &mut line_buf)
-        .map_err(|e| ParseError::InvalidYenc(format!("Failed to read yenc: {}", e)))?
-        > 0
-    {
-        if line_buf.starts_with(b"=ybegin ") {
-            header_found = true;
-
-            // Parse as lossy string for parameter extraction
-            let line_str = String::from_utf8_lossy(&line_buf);
-
-            // Parse size parameter (required)
-            if let Some(size_str) = extract_param(&line_str, "size") {
-                expected_size = size_str.parse().ok();
-            } else {
-                return Err(ParseError::InvalidYenc(
-                    "Missing 'size' parameter in =ybegin".to_string(),
-                ));
-            }
-
-            // Check if it's a multi-part
-            if extract_param(&line_str, "part").is_some() {
-                is_multipart = true;
-            }
-
-            break;
-        }
-        line_buf.clear();
-    }
-
-    if !header_found {
-        return Err(ParseError::InvalidYenc(
-            "Missing =ybegin header".to_string(),
-        ));
-    }
-
-    // Decode and checksum the data
-    let mut checksum = crc32fast::Hasher::new();
-    let mut _decoded_size = 0usize;
-    let mut footer_found = false;
-
-    line_buf.clear();
-    while reader
-        .read_until(b'\n', &mut line_buf)
-        .map_err(|e| ParseError::InvalidYenc(format!("Failed to read yenc: {}", e)))?
-        > 0
-    {
-        if line_buf.starts_with(b"=ypart ") {
-            // Multi-part metadata, skip
-            line_buf.clear();
-            continue;
-        } else if line_buf.starts_with(b"=yend ") {
-            footer_found = true;
-
-            let line_str = String::from_utf8_lossy(&line_buf);
-
-            // Parse footer size
-            if let Some(size_str) = extract_param(&line_str, "size")
-                && let Some(expected) = expected_size
-            {
-                let footer_size: usize = size_str
-                    .parse()
-                    .map_err(|_| ParseError::InvalidYenc("Invalid size in =yend".to_string()))?;
-                if footer_size != expected {
-                    return Err(ParseError::InvalidYenc(format!(
-                        "Size mismatch: header={}, footer={}",
-                        expected, footer_size
-                    )));
+    let (footer, checksum) = lines.try_fold(
+        (None, crc32fast::Hasher::new()),
+        |(footer, mut checksum), line| -> Result<_, ParseError> {
+            let line = line?;
+            match YencLine::classify(&line) {
+                YencLine::Part => Ok((footer, checksum)),
+                YencLine::End => {
+                    let parsed_footer = YencFooter::parse(&line, header.is_multipart)?;
+                    Ok((Some(parsed_footer), checksum))
+                }
+                YencLine::Data => {
+                    decode_and_checksum(&line, &mut checksum)?;
+                    Ok((footer, checksum))
                 }
             }
+        },
+    )?;
 
-            // Parse CRC if present
-            if is_multipart {
-                if let Some(crc_str) = extract_param(&line_str, "pcrc32") {
-                    expected_crc = u32::from_str_radix(crc_str, 16).ok();
-                }
-            } else if let Some(crc_str) = extract_param(&line_str, "crc32") {
-                expected_crc = u32::from_str_radix(crc_str, 16).ok();
-            }
+    let footer =
+        footer.ok_or_else(|| ParseError::InvalidYenc("Missing =yend footer".to_string()))?;
 
-            break;
-        } else {
-            // Decode the line and update checksum
-            // Strip trailing CRLF before decoding
-            let line_to_decode = line_buf
-                .strip_suffix(b"\r\n")
-                .or_else(|| line_buf.strip_suffix(b"\n"))
-                .unwrap_or(&line_buf);
-
-            let decoded = yenc::decode_buffer(line_to_decode)
-                .map_err(|e| ParseError::InvalidYenc(format!("Decode error: {}", e)))?;
-            checksum.update(&decoded);
-            _decoded_size += decoded.len();
-        }
-        line_buf.clear();
-    }
-
-    if !footer_found {
-        return Err(ParseError::InvalidYenc("Missing =yend footer".to_string()));
-    }
-
-    // Validate checksum if provided
-    if let Some(expected) = expected_crc {
-        let actual = checksum.finalize();
-        if actual != expected {
-            return Err(ParseError::InvalidYenc(format!(
-                "CRC mismatch: expected={:08x}, actual={:08x}",
-                expected, actual
-            )));
-        }
-    }
+    header.validate_size(&footer)?;
+    footer.validate_checksum(&checksum)?;
 
     Ok(())
 }
 
-/// Extract a parameter value from a yenc metadata line
-fn extract_param<'a>(line: &'a str, param: &str) -> Option<&'a str> {
-    let pattern = format!("{}=", param);
-    let start = line.find(&pattern)? + pattern.len();
-    let rest = &line[start..];
+/// Decode a yenc data line and update checksum
+#[inline]
+fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> Result<(), ParseError> {
+    let decoded = line
+        .strip_suffix(b"\r\n")
+        .or_else(|| line.strip_suffix(b"\n"))
+        .unwrap_or(line)
+        .pipe(decode_yenc_line);
 
-    // Find end (space or newline)
-    let end = rest.find(' ').unwrap_or(rest.len());
-    Some(rest[..end].trim())
+    checksum.update(&decoded);
+    Ok(())
 }
+
+/// Extract a parameter value from a yenc metadata line
+#[inline]
+fn extract_param<'a>(line: &'a str, param: &str) -> Option<&'a str> {
+    line.find(&format!("{}=", param))
+        .map(|start| &line[start + param.len() + 1..])
+        .and_then(|rest| rest.split_whitespace().next())
+}
+
+/// Pipe combinator for method chaining
+trait Pipe: Sized {
+    #[inline]
+    fn pipe<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(Self) -> R,
+    {
+        f(self)
+    }
+}
+
+impl<T> Pipe for T {}
 
 #[cfg(test)]
 mod tests {
