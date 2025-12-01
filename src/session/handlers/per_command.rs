@@ -145,7 +145,7 @@ impl ClientSession {
             if let common::QuitStatus::Quit(bytes) =
                 common::handle_quit_command(&command, &mut client_write).await?
             {
-                backend_to_client_bytes += bytes;
+                backend_to_client_bytes.add_u64(bytes.into());
                 break;
             }
 
@@ -173,29 +173,32 @@ impl ClientSession {
                         ),
                     };
 
-                    backend_to_client_bytes += match common::handle_auth_command(
-                        &self.auth_handler,
-                        auth_action,
-                        &mut client_write,
-                        &mut auth_username,
-                        &self.authenticated,
-                    )
-                    .await?
-                    {
-                        common::AuthResult::Authenticated(bytes) => {
-                            common::on_authentication_success(
-                                self.client_addr,
-                                auth_username.clone(),
-                                &self.routing_mode,
-                                &self.metrics,
-                                self.connection_stats(),
-                                |username| self.set_username(username),
-                            );
-                            skip_auth_check = true;
-                            bytes
+                    backend_to_client_bytes.add_u64(
+                        match common::handle_auth_command(
+                            &self.auth_handler,
+                            auth_action,
+                            &mut client_write,
+                            &mut auth_username,
+                            &self.authenticated,
+                        )
+                        .await?
+                        {
+                            common::AuthResult::Authenticated(bytes) => {
+                                common::on_authentication_success(
+                                    self.client_addr,
+                                    auth_username.clone(),
+                                    &self.routing_mode,
+                                    &self.metrics,
+                                    self.connection_stats(),
+                                    |username| self.set_username(username),
+                                );
+                                skip_auth_check = true;
+                                bytes
+                            }
+                            common::AuthResult::NotAuthenticated(bytes) => bytes,
                         }
-                        common::AuthResult::NotAuthenticated(bytes) => bytes,
-                    };
+                        .as_u64(),
+                    );
                 }
 
                 CommandRoutingDecision::Forward => {
@@ -1136,7 +1139,7 @@ mod tests {
         use std::time::Duration;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 
         ClientSession::builder(addr, buffer_pool, auth_handler)
@@ -1151,7 +1154,7 @@ mod tests {
         use std::sync::Arc;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 
         ClientSession::builder(addr, buffer_pool, auth_handler).build()

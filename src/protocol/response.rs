@@ -31,27 +31,23 @@
 //! CRLF "." CRLF
 //! ```
 
+use nutype::nutype;
+
 /// Raw NNTP status code (3-digit number)
 ///
 /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
 /// all NNTP responses start with a 3-digit status code (100-599).
-///
-/// This newtype ensures type safety and prevents mixing status codes with other integers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[nutype(derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, AsRef, Deref
+))]
 pub struct StatusCode(u16);
 
 impl StatusCode {
-    /// Create a new status code (unchecked - for internal use)
-    #[inline]
-    pub const fn new(code: u16) -> Self {
-        Self(code)
-    }
-
     /// Get the raw numeric value
     #[inline]
     #[must_use]
-    pub const fn as_u16(self) -> u16 {
-        self.0
+    pub fn as_u16(&self) -> u16 {
+        **self
     }
 
     /// Check if this is a success code (2xx or 3xx)
@@ -61,28 +57,25 @@ impl StatusCode {
     /// - 3xx: Success so far, send more input
     #[inline]
     #[must_use]
-    pub const fn is_success(self) -> bool {
-        self.0 >= 200 && self.0 < 400
+    pub fn is_success(&self) -> bool {
+        let code = self.into_inner();
+        (200..400).contains(&code)
     }
 
     /// Check if this is an error code (4xx or 5xx)
     #[inline]
     #[must_use]
-    pub const fn is_error(self) -> bool {
-        self.0 >= 400 && self.0 < 600
+    pub fn is_error(&self) -> bool {
+        let code = self.into_inner();
+        (400..600).contains(&code)
     }
 
     /// Check if this is an informational code (1xx)
     #[inline]
     #[must_use]
-    pub const fn is_informational(self) -> bool {
-        self.0 >= 100 && self.0 < 200
-    }
-}
-
-impl std::fmt::Display for StatusCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+    pub fn is_informational(&self) -> bool {
+        let code = self.into_inner();
+        (100..200).contains(&code)
     }
 }
 
@@ -183,7 +176,7 @@ impl NntpResponse {
     /// Get the numeric status code if available
     #[inline]
     #[must_use]
-    pub const fn status_code(&self) -> Option<StatusCode> {
+    pub fn status_code(&self) -> Option<StatusCode> {
         match self {
             Self::Greeting(c)
             | Self::AuthRequired(c)
@@ -247,9 +240,8 @@ impl StatusCode {
     /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
     #[inline]
     #[must_use]
-    pub const fn is_multiline(self) -> bool {
-        let code = self.0;
-        match code {
+    pub fn is_multiline(&self) -> bool {
+        match **self {
             100..=199 => true, // All 1xx are multiline
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
             _ => false,

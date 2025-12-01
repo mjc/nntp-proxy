@@ -172,10 +172,10 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let servers = vec![Server {
-            name: crate::types::ServerName::new("TestServer1".to_string()).unwrap(),
-            host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
-            port: crate::types::Port::new(port).unwrap(),
-            max_connections: crate::types::MaxConnections::new(2).unwrap(),
+            name: crate::types::ServerName::try_new("TestServer1".to_string()).unwrap(),
+            host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
+            port: crate::types::Port::try_new(port).unwrap(),
+            max_connections: crate::types::MaxConnections::try_new(2).unwrap(),
             username: None,
             password: None,
             use_tls: false,
@@ -220,10 +220,10 @@ mod tests {
 
         let servers = vec![
             Server {
-                name: crate::types::ServerName::new("Server1".to_string()).unwrap(),
-                host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::new(port1).unwrap(),
-                max_connections: crate::types::MaxConnections::new(2).unwrap(),
+                name: crate::types::ServerName::try_new("Server1".to_string()).unwrap(),
+                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
+                port: crate::types::Port::try_new(port1).unwrap(),
+                max_connections: crate::types::MaxConnections::try_new(2).unwrap(),
                 username: None,
                 password: None,
                 use_tls: false,
@@ -234,10 +234,10 @@ mod tests {
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
             },
             Server {
-                name: crate::types::ServerName::new("Server2".to_string()).unwrap(),
-                host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::new(port2).unwrap(),
-                max_connections: crate::types::MaxConnections::new(1).unwrap(),
+                name: crate::types::ServerName::try_new("Server2".to_string()).unwrap(),
+                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
+                port: crate::types::Port::try_new(port2).unwrap(),
+                max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
                 username: None,
                 password: None,
                 use_tls: false,
@@ -273,10 +273,10 @@ mod tests {
         let bad_port = 65500; // High port unlikely to be in use
 
         let servers = vec![Server {
-            name: crate::types::ServerName::new("UnreachableServer".to_string()).unwrap(),
-            host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
-            port: crate::types::Port::new(bad_port).unwrap(),
-            max_connections: crate::types::MaxConnections::new(1).unwrap(),
+            name: crate::types::ServerName::try_new("UnreachableServer".to_string()).unwrap(),
+            host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
+            port: crate::types::Port::try_new(bad_port).unwrap(),
+            max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
             username: None,
             password: None,
             use_tls: false,
@@ -391,10 +391,10 @@ mod tests {
 
         let servers = vec![
             Server {
-                name: crate::types::ServerName::new("GoodServer".to_string()).unwrap(),
-                host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::new(good_port).unwrap(),
-                max_connections: crate::types::MaxConnections::new(1).unwrap(),
+                name: crate::types::ServerName::try_new("GoodServer".to_string()).unwrap(),
+                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
+                port: crate::types::Port::try_new(good_port).unwrap(),
+                max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
                 username: None,
                 password: None,
                 use_tls: false,
@@ -405,10 +405,10 @@ mod tests {
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
             },
             Server {
-                name: crate::types::ServerName::new("BadServer".to_string()).unwrap(),
-                host: crate::types::HostName::new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::new(bad_port).unwrap(),
-                max_connections: crate::types::MaxConnections::new(1).unwrap(),
+                name: crate::types::ServerName::try_new("BadServer".to_string()).unwrap(),
+                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
+                port: crate::types::Port::try_new(bad_port).unwrap(),
+                max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
                 username: None,
                 password: None,
                 use_tls: false,

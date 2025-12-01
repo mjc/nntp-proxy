@@ -6,13 +6,21 @@ use crate::RoutingMode;
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
 use clap::Parser;
 
+/// Parse port from command line argument
+fn parse_port(s: &str) -> Result<Port, String> {
+    let port: u16 = s
+        .parse()
+        .map_err(|e| format!("Invalid port number: {}", e))?;
+    Port::try_new(port).map_err(|e| format!("Invalid port: {}", e))
+}
+
 /// Common command-line arguments for NNTP proxy binaries
 ///
 /// Use `#[command(flatten)]` in binary-specific Args to include these fields.
 #[derive(Parser, Debug, Clone)]
 pub struct CommonArgs {
     /// Port to listen on (overrides config file)
-    #[arg(short, long, env)]
+    #[arg(short, long, env, value_parser = parse_port)]
     pub port: Option<Port>,
 
     /// Host to bind to (overrides config file)
@@ -49,7 +57,7 @@ impl CommonArgs {
     /// Default host when none specified
     const DEFAULT_HOST: &'static str = "0.0.0.0";
 
-    /// Get listen address from args, using config as fallback
+    /// Get formatted listen address
     ///
     /// # Arguments
     /// * `config_port` - Port from config file (if any)
@@ -67,11 +75,8 @@ impl CommonArgs {
 
     /// Get effective port (from args or config)
     #[must_use]
-    pub const fn effective_port(&self, config_port: Option<Port>) -> Option<Port> {
-        match self.port {
-            Some(p) => Some(p),
-            None => config_port,
-        }
+    pub fn effective_port(&self, config_port: Option<Port>) -> Option<Port> {
+        self.port.or(config_port)
     }
 
     /// Get effective host
@@ -103,7 +108,7 @@ impl CacheArgs {
     /// Get cache capacity as usize
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.cache_capacity.get()
+        self.cache_capacity.into_inner()
     }
 }
 
@@ -129,7 +134,7 @@ mod tests {
     #[test]
     fn test_common_args_with_port() {
         let args = CommonArgs {
-            port: Some(Port::new(9119).unwrap()),
+            port: Some(Port::try_new(9119).unwrap()),
             host: None,
             routing_mode: RoutingMode::Hybrid,
             config: ConfigPath::new("config.toml").unwrap(),
@@ -137,7 +142,10 @@ mod tests {
         };
 
         assert_eq!(args.listen_addr(None), "0.0.0.0:9119");
-        assert_eq!(args.effective_port(None), Some(Port::new(9119).unwrap()));
+        assert_eq!(
+            args.effective_port(None),
+            Some(Port::try_new(9119).unwrap())
+        );
     }
 
     #[test]
@@ -157,20 +165,20 @@ mod tests {
     #[test]
     fn test_common_args_port_override() {
         let args = CommonArgs {
-            port: Some(Port::new(9119).unwrap()),
+            port: Some(Port::try_new(9119).unwrap()),
             host: None,
             routing_mode: RoutingMode::Hybrid,
             config: ConfigPath::new("config.toml").unwrap(),
             threads: None,
         };
 
-        let config_port = Some(Port::new(7119).unwrap());
+        let config_port = Some(Port::try_new(7119).unwrap());
 
         // Args port should override config port
         assert_eq!(args.listen_addr(config_port), "0.0.0.0:9119");
         assert_eq!(
             args.effective_port(config_port),
-            Some(Port::new(9119).unwrap())
+            Some(Port::try_new(9119).unwrap())
         );
     }
 
@@ -184,20 +192,20 @@ mod tests {
             threads: None,
         };
 
-        let config_port = Some(Port::new(7119).unwrap());
+        let config_port = Some(Port::try_new(7119).unwrap());
 
         // Should use config port when args port is None
         assert_eq!(args.listen_addr(config_port), "0.0.0.0:7119");
         assert_eq!(
             args.effective_port(config_port),
-            Some(Port::new(7119).unwrap())
+            Some(Port::try_new(7119).unwrap())
         );
     }
 
     #[test]
     fn test_common_args_custom_host_and_port() {
         let args = CommonArgs {
-            port: Some(Port::new(9119).unwrap()),
+            port: Some(Port::try_new(9119).unwrap()),
             host: Some("192.168.1.1".to_string()),
             routing_mode: RoutingMode::Hybrid,
             config: ConfigPath::new("config.toml").unwrap(),
@@ -206,13 +214,16 @@ mod tests {
 
         assert_eq!(args.listen_addr(None), "192.168.1.1:9119");
         assert_eq!(args.effective_host(), "192.168.1.1");
-        assert_eq!(args.effective_port(None), Some(Port::new(9119).unwrap()));
+        assert_eq!(
+            args.effective_port(None),
+            Some(Port::try_new(9119).unwrap())
+        );
     }
 
     #[test]
     fn test_cache_args_defaults() {
         let args = CacheArgs {
-            cache_capacity: CacheCapacity::new(10000).unwrap(),
+            cache_capacity: CacheCapacity::try_new(10000).unwrap(),
             cache_ttl: 3600,
         };
 
@@ -224,7 +235,7 @@ mod tests {
     #[test]
     fn test_cache_args_custom_values() {
         let args = CacheArgs {
-            cache_capacity: CacheCapacity::new(50000).unwrap(),
+            cache_capacity: CacheCapacity::try_new(50000).unwrap(),
             cache_ttl: 7200,
         };
 

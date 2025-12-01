@@ -298,7 +298,7 @@ fn test_authinfo_pass_empty() {
 /// Test buffer pool creation and usage
 #[tokio::test]
 async fn test_buffer_pool_basic_usage() {
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 2);
+    let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 2);
 
     // Get buffer
     let buffer1 = buffer_pool.acquire().await;
@@ -320,7 +320,7 @@ async fn test_buffer_pool_different_sizes() {
     let sizes = [1024, 4096, 8192, 16384];
 
     for size in &sizes {
-        let buffer_pool = BufferPool::new(BufferSize::new(*size).unwrap(), 1);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(*size).unwrap(), 1);
         let buffer = buffer_pool.acquire().await;
         assert_eq!(buffer.capacity(), *size);
     }
@@ -344,7 +344,7 @@ async fn test_auth_flow_success_with_password() -> Result<()> {
 
     // Connect client
     let mut stream = TcpStream::connect(addr).await?;
-    let _buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 2);
+    let _buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 2);
 
     // Read greeting
     let mut buf = [0u8; 1024];
@@ -622,7 +622,7 @@ fn test_command_formatting_crlf() {
 /// Test buffer pool concurrent access
 #[tokio::test]
 async fn test_buffer_pool_concurrent_access() {
-    let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);
+    let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
 
     let mut handles = vec![];
 

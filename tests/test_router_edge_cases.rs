@@ -33,7 +33,7 @@ fn test_complete_command_on_wrong_backend() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test".to_string()).unwrap(),
+        ServerName::try_new("test".to_string()).unwrap(),
         create_test_provider(),
     );
 
@@ -68,7 +68,7 @@ fn test_release_stateful_when_count_is_zero() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test".to_string()).unwrap(),
+        ServerName::try_new("test".to_string()).unwrap(),
         create_test_provider(),
     );
 
@@ -99,7 +99,7 @@ fn test_excessive_complete_command_calls() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test".to_string()).unwrap(),
+        ServerName::try_new("test".to_string()).unwrap(),
         create_test_provider(),
     );
 
@@ -131,7 +131,7 @@ fn test_large_number_of_backends() {
     for i in 0..100 {
         router.add_backend(
             BackendId::from_index(i),
-            ServerName::new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{}", i)).unwrap(),
             create_test_provider(),
         );
     }
@@ -152,7 +152,7 @@ fn test_backend_provider_retrieval() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test".to_string()).unwrap(),
+        ServerName::try_new("test".to_string()).unwrap(),
         create_test_provider(),
     );
 
@@ -172,7 +172,7 @@ fn test_single_backend_round_robin() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("solo".to_string()).unwrap(),
+        ServerName::try_new("solo".to_string()).unwrap(),
         create_test_provider(),
     );
 
@@ -200,7 +200,7 @@ fn test_stateful_acquisition_with_max_connections_1() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("minimal-backend".to_string()).unwrap(),
+        ServerName::try_new("minimal-backend".to_string()).unwrap(),
         provider,
     );
 
@@ -217,7 +217,7 @@ fn test_concurrent_route_command_calls() {
     for i in 0..3 {
         router.add_backend(
             BackendId::from_index(i),
-            ServerName::new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{}", i)).unwrap(),
             create_test_provider(),
         );
     }
@@ -281,7 +281,7 @@ fn test_stateful_acquire_release_interleaved() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test".to_string()).unwrap(),
+        ServerName::try_new("test".to_string()).unwrap(),
         provider,
     );
 
@@ -312,7 +312,7 @@ fn test_wrap_around_with_large_counter() {
     for i in 0..2 {
         router.add_backend(
             BackendId::from_index(i),
-            ServerName::new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{}", i)).unwrap(),
             create_test_provider(),
         );
     }

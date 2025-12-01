@@ -110,10 +110,11 @@ impl ClientSession {
         use crate::constants::buffer::COMMAND;
 
         // Add initial command bytes to running totals
-        let mut client_to_backend =
-            client_to_backend_bytes + ClientToBackendBytes::from(initial_cmd_bytes);
-        let mut backend_to_client =
-            backend_to_client_bytes + BackendToClientBytes::from(initial_resp_bytes);
+        let mut client_to_backend = client_to_backend_bytes;
+        client_to_backend.add_u64(initial_cmd_bytes.into());
+
+        let mut backend_to_client = backend_to_client_bytes;
+        backend_to_client.add_u64(initial_resp_bytes.into());
 
         // Track metrics incrementally for long-running sessions
         const METRICS_FLUSH_INTERVAL: u32 = 100;
@@ -139,7 +140,7 @@ impl ClientSession {
                     if let common::QuitStatus::Quit(bytes) =
                         common::handle_quit_command(&command, &mut client_write).await?
                     {
-                        backend_to_client += BackendToClientBytes::from(bytes);
+                        backend_to_client.add_u64(bytes.into());
                         break;
                     }
 
@@ -182,8 +183,8 @@ impl ClientSession {
                         self.user_bytes_received(resp_size);
                     }
 
-                    client_to_backend += ClientToBackendBytes::from(cmd_bytes);
-                    backend_to_client += BackendToClientBytes::from(resp_bytes);
+                    client_to_backend.add_u64(cmd_bytes.into());
+                    backend_to_client.add_u64(resp_bytes.into());
 
                     if let Err(e) = result {
                         warn!(

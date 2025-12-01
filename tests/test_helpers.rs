@@ -244,12 +244,12 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
         servers: server_ports
             .into_iter()
             .map(|(port, name)| Server {
-                host: HostName::new("127.0.0.1".to_string()).unwrap(),
-                port: Port::new(port).unwrap(),
-                name: ServerName::new(name.to_string()).unwrap(),
+                host: HostName::try_new("127.0.0.1".to_string()).unwrap(),
+                port: Port::try_new(port).unwrap(),
+                name: ServerName::try_new(name.to_string()).unwrap(),
                 username: None,
                 password: None,
-                max_connections: MaxConnections::new(5).unwrap(),
+                max_connections: MaxConnections::try_new(5).unwrap(),
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
@@ -279,12 +279,12 @@ pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) 
         servers: server_ports
             .into_iter()
             .map(|(port, name, user, pass)| Server {
-                host: HostName::new("127.0.0.1".to_string()).unwrap(),
-                port: Port::new(port).unwrap(),
-                name: ServerName::new(name.to_string()).unwrap(),
+                host: HostName::try_new("127.0.0.1".to_string()).unwrap(),
+                port: Port::try_new(port).unwrap(),
+                name: ServerName::try_new(name.to_string()).unwrap(),
                 username: Some(user.to_string()),
                 password: Some(pass.to_string()),
-                max_connections: MaxConnections::new(5).unwrap(),
+                max_connections: MaxConnections::try_new(5).unwrap(),
                 use_tls: false,
                 tls_verify_cert: true,
                 tls_cert_path: None,
@@ -358,7 +358,7 @@ pub async fn read_response(
 /// Create a standard test buffer pool (8KB, 4 buffers)
 ///
 /// This is the most common buffer pool configuration used across tests.
-/// Use this instead of repeating `BufferPool::new(BufferSize::new(8192).unwrap(), 4)`.
+/// Use this instead of repeating `BufferPool::new(BufferSize::try_new(8192).unwrap(), 4)`.
 ///
 /// # Examples
 /// ```ignore
@@ -369,7 +369,7 @@ pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
     use nntp_proxy::pool::BufferPool;
     use nntp_proxy::types::BufferSize;
 
-    BufferPool::new(BufferSize::new(8192).unwrap(), 4)
+    BufferPool::new(BufferSize::try_new(8192).unwrap(), 4)
 }
 
 /// Create a test auth handler with standard credentials (user/pass)

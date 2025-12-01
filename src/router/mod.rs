@@ -22,7 +22,7 @@
 //! # );
 //! selector.add_backend(
 //!     BackendId::from_index(0),
-//!     ServerName::new("server1".to_string()).unwrap(),
+//!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
 //! );
 //!
@@ -96,7 +96,7 @@ struct BackendInfo {
 /// # );
 /// selector.add_backend(
 ///     BackendId::from_index(0),
-///     ServerName::new("backend-1".to_string()).unwrap(),
+///     ServerName::try_new("backend-1".to_string()).unwrap(),
 ///     provider,
 /// );
 ///

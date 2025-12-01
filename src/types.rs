@@ -29,68 +29,67 @@ pub use pool::{
 pub use protocol::MessageId;
 pub use validated::{ConfigPath, HostName, Password, ServerName, Username, ValidationError};
 
+use nutype::nutype;
+use std::fmt;
 use uuid::Uuid;
 
-/// Unique identifier for client connections
+/// Unique identifier for a client connection
+///
+/// Uses UUIDv4 for guaranteed uniqueness across sessions.
+/// Useful for request tracing and debugging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(Uuid);
 
 impl ClientId {
-    /// Generate a new unique client ID
-    #[must_use]
+    /// Generate a new random client ID
+    #[inline]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
     /// Get the underlying UUID
+    #[inline]
     #[must_use]
-    pub fn as_uuid(&self) -> &Uuid {
+    pub const fn as_uuid(&self) -> &Uuid {
         &self.0
     }
 }
 
 impl Default for ClientId {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl std::fmt::Display for ClientId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// Identifier for backend servers
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Unique identifier for a backend server
+#[nutype(derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, From))]
 pub struct BackendId(usize);
 
 impl BackendId {
     /// Create a backend ID from an index
-    /// Marked const fn to allow compile-time evaluation
-    #[must_use]
     #[inline]
-    pub const fn from_index(index: usize) -> Self {
-        Self(index)
+    pub fn from_index(index: usize) -> Self {
+        Self::new(index)
     }
 
-    /// Get the underlying index
-    #[must_use]
+    /// Get the backend index
     #[inline]
+    #[must_use]
     pub fn as_index(&self) -> usize {
-        self.0
+        self.into_inner()
     }
 }
 
-impl From<usize> for BackendId {
-    fn from(index: usize) -> Self {
-        Self(index)
-    }
-}
-
-impl std::fmt::Display for BackendId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Backend({})", self.0)
+impl fmt::Display for BackendId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Backend({})", self.into_inner())
     }
 }
 
@@ -140,14 +139,14 @@ mod tests {
     #[test]
     fn test_client_id_clone() {
         let id1 = ClientId::new();
-        let id2 = id1.clone();
+        let id2 = id1;
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn test_client_id_equality() {
         let id1 = ClientId::new();
-        let id2 = id1.clone();
+        let id2 = id1;
         let id3 = ClientId::new();
 
         assert_eq!(id1, id2);
@@ -159,7 +158,7 @@ mod tests {
         use std::collections::HashSet;
 
         let id1 = ClientId::new();
-        let id2 = id1.clone();
+        let id2 = id1;
         let id3 = ClientId::new();
 
         let mut set = HashSet::new();
@@ -175,11 +174,13 @@ mod tests {
         let id1 = ClientId::new();
         let id2 = ClientId::new();
 
-        // Should have consistent ordering
-        assert!(id1 < id2 || id1 > id2 || id1 == id2);
+        // IDs are UUIDs - just verify ordering trait is implemented
+        // Actual ordering doesn't matter, just that comparison works
+        let _ = id1 < id2;
+        let _ = id1 > id2;
 
-        let id3 = id1.clone();
-        assert!(id1 <= id3 && id1 >= id3);
+        let id3 = id1;
+        assert_eq!(id1, id3);
     }
 
     // BackendId tests
@@ -200,9 +201,9 @@ mod tests {
 
     #[test]
     fn test_backend_id_const_fn() {
-        // This tests that from_index is const (compile-time constant)
-        const ID: BackendId = BackendId::from_index(10);
-        assert_eq!(ID.as_index(), 10);
+        // Note: from_index is no longer const (nutype limitation)
+        let id = BackendId::from_index(10);
+        assert_eq!(id.as_index(), 10);
     }
 
     #[test]
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn test_backend_id_clone() {
         let id1 = BackendId::from_index(15);
-        let id2 = id1.clone();
+        let id2 = id1;
         assert_eq!(id1, id2);
     }
 

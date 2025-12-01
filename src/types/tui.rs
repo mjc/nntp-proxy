@@ -1,5 +1,6 @@
 //! Type-safe domain values for TUI
 
+use nutype::nutype;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -194,49 +195,13 @@ impl From<Timestamp> for Instant {
 }
 
 /// Type-safe connection count
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[nutype(
+    derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, From, AsRef, Deref
+    ),
+    default = 0
+)]
 pub struct ConnectionCount(usize);
-
-impl ConnectionCount {
-    /// Create from raw count
-    #[must_use]
-    #[inline]
-    pub const fn new(count: usize) -> Self {
-        Self(count)
-    }
-
-    /// Zero connections
-    #[must_use]
-    #[inline]
-    pub const fn zero() -> Self {
-        Self(0)
-    }
-
-    /// Get raw count
-    #[must_use]
-    #[inline]
-    pub const fn get(&self) -> usize {
-        self.0
-    }
-}
-
-impl Default for ConnectionCount {
-    fn default() -> Self {
-        Self::zero()
-    }
-}
-
-impl fmt::Display for ConnectionCount {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<usize> for ConnectionCount {
-    fn from(count: usize) -> Self {
-        Self::new(count)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -371,33 +336,5 @@ mod tests {
         let ts = Timestamp::new(instant);
         let instant2: Instant = ts.into();
         assert_eq!(instant, instant2);
-    }
-
-    // ConnectionCount tests - using test macros
-    #[test]
-    fn test_connection_count_zero() {
-        assert_eq!(ConnectionCount::zero().get(), 0);
-        assert_eq!(ConnectionCount::default().get(), 0);
-    }
-
-    #[test]
-    fn test_connection_count_get() {
-        assert_eq!(ConnectionCount::new(42).get(), 42);
-        assert_eq!(ConnectionCount::new(0).get(), 0);
-        assert_eq!(ConnectionCount::new(1000).get(), 1000);
-    }
-
-    #[test]
-    fn test_connection_count_display() {
-        assert_eq!(ConnectionCount::new(0).to_string(), "0");
-        assert_eq!(ConnectionCount::new(1).to_string(), "1");
-        assert_eq!(ConnectionCount::new(42).to_string(), "42");
-        assert_eq!(ConnectionCount::new(1000).to_string(), "1000");
-    }
-
-    #[test]
-    fn test_connection_count_from_usize() {
-        let count = ConnectionCount::from(123);
-        assert_eq!(count.get(), 123);
     }
 }

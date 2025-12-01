@@ -8,7 +8,7 @@ use std::time::Duration;
 /// Default maximum connections per server
 #[inline]
 pub fn max_connections() -> MaxConnections {
-    MaxConnections::new(10).expect("10 is non-zero")
+    MaxConnections::try_new(10).expect("10 is non-zero")
 }
 
 /// Default health check interval
@@ -26,13 +26,13 @@ pub fn health_check_timeout() -> Duration {
 /// Default unhealthy threshold
 #[inline]
 pub fn unhealthy_threshold() -> MaxErrors {
-    MaxErrors::new(3).expect("3 is non-zero")
+    MaxErrors::try_new(3).expect("3 is non-zero")
 }
 
 /// Default cache max capacity (number of articles)
 #[inline]
 pub fn cache_max_capacity() -> CacheCapacity {
-    CacheCapacity::new(10000).expect("10000 is non-zero")
+    CacheCapacity::try_new(10000).expect("10000 is non-zero")
 }
 
 /// Default cache TTL (1 hour)

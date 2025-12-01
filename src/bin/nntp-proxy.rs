@@ -64,7 +64,7 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     info!("Connection pools ready");
 
     // Start listening
-    let listen_addr = format!("{}:{}", listen_host, listen_port.get());
+    let listen_addr = format!("{}:{}", listen_host, *listen_port);
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(
         "NNTP proxy listening on {} ({})",

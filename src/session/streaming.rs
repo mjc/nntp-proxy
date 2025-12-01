@@ -228,7 +228,7 @@ mod tests {
         let mut reader = Cursor::new(data);
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let result =
             drain_until_terminator(&mut reader, b"", client_addr, backend_id, &buffer_pool).await;
@@ -243,7 +243,7 @@ mod tests {
         let mut reader = Cursor::new(data);
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         // Start with tail that could span
         let result =
@@ -260,7 +260,7 @@ mod tests {
         let mut reader = Cursor::new(data);
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let result =
             drain_until_terminator(&mut reader, b"", client_addr, backend_id, &buffer_pool).await;
@@ -276,7 +276,7 @@ mod tests {
         let mut writer = Vec::new();
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let result = stream_multiline_response(
             &mut reader,
@@ -303,7 +303,7 @@ mod tests {
         let mut writer = Vec::new();
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         // First chunk includes terminator and extra data
         let first_chunk = &response[..27]; // All data including extra
@@ -333,7 +333,7 @@ mod tests {
         let mut writer = Vec::new();
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let result = stream_multiline_response(
             &mut reader,
@@ -371,7 +371,7 @@ mod tests {
         let mut writer = Vec::new();
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let result = stream_multiline_response(
             &mut reader,
@@ -397,7 +397,7 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let ctx = ClientWriteErrorContext {
             write_len: 100,
@@ -423,7 +423,7 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let ctx = ClientWriteErrorContext {
             write_len: 50,
@@ -449,7 +449,7 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let client_addr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(65536).unwrap(), 2);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
         let ctx = ClientWriteErrorContext {
             write_len: 10,

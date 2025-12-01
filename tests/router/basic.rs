@@ -16,7 +16,7 @@ fn test_add_backend() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test-backend".to_string()).unwrap(),
+        ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
     );
 
@@ -32,7 +32,7 @@ fn test_add_multiple_backends() {
         let provider = create_test_provider();
         router.add_backend(
             backend_id,
-            ServerName::new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{}", i)).unwrap(),
             provider,
         );
     }
@@ -57,7 +57,7 @@ fn test_get_backend_provider() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test".to_string()).unwrap(),
+        ServerName::try_new("test".to_string()).unwrap(),
         provider,
     );
 

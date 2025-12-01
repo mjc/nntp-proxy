@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn test_unrecorded_clone() {
         let bytes1 = MetricsBytes::<Unrecorded>::new(512);
-        let bytes2 = bytes1.clone();
+        let bytes2 = bytes1;
         assert_eq!(bytes1.peek(), bytes2.peek());
     }
 
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn test_recorded_clone() {
         let bytes1 = MetricsBytes::<Unrecorded>::new(256).mark_recorded();
-        let bytes2 = bytes1.clone();
+        let bytes2 = bytes1;
         assert_eq!(bytes1.as_u64(), bytes2.as_u64());
     }
 
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn test_transfer_direction_clone() {
         let dir1 = TransferDirection::ClientToBackend;
-        let dir2 = dir1.clone();
+        let dir2 = dir1;
         assert_eq!(dir1, dir2);
     }
 
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn test_directional_clone() {
         let bytes1 = DirectionalBytes::client_to_backend(768);
-        let bytes2 = bytes1.clone();
+        let bytes2 = bytes1;
 
         assert_eq!(bytes1.direction(), bytes2.direction());
         assert_eq!(bytes1.into_bytes().peek(), bytes2.into_bytes().peek());

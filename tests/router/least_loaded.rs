@@ -13,12 +13,12 @@ fn test_least_loaded_basic() {
     // Add two backends with equal capacity
     selector.add_backend(
         BackendId::from_index(0),
-        ServerName::new("backend0".to_string()).unwrap(),
+        ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
     );
     selector.add_backend(
         BackendId::from_index(1),
-        ServerName::new("backend1".to_string()).unwrap(),
+        ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
     );
 
@@ -50,12 +50,12 @@ fn test_least_loaded_unequal_capacity() {
     // Backend 1: 50 connections (large)
     selector.add_backend(
         BackendId::from_index(0),
-        ServerName::new("small".to_string()).unwrap(),
+        ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 10),
     );
     selector.add_backend(
         BackendId::from_index(1),
-        ServerName::new("large".to_string()).unwrap(),
+        ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 50),
     );
 
@@ -87,12 +87,12 @@ fn test_least_loaded_respects_pending_counts() {
 
     selector.add_backend(
         BackendId::from_index(0),
-        ServerName::new("backend0".to_string()).unwrap(),
+        ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
     );
     selector.add_backend(
         BackendId::from_index(1),
-        ServerName::new("backend1".to_string()).unwrap(),
+        ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
     );
 
@@ -126,7 +126,7 @@ fn test_least_loaded_single_backend() {
 
     selector.add_backend(
         BackendId::from_index(0),
-        ServerName::new("only".to_string()).unwrap(),
+        ServerName::try_new("only".to_string()).unwrap(),
         create_backend("only", 10),
     );
 
@@ -145,7 +145,7 @@ fn test_least_loaded_load_balancing_fairness() {
     for i in 0..3 {
         selector.add_backend(
             BackendId::from_index(i),
-            ServerName::new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{}", i)).unwrap(),
             create_backend(&format!("backend-{}", i), 10),
         );
     }

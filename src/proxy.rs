@@ -153,8 +153,8 @@ impl NntpProxyBuilder {
         let connection_providers = connection_providers?;
 
         let buffer_pool = BufferPool::new(
-            BufferSize::new(buffer_size)
-                .ok_or_else(|| anyhow::anyhow!("Buffer size must be non-zero"))?,
+            BufferSize::try_new(buffer_size)
+                .map_err(|_| anyhow::anyhow!("Buffer size must be non-zero"))?,
             buffer_count,
         );
 
@@ -711,12 +711,12 @@ mod tests {
         Config {
             servers: vec![
                 Server {
-                    host: HostName::new("server1.example.com".to_string()).unwrap(),
-                    port: Port::new(119).unwrap(),
-                    name: ServerName::new("Test Server 1".to_string()).unwrap(),
+                    host: HostName::try_new("server1.example.com".to_string()).unwrap(),
+                    port: Port::try_new(119).unwrap(),
+                    name: ServerName::try_new("Test Server 1".to_string()).unwrap(),
                     username: None,
                     password: None,
-                    max_connections: MaxConnections::new(5).unwrap(),
+                    max_connections: MaxConnections::try_new(5).unwrap(),
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
@@ -725,12 +725,12 @@ mod tests {
                     health_check_pool_timeout: health_check_pool_timeout(),
                 },
                 Server {
-                    host: HostName::new("server2.example.com".to_string()).unwrap(),
-                    port: Port::new(119).unwrap(),
-                    name: ServerName::new("Test Server 2".to_string()).unwrap(),
+                    host: HostName::try_new("server2.example.com".to_string()).unwrap(),
+                    port: Port::try_new(119).unwrap(),
+                    name: ServerName::try_new("Test Server 2".to_string()).unwrap(),
                     username: None,
                     password: None,
-                    max_connections: MaxConnections::new(8).unwrap(),
+                    max_connections: MaxConnections::try_new(8).unwrap(),
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,
@@ -739,12 +739,12 @@ mod tests {
                     health_check_pool_timeout: health_check_pool_timeout(),
                 },
                 Server {
-                    host: HostName::new("server3.example.com".to_string()).unwrap(),
-                    port: Port::new(119).unwrap(),
-                    name: ServerName::new("Test Server 3".to_string()).unwrap(),
+                    host: HostName::try_new("server3.example.com".to_string()).unwrap(),
+                    port: Port::try_new(119).unwrap(),
+                    name: ServerName::try_new("Test Server 3".to_string()).unwrap(),
                     username: None,
                     password: None,
-                    max_connections: MaxConnections::new(12).unwrap(),
+                    max_connections: MaxConnections::try_new(12).unwrap(),
                     use_tls: false,
                     tls_verify_cert: true,
                     tls_cert_path: None,

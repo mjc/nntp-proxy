@@ -202,7 +202,7 @@ mod tests {
     /// Test buffer pool interaction in authentication
     #[tokio::test]
     async fn test_buffer_pool_usage() {
-        let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 2);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 2);
 
         // Verify we can get and return buffers
         let buffer1 = buffer_pool.acquire().await;

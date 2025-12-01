@@ -148,30 +148,32 @@ impl ClientSession {
                                         backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        backend_to_client_bytes += match crate::session::common::handle_auth_command(
-                                            &self.auth_handler,
-                                            auth_action,
-                                            &mut client_write,
-                                            &mut auth_username,
-                                            &self.authenticated,
-                                        )
-                                        .await?
-                                        {
-                                            crate::session::common::AuthResult::Authenticated(bytes) => {
-                                                common::on_authentication_success(
-                                                    self.client_addr,
-                                                    auth_username.clone(),
-                                                    &crate::config::RoutingMode::Stateful,
-                                                    &self.metrics,
-                                                    self.connection_stats(),
-                                                    |username| self.set_username(username),
-                                                );
+                                        backend_to_client_bytes.add_u64(
+                                            match crate::session::common::handle_auth_command(
+                                                &self.auth_handler,
+                                                auth_action,
+                                                &mut client_write,
+                                                &mut auth_username,
+                                                &self.authenticated,
+                                            )
+                                            .await?
+                                            {
+                                                crate::session::common::AuthResult::Authenticated(bytes) => {
+                                                    common::on_authentication_success(
+                                                        self.client_addr,
+                                                        auth_username.clone(),
+                                                        &crate::config::RoutingMode::Stateful,
+                                                        &self.metrics,
+                                                        self.connection_stats(),
+                                                        |username| self.set_username(username),
+                                                    );
 
-                                                skip_auth_check = true;
-                                                bytes
-                                            }
-                                            crate::session::common::AuthResult::NotAuthenticated(bytes) => bytes,
-                                        };
+                                                    skip_auth_check = true;
+                                                    bytes
+                                                }
+                                                crate::session::common::AuthResult::NotAuthenticated(bytes) => bytes,
+                                            }.as_u64(),
+                                        );
                                     }
                                     CommandAction::Reject(response) => {
                                         // Send rejection response inline
