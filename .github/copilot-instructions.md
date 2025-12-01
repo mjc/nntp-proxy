@@ -1091,29 +1091,25 @@ pub async fn create_smart_mock_server(port: u16, name: &str) -> JoinHandle<()> {
 ### Running Tests
 
 ```bash
-# Run all tests (slower, serial execution per test file)
-cargo test
-
-# Run with nextest for 7x faster parallel execution
+# Run all tests with nextest (REQUIRED - 7x faster with parallel execution)
 cargo nextest run
 
 # Run with output
-cargo test -- --nocapture
 cargo nextest run --no-capture
 
 # Run specific test
-cargo test test_hybrid_mode
 cargo nextest run -E 'test(hybrid_mode)'
 
 # Run integration tests only
-cargo test --test integration_tests
 cargo nextest run --test integration_tests
 
 # Run with coverage (requires cargo-llvm-cov)
 cargo llvm-cov --html
 ```
 
-**Performance Note:** Use `cargo nextest run` for development - it's ~7x faster than `cargo test` due to parallel execution. All tests use random ports to avoid conflicts during parallel runs.
+**IMPORTANT:** Always use `cargo nextest run` for this project - it's ~7x faster than `cargo test` due to parallel execution. All tests use random ports to avoid conflicts during parallel runs.
+
+**DO NOT use `cargo test`** - it's significantly slower and should be avoided. Use `cargo nextest run` instead.
 
 ### Benchmarking
 
@@ -1497,6 +1493,8 @@ sudo systemctl status nntp-proxy
 **Rationale:** We're building toward 1.0, not maintaining a stable API. Clean, focused code is more important than backwards compatibility. Once we hit 1.0, we'll adopt proper deprecation practices.
 
 **Note:** This project has Git pre-commit hooks that automatically run `cargo fmt` and `cargo clippy --all-targets --all-features`. If clippy finds issues or formatting is incorrect, the commit will be rejected. Fix all issues before committing.
+
+**Checking compilation:** Use `cargo check` for fast compilation checking without generating binaries. Use `cargo build` only when you need the actual binary.
 
 ### NixOS Development Environment
 
