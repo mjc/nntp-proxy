@@ -1,12 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::signal;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, load_config_with_fallback, tui};
+use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, runtime, tui};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Proxy with TUI Dashboard", long_about = None)]
@@ -21,238 +19,134 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let log_buffer = setup_logging(args.no_tui);
 
-    // If TUI is enabled, we need special logging setup
-    // If TUI is disabled, use normal logging
-    let log_buffer = if args.no_tui {
-        // Normal logging to stderr
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
-        None
-    } else {
-        // For TUI mode, capture logs in memory
-        use nntp_proxy::tui::{LogBuffer, LogMakeWriter};
-
-        let log_buffer = LogBuffer::new();
-        let log_writer = LogMakeWriter::new(log_buffer.clone());
-
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_writer(log_writer)
-            .with_ansi(false) // No ANSI codes in TUI logs
-            .with_target(false) // Remove module paths (nntp_proxy::proxy)
-            .compact() // Compact format: HH:MM:SS.microseconds
-            .init();
-
-        Some(log_buffer)
-    };
-
-    // Build and configure runtime
-    let runtime_config = RuntimeConfig::from_args(args.common.threads);
-    let rt = runtime_config.build_runtime()?;
-
-    rt.block_on(run_proxy(args, log_buffer))
+    RuntimeConfig::from_args(args.common.threads)
+        .build_runtime()?
+        .block_on(run_proxy(args, log_buffer))
 }
 
-async fn run_proxy(args: Args, log_buffer: Option<nntp_proxy::tui::LogBuffer>) -> Result<()> {
-    // Load configuration with automatic fallback
-    let (config, source) = load_config_with_fallback(args.common.config.as_str())?;
+async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()> {
+    let (config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
+    let routing_mode = args.common.routing_mode;
+    let (host, port) =
+        runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
-    info!("Loaded configuration from {}", source.description());
-    info!("Loaded {} backend servers:", config.servers.len());
-    for server in &config.servers {
-        info!("  - {} ({}:{})", server.name, server.host, server.port);
-    }
-
-    // Extract listen address before moving config
-    let listen_host = args
-        .common
-        .host
-        .unwrap_or_else(|| config.proxy.host.clone());
-    let listen_port = args.common.port.unwrap_or(config.proxy.port);
-
-    // Create proxy with metrics enabled for TUI
-    let proxy = Arc::new(
-        NntpProxy::builder(config)
-            .with_routing_mode(args.common.routing_mode)
-            .with_metrics() // Enable metrics for TUI (causes ~45% perf penalty)
-            .build()?,
-    );
-
-    // Create shutdown channel - TUI will control shutdown
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    // Create channel for signaling TUI to shutdown from external signals
+    let proxy = build_proxy_with_metrics(config, routing_mode)?;
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
 
-    // Launch TUI FIRST if enabled (before prewarming for faster startup)
-    // This allows seeing the dashboard immediately
-    let tui_handle = if !args.no_tui {
-        let tui_app = if let Some(log_buffer) = log_buffer {
-            tui::TuiApp::with_log_buffer(
-                proxy.metrics().clone(),
-                proxy.router().clone(),
-                proxy.servers().to_vec().into(),
-                log_buffer,
-            )
-        } else {
-            tui::TuiApp::new(
-                proxy.metrics().clone(),
-                proxy.router().clone(),
-                proxy.servers().to_vec().into(),
-            )
-        };
+    let tui_handle = launch_tui(
+        &args,
+        &proxy,
+        log_buffer,
+        shutdown_tx.clone(),
+        tui_shutdown_rx,
+    )?;
+    let listener = runtime::bind_listener(&host, port, routing_mode).await?;
 
-        let shutdown_tx_for_tui = shutdown_tx.clone();
-        Some(tokio::spawn(async move {
-            if let Err(e) = tui::run_tui(tui_app, shutdown_tx_for_tui, tui_shutdown_rx).await {
-                error!("TUI error: {}", e);
-            }
-            // When TUI exits, signal shutdown
-            info!("TUI exited, initiating shutdown");
-        }))
-    } else {
-        None
-    };
+    runtime::spawn_connection_prewarming(&proxy);
+    runtime::spawn_stats_flusher(proxy.connection_stats());
+    spawn_tui_shutdown_handler(&proxy, &shutdown_tx, tui_shutdown_tx);
 
-    // Prewarm connection pools in background (doesn't block TUI startup)
-    let proxy_for_prewarm = proxy.clone();
-    let prewarm_handle = tokio::spawn(async move {
-        info!("Prewarming connection pools...");
-        if let Err(e) = proxy_for_prewarm.prewarm_connections().await {
-            warn!("Failed to prewarm connection pools: {}", e);
-            return false;
-        }
-        info!("Connection pools ready");
-        true
-    });
+    runtime::run_accept_loop(proxy, listener, shutdown_rx, routing_mode).await?;
 
-    // Start listening
-    let listen_addr = format!("{}:{}", listen_host, listen_port.get());
-    let listener = TcpListener::bind(&listen_addr).await?;
-    info!(
-        "NNTP proxy listening on {} ({})",
-        listen_addr, args.common.routing_mode
-    );
-
-    // Wait for prewarming to complete before accepting connections
-    info!("Waiting for connection pools to be ready...");
-    match prewarm_handle.await {
-        Ok(true) => info!("Ready to accept connections"),
-        Ok(false) => warn!("Prewarming failed, but continuing anyway"),
-        Err(e) => warn!("Prewarming task failed: {}", e),
-    }
-
-    // Set up graceful shutdown signal handler for non-TUI mode or SIGTERM
-    let proxy_for_shutdown = proxy.clone();
-    let shutdown_tx_signal = shutdown_tx.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-
-        info!("Shutdown signal received");
-
-        // Signal TUI to exit (it will clean up terminal properly and immediately)
-        let _ = tui_shutdown_tx.send(()).await;
-
-        // Notify anyone listening
-        let _ = shutdown_tx_signal.send(()).await;
-
-        // Close idle connections
-        proxy_for_shutdown.graceful_shutdown().await;
-        info!("Graceful shutdown complete");
-    });
-
-    // Start periodic connection stats flusher (every 30 seconds)
-    let connection_stats = proxy.connection_stats().clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            connection_stats.flush();
-        }
-    });
-
-    // Accept connections
-    let uses_per_command_routing = args.common.routing_mode.supports_per_command_routing();
-
-    loop {
-        tokio::select! {
-            // Check for shutdown signal from TUI
-            _ = shutdown_rx.recv() => {
-                info!("Shutdown initiated, stopping accept loop");
-                break;
-            }
-            // Accept new connections
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        let proxy_clone = proxy.clone();
-                        if uses_per_command_routing {
-                            tokio::spawn(async move {
-                                if let Err(e) = proxy_clone
-                                    .handle_client_per_command_routing(stream, addr)
-                                    .await
-                                {
-                                    error!("Error handling client {}: {}", addr, e);
-                                }
-                            });
-                        } else {
-                            tokio::spawn(async move {
-                                if let Err(e) = proxy_clone.handle_client(stream, addr).await {
-                                    error!("Error handling client {}: {}", addr, e);
-                                }
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to accept connection: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    // Graceful shutdown
-    proxy.graceful_shutdown().await;
-    info!("Proxy shutdown complete");
-
-    // Wait for TUI to exit if it's running
     if let Some(handle) = tui_handle {
-        let _ = handle.await;
+        handle.await?;
     }
 
     Ok(())
 }
 
-/// Wait for shutdown signal
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
+fn build_proxy_with_metrics(
+    config: nntp_proxy::config::Config,
+    routing_mode: nntp_proxy::RoutingMode,
+) -> Result<Arc<NntpProxy>> {
+    Ok(Arc::new(
+        NntpProxy::builder(config)
+            .with_routing_mode(routing_mode)
+            .with_metrics()
+            .build()?,
+    ))
+}
 
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
+fn setup_logging(headless: bool) -> Option<tui::LogBuffer> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    if headless {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        return None;
     }
+
+    let log_buffer = tui::LogBuffer::new();
+    let log_writer = tui::LogMakeWriter::new(log_buffer.clone());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(log_writer)
+        .with_ansi(false)
+        .with_target(false)
+        .compact()
+        .init();
+
+    Some(log_buffer)
+}
+
+fn launch_tui(
+    args: &Args,
+    proxy: &Arc<NntpProxy>,
+    log_buffer: Option<tui::LogBuffer>,
+    shutdown_tx: mpsc::Sender<()>,
+    tui_shutdown_rx: mpsc::Receiver<()>,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    (!args.no_tui)
+        .then(|| {
+            let tui_app = log_buffer.map_or_else(
+                || {
+                    tui::TuiApp::new(
+                        proxy.metrics().clone(),
+                        proxy.router().clone(),
+                        proxy.servers().to_vec().into(),
+                    )
+                },
+                |buffer| {
+                    tui::TuiApp::with_log_buffer(
+                        proxy.metrics().clone(),
+                        proxy.router().clone(),
+                        proxy.servers().to_vec().into(),
+                        buffer,
+                    )
+                },
+            );
+
+            tokio::spawn(async move {
+                if let Err(e) = tui::run_tui(tui_app, shutdown_tx, tui_shutdown_rx).await {
+                    error!("TUI error: {}", e);
+                }
+                info!("TUI exited, initiating shutdown");
+            })
+        })
+        .map(Ok)
+        .transpose()
+}
+
+fn spawn_tui_shutdown_handler(
+    proxy: &Arc<NntpProxy>,
+    shutdown_tx: &mpsc::Sender<()>,
+    tui_shutdown_tx: mpsc::Sender<()>,
+) {
+    let proxy = Arc::clone(proxy);
+    let shutdown_tx = shutdown_tx.clone();
+
+    tokio::spawn(async move {
+        runtime::shutdown_signal().await;
+        info!("Shutdown signal received");
+
+        let _ = tui_shutdown_tx.send(()).await;
+        let _ = shutdown_tx.send(()).await;
+
+        proxy.graceful_shutdown().await;
+        info!("Graceful shutdown complete");
+    });
 }
