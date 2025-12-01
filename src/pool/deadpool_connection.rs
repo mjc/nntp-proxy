@@ -161,7 +161,10 @@ impl managed::Manager for TcpManager {
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
 
-        if !crate::protocol::ResponseParser::is_greeting(greeting) {
+        if !matches!(
+            crate::protocol::NntpResponse::parse(greeting),
+            crate::protocol::NntpResponse::Greeting(_)
+        ) {
             return Err(anyhow::anyhow!("Invalid greeting: {}", greeting_str.trim()));
         }
 
@@ -172,7 +175,10 @@ impl managed::Manager for TcpManager {
             let response = &buffer[..n];
             let response_str = String::from_utf8_lossy(response);
 
-            if crate::protocol::ResponseParser::is_auth_required(response) {
+            if matches!(
+                crate::protocol::NntpResponse::parse(response),
+                crate::protocol::NntpResponse::AuthRequired(_)
+            ) {
                 // Password required
                 let Some(password) = self.password.as_ref() else {
                     anyhow::bail!("Password required but not provided");
@@ -183,7 +189,10 @@ impl managed::Manager for TcpManager {
                 let response = &buffer[..n];
                 let response_str = String::from_utf8_lossy(response);
 
-                if !crate::protocol::ResponseParser::is_auth_success(response) {
+                if !matches!(
+                    crate::protocol::NntpResponse::parse(response),
+                    crate::protocol::NntpResponse::AuthSuccess
+                ) {
                     tracing::error!(
                         "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
                         self.name,
@@ -206,7 +215,10 @@ impl managed::Manager for TcpManager {
                         username
                     );
                 }
-            } else if !crate::protocol::ResponseParser::is_auth_success(response) {
+            } else if !matches!(
+                crate::protocol::NntpResponse::parse(response),
+                crate::protocol::NntpResponse::AuthSuccess
+            ) {
                 return Err(anyhow::anyhow!(
                     "Unexpected auth response: {}",
                     response_str.trim()

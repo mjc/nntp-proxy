@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use nntp_proxy::pool::BufferPool;
-use nntp_proxy::protocol::{ResponseParser, authinfo_pass, authinfo_user};
+use nntp_proxy::protocol::{NntpResponse, authinfo_pass, authinfo_user};
 use nntp_proxy::types::BufferSize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -110,14 +110,17 @@ enum AuthScenario {
     NonSuccessGreeting,
 }
 
-/// Test ResponseParser::is_auth_success with valid auth response
+/// Test NntpResponse::is_auth_success with valid auth response
 #[test]
 fn test_is_auth_success_valid() {
     let response = b"281 Authentication accepted\r\n";
-    assert!(ResponseParser::is_auth_success(response));
+    assert!(matches!(
+        NntpResponse::parse(response),
+        NntpResponse::AuthSuccess
+    ));
 }
 
-/// Test ResponseParser::is_auth_success with various valid formats
+/// Test NntpResponse::is_auth_success with various valid formats
 #[test]
 fn test_is_auth_success_variations() {
     // Different message text
@@ -128,11 +131,14 @@ fn test_is_auth_success_variations() {
     ];
 
     for response in responses {
-        assert!(ResponseParser::is_auth_success(response));
+        assert!(matches!(
+            NntpResponse::parse(response),
+            NntpResponse::AuthSuccess
+        ));
     }
 }
 
-/// Test ResponseParser::is_auth_success rejects non-281 responses
+/// Test NntpResponse::is_auth_success rejects non-281 responses
 #[test]
 fn test_is_auth_success_rejects_others() {
     let responses: &[&[u8]] = &[
@@ -143,18 +149,24 @@ fn test_is_auth_success_rejects_others() {
     ];
 
     for response in responses {
-        assert!(!ResponseParser::is_auth_success(response));
+        assert!(!matches!(
+            NntpResponse::parse(response),
+            NntpResponse::AuthSuccess
+        ));
     }
 }
 
-/// Test ResponseParser::is_auth_required with valid response
+/// Test NntpResponse::is_auth_required with valid response
 #[test]
 fn test_is_auth_required_valid() {
     let response = b"381 Password required\r\n";
-    assert!(ResponseParser::is_auth_required(response));
+    assert!(matches!(
+        NntpResponse::parse(response),
+        NntpResponse::AuthRequired(_)
+    ));
 }
 
-/// Test ResponseParser::is_auth_required with variations
+/// Test NntpResponse::is_auth_required with variations
 #[test]
 fn test_is_auth_required_variations() {
     let responses: &[&[u8]] = &[
@@ -164,11 +176,14 @@ fn test_is_auth_required_variations() {
     ];
 
     for response in responses {
-        assert!(ResponseParser::is_auth_required(response));
+        assert!(matches!(
+            NntpResponse::parse(response),
+            NntpResponse::AuthRequired(_)
+        ));
     }
 }
 
-/// Test ResponseParser::is_auth_required rejects non-381
+/// Test NntpResponse::is_auth_required rejects non-381
 #[test]
 fn test_is_auth_required_rejects_others() {
     let responses: &[&[u8]] = &[
@@ -178,25 +193,34 @@ fn test_is_auth_required_rejects_others() {
     ];
 
     for response in responses {
-        assert!(!ResponseParser::is_auth_required(response));
+        assert!(!matches!(
+            NntpResponse::parse(response),
+            NntpResponse::AuthRequired(_)
+        ));
     }
 }
 
-/// Test ResponseParser::is_greeting with 200 response
+/// Test NntpResponse::is_greeting with 200 response
 #[test]
 fn test_is_greeting_200() {
     let response = b"200 Welcome to NNTP server\r\n";
-    assert!(ResponseParser::is_greeting(response));
+    assert!(matches!(
+        NntpResponse::parse(response),
+        NntpResponse::Greeting(_)
+    ));
 }
 
-/// Test ResponseParser::is_greeting with 201 response
+/// Test NntpResponse::is_greeting with 201 response
 #[test]
 fn test_is_greeting_201() {
     let response = b"201 Service available, posting prohibited\r\n";
-    assert!(ResponseParser::is_greeting(response));
+    assert!(matches!(
+        NntpResponse::parse(response),
+        NntpResponse::Greeting(_)
+    ));
 }
 
-/// Test ResponseParser::is_greeting rejects non-200/201
+/// Test NntpResponse::is_greeting rejects non-200/201
 #[test]
 fn test_is_greeting_rejects_others() {
     let responses: &[&[u8]] = &[
@@ -206,7 +230,10 @@ fn test_is_greeting_rejects_others() {
     ];
 
     for response in responses {
-        assert!(!ResponseParser::is_greeting(response));
+        assert!(!matches!(
+            NntpResponse::parse(response),
+            NntpResponse::Greeting(_)
+        ));
     }
 }
 
@@ -322,7 +349,10 @@ async fn test_auth_flow_success_with_password() -> Result<()> {
     // Read greeting
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_greeting(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::Greeting(_)
+    ));
 
     // Send AUTHINFO USER
     stream
@@ -331,7 +361,10 @@ async fn test_auth_flow_success_with_password() -> Result<()> {
 
     // Read 381 response
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_auth_required(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::AuthRequired(_)
+    ));
 
     // Send AUTHINFO PASS
     stream
@@ -340,7 +373,10 @@ async fn test_auth_flow_success_with_password() -> Result<()> {
 
     // Read 281 response
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_auth_success(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::AuthSuccess
+    ));
 
     Ok(())
 }
@@ -364,7 +400,10 @@ async fn test_auth_flow_success_username_only() -> Result<()> {
     // Read greeting
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_greeting(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::Greeting(_)
+    ));
 
     // Send AUTHINFO USER
     stream
@@ -373,7 +412,10 @@ async fn test_auth_flow_success_username_only() -> Result<()> {
 
     // Should get immediate 281 success
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_auth_success(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::AuthSuccess
+    ));
 
     Ok(())
 }
@@ -397,7 +439,10 @@ async fn test_auth_flow_failure() -> Result<()> {
     // Read greeting
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_greeting(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::Greeting(_)
+    ));
 
     // Send AUTHINFO USER
     stream
@@ -406,7 +451,10 @@ async fn test_auth_flow_failure() -> Result<()> {
 
     // Read 381
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_auth_required(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::AuthRequired(_)
+    ));
 
     // Send AUTHINFO PASS
     stream
@@ -417,7 +465,10 @@ async fn test_auth_flow_failure() -> Result<()> {
     let n = stream.read(&mut buf).await?;
     let response = String::from_utf8_lossy(&buf[..n]);
     assert!(response.starts_with("481"));
-    assert!(!ResponseParser::is_auth_success(&buf[..n]));
+    assert!(!matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::AuthSuccess
+    ));
 
     Ok(())
 }
@@ -441,7 +492,10 @@ async fn test_auth_flow_unexpected_response() -> Result<()> {
     // Read greeting
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).await?;
-    assert!(ResponseParser::is_greeting(&buf[..n]));
+    assert!(matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::Greeting(_)
+    ));
 
     // Send AUTHINFO USER
     stream
@@ -452,8 +506,14 @@ async fn test_auth_flow_unexpected_response() -> Result<()> {
     let n = stream.read(&mut buf).await?;
     let response = String::from_utf8_lossy(&buf[..n]);
     assert!(response.starts_with("500"));
-    assert!(!ResponseParser::is_auth_success(&buf[..n]));
-    assert!(!ResponseParser::is_auth_required(&buf[..n]));
+    assert!(!matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::AuthSuccess
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::AuthRequired(_)
+    ));
 
     Ok(())
 }
@@ -479,7 +539,10 @@ async fn test_auth_flow_non_success_greeting() -> Result<()> {
     let n = stream.read(&mut buf).await?;
     let response = String::from_utf8_lossy(&buf[..n]);
     assert!(response.starts_with("400"));
-    assert!(!ResponseParser::is_greeting(&buf[..n]));
+    assert!(!matches!(
+        NntpResponse::parse(&buf[..n]),
+        NntpResponse::Greeting(_)
+    ));
 
     Ok(())
 }
@@ -488,27 +551,60 @@ async fn test_auth_flow_non_success_greeting() -> Result<()> {
 #[test]
 fn test_response_parsing_malformed() {
     // Too short (less than 3 bytes)
-    assert!(!ResponseParser::is_auth_success(b"28"));
-    assert!(!ResponseParser::is_auth_required(b"38"));
-    assert!(!ResponseParser::is_greeting(b"20"));
+    assert!(!matches!(
+        NntpResponse::parse(b"28"),
+        NntpResponse::AuthSuccess
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(b"38"),
+        NntpResponse::AuthRequired(_)
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(b"20"),
+        NntpResponse::Greeting(_)
+    ));
 
     // Non-numeric characters
-    assert!(!ResponseParser::is_auth_success(b"2X1"));
-    assert!(!ResponseParser::is_auth_required(b"3X1"));
+    assert!(!matches!(
+        NntpResponse::parse(b"2X1"),
+        NntpResponse::AuthSuccess
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(b"3X1"),
+        NntpResponse::AuthRequired(_)
+    ));
 
     // Empty
-    assert!(!ResponseParser::is_auth_success(b""));
-    assert!(!ResponseParser::is_auth_required(b""));
-    assert!(!ResponseParser::is_greeting(b""));
+    assert!(!matches!(
+        NntpResponse::parse(b""),
+        NntpResponse::AuthSuccess
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(b""),
+        NntpResponse::AuthRequired(_)
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(b""),
+        NntpResponse::Greeting(_)
+    ));
 }
 
 /// Test response parsing with extra whitespace
 #[test]
 fn test_response_parsing_whitespace() {
     // Leading space in message (valid)
-    assert!(ResponseParser::is_auth_success(b"281  OK\r\n"));
-    assert!(ResponseParser::is_auth_required(b"381  Required\r\n"));
-    assert!(ResponseParser::is_greeting(b"200  Welcome\r\n"));
+    assert!(matches!(
+        NntpResponse::parse(b"281  OK\r\n"),
+        NntpResponse::AuthSuccess
+    ));
+    assert!(matches!(
+        NntpResponse::parse(b"381  Required\r\n"),
+        NntpResponse::AuthRequired(_)
+    ));
+    assert!(matches!(
+        NntpResponse::parse(b"200  Welcome\r\n"),
+        NntpResponse::Greeting(_)
+    ));
 }
 
 /// Test command formatting preserves CRLF

@@ -13,15 +13,11 @@ mod commands;
 mod response;
 mod responses;
 
-pub use response::ResponseParser;
-
 // Re-export article parsing types
 pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
-pub use response::{
-    NntpResponse, StatusCode, is_disconnect, is_multiline_response, parse_status_code,
-};
+pub use response::{NntpResponse, StatusCode};
 
 // Re-export command construction helpers
 pub use commands::{

@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
 use crate::pool::BufferPool;
-use crate::protocol::{ResponseParser, authinfo_pass, authinfo_user};
+use crate::protocol::{NntpResponse, authinfo_pass, authinfo_user};
 
 /// Handles authentication to backend NNTP servers
 pub struct BackendAuthenticator;
@@ -35,10 +35,13 @@ impl BackendAuthenticator {
         debug!("AUTHINFO USER response: {}", response.trim());
 
         // Should get 381 (password required) or 281 (authenticated)
-        if ResponseParser::is_auth_success(&buffer[..n]) {
+        if matches!(NntpResponse::parse(&buffer[..n]), NntpResponse::AuthSuccess) {
             // Already authenticated with just username
             return Ok(());
-        } else if !ResponseParser::is_auth_required(&buffer[..n]) {
+        } else if !matches!(
+            NntpResponse::parse(&buffer[..n]),
+            NntpResponse::AuthRequired(_)
+        ) {
             let error = format!("Unexpected response to AUTHINFO USER: {}", response.trim());
             return Err(anyhow::anyhow!(error));
         }
@@ -54,7 +57,7 @@ impl BackendAuthenticator {
         debug!("AUTHINFO PASS response: {}", response.trim());
 
         // Should get 281 (authenticated)
-        if ResponseParser::is_auth_success(&buffer[..n]) {
+        if matches!(NntpResponse::parse(&buffer[..n]), NntpResponse::AuthSuccess) {
             Ok(())
         } else {
             Err(anyhow::anyhow!(
@@ -83,7 +86,7 @@ impl BackendAuthenticator {
         let greeting_str = String::from_utf8_lossy(greeting);
         debug!("Backend greeting: {}", greeting_str.trim());
 
-        if !ResponseParser::is_greeting(greeting) {
+        if !matches!(NntpResponse::parse(greeting), NntpResponse::Greeting(_)) {
             let error = format!(
                 "Server returned non-success greeting: {}",
                 greeting_str.trim()
@@ -118,7 +121,7 @@ impl BackendAuthenticator {
         let greeting_str = String::from_utf8_lossy(greeting);
         debug!("Backend greeting: {}", greeting_str.trim());
 
-        if !ResponseParser::is_greeting(greeting) {
+        if !matches!(NntpResponse::parse(greeting), NntpResponse::Greeting(_)) {
             let error = format!(
                 "Server returned non-success greeting: {}",
                 greeting_str.trim()
@@ -141,35 +144,59 @@ mod tests {
     use super::*;
     use crate::types::BufferSize;
 
-    /// Test ResponseParser::is_auth_success
+    /// Test NntpResponse parsing for auth responses
     #[test]
     fn test_auth_response_parsing() {
         // Test successful auth response
         let auth_success = b"281 Authentication accepted\r\n";
-        assert!(ResponseParser::is_auth_success(auth_success));
+        assert!(matches!(
+            NntpResponse::parse(auth_success),
+            NntpResponse::AuthSuccess
+        ));
 
         // Test password required response
         let password_required = b"381 Password required\r\n";
-        assert!(ResponseParser::is_auth_required(password_required));
-        assert!(!ResponseParser::is_auth_success(password_required));
+        assert!(matches!(
+            NntpResponse::parse(password_required),
+            NntpResponse::AuthRequired(_)
+        ));
+        assert!(!matches!(
+            NntpResponse::parse(password_required),
+            NntpResponse::AuthSuccess
+        ));
 
         // Test failure response
         let auth_failed = b"481 Authentication failed\r\n";
-        assert!(!ResponseParser::is_auth_success(auth_failed));
-        assert!(!ResponseParser::is_auth_required(auth_failed));
+        assert!(!matches!(
+            NntpResponse::parse(auth_failed),
+            NntpResponse::AuthSuccess
+        ));
+        assert!(!matches!(
+            NntpResponse::parse(auth_failed),
+            NntpResponse::AuthRequired(_)
+        ));
     }
 
     /// Test greeting detection
     #[test]
     fn test_greeting_parsing() {
         let greeting = b"200 Welcome to the NNTP server\r\n";
-        assert!(ResponseParser::is_greeting(greeting));
+        assert!(matches!(
+            NntpResponse::parse(greeting),
+            NntpResponse::Greeting(_)
+        ));
 
         let greeting_auth_required = b"201 Welcome, authentication required\r\n";
-        assert!(ResponseParser::is_greeting(greeting_auth_required));
+        assert!(matches!(
+            NntpResponse::parse(greeting_auth_required),
+            NntpResponse::Greeting(_)
+        ));
 
         let not_greeting = b"400 Service temporarily unavailable\r\n";
-        assert!(!ResponseParser::is_greeting(not_greeting));
+        assert!(!matches!(
+            NntpResponse::parse(not_greeting),
+            NntpResponse::Greeting(_)
+        ));
     }
 
     /// Test buffer pool interaction in authentication

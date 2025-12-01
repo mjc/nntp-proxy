@@ -750,6 +750,66 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
 
 ## Testing Guidelines
 
+### Test Organization Rules
+
+**CRITICAL: Where to put tests**
+
+1. **Unit tests** - In the same file as the code being tested, inside `#[cfg(test)] mod tests { ... }`
+   - Tests for a specific function/struct/module
+   - No external dependencies or I/O
+   - Fast, isolated, pure logic testing
+   - Example: `src/protocol/response.rs` has `#[cfg(test)] mod tests` at the bottom
+
+2. **Integration tests** - In `tests/*.rs` directory at repository root
+   - Tests that involve multiple modules
+   - Tests with I/O, networking, file system
+   - Tests requiring mock servers or external resources
+   - Example: `tests/integration_tests.rs`, `tests/test_auth_backend.rs`
+
+3. **❌ NEVER create test submodules in `src/`**
+   - DO NOT create `src/foo/tests/` directories
+   - DO NOT create `src/foo/tests/mod.rs` or `src/foo/tests/test_*.rs` files
+   - Unit tests belong inline in the module file itself
+
+**Examples:**
+
+```rust
+// ✅ CORRECT - Unit tests in same file
+// src/protocol/response.rs
+pub struct StatusCode(u16);
+
+impl StatusCode {
+    pub fn parse(data: &[u8]) -> Option<Self> { ... }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_valid_code() {
+        assert_eq!(StatusCode::parse(b"200"), Some(StatusCode(200)));
+    }
+}
+```
+
+```rust
+// ✅ CORRECT - Integration tests in tests/ directory
+// tests/test_proxy_routing.rs
+use nntp_proxy::*;
+
+#[tokio::test]
+async fn test_end_to_end_routing() {
+    // Multi-module integration test
+}
+```
+
+```rust
+// ❌ WRONG - Don't create test subdirectories in src/
+// src/protocol/response/tests/mod.rs  ← NEVER DO THIS
+// src/protocol/response/tests/parsing.rs  ← NEVER DO THIS
+```
+
 ### Test Structure
 
 The codebase uses a mix of unit tests (in module files) and integration tests (in `tests/` directory).
@@ -797,7 +857,7 @@ async fn test_proxy_routing() -> Result<()> {
     let mut client = TcpStream::connect("127.0.0.1:8119").await?;
     // ... assertions
     
-    Ok(())
+    Ok(()))
 }
 ```
 

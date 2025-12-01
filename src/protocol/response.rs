@@ -141,7 +141,7 @@ impl NntpResponse {
     /// **Optimization**: Direct byte-to-digit conversion avoids UTF-8 overhead.
     #[inline]
     pub fn parse(data: &[u8]) -> Self {
-        let code = match parse_status_code(data) {
+        let code = match StatusCode::parse(data) {
             Some(c) => c,
             None => return Self::Invalid,
         };
@@ -207,103 +207,128 @@ impl NntpResponse {
     }
 }
 
-/// Parse a status code from response data
-///
-/// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
-/// responses begin with a 3-digit status code (ASCII digits '0'-'9').
-///
-/// **Optimization**: Direct byte-to-digit conversion without UTF-8 validation.
-/// Status codes are guaranteed to be ASCII digits per the RFC.
-#[inline]
-pub fn parse_status_code(data: &[u8]) -> Option<StatusCode> {
-    if data.len() < 3 {
-        return None;
-    }
-
-    // Fast path: Direct ASCII digit conversion without UTF-8 overhead
-    // Per RFC 3977, status codes are exactly 3 ASCII digits
-    let d0 = data[0].wrapping_sub(b'0');
-    let d1 = data[1].wrapping_sub(b'0');
-    let d2 = data[2].wrapping_sub(b'0');
-
-    // Validate all three are digits (0-9)
-    if d0 > 9 || d1 > 9 || d2 > 9 {
-        return None;
-    }
-
-    // Combine into u16: d0*100 + d1*10 + d2
-    let code = (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16);
-    Some(StatusCode::new(code))
-}
-
-/// Check if a response indicates a multiline response
-///
-/// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
-/// certain status codes indicate multiline data follows.
-///
-/// # Multiline Response Codes
-/// - **1xx**: All informational responses (100-199)
-/// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
-#[inline]
-pub fn is_multiline_response(status_code: StatusCode) -> bool {
-    let code = status_code.as_u16();
-    match code {
-        100..=199 => true, // All 1xx are multiline
-        215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
-        _ => false,
-    }
-}
-
-/// Check if response is a disconnect/goodbye (205)
-///
-/// Per [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4),
-/// code 205 indicates "Connection closing" / "Goodbye".
-///
-/// **Optimization**: Direct byte prefix check, no parsing.
-#[inline]
-pub fn is_disconnect(data: &[u8]) -> bool {
-    data.len() >= 3 && data.starts_with(b"205")
-}
-
-/// Response parser for NNTP protocol
-pub struct ResponseParser;
-
-impl ResponseParser {
-    /// Check if a response starts with a success code (2xx or 3xx)
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_success_response(data: &[u8]) -> bool {
-        NntpResponse::parse(data).is_success()
-    }
-
-    /// Check if response is a greeting (200 or 201)
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_greeting(data: &[u8]) -> bool {
-        matches!(NntpResponse::parse(data), NntpResponse::Greeting(_))
-    }
-
-    /// Check if response indicates authentication is required (381 or 480)
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_auth_required(data: &[u8]) -> bool {
-        matches!(NntpResponse::parse(data), NntpResponse::AuthRequired(_))
-    }
-
-    /// Check if response indicates successful authentication (281)
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_auth_success(data: &[u8]) -> bool {
-        matches!(NntpResponse::parse(data), NntpResponse::AuthSuccess)
-    }
-
-    /// Check if response has a specific status code
+impl StatusCode {
+    /// Parse a status code from response data
     ///
-    /// This is useful for checking specific response codes like 111 (DATE response),
-    /// or any other specific code that doesn't have a dedicated helper.
+    /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
+    /// responses begin with a 3-digit status code (ASCII digits '0'-'9').
+    ///
+    /// **Optimization**: Direct byte-to-digit conversion without UTF-8 validation.
+    /// Status codes are guaranteed to be ASCII digits per the RFC.
     #[inline]
-    pub fn is_response_code(data: &[u8], code: u16) -> bool {
-        parse_status_code(data).is_some_and(|c| c.as_u16() == code)
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 3 {
+            return None;
+        }
+
+        // Fast path: Direct ASCII digit conversion without UTF-8 overhead
+        // Per RFC 3977, status codes are exactly 3 ASCII digits
+        let d0 = data[0].wrapping_sub(b'0');
+        let d1 = data[1].wrapping_sub(b'0');
+        let d2 = data[2].wrapping_sub(b'0');
+
+        // Validate all three are digits (0-9)
+        if d0 > 9 || d1 > 9 || d2 > 9 {
+            return None;
+        }
+
+        // Combine into u16: d0*100 + d1*10 + d2
+        let code = (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16);
+        Some(Self::new(code))
+    }
+
+    /// Check if this code indicates a multiline response
+    ///
+    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
+    /// certain status codes indicate multiline data follows.
+    ///
+    /// # Multiline Response Codes
+    /// - **1xx**: All informational responses (100-199)
+    /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
+    #[inline]
+    #[must_use]
+    pub const fn is_multiline(self) -> bool {
+        let code = self.0;
+        match code {
+            100..=199 => true, // All 1xx are multiline
+            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    #[test]
+    fn test_status_code_categories() {
+        assert!(StatusCode::new(100).is_informational());
+        assert!(StatusCode::new(200).is_success());
+        assert!(StatusCode::new(381).is_success()); // 3xx counts as success
+        assert!(StatusCode::new(400).is_error());
+        assert!(StatusCode::new(500).is_error());
+        assert!(!StatusCode::new(200).is_error());
+    }
+
+    #[test]
+    fn test_status_code_multiline() {
+        // All 1xx are multiline
+        assert!(StatusCode::new(111).is_multiline());
+        // Specific 2xx multiline codes
+        assert!(StatusCode::new(220).is_multiline());
+        assert!(!StatusCode::new(200).is_multiline());
+        assert!(!StatusCode::new(400).is_multiline());
+    }
+
+    #[test]
+    fn test_status_code_parsing() {
+        assert_eq!(StatusCode::parse(b"200"), Some(StatusCode::new(200)));
+        assert_eq!(StatusCode::parse(b""), None);
+        assert_eq!(StatusCode::parse(b"XX"), None);
+    }
+
+    #[test]
+    fn test_nntp_response_categorization() {
+        assert!(matches!(
+            NntpResponse::parse(b"200 OK\r\n"),
+            NntpResponse::Greeting(_)
+        ));
+        assert_eq!(
+            NntpResponse::parse(b"205 Bye\r\n"),
+            NntpResponse::Disconnect
+        );
+        assert!(matches!(
+            NntpResponse::parse(b"381 Pass\r\n"),
+            NntpResponse::AuthRequired(_)
+        ));
+        assert_eq!(
+            NntpResponse::parse(b"281 OK\r\n"),
+            NntpResponse::AuthSuccess
+        );
+        assert!(matches!(
+            NntpResponse::parse(b"220 Art\r\n"),
+            NntpResponse::MultilineData(_)
+        ));
+        assert!(matches!(
+            NntpResponse::parse(b"211 Group\r\n"),
+            NntpResponse::SingleLine(_)
+        ));
+        assert_eq!(NntpResponse::parse(b""), NntpResponse::Invalid);
+    }
+
+    #[test]
+    fn test_response_is_success() {
+        assert!(NntpResponse::parse(b"200 OK\r\n").is_success());
+        assert!(NntpResponse::parse(b"281 Auth\r\n").is_success());
+        assert!(!NntpResponse::parse(b"400 Error\r\n").is_success());
+        assert!(!NntpResponse::parse(b"500 Error\r\n").is_success());
+    }
+
+    #[test]
+    fn test_response_is_multiline() {
+        assert!(NntpResponse::parse(b"220 Article\r\n").is_multiline());
+        assert!(!NntpResponse::parse(b"200 OK\r\n").is_multiline());
     }
 }
 

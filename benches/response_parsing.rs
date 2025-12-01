@@ -6,34 +6,9 @@ fn main() {
     divan::main();
 }
 
-#[inline]
-fn parse_status_code_old(data: &[u8]) -> Option<u16> {
-    if data.len() < 3 {
-        return None;
-    }
-    let code_str = std::str::from_utf8(&data[0..3]).ok()?;
-    code_str.parse().ok()
-}
-
-#[inline]
-fn parse_status_code_new(data: &[u8]) -> Option<u16> {
-    if data.len() < 3 {
-        return None;
-    }
-
-    let d0 = data[0].wrapping_sub(b'0');
-    let d1 = data[1].wrapping_sub(b'0');
-    let d2 = data[2].wrapping_sub(b'0');
-
-    if d0 > 9 || d1 > 9 || d2 > 9 {
-        return None;
-    }
-
-    Some((d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16))
-}
-
 mod status_code_parsing {
     use super::*;
+    use nntp_proxy::protocol::StatusCode;
 
     const RESPONSES: &[&[u8]] = &[
         b"200 Ready\r\n",
@@ -42,19 +17,10 @@ mod status_code_parsing {
     ];
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn old_utf8(bencher: Bencher) {
+    fn optimized(bencher: Bencher) {
         bencher.bench(|| {
             for response in RESPONSES {
-                black_box(parse_status_code_old(black_box(*response)));
-            }
-        });
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn new_optimized(bencher: Bencher) {
-        bencher.bench(|| {
-            for response in RESPONSES {
-                black_box(parse_status_code_new(black_box(*response)));
+                black_box(StatusCode::parse(black_box(*response)));
             }
         });
     }
