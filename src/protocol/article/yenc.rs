@@ -1,62 +1,25 @@
 //! yEnc validation utilities
 //!
-//! Validates yenc-encoded binary data structure and checksums using
-//! functional composition and iterator-based parsing.
-//!
-//! yEnc encoding is simple: each byte is `(input - 42) % 256`, with `=` as escape
-//! for special bytes (followed by `byte - 64`), and leading `..` for dot-stuffing.
+//! Validates yenc-encoded binary data structure and checksums.
+//! Uses the `yenc` crate for decoding - it's faster and more correct than custom implementations.
 
 use super::ParseError;
 use std::io::{BufRead, BufReader};
 
-/// yEnc escape character (signals next byte needs special handling)
-const ESCAPE: u8 = b'=';
-/// CR/LF and NUL are skipped in yenc data
-const CR: u8 = b'\r';
-const LF: u8 = b'\n';
-const NUL: u8 = b'\0';
-/// Dot at start of line (NNTP dot-stuffing)
-const DOT: u8 = b'.';
-
-/// Decode yenc-encoded line to raw bytes
+/// Decode yenc-encoded line to raw bytes using the yenc crate
 ///
 /// yEnc encoding: `encoded = (original + 42) % 256`
 /// Special handling:
 /// - `=` is escape: next byte uses `(byte - 64) % 256` instead of 42
 /// - Leading `..` collapses to `.` (NNTP dot-stuffing)
 /// - CR, LF, NUL are ignored
+///
+/// Delegates to yenc crate which is faster and handles all edge cases correctly
 #[inline]
 pub fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(input.len());
-    let mut iter = input.iter().copied().enumerate();
-
-    while let Some((col, byte)) = iter.next() {
-        match byte {
-            // Skip control characters
-            NUL | CR | LF => continue,
-
-            // Handle NNTP dot-stuffing (.. at start becomes .)
-            DOT if col == 0 => {
-                if let Some((_, DOT)) = iter.next() {
-                    output.push(DOT.wrapping_sub(42));
-                } else {
-                    output.push(DOT.wrapping_sub(42));
-                }
-            }
-
-            // Escape character: next byte uses different offset
-            ESCAPE => {
-                if let Some((_, escaped_byte)) = iter.next() {
-                    output.push(escaped_byte.wrapping_sub(64).wrapping_sub(42));
-                }
-            }
-
-            // Normal yenc byte: subtract 42
-            _ => output.push(byte.wrapping_sub(42)),
-        }
-    }
-
-    output
+    // yenc crate returns Result but decoding never actually fails
+    // (it just returns empty/partial on malformed input)
+    yenc::decode_buffer(input).unwrap_or_default()
 }
 
 /// yEnc header metadata extracted from =ybegin line

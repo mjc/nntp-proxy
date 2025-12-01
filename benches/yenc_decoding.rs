@@ -1,13 +1,7 @@
 //! Benchmarks for yEnc decoding
 //!
-//! Measures performance of our custom yEnc decoder across:
-//! - Different line lengths (typical yenc is 128-byte lines)
-//! - Escaped vs non-escaped data
-//! - Realistic binary data patterns
-//!
-//! Run with:
-//! - Criterion: `cargo bench --bench yenc_decoding`
-//! - Iai: `cargo bench --bench yenc_decoding_iai`
+//! Now that we use the yenc crate, these benchmarks just verify
+//! we're getting expected performance from it.
 
 use divan::{Bencher, black_box};
 
@@ -44,67 +38,116 @@ fn generate_yenc_with_escapes(length: usize, escape_freq: usize) -> Vec<u8> {
     data
 }
 
-// =============================================================================
-// Divan Benchmarks (fast, cachegrind-based)
-// =============================================================================
-
-mod divan_benches {
+mod yenc_crate_benches {
     use super::*;
-    use nntp_proxy::protocol::yenc::decode_yenc_line;
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_128_bytes(bencher: Bencher) {
+    fn yenc_decode_128_bytes(bencher: Bencher) {
         let data = generate_yenc_data(128);
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_256_bytes(bencher: Bencher) {
+    fn yenc_decode_256_bytes(bencher: Bencher) {
         let data = generate_yenc_data(256);
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_512_bytes(bencher: Bencher) {
+    fn yenc_decode_512_bytes(bencher: Bencher) {
         let data = generate_yenc_data(512);
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_1024_bytes(bencher: Bencher) {
+    fn yenc_decode_1024_bytes(bencher: Bencher) {
         let data = generate_yenc_data(1024);
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_with_10pct_escapes(bencher: Bencher) {
+    fn yenc_decode_4k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(4096);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 1000)]
+    fn yenc_decode_8k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(8192);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 1000)]
+    fn yenc_decode_16k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(16384);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 500)]
+    fn yenc_decode_32k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(32768);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 500)]
+    fn yenc_decode_64k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(65536);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 200)]
+    fn yenc_decode_128k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(131072);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 200)]
+    fn yenc_decode_256k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(262144);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 100)]
+    fn yenc_decode_512k_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(524288);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 50)]
+    fn yenc_decode_1mb_bytes(bencher: Bencher) {
+        let data = generate_yenc_data(1048576);
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 1000)]
+    fn yenc_decode_with_10pct_escapes(bencher: Bencher) {
         let data = generate_yenc_with_escapes(128, 10);
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_with_25pct_escapes(bencher: Bencher) {
+    fn yenc_decode_with_25pct_escapes(bencher: Bencher) {
         let data = generate_yenc_with_escapes(128, 4);
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_with_50pct_escapes(bencher: Bencher) {
+    fn yenc_decode_with_50pct_escapes(bencher: Bencher) {
         let data = generate_yenc_with_escapes(128, 2);
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_with_crlf(bencher: Bencher) {
+    fn yenc_decode_with_crlf(bencher: Bencher) {
         let mut data = generate_yenc_data(128);
         data.extend_from_slice(b"\r\n");
-        bencher.bench(|| black_box(decode_yenc_line(black_box(&data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 1000)]
-    fn decode_real_world_line(bencher: Bencher) {
+    fn yenc_decode_real_world_line(bencher: Bencher) {
         // Real yenc-encoded "Hello, yEnc!" with CRLF
         let data = b"r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n";
-        bencher.bench(|| black_box(decode_yenc_line(black_box(data))));
+        bencher.bench(|| black_box(yenc::decode_buffer(black_box(data)).unwrap()));
     }
 }
