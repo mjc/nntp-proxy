@@ -31,24 +31,35 @@ pub struct Article<'a> {
 impl<'a> TryFrom<&'a [u8]> for Article<'a> {
     type Error = ParseError;
 
+    /// Parse article with yEnc validation enabled by default
+    /// Use `Article::parse(buf, false)` to disable validation
     fn try_from(buf: &'a [u8]) -> Result<Self, Self::Error> {
+        Self::parse(buf, true)
+    }
+}
+
+impl<'a> Article<'a> {
+    /// Parse NNTP article response with optional yEnc validation
+    ///
+    /// # Arguments
+    /// * `buf` - Raw response bytes
+    /// * `validate_yenc` - Whether to validate yEnc structure/checksums
+    pub fn parse(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
         // Parse status code from first line
         let status_code = parse_status_code(buf)?;
 
         // Dispatch to appropriate parser
         match status_code {
-            220 => Self::parse_article(buf),
+            220 => Self::parse_article(buf, validate_yenc),
             221 => Self::parse_head(buf),
-            222 => Self::parse_body(buf),
+            222 => Self::parse_body(buf, validate_yenc),
             223 => Self::parse_stat(buf),
             _ => Err(ParseError::InvalidStatusCode(status_code)),
         }
     }
-}
 
-impl<'a> Article<'a> {
     /// Parse 220 ARTICLE response (headers + body)
-    fn parse_article(buf: &'a [u8]) -> Result<Self, ParseError> {
+    fn parse_article(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
         // 220 <article-number> <message-id> ...
         let first_line_end = find_line_end(buf, 0)?;
         let first_line = &buf[..first_line_end];
@@ -70,8 +81,8 @@ impl<'a> Article<'a> {
         let terminator_start = find_terminator(buf, body_start)?;
         let body_data = &buf[body_start..terminator_start];
 
-        // Validate yenc if present
-        if body_data.starts_with(b"=ybegin") {
+        // Validate yenc if enabled and present
+        if validate_yenc && body_data.starts_with(b"=ybegin") {
             validate_yenc_structure(body_data)?;
         }
 
@@ -118,7 +129,7 @@ impl<'a> Article<'a> {
     }
 
     /// Parse 222 BODY response (body only)
-    fn parse_body(buf: &'a [u8]) -> Result<Self, ParseError> {
+    fn parse_body(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
         // 222 <article-number> <message-id> ...
         let first_line_end = find_line_end(buf, 0)?;
         let first_line = &buf[..first_line_end];
@@ -132,8 +143,8 @@ impl<'a> Article<'a> {
         let terminator_start = find_terminator(buf, body_start)?;
         let body_data = &buf[body_start..terminator_start];
 
-        // Validate yenc if present
-        if body_data.starts_with(b"=ybegin") {
+        // Validate yenc if enabled and present
+        if validate_yenc && body_data.starts_with(b"=ybegin") {
             validate_yenc_structure(body_data)?;
         }
 

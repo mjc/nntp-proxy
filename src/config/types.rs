@@ -127,6 +127,8 @@ pub struct Proxy {
     pub threads: ThreadCount,
     /// Backend selection strategy for load balancing
     pub backend_selection: BackendSelectionStrategy,
+    /// Validate yEnc structure and checksums (default: true)
+    pub validate_yenc: bool,
 }
 
 impl Proxy {
@@ -141,6 +143,7 @@ impl Default for Proxy {
             port: Port::default(),
             threads: ThreadCount::default(),
             backend_selection: BackendSelectionStrategy::default(),
+            validate_yenc: true,
         }
     }
 }
