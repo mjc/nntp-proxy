@@ -52,6 +52,9 @@ smallvec = "1.13"  # Stack-allocated vectors for small collections
 dashmap = "6.1"  # Lock-free concurrent HashMap for metrics
 sysinfo = "0.37"  # System metrics (CPU, memory) for monitoring
 
+# Derive helpers to reduce newtype boilerplate
+nutype = { version = "0.5", features = ["serde"] }  # Validated newtypes with automatic derives
+
 # TLS dependencies - use ring for smaller binaries (pure Rust, no C dependencies)
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
 rustls = { version = "0.23", features = ["ring", "std"], default-features = false }  # Pure Rust TLS with ring only
@@ -86,8 +89,8 @@ harness = false
 
 
 [profile.release]
-debug = false          # No debug symbols for smaller binaries
-strip = true          # Strip symbols for even smaller size
-lto = true            # Link-time optimization for better performance
-codegen-units = 1     # Single codegen unit for better optimization
-overflow-checks = true  # Keep overflow checks for safety with untrusted network data
+debug = 1          # No debug symbols for smaller binaries
+# strip = false          # Strip symbols for even smaller size
+# lto = false            # Link-time optimization for better performance
+# codegen-units = 1     # Single codegen unit for better optimization
+# overflow-checks = true  # Keep overflow checks for safety with untrusted network data
