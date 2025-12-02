@@ -60,7 +60,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
     let max_connections = env
         .get(&max_conn_key)
         .and_then(|m| m.parse::<usize>().ok())
-        .and_then(crate::types::MaxConnections::new)
+        .and_then(|m| crate::types::MaxConnections::try_new(m).ok())
         .unwrap_or_else(defaults::max_connections);
 
     // TLS configuration
@@ -101,11 +101,11 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         .unwrap_or_else(defaults::health_check_pool_timeout);
 
     Some(Server {
-        host: crate::types::HostName::new(host.clone())
+        host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {}: '{}'", host_key, host)),
-        port: crate::types::Port::new(port)
-            .unwrap_or_else(|| panic!("Invalid port in {}: {}", port_key, port)),
-        name: crate::types::ServerName::new(name.clone())
+        port: crate::types::Port::try_new(port)
+            .unwrap_or_else(|_| panic!("Invalid port in {}: {}", port_key, port)),
+        name: crate::types::ServerName::try_new(name.clone())
             .unwrap_or_else(|_| panic!("Invalid server name in {}: '{}'", name_key, name)),
         username,
         password,
@@ -317,10 +317,10 @@ pub fn load_config_with_fallback(config_path: &str) -> Result<(Config, ConfigSou
 pub fn create_default_config() -> Config {
     Config {
         servers: vec![Server {
-            host: crate::types::HostName::new("news.example.com".to_string())
+            host: crate::types::HostName::try_new("news.example.com".to_string())
                 .expect("Valid hostname"),
-            port: crate::types::Port::new(119).expect("Valid port"),
-            name: crate::types::ServerName::new("Example News Server".to_string())
+            port: crate::types::Port::try_new(119).expect("Valid port"),
+            name: crate::types::ServerName::try_new("Example News Server".to_string())
                 .expect("Valid server name"),
             username: None,
             password: None,

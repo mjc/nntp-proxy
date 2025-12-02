@@ -344,10 +344,10 @@ impl TuiApp {
                 let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
                 (
                     BytesPerSecondRate::new(
-                        Self::calculate_rate(sent_delta, time_delta).get() as u64
+                        Self::calculate_rate(sent_delta.into(), time_delta).get() as u64,
                     ),
                     BytesPerSecondRate::new(
-                        Self::calculate_rate(recv_delta, time_delta).get() as u64
+                        Self::calculate_rate(recv_delta.into(), time_delta).get() as u64,
                     ),
                 )
             })
@@ -385,8 +385,8 @@ impl TuiApp {
                 .saturating_sub(prev.backend_to_client_bytes);
 
             // Calculate rates
-            let client_sent_rate = Self::calculate_rate(client_to_backend_delta, time_delta);
-            let client_recv_rate = Self::calculate_rate(backend_to_client_delta, time_delta);
+            let client_sent_rate = Self::calculate_rate(client_to_backend_delta.into(), time_delta);
+            let client_recv_rate = Self::calculate_rate(backend_to_client_delta.into(), time_delta);
 
             // Store client throughput point
             let client_point = ThroughputPoint::new_client(now, client_sent_rate, client_recv_rate);
@@ -407,8 +407,8 @@ impl TuiApp {
                     .total_commands
                     .saturating_sub(prev_stats.total_commands);
 
-                let sent_rate = Self::calculate_rate(sent_delta, time_delta);
-                let recv_rate = Self::calculate_rate(recv_delta, time_delta);
+                let sent_rate = Self::calculate_rate(sent_delta.into(), time_delta);
+                let recv_rate = Self::calculate_rate(recv_delta.into(), time_delta);
                 let cmd_rate = Self::calculate_command_rate(cmd_delta.get(), time_delta);
 
                 let point = ThroughputPoint::new_backend(now, sent_rate, recv_rate, cmd_rate);
@@ -529,6 +529,7 @@ mod tests {
     use crate::config::Server;
     use crate::metrics::MetricsCollector;
     use crate::router::BackendSelector;
+    use crate::types::Port;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -537,10 +538,13 @@ mod tests {
         Arc::new(
             (0..count)
                 .map(|i| {
-                    Server::builder(format!("backend{}.example.com", i), 119)
-                        .name(format!("Backend {}", i))
-                        .build()
-                        .unwrap()
+                    Server::builder(
+                        format!("backend{}.example.com", i),
+                        Port::try_new(119).unwrap(),
+                    )
+                    .name(format!("Backend {}", i))
+                    .build()
+                    .unwrap()
                 })
                 .collect(),
         )
@@ -565,7 +569,7 @@ mod tests {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
         let servers = Arc::new(vec![
-            Server::builder("test.example.com", 119)
+            Server::builder("test.example.com", Port::try_new(119).unwrap())
                 .name("Test Server".to_string())
                 .build()
                 .unwrap(),

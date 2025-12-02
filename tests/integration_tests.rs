@@ -70,7 +70,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -157,7 +157,7 @@ async fn test_round_robin_distribution() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -243,7 +243,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -276,10 +276,10 @@ async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool
                 tokio::spawn(async move {
                     if per_command_routing {
                         let _ = proxy_clone
-                            .handle_client_per_command_routing(stream, addr)
+                            .handle_client_per_command_routing(stream, addr.into())
                             .await;
                     } else {
-                        let _ = proxy_clone.handle_client(stream, addr).await;
+                        let _ = proxy_clone.handle_client(stream, addr.into()).await;
                     }
                 });
             }
@@ -558,7 +558,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -641,7 +641,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -735,7 +735,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
             if let Ok((stream, addr)) = listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -865,7 +865,9 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
         while let Ok((stream, addr)) = listener.accept().await {
             let proxy = proxy_clone.clone();
             tokio::spawn(async move {
-                let _ = proxy.handle_client_per_command_routing(stream, addr).await;
+                let _ = proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await;
             });
         }
     });

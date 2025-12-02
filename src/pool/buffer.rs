@@ -268,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_creation() {
-        let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);
+        let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
 
         // Pool should pre-allocate buffers
         let buffer1 = pool.acquire().await;
@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_get_and_return() {
-        let pool = BufferPool::new(BufferSize::new(4096).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 5);
 
         // Get a buffer
         let buffer = pool.acquire().await;
@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_exhaustion() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         // Get all pre-allocated buffers
         let buf1 = pool.acquire().await;
@@ -317,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_concurrent_access() {
-        let pool = BufferPool::new(BufferSize::new(2048).unwrap(), 10);
+        let pool = BufferPool::new(BufferSize::try_new(2048).unwrap(), 10);
 
         // Spawn multiple tasks accessing the pool concurrently
         let mut handles = vec![];
@@ -341,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_alignment() {
-        let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 1);
+        let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1);
         let buffer = pool.acquire().await;
 
         // Buffer capacity should be aligned to page boundaries (4KB)
@@ -352,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_clear_and_resize() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         let mut buffer = pool.acquire().await;
 
@@ -372,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_max_size_enforcement() {
-        let pool = BufferPool::new(BufferSize::new(512).unwrap(), 3);
+        let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 3);
 
         // Get all buffers
         let buf1 = pool.acquire().await;
@@ -394,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_wrong_size_not_returned() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 2);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         let buffer = pool.acquire().await;
         assert_eq!(buffer.capacity(), 1024);
@@ -405,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_multiple_get_return_cycles() {
-        let pool = BufferPool::new(BufferSize::new(4096).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 5);
 
         // Do multiple get/return cycles
         for i in 0..20 {
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_clone() {
-        let pool1 = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let pool1 = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let _pool2 = pool1.clone();
 
         // Both should share the same underlying pool
@@ -430,9 +430,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_different_buffer_sizes() {
-        let small_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
-        let medium_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 5);
-        let large_pool = BufferPool::new(BufferSize::new(65536).unwrap(), 5);
+        let small_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
+        let medium_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 5);
+        let large_pool = BufferPool::new(BufferSize::try_new(65536).unwrap(), 5);
 
         let small_buf = small_pool.acquire().await;
         let medium_buf = medium_pool.acquire().await;
@@ -447,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_as_mut_slice() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         // Get mutable slice and write to it
@@ -471,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_stress() {
-        let pool = BufferPool::new(BufferSize::new(4096).unwrap(), 10);
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 10);
 
         // Stress test with many concurrent operations
         let mut handles = vec![];
@@ -494,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pooled_buffer_deref() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         // Initially no initialized bytes
@@ -510,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pooled_buffer_as_ref() {
-        let pool = BufferPool::new(BufferSize::new(512).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         buffer.copy_from_slice(b"Test data");
@@ -523,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_from_slice_updates_initialized() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         assert_eq!(buffer.initialized(), 0);
@@ -538,7 +538,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "data exceeds buffer capacity")]
     async fn test_copy_from_slice_panic_on_overflow() {
-        let pool = BufferPool::new(BufferSize::new(10).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(10).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         let too_large = vec![0u8; 20];
@@ -547,14 +547,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_pool_debug() {
-        let pool = BufferPool::new(BufferSize::new(2048).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(2048).unwrap(), 5);
         let debug_str = format!("{:?}", pool);
         assert!(debug_str.contains("BufferPool"));
     }
 
     #[tokio::test]
     async fn test_buffer_initialized_tracking() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         // Test multiple writes update initialized correctly
@@ -569,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_capacity_vs_initialized() {
-        let pool = BufferPool::new(BufferSize::new(8192).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         // Capacity is full buffer size
@@ -585,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_as_mut_slice_capacity() {
-        let pool = BufferPool::new(BufferSize::new(1024).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         // as_mut_slice should return full capacity
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_slice_copy() {
-        let pool = BufferPool::new(BufferSize::new(512).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
         // Copying empty slice should work
@@ -606,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_reuse_preserves_capacity() {
-        let pool = BufferPool::new(BufferSize::new(2048).unwrap(), 5);
+        let pool = BufferPool::new(BufferSize::try_new(2048).unwrap(), 5);
 
         {
             let mut buffer = pool.acquire().await;

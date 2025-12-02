@@ -1,7 +1,6 @@
 //! Stateful connection reservation tests
 
 use super::*;
-use crate::types::ServerName;
 use std::sync::Arc;
 
 #[test]
@@ -21,7 +20,7 @@ fn test_stateful_connection_reservation() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test-backend".to_string()).unwrap(),
+        ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
     );
 
@@ -50,7 +49,7 @@ fn test_stateful_connection_concurrent_access() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test-backend".to_string()).unwrap(),
+        ServerName::try_new("test-backend".to_string()).unwrap(),
         create_test_provider(),
     );
 
@@ -109,12 +108,12 @@ fn test_stateful_connection_multiple_backends() {
 
     router.add_backend(
         backend1,
-        ServerName::new("backend-1".to_string()).unwrap(),
+        ServerName::try_new("backend-1".to_string()).unwrap(),
         provider1,
     );
     router.add_backend(
         backend2,
-        ServerName::new("backend-2".to_string()).unwrap(),
+        ServerName::try_new("backend-2".to_string()).unwrap(),
         provider2,
     );
 
@@ -170,7 +169,7 @@ fn test_stateful_reservation_edge_cases() {
 
     router.add_backend(
         backend_id,
-        ServerName::new("test-backend".to_string()).unwrap(),
+        ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
     );
 

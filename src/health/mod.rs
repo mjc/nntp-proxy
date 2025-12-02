@@ -2,7 +2,7 @@ mod types;
 
 pub use types::{BackendHealth, HealthMetrics, HealthStatus};
 
-use crate::protocol::{DATE, ResponseParser};
+use crate::protocol::{DATE, StatusCode};
 use crate::types::BackendId;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -122,7 +122,7 @@ impl HealthChecker {
         reader.read_until(b'\n', &mut response).await?;
 
         // Check if response indicates success (111 response)
-        if ResponseParser::is_response_code(&response, 111) {
+        if StatusCode::parse(&response).is_some_and(|code| code.as_u16() == 111) {
             Ok(())
         } else {
             Err("Unexpected response from DATE command".into())

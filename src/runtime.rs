@@ -1,7 +1,9 @@
-//! Tokio runtime configuration and builder
+//! Tokio runtime configuration and common utilities for binary targets
 //!
-//! This module provides testable runtime configuration and builder logic,
-//! extracted from the binary for better separation of concerns.
+//! This module provides:
+//! - Testable runtime configuration and builder logic
+//! - Shared utilities used across multiple binary targets to reduce duplication
+//! - Shutdown signal handling
 
 use crate::types::ThreadCount;
 use anyhow::Result;
@@ -157,6 +159,183 @@ pub async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+}
+
+// ============================================================================
+// Binary Utilities - Shared code across nntp-proxy, nntp-proxy-tui, etc.
+// ============================================================================
+
+/// Load configuration and log server information
+///
+/// Common pattern across all binary targets - load config and display backends.
+///
+/// # Errors
+/// Returns error if configuration loading fails
+pub fn load_and_log_config(
+    config_path: &str,
+) -> Result<(crate::config::Config, crate::config::ConfigSource)> {
+    use crate::load_config_with_fallback;
+    use tracing::info;
+
+    let (config, source) = load_config_with_fallback(config_path)?;
+
+    info!("Loaded configuration from {}", source.description());
+    info!("Loaded {} backend servers:", config.servers.len());
+    for server in &config.servers {
+        info!("  - {} ({}:{})", server.name, server.host, server.port);
+    }
+
+    Ok((config, source))
+}
+
+/// Extract listen address from CLI args or config
+///
+/// Prefers CLI args over config values.
+#[must_use]
+pub fn resolve_listen_address(
+    host_arg: Option<&str>,
+    port_arg: Option<crate::types::Port>,
+    config: &crate::config::Config,
+) -> (String, crate::types::Port) {
+    let host = host_arg
+        .map(String::from)
+        .unwrap_or_else(|| config.proxy.host.clone());
+    let port = port_arg.unwrap_or(config.proxy.port);
+    (host, port)
+}
+
+/// Bind TCP listener and log startup information
+///
+/// # Errors
+/// Returns error if binding fails
+pub async fn bind_listener(
+    host: &str,
+    port: crate::types::Port,
+    routing_mode: crate::RoutingMode,
+) -> Result<tokio::net::TcpListener> {
+    use tracing::info;
+
+    let listen_addr = format!("{}:{}", host, port.get());
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+
+    info!("NNTP proxy listening on {} ({})", listen_addr, routing_mode);
+
+    Ok(listener)
+}
+
+/// Spawn background task to prewarm connection pools
+///
+/// Returns immediately without blocking. Logs errors but doesn't fail.
+pub fn spawn_connection_prewarming(proxy: &std::sync::Arc<crate::NntpProxy>) {
+    use std::sync::Arc;
+    use tracing::{info, warn};
+
+    let proxy = Arc::clone(proxy);
+    tokio::spawn(async move {
+        info!("Prewarming connection pools...");
+        if let Err(e) = proxy.prewarm_connections().await {
+            warn!("Failed to prewarm connection pools: {}", e);
+            return;
+        }
+        info!("Connection pools ready");
+    });
+}
+
+/// Spawn background task to periodically flush connection stats
+///
+/// Flushes every 30 seconds to ensure metrics are up-to-date.
+pub fn spawn_stats_flusher(stats: &crate::metrics::ConnectionStatsAggregator) {
+    let stats = stats.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            stats.flush();
+        }
+    });
+}
+
+/// Spawn graceful shutdown handler
+///
+/// Waits for shutdown signal, then:
+/// 1. Sends shutdown notification via channel
+/// 2. Calls graceful_shutdown() on proxy
+///
+/// Returns the shutdown receiver channel.
+#[must_use]
+pub fn spawn_shutdown_handler(
+    proxy: &std::sync::Arc<crate::NntpProxy>,
+) -> tokio::sync::mpsc::Receiver<()> {
+    use std::sync::Arc;
+    use tracing::info;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let proxy = Arc::clone(proxy);
+
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Shutdown signal received");
+
+        // Notify listeners
+        let _ = shutdown_tx.send(()).await;
+
+        // Close idle connections
+        proxy.graceful_shutdown().await;
+        info!("Graceful shutdown complete");
+    });
+
+    shutdown_rx
+}
+
+/// Run the main accept loop for client connections
+///
+/// Accepts connections and spawns a task for each based on routing mode.
+/// Exits when shutdown signal is received.
+///
+/// # Errors
+/// Returns error if listener.accept() fails
+pub async fn run_accept_loop(
+    proxy: std::sync::Arc<crate::NntpProxy>,
+    listener: tokio::net::TcpListener,
+    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+    routing_mode: crate::RoutingMode,
+) -> Result<()> {
+    use tracing::{error, info};
+
+    let uses_per_command = routing_mode.supports_per_command_routing();
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown initiated, stopping accept loop");
+                break;
+            }
+
+            accept_result = listener.accept() => {
+                let (stream, addr) = accept_result?;
+                let proxy = proxy.clone();
+
+                tokio::spawn(async move {
+                    let result = if uses_per_command {
+                        proxy.handle_client_per_command_routing(stream, addr.into()).await
+                    } else {
+                        proxy.handle_client(stream, addr.into()).await
+                    };
+
+                    if let Err(e) = result {
+                        error!("Error handling client {}: {}", addr, e);
+                    }
+                });
+            }
+        }
+    }
+
+    proxy.graceful_shutdown().await;
+    info!("Proxy shutdown complete");
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,87 +1,87 @@
 //! Connection pool metric newtypes
 
+use nutype::nutype;
 use std::fmt;
 
-/// Macro to generate simple usize newtype wrappers
-macro_rules! usize_newtype {
-    (
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident;
-    ) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        $vis struct $name(usize);
+/// Number of available connections in the pool
+#[nutype(derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, From
+))]
+pub struct AvailableConnections(usize);
 
-        impl $name {
-            #[inline]
-            pub const fn new(count: usize) -> Self {
-                Self(count)
-            }
+impl AvailableConnections {
+    #[inline]
+    pub fn zero() -> Self {
+        Self::new(0)
+    }
 
-            #[inline]
-            #[must_use]
-            pub const fn get(self) -> usize {
-                self.0
-            }
-
-            #[inline]
-            pub const fn zero() -> Self {
-                Self(0)
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.0)
-            }
-        }
-
-        impl From<usize> for $name {
-            fn from(value: usize) -> Self {
-                Self(value)
-            }
-        }
-    };
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> usize {
+        self.into_inner()
+    }
 }
 
-usize_newtype! {
-    /// Number of available connections in the pool
-    ///
-    /// Represents connections that are idle and ready to be used.
-    /// This value should always be ≤ MaxPoolSize.
-    pub struct AvailableConnections;
+/// Maximum size of the connection pool
+#[nutype(derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, From
+))]
+pub struct MaxPoolSize(usize);
+
+impl MaxPoolSize {
+    #[inline]
+    pub fn zero() -> Self {
+        Self::new(0)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> usize {
+        self.into_inner()
+    }
 }
 
-usize_newtype! {
-    /// Maximum size of the connection pool
-    ///
-    /// Represents the configured maximum number of connections
-    /// that can exist in the pool simultaneously.
-    pub struct MaxPoolSize;
+/// Total number of connections created in the pool's lifetime
+#[nutype(derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, From
+))]
+pub struct CreatedConnections(usize);
+
+impl CreatedConnections {
+    #[inline]
+    pub fn zero() -> Self {
+        Self::new(0)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> usize {
+        self.into_inner()
+    }
 }
 
-usize_newtype! {
-    /// Total number of connections created in the pool's lifetime
-    ///
-    /// This is a monotonically increasing counter that tracks all connections
-    /// created since the pool was initialized. Useful for monitoring connection
-    /// churn and pool efficiency.
-    pub struct CreatedConnections;
-}
-
-usize_newtype! {
-    /// Number of connections currently in use
-    ///
-    /// Calculated as: max_size - available
-    /// Represents connections that are actively being used by clients.
-    pub struct InUseConnections;
-}
+/// Number of connections currently in use
+#[nutype(derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, From
+))]
+pub struct InUseConnections(usize);
 
 impl InUseConnections {
+    #[inline]
+    pub fn zero() -> Self {
+        Self::new(0)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> usize {
+        self.into_inner()
+    }
+
     /// Calculate from pool capacity and availability
     #[inline]
     pub fn from_pool_stats(max: MaxPoolSize, available: AvailableConnections) -> Self {
-        Self(max.get().saturating_sub(available.get()))
+        Self::new(max.get().saturating_sub(available.get()))
     }
 }
 

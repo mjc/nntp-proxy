@@ -5,136 +5,160 @@ use crate::protocol::response::*;
 #[test]
 fn test_parse_status_code() {
     assert_eq!(
-        NntpResponse::parse_status_code(b"200 Ready\r\n"),
+        StatusCode::parse(b"200 Ready\r\n"),
         Some(StatusCode::new(200))
     );
     assert_eq!(
-        NntpResponse::parse_status_code(b"381 Password required\r\n"),
+        StatusCode::parse(b"381 Password required\r\n"),
         Some(StatusCode::new(381))
     );
     assert_eq!(
-        NntpResponse::parse_status_code(b"500 Error\r\n"),
+        StatusCode::parse(b"500 Error\r\n"),
         Some(StatusCode::new(500))
     );
-    assert_eq!(NntpResponse::parse_status_code(b"XX"), None);
-    assert_eq!(NntpResponse::parse_status_code(b""), None);
+    assert_eq!(StatusCode::parse(b"XX"), None);
+    assert_eq!(StatusCode::parse(b""), None);
 }
 
 #[test]
 fn test_is_success_response() {
-    assert!(ResponseParser::is_success_response(b"200 Ready\r\n"));
-    assert!(ResponseParser::is_success_response(b"281 Auth OK\r\n"));
-    assert!(!ResponseParser::is_success_response(b"400 Error\r\n"));
-    assert!(!ResponseParser::is_success_response(b"500 Error\r\n"));
+    assert!(NntpResponse::parse(b"200 Ready\r\n").is_success());
+    assert!(NntpResponse::parse(b"281 Auth OK\r\n").is_success());
+    assert!(!NntpResponse::parse(b"400 Error\r\n").is_success());
+    assert!(!NntpResponse::parse(b"500 Error\r\n").is_success());
 }
 
 #[test]
 fn test_is_greeting() {
-    assert!(ResponseParser::is_greeting(
-        b"200 news.example.com ready\r\n"
+    assert!(matches!(
+        NntpResponse::parse(b"200 news.example.com ready\r\n"),
+        NntpResponse::Greeting(_)
     ));
-    assert!(ResponseParser::is_greeting(b"201 read-only\r\n"));
-    assert!(!ResponseParser::is_greeting(b"381 Password required\r\n"));
+    assert!(matches!(
+        NntpResponse::parse(b"201 read-only\r\n"),
+        NntpResponse::Greeting(_)
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(b"381 Password required\r\n"),
+        NntpResponse::Greeting(_)
+    ));
 }
 
 #[test]
 fn test_auth_responses() {
-    assert!(ResponseParser::is_auth_required(
-        b"381 Password required\r\n"
+    assert!(matches!(
+        NntpResponse::parse(b"381 Password required\r\n"),
+        NntpResponse::AuthRequired(_)
     ));
-    assert!(ResponseParser::is_auth_required(b"480 Auth required\r\n"));
-    assert!(!ResponseParser::is_auth_required(b"200 Ready\r\n"));
+    assert!(matches!(
+        NntpResponse::parse(b"480 Auth required\r\n"),
+        NntpResponse::AuthRequired(_)
+    ));
+    assert!(!matches!(
+        NntpResponse::parse(b"200 Ready\r\n"),
+        NntpResponse::AuthRequired(_)
+    ));
 
-    assert!(ResponseParser::is_auth_success(b"281 Auth accepted\r\n"));
-    assert!(!ResponseParser::is_auth_success(
-        b"381 Password required\r\n"
-    ));
+    assert_eq!(
+        NntpResponse::parse(b"281 Auth accepted\r\n"),
+        NntpResponse::AuthSuccess
+    );
+    assert_ne!(
+        NntpResponse::parse(b"381 Password required\r\n"),
+        NntpResponse::AuthSuccess
+    );
 }
 
 #[test]
 fn test_is_response_code() {
-    assert!(ResponseParser::is_response_code(
-        b"111 20251010120000\r\n",
-        111
-    ));
-    assert!(ResponseParser::is_response_code(b"200 Ready\r\n", 200));
-    assert!(ResponseParser::is_response_code(b"201 Read-only\r\n", 201));
-    assert!(ResponseParser::is_response_code(b"281 Auth OK\r\n", 281));
-    assert!(ResponseParser::is_response_code(
-        b"381 Password required\r\n",
-        381
-    ));
-    assert!(!ResponseParser::is_response_code(b"200 Ready\r\n", 201));
-    assert!(!ResponseParser::is_response_code(b"111 Date\r\n", 200));
+    assert_eq!(
+        StatusCode::parse(b"111 20251010120000\r\n").map(|c| c.as_u16()),
+        Some(111)
+    );
+    assert_eq!(
+        StatusCode::parse(b"200 Ready\r\n").map(|c| c.as_u16()),
+        Some(200)
+    );
+    assert_eq!(
+        StatusCode::parse(b"201 Read-only\r\n").map(|c| c.as_u16()),
+        Some(201)
+    );
+    assert_eq!(
+        StatusCode::parse(b"281 Auth OK\r\n").map(|c| c.as_u16()),
+        Some(281)
+    );
+    assert_eq!(
+        StatusCode::parse(b"381 Password required\r\n").map(|c| c.as_u16()),
+        Some(381)
+    );
+    assert_ne!(
+        StatusCode::parse(b"200 Ready\r\n").map(|c| c.as_u16()),
+        Some(201)
+    );
+    assert_ne!(
+        StatusCode::parse(b"111 Date\r\n").map(|c| c.as_u16()),
+        Some(200)
+    );
 }
 
 #[test]
 fn test_malformed_status_codes() {
     // Non-numeric status
-    assert_eq!(NntpResponse::parse_status_code(b"ABC Invalid\r\n"), None);
+    assert_eq!(StatusCode::parse(b"ABC Invalid\r\n"), None);
 
     // Missing status code
-    assert_eq!(NntpResponse::parse_status_code(b"Missing code\r\n"), None);
+    assert_eq!(StatusCode::parse(b"Missing code\r\n"), None);
 
     // Incomplete status code
-    assert_eq!(NntpResponse::parse_status_code(b"20"), None);
-    assert_eq!(NntpResponse::parse_status_code(b"2"), None);
+    assert_eq!(StatusCode::parse(b"20"), None);
+    assert_eq!(StatusCode::parse(b"2"), None);
 
     // Status code with invalid characters
-    assert_eq!(NntpResponse::parse_status_code(b"2X0 Error\r\n"), None);
+    assert_eq!(StatusCode::parse(b"2X0 Error\r\n"), None);
 
     // Negative status (shouldn't parse)
-    assert_eq!(NntpResponse::parse_status_code(b"-200 Invalid\r\n"), None);
+    assert_eq!(StatusCode::parse(b"-200 Invalid\r\n"), None);
 }
 
 #[test]
 fn test_incomplete_responses() {
     // Empty response
-    assert_eq!(NntpResponse::parse_status_code(b""), None);
+    assert_eq!(StatusCode::parse(b""), None);
 
     // Only newline
-    assert_eq!(NntpResponse::parse_status_code(b"\r\n"), None);
+    assert_eq!(StatusCode::parse(b"\r\n"), None);
 
     // Status without message
-    assert_eq!(
-        NntpResponse::parse_status_code(b"200"),
-        Some(StatusCode::new(200))
-    );
+    assert_eq!(StatusCode::parse(b"200"), Some(StatusCode::new(200)));
 
     // Status with just space
-    assert_eq!(
-        NntpResponse::parse_status_code(b"200 "),
-        Some(StatusCode::new(200))
-    );
+    assert_eq!(StatusCode::parse(b"200 "), Some(StatusCode::new(200)));
 }
 
 #[test]
 fn test_boundary_status_codes() {
     // Minimum valid code
     assert_eq!(
-        NntpResponse::parse_status_code(b"100 Info\r\n"),
+        StatusCode::parse(b"100 Info\r\n"),
         Some(StatusCode::new(100))
     );
 
     // Maximum valid code
     assert_eq!(
-        NntpResponse::parse_status_code(b"599 Error\r\n"),
+        StatusCode::parse(b"599 Error\r\n"),
         Some(StatusCode::new(599))
     );
 
     // Out of range codes (but still parse)
+    assert_eq!(StatusCode::parse(b"000 Zero\r\n"), Some(StatusCode::new(0)));
     assert_eq!(
-        NntpResponse::parse_status_code(b"000 Zero\r\n"),
-        Some(StatusCode::new(0))
-    );
-    assert_eq!(
-        NntpResponse::parse_status_code(b"999 Max\r\n"),
+        StatusCode::parse(b"999 Max\r\n"),
         Some(StatusCode::new(999))
     );
 
     // Four digit code (only first 3 parsed)
     assert_eq!(
-        NntpResponse::parse_status_code(b"1234 Invalid\r\n"),
+        StatusCode::parse(b"1234 Invalid\r\n"),
         Some(StatusCode::new(123))
     );
 }

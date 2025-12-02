@@ -17,7 +17,7 @@ use crate::config::RoutingMode;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::protocol::PROXY_GREETING_PCR;
 use crate::router::BackendSelector;
-use crate::types::{BytesTransferred, TransferMetrics};
+use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, PartialEq, Eq)]
@@ -92,8 +92,8 @@ impl ClientSession {
         let (client_read, mut client_write) = client_stream.split();
         let mut client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
 
-        let mut client_to_backend_bytes = BytesTransferred::zero();
-        let mut backend_to_client_bytes = BytesTransferred::zero();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
 
         // Auth state: username from AUTHINFO USER command
         let mut auth_username: Option<String> = None;
@@ -130,36 +130,33 @@ impl ClientSession {
                         self.username().as_deref(),
                         &e,
                         TransferMetrics {
-                            client_to_backend: client_to_backend_bytes.into(),
-                            backend_to_client: backend_to_client_bytes.into(),
+                            client_to_backend: client_to_backend_bytes,
+                            backend_to_client: backend_to_client_bytes,
                         },
                     );
                     break;
                 }
             };
 
-            client_to_backend_bytes.add(n);
+            client_to_backend_bytes = client_to_backend_bytes.add(n);
             let trimmed = command.trim();
 
             // Handle QUIT locally
             if let common::QuitStatus::Quit(bytes) =
                 common::handle_quit_command(&command, &mut client_write).await?
             {
-                backend_to_client_bytes += bytes;
+                backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
                 break;
             }
 
             let action = CommandHandler::classify(&command);
-            skip_auth_check = skip_auth_check
-                || self
-                    .authenticated
-                    .load(std::sync::atomic::Ordering::Acquire);
+            skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
             let decision = decide_command_routing(
                 action.clone(),
                 skip_auth_check,
                 self.auth_handler.is_enabled(),
-                self.routing_mode,
+                self.mode_state.routing_mode(),
                 &command,
             );
 
@@ -173,29 +170,32 @@ impl ClientSession {
                         ),
                     };
 
-                    backend_to_client_bytes += match common::handle_auth_command(
-                        &self.auth_handler,
-                        auth_action,
-                        &mut client_write,
-                        &mut auth_username,
-                        &self.authenticated,
-                    )
-                    .await?
-                    {
-                        common::AuthResult::Authenticated(bytes) => {
-                            common::on_authentication_success(
-                                self.client_addr,
-                                auth_username.clone(),
-                                &self.routing_mode,
-                                &self.metrics,
-                                self.connection_stats(),
-                                |username| self.set_username(username),
-                            );
-                            skip_auth_check = true;
-                            bytes
+                    backend_to_client_bytes = backend_to_client_bytes.add_u64(
+                        match common::handle_auth_command(
+                            &self.auth_handler,
+                            auth_action,
+                            &mut client_write,
+                            &mut auth_username,
+                            &self.auth_state,
+                        )
+                        .await?
+                        {
+                            common::AuthResult::Authenticated(bytes) => {
+                                common::on_authentication_success(
+                                    self.client_addr,
+                                    auth_username.clone(),
+                                    &self.mode_state.routing_mode(),
+                                    &self.metrics,
+                                    self.connection_stats(),
+                                    |username| self.set_username(username),
+                                );
+                                skip_auth_check = true;
+                                bytes
+                            }
+                            common::AuthResult::NotAuthenticated(bytes) => bytes,
                         }
-                        common::AuthResult::NotAuthenticated(bytes) => bytes,
-                    };
+                        .as_u64(),
+                    );
                 }
 
                 CommandRoutingDecision::Forward => {
@@ -212,7 +212,8 @@ impl ClientSession {
                 CommandRoutingDecision::RequireAuth => {
                     use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
                     client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
-                    backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
+                    backend_to_client_bytes =
+                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                 }
 
                 CommandRoutingDecision::SwitchToStateful => {
@@ -225,8 +226,8 @@ impl ClientSession {
                             client_reader,
                             client_write,
                             &command,
-                            client_to_backend_bytes.into(),
-                            backend_to_client_bytes.into(),
+                            client_to_backend_bytes,
+                            backend_to_client_bytes,
                         )
                         .await;
                 }
@@ -237,7 +238,7 @@ impl ClientSession {
                         _ => unreachable!("Reject decision must come from Reject action"),
                     };
                     client_write.write_all(response.as_bytes()).await?;
-                    backend_to_client_bytes.add(response.len());
+                    backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                 }
             }
         }
@@ -257,8 +258,8 @@ impl ClientSession {
         }
 
         Ok(TransferMetrics {
-            client_to_backend: client_to_backend_bytes.into(),
-            backend_to_client: backend_to_client_bytes.into(),
+            client_to_backend: client_to_backend_bytes,
+            backend_to_client: backend_to_client_bytes,
         })
     }
 
@@ -271,8 +272,8 @@ impl ClientSession {
         router: &BackendSelector,
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        client_to_backend_bytes: &mut BytesTransferred,
-        backend_to_client_bytes: &mut BytesTransferred,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+        backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<crate::types::BackendId> {
         // Check cache early - returns Some(backend_id) on cache hit, None otherwise
         if let Some(backend_id) = self
@@ -410,8 +411,8 @@ impl ClientSession {
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_id: crate::types::BackendId,
-        client_to_backend_bytes: &mut BytesTransferred,
-        backend_to_client_bytes: &mut BytesTransferred,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+        backend_to_client_bytes: &mut BackendToClientBytes,
         chunk_buffer: &mut PooledBuffer, // Reusable buffer from pool
     ) -> (
         Result<()>,
@@ -453,7 +454,7 @@ impl ClientSession {
             metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
         }
 
-        client_to_backend_bytes.add(command.len());
+        *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
         // Extract message-ID from command if present (for correlation with SABnzbd errors)
         let msgid = common::extract_message_id(command);
@@ -509,7 +510,7 @@ impl ClientSession {
             }
         };
 
-        backend_to_client_bytes.add(bytes_written as usize);
+        *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
 
         // Track metrics based on response code
         if let Some(ref metrics) = self.metrics
@@ -562,8 +563,8 @@ impl ClientSession {
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_id: crate::types::BackendId,
-        client_to_backend_bytes: &mut BytesTransferred,
-        backend_to_client_bytes: &mut BytesTransferred,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+        backend_to_client_bytes: &mut BackendToClientBytes,
         chunk_buffer: &mut PooledBuffer,
     ) -> (
         Result<()>,
@@ -605,7 +606,7 @@ impl ClientSession {
             metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
         }
 
-        client_to_backend_bytes.add(command.len());
+        *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
         // Buffer first chunk
         response_buffer.extend_from_slice(&chunk_buffer[..n]);
@@ -631,7 +632,7 @@ impl ClientSession {
                 response_buffer.extend_from_slice(chunk);
 
                 // Check for terminator
-                if crate::protocol::NntpResponse::has_terminator_at_end(chunk) {
+                if crate::session::streaming::tail_buffer::has_terminator_at_end(chunk) {
                     break;
                 }
             }
@@ -648,11 +649,12 @@ impl ClientSession {
             );
         }
 
-        backend_to_client_bytes.add(bytes_written as usize);
+        *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
 
         // Cache successful ARTICLE responses (2xx status codes)
         if let Some(ref cache) = self.cache
-            && let Some(message_id) = crate::protocol::NntpResponse::extract_message_id(command)
+            && let Some(message_id_str) = crate::session::common::extract_message_id(command)
+            && let Ok(message_id) = crate::types::MessageId::from_borrowed(message_id_str)
             && let Some(code) = response_code.status_code()
             && code.is_success()
         {
@@ -702,14 +704,19 @@ impl ClientSession {
         router: &BackendSelector,
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_to_client_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<Option<crate::types::BackendId>> {
         // Functional pipeline: cache → is ARTICLE → extract ID
         let Some((cache, message_id)) = self
             .cache
             .as_ref()
             .filter(|_| matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId))
-            .zip(crate::protocol::NntpResponse::extract_message_id(command))
+            .zip(crate::session::common::extract_message_id(command))
+            .and_then(|(cache, msg_id_str)| {
+                crate::types::MessageId::from_borrowed(msg_id_str)
+                    .ok()
+                    .map(|msg_id| (cache, msg_id))
+            })
         else {
             return Ok(None);
         };
@@ -734,7 +741,7 @@ impl ClientSession {
         router: &BackendSelector,
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_to_client_bytes: &mut BytesTransferred,
+        backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<Option<crate::types::BackendId>> {
         match cache.get(&message_id).await {
             Some(cached) => {
@@ -744,7 +751,7 @@ impl ClientSession {
                     cached.response.len()
                 );
                 client_write.write_all(&cached.response).await?;
-                backend_to_client_bytes.add(cached.response.len());
+                *backend_to_client_bytes = backend_to_client_bytes.add(cached.response.len());
 
                 let backend_id = router.route_command(self.client_id, command)?;
                 router.complete_command(backend_id);
@@ -1130,10 +1137,10 @@ mod tests {
         use std::time::Duration;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 
-        ClientSession::builder(addr, buffer_pool, auth_handler)
+        ClientSession::builder(addr.into(), buffer_pool, auth_handler)
             .with_cache(Arc::new(ArticleCache::new(100, Duration::from_secs(3600))))
             .build()
     }
@@ -1145,9 +1152,9 @@ mod tests {
         use std::sync::Arc;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 
-        ClientSession::builder(addr, buffer_pool, auth_handler).build()
+        ClientSession::builder(addr.into(), buffer_pool, auth_handler).build()
     }
 }

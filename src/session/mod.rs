@@ -5,6 +5,121 @@
 //! This module handles the lifecycle of a client connection, including
 //! command processing, authentication interception, and data transfer.
 //!
+//! # Quick Start
+//!
+//! ## Basic Stateful Session (1:1 mapping)
+//!
+//! ```no_run
+//! use std::net::SocketAddr;
+//! use std::sync::Arc;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let client_addr: SocketAddr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//!
+//! // Create a simple 1:1 session (no load balancing)
+//! let session = ClientSession::new(client_addr, buffer_pool, auth);
+//! assert_eq!(session.mode(), nntp_proxy::session::SessionMode::Stateful);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Per-Command Routing (Load Balancing)
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::router::BackendSelector;
+//! use nntp_proxy::config::RoutingMode;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let addr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let router = Arc::new(BackendSelector::new());
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//!
+//! // Each command routed to potentially different backend
+//! let session = ClientSession::builder(addr.into(), buffer_pool, auth)
+//!     .with_router(router)
+//!     .with_routing_mode(RoutingMode::PerCommand)
+//!     .build();
+//!
+//! assert!(session.is_per_command_routing());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Hybrid Mode (Best of Both Worlds)
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::router::BackendSelector;
+//! use nntp_proxy::config::RoutingMode;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let addr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let router = Arc::new(BackendSelector::new());
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//!
+//! // Starts in per-command mode, auto-switches to stateful when needed
+//! let session = ClientSession::builder(addr.into(), buffer_pool, auth)
+//!     .with_router(router)
+//!     .with_routing_mode(RoutingMode::Hybrid)
+//!     .build();
+//!
+//! // Initially per-command for load balancing
+//! assert_eq!(session.mode(), nntp_proxy::session::SessionMode::PerCommand);
+//! // Will switch to Stateful automatically on GROUP, NEXT, LAST, etc.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## With Metrics and Caching
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::router::BackendSelector;
+//! use nntp_proxy::config::RoutingMode;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//! use nntp_proxy::metrics::MetricsCollector;
+//! use nntp_proxy::cache::ArticleCache;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let addr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let router = Arc::new(BackendSelector::new());
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//! let metrics = MetricsCollector::new(2); // 2 backends
+//! let cache = Arc::new(ArticleCache::new(1000, Duration::from_secs(3600)));
+//!
+//! // Full-featured session with all bells and whistles
+//! let session = ClientSession::builder(addr.into(), buffer_pool, auth)
+//!     .with_router(router)
+//!     .with_routing_mode(RoutingMode::Hybrid)
+//!     .with_metrics(metrics)
+//!     .with_cache(cache)
+//!     .build();
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Architecture Overview
 //!
 //! ## Three Operating Modes
@@ -41,75 +156,47 @@
 //!   - Handles connection pool management
 //!   - Distinguishes backend errors from client disconnects
 
+pub mod auth_state;
 pub mod backend;
 pub(crate) mod common;
 pub mod connection;
 pub mod error_classification;
 pub mod handlers;
+pub mod metrics_ext;
+pub mod mode_state;
+pub mod routing;
 pub mod streaming;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
 
 use crate::auth::AuthHandler;
 use crate::config::RoutingMode;
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
-use crate::types::ClientId;
+use crate::types::{ClientAddress, ClientId};
 
-/// Session mode for hybrid routing
-///
-/// In hybrid mode, sessions can dynamically transition between per-command
-/// and stateful modes. This allows load balancing for stateless commands
-/// while supporting stateful commands by switching to dedicated connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionMode {
-    /// Per-command routing mode - each command can use a different backend
-    ///
-    /// Benefits:
-    /// - Load balancing across multiple backend servers
-    /// - Better resource utilization
-    /// - Fault tolerance (can route around failed backends)
-    ///
-    /// Limitations:
-    /// - Cannot support stateful commands (MODE READER, GROUP, etc.)
-    /// - Slightly higher latency (connection pool overhead)
-    PerCommand,
+pub use auth_state::AuthState;
+pub use metrics_ext::MetricsRecorder;
+pub use mode_state::{ModeState, SessionMode};
+pub use routing::RoutingDecision;
 
-    /// Stateful mode - using a dedicated backend connection
-    ///
-    /// Benefits:
-    /// - Lowest latency (no pool overhead)
-    /// - Supports stateful commands
-    /// - Simple 1:1 client-to-backend mapping
-    ///
-    /// Limitations:
-    /// - No load balancing (one backend per client)
-    /// - Less efficient resource usage
-    Stateful,
-}
+// SessionMode is now exported from mode_state module
 
 /// Represents an active client session
 pub struct ClientSession {
-    client_addr: SocketAddr,
+    client_addr: ClientAddress,
     buffer_pool: BufferPool,
     /// Unique identifier for this client
     client_id: ClientId,
     /// Optional router for per-command routing mode
     router: Option<Arc<BackendSelector>>,
-    /// Current session mode (for hybrid routing)
-    mode: SessionMode,
-    /// Routing mode configuration (Stateful, PerCommand, or Hybrid)
-    routing_mode: RoutingMode,
+    /// Session mode state (encapsulates mode and routing mode)
+    mode_state: ModeState,
     /// Authentication handler
     auth_handler: Arc<AuthHandler>,
-    /// Whether client has authenticated (starts false, set true after successful auth)
-    authenticated: AtomicBool,
-    /// Authenticated username (write-once, lock-free reads with cheap clones)
-    username: Arc<OnceLock<Arc<str>>>,
+    /// Authentication state (encapsulates auth status and username)
+    auth_state: AuthState,
     /// Metrics collector for session statistics
     metrics: Option<crate::metrics::MetricsCollector>,
 
@@ -141,18 +228,18 @@ pub struct ClientSession {
 /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 ///
 /// // Stateful 1:1 routing mode
-/// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone())
+/// let session = ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler.clone())
 ///     .build();
 ///
 /// // Per-command routing mode
 /// let router = Arc::new(BackendSelector::new());
-/// let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
+/// let session = ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler)
 ///     .with_router(router)
 ///     .with_routing_mode(RoutingMode::PerCommand)
 ///     .build();
 /// ```
 pub struct ClientSessionBuilder {
-    client_addr: SocketAddr,
+    client_addr: ClientAddress,
     buffer_pool: BufferPool,
     router: Option<Arc<BackendSelector>>,
     routing_mode: RoutingMode,
@@ -238,11 +325,9 @@ impl ClientSessionBuilder {
             buffer_pool: self.buffer_pool,
             client_id: ClientId::new(),
             router: self.router,
-            mode,
-            routing_mode,
+            mode_state: ModeState::new(mode, routing_mode),
             auth_handler: self.auth_handler,
-            authenticated: AtomicBool::new(false),
-            username: Arc::new(OnceLock::new()),
+            auth_state: AuthState::new(),
             metrics: self.metrics,
             connection_stats: self.connection_stats,
             cache: self.cache,
@@ -254,7 +339,7 @@ impl ClientSession {
     /// Create a new client session for 1:1 backend mapping
     #[must_use]
     pub fn new(
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
         buffer_pool: BufferPool,
         auth_handler: Arc<AuthHandler>,
     ) -> Self {
@@ -263,11 +348,9 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: None,
-            mode: SessionMode::Stateful, // 1:1 mode is always stateful
-            routing_mode: RoutingMode::Stateful,
+            mode_state: ModeState::new(SessionMode::Stateful, RoutingMode::Stateful),
             auth_handler,
-            authenticated: AtomicBool::new(false),
-            username: Arc::new(OnceLock::new()),
+            auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
             cache: None,
@@ -280,7 +363,7 @@ impl ClientSession {
     /// using round-robin load balancing.
     #[must_use]
     pub fn new_with_router(
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
         buffer_pool: BufferPool,
         router: Arc<BackendSelector>,
         routing_mode: RoutingMode,
@@ -291,11 +374,9 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: Some(router),
-            mode: SessionMode::PerCommand, // Starts in per-command mode
-            routing_mode,
+            mode_state: ModeState::new(SessionMode::PerCommand, routing_mode),
             auth_handler,
-            authenticated: AtomicBool::new(false),
-            username: Arc::new(OnceLock::new()),
+            auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
             cache: None,
@@ -318,12 +399,12 @@ impl ClientSession {
     /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
     /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
     ///
-    /// let session = ClientSession::builder(addr, buffer_pool, auth_handler)
+    /// let session = ClientSession::builder(addr.into(), buffer_pool, auth_handler)
     ///     .build();
     /// ```
     #[must_use]
     pub fn builder(
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
         buffer_pool: BufferPool,
         auth_handler: Arc<AuthHandler>,
     ) -> ClientSessionBuilder {
@@ -349,6 +430,10 @@ impl ClientSession {
     }
 
     /// Check if this session is using per-command routing
+    ///
+    /// Returns true if this session has a router available (regardless of current mode).
+    /// This is slightly different from checking routing mode - a session can have a router
+    /// but be in Stateful mode (e.g., after hybrid mode switches).
     #[must_use]
     #[inline]
     pub fn is_per_command_routing(&self) -> bool {
@@ -359,19 +444,25 @@ impl ClientSession {
     #[must_use]
     #[inline]
     pub fn mode(&self) -> SessionMode {
-        self.mode
+        self.mode_state.mode()
     }
 
-    /// Get the authenticated username (if any) - cheap clone via Arc
+    /// Get the authenticated username (if any) - zero-cost reference
+    ///\n    /// Returns the authenticated username as an Arc<str> for cheap cloning.
+    /// Returns None if the client has not authenticated yet.
+    #[inline]
     #[must_use]
     pub fn username(&self) -> Option<Arc<str>> {
-        self.username.get().map(Arc::clone)
+        self.auth_state.username()
     }
 
     /// Set the authenticated username (write-once)
+    ///
+    /// This marks the session as authenticated and stores the username.
+    /// Called after successful authentication with the backend.
     pub(crate) fn set_username(&self, username: Option<String>) {
         if let Some(name) = username {
-            let _ = self.username.set(name.into());
+            self.auth_state.mark_authenticated(name);
         }
     }
 
@@ -382,48 +473,112 @@ impl ClientSession {
         self.connection_stats.as_ref()
     }
 
-    // Metrics helper methods - encapsulate Option checks for cleaner handler code
+    // Metrics helper methods - delegate to MetricsRecorder trait
 
     #[inline]
     pub(crate) fn record_command(&self, backend_id: crate::types::BackendId) {
-        if let Some(ref m) = self.metrics {
-            m.record_command(backend_id);
-        }
+        self.metrics.record_command(backend_id);
     }
 
     #[inline]
     pub(crate) fn user_command(&self) {
-        if let Some(ref m) = self.metrics {
-            m.user_command(self.username().as_deref());
-        }
+        self.metrics.user_command(self.username().as_deref());
     }
 
     #[inline]
     pub(crate) fn stateful_session_started(&self) {
-        if let Some(ref m) = self.metrics {
-            m.stateful_session_started();
-        }
+        self.metrics.stateful_session_started();
     }
 
     #[inline]
     pub(crate) fn stateful_session_ended(&self) {
-        if let Some(ref m) = self.metrics {
-            m.stateful_session_ended();
-        }
+        self.metrics.stateful_session_ended();
     }
 
     #[inline]
     pub(crate) fn user_bytes_sent(&self, bytes: u64) {
-        if let Some(ref m) = self.metrics {
-            m.user_bytes_sent(self.username().as_deref(), bytes);
-        }
+        self.metrics
+            .user_bytes_sent(self.username().as_deref(), bytes);
     }
 
     #[inline]
     pub(crate) fn user_bytes_received(&self, bytes: u64) {
-        if let Some(ref m) = self.metrics {
-            m.user_bytes_received(self.username().as_deref(), bytes);
+        self.metrics
+            .user_bytes_received(self.username().as_deref(), bytes);
+    }
+
+    /// Flush incremental metrics for long-running sessions
+    ///
+    /// This should be called periodically (e.g., every 100 iterations) to report
+    /// byte transfer progress for the TUI without waiting until session end.
+    #[inline]
+    pub(crate) fn flush_incremental_metrics(
+        &self,
+        backend_id: crate::types::BackendId,
+        client_to_backend: crate::types::ClientToBackendBytes,
+        backend_to_client: crate::types::BackendToClientBytes,
+        last_reported_c2b: &mut crate::types::ClientToBackendBytes,
+        last_reported_b2c: &mut crate::types::BackendToClientBytes,
+    ) {
+        let delta_c2b = client_to_backend.saturating_sub(*last_reported_c2b);
+        let delta_b2c = backend_to_client.saturating_sub(*last_reported_b2c);
+
+        if delta_c2b.as_u64() > 0 {
+            self.metrics
+                .record_client_to_backend_bytes_for(backend_id, delta_c2b.as_u64());
+            self.user_bytes_sent(delta_c2b.as_u64());
         }
+        if delta_b2c.as_u64() > 0 {
+            self.metrics
+                .record_backend_to_client_bytes_for(backend_id, delta_b2c.as_u64());
+            self.user_bytes_received(delta_b2c.as_u64());
+        }
+
+        *last_reported_c2b = client_to_backend;
+        *last_reported_b2c = backend_to_client;
+    }
+
+    /// Check if already authenticated (cached for performance)
+    ///
+    /// # Arguments
+    /// * `skip_auth_check` - If true, bypasses the authentication check
+    ///
+    /// # Returns
+    /// Returns true if authenticated or if skip_auth_check is true
+    #[inline]
+    pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
+        self.auth_state.is_authenticated_or_skipped(skip_auth_check)
+    }
+
+    /// Report final session metrics before ending
+    #[inline]
+    pub(crate) fn report_final_metrics(
+        &self,
+        backend_id: crate::types::BackendId,
+        client_to_backend: impl Into<u64>,
+        backend_to_client: impl Into<u64>,
+        last_reported_c2b: u64,
+        last_reported_b2c: u64,
+    ) {
+        let current_c2b = client_to_backend.into();
+        let current_b2c = backend_to_client.into();
+
+        let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
+        let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
+
+        if delta_c2b > 0 {
+            self.metrics
+                .record_client_to_backend_bytes_for(backend_id, delta_c2b);
+            self.user_bytes_sent(delta_c2b);
+        }
+        if delta_b2c > 0 {
+            self.metrics
+                .record_backend_to_client_bytes_for(backend_id, delta_b2c);
+            self.user_bytes_received(delta_b2c);
+        }
+
+        self.metrics
+            .user_connection_closed(self.username().as_deref());
     }
 }
 
@@ -432,7 +587,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthHandler;
     use crate::types::BufferSize;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
     /// Helper to create a default AuthHandler for tests (no auth)
@@ -443,8 +598,8 @@ mod tests {
     #[test]
     fn test_client_session_creation() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool.clone(), test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool.clone(), test_auth_handler());
 
         assert_eq!(session.client_addr.port(), 8080);
         assert_eq!(
@@ -455,13 +610,13 @@ mod tests {
 
     #[test]
     fn test_client_session_with_different_ports() {
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
 
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let session1 = ClientSession::new(addr1, buffer_pool.clone(), test_auth_handler());
+        let session1 = ClientSession::new(addr1.into(), buffer_pool.clone(), test_auth_handler());
 
         let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090);
-        let session2 = ClientSession::new(addr2, buffer_pool.clone(), test_auth_handler());
+        let session2 = ClientSession::new(addr2.into(), buffer_pool.clone(), test_auth_handler());
 
         assert_ne!(session1.client_addr.port(), session2.client_addr.port());
         assert_eq!(session1.client_addr.port(), 8080);
@@ -470,9 +625,9 @@ mod tests {
 
     #[test]
     fn test_client_session_with_ipv6() {
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let addr = SocketAddr::new(IpAddr::V6("::1".parse().unwrap()), 8119);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         assert_eq!(session.client_addr.port(), 8119);
         assert!(session.client_addr.is_ipv6());
@@ -480,19 +635,19 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_cloning() {
-        let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
         let buffer_pool_clone = buffer_pool.clone();
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 1234);
-        let _session1 = ClientSession::new(addr, buffer_pool, test_auth_handler());
-        let _session2 = ClientSession::new(addr, buffer_pool_clone, test_auth_handler());
+        let _session1 = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
+        let _session2 = ClientSession::new(addr.into(), buffer_pool_clone, test_auth_handler());
     }
 
     #[test]
     fn test_session_addr_formatting() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5555);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         let addr_str = format!("{}", session.client_addr);
         assert!(addr_str.contains("10.0.0.1"));
@@ -501,11 +656,11 @@ mod tests {
 
     #[test]
     fn test_multiple_sessions_same_buffer_pool() {
-        let buffer_pool = BufferPool::new(BufferSize::new(4096).unwrap(), 8);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 8);
         let sessions: Vec<_> = (0..5)
             .map(|i| {
                 let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000 + i);
-                ClientSession::new(addr, buffer_pool.clone(), test_auth_handler())
+                ClientSession::new(addr.into(), buffer_pool.clone(), test_auth_handler())
             })
             .collect();
 
@@ -517,18 +672,18 @@ mod tests {
 
     #[test]
     fn test_loopback_address() {
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         assert!(session.client_addr.ip().is_loopback());
     }
 
     #[test]
     fn test_unspecified_address() {
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         assert!(session.client_addr.ip().is_unspecified());
         assert_eq!(session.client_addr.port(), 0);
@@ -537,8 +692,8 @@ mod tests {
     #[test]
     fn test_session_without_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         assert!(!session.is_per_command_routing());
         assert_eq!(session.client_addr.port(), 8080);
@@ -547,10 +702,10 @@ mod tests {
     #[test]
     fn test_session_with_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool,
             router,
             RoutingMode::PerCommand,
@@ -564,10 +719,10 @@ mod tests {
     #[test]
     fn test_client_id_uniqueness() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
 
-        let session1 = ClientSession::new(addr, buffer_pool.clone(), test_auth_handler());
-        let session2 = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let session1 = ClientSession::new(addr.into(), buffer_pool.clone(), test_auth_handler());
+        let session2 = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         assert_ne!(session1.client_id(), session2.client_id());
     }
@@ -587,11 +742,11 @@ mod tests {
     #[test]
     fn test_hybrid_session_creation() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool,
             router,
             RoutingMode::Hybrid,
@@ -599,80 +754,80 @@ mod tests {
         );
 
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
-        assert_eq!(session.mode, SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
     }
 
     #[test]
     fn test_routing_mode_configurations() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
         // Stateful mode
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool.clone(),
             router.clone(),
             RoutingMode::Stateful,
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
 
         // PerCommand mode
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool.clone(),
             router.clone(),
             RoutingMode::PerCommand,
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::PerCommand);
-        assert_eq!(session.mode, SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::PerCommand);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
 
         // Hybrid mode
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool,
             router,
             RoutingMode::Hybrid,
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
-        assert_eq!(session.mode, SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
     }
 
     #[test]
     fn test_hybrid_mode_initial_state() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool,
             router,
             RoutingMode::Hybrid,
             test_auth_handler(),
         );
 
-        assert_eq!(session.mode, SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
         assert!(session.is_per_command_routing());
     }
 
     #[test]
     fn test_is_per_command_routing_logic() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
         // Stateful mode has router capability
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool.clone(),
             router.clone(),
             RoutingMode::Stateful,
@@ -682,7 +837,7 @@ mod tests {
 
         // PerCommand mode
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool.clone(),
             router.clone(),
             RoutingMode::PerCommand,
@@ -692,7 +847,7 @@ mod tests {
 
         // Hybrid mode (initially)
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool.clone(),
             router,
             RoutingMode::Hybrid,
@@ -701,7 +856,7 @@ mod tests {
         assert!(session.is_per_command_routing());
 
         // Session without router
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
         assert!(!session.is_per_command_routing());
     }
 
@@ -710,94 +865,94 @@ mod tests {
     #[test]
     fn test_builder_basic_construction() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler = test_auth_handler();
 
-        let session = ClientSession::builder(addr, buffer_pool, auth_handler).build();
+        let session = ClientSession::builder(addr.into(), buffer_pool, auth_handler).build();
 
-        assert_eq!(session.client_addr, addr);
+        assert_eq!(*session.client_addr, addr);
         assert!(!session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::Stateful);
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
     }
 
     #[test]
     fn test_builder_with_router() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_router(router)
             .with_routing_mode(RoutingMode::PerCommand)
             .build();
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::PerCommand);
     }
 
     #[test]
     fn test_builder_with_hybrid_mode() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_router(router)
             .with_routing_mode(RoutingMode::Hybrid)
             .build();
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
     }
 
     #[test]
     fn test_builder_with_stateful_mode() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
         // Builder with router but Stateful mode requested
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_router(router)
             .with_routing_mode(RoutingMode::Stateful)
             .build();
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::Stateful);
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
     }
 
     #[test]
     fn test_builder_without_router_ignores_mode() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
 
         // Request PerCommand mode but no router - should default to Stateful
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_routing_mode(RoutingMode::PerCommand)
             .build();
 
         assert!(!session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::Stateful);
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
     }
 
     #[test]
     fn test_builder_with_auth_handler() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler =
             Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap());
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_auth_handler(auth_handler.clone())
             .build();
 
         // Verify auth_handler is set (can't test internals, but creation succeeds)
-        assert_eq!(session.client_addr, addr);
+        assert_eq!(*session.client_addr, addr);
     }
 
     #[test]
@@ -805,10 +960,10 @@ mod tests {
         use crate::metrics::MetricsCollector;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let metrics = MetricsCollector::new(1); // 1 backend
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_metrics(metrics)
             .build();
 
@@ -820,10 +975,10 @@ mod tests {
         use crate::metrics::ConnectionStatsAggregator;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let stats = ConnectionStatsAggregator::default();
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_connection_stats(stats)
             .build();
 
@@ -836,10 +991,10 @@ mod tests {
         use std::time::Duration;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600)));
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_cache(cache)
             .build();
 
@@ -851,12 +1006,12 @@ mod tests {
         use crate::metrics::MetricsCollector;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
         let metrics = MetricsCollector::new(1); // 1 backend
 
         // Chain all builder methods
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_router(router)
             .with_routing_mode(RoutingMode::Hybrid)
             .with_metrics(metrics)
@@ -864,7 +1019,7 @@ mod tests {
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
         assert!(session.metrics.is_some());
     }
 
@@ -873,12 +1028,12 @@ mod tests {
     #[test]
     fn test_mode_getter() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let router = Arc::new(BackendSelector::new());
 
         // Per-command mode
         let session = ClientSession::new_with_router(
-            addr,
+            addr.into(),
             buffer_pool.clone(),
             router.clone(),
             RoutingMode::PerCommand,
@@ -887,15 +1042,15 @@ mod tests {
         assert_eq!(session.mode(), SessionMode::PerCommand);
 
         // Stateful mode (no router)
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
         assert_eq!(session.mode(), SessionMode::Stateful);
     }
 
     #[test]
     fn test_username_initially_none() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         assert!(session.username().is_none());
     }
@@ -903,8 +1058,8 @@ mod tests {
     #[test]
     fn test_set_username_and_get() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         session.set_username(Some("testuser".to_string()));
 
@@ -916,8 +1071,8 @@ mod tests {
     #[test]
     fn test_set_username_none() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         session.set_username(None);
 
@@ -927,8 +1082,8 @@ mod tests {
     #[test]
     fn test_username_cheap_clone() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         session.set_username(Some("testuser".to_string()));
 
@@ -938,19 +1093,14 @@ mod tests {
         assert!(username1.is_some());
         assert!(username2.is_some());
         assert_eq!(username1, username2);
-
-        // Arc pointers should be equal (cheap clone)
-        assert!(Arc::ptr_eq(
-            username1.as_ref().unwrap(),
-            username2.as_ref().unwrap()
-        ));
+        assert_eq!(username1.as_deref(), Some("testuser"));
     }
 
     #[test]
     fn test_connection_stats_none_by_default() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         assert!(session.connection_stats().is_none());
     }
@@ -960,10 +1110,10 @@ mod tests {
         use crate::metrics::ConnectionStatsAggregator;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let stats = ConnectionStatsAggregator::default();
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_connection_stats(stats)
             .build();
 
@@ -977,8 +1127,8 @@ mod tests {
         use crate::types::BackendId;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
-        let session = ClientSession::new(addr, buffer_pool, test_auth_handler());
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
         // Should not panic when metrics is None
         session.record_command(BackendId::from_index(0));
@@ -995,10 +1145,10 @@ mod tests {
         use crate::types::BackendId;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let metrics = MetricsCollector::new(1); // 1 backend
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_metrics(metrics.clone())
             .build();
 
@@ -1024,10 +1174,10 @@ mod tests {
         use crate::types::BackendId;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let metrics = MetricsCollector::new(1); // 1 backend
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_metrics(metrics.clone())
             .build();
 
@@ -1043,10 +1193,10 @@ mod tests {
         use crate::metrics::MetricsCollector;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let metrics = MetricsCollector::new(1); // 1 backend
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_metrics(metrics.clone())
             .build();
 
@@ -1071,10 +1221,10 @@ mod tests {
         use crate::metrics::MetricsCollector;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = BufferPool::new(BufferSize::new(1024).unwrap(), 4);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let metrics = MetricsCollector::new(1); // 1 backend
 
-        let session = ClientSession::builder(addr, buffer_pool, test_auth_handler())
+        let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_metrics(metrics.clone())
             .build();
 

@@ -1,59 +1,74 @@
 //! Connection and error limit configuration types
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use nutype::nutype;
+use std::num::NonZeroUsize;
 
-nonzero_newtype! {
-    /// A non-zero maximum connections limit
-    ///
-    /// Ensures connection pools always have at least 1 connection allowed.
-    ///
-    /// # Examples
-    /// ```
-    /// use nntp_proxy::types::MaxConnections;
-    ///
-    /// let max = MaxConnections::new(10).unwrap();
-    /// assert_eq!(max.get(), 10);
-    ///
-    /// // Zero connections is invalid
-    /// assert!(MaxConnections::new(0).is_none());
-    /// ```
-    #[doc(alias = "pool_size")]
-    #[doc(alias = "connection_limit")]
-    pub struct MaxConnections(NonZeroUsize: usize, serialize as serialize_u64);
-}
+/// A non-zero maximum connections limit
+///
+/// Ensures connection pools always have at least 1 connection allowed.
+#[nutype(
+    validate(greater = 0),
+    derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        TryFrom,
+        AsRef,
+        Deref,
+        Serialize,
+        Deserialize
+    )
+)]
+#[doc(alias = "pool_size")]
+#[doc(alias = "connection_limit")]
+pub struct MaxConnections(usize);
 
 impl MaxConnections {
     /// Default maximum connections per backend
-    pub const DEFAULT: Self = Self(NonZeroUsize::new(10).unwrap());
+    pub const DEFAULT: usize = 10;
+
+    /// Get the inner value
+    #[inline]
+    pub fn get(&self) -> usize {
+        self.into_inner()
+    }
 }
 
-nonzero_newtype! {
-    /// A non-zero maximum errors threshold.
-    ///
-    /// Used to specify the maximum number of errors allowed before taking action.
-    ///
-    /// This type is used in two primary contexts:
-    /// - **Health check error thresholds:** Ensures that health checks require at least one error before marking a service as unhealthy.
-    /// - **Retry logic:** Specifies the maximum number of retry attempts after errors.
-    ///
-    /// By enforcing a non-zero value, this type ensures that both health check and retry thresholds are always meaningful (at least 1 error required).
-    ///
-    /// # Examples
-    /// ```
-    /// use nntp_proxy::types::MaxErrors;
-    ///
-    /// let max = MaxErrors::new(3).unwrap();
-    /// assert_eq!(max.get(), 3);
-    ///
-    /// // Zero errors is invalid
-    /// assert!(MaxErrors::new(0).is_none());
-    /// ```
-    pub struct MaxErrors(NonZeroU32: u32, serialize as serialize_u32);
-}
+/// A non-zero maximum errors threshold
+///
+/// Used to specify the maximum number of errors allowed before taking action.
+#[nutype(
+    validate(greater = 0),
+    derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        TryFrom,
+        AsRef,
+        Deref,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct MaxErrors(u32);
 
 impl MaxErrors {
     /// Default maximum errors threshold
-    pub const DEFAULT: Self = Self(NonZeroU32::new(3).unwrap());
+    pub const DEFAULT: u32 = 3;
+
+    /// Get the inner value
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.into_inner()
+    }
 }
 
 /// A non-zero thread count
@@ -181,21 +196,21 @@ mod tests {
         /// Property: Any non-zero usize round-trips through MaxConnections
         #[test]
         fn prop_max_connections_valid_range(value in 1usize..=10000) {
-            let max = MaxConnections::new(value).unwrap();
+            let max = MaxConnections::try_new(value).unwrap();
             prop_assert_eq!(max.get(), value);
         }
 
         /// Property: Display shows exact value
         #[test]
         fn prop_max_connections_display(value in 1usize..=10000) {
-            let max = MaxConnections::new(value).unwrap();
+            let max = MaxConnections::try_new(value).unwrap();
             prop_assert_eq!(max.to_string(), value.to_string());
         }
 
         /// Property: JSON serialization round-trips correctly
         #[test]
         fn prop_max_connections_serde_json(value in 1usize..=10000) {
-            let max = MaxConnections::new(value).unwrap();
+            let max = MaxConnections::try_new(value).unwrap();
             let json = serde_json::to_string(&max).unwrap();
             let parsed: MaxConnections = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(parsed.get(), value);
@@ -204,8 +219,8 @@ mod tests {
         /// Property: Clone creates identical copy
         #[test]
         fn prop_max_connections_clone(value in 1usize..=10000) {
-            let max = MaxConnections::new(value).unwrap();
-            let cloned = max.clone();
+            let max = MaxConnections::try_new(value).unwrap();
+            let cloned = max;
             prop_assert_eq!(max, cloned);
         }
     }
@@ -213,12 +228,12 @@ mod tests {
     // Edge Cases - MaxConnections
     #[test]
     fn test_max_connections_zero_rejected() {
-        assert!(MaxConnections::new(0).is_none());
+        assert!(MaxConnections::try_new(0).is_err());
     }
 
     #[test]
     fn test_max_connections_default() {
-        assert_eq!(MaxConnections::DEFAULT.get(), 10);
+        assert_eq!(MaxConnections::DEFAULT, 10);
     }
 
     #[test]
@@ -234,21 +249,21 @@ mod tests {
         /// Property: Any non-zero u32 round-trips through MaxErrors
         #[test]
         fn prop_max_errors_valid_range(value in 1u32..=1000) {
-            let max = MaxErrors::new(value).unwrap();
+            let max = MaxErrors::try_new(value).unwrap();
             prop_assert_eq!(max.get(), value);
         }
 
         /// Property: Display shows exact value
         #[test]
         fn prop_max_errors_display(value in 1u32..=1000) {
-            let max = MaxErrors::new(value).unwrap();
+            let max = MaxErrors::try_new(value).unwrap();
             prop_assert_eq!(max.to_string(), value.to_string());
         }
 
         /// Property: JSON serialization round-trips correctly
         #[test]
         fn prop_max_errors_serde_json(value in 1u32..=1000) {
-            let max = MaxErrors::new(value).unwrap();
+            let max = MaxErrors::try_new(value).unwrap();
             let json = serde_json::to_string(&max).unwrap();
             let parsed: MaxErrors = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(parsed.get(), value);
@@ -257,8 +272,8 @@ mod tests {
         /// Property: Clone creates identical copy
         #[test]
         fn prop_max_errors_clone(value in 1u32..=1000) {
-            let max = MaxErrors::new(value).unwrap();
-            let cloned = max.clone();
+            let max = MaxErrors::try_new(value).unwrap();
+            let cloned = max;
             prop_assert_eq!(max, cloned);
         }
     }
@@ -266,12 +281,12 @@ mod tests {
     // Edge Cases - MaxErrors
     #[test]
     fn test_max_errors_zero_rejected() {
-        assert!(MaxErrors::new(0).is_none());
+        assert!(MaxErrors::try_new(0).is_err());
     }
 
     #[test]
     fn test_max_errors_default() {
-        assert_eq!(MaxErrors::DEFAULT.get(), 3);
+        assert_eq!(MaxErrors::DEFAULT, 3);
     }
 
     #[test]
@@ -334,7 +349,7 @@ mod tests {
         #[test]
         fn prop_thread_count_clone(value in 1usize..=128) {
             let threads = ThreadCount::new(value).unwrap();
-            let cloned = threads.clone();
+            let cloned = threads;
             prop_assert_eq!(threads, cloned);
         }
     }

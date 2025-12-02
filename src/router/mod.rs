@@ -22,7 +22,7 @@
 //! # );
 //! selector.add_backend(
 //!     BackendId::from_index(0),
-//!     ServerName::new("server1".to_string()).unwrap(),
+//!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
 //! );
 //!
@@ -34,13 +34,24 @@
 //! selector.complete_command(backend_id);
 //! ```
 
+mod strategies;
+
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info};
 
+use crate::config::BackendSelectionStrategy;
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
+use strategies::{LeastLoaded, WeightedRoundRobin};
+
+/// Selection strategy enum that holds either strategy type
+#[derive(Debug)]
+enum SelectionStrategy {
+    WeightedRoundRobin(WeightedRoundRobin),
+    LeastLoaded(LeastLoaded),
+}
 
 /// Backend connection information
 #[derive(Debug, Clone)]
@@ -57,7 +68,7 @@ struct BackendInfo {
     stateful_count: Arc<AtomicUsize>,
 }
 
-/// Selects backend servers using round-robin with load tracking
+/// Selects backend servers using weighted round-robin with load tracking
 ///
 /// # Thread Safety
 ///
@@ -67,9 +78,10 @@ struct BackendInfo {
 ///
 /// # Load Balancing
 ///
-/// - **Strategy**: Round-robin rotation through available backends
+/// - **Strategy**: Weighted round-robin based on max_connections
 /// - **Tracking**: Atomic counters track pending commands per backend
 /// - **Monitoring**: Load statistics available via `backend_load()`
+/// - **Fairness**: Backends with larger pools receive proportionally more requests
 ///
 /// # Examples
 ///
@@ -84,7 +96,7 @@ struct BackendInfo {
 /// # );
 /// selector.add_backend(
 ///     BackendId::from_index(0),
-///     ServerName::new("backend-1".to_string()).unwrap(),
+///     ServerName::try_new("backend-1".to_string()).unwrap(),
 ///     provider,
 /// );
 ///
@@ -96,8 +108,8 @@ struct BackendInfo {
 pub struct BackendSelector {
     /// Backend connection providers
     backends: Vec<BackendInfo>,
-    /// Current backend index for round-robin selection
-    current_backend: AtomicUsize,
+    /// Selection strategy (weighted round-robin or least-loaded)
+    strategy: SelectionStrategy,
 }
 
 impl Default for BackendSelector {
@@ -107,13 +119,28 @@ impl Default for BackendSelector {
 }
 
 impl BackendSelector {
-    /// Create a new backend selector
+    /// Create a new backend selector with weighted round-robin strategy (default)
     #[must_use]
     pub fn new() -> Self {
+        Self::with_strategy(BackendSelectionStrategy::WeightedRoundRobin)
+    }
+
+    /// Create a new backend selector with specified strategy
+    #[must_use]
+    pub fn with_strategy(strategy: BackendSelectionStrategy) -> Self {
+        let selection_strategy = match strategy {
+            BackendSelectionStrategy::WeightedRoundRobin => {
+                SelectionStrategy::WeightedRoundRobin(WeightedRoundRobin::new(0))
+            }
+            BackendSelectionStrategy::LeastLoaded => {
+                SelectionStrategy::LeastLoaded(LeastLoaded::new())
+            }
+        };
+
         Self {
             // Pre-allocate for typical number of backend servers (most setups have 2-8)
             backends: Vec::with_capacity(4),
-            current_backend: AtomicUsize::new(0),
+            strategy: selection_strategy,
         }
     }
 
@@ -124,7 +151,35 @@ impl BackendSelector {
         name: ServerName,
         provider: DeadpoolConnectionProvider,
     ) {
-        info!("Added backend {:?} ({})", backend_id, name);
+        let max_connections = provider.max_size();
+
+        // Update strategy-specific state
+        match &mut self.strategy {
+            SelectionStrategy::WeightedRoundRobin(wrr) => {
+                let old_weight = wrr.total_weight();
+                let new_weight = old_weight + max_connections;
+                wrr.set_total_weight(new_weight);
+
+                // Calculate this backend's share of traffic
+                let traffic_share = if new_weight > 0 {
+                    (max_connections as f64 / new_weight as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                info!(
+                    "Added backend {:?} ({}) with {} connections - will receive {:.1}% of traffic (total weight: {} -> {}) [weighted round-robin]",
+                    backend_id, name, max_connections, traffic_share, old_weight, new_weight
+                );
+            }
+            SelectionStrategy::LeastLoaded(_) => {
+                info!(
+                    "Added backend {:?} ({}) with {} connections [least-loaded strategy]",
+                    backend_id, name, max_connections
+                );
+            }
+        }
+
         self.backends.push(BackendInfo {
             id: backend_id,
             name,
@@ -134,14 +189,55 @@ impl BackendSelector {
         });
     }
 
-    /// Select the next backend using round-robin strategy
+    /// Select the next backend using the configured strategy
+    ///
+    /// - **Weighted round-robin**: Distributes proportionally to max_connections
+    /// - **Least-loaded**: Routes to backend with fewest pending requests
     fn select_backend(&self) -> Option<&BackendInfo> {
         if self.backends.is_empty() {
             return None;
         }
 
-        let index = self.current_backend.fetch_add(1, Ordering::Relaxed) % self.backends.len();
-        Some(&self.backends[index])
+        match &self.strategy {
+            SelectionStrategy::WeightedRoundRobin(wrr) => {
+                let weighted_position = wrr.select()?;
+
+                // Find which backend owns this weighted position
+                let mut cumulative = 0;
+                for backend in &self.backends {
+                    cumulative += backend.provider.max_size();
+                    if weighted_position < cumulative {
+                        return Some(backend);
+                    }
+                }
+
+                // Should never reach here if total_weight is correct
+                debug_assert!(false, "Weighted position out of bounds");
+                Some(&self.backends[0])
+            }
+            SelectionStrategy::LeastLoaded(_) => {
+                // Find backend with lowest load_ratio = pending / max_connections
+                let mut best_backend = &self.backends[0];
+                let mut best_ratio = f64::MAX;
+
+                for backend in &self.backends {
+                    let max_conns = backend.provider.max_size() as f64;
+                    let pending = backend.pending_count.load(Ordering::Relaxed) as f64;
+                    let ratio = if max_conns > 0.0 {
+                        pending / max_conns
+                    } else {
+                        f64::MAX
+                    };
+
+                    if ratio < best_ratio {
+                        best_ratio = ratio;
+                        best_backend = backend;
+                    }
+                }
+
+                Some(best_backend)
+            }
+        }
     }
 
     /// Select a backend for the given command using round-robin
@@ -186,6 +282,20 @@ impl BackendSelector {
     #[inline]
     pub fn backend_count(&self) -> usize {
         self.backends.len()
+    }
+
+    /// Get total weight (sum of all max_connections)
+    /// Only applicable for weighted round-robin strategy
+    #[must_use]
+    #[inline]
+    pub fn total_weight(&self) -> usize {
+        match &self.strategy {
+            SelectionStrategy::WeightedRoundRobin(wrr) => wrr.total_weight(),
+            SelectionStrategy::LeastLoaded(_) => {
+                // For least-loaded, return sum of all max_connections for compatibility
+                self.backends.iter().map(|b| b.provider.max_size()).sum()
+            }
+        }
     }
 
     /// Get backend load (pending requests) for monitoring
@@ -289,6 +399,3 @@ impl BackendSelector {
             .map(|b| b.stateful_count.load(Ordering::Relaxed))
     }
 }
-
-#[cfg(test)]
-mod tests;

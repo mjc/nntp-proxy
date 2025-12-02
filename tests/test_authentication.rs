@@ -293,7 +293,7 @@ async fn test_session_with_auth_handler() {
     let auth_handler = create_test_auth_handler_with("testuser", "testpass");
 
     let addr = create_test_addr();
-    let _session = ClientSession::new(addr, buffer_pool, auth_handler);
+    let _session = ClientSession::new(addr.into(), buffer_pool, auth_handler);
 
     // Session should be created successfully with auth handler
 }
@@ -309,7 +309,7 @@ async fn test_session_with_disabled_auth() {
     let auth_handler = create_test_auth_handler_disabled();
 
     let addr = create_test_addr();
-    let _session = ClientSession::new(addr, buffer_pool, auth_handler.clone());
+    let _session = ClientSession::new(addr.into(), buffer_pool, auth_handler.clone());
 
     assert!(!auth_handler.is_enabled());
 }
@@ -422,7 +422,8 @@ async fn test_session_builder_with_auth_handler() {
     let auth_handler = create_test_auth_handler();
     let addr = create_test_addr();
 
-    let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler.clone()).build();
+    let session =
+        ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler.clone()).build();
 
     assert!(!session.is_per_command_routing());
 }
@@ -438,7 +439,7 @@ async fn test_session_builder_with_router_and_auth() {
     let router = create_test_router();
     let addr = create_test_addr();
 
-    let session = ClientSession::builder(addr, buffer_pool.clone(), auth_handler)
+    let session = ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler)
         .with_router(router)
         .with_routing_mode(RoutingMode::PerCommand)
         .build();

@@ -70,9 +70,10 @@ fn validate_server(server: &Server) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Port;
 
     fn create_test_server(name: &str, keepalive: Option<Duration>) -> Server {
-        let mut builder = Server::builder("localhost", 119).name(name);
+        let mut builder = Server::builder("localhost", Port::try_new(119).unwrap()).name(name);
 
         if let Some(ka) = keepalive {
             builder = builder.connection_keepalive(ka);

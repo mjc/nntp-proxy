@@ -46,8 +46,8 @@ impl AuthHandler {
 
         if let (Some(u), Some(p)) = (username, password) {
             // Both provided - validate they're non-empty
-            let username = Username::new(u.clone())?; // Returns Err if empty
-            let password = Password::new(p.clone())?; // Returns Err if empty
+            let username = Username::try_new(u.clone())?; // Returns Err if empty
+            let password = Password::try_new(p.clone())?; // Returns Err if empty
             users.insert(username.as_str().to_string(), password.as_str().to_string());
         }
 
@@ -63,8 +63,8 @@ impl AuthHandler {
 
         for (u, p) in user_list {
             // Validate each credential pair
-            let username = Username::new(u.clone())?;
-            let password = Password::new(p.clone())?;
+            let username = Username::try_new(u.clone())?;
+            let password = Password::try_new(p.clone())?;
             users.insert(username.as_str().to_string(), password.as_str().to_string());
         }
 

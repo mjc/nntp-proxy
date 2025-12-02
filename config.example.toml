@@ -10,6 +10,9 @@ host = "0.0.0.0"
 # Port to listen on (default: 8119)
 # Can be overridden with --port or NNTP_PROXY_PORT
 port = 8119
+# Validate yEnc structure and checksums (default: true)
+# Disable for better performance if you trust your backends
+validate_yenc = true
 
 # Client Authentication Configuration
 # Two formats supported:

@@ -750,6 +750,66 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
 
 ## Testing Guidelines
 
+### Test Organization Rules
+
+**CRITICAL: Where to put tests**
+
+1. **Unit tests** - In the same file as the code being tested, inside `#[cfg(test)] mod tests { ... }`
+   - Tests for a specific function/struct/module
+   - No external dependencies or I/O
+   - Fast, isolated, pure logic testing
+   - Example: `src/protocol/response.rs` has `#[cfg(test)] mod tests` at the bottom
+
+2. **Integration tests** - In `tests/*.rs` directory at repository root
+   - Tests that involve multiple modules
+   - Tests with I/O, networking, file system
+   - Tests requiring mock servers or external resources
+   - Example: `tests/integration_tests.rs`, `tests/test_auth_backend.rs`
+
+3. **❌ NEVER create test submodules in `src/`**
+   - DO NOT create `src/foo/tests/` directories
+   - DO NOT create `src/foo/tests/mod.rs` or `src/foo/tests/test_*.rs` files
+   - Unit tests belong inline in the module file itself
+
+**Examples:**
+
+```rust
+// ✅ CORRECT - Unit tests in same file
+// src/protocol/response.rs
+pub struct StatusCode(u16);
+
+impl StatusCode {
+    pub fn parse(data: &[u8]) -> Option<Self> { ... }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_valid_code() {
+        assert_eq!(StatusCode::parse(b"200"), Some(StatusCode(200)));
+    }
+}
+```
+
+```rust
+// ✅ CORRECT - Integration tests in tests/ directory
+// tests/test_proxy_routing.rs
+use nntp_proxy::*;
+
+#[tokio::test]
+async fn test_end_to_end_routing() {
+    // Multi-module integration test
+}
+```
+
+```rust
+// ❌ WRONG - Don't create test subdirectories in src/
+// src/protocol/response/tests/mod.rs  ← NEVER DO THIS
+// src/protocol/response/tests/parsing.rs  ← NEVER DO THIS
+```
+
 ### Test Structure
 
 The codebase uses a mix of unit tests (in module files) and integration tests (in `tests/` directory).
@@ -797,7 +857,7 @@ async fn test_proxy_routing() -> Result<()> {
     let mut client = TcpStream::connect("127.0.0.1:8119").await?;
     // ... assertions
     
-    Ok(())
+    Ok(()))
 }
 ```
 
@@ -1031,29 +1091,25 @@ pub async fn create_smart_mock_server(port: u16, name: &str) -> JoinHandle<()> {
 ### Running Tests
 
 ```bash
-# Run all tests (slower, serial execution per test file)
-cargo test
-
-# Run with nextest for 7x faster parallel execution
+# Run all tests with nextest (REQUIRED - 7x faster with parallel execution)
 cargo nextest run
 
 # Run with output
-cargo test -- --nocapture
 cargo nextest run --no-capture
 
 # Run specific test
-cargo test test_hybrid_mode
 cargo nextest run -E 'test(hybrid_mode)'
 
 # Run integration tests only
-cargo test --test integration_tests
 cargo nextest run --test integration_tests
 
 # Run with coverage (requires cargo-llvm-cov)
 cargo llvm-cov --html
 ```
 
-**Performance Note:** Use `cargo nextest run` for development - it's ~7x faster than `cargo test` due to parallel execution. All tests use random ports to avoid conflicts during parallel runs.
+**IMPORTANT:** Always use `cargo nextest run` for this project - it's ~7x faster than `cargo test` due to parallel execution. All tests use random ports to avoid conflicts during parallel runs.
+
+**DO NOT use `cargo test`** - it's significantly slower and should be avoided. Use `cargo nextest run` instead.
 
 ### Benchmarking
 
@@ -1437,6 +1493,8 @@ sudo systemctl status nntp-proxy
 **Rationale:** We're building toward 1.0, not maintaining a stable API. Clean, focused code is more important than backwards compatibility. Once we hit 1.0, we'll adopt proper deprecation practices.
 
 **Note:** This project has Git pre-commit hooks that automatically run `cargo fmt` and `cargo clippy --all-targets --all-features`. If clippy finds issues or formatting is incorrect, the commit will be rejected. Fix all issues before committing.
+
+**Checking compilation:** Use `cargo check` for fast compilation checking without generating binaries. Use `cargo build` only when you need the actual binary.
 
 ### NixOS Development Environment
 

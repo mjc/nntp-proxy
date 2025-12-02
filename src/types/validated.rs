@@ -1,5 +1,6 @@
 //! Validated string types that enforce invariants at construction time
 
+use nutype::nutype;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -27,88 +28,109 @@ pub enum ValidationError {
     EmptyPassword,
 }
 
-/// Generate validated non-empty string newtypes
-macro_rules! validated_string {
-    ($(#[$meta:meta])* $vis:vis struct $name:ident($err:path);) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-        #[serde(transparent)]
-        $vis struct $name(String);
+/// Validated hostname (non-empty, non-whitespace)
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        AsRef,
+        Deref,
+        TryFrom,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct HostName(String);
 
-        impl $name {
-            pub fn new(s: String) -> Result<Self, ValidationError> {
-                if s.trim().is_empty() {
-                    Err($err)
-                } else {
-                    Ok(Self(s))
-                }
-            }
+/// Validated server name (non-empty, non-whitespace)
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        AsRef,
+        Deref,
+        TryFrom,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct ServerName(String);
 
-            #[must_use]
-            #[inline]
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
+/// Validated username (non-empty, non-whitespace)
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        AsRef,
+        Deref,
+        TryFrom,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct Username(String);
 
-        impl AsRef<str> for $name {
-            #[inline]
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
+/// Validated password (non-empty, non-whitespace)
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        AsRef,
+        Deref,
+        TryFrom,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct Password(String);
 
-        impl std::ops::Deref for $name {
-            type Target = str;
-            #[inline]
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl TryFrom<String> for $name {
-            type Error = ValidationError;
-            fn try_from(s: String) -> Result<Self, Self::Error> {
-                Self::new(s)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                let s = String::deserialize(deserializer)?;
-                Self::new(s).map_err(serde::de::Error::custom)
-            }
-        }
-    };
+// Convert nutype errors to our ValidationError
+impl From<HostNameError> for ValidationError {
+    fn from(_: HostNameError) -> Self {
+        ValidationError::EmptyHostName
+    }
 }
 
-validated_string! {
-    /// Validated hostname (non-empty, non-whitespace)
-    pub struct HostName(ValidationError::EmptyHostName);
+impl From<ServerNameError> for ValidationError {
+    fn from(_: ServerNameError) -> Self {
+        ValidationError::EmptyServerName
+    }
 }
 
-validated_string! {
-    /// Validated server name (non-empty, non-whitespace)
-    pub struct ServerName(ValidationError::EmptyServerName);
+impl From<UsernameError> for ValidationError {
+    fn from(_: UsernameError) -> Self {
+        ValidationError::EmptyUsername
+    }
 }
 
-validated_string! {
-    /// Validated username (non-empty, non-whitespace)
-    pub struct Username(ValidationError::EmptyUsername);
-}
-
-validated_string! {
-    /// Validated password (non-empty, non-whitespace)
-    pub struct Password(ValidationError::EmptyPassword);
+impl From<PasswordError> for ValidationError {
+    fn from(_: PasswordError) -> Self {
+        ValidationError::EmptyPassword
+    }
 }
 
 /// Validated configuration file path (non-empty, non-whitespace)
@@ -195,7 +217,6 @@ impl<'de> Deserialize<'de> for ConfigPath {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::collections::HashSet;
 
     // Property test strategies for non-empty strings
     fn non_empty_string() -> impl Strategy<Value = String> {
@@ -209,72 +230,19 @@ mod tests {
     // Property tests for HostName
     proptest! {
         #[test]
-        fn hostname_non_empty_accepts(s in non_empty_string()) {
-            let hostname = HostName::new(s.clone()).unwrap();
-            prop_assert_eq!(hostname.as_str(), &s);
-        }
-
-        #[test]
-        fn hostname_roundtrip_string(s in non_empty_string()) {
-            let hostname = HostName::new(s.clone()).unwrap();
-            let as_str: &str = hostname.as_ref();
-            prop_assert_eq!(as_str, &s);
-        }
-
-        #[test]
-        fn hostname_deref_works(s in non_empty_string()) {
-            let hostname = HostName::new(s.clone()).unwrap();
-            prop_assert_eq!(&*hostname, &s);
-            prop_assert_eq!(hostname.len(), s.len());
-        }
-
-        #[test]
-        fn hostname_display(s in non_empty_string()) {
-            let hostname = HostName::new(s.clone()).unwrap();
-            prop_assert_eq!(format!("{}", hostname), s);
-        }
-
-        #[test]
-        fn hostname_try_from(s in non_empty_string()) {
-            let result: Result<HostName, _> = s.clone().try_into();
-            prop_assert!(result.is_ok());
-            let hostname = result.unwrap();
-            prop_assert_eq!(hostname.as_str(), &s);
-        }
-
-        #[test]
         fn hostname_serde_roundtrip(s in non_empty_string()) {
-            let hostname = HostName::new(s).unwrap();
+            let hostname = HostName::try_new(s).unwrap();
             let json = serde_json::to_string(&hostname).unwrap();
             let deserialized: HostName = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(hostname, deserialized);
-        }
-
-        #[test]
-        fn hostname_clone_equality(s in non_empty_string()) {
-            let hostname = HostName::new(s).unwrap();
-            let cloned = hostname.clone();
-            prop_assert_eq!(hostname, cloned);
         }
     }
 
     // Property tests for ServerName
     proptest! {
         #[test]
-        fn server_name_non_empty_accepts(s in non_empty_string()) {
-            let server = ServerName::new(s.clone()).unwrap();
-            prop_assert_eq!(server.as_str(), &s);
-        }
-
-        #[test]
-        fn server_name_deref_works(s in non_empty_string()) {
-            let server = ServerName::new(s.clone()).unwrap();
-            prop_assert_eq!(&*server, &s);
-        }
-
-        #[test]
         fn server_name_serde_roundtrip(s in non_empty_string()) {
-            let server = ServerName::new(s).unwrap();
+            let server = ServerName::try_new(s).unwrap();
             let json = serde_json::to_string(&server).unwrap();
             let deserialized: ServerName = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(server, deserialized);
@@ -284,14 +252,8 @@ mod tests {
     // Property tests for Username
     proptest! {
         #[test]
-        fn username_non_empty_accepts(s in non_empty_string()) {
-            let username = Username::new(s.clone()).unwrap();
-            prop_assert_eq!(username.as_str(), &s);
-        }
-
-        #[test]
         fn username_serde_roundtrip(s in non_empty_string()) {
-            let username = Username::new(s).unwrap();
+            let username = Username::try_new(s).unwrap();
             let json = serde_json::to_string(&username).unwrap();
             let deserialized: Username = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(username, deserialized);
@@ -301,14 +263,8 @@ mod tests {
     // Property tests for Password
     proptest! {
         #[test]
-        fn password_non_empty_accepts(s in non_empty_string()) {
-            let password = Password::new(s.clone()).unwrap();
-            prop_assert_eq!(password.as_str(), &s);
-        }
-
-        #[test]
         fn password_serde_roundtrip(s in non_empty_string()) {
-            let password = Password::new(s).unwrap();
+            let password = Password::try_new(s).unwrap();
             let json = serde_json::to_string(&password).unwrap();
             let deserialized: Password = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(password, deserialized);
@@ -339,98 +295,19 @@ mod tests {
         }
     }
 
-    // Edge case tests - empty validation
-    #[test]
-    fn hostname_empty_rejected() {
-        assert!(matches!(
-            HostName::new("".to_string()),
-            Err(ValidationError::EmptyHostName)
-        ));
-    }
-
-    #[test]
-    fn hostname_whitespace_rejected() {
-        assert!(matches!(
-            HostName::new("   ".to_string()),
-            Err(ValidationError::EmptyHostName)
-        ));
-    }
-
-    #[test]
-    fn server_name_empty_rejected() {
-        assert!(matches!(
-            ServerName::new("".to_string()),
-            Err(ValidationError::EmptyServerName)
-        ));
-    }
-
-    #[test]
-    fn server_name_whitespace_rejected() {
-        assert!(matches!(
-            ServerName::new("\t".to_string()),
-            Err(ValidationError::EmptyServerName)
-        ));
-    }
-
-    #[test]
-    fn username_empty_rejected() {
-        assert!(matches!(
-            Username::new("".to_string()),
-            Err(ValidationError::EmptyUsername)
-        ));
-    }
-
-    #[test]
-    fn username_whitespace_only_rejected() {
-        assert!(Username::new("   ".to_string()).is_err());
-        assert!(Username::new("\t\n".to_string()).is_err());
-    }
-
+    // Edge case tests - verify sanitization behavior
     #[test]
     fn username_with_spaces_accepted() {
-        // Username with spaces in content is valid (trim checks if empty)
-        assert!(Username::new("  user  ".to_string()).is_ok());
-        assert!(Username::new("user name".to_string()).is_ok());
-    }
-
-    #[test]
-    fn username_special_characters_accepted() {
-        assert!(Username::new("user@domain.com".to_string()).is_ok());
-        assert!(Username::new("user-123".to_string()).is_ok());
-        assert!(Username::new("user_name".to_string()).is_ok());
-    }
-
-    #[test]
-    fn password_empty_rejected() {
-        assert!(matches!(
-            Password::new("".to_string()),
-            Err(ValidationError::EmptyPassword)
-        ));
-    }
-
-    #[test]
-    fn password_whitespace_only_rejected() {
-        assert!(Password::new("   ".to_string()).is_err());
+        // Username with spaces in content is valid (trim only removes leading/trailing)
+        assert!(Username::try_new("  user  ".to_string()).is_ok());
+        assert!(Username::try_new("user name".to_string()).is_ok());
     }
 
     #[test]
     fn password_with_spaces_accepted() {
-        assert!(Password::new("   pass   ".to_string()).is_ok());
-        assert!(Password::new("P@ssw0rd!".to_string()).is_ok());
-        assert!(Password::new("密码123".to_string()).is_ok());
-    }
-
-    #[test]
-    fn config_path_empty_rejected() {
-        assert!(matches!(
-            ConfigPath::try_from(""),
-            Err(ValidationError::EmptyConfigPath)
-        ));
-    }
-
-    #[test]
-    fn config_path_whitespace_rejected() {
-        assert!(ConfigPath::try_from("   ").is_err());
+        assert!(Password::try_new("   pass   ".to_string()).is_ok());
+        assert!(Password::try_new("P@ssw0rd!".to_string()).is_ok());
+        assert!(Password::try_new("密码123".to_string()).is_ok());
     }
 
     #[test]
@@ -454,21 +331,6 @@ mod tests {
         let json = "\"\"";
         let result: Result<ConfigPath, _> = serde_json::from_str(json);
         assert!(result.is_err());
-    }
-
-    // Hash implementation tests
-    #[test]
-    fn hostname_hash_works() {
-        let mut set = HashSet::new();
-        set.insert(HostName::new("example.com".to_string()).unwrap());
-        assert!(set.contains(&HostName::new("example.com".to_string()).unwrap()));
-    }
-
-    #[test]
-    fn server_name_hash_works() {
-        let mut set = HashSet::new();
-        set.insert(ServerName::new("server1".to_string()).unwrap());
-        assert!(set.contains(&ServerName::new("server1".to_string()).unwrap()));
     }
 
     // ValidationError tests

@@ -1,37 +1,35 @@
 //! Cache capacity configuration types
 
-use std::num::NonZeroUsize;
+use nutype::nutype;
 
-nonzero_newtype! {
-    /// A non-zero cache capacity
-    ///
-    /// Ensures caches track at least 1 item
-    pub struct CacheCapacity(NonZeroUsize: usize, serialize as serialize_u64);
-}
+/// A non-zero cache capacity
+///
+/// Ensures caches track at least 1 item (default: 1000)
+#[nutype(
+    validate(greater = 0),
+    default = 1000,
+    derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        Hash,
+        FromStr,
+        Serialize,
+        Deserialize,
+        Default
+    )
+)]
+pub struct CacheCapacity(usize);
 
 impl CacheCapacity {
-    /// Default cache capacity (1000 items)
-    pub const DEFAULT: Self = Self(NonZeroUsize::new(1000).unwrap());
-}
-
-impl std::str::FromStr for CacheCapacity {
-    type Err = std::num::ParseIntError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value = s.parse::<usize>()?;
-        Ok(Self::new(value).unwrap_or(Self::DEFAULT))
-    }
-}
-
-impl PartialOrd for CacheCapacity {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CacheCapacity {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.get().cmp(&other.get())
+    /// Get the inner value (convenience method)
+    #[inline]
+    pub fn get(&self) -> usize {
+        self.into_inner()
     }
 }
 
@@ -39,20 +37,33 @@ impl Ord for CacheCapacity {
 mod tests {
     use super::*;
 
-    // Use consolidated test macros for common patterns
-    test_nonzero_newtype_full!(
-        CacheCapacity,
-        default: 1000,
-        test_value: 5000,
-        ordering: (100, 1000),
-        from_str: ("2000", 2000, "not_a_number")
-    );
-
-    // Special test for zero defaulting to DEFAULT
     #[test]
-    fn test_from_str_zero_defaults() {
-        // Zero values should default to DEFAULT (1000)
-        let capacity: CacheCapacity = "0".parse().unwrap();
-        assert_eq!(capacity.get(), 1000);
+    fn test_default() {
+        assert_eq!(CacheCapacity::default().get(), 1000);
+    }
+
+    #[test]
+    fn test_zero_rejected() {
+        assert!(CacheCapacity::try_new(0).is_err());
+    }
+
+    #[test]
+    fn test_valid_values() {
+        assert_eq!(CacheCapacity::try_new(1).unwrap().get(), 1);
+        assert_eq!(CacheCapacity::try_new(5000).unwrap().get(), 5000);
+    }
+
+    #[test]
+    fn test_from_str() {
+        assert_eq!("2000".parse::<CacheCapacity>().unwrap().get(), 2000);
+        assert!("0".parse::<CacheCapacity>().is_err());
+        assert!("not_a_number".parse::<CacheCapacity>().is_err());
+    }
+
+    #[test]
+    fn test_ordering() {
+        let small = CacheCapacity::try_new(100).unwrap();
+        let large = CacheCapacity::try_new(1000).unwrap();
+        assert!(small < large);
     }
 }

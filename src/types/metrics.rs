@@ -1,19 +1,64 @@
 //! Type-safe metrics and measurement types
+//!
+//! Uses phantom types to provide zero-cost newtype wrappers with compile-time direction tracking.
+//! All byte counter types share the same implementation via `ByteCounter<D>` where `D` is a
+//! direction marker type (ClientToBackend, BackendToClient, etc.).
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Add, AddAssign};
 
-/// Type-safe byte transfer counter
+// ============================================================================
+// Direction Marker Types (zero-sized)
+// ============================================================================
+
+/// Marker: Client → Backend traffic
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct ClientToBackend;
+
+/// Marker: Backend → Client traffic
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct BackendToClient;
+
+/// Marker: Generic client traffic
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Client;
+
+/// Marker: Bytes sent
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Sent;
+
+/// Marker: Bytes received
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Received;
+
+// ============================================================================
+// Generic ByteCounter with Phantom Type Direction
+// ============================================================================
+
+/// Generic byte counter with compile-time direction tracking via phantom types
+///
+/// This zero-cost abstraction provides type-safe byte counting where the direction
+/// is encoded in the type system. The `PhantomData<D>` has zero size at runtime.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct BytesTransferred(u64);
+pub struct ByteCounter<D> {
+    bytes: u64,
+    _direction: PhantomData<D>,
+}
 
-impl BytesTransferred {
-    pub const ZERO: Self = Self(0);
+impl<D> ByteCounter<D> {
+    pub const ZERO: Self = Self {
+        bytes: 0,
+        _direction: PhantomData,
+    };
 
     #[must_use]
     pub const fn new(bytes: u64) -> Self {
-        Self(bytes)
+        Self {
+            bytes,
+            _direction: PhantomData,
+        }
     }
 
     #[must_use]
@@ -23,254 +68,93 @@ impl BytesTransferred {
 
     #[must_use]
     pub const fn as_u64(&self) -> u64 {
-        self.0
+        self.bytes
     }
 
+    #[must_use]
     #[inline]
-    pub fn add(&mut self, bytes: usize) {
-        self.0 += bytes as u64;
+    pub const fn add(self, bytes: usize) -> Self {
+        Self {
+            bytes: self.bytes + bytes as u64,
+            _direction: PhantomData,
+        }
     }
 
+    #[must_use]
     #[inline]
-    pub fn add_u64(&mut self, bytes: u64) {
-        self.0 += bytes;
+    pub const fn add_u64(self, bytes: u64) -> Self {
+        Self {
+            bytes: self.bytes + bytes,
+            _direction: PhantomData,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_sub(other.bytes),
+            _direction: PhantomData,
+        }
     }
 }
 
-impl From<u64> for BytesTransferred {
+impl<D> From<u64> for ByteCounter<D> {
     #[inline]
     fn from(bytes: u64) -> Self {
-        Self(bytes)
+        Self::new(bytes)
     }
 }
 
-impl From<BytesTransferred> for u64 {
+impl<D> From<ByteCounter<D>> for u64 {
     #[inline]
-    fn from(bytes: BytesTransferred) -> Self {
-        bytes.0
+    fn from(counter: ByteCounter<D>) -> Self {
+        counter.bytes
     }
 }
 
-impl std::ops::Deref for BytesTransferred {
-    type Target = u64;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Add for BytesTransferred {
+impl<D> Add for ByteCounter<D> {
     type Output = Self;
     #[inline]
     fn add(self, other: Self) -> Self {
-        Self(self.0 + other.0)
+        Self {
+            bytes: self.bytes + other.bytes,
+            _direction: PhantomData,
+        }
     }
 }
 
-impl AddAssign for BytesTransferred {
+impl<D> AddAssign for ByteCounter<D> {
     #[inline]
     fn add_assign(&mut self, other: Self) {
-        self.0 += other.0;
+        self.bytes += other.bytes;
     }
 }
 
-impl fmt::Display for BytesTransferred {
+impl<D> fmt::Display for ByteCounter<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} bytes", self.0)
+        write!(f, "{} bytes", self.bytes)
     }
 }
+
+// ============================================================================
+// Type Aliases for Direction-Specific Counters
+// ============================================================================
 
 /// Client traffic metrics (Client ↔ Proxy)
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct ClientBytes(u64);
-
-impl ClientBytes {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(bytes: u64) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn as_u64(&self) -> u64 {
-        self.0
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn saturating_sub(self, other: Self) -> u64 {
-        self.0.saturating_sub(other.0)
-    }
-}
-
-impl From<u64> for ClientBytes {
-    #[inline]
-    fn from(bytes: u64) -> Self {
-        Self(bytes)
-    }
-}
-
-impl fmt::Display for ClientBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} bytes", self.0)
-    }
-}
+pub type ClientBytes = ByteCounter<Client>;
 
 /// Client → Backend traffic (request bytes)
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct ClientToBackendBytes(u64);
-
-impl ClientToBackendBytes {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(bytes: u64) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn zero() -> Self {
-        Self::ZERO
-    }
-
-    #[must_use]
-    pub const fn as_u64(&self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub fn add(&mut self, bytes: usize) {
-        self.0 += bytes as u64;
-    }
-
-    #[inline]
-    pub fn add_u64(&mut self, bytes: u64) {
-        self.0 += bytes;
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn saturating_sub(self, other: Self) -> u64 {
-        self.0.saturating_sub(other.0)
-    }
-}
-
-impl From<u64> for ClientToBackendBytes {
-    #[inline]
-    fn from(bytes: u64) -> Self {
-        Self(bytes)
-    }
-}
-
-impl From<BytesTransferred> for ClientToBackendBytes {
-    #[inline]
-    fn from(bytes: BytesTransferred) -> Self {
-        Self(bytes.as_u64())
-    }
-}
-
-impl Add for ClientToBackendBytes {
-    type Output = Self;
-    #[inline]
-    fn add(self, other: Self) -> Self {
-        Self(self.0 + other.0)
-    }
-}
-
-impl AddAssign for ClientToBackendBytes {
-    #[inline]
-    fn add_assign(&mut self, other: Self) {
-        self.0 += other.0;
-    }
-}
-
-impl fmt::Display for ClientToBackendBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} bytes", self.0)
-    }
-}
+pub type ClientToBackendBytes = ByteCounter<ClientToBackend>;
 
 /// Backend → Client traffic (response bytes)
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct BackendToClientBytes(u64);
+pub type BackendToClientBytes = ByteCounter<BackendToClient>;
 
-impl BackendToClientBytes {
-    pub const ZERO: Self = Self(0);
+/// Bytes sent by a backend or user
+pub type BytesSent = ByteCounter<Sent>;
 
-    #[must_use]
-    pub const fn new(bytes: u64) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn zero() -> Self {
-        Self::ZERO
-    }
-
-    #[must_use]
-    pub const fn as_u64(&self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub fn add(&mut self, bytes: usize) {
-        self.0 += bytes as u64;
-    }
-
-    #[inline]
-    pub fn add_u64(&mut self, bytes: u64) {
-        self.0 += bytes;
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn saturating_sub(self, other: Self) -> u64 {
-        self.0.saturating_sub(other.0)
-    }
-}
-
-impl From<u64> for BackendToClientBytes {
-    #[inline]
-    fn from(bytes: u64) -> Self {
-        Self(bytes)
-    }
-}
-
-impl From<BytesTransferred> for BackendToClientBytes {
-    #[inline]
-    fn from(bytes: BytesTransferred) -> Self {
-        Self(bytes.as_u64())
-    }
-}
-
-impl Add for BackendToClientBytes {
-    type Output = Self;
-    #[inline]
-    fn add(self, other: Self) -> Self {
-        Self(self.0 + other.0)
-    }
-}
-
-impl AddAssign for BackendToClientBytes {
-    #[inline]
-    fn add_assign(&mut self, other: Self) {
-        self.0 += other.0;
-    }
-}
-
-impl fmt::Display for BackendToClientBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} bytes", self.0)
-    }
-}
-
-/// Legacy type alias for backwards compatibility during refactor
-#[deprecated(note = "Use ClientToBackendBytes or BackendToClientBytes instead")]
-pub type BackendBytes = ClientToBackendBytes;
+/// Bytes received by a backend or user
+pub type BytesReceived = ByteCounter<Received>;
 
 /// Transfer statistics for a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,8 +175,8 @@ impl TransferMetrics {
     #[must_use]
     pub const fn new(client_to_backend: u64, backend_to_client: u64) -> Self {
         Self {
-            client_to_backend: ClientToBackendBytes(client_to_backend),
-            backend_to_client: BackendToClientBytes(backend_to_client),
+            client_to_backend: ClientToBackendBytes::new(client_to_backend),
+            backend_to_client: BackendToClientBytes::new(backend_to_client),
         }
     }
 
@@ -309,6 +193,19 @@ impl TransferMetrics {
             self.client_to_backend.as_u64(),
             self.backend_to_client.as_u64(),
         )
+    }
+
+    /// Saturating subtraction of two transfer metrics
+    #[must_use]
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            client_to_backend: self
+                .client_to_backend
+                .saturating_sub(other.client_to_backend),
+            backend_to_client: self
+                .backend_to_client
+                .saturating_sub(other.backend_to_client),
+        }
     }
 }
 
@@ -334,455 +231,124 @@ mod tests {
     use proptest::prelude::*;
 
     // ============================================================================
-    // Property Tests - BytesTransferred
+    // Critical Property Tests - Arithmetic Operations
     // ============================================================================
 
     proptest! {
-        /// Property: new() and as_u64() round-trip correctly
+        /// Property: ByteCounter arithmetic works correctly across all direction types
         #[test]
-        fn prop_bytes_transferred_roundtrip(value in 0u64..=u64::MAX / 2) {
-            let bytes = BytesTransferred::new(value);
-            prop_assert_eq!(bytes.as_u64(), value);
-        }
+        fn prop_byte_counter_arithmetic(initial in 0u64..1000000, increment in 0usize..1000000, b in 0u64..1000000) {
+            // Test add() method
+            let c2b = ClientToBackendBytes::new(initial).add(increment);
+            let b2c = BackendToClientBytes::new(initial).add(increment);
+            prop_assert_eq!(c2b.as_u64(), initial + increment as u64);
+            prop_assert_eq!(b2c.as_u64(), initial + increment as u64);
 
-        /// Property: add() increments correctly (using explicit method call)
-        #[test]
-        fn prop_bytes_transferred_add(initial in 0u64..1000000, increment in 0usize..1000000) {
-            let mut bytes = BytesTransferred::new(initial);
-            BytesTransferred::add(&mut bytes, increment);
-            prop_assert_eq!(bytes.as_u64(), initial + increment as u64);
-        }
+            // Test Add trait
+            let sum1 = ClientToBackendBytes::new(initial) + ClientToBackendBytes::new(b);
+            let sum2 = BackendToClientBytes::new(initial) + BackendToClientBytes::new(b);
+            prop_assert_eq!(sum1.as_u64(), initial + b);
+            prop_assert_eq!(sum2.as_u64(), initial + b);
 
-        /// Property: add_u64() increments correctly
-        #[test]
-        fn prop_bytes_transferred_add_u64(initial in 0u64..1000000, increment in 0u64..1000000) {
-            let mut bytes = BytesTransferred::new(initial);
-            bytes.add_u64(increment);
-            prop_assert_eq!(bytes.as_u64(), initial + increment);
+            // Test saturating_sub
+            prop_assert_eq!(
+                ClientToBackendBytes::new(initial).saturating_sub(ClientToBackendBytes::new(b)).as_u64(),
+                initial.saturating_sub(b)
+            );
+            prop_assert_eq!(
+                BackendToClientBytes::new(initial).saturating_sub(BackendToClientBytes::new(b)).as_u64(),
+                initial.saturating_sub(b)
+            );
         }
-
-        /// Property: Addition operator is commutative
-        #[test]
-        fn prop_bytes_transferred_add_commutative(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = BytesTransferred::new(a);
-            let bytes_b = BytesTransferred::new(b);
-            prop_assert_eq!(bytes_a + bytes_b, bytes_b + bytes_a);
-        }
-
-        /// Property: From<u64> conversion
-        #[test]
-        fn prop_bytes_transferred_from_u64(value in 0u64..=u64::MAX / 2) {
-            let bytes = BytesTransferred::from(value);
-            prop_assert_eq!(bytes.as_u64(), value);
-        }
-    }
-
-    // Edge cases for BytesTransferred
-    #[test]
-    fn test_bytes_transferred_zero() {
-        assert_eq!(BytesTransferred::zero().as_u64(), 0);
-        assert_eq!(BytesTransferred::ZERO.as_u64(), 0);
     }
 
     #[test]
-    fn test_bytes_transferred_add_assign() {
-        let mut bytes = BytesTransferred::new(100);
-        bytes += BytesTransferred::new(50);
-        assert_eq!(bytes.as_u64(), 150);
+    fn test_phantom_type_zero_size() {
+        use std::mem::size_of;
+        // Verify PhantomData has zero runtime cost
+        assert_eq!(size_of::<ClientToBackendBytes>(), size_of::<u64>());
+        assert_eq!(size_of::<BackendToClientBytes>(), size_of::<u64>());
+        assert_eq!(size_of::<BytesSent>(), size_of::<u64>());
     }
 
     // ============================================================================
-    // Property Tests - ClientBytes
+    // TransferMetrics Tests
     // ============================================================================
+
+    #[test]
+    fn test_transfer_metrics_total() {
+        let metrics = TransferMetrics::new(100, 200);
+        assert_eq!(metrics.total(), 300);
+        assert_eq!(metrics.as_tuple(), (100, 200));
+    }
 
     proptest! {
-        /// Property: saturating_sub never underflows
+        /// Property: total() equals sum of components
         #[test]
-        fn prop_client_bytes_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = ClientBytes::new(a);
-            let bytes_b = ClientBytes::new(b);
-            let result = bytes_a.saturating_sub(bytes_b);
+        fn prop_transfer_metrics_total(c2b in 0u64..1000000, b2c in 0u64..1000000) {
+            let metrics = TransferMetrics::new(c2b, b2c);
+            prop_assert_eq!(metrics.total(), c2b + b2c);
+        }
 
-            if a >= b {
-                prop_assert_eq!(result, a - b);
-            } else {
-                prop_assert_eq!(result, 0);
+        /// Property: saturating_sub works on TransferMetrics
+        #[test]
+        fn prop_transfer_metrics_saturating_sub(a1 in 0u64..1000000, a2 in 0u64..1000000, b1 in 0u64..1000000, b2 in 0u64..1000000) {
+            let metrics1 = TransferMetrics::new(a1, a2);
+            let metrics2 = TransferMetrics::new(b1, b2);
+            let diff = metrics1.saturating_sub(metrics2);
+
+            prop_assert_eq!(diff.client_to_backend.as_u64(), a1.saturating_sub(b1));
+            prop_assert_eq!(diff.backend_to_client.as_u64(), a2.saturating_sub(b2));
+        }
+    }
+}
+
+// ============================================================================
+// Macro for Non-Byte Counter Types
+// ============================================================================
+
+macro_rules! define_counter {
+    ($name:ident, $unit:expr) => {
+        #[repr(transparent)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+        pub struct $name(u64);
+
+        impl $name {
+            pub const ZERO: Self = Self(0);
+
+            #[must_use]
+            pub const fn new(value: u64) -> Self {
+                Self(value)
+            }
+
+            #[must_use]
+            pub const fn get(&self) -> u64 {
+                self.0
             }
         }
 
-        /// Property: ClientBytes round-trip
-        #[test]
-        fn prop_client_bytes_roundtrip(value in 0u64..=u64::MAX / 2) {
-            let bytes = ClientBytes::new(value);
-            prop_assert_eq!(bytes.as_u64(), value);
-        }
-    }
-
-    #[test]
-    fn test_client_bytes_zero() {
-        assert_eq!(ClientBytes::ZERO.as_u64(), 0);
-    }
-
-    // ============================================================================
-    // Property Tests - ClientToBackendBytes
-    // ============================================================================
-
-    proptest! {
-        /// Property: add() works correctly
-        #[test]
-        fn prop_client_to_backend_add(initial in 0u64..1000000, increment in 0usize..1000000) {
-            let mut bytes = ClientToBackendBytes::new(initial);
-            ClientToBackendBytes::add(&mut bytes, increment);
-            prop_assert_eq!(bytes.as_u64(), initial + increment as u64);
+        impl From<u64> for $name {
+            #[inline]
+            fn from(value: u64) -> Self {
+                Self(value)
+            }
         }
 
-        /// Property: add_u64() works correctly
-        #[test]
-        fn prop_client_to_backend_add_u64(initial in 0u64..1000000, increment in 0u64..1000000) {
-            let mut bytes = ClientToBackendBytes::new(initial);
-            bytes.add_u64(increment);
-            prop_assert_eq!(bytes.as_u64(), initial + increment);
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{} {}", self.0, $unit)
+            }
         }
-
-        /// Property: Addition operators work
-        #[test]
-        fn prop_client_to_backend_operators(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = ClientToBackendBytes::new(a);
-            let bytes_b = ClientToBackendBytes::new(b);
-
-            // Test + operator
-            let sum1 = bytes_a + bytes_b;
-            prop_assert_eq!(sum1.as_u64(), a + b);
-
-            // Test += operator
-            let mut sum2 = bytes_a;
-            sum2 += bytes_b;
-            prop_assert_eq!(sum2.as_u64(), a + b);
-        }
-
-        /// Property: saturating_sub never underflows
-        #[test]
-        fn prop_client_to_backend_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = ClientToBackendBytes::new(a);
-            let bytes_b = ClientToBackendBytes::new(b);
-            let result = bytes_a.saturating_sub(bytes_b);
-            prop_assert_eq!(result, a.saturating_sub(b));
-        }
-    }
-
-    #[test]
-    fn test_client_to_backend_zero() {
-        assert_eq!(ClientToBackendBytes::zero().as_u64(), 0);
-    }
-
-    // ============================================================================
-    // Property Tests - BackendToClientBytes
-    // ============================================================================
-
-    proptest! {
-        /// Property: add() works correctly
-        #[test]
-        fn prop_backend_to_client_add(initial in 0u64..1000000, increment in 0usize..1000000) {
-            let mut bytes = BackendToClientBytes::new(initial);
-            BackendToClientBytes::add(&mut bytes, increment);
-            prop_assert_eq!(bytes.as_u64(), initial + increment as u64);
-        }
-
-        /// Property: Addition operators work
-        #[test]
-        fn prop_backend_to_client_operators(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = BackendToClientBytes::new(a);
-            let bytes_b = BackendToClientBytes::new(b);
-
-            let sum1 = bytes_a + bytes_b;
-            prop_assert_eq!(sum1.as_u64(), a + b);
-
-            let mut sum2 = bytes_a;
-            sum2 += bytes_b;
-            prop_assert_eq!(sum2.as_u64(), a + b);
-        }
-
-        /// Property: saturating_sub never underflows
-        #[test]
-        fn prop_backend_to_client_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = BackendToClientBytes::new(a);
-            let bytes_b = BackendToClientBytes::new(b);
-            prop_assert_eq!(bytes_a.saturating_sub(bytes_b), a.saturating_sub(b));
-        }
-    }
-
-    // ============================================================================
-    // Property Tests - BytesSent & BytesReceived
-    // ============================================================================
-
-    proptest! {
-        /// Property: BytesSent saturating_sub
-        #[test]
-        fn prop_bytes_sent_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = BytesSent::new(a);
-            let bytes_b = BytesSent::new(b);
-            prop_assert_eq!(bytes_a.saturating_sub(bytes_b), a.saturating_sub(b));
-        }
-
-        /// Property: BytesReceived saturating_sub
-        #[test]
-        fn prop_bytes_received_saturating_sub(a in 0u64..1000000, b in 0u64..1000000) {
-            let bytes_a = BytesReceived::new(a);
-            let bytes_b = BytesReceived::new(b);
-            prop_assert_eq!(bytes_a.saturating_sub(bytes_b), a.saturating_sub(b));
-        }
-    }
-
-    // ============================================================================
-    // Property Tests - From Conversions
-    // ============================================================================
-
-    proptest! {
-        /// Property: All From<u64> conversions work
-        #[test]
-        fn prop_from_u64_conversions(value in 0u64..1000000) {
-            prop_assert_eq!(BytesTransferred::from(value).as_u64(), value);
-            prop_assert_eq!(ClientBytes::from(value).as_u64(), value);
-            prop_assert_eq!(ClientToBackendBytes::from(value).as_u64(), value);
-            prop_assert_eq!(BackendToClientBytes::from(value).as_u64(), value);
-            prop_assert_eq!(BytesSent::from(value).as_u64(), value);
-            prop_assert_eq!(BytesReceived::from(value).as_u64(), value);
-            prop_assert_eq!(TotalConnections::from(value).get(), value);
-            prop_assert_eq!(BytesPerSecondRate::from(value).get(), value);
-            prop_assert_eq!(ArticleBytesTotal::from(value).get(), value);
-            prop_assert_eq!(TimingMeasurementCount::from(value).get(), value);
-        }
-
-        /// Property: Into<u64> conversion
-        #[test]
-        fn prop_into_u64(value in 0u64..1000000) {
-            let bytes = BytesTransferred::new(value);
-            let converted: u64 = bytes.into();
-            prop_assert_eq!(converted, value);
-        }
-    }
-
-    // ============================================================================
-    // Property Tests - Display Implementations
-    // ============================================================================
-
-    proptest! {
-        /// Property: Display implementations contain the value
-        #[test]
-        fn prop_display_implementations(value in 0u64..10000) {
-            let value_str = value.to_string();
-
-            prop_assert!(BytesTransferred::new(value).to_string().contains(&value_str));
-            prop_assert!(ClientBytes::new(value).to_string().contains(&value_str));
-            prop_assert!(ClientToBackendBytes::new(value).to_string().contains(&value_str));
-            prop_assert!(BackendToClientBytes::new(value).to_string().contains(&value_str));
-            prop_assert!(BytesSent::new(value).to_string().contains(&value_str));
-            prop_assert!(BytesReceived::new(value).to_string().contains(&value_str));
-            prop_assert!(TotalConnections::new(value).to_string().contains(&value_str));
-            prop_assert!(ArticleBytesTotal::new(value).to_string().contains(&value_str));
-        }
-    }
-
-    // ============================================================================
-    // Edge Cases & Cross-Type Conversions
-    // ============================================================================
-
-    #[test]
-    fn test_bytes_transferred_from_conversion() {
-        let transferred = BytesTransferred::new(100);
-        let client_to_backend = ClientToBackendBytes::from(transferred);
-        assert_eq!(client_to_backend.as_u64(), 100);
-
-        let backend_to_client = BackendToClientBytes::from(transferred);
-        assert_eq!(backend_to_client.as_u64(), 100);
-    }
-
-    #[test]
-    fn test_zero_constants() {
-        assert_eq!(BytesSent::ZERO.as_u64(), 0);
-        assert_eq!(BytesReceived::ZERO.as_u64(), 0);
-        assert_eq!(TotalConnections::ZERO.get(), 0);
-        assert_eq!(BytesPerSecondRate::ZERO.get(), 0);
-        assert_eq!(ArticleBytesTotal::ZERO.get(), 0);
-        assert_eq!(TimingMeasurementCount::ZERO.get(), 0);
-    }
+    };
 }
 
 // ============================================================================
-// Per-Backend/User Byte Counters
+// Specific Counter Types
 // ============================================================================
 
-/// Bytes sent by a backend or user
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct BytesSent(u64);
-
-impl BytesSent {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(bytes: u64) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn as_u64(&self) -> u64 {
-        self.0
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn saturating_sub(self, other: Self) -> u64 {
-        self.0.saturating_sub(other.0)
-    }
-}
-
-impl From<u64> for BytesSent {
-    #[inline]
-    fn from(bytes: u64) -> Self {
-        Self(bytes)
-    }
-}
-
-impl fmt::Display for BytesSent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} bytes", self.0)
-    }
-}
-
-/// Bytes received by a backend or user
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct BytesReceived(u64);
-
-impl BytesReceived {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(bytes: u64) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn as_u64(&self) -> u64 {
-        self.0
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn saturating_sub(self, other: Self) -> u64 {
-        self.0.saturating_sub(other.0)
-    }
-}
-
-impl From<u64> for BytesReceived {
-    #[inline]
-    fn from(bytes: u64) -> Self {
-        Self(bytes)
-    }
-}
-
-impl fmt::Display for BytesReceived {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} bytes", self.0)
-    }
-}
-
-/// Total connections count
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct TotalConnections(u64);
-
-impl TotalConnections {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(count: u64) -> Self {
-        Self(count)
-    }
-
-    #[must_use]
-    pub const fn get(&self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for TotalConnections {
-    #[inline]
-    fn from(count: u64) -> Self {
-        Self(count)
-    }
-}
-
-impl fmt::Display for TotalConnections {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} connections", self.0)
-    }
-}
-
-/// Bytes per second (rate)
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct BytesPerSecondRate(u64);
-
-impl BytesPerSecondRate {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(rate: u64) -> Self {
-        Self(rate)
-    }
-
-    #[must_use]
-    pub const fn get(&self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for BytesPerSecondRate {
-    #[inline]
-    fn from(rate: u64) -> Self {
-        Self(rate)
-    }
-}
-
-impl fmt::Display for BytesPerSecondRate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} B/s", self.0)
-    }
-}
-
-/// Article bytes total (cumulative)
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct ArticleBytesTotal(u64);
-
-impl ArticleBytesTotal {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(bytes: u64) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn get(&self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for ArticleBytesTotal {
-    #[inline]
-    fn from(bytes: u64) -> Self {
-        Self(bytes)
-    }
-}
-
-impl fmt::Display for ArticleBytesTotal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} bytes", self.0)
-    }
-}
+define_counter!(TotalConnections, "connections");
+define_counter!(BytesPerSecondRate, "B/s");
+define_counter!(ArticleBytesTotal, "bytes");
 
 /// Timing measurement count (for averaging TTFB/send/recv times)
 #[repr(transparent)]
@@ -793,8 +359,8 @@ impl TimingMeasurementCount {
     pub const ZERO: Self = Self(0);
 
     #[must_use]
-    pub const fn new(count: u64) -> Self {
-        Self(count)
+    pub const fn new(value: u64) -> Self {
+        Self(value)
     }
 
     #[must_use]
@@ -805,7 +371,13 @@ impl TimingMeasurementCount {
 
 impl From<u64> for TimingMeasurementCount {
     #[inline]
-    fn from(count: u64) -> Self {
-        Self(count)
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for TimingMeasurementCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }

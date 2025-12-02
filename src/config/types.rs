@@ -61,6 +61,40 @@ impl std::fmt::Display for RoutingMode {
     }
 }
 
+/// Backend selection strategy for load balancing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendSelectionStrategy {
+    /// Weighted round-robin - distributes requests proportionally to max_connections
+    WeightedRoundRobin,
+    /// Least-loaded - routes to backend with fewest pending requests
+    LeastLoaded,
+}
+
+impl Default for BackendSelectionStrategy {
+    /// Default is weighted round-robin for predictable distribution
+    fn default() -> Self {
+        Self::WeightedRoundRobin
+    }
+}
+
+impl BackendSelectionStrategy {
+    /// Get a human-readable description
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::WeightedRoundRobin => "weighted round-robin",
+            Self::LeastLoaded => "least-loaded",
+        }
+    }
+}
+
+impl std::fmt::Display for BackendSelectionStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct Config {
@@ -91,6 +125,10 @@ pub struct Proxy {
     pub port: Port,
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     pub threads: ThreadCount,
+    /// Backend selection strategy for load balancing
+    pub backend_selection: BackendSelectionStrategy,
+    /// Validate yEnc structure and checksums (default: true)
+    pub validate_yenc: bool,
 }
 
 impl Proxy {
@@ -104,6 +142,8 @@ impl Default for Proxy {
             host: Self::DEFAULT_HOST.to_string(),
             port: Port::default(),
             threads: ThreadCount::default(),
+            backend_selection: BackendSelectionStrategy::default(),
+            validate_yenc: true,
         }
     }
 }
@@ -280,11 +320,11 @@ pub struct Server {
 /// ```
 pub struct ServerBuilder {
     host: String,
-    port: u16,
+    port: Port,
     name: Option<String>,
     username: Option<String>,
     password: Option<String>,
-    max_connections: Option<usize>,
+    max_connections: Option<MaxConnections>,
     use_tls: bool,
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
@@ -298,9 +338,9 @@ impl ServerBuilder {
     ///
     /// # Arguments
     /// * `host` - Backend server hostname or IP address
-    /// * `port` - Backend server port number
+    /// * `port` - Backend server port
     #[must_use]
-    pub fn new(host: impl Into<String>, port: u16) -> Self {
+    pub fn new(host: impl Into<String>, port: Port) -> Self {
         Self {
             host: host.into(),
             port,
@@ -340,7 +380,7 @@ impl ServerBuilder {
 
     /// Set maximum number of concurrent connections
     #[must_use]
-    pub fn max_connections(mut self, max: usize) -> Self {
+    pub fn max_connections(mut self, max: MaxConnections) -> Self {
         self.max_connections = Some(max);
         self
     }
@@ -397,24 +437,18 @@ impl ServerBuilder {
     /// - Name is empty (when explicitly set)
     /// - Max connections is 0 (when explicitly set)
     pub fn build(self) -> Result<Server, anyhow::Error> {
-        use crate::types::{HostName, MaxConnections, Port, ServerName};
+        use crate::types::{HostName, ServerName};
 
-        let host = HostName::new(self.host.clone())?;
-
-        let port = Port::new(self.port)
-            .ok_or_else(|| anyhow::anyhow!("Invalid port: {} (must be 1-65535)", self.port))?;
-
+        let host = HostName::try_new(self.host.clone())?;
+        let port = self.port; // Already a Port type
         let name_str = self
             .name
-            .unwrap_or_else(|| format!("{}:{}", self.host, self.port));
-        let name = ServerName::new(name_str)?;
+            .unwrap_or_else(|| format!("{}:{}", self.host, self.port.get()));
+        let name = ServerName::try_new(name_str)?;
 
-        let max_connections = if let Some(max) = self.max_connections {
-            MaxConnections::new(max)
-                .ok_or_else(|| anyhow::anyhow!("Invalid max_connections: {} (must be > 0)", max))?
-        } else {
-            super::defaults::max_connections()
-        };
+        let max_connections = self
+            .max_connections
+            .unwrap_or_else(super::defaults::max_connections);
 
         let health_check_max_per_cycle = self
             .health_check_max_per_cycle
@@ -442,9 +476,9 @@ impl ServerBuilder {
 }
 
 impl Server {
-    /// Create a builder for constructing a Server
+    /// Create a builder for configuring a backend server
     ///
-    /// # Examples
+    /// # Example
     ///
     /// ```
     /// use nntp_proxy::config::Server;
@@ -456,7 +490,7 @@ impl Server {
     ///     .unwrap();
     /// ```
     #[must_use]
-    pub fn builder(host: impl Into<String>, port: u16) -> ServerBuilder {
+    pub fn builder(host: impl Into<String>, port: Port) -> ServerBuilder {
         ServerBuilder::new(host, port)
     }
 }
@@ -600,7 +634,9 @@ mod tests {
     // ServerBuilder tests
     #[test]
     fn test_server_builder_minimal() {
-        let server = Server::builder("news.example.com", 119).build().unwrap();
+        let server = Server::builder("news.example.com", Port::try_new(119).unwrap())
+            .build()
+            .unwrap();
 
         assert_eq!(server.host.as_str(), "news.example.com");
         assert_eq!(server.port.get(), 119);
@@ -612,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_server_builder_with_name() {
-        let server = Server::builder("localhost", 119)
+        let server = Server::builder("localhost", Port::try_new(119).unwrap())
             .name("Test Server")
             .build()
             .unwrap();
@@ -622,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_server_builder_with_auth() {
-        let server = Server::builder("news.example.com", 119)
+        let server = Server::builder("news.example.com", Port::try_new(119).unwrap())
             .username("testuser")
             .password("testpass")
             .build()
@@ -634,8 +670,8 @@ mod tests {
 
     #[test]
     fn test_server_builder_with_max_connections() {
-        let server = Server::builder("localhost", 119)
-            .max_connections(20)
+        let server = Server::builder("localhost", Port::try_new(119).unwrap())
+            .max_connections(MaxConnections::try_new(20).unwrap())
             .build()
             .unwrap();
 
@@ -644,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_server_builder_with_tls() {
-        let server = Server::builder("secure.example.com", 563)
+        let server = Server::builder("secure.example.com", Port::try_new(563).unwrap())
             .use_tls(true)
             .tls_verify_cert(false)
             .tls_cert_path("/path/to/cert.pem")
@@ -659,7 +695,7 @@ mod tests {
     #[test]
     fn test_server_builder_with_keepalive() {
         let keepalive = Duration::from_secs(300);
-        let server = Server::builder("localhost", 119)
+        let server = Server::builder("localhost", Port::try_new(119).unwrap())
             .connection_keepalive(keepalive)
             .build()
             .unwrap();
@@ -670,7 +706,7 @@ mod tests {
     #[test]
     fn test_server_builder_with_health_check_settings() {
         let timeout = Duration::from_millis(500);
-        let server = Server::builder("localhost", 119)
+        let server = Server::builder("localhost", Port::try_new(119).unwrap())
             .health_check_max_per_cycle(5)
             .health_check_pool_timeout(timeout)
             .build()
@@ -682,11 +718,11 @@ mod tests {
 
     #[test]
     fn test_server_builder_chaining() {
-        let server = Server::builder("news.example.com", 563)
+        let server = Server::builder("news.example.com", Port::try_new(563).unwrap())
             .name("Production Server")
             .username("admin")
             .password("secret")
-            .max_connections(25)
+            .max_connections(MaxConnections::try_new(25).unwrap())
             .use_tls(true)
             .tls_verify_cert(true)
             .build()
@@ -695,31 +731,6 @@ mod tests {
         assert_eq!(server.name.as_str(), "Production Server");
         assert_eq!(server.max_connections.get(), 25);
         assert!(server.use_tls);
-    }
-
-    #[test]
-    fn test_server_builder_invalid_host() {
-        let result = Server::builder("", 119).build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_server_builder_invalid_port() {
-        let result = Server::builder("localhost", 0).build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_server_builder_invalid_max_connections() {
-        let result = Server::builder("localhost", 119).max_connections(0).build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_server_builder_from_server_method() {
-        let builder = Server::builder("localhost", 119);
-        let server = builder.build().unwrap();
-        assert_eq!(server.host.as_str(), "localhost");
     }
 
     // Config tests

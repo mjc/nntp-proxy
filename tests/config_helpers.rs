@@ -3,12 +3,13 @@
 //! These helpers use the Server builder pattern for cleaner, more maintainable test code.
 
 use nntp_proxy::config::Server;
+use nntp_proxy::types::{MaxConnections, Port};
 
 /// Create a basic server configuration for testing (no TLS)
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
-    Server::builder(host, port)
+    Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
-        .max_connections(5)
+        .max_connections(MaxConnections::try_new(5).unwrap())
         .build()
         .expect("Valid server config")
 }
@@ -21,11 +22,11 @@ pub fn create_test_server_config_with_auth(
     username: &str,
     password: &str,
 ) -> Server {
-    Server::builder(host, port)
+    Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
         .username(username)
         .password(password)
-        .max_connections(5)
+        .max_connections(MaxConnections::try_new(5).unwrap())
         .build()
         .expect("Valid server config")
 }
@@ -38,9 +39,9 @@ pub fn create_test_server_config_with_tls(
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
 ) -> Server {
-    let mut builder = Server::builder(host, port)
+    let mut builder = Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
-        .max_connections(5)
+        .max_connections(MaxConnections::try_new(5).unwrap())
         .use_tls(true)
         .tls_verify_cert(tls_verify_cert);
 
@@ -58,9 +59,9 @@ pub fn create_test_server_config_with_max_connections(
     name: &str,
     max_connections: usize,
 ) -> Server {
-    Server::builder(host, port)
+    Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
-        .max_connections(max_connections)
+        .max_connections(MaxConnections::try_new(max_connections).unwrap())
         .build()
         .expect("Valid server config")
 }

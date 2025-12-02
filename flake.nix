@@ -106,7 +106,7 @@
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
           export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
 
-          echo "🦀 Rust development environment loaded!"
+          echo "🦀 Rust development environment loaded (NIGHTLY)!"
           echo "   Rust version: $(rustc --version)"
           echo "   Cargo version: $(cargo --version)"
           echo "   OpenSSL version: ${pkgs.openssl.version}"

@@ -351,17 +351,46 @@ fn render_backend_list(
                         Style::default().fg(styles::LABEL),
                     ),
                 ]),
-                Line::from(vec![
-                    Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("{}/{}", stats.active_connections, server.max_connections),
-                        Style::default().fg(styles::VALUE_SECONDARY),
-                    ),
-                    Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
-                    Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(ttfb_text, Style::default().fg(styles::VALUE_INFO)),
-                ]),
+                Line::from({
+                    let mut line = vec![
+                        Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
+                        Span::styled(
+                            format!("{}/{}", stats.active_connections, server.max_connections),
+                            Style::default().fg(styles::VALUE_SECONDARY),
+                        ),
+                    ];
+
+                    // Show pending count if details mode is enabled
+                    if app.show_details() {
+                        let pending = app.backend_pending_count(i);
+                        line.push(Span::styled(
+                            format!(" ({} pending)", pending),
+                            Style::default().fg(if pending > 0 {
+                                Color::Yellow
+                            } else {
+                                styles::LABEL
+                            }),
+                        ));
+                    }
+
+                    line.push(Span::styled(
+                        " | Cmd/s: ",
+                        Style::default().fg(styles::LABEL),
+                    ));
+                    line.push(Span::styled(
+                        cmd_per_sec,
+                        Style::default().fg(styles::VALUE_INFO),
+                    ));
+                    line.push(Span::styled(
+                        " | TTFB: ",
+                        Style::default().fg(styles::LABEL),
+                    ));
+                    line.push(Span::styled(
+                        ttfb_text,
+                        Style::default().fg(styles::VALUE_INFO),
+                    ));
+                    line
+                }),
                 Line::from(vec![
                     Span::styled(
                         format!("  {} ", text::ARROW_UP),
