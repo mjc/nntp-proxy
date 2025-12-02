@@ -257,6 +257,31 @@ pub fn spawn_stats_flusher(stats: &crate::metrics::ConnectionStatsAggregator) {
     });
 }
 
+/// Spawn background task to periodically log cache statistics
+///
+/// Logs every 60 seconds if cache is enabled.
+pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
+    use std::sync::Arc;
+    use tracing::info;
+
+    if let Some(cache) = proxy.cache() {
+        let cache = Arc::clone(cache);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                let stats = cache.stats().await;
+                info!(
+                    "Cache stats: entries={}, size={} bytes",
+                    stats.entry_count, stats.weighted_size
+                );
+            }
+        });
+    }
+}
+
 /// Spawn graceful shutdown handler
 ///
 /// Waits for shutdown signal, then:

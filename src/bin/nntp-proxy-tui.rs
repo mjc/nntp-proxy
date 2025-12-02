@@ -47,6 +47,7 @@ async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()>
 
     runtime::spawn_connection_prewarming(&proxy);
     runtime::spawn_stats_flusher(proxy.connection_stats());
+    runtime::spawn_cache_stats_logger(&proxy);
     spawn_tui_shutdown_handler(&proxy, &shutdown_tx, tui_shutdown_tx);
 
     runtime::run_accept_loop(proxy, listener, shutdown_rx, routing_mode).await?;
@@ -102,23 +103,30 @@ fn launch_tui(
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
     (!args.no_tui)
         .then(|| {
-            let tui_app = log_buffer.map_or_else(
-                || {
-                    tui::TuiApp::new(
-                        proxy.metrics().clone(),
-                        proxy.router().clone(),
-                        proxy.servers().to_vec().into(),
-                    )
-                },
-                |buffer| {
-                    tui::TuiApp::with_log_buffer(
-                        proxy.metrics().clone(),
-                        proxy.router().clone(),
-                        proxy.servers().to_vec().into(),
-                        buffer,
-                    )
-                },
+            let mut builder = tui::TuiAppBuilder::new(
+                proxy.metrics().clone(),
+                proxy.router().clone(),
+                proxy.servers().to_vec().into(),
             );
+
+            // Add log buffer if available
+            if let Some(buffer) = log_buffer {
+                builder = builder.with_log_buffer(buffer);
+            }
+
+            // Add cache if available
+            if let Some(cache) = proxy.cache() {
+                info!(
+                    "Adding cache to TUI: entries={}, size={}",
+                    cache.entry_count(),
+                    cache.weighted_size()
+                );
+                builder = builder.with_cache(cache.clone());
+            } else {
+                info!("No cache available for TUI");
+            }
+
+            let tui_app = builder.build();
 
             tokio::spawn(async move {
                 if let Err(e) = tui::run_tui(tui_app, shutdown_tx, tui_shutdown_rx).await {

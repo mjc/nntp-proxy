@@ -158,6 +158,7 @@ pub struct TuiAppBuilder {
     metrics: MetricsCollector,
     router: Arc<BackendSelector>,
     servers: Arc<Vec<Server>>,
+    cache: Option<Arc<crate::cache::ArticleCache>>,
     log_buffer: Option<LogBuffer>,
     history_size: HistorySize,
 }
@@ -174,9 +175,17 @@ impl TuiAppBuilder {
             metrics,
             router,
             servers,
+            cache: None,
             log_buffer: None,
             history_size: HistorySize::DEFAULT,
         }
+    }
+
+    /// Set the article cache for monitoring cache statistics
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<crate::cache::ArticleCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Set the log buffer for displaying recent log messages
@@ -198,7 +207,7 @@ impl TuiAppBuilder {
     pub fn build(self) -> TuiApp {
         use crate::tui::SystemMonitor;
 
-        let snapshot = Arc::new(self.metrics.snapshot());
+        let snapshot = Arc::new(self.metrics.snapshot(self.cache.as_deref()));
         let backend_count = self.servers.len();
 
         // Initialize empty history for each backend
@@ -210,6 +219,7 @@ impl TuiAppBuilder {
             metrics: self.metrics,
             router: self.router,
             servers: self.servers,
+            cache: self.cache,
             snapshot,
             backend_history,
             client_history: ThroughputHistory::new(self.history_size),
@@ -256,6 +266,8 @@ pub struct TuiApp {
     system_monitor: crate::tui::SystemMonitor,
     /// Current system stats (CPU, memory, threads)
     system_stats: crate::tui::SystemStats,
+    /// Article cache (optional - only present in caching mode)
+    cache: Option<Arc<crate::cache::ArticleCache>>,
 }
 
 impl TuiApp {
@@ -270,38 +282,6 @@ impl TuiApp {
         servers: Arc<Vec<Server>>,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers).build()
-    }
-
-    /// Create with log buffer
-    ///
-    /// **Note:** Prefer using `TuiAppBuilder::new(...).with_log_buffer(buffer).build()`.
-    /// This method is kept for backward compatibility.
-    #[must_use]
-    pub fn with_log_buffer(
-        metrics: MetricsCollector,
-        router: Arc<BackendSelector>,
-        servers: Arc<Vec<Server>>,
-        log_buffer: LogBuffer,
-    ) -> Self {
-        TuiAppBuilder::new(metrics, router, servers)
-            .with_log_buffer(log_buffer)
-            .build()
-    }
-
-    /// Create with custom history size
-    ///
-    /// **Note:** Prefer using `TuiAppBuilder::new(...).with_history_size(size).build()`.
-    /// This method is kept for backward compatibility.
-    #[must_use]
-    pub fn with_history_size(
-        metrics: MetricsCollector,
-        router: Arc<BackendSelector>,
-        servers: Arc<Vec<Server>>,
-        history_size: HistorySize,
-    ) -> Self {
-        TuiAppBuilder::new(metrics, router, servers)
-            .with_history_size(history_size)
-            .build()
     }
 
     /// Calculate throughput rate from byte delta and time delta
@@ -371,7 +351,11 @@ impl TuiApp {
         // Update system stats (CPU, memory)
         self.system_stats = self.system_monitor.update();
 
-        let new_snapshot = Arc::new(self.metrics.snapshot().with_pool_status(&self.router));
+        let new_snapshot = Arc::new(
+            self.metrics
+                .snapshot(self.cache.as_deref())
+                .with_pool_status(&self.router),
+        );
         let now = Timestamp::now();
         let time_delta = now.duration_since(self.last_update).as_secs_f64();
 
@@ -702,12 +686,9 @@ mod tests {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
         let servers = create_test_servers(1);
-        let mut app = TuiApp::with_history_size(
-            metrics.clone(),
-            router,
-            servers,
-            HistorySize::new(5), // Small history for testing
-        );
+        let mut app = TuiAppBuilder::new(metrics.clone(), router, servers)
+            .with_history_size(HistorySize::new(5)) // Small history for testing
+            .build();
 
         // First update (baseline)
         app.update();
@@ -818,7 +799,9 @@ mod tests {
         let router = Arc::new(BackendSelector::new());
         let servers = create_test_servers(1);
 
-        let app = TuiApp::with_log_buffer(metrics, router, servers, log_buffer.clone());
+        let app = TuiAppBuilder::new(metrics, router, servers)
+            .with_log_buffer(log_buffer.clone())
+            .build();
 
         // Should have access to log buffer
         let logs = app.log_buffer().recent_lines(2);
@@ -942,33 +925,5 @@ mod tests {
 
         assert_eq!(app.backend_history.len(), 3);
         assert_eq!(app.history_size.get(), 90);
-    }
-
-    #[test]
-    fn test_backward_compat_constructors() {
-        use crate::tui::log_capture::LogBuffer;
-
-        let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
-        let servers = create_test_servers(1);
-
-        // new() should work
-        let app1 = TuiApp::new(metrics.clone(), router.clone(), servers.clone());
-        assert_eq!(app1.history_size, HistorySize::DEFAULT);
-
-        // with_log_buffer() should work
-        let log_buffer = LogBuffer::new();
-        let app2 = TuiApp::with_log_buffer(
-            metrics.clone(),
-            router.clone(),
-            servers.clone(),
-            log_buffer.clone(),
-        );
-        assert_eq!(app2.history_size, HistorySize::DEFAULT);
-
-        // with_history_size() should work
-        let custom_size = HistorySize::new(45);
-        let app3 = TuiApp::with_history_size(metrics, router, servers, custom_size);
-        assert_eq!(app3.history_size, custom_size);
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! These helpers use the Server builder pattern for cleaner, more maintainable test code.
 
-use nntp_proxy::config::Server;
-use nntp_proxy::types::{MaxConnections, Port};
+use nntp_proxy::config::{Cache, Config, Server};
+use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
 
 /// Create a basic server configuration for testing (no TLS)
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
@@ -64,6 +64,22 @@ pub fn create_test_server_config_with_max_connections(
         .max_connections(MaxConnections::try_new(max_connections).unwrap())
         .build()
         .expect("Valid server config")
+}
+
+/// Create a full proxy configuration with cache enabled for testing
+pub fn create_test_config_with_cache(backend_port: u16, cache_capacity: usize) -> Config {
+    Config {
+        servers: vec![create_test_server_config(
+            "localhost",
+            backend_port,
+            "test-backend",
+        )],
+        cache: Some(Cache {
+            max_capacity: CacheCapacity::try_new(cache_capacity).unwrap(),
+            ttl: std::time::Duration::from_secs(3600),
+        }),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

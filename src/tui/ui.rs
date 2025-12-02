@@ -193,6 +193,23 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
                 }),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("Cache Entries: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{}", snapshot.cache_entries),
+                Style::default().fg(if snapshot.cache_entries > 0 {
+                    styles::VALUE_INFO
+                } else {
+                    styles::VALUE_NEUTRAL
+                }),
+            ),
+            Span::styled(" (", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(snapshot.cache_size_bytes),
+                Style::default().fg(styles::VALUE_NEUTRAL),
+            ),
+            Span::styled(")", Style::default().fg(styles::LABEL)),
+        ]),
     ])
     .block(
         Block::default()

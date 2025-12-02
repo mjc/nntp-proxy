@@ -211,8 +211,6 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 
 /// Spawn a mock NNTP server that requires authentication
 ///
-/// **Deprecated:** Use `MockNntpServer::new(port).with_auth(user, pass).spawn()` instead.
-///
 /// # Arguments
 /// * `port` - Port to listen on
 /// * `expected_user` - Expected username
@@ -220,7 +218,6 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 ///
 /// # Returns
 /// Handle to the background task running the mock server
-#[allow(dead_code)]
 /// Spawn a mock NNTP server that requires authentication
 ///
 /// Returns an AbortHandle that automatically cancels the server when dropped.

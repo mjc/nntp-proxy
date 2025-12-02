@@ -149,7 +149,7 @@ mod tests {
         metrics.user_bytes_sent(Some("testuser"), 1024);
         metrics.user_bytes_received(Some("testuser"), 2048);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector.snapshot(None);
         assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
 
         let user_stats = snapshot

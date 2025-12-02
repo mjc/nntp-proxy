@@ -36,7 +36,7 @@ fn test_metrics_with_pool_status_standard_mode() {
     metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);
     metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
 
-    let snapshot = metrics.snapshot().with_pool_status(&router);
+    let snapshot = metrics.snapshot(None).with_pool_status(&router);
 
     // Verify metrics
     assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(1000));
@@ -115,7 +115,7 @@ fn test_metrics_with_pool_status_per_command_mode() {
     metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
     metrics.record_backend_to_client_bytes_for(BackendId::from(0), 1000);
 
-    let snapshot = metrics.snapshot().with_pool_status(&router);
+    let snapshot = metrics.snapshot(None).with_pool_status(&router);
 
     // Verify round-robin distribution
     assert_eq!(
@@ -193,7 +193,7 @@ fn test_metrics_with_pool_status_hybrid_mode() {
     metrics.record_client_to_backend_bytes_for(BackendId::from(0), 100);
     metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
 
-    let snapshot = metrics.snapshot().with_pool_status(&router);
+    let snapshot = metrics.snapshot(None).with_pool_status(&router);
 
     // Verify metrics accumulated across both modes
     assert_eq!(
@@ -257,7 +257,7 @@ fn test_all_modes_show_meaningful_metrics() {
             metrics.record_command(BackendId::from(0));
         }
 
-        let snapshot = metrics.snapshot().with_pool_status(&router);
+        let snapshot = metrics.snapshot(None).with_pool_status(&router);
 
         // All modes should show:
         // 1. Bytes transferred

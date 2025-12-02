@@ -12,7 +12,7 @@ fn test_metrics_collector_new() {
     let collector = MetricsCollector::new(3);
     assert_eq!(collector.num_backends(), 3);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats.len(), 3);
 }
 
@@ -22,31 +22,31 @@ fn test_connection_lifecycle() {
     let collector = MetricsCollector::new(1);
 
     // Initially zero
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.total_connections, 0);
     assert_eq!(snapshot.active_connections, 0);
 
     // Open connection
     collector.connection_opened();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.total_connections, 1);
     assert_eq!(snapshot.active_connections, 1);
 
     // Open another
     collector.connection_opened();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.total_connections, 2);
     assert_eq!(snapshot.active_connections, 2);
 
     // Close one
     collector.connection_closed();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.total_connections, 2); // Total stays
     assert_eq!(snapshot.active_connections, 1); // Active decrements
 
     // Close another
     collector.connection_closed();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.total_connections, 2);
     assert_eq!(snapshot.active_connections, 0);
 }
@@ -56,27 +56,27 @@ fn test_connection_lifecycle() {
 fn test_stateful_session_tracking() {
     let collector = MetricsCollector::new(1);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.stateful_sessions, 0);
 
     // Start session
     collector.stateful_session_started();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.stateful_sessions, 1);
 
     // Start another
     collector.stateful_session_started();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.stateful_sessions, 2);
 
     // End one
     collector.stateful_session_ended();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.stateful_sessions, 1);
 
     // End another
     collector.stateful_session_ended();
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.stateful_sessions, 0);
 }
 
@@ -95,7 +95,7 @@ fn test_record_command() {
     // Record commands for backend 1
     collector.record_command(backend1);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].total_commands.get(), 3);
     assert_eq!(snapshot.backend_stats[1].total_commands.get(), 1);
 }
@@ -112,7 +112,7 @@ fn test_byte_transfer_recording() {
     collector.record_backend_to_client_bytes_for(backend, 500);
     collector.record_backend_to_client_bytes_for(backend, 700);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].bytes_sent.as_u64(), 300);
     assert_eq!(snapshot.backend_stats[0].bytes_received.as_u64(), 1200);
 }
@@ -145,7 +145,7 @@ fn test_record_command_execution() {
 
     let (_sent_recorded, _recv_recorded) = collector.record_command_execution(backend, sent, recv);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
     assert_eq!(snapshot.backend_stats[0].bytes_sent.as_u64(), 150);
     assert_eq!(snapshot.backend_stats[0].bytes_received.as_u64(), 350);
@@ -160,7 +160,7 @@ fn test_error_recording() {
     collector.record_error(backend);
     collector.record_error(backend);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].errors.get(), 2);
 }
 
@@ -174,7 +174,7 @@ fn test_error_4xx_recording() {
     collector.record_error_4xx(backend);
     collector.record_error_4xx(backend);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].errors_4xx.get(), 3);
     assert_eq!(snapshot.backend_stats[0].errors.get(), 3); // Also increments total
 }
@@ -188,7 +188,7 @@ fn test_error_5xx_recording() {
     collector.record_error_5xx(backend);
     collector.record_error_5xx(backend);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].errors_5xx.get(), 2);
     assert_eq!(snapshot.backend_stats[0].errors.get(), 2); // Also increments total
 }
@@ -203,7 +203,7 @@ fn test_mixed_error_recording() {
     collector.record_error_4xx(backend);
     collector.record_error_5xx(backend);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].errors_4xx.get(), 2);
     assert_eq!(snapshot.backend_stats[0].errors_5xx.get(), 1);
     assert_eq!(snapshot.backend_stats[0].errors.get(), 3); // Total
@@ -219,7 +219,7 @@ fn test_article_recording() {
     collector.record_article(backend, 2048);
     collector.record_article(backend, 4096);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].article_count.get(), 3);
     assert_eq!(snapshot.backend_stats[0].article_bytes_total.get(), 7168);
 }
@@ -234,7 +234,7 @@ fn test_ttfb_recording() {
     collector.record_ttfb_micros(backend, 2000);
     collector.record_ttfb_micros(backend, 3000);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].ttfb_micros_total.get(), 6000);
     assert_eq!(snapshot.backend_stats[0].ttfb_count.get(), 3);
 }
@@ -248,7 +248,7 @@ fn test_send_recv_timing_recording() {
     collector.record_send_recv_micros(backend, 100, 500);
     collector.record_send_recv_micros(backend, 200, 600);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].send_micros_total.get(), 300);
     assert_eq!(snapshot.backend_stats[0].recv_micros_total.get(), 1100);
 }
@@ -262,7 +262,7 @@ fn test_connection_failure_recording() {
     collector.record_connection_failure(backend);
     collector.record_connection_failure(backend);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].connection_failures.get(), 2);
 }
 
@@ -272,19 +272,19 @@ fn test_backend_connection_lifecycle() {
     let collector = MetricsCollector::new(1);
     let backend = BackendId::from_index(0);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].active_connections.get(), 0);
 
     collector.backend_connection_opened(backend);
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].active_connections.get(), 1);
 
     collector.backend_connection_opened(backend);
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].active_connections.get(), 2);
 
     collector.backend_connection_closed(backend);
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].active_connections.get(), 1);
 }
 
@@ -295,21 +295,21 @@ fn test_health_status_recording() {
     let backend = BackendId::from_index(0);
 
     collector.set_backend_health(backend, HealthStatus::Healthy);
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(
         snapshot.backend_stats[0].health_status,
         HealthStatus::Healthy
     );
 
     collector.set_backend_health(backend, HealthStatus::Degraded);
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(
         snapshot.backend_stats[0].health_status,
         HealthStatus::Degraded
     );
 
     collector.set_backend_health(backend, HealthStatus::Down);
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].health_status, HealthStatus::Down);
 }
 
@@ -322,7 +322,7 @@ fn test_user_connection_opened() {
     collector.user_connection_opened(Some("user1"));
     collector.user_connection_opened(Some("user2"));
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
 
     let user1 = snapshot
         .user_stats
@@ -349,7 +349,7 @@ fn test_user_connection_closed() {
     collector.user_connection_opened(Some("user1"));
     collector.user_connection_opened(Some("user1"));
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     let user1 = snapshot
         .user_stats
         .iter()
@@ -359,7 +359,7 @@ fn test_user_connection_closed() {
 
     collector.user_connection_closed(Some("user1"));
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     let user1 = snapshot
         .user_stats
         .iter()
@@ -377,7 +377,7 @@ fn test_anonymous_user_tracking() {
     collector.user_connection_opened(None);
     collector.user_connection_opened(None);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     let anon = snapshot
         .user_stats
         .iter()
@@ -396,7 +396,7 @@ fn test_user_bytes_sent() {
     collector.user_bytes_sent(Some("user1"), 1000);
     collector.user_bytes_sent(Some("user1"), 2000);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     let user1 = snapshot
         .user_stats
         .iter()
@@ -414,7 +414,7 @@ fn test_user_bytes_received() {
     collector.user_bytes_received(Some("user1"), 500);
     collector.user_bytes_received(Some("user1"), 700);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     let user1 = snapshot
         .user_stats
         .iter()
@@ -433,7 +433,7 @@ fn test_user_command_tracking() {
     collector.user_command(Some("user1"));
     collector.user_command(Some("user1"));
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     let user1 = snapshot
         .user_stats
         .iter()
@@ -451,7 +451,7 @@ fn test_user_error_tracking() {
     collector.user_error(Some("user1"));
     collector.user_error(Some("user1"));
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     let user1 = snapshot
         .user_stats
         .iter()
@@ -480,7 +480,7 @@ fn test_multiple_users_simultaneously() {
     collector.user_connection_opened(None);
     collector.user_command(None);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.user_stats.len(), 3);
 
     let user1 = snapshot
@@ -513,7 +513,7 @@ fn test_snapshot_total_bytes() {
     collector.record_client_to_backend_bytes_for(backend1, 300);
     collector.record_backend_to_client_bytes_for(backend1, 400);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.client_to_backend_bytes.as_u64(), 400);
     assert_eq!(snapshot.backend_to_client_bytes.as_u64(), 600);
 }
@@ -525,7 +525,7 @@ fn test_uptime_tracking() {
 
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert!(snapshot.uptime.as_millis() >= 10);
 }
 
@@ -554,7 +554,7 @@ fn test_concurrent_metric_updates() {
         handle.join().unwrap();
     }
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1000);
 }
 
@@ -574,7 +574,7 @@ fn test_zero_backends() {
     let collector = MetricsCollector::new(0);
     assert_eq!(collector.num_backends(), 0);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats.len(), 0);
 }
 
@@ -584,7 +584,7 @@ fn test_large_number_of_backends() {
     let collector = MetricsCollector::new(100);
     assert_eq!(collector.num_backends(), 100);
 
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats.len(), 100);
 }
 
@@ -600,6 +600,6 @@ fn test_invalid_backend_graceful() {
     collector.record_client_to_backend_bytes_for(invalid_backend, 100);
 
     // Should have no effect
-    let snapshot = collector.snapshot();
+    let snapshot = collector.snapshot(None);
     assert_eq!(snapshot.backend_stats[0].total_commands.get(), 0);
 }

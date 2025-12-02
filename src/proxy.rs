@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthHandler;
+use crate::cache::ArticleCache;
 use crate::config::{Config, RoutingMode, Server};
 use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
@@ -198,6 +199,26 @@ impl NntpProxyBuilder {
             }
         };
 
+        // Create article cache if configured
+        let cache = if let Some(cache_config) = &self.config.cache {
+            if cache_config.max_capacity.get() > 0 {
+                let cache =
+                    ArticleCache::new(cache_config.max_capacity.get() as u64, cache_config.ttl);
+                info!(
+                    "Article cache enabled: max_capacity={}, ttl={}s",
+                    cache_config.max_capacity.get(),
+                    cache_config.ttl.as_secs()
+                );
+                Some(Arc::new(cache))
+            } else {
+                debug!("Article cache disabled (max_capacity=0)");
+                None
+            }
+        } else {
+            debug!("Article cache disabled (not configured)");
+            None
+        };
+
         Ok(NntpProxy {
             servers,
             router,
@@ -208,6 +229,7 @@ impl NntpProxyBuilder {
             metrics,
             enable_metrics: self.enable_metrics,
             connection_stats: ConnectionStatsAggregator::new(),
+            cache,
         })
     }
 }
@@ -231,6 +253,8 @@ pub struct NntpProxy {
     enable_metrics: bool,
     /// Connection statistics aggregator (reduces log spam)
     connection_stats: ConnectionStatsAggregator,
+    /// Article cache (enabled when config.cache.max_capacity > 0)
+    cache: Option<Arc<ArticleCache>>,
 }
 
 /// Classify an error as a client disconnect (broken pipe/connection reset)
@@ -438,6 +462,13 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
+    /// Get the article cache (if enabled via config)
+    #[must_use]
+    #[inline]
+    pub fn cache(&self) -> Option<&Arc<crate::cache::ArticleCache>> {
+        self.cache.as_ref()
+    }
+
     /// Get the metrics collector
     #[must_use]
     #[inline]
@@ -553,7 +584,7 @@ impl NntpProxy {
         self.optimize_tcp_connections(&client_stream, &ConnectionOptimizer::new(&backend_conn));
 
         // Create session and handle connection
-        let session = self.build_session(client_addr, None, self.routing_mode, None);
+        let session = self.build_session(client_addr, None, self.routing_mode, self.cache.clone());
         let session_id = crate::formatting::short_id(session.client_id().as_uuid());
 
         debug!("Starting session for client {}", client_addr);
@@ -631,17 +662,6 @@ impl NntpProxy {
         Ok(())
     }
 
-    /// Handle client connection using per-command routing with article caching
-    pub async fn handle_client_with_cache(
-        &self,
-        client_stream: TcpStream,
-        client_addr: ClientAddress,
-        cache: Arc<crate::cache::ArticleCache>,
-    ) -> Result<()> {
-        self.handle_per_command_session(client_stream, client_addr, Some(cache))
-            .await
-    }
-
     /// Handle client connection using per-command routing mode
     ///
     /// This creates a session with the router, allowing commands from this client
@@ -651,7 +671,7 @@ impl NntpProxy {
         client_stream: TcpStream,
         client_addr: ClientAddress,
     ) -> Result<()> {
-        self.handle_per_command_session(client_stream, client_addr, None)
+        self.handle_per_command_session(client_stream, client_addr, self.cache.clone())
             .await
     }
 

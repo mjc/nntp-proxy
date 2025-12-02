@@ -1163,7 +1163,7 @@ mod tests {
         session.user_bytes_received(2048);
 
         // Verify metrics were recorded (snapshot should have data)
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert!(!snapshot.backend_stats.is_empty());
         assert!(snapshot.backend_stats[0].total_commands.get() > 0);
     }
@@ -1184,7 +1184,7 @@ mod tests {
         let backend_id = BackendId::from_index(0);
         session.record_command(backend_id);
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
         session.user_bytes_sent(1024);
         session.user_bytes_received(2048);
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         let user_stats = snapshot
             .user_stats
             .iter()
@@ -1230,12 +1230,12 @@ mod tests {
 
         session.stateful_session_started();
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.stateful_sessions, 1);
 
         session.stateful_session_ended();
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.stateful_sessions, 0);
     }
 }

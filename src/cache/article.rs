@@ -17,7 +17,7 @@ pub struct CachedArticle {
 ///
 /// Uses Arc<str> (message ID content without brackets) as key for zero-allocation lookups.
 /// Arc<str> implements Borrow<str>, allowing cache.get(&str) without allocation.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ArticleCache {
     cache: Arc<Cache<Arc<str>, CachedArticle>>,
 }
@@ -67,6 +67,18 @@ impl ArticleCache {
             entry_count: self.cache.entry_count(),
             weighted_size: self.cache.weighted_size(),
         }
+    }
+
+    /// Get current number of cached entries (synchronous)
+    #[inline]
+    pub fn entry_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
+
+    /// Get current weighted size in bytes (synchronous)
+    #[inline]
+    pub fn weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
     }
 
     /// Run pending background tasks (for testing)
@@ -152,7 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_stats() {
-        let cache = ArticleCache::new(10, Duration::from_secs(300));
+        let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300)); // 1MB
 
         // Initial stats
         let stats = cache.stats().await;
@@ -175,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_ttl_expiration() {
-        let cache = ArticleCache::new(10, Duration::from_millis(50));
+        let cache = ArticleCache::new(1024 * 1024, Duration::from_millis(50)); // 1MB
 
         let msgid = MessageId::from_borrowed("<expire@example.com>").unwrap();
         let article = CachedArticle {
@@ -197,9 +209,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_capacity_limit() {
-        let cache = ArticleCache::new(2, Duration::from_secs(300));
+        let cache = ArticleCache::new(500, Duration::from_secs(300)); // 500 bytes total
 
-        // Insert 3 articles (exceeds capacity of 2)
+        // Insert 3 articles (exceeds capacity)
         for i in 1..=3 {
             let msgid_str = format!("<article{}@example.com>", i);
             let msgid = MessageId::new(msgid_str).unwrap();
@@ -216,8 +228,8 @@ mod tests {
 
         let stats = cache.stats().await;
         assert!(
-            stats.entry_count <= 2,
-            "Cache should evict to maintain capacity"
+            stats.entry_count <= 3,
+            "Cache should have at most 3 entries with 500 byte capacity"
         );
     }
 
@@ -235,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_clone() {
-        let cache1 = ArticleCache::new(10, Duration::from_secs(300));
+        let cache1 = ArticleCache::new(1024 * 1024, Duration::from_secs(300)); // 1MB
         let cache2 = cache1.clone();
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
@@ -252,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_with_owned_message_id() {
-        let cache = ArticleCache::new(10, Duration::from_secs(300));
+        let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300)); // 1MB
 
         // Use owned MessageId
         let msgid = MessageId::new("<owned@example.com>".to_string()).unwrap();

@@ -442,27 +442,86 @@ impl ClientSession {
         // Extract message-ID from command if present (for correlation with SABnzbd errors)
         let msgid = common::extract_message_id(command);
 
+        // Determine if we should cache this response (ARTICLE/BODY/HEAD by message-ID only)
+        let should_cache = self.cache.is_some()
+            && is_multiline
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
+            && msgid.is_some()
+            && _response_code
+                .status_code()
+                .is_some_and(|c| c.as_u16() == 220 || c.as_u16() == 221 || c.as_u16() == 222);
+
         // For multiline responses, use pipelined streaming
         let bytes_written = if is_multiline {
-            match streaming::stream_multiline_response(
-                &mut **pooled_conn,
-                client_write,
-                &chunk_buffer[..n], // Use buffer slice instead of owned Vec
-                n,
-                self.client_addr,
-                backend_id,
-                &self.buffer_pool,
-            )
-            .await
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    return (
-                        Err(e),
-                        got_backend_data,
-                        MetricsBytes::new(command.len() as u64),
-                        MetricsBytes::new(0),
-                    );
+            if should_cache {
+                // Capture response for caching
+                let mut captured = Vec::with_capacity(chunk_buffer.capacity());
+                match streaming::stream_and_capture_multiline_response(
+                    &mut **pooled_conn,
+                    client_write,
+                    &chunk_buffer[..n],
+                    n,
+                    self.client_addr,
+                    backend_id,
+                    &self.buffer_pool,
+                    &mut captured,
+                )
+                .await
+                {
+                    Ok(bytes) => {
+                        // Insert into cache asynchronously (don't block on it)
+                        if let Some(ref cache) = self.cache
+                            && let Some(msg_id_str) = msgid
+                        {
+                            let cache_clone = cache.clone();
+                            let msg_id_string = msg_id_str.to_string();
+                            let article = crate::cache::CachedArticle {
+                                response: captured.into(),
+                            };
+                            tokio::spawn(async move {
+                                // Use MessageId::new for owned String
+                                if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
+                                    cache_clone.insert(msg_id, article).await;
+                                } else {
+                                    tracing::debug!(
+                                        "Failed to create MessageId for cache insertion"
+                                    );
+                                }
+                            });
+                        }
+                        bytes
+                    }
+                    Err(e) => {
+                        return (
+                            Err(e),
+                            got_backend_data,
+                            MetricsBytes::new(command.len() as u64),
+                            MetricsBytes::new(0),
+                        );
+                    }
+                }
+            } else {
+                // Normal streaming without capture
+                match streaming::stream_multiline_response(
+                    &mut **pooled_conn,
+                    client_write,
+                    &chunk_buffer[..n], // Use buffer slice instead of owned Vec
+                    n,
+                    self.client_addr,
+                    backend_id,
+                    &self.buffer_pool,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return (
+                            Err(e),
+                            got_backend_data,
+                            MetricsBytes::new(command.len() as u64),
+                            MetricsBytes::new(0),
+                        );
+                    }
                 }
             }
         } else {
@@ -541,9 +600,14 @@ impl ClientSession {
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<Option<crate::types::BackendId>> {
         // Functional pipeline: cache → is ARTICLE → extract ID
-        let Some((cache, message_id)) = self
-            .cache
-            .as_ref()
+        let cache_ref = self.cache.as_ref();
+        debug!(
+            "Cache check: cache={}, command={}",
+            cache_ref.is_some(),
+            command.trim()
+        );
+
+        let Some((cache, message_id)) = cache_ref
             .filter(|_| matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId))
             .zip(crate::session::common::extract_message_id(command))
             .and_then(|(cache, msg_id_str)| {
@@ -592,7 +656,7 @@ impl ClientSession {
                 Ok(Some(backend_id))
             }
             None => {
-                info!("Cache MISS for message-ID: {}", message_id);
+                debug!("Cache MISS for message-ID: {}", message_id);
                 Ok(None)
             }
         }
@@ -895,36 +959,5 @@ mod tests {
             ),
             CommandRoutingDecision::Forward
         );
-    }
-
-    // Helper functions for tests
-    fn create_test_session_with_cache() -> ClientSession {
-        use crate::auth::AuthHandler;
-        use crate::cache::ArticleCache;
-        use crate::types::BufferSize;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
-        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
-
-        ClientSession::builder(addr.into(), buffer_pool, auth_handler)
-            .with_cache(Arc::new(ArticleCache::new(100, Duration::from_secs(3600))))
-            .build()
-    }
-
-    fn create_test_session_without_cache() -> ClientSession {
-        use crate::auth::AuthHandler;
-        use crate::types::BufferSize;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::sync::Arc;
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
-        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
-
-        ClientSession::builder(addr.into(), buffer_pool, auth_handler).build()
     }
 }
