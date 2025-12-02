@@ -2,7 +2,8 @@
 
 use crate::auth::AuthHandler;
 use crate::command::AuthAction;
-use crate::types::BytesTransferred;
+use crate::types::BackendToClientBytes;
+
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -15,16 +16,16 @@ pub(crate) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthResult {
     /// Authentication succeeded
-    Authenticated(BytesTransferred),
+    Authenticated(BackendToClientBytes),
     /// Authentication failed or not required yet
-    NotAuthenticated(BytesTransferred),
+    NotAuthenticated(BackendToClientBytes),
 }
 
 /// Result of checking for QUIT command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuitStatus {
     /// QUIT command was detected and response sent (contains bytes written)
-    Quit(BytesTransferred),
+    Quit(BackendToClientBytes),
     /// Not a QUIT command
     Continue,
 }
@@ -60,8 +61,7 @@ where
         authenticated.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    let mut bytes_written = BytesTransferred::zero();
-    bytes_written.add(bytes);
+    let bytes_written = BackendToClientBytes::new(bytes as u64);
 
     Ok(if auth_success {
         AuthResult::Authenticated(bytes_written)
@@ -88,8 +88,7 @@ where
                 tracing::debug!("Failed to write CONNECTION_CLOSING: {}", e);
             })?;
 
-        let mut bytes = BytesTransferred::zero();
-        bytes.add(CONNECTION_CLOSING.len());
+        let bytes = BackendToClientBytes::new(CONNECTION_CLOSING.len() as u64);
         Ok(QuitStatus::Quit(bytes))
     } else {
         Ok(QuitStatus::Continue)
@@ -216,9 +215,9 @@ mod tests {
 
     #[test]
     fn test_auth_result_equality() {
-        let auth1 = AuthResult::Authenticated(BytesTransferred::new(100));
-        let auth2 = AuthResult::Authenticated(BytesTransferred::new(100));
-        let not_auth = AuthResult::NotAuthenticated(BytesTransferred::new(100));
+        let auth1 = AuthResult::Authenticated(BackendToClientBytes::new(100));
+        let auth2 = AuthResult::Authenticated(BackendToClientBytes::new(100));
+        let not_auth = AuthResult::NotAuthenticated(BackendToClientBytes::new(100));
 
         assert_eq!(auth1, auth2);
         assert_ne!(auth1, not_auth);
@@ -226,8 +225,8 @@ mod tests {
 
     #[test]
     fn test_quit_status_equality() {
-        let quit1 = QuitStatus::Quit(BytesTransferred::new(50));
-        let quit2 = QuitStatus::Quit(BytesTransferred::new(50));
+        let quit1 = QuitStatus::Quit(BackendToClientBytes::new(50));
+        let quit2 = QuitStatus::Quit(BackendToClientBytes::new(50));
         let cont = QuitStatus::Continue;
 
         assert_eq!(quit1, quit2);

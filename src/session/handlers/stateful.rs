@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::command::CommandHandler;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
-use crate::types::{BytesTransferred, TransferMetrics};
+use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 impl ClientSession {
     /// Handle a client connection with a dedicated backend connection (stateful 1:1 mode)
@@ -64,12 +64,12 @@ impl ClientSession {
         let (mut backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
 
-        let mut client_to_backend_bytes = BytesTransferred::zero();
-        let mut backend_to_client_bytes = BytesTransferred::zero();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
 
         // Track last reported values for incremental metrics updates
-        let mut last_reported_c2b = 0u64;
-        let mut last_reported_b2c = 0u64;
+        let mut last_reported_c2b = ClientToBackendBytes::zero();
+        let mut last_reported_b2c = BackendToClientBytes::zero();
 
         // Reuse line buffer to avoid per-iteration allocations
         let mut line = String::with_capacity(COMMAND);
@@ -92,30 +92,14 @@ impl ClientSession {
             // Periodically flush metrics for long-running sessions
             iteration_count += 1;
             if iteration_count >= METRICS_FLUSH_INTERVAL {
-                if let (Some(metrics), Some(bid)) = (self.metrics.as_ref(), backend_id) {
-                    let current_c2b = client_to_backend_bytes.as_u64();
-                    let current_b2c = backend_to_client_bytes.as_u64();
-
-                    let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
-                    let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
-
-                    if delta_c2b > 0 {
-                        metrics.record_client_to_backend_bytes_for(bid, delta_c2b);
-                    }
-                    if delta_b2c > 0 {
-                        metrics.record_backend_to_client_bytes_for(bid, delta_b2c);
-                    }
-
-                    // Report user metrics incrementally
-                    if delta_c2b > 0 {
-                        self.user_bytes_sent(delta_c2b);
-                    }
-                    if delta_b2c > 0 {
-                        self.user_bytes_received(delta_b2c);
-                    }
-
-                    last_reported_c2b = current_c2b;
-                    last_reported_b2c = current_b2c;
+                if let Some(bid) = backend_id {
+                    self.flush_incremental_metrics(
+                        bid,
+                        client_to_backend_bytes,
+                        backend_to_client_bytes,
+                        &mut last_reported_c2b,
+                        &mut last_reported_b2c,
+                    );
                 }
                 iteration_count = 0;
             }
@@ -131,11 +115,11 @@ impl ClientSession {
                             //
                             // Cache the authenticated state to avoid atomic loads on every command.
                             // Once authenticated, we never go back, so caching is safe.
-                            skip_auth_check = skip_auth_check || self.authenticated.load(std::sync::atomic::Ordering::Acquire);
+                            skip_auth_check = self.is_authenticated_cached(skip_auth_check);
                             if skip_auth_check {
                                 // Already authenticated - just forward everything (HOT PATH)
                                 backend_write.write_all(line.as_bytes()).await?;
-                                client_to_backend_bytes.add(line.len());
+                                client_to_backend_bytes = client_to_backend_bytes.add(line.len());
                             } else {
                                 // Not yet authenticated and auth is enabled - check for auth commands
                                 use crate::command::CommandAction;
@@ -145,10 +129,10 @@ impl ClientSession {
                                         // Reject all non-auth commands before authentication
                                         use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
                                         client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
-                                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
+                                        backend_to_client_bytes = backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                                     }
                                     CommandAction::InterceptAuth(auth_action) => {
-                                        backend_to_client_bytes.add_u64(
+                                        backend_to_client_bytes = backend_to_client_bytes.add_u64(
                                             match crate::session::common::handle_auth_command(
                                                 &self.auth_handler,
                                                 auth_action,
@@ -178,7 +162,7 @@ impl ClientSession {
                                     CommandAction::Reject(response) => {
                                         // Send rejection response inline
                                         client_write.write_all(response.as_bytes()).await?;
-                                        backend_to_client_bytes.add(response.len());
+                                        backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                                     }
                                 }
                             }
@@ -198,7 +182,7 @@ impl ClientSession {
                         }
                         Ok(n) => {
                             client_write.write_all(&buffer[..n]).await?;
-                            backend_to_client_bytes.add(n);
+                            backend_to_client_bytes = backend_to_client_bytes.add(n);
                         }
                         Err(e) => {
                             warn!("Error reading from backend for client {}: {}", self.client_addr, e);
@@ -210,36 +194,19 @@ impl ClientSession {
         }
 
         // Report final metrics deltas before session ends
-        if let (Some(metrics), Some(bid)) = (self.metrics.as_ref(), backend_id) {
-            let current_c2b = client_to_backend_bytes.as_u64();
-            let current_b2c = backend_to_client_bytes.as_u64();
-
-            let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
-            let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
-
-            if delta_c2b > 0 {
-                metrics.record_client_to_backend_bytes_for(bid, delta_c2b);
-            }
-            if delta_b2c > 0 {
-                metrics.record_backend_to_client_bytes_for(bid, delta_b2c);
-            }
-
-            // Track final per-user metrics
-            if delta_c2b > 0 {
-                self.user_bytes_sent(delta_c2b);
-            }
-            if delta_b2c > 0 {
-                self.user_bytes_received(delta_b2c);
-            }
-
-            if let Some(ref m) = self.metrics {
-                m.user_connection_closed(self.username().as_deref());
-            }
+        if let Some(bid) = backend_id {
+            self.report_final_metrics(
+                bid,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+                last_reported_c2b.as_u64(),
+                last_reported_b2c.as_u64(),
+            );
         }
 
         Ok(TransferMetrics {
-            client_to_backend: client_to_backend_bytes.into(),
-            backend_to_client: backend_to_client_bytes.into(),
+            client_to_backend: client_to_backend_bytes,
+            backend_to_client: backend_to_client_bytes,
         })
     }
 }

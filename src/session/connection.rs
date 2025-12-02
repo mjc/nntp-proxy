@@ -8,7 +8,7 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::COMMAND;
 use crate::pool::BufferPool;
-use crate::types::{BytesTransferred, TransferMetrics};
+use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 /// Result of bidirectional forwarding
 pub enum ForwardResult {
@@ -29,8 +29,8 @@ pub async fn bidirectional_forward<R, W, B>(
     pooled_conn: &mut B,
     buffer_pool: &BufferPool,
     _client_addr: std::net::SocketAddr,
-    client_to_backend_bytes: BytesTransferred,
-    backend_to_client_bytes: BytesTransferred,
+    client_to_backend_bytes: ClientToBackendBytes,
+    backend_to_client_bytes: BackendToClientBytes,
 ) -> Result<ForwardResult>
 where
     R: AsyncBufReadExt + Unpin,
@@ -55,14 +55,14 @@ where
                             if crate::pool::is_connection_error(&err) {
                                 return Ok(ForwardResult::BackendError(
                                     TransferMetrics {
-                                        client_to_backend: c2b.into(),
-                                        backend_to_client: b2c.into(),
+                                        client_to_backend: c2b,
+                                        backend_to_client: b2c,
                                     }
                                 ));
                             }
                             break;
                         }
-                        c2b.add(n);
+                        c2b = c2b.add(n);
                         command.clear();
                     }
                     Err(e) => {
@@ -81,15 +81,15 @@ where
                             debug!("Client write error: {}", e);
                             break;
                         }
-                        b2c.add(n);
+                        b2c = b2c.add(n);
                     }
                     Err(e) => {
                         let err: anyhow::Error = e.into();
                         if crate::pool::is_connection_error(&err) {
                             return Ok(ForwardResult::BackendError(
                                 TransferMetrics {
-                                    client_to_backend: c2b.into(),
-                                    backend_to_client: b2c.into(),
+                                    client_to_backend: c2b,
+                                    backend_to_client: b2c,
                                 }
                             ));
                         }
@@ -101,8 +101,8 @@ where
     }
 
     Ok(ForwardResult::NormalDisconnect(TransferMetrics {
-        client_to_backend: c2b.into(),
-        backend_to_client: b2c.into(),
+        client_to_backend: c2b,
+        backend_to_client: b2c,
     }))
 }
 

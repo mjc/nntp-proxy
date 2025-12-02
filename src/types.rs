@@ -17,8 +17,7 @@ pub use config::{
 };
 pub use metrics::{
     ArticleBytesTotal, BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent,
-    BytesTransferred, ClientBytes, ClientToBackendBytes, TimingMeasurementCount, TotalConnections,
-    TransferMetrics,
+    ClientBytes, ClientToBackendBytes, TimingMeasurementCount, TotalConnections, TransferMetrics,
 };
 pub use metrics_recording::{
     DirectionalBytes, MetricsBytes, Recorded, RecordingState, TransferDirection, Unrecorded,

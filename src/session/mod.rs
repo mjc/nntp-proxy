@@ -425,6 +425,80 @@ impl ClientSession {
             m.user_bytes_received(self.username().as_deref(), bytes);
         }
     }
+
+    /// Flush incremental metrics for long-running sessions
+    ///
+    /// This should be called periodically (e.g., every 100 iterations) to report
+    /// byte transfer progress for the TUI without waiting until session end.
+    #[inline]
+    pub(crate) fn flush_incremental_metrics(
+        &self,
+        backend_id: crate::types::BackendId,
+        client_to_backend: crate::types::ClientToBackendBytes,
+        backend_to_client: crate::types::BackendToClientBytes,
+        last_reported_c2b: &mut crate::types::ClientToBackendBytes,
+        last_reported_b2c: &mut crate::types::BackendToClientBytes,
+    ) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+
+        let delta_c2b = client_to_backend.saturating_sub(*last_reported_c2b);
+        let delta_b2c = backend_to_client.saturating_sub(*last_reported_b2c);
+
+        if delta_c2b.as_u64() > 0 {
+            metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b.as_u64());
+            self.user_bytes_sent(delta_c2b.as_u64());
+        }
+        if delta_b2c.as_u64() > 0 {
+            metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c.as_u64());
+            self.user_bytes_received(delta_b2c.as_u64());
+        }
+
+        *last_reported_c2b = client_to_backend;
+        *last_reported_b2c = backend_to_client;
+    }
+
+    /// Check if already authenticated (cached for performance)
+    #[inline]
+    pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
+        skip_auth_check
+            || self
+                .authenticated
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Report final session metrics before ending
+    #[inline]
+    pub(crate) fn report_final_metrics(
+        &self,
+        backend_id: crate::types::BackendId,
+        client_to_backend: impl Into<u64>,
+        backend_to_client: impl Into<u64>,
+        last_reported_c2b: u64,
+        last_reported_b2c: u64,
+    ) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+
+        let current_c2b = client_to_backend.into();
+        let current_b2c = backend_to_client.into();
+
+        let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
+        let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
+
+        if delta_c2b > 0 {
+            metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b);
+            self.user_bytes_sent(delta_c2b);
+        }
+        if delta_b2c > 0 {
+            metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c);
+            self.user_bytes_received(delta_b2c);
+        }
+
+        metrics.user_connection_closed(self.username().as_deref());
+    }
 }
 
 #[cfg(test)]

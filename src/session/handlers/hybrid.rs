@@ -10,7 +10,7 @@ use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{error, info, warn};
 
-use crate::types::{BackendToClientBytes, BytesTransferred, ClientToBackendBytes, TransferMetrics};
+use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 impl ClientSession {
     /// Switch from per-command routing to stateful mode by acquiring a dedicated backend connection
@@ -56,8 +56,8 @@ impl ClientSession {
         let mut buffer = self.buffer_pool.acquire().await;
 
         // Track bytes for initial command
-        let mut initial_cmd_bytes = BytesTransferred::zero();
-        let mut initial_resp_bytes = BytesTransferred::zero();
+        let mut initial_cmd_bytes = ClientToBackendBytes::zero();
+        let mut initial_resp_bytes = BackendToClientBytes::zero();
 
         // Execute the initial command that triggered the switch
         let (result, got_backend_data, cmd_bytes, resp_bytes) = self
@@ -110,11 +110,9 @@ impl ClientSession {
         use crate::constants::buffer::COMMAND;
 
         // Add initial command bytes to running totals
-        let mut client_to_backend = client_to_backend_bytes;
-        client_to_backend.add_u64(initial_cmd_bytes.into());
+        let mut client_to_backend = client_to_backend_bytes.add_u64(initial_cmd_bytes.into());
 
-        let mut backend_to_client = backend_to_client_bytes;
-        backend_to_client.add_u64(initial_resp_bytes.into());
+        let mut backend_to_client = backend_to_client_bytes.add_u64(initial_resp_bytes.into());
 
         // Track metrics incrementally for long-running sessions
         const METRICS_FLUSH_INTERVAL: u32 = 100;
@@ -134,20 +132,19 @@ impl ClientSession {
             match client_reader.read_line(&mut command).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    client_to_backend.add(n);
+                    client_to_backend = client_to_backend.add(n);
 
                     // Handle QUIT locally
                     if let common::QuitStatus::Quit(bytes) =
                         common::handle_quit_command(&command, &mut client_write).await?
                     {
-                        backend_to_client.add_u64(bytes.into());
+                        backend_to_client = backend_to_client.add_u64(bytes.into());
                         break;
                     }
 
                     // Execute on dedicated backend connection
-                    let mut cmd_bytes = BytesTransferred::zero();
-                    let mut resp_bytes = BytesTransferred::zero();
-                    cmd_bytes.add(command.len());
+                    let mut cmd_bytes = ClientToBackendBytes::new(command.len() as u64);
+                    let mut resp_bytes = BackendToClientBytes::zero();
 
                     // Record command in metrics
                     self.record_command(backend_id);
@@ -183,8 +180,8 @@ impl ClientSession {
                         self.user_bytes_received(resp_size);
                     }
 
-                    client_to_backend.add_u64(cmd_bytes.into());
-                    backend_to_client.add_u64(resp_bytes.into());
+                    client_to_backend = client_to_backend.add_u64(cmd_bytes.into());
+                    backend_to_client = backend_to_client.add_u64(resp_bytes.into());
 
                     if let Err(e) = result {
                         warn!(
@@ -197,28 +194,13 @@ impl ClientSession {
                     // Periodically flush metrics for long-running sessions
                     iteration_count += 1;
                     if iteration_count >= METRICS_FLUSH_INTERVAL {
-                        if let Some(ref metrics) = self.metrics {
-                            let delta_c2b = client_to_backend.saturating_sub(last_reported_c2b);
-                            let delta_b2c = backend_to_client.saturating_sub(last_reported_b2c);
-
-                            if delta_c2b > 0 {
-                                metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b);
-                            }
-                            if delta_b2c > 0 {
-                                metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c);
-                            }
-
-                            // Report user metrics incrementally as well
-                            if delta_c2b > 0 {
-                                self.user_bytes_sent(delta_c2b);
-                            }
-                            if delta_b2c > 0 {
-                                self.user_bytes_received(delta_b2c);
-                            }
-
-                            last_reported_c2b = client_to_backend;
-                            last_reported_b2c = backend_to_client;
-                        }
+                        self.flush_incremental_metrics(
+                            backend_id,
+                            client_to_backend,
+                            backend_to_client,
+                            &mut last_reported_c2b,
+                            &mut last_reported_b2c,
+                        );
                         iteration_count = 0;
                     }
                 }
