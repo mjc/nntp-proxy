@@ -259,10 +259,16 @@ pub fn spawn_stats_flusher(stats: &crate::metrics::ConnectionStatsAggregator) {
 
 /// Spawn background task to periodically log cache statistics
 ///
-/// Logs every 60 seconds if cache is enabled.
+/// Only spawns if cache is enabled AND debug logging is enabled.
+/// Logs every 60 seconds.
 pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
     use std::sync::Arc;
-    use tracing::info;
+    use tracing::debug;
+
+    // Only spawn if debug logging is enabled
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
 
     if let Some(cache) = proxy.cache() {
         let cache = Arc::clone(cache);
@@ -272,10 +278,14 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 
             loop {
                 interval.tick().await;
-                let stats = cache.stats().await;
-                info!(
-                    "Cache stats: entries={}, size={} bytes",
-                    stats.entry_count, stats.weighted_size
+                let entries = cache.entry_count();
+                let size_bytes = entries.saturating_mul(750_000 + 100);
+                let hit_rate = cache.hit_rate();
+                debug!(
+                    "Cache stats: entries={}, size={} ({:.1}% hit rate)",
+                    entries,
+                    crate::formatting::format_bytes(size_bytes),
+                    hit_rate
                 );
             }
         });

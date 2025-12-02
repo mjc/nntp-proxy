@@ -215,25 +215,6 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 /// * `port` - Port to listen on
 /// * `expected_user` - Expected username
 /// * `expected_pass` - Expected password
-///
-/// # Returns
-/// Handle to the background task running the mock server
-/// Spawn a mock NNTP server that requires authentication
-///
-/// Returns an AbortHandle that automatically cancels the server when dropped.
-/// This ensures fast test cleanup without waiting for graceful shutdown.
-pub fn spawn_mock_server_with_auth(
-    port: u16,
-    server_name: &str,
-    username: &str,
-    password: &str,
-) -> AbortHandle {
-    MockNntpServer::new(port)
-        .with_name(server_name)
-        .with_auth(username, password)
-        .spawn()
-}
-
 /// Create a test configuration with servers on the given ports
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};

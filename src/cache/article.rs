@@ -3,6 +3,7 @@
 use crate::types::MessageId;
 use moka::future::Cache;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Cached article data
@@ -20,6 +21,8 @@ pub struct CachedArticle {
 #[derive(Clone, Debug)]
 pub struct ArticleCache {
     cache: Arc<Cache<Arc<str>, CachedArticle>>,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
 }
 
 impl ArticleCache {
@@ -36,6 +39,8 @@ impl ArticleCache {
 
         Self {
             cache: Arc::new(cache),
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -49,7 +54,16 @@ impl ArticleCache {
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<CachedArticle> {
         // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
         // This is zero-allocation: no Arc<str> is created for the lookup
-        self.cache.get(message_id.without_brackets()).await
+        let result = self.cache.get(message_id.without_brackets()).await;
+
+        if result.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        result
     }
 
     /// Store an article in the cache
@@ -79,6 +93,20 @@ impl ArticleCache {
     #[inline]
     pub fn weighted_size(&self) -> u64 {
         self.cache.weighted_size()
+    }
+
+    /// Get cache hit rate as percentage (0.0 to 100.0)
+    #[inline]
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+
+        if total == 0 {
+            0.0
+        } else {
+            (hits as f64 / total as f64) * 100.0
+        }
     }
 
     /// Run pending background tasks (for testing)

@@ -643,7 +643,7 @@ impl ClientSession {
     ) -> Result<Option<crate::types::BackendId>> {
         match cache.get(&message_id).await {
             Some(cached) => {
-                info!(
+                debug!(
                     "Cache HIT for message-ID: {} (size: {} bytes)",
                     message_id,
                     cached.response.len()

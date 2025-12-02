@@ -436,14 +436,15 @@ impl MetricsCollector {
             .map(|b| b.bytes_received.as_u64())
             .sum();
 
-        let (cache_entries, cache_size_bytes) = cache
+        let (cache_entries, cache_size_bytes, cache_hit_rate) = cache
             .map(|c| {
                 let entries = c.entry_count();
                 // Estimate: ~750KB per article + 100 bytes overhead
                 let estimated_size = entries.saturating_mul(750_000 + 100);
-                (entries, estimated_size)
+                let hit_rate = c.hit_rate();
+                (entries, estimated_size, hit_rate)
             })
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0.0));
 
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),
@@ -456,6 +457,7 @@ impl MetricsCollector {
             user_stats,
             cache_entries,
             cache_size_bytes,
+            cache_hit_rate,
         }
     }
 

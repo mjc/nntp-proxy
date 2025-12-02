@@ -11,7 +11,7 @@ pub mod layout {
     use ratatui::layout::Constraint;
 
     pub const TITLE_HEIGHT: u16 = 3;
-    pub const SUMMARY_HEIGHT: u16 = 7; // Increased to fit cache stats
+    pub const SUMMARY_HEIGHT: u16 = 6; // 3 columns with 4 lines each
     pub const FOOTER_HEIGHT: u16 = 3;
     pub const MIN_CHART_HEIGHT: u16 = 8; // Reduced to fit cache stats in summary
 
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn test_layout_constants() {
         assert_eq!(layout::TITLE_HEIGHT, 3);
-        assert_eq!(layout::SUMMARY_HEIGHT, 7);
+        assert_eq!(layout::SUMMARY_HEIGHT, 6);
         assert_eq!(layout::FOOTER_HEIGHT, 3);
         assert_eq!(layout::MIN_CHART_HEIGHT, 8);
         assert_eq!(layout::BACKEND_LIST_WIDTH_PCT, 50);

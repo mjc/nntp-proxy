@@ -150,15 +150,110 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
     let (client_to_backend_str, backend_to_client_str) =
         format_summary_throughput(app.latest_client_throughput());
 
-    // Split summary box into two columns
+    // Split summary box into three columns
     use ratatui::layout::Constraint;
     let summary_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
         .split(area);
 
-    // Left half: Throughput and transfer stats
+    // Left: App summary (uptime, sessions)
     let left_summary = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Uptime: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                snapshot.format_uptime(),
+                Style::default().fg(styles::VALUE_PRIMARY),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Stateful Sessions: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{}", snapshot.stateful_sessions),
+                Style::default().fg(if snapshot.stateful_sessions > 0 {
+                    styles::VALUE_PRIMARY
+                } else {
+                    styles::VALUE_NEUTRAL
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("CPU: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{:.1}%", system_stats.cpu_usage),
+                Style::default().fg(if system_stats.cpu_usage > 80.0 {
+                    Color::Red
+                } else if system_stats.cpu_usage > 50.0 {
+                    Color::Yellow
+                } else {
+                    styles::VALUE_INFO
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Memory: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(system_stats.memory_bytes),
+                Style::default().fg(styles::VALUE_INFO),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("App")
+            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
+    )
+    .alignment(Alignment::Left);
+
+    // Middle: Cache summary
+    let middle_summary = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Entries: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{}", snapshot.cache_entries),
+                Style::default().fg(if snapshot.cache_entries > 0 {
+                    styles::VALUE_INFO
+                } else {
+                    styles::VALUE_NEUTRAL
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Size: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format_bytes(snapshot.cache_size_bytes),
+                Style::default().fg(styles::VALUE_NEUTRAL),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Hit Rate: ", Style::default().fg(styles::LABEL)),
+            Span::styled(
+                format!("{:.1}%", snapshot.cache_hit_rate),
+                Style::default().fg(if snapshot.cache_hit_rate > 50.0 {
+                    styles::VALUE_PRIMARY
+                } else if snapshot.cache_hit_rate > 0.0 {
+                    styles::VALUE_INFO
+                } else {
+                    styles::VALUE_NEUTRAL
+                }),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Cache")
+            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
+    )
+    .alignment(Alignment::Left);
+
+    // Right: Data transfer summary
+    let right_summary = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Client → Backend: ", Style::default().fg(styles::LABEL)),
             Span::styled(
@@ -176,94 +271,24 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Total Transferred: ", Style::default().fg(styles::LABEL)),
+            Span::styled("Total: ", Style::default().fg(styles::LABEL)),
             Span::styled(
                 format_bytes(snapshot.total_bytes()),
                 Style::default().fg(styles::VALUE_PRIMARY),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("Stateful Sessions: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{}", snapshot.stateful_sessions),
-                Style::default().fg(if snapshot.stateful_sessions > 0 {
-                    styles::VALUE_PRIMARY
-                } else {
-                    styles::VALUE_NEUTRAL
-                }),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Cache Entries: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{}", snapshot.cache_entries),
-                Style::default().fg(if snapshot.cache_entries > 0 {
-                    styles::VALUE_INFO
-                } else {
-                    styles::VALUE_NEUTRAL
-                }),
-            ),
-            Span::styled(" (", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format_bytes(snapshot.cache_size_bytes),
-                Style::default().fg(styles::VALUE_NEUTRAL),
-            ),
-            Span::styled(")", Style::default().fg(styles::LABEL)),
-        ]),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Summary")
-            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
-    )
-    .alignment(Alignment::Left);
-
-    // Right half: System stats
-    let right_summary = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("CPU: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{:.1}%", system_stats.cpu_usage),
-                Style::default().fg(if system_stats.cpu_usage > 80.0 {
-                    Color::Red
-                } else if system_stats.cpu_usage > 50.0 {
-                    Color::Yellow
-                } else {
-                    styles::VALUE_INFO
-                }),
-            ),
-            Span::styled("  (peak: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{:.1}%", system_stats.peak_cpu_usage),
-                Style::default().fg(styles::VALUE_NEUTRAL),
-            ),
-            Span::styled(")", Style::default().fg(styles::LABEL)),
-        ]),
-        Line::from(vec![
-            Span::styled("Memory: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format_bytes(system_stats.memory_bytes),
-                Style::default().fg(styles::VALUE_INFO),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Peak Memory: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format_bytes(system_stats.peak_memory_bytes),
-                Style::default().fg(styles::VALUE_NEUTRAL),
-            ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
+            .title("Data Transfer")
             .border_style(Style::default().fg(styles::BORDER_NORMAL)),
     )
     .alignment(Alignment::Left);
 
     f.render_widget(left_summary, summary_chunks[0]);
-    f.render_widget(right_summary, summary_chunks[1]);
+    f.render_widget(middle_summary, summary_chunks[1]);
+    f.render_widget(right_summary, summary_chunks[2]);
 }
 
 /// Render backend server visualization

@@ -99,6 +99,7 @@ fn test_metrics_snapshot_total_bytes() {
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
         cache_entries: 0,
+        cache_hit_rate: 0.0,
         cache_size_bytes: 0,
     };
 
@@ -117,6 +118,7 @@ fn test_metrics_snapshot_throughput() {
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
         cache_entries: 0,
+        cache_hit_rate: 0.0,
         cache_size_bytes: 0,
     };
 
@@ -143,6 +145,7 @@ fn test_metrics_snapshot_format_uptime() {
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
         cache_entries: 0,
+        cache_hit_rate: 0.0,
         cache_size_bytes: 0,
     };
     assert_eq!(snapshot_secs.format_uptime(), "45s");
@@ -157,6 +160,7 @@ fn test_metrics_snapshot_format_uptime() {
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
         cache_entries: 0,
+        cache_hit_rate: 0.0,
         cache_size_bytes: 0,
     };
     assert_eq!(snapshot_mins.format_uptime(), "3m 5s");
@@ -171,6 +175,7 @@ fn test_metrics_snapshot_format_uptime() {
         backend_stats: Arc::new(vec![]),
         user_stats: vec![],
         cache_entries: 0,
+        cache_hit_rate: 0.0,
         cache_size_bytes: 0,
     };
     assert_eq!(snapshot_hours.format_uptime(), "2h 1m 5s");
@@ -266,6 +271,7 @@ fn test_metrics_snapshot_with_multiple_backends() {
         backend_stats: Arc::new(vec![stats1, stats2]),
         user_stats: vec![],
         cache_entries: 0,
+        cache_hit_rate: 0.0,
         cache_size_bytes: 0,
     };
 
