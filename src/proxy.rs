@@ -286,7 +286,8 @@ impl NntpProxy {
         routing_mode: RoutingMode,
         cache: Option<Arc<crate::cache::ArticleCache>>,
     ) -> ClientSession {
-        let mut builder = ClientSession::builder(
+        // Start with base builder
+        let builder = ClientSession::builder(
             client_addr,
             self.buffer_pool.clone(),
             self.auth_handler.clone(),
@@ -294,17 +295,24 @@ impl NntpProxy {
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone());
 
-        if let Some(r) = router {
-            builder = builder.with_router(r);
-        }
+        // Apply optional router
+        let builder = match router {
+            Some(r) => builder.with_router(r),
+            None => builder,
+        };
 
-        if let Some(c) = cache {
-            builder = builder.with_cache(c);
-        }
+        // Apply optional cache
+        let builder = match cache {
+            Some(c) => builder.with_cache(c),
+            None => builder,
+        };
 
-        if self.enable_metrics {
-            builder = builder.with_metrics(self.metrics.clone());
-        }
+        // Apply optional metrics
+        let builder = if self.enable_metrics {
+            builder.with_metrics(self.metrics.clone())
+        } else {
+            builder
+        };
 
         builder.build()
     }
@@ -444,6 +452,31 @@ impl NntpProxy {
         &self.connection_stats
     }
 
+    /// Apply TCP optimizations to both client and backend streams
+    fn optimize_tcp_connections(&self, client: &TcpStream, backend: &impl NetworkOptimizer) {
+        TcpOptimizer::new(client)
+            .optimize()
+            .map_err(|e| debug!("Failed to optimize client socket: {}", e))
+            .ok();
+
+        backend
+            .optimize()
+            .map_err(|e| debug!("Failed to optimize backend socket: {}", e))
+            .ok();
+    }
+
+    /// Get human-readable routing mode label for logging
+    #[inline]
+    fn get_routing_mode_label(&self, session_mode: crate::session::SessionMode) -> &'static str {
+        use crate::session::SessionMode;
+        match (session_mode, self.routing_mode) {
+            (SessionMode::PerCommand, _) => "per-command",
+            (SessionMode::Stateful, RoutingMode::Stateful) => "standard",
+            (SessionMode::Stateful, RoutingMode::Hybrid) => "hybrid",
+            (SessionMode::Stateful, _) => "stateful",
+        }
+    }
+
     /// Common setup for client connections
     ///
     /// Sends the proxy's greeting immediately to the client.
@@ -506,26 +539,18 @@ impl NntpProxy {
                     "Failed to get pooled connection for {} (client {}): {}",
                     server.name, client_addr, e
                 );
-                let _ = client_stream.write_all(BACKEND_UNAVAILABLE).await;
-                return Err(anyhow::anyhow!(
+                client_stream.write_all(BACKEND_UNAVAILABLE).await?;
+                anyhow::bail!(
                     "Failed to get pooled connection for backend '{}' (client {}): {}",
                     server.name,
                     client_addr,
                     e
-                ));
+                );
             }
         };
 
         // Apply socket optimizations for high-throughput
-        let client_optimizer = TcpOptimizer::new(&client_stream);
-        if let Err(e) = client_optimizer.optimize() {
-            debug!("Failed to optimize client socket: {}", e);
-        }
-
-        let backend_optimizer = ConnectionOptimizer::new(&backend_conn);
-        if let Err(e) = backend_optimizer.optimize() {
-            debug!("Failed to optimize backend socket: {}", e);
-        }
+        self.optimize_tcp_connections(&client_stream, &ConnectionOptimizer::new(&backend_conn));
 
         // Create session and handle connection
         let session = self.build_session(client_addr, None, self.routing_mode, None);
@@ -551,14 +576,7 @@ impl NntpProxy {
         // Record connection statistics if not already recorded during auth
         // (on_authentication_success already records for authenticated sessions)
         if !self.auth_handler.is_enabled() || session.username().is_none() {
-            let routing_mode_str = match session.mode() {
-                crate::session::SessionMode::PerCommand => "per-command",
-                crate::session::SessionMode::Stateful => match self.routing_mode {
-                    RoutingMode::Stateful => "standard",
-                    RoutingMode::Hybrid => "hybrid",
-                    _ => "stateful",
-                },
-            };
+            let routing_mode_str = self.get_routing_mode_label(session.mode());
             self.connection_stats
                 .record_connection(session.username().as_deref(), routing_mode_str);
         }
