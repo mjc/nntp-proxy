@@ -156,7 +156,7 @@ impl ClientSession {
                 action.clone(),
                 skip_auth_check,
                 self.auth_handler.is_enabled(),
-                self.routing_mode,
+                self.mode_state.routing_mode(),
                 &command,
             );
 
@@ -184,7 +184,7 @@ impl ClientSession {
                                 common::on_authentication_success(
                                     self.client_addr,
                                     auth_username.clone(),
-                                    &self.routing_mode,
+                                    &self.mode_state.routing_mode(),
                                     &self.metrics,
                                     self.connection_stats(),
                                     |username| self.set_username(username),

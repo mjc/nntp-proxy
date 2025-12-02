@@ -163,6 +163,7 @@ pub mod connection;
 pub mod error_classification;
 pub mod handlers;
 pub mod metrics_ext;
+pub mod mode_state;
 pub mod routing;
 pub mod streaming;
 
@@ -177,39 +178,10 @@ use crate::types::{ClientAddress, ClientId};
 
 pub use auth_state::AuthState;
 pub use metrics_ext::MetricsRecorder;
+pub use mode_state::{ModeState, SessionMode};
 pub use routing::RoutingDecision;
 
-/// Session mode for hybrid routing
-///
-/// In hybrid mode, sessions can dynamically transition between per-command
-/// and stateful modes. This allows load balancing for stateless commands
-/// while supporting stateful commands by switching to dedicated connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionMode {
-    /// Per-command routing mode - each command can use a different backend
-    ///
-    /// Benefits:
-    /// - Load balancing across multiple backend servers
-    /// - Better resource utilization
-    /// - Fault tolerance (can route around failed backends)
-    ///
-    /// Limitations:
-    /// - Cannot support stateful commands (MODE READER, GROUP, etc.)
-    /// - Slightly higher latency (connection pool overhead)
-    PerCommand,
-
-    /// Stateful mode - using a dedicated backend connection
-    ///
-    /// Benefits:
-    /// - Lowest latency (no pool overhead)
-    /// - Supports stateful commands
-    /// - Simple 1:1 client-to-backend mapping
-    ///
-    /// Limitations:
-    /// - No load balancing (one backend per client)
-    /// - Less efficient resource usage
-    Stateful,
-}
+// SessionMode is now exported from mode_state module
 
 /// Represents an active client session
 pub struct ClientSession {
@@ -219,10 +191,8 @@ pub struct ClientSession {
     client_id: ClientId,
     /// Optional router for per-command routing mode
     router: Option<Arc<BackendSelector>>,
-    /// Current session mode (for hybrid routing)
-    mode: SessionMode,
-    /// Routing mode configuration (Stateful, PerCommand, or Hybrid)
-    routing_mode: RoutingMode,
+    /// Session mode state (encapsulates mode and routing mode)
+    mode_state: ModeState,
     /// Authentication handler
     auth_handler: Arc<AuthHandler>,
     /// Authentication state (encapsulates auth status and username)
@@ -355,8 +325,7 @@ impl ClientSessionBuilder {
             buffer_pool: self.buffer_pool,
             client_id: ClientId::new(),
             router: self.router,
-            mode,
-            routing_mode,
+            mode_state: ModeState::new(mode, routing_mode),
             auth_handler: self.auth_handler,
             auth_state: AuthState::new(),
             metrics: self.metrics,
@@ -379,8 +348,7 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: None,
-            mode: SessionMode::Stateful, // 1:1 mode is always stateful
-            routing_mode: RoutingMode::Stateful,
+            mode_state: ModeState::new(SessionMode::Stateful, RoutingMode::Stateful),
             auth_handler,
             auth_state: AuthState::new(),
             metrics: None,
@@ -406,8 +374,7 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: Some(router),
-            mode: SessionMode::PerCommand, // Starts in per-command mode
-            routing_mode,
+            mode_state: ModeState::new(SessionMode::PerCommand, routing_mode),
             auth_handler,
             auth_state: AuthState::new(),
             metrics: None,
@@ -463,6 +430,10 @@ impl ClientSession {
     }
 
     /// Check if this session is using per-command routing
+    ///
+    /// Returns true if this session has a router available (regardless of current mode).
+    /// This is slightly different from checking routing mode - a session can have a router
+    /// but be in Stateful mode (e.g., after hybrid mode switches).
     #[must_use]
     #[inline]
     pub fn is_per_command_routing(&self) -> bool {
@@ -473,7 +444,7 @@ impl ClientSession {
     #[must_use]
     #[inline]
     pub fn mode(&self) -> SessionMode {
-        self.mode
+        self.mode_state.mode()
     }
 
     /// Get the authenticated username (if any) - zero-cost reference
@@ -783,8 +754,8 @@ mod tests {
         );
 
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
-        assert_eq!(session.mode, SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
     }
 
     #[test]
@@ -802,7 +773,7 @@ mod tests {
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
 
         // PerCommand mode
         let session = ClientSession::new_with_router(
@@ -813,8 +784,8 @@ mod tests {
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::PerCommand);
-        assert_eq!(session.mode, SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::PerCommand);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
 
         // Hybrid mode
         let session = ClientSession::new_with_router(
@@ -825,8 +796,8 @@ mod tests {
             test_auth_handler(),
         );
         assert!(session.is_per_command_routing());
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
-        assert_eq!(session.mode, SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
     }
 
     #[test]
@@ -843,8 +814,8 @@ mod tests {
             test_auth_handler(),
         );
 
-        assert_eq!(session.mode, SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode(), SessionMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
         assert!(session.is_per_command_routing());
     }
 
@@ -902,7 +873,7 @@ mod tests {
         assert_eq!(*session.client_addr, addr);
         assert!(!session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::Stateful);
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
     }
 
     #[test]
@@ -918,7 +889,7 @@ mod tests {
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::PerCommand);
     }
 
     #[test]
@@ -934,7 +905,7 @@ mod tests {
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
     }
 
     #[test]
@@ -951,7 +922,7 @@ mod tests {
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::Stateful);
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
     }
 
     #[test]
@@ -966,7 +937,7 @@ mod tests {
 
         assert!(!session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::Stateful);
-        assert_eq!(session.routing_mode, RoutingMode::Stateful);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Stateful);
     }
 
     #[test]
@@ -1048,7 +1019,7 @@ mod tests {
 
         assert!(session.is_per_command_routing());
         assert_eq!(session.mode(), SessionMode::PerCommand);
-        assert_eq!(session.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(session.mode_state.routing_mode(), RoutingMode::Hybrid);
         assert!(session.metrics.is_some());
     }
 

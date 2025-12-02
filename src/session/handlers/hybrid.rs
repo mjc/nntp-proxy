@@ -24,6 +24,9 @@ impl ClientSession {
     ) -> Result<TransferMetrics> {
         use tokio::io::AsyncBufReadExt;
 
+        // Update mode state (one-way transition from PerCommand to Stateful)
+        self.mode_state.switch_to_stateful();
+
         // Get router to select backend for stateful session
         let Some(router) = self.router.as_ref() else {
             anyhow::bail!("Hybrid mode requires a router");
