@@ -156,6 +156,7 @@
 //!   - Handles connection pool management
 //!   - Distinguishes backend errors from client disconnects
 
+pub mod auth_state;
 pub mod backend;
 pub(crate) mod common;
 pub mod connection;
@@ -166,8 +167,6 @@ pub mod routing;
 pub mod streaming;
 
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
 
 use crate::auth::AuthHandler;
 use crate::config::RoutingMode;
@@ -176,7 +175,7 @@ use crate::pool::BufferPool;
 use crate::router::BackendSelector;
 use crate::types::{ClientAddress, ClientId};
 
-// Re-export for convenience
+pub use auth_state::AuthState;
 pub use metrics_ext::MetricsRecorder;
 pub use routing::RoutingDecision;
 
@@ -226,10 +225,8 @@ pub struct ClientSession {
     routing_mode: RoutingMode,
     /// Authentication handler
     auth_handler: Arc<AuthHandler>,
-    /// Whether client has authenticated (starts false, set true after successful auth)
-    authenticated: AtomicBool,
-    /// Authenticated username (write-once, lock-free reads with cheap clones)
-    username: Arc<OnceLock<Arc<str>>>,
+    /// Authentication state (encapsulates auth status and username)
+    auth_state: AuthState,
     /// Metrics collector for session statistics
     metrics: Option<crate::metrics::MetricsCollector>,
 
@@ -361,8 +358,7 @@ impl ClientSessionBuilder {
             mode,
             routing_mode,
             auth_handler: self.auth_handler,
-            authenticated: AtomicBool::new(false),
-            username: Arc::new(OnceLock::new()),
+            auth_state: AuthState::new(),
             metrics: self.metrics,
             connection_stats: self.connection_stats,
             cache: self.cache,
@@ -386,8 +382,7 @@ impl ClientSession {
             mode: SessionMode::Stateful, // 1:1 mode is always stateful
             routing_mode: RoutingMode::Stateful,
             auth_handler,
-            authenticated: AtomicBool::new(false),
-            username: Arc::new(OnceLock::new()),
+            auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
             cache: None,
@@ -414,8 +409,7 @@ impl ClientSession {
             mode: SessionMode::PerCommand, // Starts in per-command mode
             routing_mode,
             auth_handler,
-            authenticated: AtomicBool::new(false),
-            username: Arc::new(OnceLock::new()),
+            auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
             cache: None,
@@ -483,15 +477,21 @@ impl ClientSession {
     }
 
     /// Get the authenticated username (if any) - zero-cost reference
+    ///\n    /// Returns the authenticated username as an Arc<str> for cheap cloning.
+    /// Returns None if the client has not authenticated yet.
+    #[inline]
     #[must_use]
-    pub fn username(&self) -> Option<&str> {
-        self.username.get().map(|s| s.as_ref())
+    pub fn username(&self) -> Option<Arc<str>> {
+        self.auth_state.username()
     }
 
     /// Set the authenticated username (write-once)
+    ///
+    /// This marks the session as authenticated and stores the username.
+    /// Called after successful authentication with the backend.
     pub(crate) fn set_username(&self, username: Option<String>) {
         if let Some(name) = username {
-            let _ = self.username.set(name.into());
+            self.auth_state.mark_authenticated(name);
         }
     }
 
@@ -511,7 +511,7 @@ impl ClientSession {
 
     #[inline]
     pub(crate) fn user_command(&self) {
-        self.metrics.user_command(self.username());
+        self.metrics.user_command(self.username().as_deref());
     }
 
     #[inline]
@@ -526,12 +526,14 @@ impl ClientSession {
 
     #[inline]
     pub(crate) fn user_bytes_sent(&self, bytes: u64) {
-        self.metrics.user_bytes_sent(self.username(), bytes);
+        self.metrics
+            .user_bytes_sent(self.username().as_deref(), bytes);
     }
 
     #[inline]
     pub(crate) fn user_bytes_received(&self, bytes: u64) {
-        self.metrics.user_bytes_received(self.username(), bytes);
+        self.metrics
+            .user_bytes_received(self.username().as_deref(), bytes);
     }
 
     /// Flush incremental metrics for long-running sessions
@@ -566,12 +568,15 @@ impl ClientSession {
     }
 
     /// Check if already authenticated (cached for performance)
+    ///
+    /// # Arguments
+    /// * `skip_auth_check` - If true, bypasses the authentication check
+    ///
+    /// # Returns
+    /// Returns true if authenticated or if skip_auth_check is true
     #[inline]
     pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
-        skip_auth_check
-            || self
-                .authenticated
-                .load(std::sync::atomic::Ordering::Acquire)
+        self.auth_state.is_authenticated_or_skipped(skip_auth_check)
     }
 
     /// Report final session metrics before ending
@@ -601,7 +606,8 @@ impl ClientSession {
             self.user_bytes_received(delta_b2c);
         }
 
-        self.metrics.user_connection_closed(self.username());
+        self.metrics
+            .user_connection_closed(self.username().as_deref());
     }
 }
 
@@ -1088,7 +1094,7 @@ mod tests {
 
         let username = session.username();
         assert!(username.is_some());
-        assert_eq!(username, Some("testuser"));
+        assert_eq!(username.as_deref(), Some("testuser"));
     }
 
     #[test]
@@ -1116,7 +1122,7 @@ mod tests {
         assert!(username1.is_some());
         assert!(username2.is_some());
         assert_eq!(username1, username2);
-        assert_eq!(username1, Some("testuser"));
+        assert_eq!(username1.as_deref(), Some("testuser"));
     }
 
     #[test]

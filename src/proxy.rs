@@ -327,7 +327,7 @@ impl NntpProxy {
         metrics: &types::TransferMetrics,
     ) {
         self.connection_stats
-            .record_disconnection(session.username(), routing_mode_str);
+            .record_disconnection(session.username().as_deref(), routing_mode_str);
 
         debug!(
             "Session {} [{}] ↑{} ↓{}",
@@ -578,7 +578,7 @@ impl NntpProxy {
         if !self.auth_handler.is_enabled() || session.username().is_none() {
             let routing_mode_str = self.get_routing_mode_label(session.mode());
             self.connection_stats
-                .record_connection(session.username(), routing_mode_str);
+                .record_connection(session.username().as_deref(), routing_mode_str);
         }
 
         // Complete the routing (decrement pending count)

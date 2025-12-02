@@ -210,7 +210,7 @@ impl ClientSession {
 
                     connection::log_client_error(
                         self.client_addr,
-                        self.username(),
+                        self.username().as_deref(),
                         &e,
                         TransferMetrics {
                             client_to_backend,

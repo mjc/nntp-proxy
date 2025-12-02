@@ -44,7 +44,7 @@ pub(crate) async fn handle_auth_command<W>(
     auth_action: AuthAction,
     client_write: &mut W,
     auth_username: &mut Option<String>,
-    authenticated: &std::sync::atomic::AtomicBool,
+    auth_state: &crate::session::AuthState,
 ) -> Result<AuthResult>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -57,8 +57,8 @@ where
         .handle_auth_command(auth_action, client_write, auth_username.as_deref())
         .await?;
 
-    if auth_success {
-        authenticated.store(true, std::sync::atomic::Ordering::Release);
+    if auth_success && let Some(ref username) = *auth_username {
+        auth_state.mark_authenticated(username.clone());
     }
 
     let bytes_written = BackendToClientBytes::new(bytes as u64);

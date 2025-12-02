@@ -138,7 +138,7 @@ impl ClientSession {
                                                 auth_action,
                                                 &mut client_write,
                                                 &mut auth_username,
-                                                &self.authenticated,
+                                                &self.auth_state,
                                             )
                                             .await?
                                             {
