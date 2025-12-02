@@ -5,6 +5,7 @@
 pub mod config;
 pub mod metrics;
 pub mod metrics_recording;
+pub mod network;
 pub mod pool;
 pub mod protocol;
 pub mod tui;
@@ -22,6 +23,7 @@ pub use metrics::{
 pub use metrics_recording::{
     DirectionalBytes, MetricsBytes, Recorded, RecordingState, TransferDirection, Unrecorded,
 };
+pub use network::ClientAddress;
 pub use pool::{
     AvailableConnections, CreatedConnections, InUseConnections, MaxPoolSize, PoolUtilization,
 };

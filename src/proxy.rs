@@ -4,7 +4,6 @@
 //! connection handling, routing, and resource management.
 
 use anyhow::{Context, Result};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -19,6 +18,7 @@ use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, pr
 use crate::protocol::BACKEND_UNAVAILABLE;
 use crate::router;
 use crate::session::ClientSession;
+use crate::types::ClientAddress;
 use crate::types::{self, BufferSize};
 
 /// Builder for constructing an `NntpProxy` with optional configuration overrides
@@ -281,7 +281,7 @@ impl NntpProxy {
     /// Build a session with standard configuration (conditionally enables metrics)
     fn build_session(
         &self,
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
         router: Option<Arc<router::BackendSelector>>,
         routing_mode: RoutingMode,
         cache: Option<Arc<crate::cache::ArticleCache>>,
@@ -320,7 +320,7 @@ impl NntpProxy {
     /// Log session completion and record stats
     fn log_session_completion(
         &self,
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
         routing_mode_str: &str,
@@ -339,7 +339,7 @@ impl NntpProxy {
     }
 
     /// Handle session errors with appropriate logging
-    fn handle_session_error(&self, e: anyhow::Error, client_addr: SocketAddr, session_id: &str) {
+    fn handle_session_error(&self, e: anyhow::Error, client_addr: ClientAddress, session_id: &str) {
         if is_client_disconnect_error(&e) {
             debug!(
                 "Client {} [{}] disconnected: {} (normal for test connections)",
@@ -484,7 +484,7 @@ impl NntpProxy {
     async fn setup_client_connection(
         &self,
         client_stream: &mut TcpStream,
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
     ) -> Result<()> {
         // Send proxy greeting immediately
         // (Backend greetings already consumed during connection creation)
@@ -494,7 +494,7 @@ impl NntpProxy {
     pub async fn handle_client(
         &self,
         mut client_stream: TcpStream,
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
     ) -> Result<()> {
         debug!("New client connection from {}", client_addr);
 
@@ -635,7 +635,7 @@ impl NntpProxy {
     pub async fn handle_client_with_cache(
         &self,
         client_stream: TcpStream,
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
         cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
         self.handle_per_command_session(client_stream, client_addr, Some(cache))
@@ -649,7 +649,7 @@ impl NntpProxy {
     pub async fn handle_client_per_command_routing(
         &self,
         client_stream: TcpStream,
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
     ) -> Result<()> {
         self.handle_per_command_session(client_stream, client_addr, None)
             .await
@@ -659,7 +659,7 @@ impl NntpProxy {
     async fn handle_per_command_session(
         &self,
         client_stream: TcpStream,
-        client_addr: SocketAddr,
+        client_addr: ClientAddress,
         cache: Option<Arc<crate::cache::ArticleCache>>,
     ) -> Result<()> {
         let mode_label = cache.as_ref().map_or("per-command", |_| "caching");

@@ -146,5 +146,7 @@ async fn handle_caching_client(
         .optimize()
         .unwrap_or_else(|e| debug!("Failed to optimize client socket: {}", e));
 
-    proxy.handle_client_with_cache(stream, addr, cache).await
+    proxy
+        .handle_client_with_cache(stream, addr.into(), cache)
+        .await
 }

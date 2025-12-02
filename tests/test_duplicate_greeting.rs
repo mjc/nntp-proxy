@@ -32,7 +32,7 @@ async fn spawn_test_proxy(proxy: NntpProxy, port: u16, _with_auth: bool) {
         while let Ok((stream, addr)) = listener.accept().await {
             let proxy = proxy.clone();
             tokio::spawn(async move {
-                let _ = proxy.handle_client(stream, addr).await;
+                let _ = proxy.handle_client(stream, addr.into()).await;
             });
         }
     });

@@ -49,7 +49,7 @@ async fn test_quit_command_integration() -> Result<()> {
             if let Ok((stream, addr)) = proxy_listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -117,7 +117,7 @@ async fn test_auth_command_integration() -> Result<()> {
             if let Ok((stream, addr)) = proxy_listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }
@@ -233,7 +233,7 @@ async fn test_concurrent_auth_sessions() -> Result<()> {
             if let Ok((stream, addr)) = proxy_listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr).await;
+                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
                 });
             }
         }

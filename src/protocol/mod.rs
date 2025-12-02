@@ -3,7 +3,6 @@
 //! This module contains response parsing and protocol utilities for NNTP communication.
 
 use anyhow::Result;
-use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -41,7 +40,7 @@ pub use responses::{
 /// before we start processing commands.
 pub async fn send_proxy_greeting(
     client_stream: &mut TcpStream,
-    client_addr: SocketAddr,
+    client_addr: impl std::fmt::Display,
 ) -> Result<()> {
     let proxy_greeting = b"200 NNTP Proxy Ready\r\n";
     client_stream.write_all(proxy_greeting).await?;

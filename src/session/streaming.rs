@@ -17,7 +17,7 @@ struct ClientWriteErrorContext<'a> {
     total_bytes: u64,
     partial_data: &'a [u8],
     terminator_found: bool,
-    client_addr: std::net::SocketAddr,
+    client_addr: String,
     backend_id: crate::types::BackendId,
     buffer_pool: &'a crate::pool::BufferPool,
 }
@@ -61,7 +61,7 @@ where
         && let Err(drain_err) = drain_until_terminator(
             backend_read,
             ctx.partial_data,
-            ctx.client_addr,
+            ctx.client_addr.clone(),
             ctx.backend_id,
             ctx.buffer_pool,
         )
@@ -83,7 +83,7 @@ where
 async fn drain_until_terminator<R>(
     backend_read: &mut R,
     initial_tail: &[u8],
-    client_addr: std::net::SocketAddr,
+    client_addr: impl std::fmt::Display,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
 ) -> Result<()>
@@ -123,7 +123,7 @@ pub async fn stream_multiline_response<R, W>(
     client_write: &mut W,
     first_chunk: &[u8],
     first_n: usize,
-    client_addr: std::net::SocketAddr,
+    client_addr: impl std::fmt::Display,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
 ) -> Result<u64>
@@ -166,7 +166,7 @@ where
                     total_bytes,
                     partial_data: &data[..write_len],
                     terminator_found: status.is_found(),
-                    client_addr,
+                    client_addr: client_addr.to_string(),
                     backend_id,
                     buffer_pool,
                 },
@@ -226,7 +226,7 @@ mod tests {
         // Response with terminator already present
         let data = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
         let mut reader = Cursor::new(data);
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -241,7 +241,7 @@ mod tests {
         // Response where terminator spans chunks
         let data = b"220 Article follows\r\nLine 1\r\n.\r\n";
         let mut reader = Cursor::new(data);
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -258,7 +258,7 @@ mod tests {
         // Response without terminator (EOF)
         let data = b"220 Article follows\r\nLine 1\r\nLine 2\r\n";
         let mut reader = Cursor::new(data);
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -274,7 +274,7 @@ mod tests {
         let response = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
         let mut reader = Cursor::new(response);
         let mut writer = Vec::new();
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -301,7 +301,7 @@ mod tests {
         let response = b"220 Article\r\nData\r\n.\r\nExtra";
         let mut reader = Cursor::new(&response[22..]); // Everything after terminator
         let mut writer = Vec::new();
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -331,7 +331,7 @@ mod tests {
         let response = b"220 0 Article follows\r\n.\r\n";
         let mut reader = Cursor::new(b"");
         let mut writer = Vec::new();
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -369,7 +369,7 @@ mod tests {
 
         let mut reader = Cursor::new(&full_response[header.len()..]);
         let mut writer = Vec::new();
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -395,7 +395,7 @@ mod tests {
         // Test that client disconnect after complete chunk logs at debug level
         let mut backend = Cursor::new(b"");
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -405,7 +405,7 @@ mod tests {
             total_bytes: 100,
             partial_data: b"test",
             terminator_found: true,
-            client_addr,
+            client_addr: client_addr.to_string(),
             backend_id,
             buffer_pool: &buffer_pool,
         };
@@ -421,7 +421,7 @@ mod tests {
         // Test that client disconnect mid-chunk logs at warn level
         let mut backend = Cursor::new(b"remaining data\r\n.\r\n");
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -431,7 +431,7 @@ mod tests {
             total_bytes: 500,
             partial_data: b"",
             terminator_found: false, // Need to drain
-            client_addr,
+            client_addr: client_addr.to_string(),
             backend_id,
             buffer_pool: &buffer_pool,
         };
@@ -447,7 +447,7 @@ mod tests {
         let remaining_data = b"more data\r\neven more\r\n.\r\n";
         let mut backend = Cursor::new(remaining_data);
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
-        let client_addr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
@@ -457,7 +457,7 @@ mod tests {
             total_bytes: 10,
             partial_data: b"",
             terminator_found: false,
-            client_addr,
+            client_addr: client_addr.to_string(),
             backend_id,
             buffer_pool: &buffer_pool,
         };

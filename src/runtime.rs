@@ -319,9 +319,9 @@ pub async fn run_accept_loop(
 
                 tokio::spawn(async move {
                     let result = if uses_per_command {
-                        proxy.handle_client_per_command_routing(stream, addr).await
+                        proxy.handle_client_per_command_routing(stream, addr.into()).await
                     } else {
-                        proxy.handle_client(stream, addr).await
+                        proxy.handle_client(stream, addr.into()).await
                     };
 
                     if let Err(e) = result {

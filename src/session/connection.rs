@@ -28,7 +28,7 @@ pub async fn bidirectional_forward<R, W, B>(
     client_write: &mut W,
     pooled_conn: &mut B,
     buffer_pool: &BufferPool,
-    _client_addr: std::net::SocketAddr,
+    _client_addr: impl std::fmt::Display,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: BackendToClientBytes,
 ) -> Result<ForwardResult>
@@ -108,7 +108,7 @@ where
 
 /// Log client disconnect/error with appropriate log level and context
 pub fn log_client_error(
-    client_addr: std::net::SocketAddr,
+    client_addr: impl std::fmt::Display,
     username: Option<&str>,
     error: &std::io::Error,
     metrics: TransferMetrics,
@@ -159,7 +159,7 @@ pub fn log_client_error(
 
 /// Log routing command error with detailed context
 pub fn log_routing_error(
-    client_addr: std::net::SocketAddr,
+    client_addr: impl std::fmt::Display,
     error: &std::io::Error,
     command: &str,
     metrics: TransferMetrics,

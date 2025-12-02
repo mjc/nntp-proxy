@@ -363,7 +363,7 @@ pub async fn read_response(
 /// # Examples
 /// ```ignore
 /// let pool = create_test_buffer_pool();
-/// let session = ClientSession::new(addr, pool, auth_handler);
+/// let session = ClientSession::new(addr.into(), pool, auth_handler);
 /// ```
 pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
     use nntp_proxy::pool::BufferPool;
@@ -379,7 +379,7 @@ pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
 /// # Examples
 /// ```ignore
 /// let auth = create_test_auth_handler();
-/// let session = ClientSession::new(addr, pool, auth);
+/// let session = ClientSession::new(addr.into(), pool, auth);
 /// ```
 pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     use nntp_proxy::auth::AuthHandler;
@@ -411,7 +411,7 @@ pub fn create_test_auth_handler_with(
 /// # Examples
 /// ```ignore
 /// let auth = create_test_auth_handler_disabled();
-/// let session = ClientSession::new(addr, pool, auth);
+/// let session = ClientSession::new(addr.into(), pool, auth);
 /// ```
 pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     use nntp_proxy::auth::AuthHandler;
@@ -443,7 +443,7 @@ pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelecto
 /// # Examples
 /// ```ignore
 /// let addr = create_test_addr();
-/// let session = ClientSession::new(addr, pool, auth);
+/// let session = ClientSession::new(addr.into(), pool, auth);
 /// ```
 pub fn create_test_addr() -> std::net::SocketAddr {
     "127.0.0.1:9999".parse().unwrap()

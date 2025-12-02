@@ -99,7 +99,7 @@ where
 ///
 /// Sets username, records connection stats, updates metrics
 pub(crate) fn on_authentication_success(
-    client_addr: std::net::SocketAddr,
+    client_addr: impl std::fmt::Display,
     username: Option<String>,
     routing_mode: &crate::config::RoutingMode,
     metrics: &Option<crate::metrics::MetricsCollector>,

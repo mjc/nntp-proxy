@@ -48,7 +48,7 @@ async fn test_auth_flow_complete_with_valid_credentials() {
     let proxy_clone = proxy.clone();
     tokio::spawn(async move {
         if let Ok((stream, addr)) = proxy_listener.accept().await {
-            let _ = proxy_clone.handle_client(stream, addr).await;
+            let _ = proxy_clone.handle_client(stream, addr.into()).await;
         }
     });
 
@@ -118,7 +118,7 @@ async fn test_auth_disabled_allows_immediate_commands() {
     let proxy_clone = proxy.clone();
     tokio::spawn(async move {
         if let Ok((stream, addr)) = proxy_listener.accept().await {
-            let _ = proxy_clone.handle_client(stream, addr).await;
+            let _ = proxy_clone.handle_client(stream, addr.into()).await;
         }
     });
 
@@ -173,7 +173,7 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
     let proxy_clone = proxy.clone();
     tokio::spawn(async move {
         if let Ok((stream, addr)) = proxy_listener.accept().await {
-            let _ = proxy_clone.handle_client(stream, addr).await;
+            let _ = proxy_clone.handle_client(stream, addr.into()).await;
         }
     });
 
@@ -236,7 +236,7 @@ async fn test_multiple_clients_with_auth() {
         while let Ok((stream, addr)) = proxy_listener.accept().await {
             let p = proxy_clone.clone();
             tokio::spawn(async move {
-                let _ = p.handle_client(stream, addr).await;
+                let _ = p.handle_client(stream, addr.into()).await;
             });
         }
     });

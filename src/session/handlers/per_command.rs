@@ -1140,7 +1140,7 @@ mod tests {
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 
-        ClientSession::builder(addr, buffer_pool, auth_handler)
+        ClientSession::builder(addr.into(), buffer_pool, auth_handler)
             .with_cache(Arc::new(ArticleCache::new(100, Duration::from_secs(3600))))
             .build()
     }
@@ -1155,6 +1155,6 @@ mod tests {
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 
-        ClientSession::builder(addr, buffer_pool, auth_handler).build()
+        ClientSession::builder(addr.into(), buffer_pool, auth_handler).build()
     }
 }

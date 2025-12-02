@@ -90,7 +90,7 @@ pub async fn send_command_and_read_first_chunk<T>(
     backend_conn: &mut T,
     command: &str,
     backend_id: BackendId,
-    client_addr: std::net::SocketAddr,
+    client_addr: impl std::fmt::Display,
     chunk: &mut PooledBuffer,
 ) -> Result<(usize, NntpResponse, bool, u64, u64, u64)>
 where
