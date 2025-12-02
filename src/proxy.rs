@@ -620,31 +620,32 @@ impl NntpProxy {
         client_addr: SocketAddr,
         cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
-        self.handle_per_command_routing_internal(client_stream, client_addr, Some(cache), "caching")
+        self.handle_per_command_session(client_stream, client_addr, Some(cache))
             .await
     }
 
     /// Handle client connection using per-command routing mode
     ///
     /// This creates a session with the router, allowing commands from this client
-    /// to be routed to different backends based on load balancing.
+    /// to be routed to different backends based on load balancing.  
     pub async fn handle_client_per_command_routing(
         &self,
         client_stream: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        self.handle_per_command_routing_internal(client_stream, client_addr, None, "per-command")
+        self.handle_per_command_session(client_stream, client_addr, None)
             .await
     }
 
-    /// Internal implementation for per-command routing (with optional caching)
-    async fn handle_per_command_routing_internal(
+    /// Handle a per-command routing session with optional caching
+    async fn handle_per_command_session(
         &self,
         client_stream: TcpStream,
         client_addr: SocketAddr,
         cache: Option<Arc<crate::cache::ArticleCache>>,
-        mode_label: &str,
     ) -> Result<()> {
+        let mode_label = cache.as_ref().map_or("per-command", |_| "caching");
+
         debug!(
             "New {} routing client connection from {}",
             mode_label, client_addr
@@ -654,9 +655,10 @@ impl NntpProxy {
         self.record_connection_opened();
 
         // Enable TCP_NODELAY for low latency
-        if let Err(e) = client_stream.set_nodelay(true) {
-            debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e);
-        }
+        client_stream
+            .set_nodelay(true)
+            .map_err(|e| debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e))
+            .ok();
 
         // Create session with optional cache
         let session = self.build_session(
@@ -679,20 +681,16 @@ impl NntpProxy {
                 )
             });
 
-        // Log session results
+        // Log session results and cleanup
         match result {
-            Ok(metrics) => {
-                self.log_session_completion(
-                    client_addr,
-                    &session_id,
-                    &session,
-                    &self.routing_mode.to_string().to_lowercase(),
-                    &metrics,
-                );
-            }
-            Err(e) => {
-                self.handle_session_error(e, client_addr, &session_id);
-            }
+            Ok(metrics) => self.log_session_completion(
+                client_addr,
+                &session_id,
+                &session,
+                &self.routing_mode.to_string().to_lowercase(),
+                &metrics,
+            ),
+            Err(e) => self.handle_session_error(e, client_addr, &session_id),
         }
 
         self.record_connection_closed();
