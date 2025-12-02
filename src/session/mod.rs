@@ -5,6 +5,121 @@
 //! This module handles the lifecycle of a client connection, including
 //! command processing, authentication interception, and data transfer.
 //!
+//! # Quick Start
+//!
+//! ## Basic Stateful Session (1:1 mapping)
+//!
+//! ```no_run
+//! use std::net::SocketAddr;
+//! use std::sync::Arc;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let client_addr: SocketAddr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//!
+//! // Create a simple 1:1 session (no load balancing)
+//! let session = ClientSession::new(client_addr, buffer_pool, auth);
+//! assert_eq!(session.mode(), nntp_proxy::session::SessionMode::Stateful);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Per-Command Routing (Load Balancing)
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::router::BackendSelector;
+//! use nntp_proxy::config::RoutingMode;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let addr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let router = Arc::new(BackendSelector::new());
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//!
+//! // Each command routed to potentially different backend
+//! let session = ClientSession::builder(addr, buffer_pool, auth)
+//!     .with_router(router)
+//!     .with_routing_mode(RoutingMode::PerCommand)
+//!     .build();
+//!
+//! assert!(session.is_per_command_routing());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Hybrid Mode (Best of Both Worlds)
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::router::BackendSelector;
+//! use nntp_proxy::config::RoutingMode;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let addr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let router = Arc::new(BackendSelector::new());
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//!
+//! // Starts in per-command mode, auto-switches to stateful when needed
+//! let session = ClientSession::builder(addr, buffer_pool, auth)
+//!     .with_router(router)
+//!     .with_routing_mode(RoutingMode::Hybrid)
+//!     .build();
+//!
+//! // Initially per-command for load balancing
+//! assert_eq!(session.mode(), nntp_proxy::session::SessionMode::PerCommand);
+//! // Will switch to Stateful automatically on GROUP, NEXT, LAST, etc.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## With Metrics and Caching
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//! use nntp_proxy::session::ClientSession;
+//! use nntp_proxy::pool::BufferPool;
+//! use nntp_proxy::router::BackendSelector;
+//! use nntp_proxy::config::RoutingMode;
+//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::auth::AuthHandler;
+//! use nntp_proxy::metrics::MetricsCollector;
+//! use nntp_proxy::cache::ArticleCache;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let addr = "127.0.0.1:50000".parse()?;
+//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let router = Arc::new(BackendSelector::new());
+//! let auth = Arc::new(AuthHandler::new(None, None)?);
+//! let metrics = MetricsCollector::new(2); // 2 backends
+//! let cache = Arc::new(ArticleCache::new(1000, Duration::from_secs(3600)));
+//!
+//! // Full-featured session with all bells and whistles
+//! let session = ClientSession::builder(addr, buffer_pool, auth)
+//!     .with_router(router)
+//!     .with_routing_mode(RoutingMode::Hybrid)
+//!     .with_metrics(metrics)
+//!     .with_cache(cache)
+//!     .build();
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Architecture Overview
 //!
 //! ## Three Operating Modes
@@ -46,6 +161,8 @@ pub(crate) mod common;
 pub mod connection;
 pub mod error_classification;
 pub mod handlers;
+pub mod metrics_ext;
+pub mod routing;
 pub mod streaming;
 
 use std::net::SocketAddr;
@@ -59,6 +176,10 @@ use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
 use crate::types::ClientId;
+
+// Re-export for convenience
+pub use metrics_ext::MetricsRecorder;
+pub use routing::RoutingDecision;
 
 /// Session mode for hybrid routing
 ///
@@ -362,10 +483,10 @@ impl ClientSession {
         self.mode
     }
 
-    /// Get the authenticated username (if any) - cheap clone via Arc
+    /// Get the authenticated username (if any) - zero-cost reference
     #[must_use]
-    pub fn username(&self) -> Option<Arc<str>> {
-        self.username.get().map(Arc::clone)
+    pub fn username(&self) -> Option<&str> {
+        self.username.get().map(|s| s.as_ref())
     }
 
     /// Set the authenticated username (write-once)
@@ -382,48 +503,36 @@ impl ClientSession {
         self.connection_stats.as_ref()
     }
 
-    // Metrics helper methods - encapsulate Option checks for cleaner handler code
+    // Metrics helper methods - delegate to MetricsRecorder trait
 
     #[inline]
     pub(crate) fn record_command(&self, backend_id: crate::types::BackendId) {
-        if let Some(ref m) = self.metrics {
-            m.record_command(backend_id);
-        }
+        self.metrics.record_command(backend_id);
     }
 
     #[inline]
     pub(crate) fn user_command(&self) {
-        if let Some(ref m) = self.metrics {
-            m.user_command(self.username().as_deref());
-        }
+        self.metrics.user_command(self.username());
     }
 
     #[inline]
     pub(crate) fn stateful_session_started(&self) {
-        if let Some(ref m) = self.metrics {
-            m.stateful_session_started();
-        }
+        self.metrics.stateful_session_started();
     }
 
     #[inline]
     pub(crate) fn stateful_session_ended(&self) {
-        if let Some(ref m) = self.metrics {
-            m.stateful_session_ended();
-        }
+        self.metrics.stateful_session_ended();
     }
 
     #[inline]
     pub(crate) fn user_bytes_sent(&self, bytes: u64) {
-        if let Some(ref m) = self.metrics {
-            m.user_bytes_sent(self.username().as_deref(), bytes);
-        }
+        self.metrics.user_bytes_sent(self.username(), bytes);
     }
 
     #[inline]
     pub(crate) fn user_bytes_received(&self, bytes: u64) {
-        if let Some(ref m) = self.metrics {
-            m.user_bytes_received(self.username().as_deref(), bytes);
-        }
+        self.metrics.user_bytes_received(self.username(), bytes);
     }
 
     /// Flush incremental metrics for long-running sessions
@@ -439,19 +548,17 @@ impl ClientSession {
         last_reported_c2b: &mut crate::types::ClientToBackendBytes,
         last_reported_b2c: &mut crate::types::BackendToClientBytes,
     ) {
-        let Some(ref metrics) = self.metrics else {
-            return;
-        };
-
         let delta_c2b = client_to_backend.saturating_sub(*last_reported_c2b);
         let delta_b2c = backend_to_client.saturating_sub(*last_reported_b2c);
 
         if delta_c2b.as_u64() > 0 {
-            metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b.as_u64());
+            self.metrics
+                .record_client_to_backend_bytes_for(backend_id, delta_c2b.as_u64());
             self.user_bytes_sent(delta_c2b.as_u64());
         }
         if delta_b2c.as_u64() > 0 {
-            metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c.as_u64());
+            self.metrics
+                .record_backend_to_client_bytes_for(backend_id, delta_b2c.as_u64());
             self.user_bytes_received(delta_b2c.as_u64());
         }
 
@@ -478,10 +585,6 @@ impl ClientSession {
         last_reported_c2b: u64,
         last_reported_b2c: u64,
     ) {
-        let Some(ref metrics) = self.metrics else {
-            return;
-        };
-
         let current_c2b = client_to_backend.into();
         let current_b2c = backend_to_client.into();
 
@@ -489,15 +592,17 @@ impl ClientSession {
         let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
 
         if delta_c2b > 0 {
-            metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b);
+            self.metrics
+                .record_client_to_backend_bytes_for(backend_id, delta_c2b);
             self.user_bytes_sent(delta_c2b);
         }
         if delta_b2c > 0 {
-            metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c);
+            self.metrics
+                .record_backend_to_client_bytes_for(backend_id, delta_b2c);
             self.user_bytes_received(delta_b2c);
         }
 
-        metrics.user_connection_closed(self.username().as_deref());
+        self.metrics.user_connection_closed(self.username());
     }
 }
 
@@ -984,7 +1089,7 @@ mod tests {
 
         let username = session.username();
         assert!(username.is_some());
-        assert_eq!(username.as_deref(), Some("testuser"));
+        assert_eq!(username, Some("testuser"));
     }
 
     #[test]
@@ -1012,12 +1117,7 @@ mod tests {
         assert!(username1.is_some());
         assert!(username2.is_some());
         assert_eq!(username1, username2);
-
-        // Arc pointers should be equal (cheap clone)
-        assert!(Arc::ptr_eq(
-            username1.as_ref().unwrap(),
-            username2.as_ref().unwrap()
-        ));
+        assert_eq!(username1, Some("testuser"));
     }
 
     #[test]

@@ -127,7 +127,7 @@ impl ClientSession {
                 Err(e) => {
                     connection::log_client_error(
                         self.client_addr,
-                        self.username().as_deref(),
+                        self.username(),
                         &e,
                         TransferMetrics {
                             client_to_backend: client_to_backend_bytes,
@@ -254,7 +254,7 @@ impl ClientSession {
             );
         }
         if let Some(ref m) = self.metrics {
-            m.user_connection_closed(self.username().as_deref());
+            m.user_connection_closed(self.username());
         }
 
         Ok(TransferMetrics {
@@ -360,7 +360,7 @@ impl ClientSession {
                     );
                     if let Some(ref metrics) = self.metrics {
                         metrics.record_error(backend_id);
-                        metrics.user_error(self.username().as_deref());
+                        metrics.user_error(self.username());
                     }
                     crate::pool::remove_from_pool(pooled_conn);
                 }
