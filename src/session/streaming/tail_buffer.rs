@@ -177,23 +177,6 @@ fn has_spanning_terminator(
     false
 }
 
-/// Check if data ends with the NNTP multiline terminator
-///
-/// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
-/// ```text
-/// Multiline blocks are terminated by a line containing only a period:
-/// CRLF "." CRLF
-/// Which appears in the data stream as: \r\n.\r\n
-/// ```
-///
-/// **Optimization**: Single suffix check, no scanning.
-#[inline]
-pub(crate) fn has_terminator_at_end(data: &[u8]) -> bool {
-    let n = data.len();
-    // Only check for proper RFC 3977 terminator: \r\n.\r\n
-    n >= 5 && data[n - 5..n] == *b"\r\n.\r\n"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
