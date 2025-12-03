@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
@@ -199,24 +200,37 @@ impl NntpProxyBuilder {
             }
         };
 
-        // Create article cache if configured
-        let cache = if let Some(cache_config) = &self.config.cache {
-            if cache_config.max_capacity.get() > 0 {
-                let cache =
-                    ArticleCache::new(cache_config.max_capacity.get() as u64, cache_config.ttl);
-                info!(
-                    "Article cache enabled: max_capacity={}, ttl={}s",
-                    cache_config.max_capacity.get(),
-                    cache_config.ttl.as_secs()
-                );
-                Some(Arc::new(cache))
+        // Create article cache (always enabled for availability tracking)
+        // If max_capacity=0, only tracks which backends have articles (no content caching)
+        let (cache, cache_articles) = if let Some(cache_config) = &self.config.cache {
+            let capacity = cache_config.max_capacity.as_u64();
+            let cache = ArticleCache::new(capacity, cache_config.ttl, cache_config.cache_articles);
+            let cache_articles = cache_config.cache_articles;
+
+            if capacity > 0 {
+                if cache_articles {
+                    info!(
+                        "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
+                        cache_config.max_capacity,
+                        cache_config.ttl.as_secs()
+                    );
+                } else {
+                    info!(
+                        "Article cache enabled: max_capacity={}, ttl={}s (availability-only, bodies not cached)",
+                        cache_config.max_capacity,
+                        cache_config.ttl.as_secs()
+                    );
+                }
             } else {
-                debug!("Article cache disabled (max_capacity=0)");
-                None
+                info!("Backend availability tracking enabled (cache disabled, capacity=0)");
             }
+            (Arc::new(cache), cache_articles)
         } else {
-            debug!("Article cache disabled (not configured)");
-            None
+            debug!("Cache not configured, using availability-only mode (capacity=0)");
+            (
+                Arc::new(ArticleCache::new(0, Duration::from_secs(3600), false)),
+                true,
+            )
         };
 
         Ok(NntpProxy {
@@ -230,6 +244,7 @@ impl NntpProxyBuilder {
             enable_metrics: self.enable_metrics,
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
+            cache_articles,
         })
     }
 }
@@ -253,8 +268,10 @@ pub struct NntpProxy {
     enable_metrics: bool,
     /// Connection statistics aggregator (reduces log spam)
     connection_stats: ConnectionStatsAggregator,
-    /// Article cache (enabled when config.cache.max_capacity > 0)
-    cache: Option<Arc<ArticleCache>>,
+    /// Article cache (always present - tracks backend availability even with capacity=0)
+    cache: Arc<ArticleCache>,
+    /// Whether to cache article bodies (config-driven)
+    cache_articles: bool,
 }
 
 /// Classify an error as a client disconnect (broken pipe/connection reset)
@@ -308,7 +325,7 @@ impl NntpProxy {
         client_addr: ClientAddress,
         router: Option<Arc<router::BackendSelector>>,
         routing_mode: RoutingMode,
-        cache: Option<Arc<crate::cache::ArticleCache>>,
+        cache: Arc<crate::cache::ArticleCache>,
     ) -> ClientSession {
         // Start with base builder
         let builder = ClientSession::builder(
@@ -317,17 +334,13 @@ impl NntpProxy {
             self.auth_handler.clone(),
         )
         .with_routing_mode(routing_mode)
-        .with_connection_stats(self.connection_stats.clone());
+        .with_connection_stats(self.connection_stats.clone())
+        .with_cache(cache)
+        .with_cache_articles(self.cache_articles);
 
         // Apply optional router
         let builder = match router {
             Some(r) => builder.with_router(r),
-            None => builder,
-        };
-
-        // Apply optional cache
-        let builder = match cache {
-            Some(c) => builder.with_cache(c),
             None => builder,
         };
 
@@ -465,8 +478,8 @@ impl NntpProxy {
     /// Get the article cache (if enabled via config)
     #[must_use]
     #[inline]
-    pub fn cache(&self) -> Option<&Arc<crate::cache::ArticleCache>> {
-        self.cache.as_ref()
+    pub fn cache(&self) -> &Arc<crate::cache::ArticleCache> {
+        &self.cache
     }
 
     /// Get the metrics collector
@@ -671,18 +684,22 @@ impl NntpProxy {
         client_stream: TcpStream,
         client_addr: ClientAddress,
     ) -> Result<()> {
-        self.handle_per_command_session(client_stream, client_addr, self.cache.clone())
+        self.handle_per_command_client(client_stream, client_addr, self.cache.clone())
             .await
     }
 
     /// Handle a per-command routing session with optional caching
-    async fn handle_per_command_session(
+    async fn handle_per_command_client(
         &self,
         client_stream: TcpStream,
         client_addr: ClientAddress,
-        cache: Option<Arc<crate::cache::ArticleCache>>,
+        cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
-        let mode_label = cache.as_ref().map_or("per-command", |_| "caching");
+        let mode_label = if cache.entry_count() > 0 {
+            "caching"
+        } else {
+            "per-command"
+        };
 
         debug!(
             "New {} routing client connection from {}",

@@ -439,10 +439,10 @@ impl MetricsCollector {
         let (cache_entries, cache_size_bytes, cache_hit_rate) = cache
             .map(|c| {
                 let entries = c.entry_count();
-                // Estimate: ~750KB per article + 100 bytes overhead
-                let estimated_size = entries.saturating_mul(750_000 + 100);
+                // weighted_size() returns total weight from weigher (bytes)
+                let size_bytes = c.weighted_size();
                 let hit_rate = c.hit_rate();
-                (entries, estimated_size, hit_rate)
+                (entries, size_bytes, hit_rate)
             })
             .unwrap_or((0, 0, 0.0));
 

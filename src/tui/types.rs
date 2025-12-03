@@ -159,12 +159,6 @@ pub struct BackendChartData {
     pub name: String,
     /// Color for this backend's lines
     pub color: Color,
-    /// Data points for sent throughput (x, y) where x is time index (internal)
-    #[allow(dead_code)]
-    sent_points: PointVec,
-    /// Data points for received throughput (x, y) where x is time index (internal)
-    #[allow(dead_code)]
-    recv_points: PointVec,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
     sent_tuples: Vec<(f64, f64)>,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
@@ -180,8 +174,6 @@ impl BackendChartData {
         Self {
             name,
             color,
-            sent_points,
-            recv_points,
             sent_tuples,
             recv_tuples,
         }

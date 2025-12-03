@@ -119,10 +119,7 @@ mod tests {
             }
             Err(e) => {
                 // Some systems might not support these buffer sizes
-                println!(
-                    "Buffer size not supported (expected on some systems): {}",
-                    e
-                );
+                eprintln!("Warning: Failed to set buffer size: {}", e);
             }
         }
     }

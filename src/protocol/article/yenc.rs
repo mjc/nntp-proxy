@@ -251,9 +251,6 @@ mod tests {
         let data = b"=ybegin line=128 size=12 name=test.txt\r\nr\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n=yend size=12 crc32=0337ab3d\r\n";
 
         let result = validate_yenc_structure(data);
-        if let Err(ref e) = result {
-            eprintln!("Validation error: {:?}", e);
-        }
         assert!(result.is_ok());
     }
 

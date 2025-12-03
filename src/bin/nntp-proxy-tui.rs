@@ -114,17 +114,14 @@ fn launch_tui(
                 builder = builder.with_log_buffer(buffer);
             }
 
-            // Add cache if available
-            if let Some(cache) = proxy.cache() {
-                info!(
-                    "Adding cache to TUI: entries={}, size={}",
-                    cache.entry_count(),
-                    cache.weighted_size()
-                );
-                builder = builder.with_cache(cache.clone());
-            } else {
-                info!("No cache available for TUI");
-            }
+            // Add cache (always available now)
+            let cache = proxy.cache();
+            info!(
+                "Adding cache to TUI: entries={}, size={}",
+                cache.entry_count(),
+                cache.weighted_size()
+            );
+            builder = builder.with_cache(cache.clone());
 
             let tui_app = builder.build();
 

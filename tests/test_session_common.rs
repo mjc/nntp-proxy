@@ -13,7 +13,7 @@ mod test_helpers;
 use config_helpers::create_test_server_config;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
-use nntp_proxy::config::{ClientAuth, Config, RoutingMode};
+use nntp_proxy::config::{ClientAuth, Config, RoutingMode, UserCredentials};
 use test_helpers::MockNntpServer;
 
 #[tokio::test]
@@ -102,9 +102,10 @@ async fn test_auth_command_integration() -> Result<()> {
             "backend",
         )],
         client_auth: ClientAuth {
-            users: vec![],
-            username: Some("testuser".to_string()),
-            password: Some("testpass".to_string()),
+            users: vec![UserCredentials {
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            }],
             greeting: None,
         },
         ..Default::default()
@@ -218,9 +219,10 @@ async fn test_concurrent_auth_sessions() -> Result<()> {
             "backend",
         )],
         client_auth: ClientAuth {
-            users: vec![],
-            username: Some("user".to_string()),
-            password: Some("pass".to_string()),
+            users: vec![UserCredentials {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            }],
             greeting: None,
         },
         ..Default::default()

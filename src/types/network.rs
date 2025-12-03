@@ -85,11 +85,12 @@ impl ClientAddress {
     ///
     /// ```
     /// use nntp_proxy::types::ClientAddress;
+    /// use std::net::SocketAddr;
     ///
-    /// let addr = ClientAddress::from("127.0.0.1:8119".parse().unwrap());
+    /// let addr = ClientAddress::from("127.0.0.1:8119".parse::<SocketAddr>().unwrap());
     /// assert!(addr.is_ipv4());
     ///
-    /// let addr6 = ClientAddress::from("[::1]:8119".parse().unwrap());
+    /// let addr6 = ClientAddress::from("[::1]:8119".parse::<SocketAddr>().unwrap());
     /// assert!(!addr6.is_ipv4());
     /// ```
     #[inline]
@@ -104,11 +105,12 @@ impl ClientAddress {
     ///
     /// ```
     /// use nntp_proxy::types::ClientAddress;
+    /// use std::net::SocketAddr;
     ///
-    /// let addr = ClientAddress::from("[::1]:8119".parse().unwrap());
+    /// let addr = ClientAddress::from("[::1]:8119".parse::<SocketAddr>().unwrap());
     /// assert!(addr.is_ipv6());
     ///
-    /// let addr4 = ClientAddress::from("127.0.0.1:8119".parse().unwrap());
+    /// let addr4 = ClientAddress::from("127.0.0.1:8119".parse::<SocketAddr>().unwrap());
     /// assert!(!addr4.is_ipv6());
     /// ```
     #[inline]

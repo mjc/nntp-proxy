@@ -270,26 +270,25 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
         return;
     }
 
-    if let Some(cache) = proxy.cache() {
-        let cache = Arc::clone(cache);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Cache is always present now
+    let cache = Arc::clone(proxy.cache());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            loop {
-                interval.tick().await;
-                let entries = cache.entry_count();
-                let size_bytes = entries.saturating_mul(750_000 + 100);
-                let hit_rate = cache.hit_rate();
-                debug!(
-                    "Cache stats: entries={}, size={} ({:.1}% hit rate)",
-                    entries,
-                    crate::formatting::format_bytes(size_bytes),
-                    hit_rate
-                );
-            }
-        });
-    }
+        loop {
+            interval.tick().await;
+            let entries = cache.entry_count();
+            let size_bytes = entries.saturating_mul(750_000 + 100);
+            let hit_rate = cache.hit_rate();
+            debug!(
+                "Cache stats: entries={}, size={} ({:.1}% hit rate)",
+                entries,
+                crate::formatting::format_bytes(size_bytes),
+                hit_rate
+            );
+        }
+    });
 }
 
 /// Spawn graceful shutdown handler

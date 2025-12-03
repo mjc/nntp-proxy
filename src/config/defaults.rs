@@ -32,13 +32,20 @@ pub fn unhealthy_threshold() -> MaxErrors {
 /// Default cache max capacity (number of articles)
 #[inline]
 pub fn cache_max_capacity() -> CacheCapacity {
-    CacheCapacity::try_new(10000).expect("10000 is non-zero")
+    // 64 MB default (good for availability-only mode)
+    CacheCapacity::try_new(64 * 1024 * 1024).expect("64MB is non-zero")
 }
 
 /// Default cache TTL (1 hour)
 #[inline]
 pub fn cache_ttl() -> Duration {
     Duration::from_secs(3600)
+}
+
+/// Default for caching article bodies (true = full caching)
+#[inline]
+pub fn cache_articles() -> bool {
+    true
 }
 
 /// Default for TLS certificate verification (true for security)

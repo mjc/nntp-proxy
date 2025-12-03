@@ -8,10 +8,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
-/// Threshold for logging detailed transfer info (bytes)
-/// Transfers under this size are considered "small" (test connections, etc.)
-pub(crate) const SMALL_TRANSFER_THRESHOLD: u64 = 500;
-
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthResult {
@@ -231,10 +227,5 @@ mod tests {
 
         assert_eq!(quit1, quit2);
         assert_ne!(quit1, cont);
-    }
-
-    #[test]
-    fn test_small_transfer_threshold() {
-        assert_eq!(SMALL_TRANSFER_THRESHOLD, 500);
     }
 }

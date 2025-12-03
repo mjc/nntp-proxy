@@ -14,6 +14,8 @@ use tokio::net::{TcpListener, TcpStream};
 mod test_helpers;
 use test_helpers::wait_for_server;
 
+use nntp_proxy::config::UserCredentials;
+
 #[tokio::test]
 async fn test_auth_flow_complete_with_valid_credentials() {
     // Use a specific port for testing
@@ -31,9 +33,10 @@ async fn test_auth_flow_complete_with_valid_credentials() {
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuth {
-        users: vec![],
-        username: Some("testuser".to_string()),
-        password: Some("testpass".to_string()),
+        users: vec![UserCredentials {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        }],
         greeting: None,
     };
 
@@ -158,9 +161,10 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuth {
-        users: vec![],
-        username: Some("user".to_string()),
-        password: Some("pass".to_string()),
+        users: vec![UserCredentials {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        }],
         greeting: None,
     };
 
@@ -218,9 +222,10 @@ async fn test_multiple_clients_with_auth() {
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuth {
-        users: vec![],
-        username: Some("user".to_string()),
-        password: Some("pass".to_string()),
+        users: vec![UserCredentials {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        }],
         greeting: None,
     };
 
@@ -342,17 +347,19 @@ async fn test_config_auth_round_trip() {
         health_check: Default::default(),
         cache: None,
         client_auth: ClientAuth {
-            users: vec![],
-            username: Some("testuser".to_string()),
-            password: Some("testpass".to_string()),
+            users: vec![UserCredentials {
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            }],
             greeting: Some("Custom Auth Required".to_string()),
         },
     };
 
     // Verify config
     assert!(config.client_auth.is_enabled());
-    assert_eq!(config.client_auth.username.as_deref(), Some("testuser"));
-    assert_eq!(config.client_auth.password.as_deref(), Some("testpass"));
+    assert_eq!(config.client_auth.users.len(), 1);
+    assert_eq!(config.client_auth.users[0].username, "testuser");
+    assert_eq!(config.client_auth.users[0].password, "testpass");
     assert_eq!(
         config.client_auth.greeting.as_deref(),
         Some("Custom Auth Required")
@@ -366,7 +373,6 @@ async fn test_config_auth_round_trip() {
 
     // Deserialize back
     let config2: Config = toml::from_str(&toml).unwrap();
-    assert_eq!(config.client_auth.username, config2.client_auth.username);
-    assert_eq!(config.client_auth.password, config2.client_auth.password);
+    assert_eq!(config.client_auth.users, config2.client_auth.users);
     assert_eq!(config.client_auth.greeting, config2.client_auth.greeting);
 }

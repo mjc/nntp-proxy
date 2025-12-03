@@ -22,7 +22,7 @@ use test_helpers::MockNntpServer;
 
 /// Create test config with client auth enabled
 fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
-    use nntp_proxy::config::ClientAuth;
+    use nntp_proxy::config::{ClientAuth, UserCredentials};
     Config {
         servers: backend_ports
             .into_iter()
@@ -32,9 +32,10 @@ fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &s
         health_check: Default::default(),
         cache: None,
         client_auth: ClientAuth {
-            users: vec![],
-            username: Some(username.to_string()),
-            password: Some(password.to_string()),
+            users: vec![UserCredentials {
+                username: username.to_string(),
+                password: password.to_string(),
+            }],
             greeting: None,
         },
     }
@@ -316,12 +317,13 @@ async fn test_session_with_disabled_auth() {
 
 #[tokio::test]
 async fn test_config_client_auth_is_enabled() {
-    use nntp_proxy::config::ClientAuth;
+    use nntp_proxy::config::{ClientAuth, UserCredentials};
 
     let config = ClientAuth {
-        users: vec![],
-        username: Some("user".to_string()),
-        password: Some("pass".to_string()),
+        users: vec![UserCredentials {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        }],
         greeting: None,
     };
 
@@ -334,8 +336,6 @@ async fn test_config_client_auth_disabled_missing_username() {
 
     let config = ClientAuth {
         users: vec![],
-        username: None,
-        password: Some("pass".to_string()),
         greeting: None,
     };
 
@@ -348,8 +348,6 @@ async fn test_config_client_auth_disabled_missing_password() {
 
     let config = ClientAuth {
         users: vec![],
-        username: Some("user".to_string()),
-        password: None,
         greeting: None,
     };
 
@@ -362,8 +360,6 @@ async fn test_config_client_auth_disabled_both_missing() {
 
     let config = ClientAuth {
         users: vec![],
-        username: None,
-        password: None,
         greeting: None,
     };
 

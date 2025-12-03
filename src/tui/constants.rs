@@ -68,14 +68,6 @@ pub const BACKEND_COLORS: &[Color] = &[
     Color::Blue,
 ];
 
-/// Status colors
-pub mod status {
-    use ratatui::style::Color;
-
-    #[allow(dead_code)] // May be used in future features
-    pub const WARNING: Color = Color::Yellow;
-}
-
 /// UI text styles
 pub mod styles {
     use ratatui::style::Color;
@@ -98,7 +90,6 @@ pub mod text {
     pub const ARROW_UP: &str = "↑";
     pub const ARROW_DOWN: &str = "↓";
     pub const DEFAULT_CMD_RATE: &str = "0.0";
-    #[allow(dead_code)] // Used in default values
     pub const DEFAULT_THROUGHPUT: &str = "0 B/s";
 }
 
@@ -173,11 +164,6 @@ mod tests {
         assert_eq!(BACKEND_COLORS[3], Color::Magenta);
         assert_eq!(BACKEND_COLORS[4], Color::Red);
         assert_eq!(BACKEND_COLORS[5], Color::Blue);
-    }
-
-    #[test]
-    fn test_status_colors() {
-        assert_eq!(status::WARNING, Color::Yellow);
     }
 
     #[test]

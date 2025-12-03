@@ -191,30 +191,30 @@ impl MockNntpServer {
     }
 }
 
-/// Spawn a mock NNTP server that responds with a greeting
-///
-/// **Deprecated:** Use `MockNntpServer::new(port).with_name(name).spawn()` instead.
-///
-/// # Arguments
-/// * `port` - Port to listen on
-/// * `server_name` - Name to include in greeting message
-///
-/// # Returns
-/// Handle to the background task running the mock server
 /// Spawn a basic mock NNTP server
 ///
 /// Returns an AbortHandle that automatically cancels the server when dropped.
 /// This ensures fast test cleanup without waiting for graceful shutdown.
+///
+/// # Arguments
+/// * `port` - Port to listen on
+/// * `server_name` - Name to include in greeting message
+#[allow(dead_code)]
 pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
     MockNntpServer::new(port).with_name(server_name).spawn()
 }
 
-/// Spawn a mock NNTP server that requires authentication
+/// Get an available port from the OS
 ///
-/// # Arguments
-/// * `port` - Port to listen on
-/// * `expected_user` - Expected username
-/// * `expected_pass` - Expected password
+/// Binds to 127.0.0.1:0 to let the OS assign a random available port,
+/// then immediately releases it for use by the caller.
+pub async fn get_available_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
 /// Create a test configuration with servers on the given ports
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
@@ -239,41 +239,6 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
         proxy: Default::default(),
         health_check: Default::default(),
         cache: Default::default(),
-        client_auth: Default::default(),
-    }
-}
-
-/// Create a test configuration with authentication
-///
-/// # Arguments
-/// * `server_ports` - List of (port, name, user, pass) tuples for backend servers
-///
-/// # Returns
-/// Configuration object ready for use in tests
-#[allow(dead_code)]
-pub fn create_test_config_with_auth(server_ports: Vec<(u16, &str, &str, &str)>) -> Config {
-    use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
-    Config {
-        servers: server_ports
-            .into_iter()
-            .map(|(port, name, user, pass)| Server {
-                host: HostName::try_new("127.0.0.1".to_string()).unwrap(),
-                port: Port::try_new(port).unwrap(),
-                name: ServerName::try_new(name.to_string()).unwrap(),
-                username: Some(user.to_string()),
-                password: Some(pass.to_string()),
-                max_connections: MaxConnections::try_new(5).unwrap(),
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive: None,
-                health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-                health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
-            })
-            .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: None,
         client_auth: Default::default(),
     }
 }
@@ -306,26 +271,6 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
     Ok(())
 }
 
-/// Read a complete NNTP response from a stream
-///
-/// # Arguments
-/// * `stream` - TCP stream to read from
-/// * `buffer` - Buffer to read into
-/// * `timeout_ms` - Timeout in milliseconds
-///
-/// # Returns
-/// Number of bytes read
-#[allow(dead_code)]
-pub async fn read_response(
-    stream: &mut tokio::net::TcpStream,
-    buffer: &mut [u8],
-    timeout_ms: u64,
-) -> Result<usize> {
-    tokio::time::timeout(Duration::from_millis(timeout_ms), stream.read(buffer))
-        .await?
-        .map_err(Into::into)
-}
-
 // ============================================================================
 // Test Factory Functions
 // ============================================================================
@@ -351,67 +296,29 @@ pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
 }
 
 /// Create a test auth handler with standard credentials (user/pass)
-///
-/// Use this instead of repeating `Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap())`.
-///
-/// # Examples
-/// ```ignore
-/// let auth = create_test_auth_handler();
-/// let session = ClientSession::new(addr.into(), pool, auth);
-/// ```
 pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
-    use nntp_proxy::auth::AuthHandler;
-    use std::sync::Arc;
-
-    Arc::new(AuthHandler::new(Some("user".to_string()), Some("pass".to_string())).unwrap())
+    create_test_auth_handler_with("user", "pass")
 }
 
 /// Create a test auth handler with custom credentials
-///
-/// # Examples
-/// ```ignore
-/// let auth = create_test_auth_handler_with("alice", "secret123");
-/// ```
 pub fn create_test_auth_handler_with(
     username: &str,
     password: &str,
 ) -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
-    use nntp_proxy::auth::AuthHandler;
-    use std::sync::Arc;
-
-    Arc::new(AuthHandler::new(Some(username.to_string()), Some(password.to_string())).unwrap())
+    std::sync::Arc::new(
+        nntp_proxy::auth::AuthHandler::new(Some(username.to_string()), Some(password.to_string()))
+            .unwrap(),
+    )
 }
 
 /// Create a disabled (no-auth) test auth handler
-///
-/// Use this instead of repeating `Arc::new(AuthHandler::new(None, None).unwrap())`.
-///
-/// # Examples
-/// ```ignore
-/// let auth = create_test_auth_handler_disabled();
-/// let session = ClientSession::new(addr.into(), pool, auth);
-/// ```
 pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
-    use nntp_proxy::auth::AuthHandler;
-    use std::sync::Arc;
-
-    Arc::new(AuthHandler::new(None, None).unwrap())
+    std::sync::Arc::new(nntp_proxy::auth::AuthHandler::new(None, None).unwrap())
 }
 
 /// Create a test backend selector (router)
-///
-/// Use this instead of repeating `Arc::new(BackendSelector::new())`.
-///
-/// # Examples
-/// ```ignore
-/// let router = create_test_router();
-/// router.add_backend(...);
-/// ```
 pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelector> {
-    use nntp_proxy::router::BackendSelector;
-    use std::sync::Arc;
-
-    Arc::new(BackendSelector::new())
+    std::sync::Arc::new(nntp_proxy::router::BackendSelector::new())
 }
 
 /// Create a test socket address (127.0.0.1:9999)
@@ -427,18 +334,171 @@ pub fn create_test_addr() -> std::net::SocketAddr {
     "127.0.0.1:9999".parse().unwrap()
 }
 
+// ============================================================================
+// Proxy Setup Helpers
+// ============================================================================
+
+/// Setup a proxy with mock backends and return ports + handles
+///
+/// This eliminates the boilerplate of:
+/// 1. Finding available ports
+/// 2. Starting mock backends  
+/// 3. Creating config
+/// 4. Starting proxy with accept loop
+/// 5. Waiting for everything to be ready
+///
+/// Returns: (proxy_port, Vec<backend_port>, Vec<mock_handles>)
+#[allow(dead_code)]
+pub async fn setup_proxy_with_backends(
+    backend_configs: Vec<(&str, bool)>, // (name, has_article)
+    routing_mode: nntp_proxy::RoutingMode,
+) -> Result<(u16, Vec<u16>, Vec<AbortHandle>)> {
+    use nntp_proxy::NntpProxy;
+
+    // Allocate ports using helper
+    let mut backend_ports = Vec::new();
+    for _ in 0..backend_configs.len() {
+        backend_ports.push(get_available_port().await?);
+    }
+
+    let proxy_port = get_available_port().await?;
+    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port)).await?;
+
+    // Start mock backends
+    let mut mock_handles = Vec::new();
+    for (i, (name, has_article)) in backend_configs.iter().enumerate() {
+        let port = backend_ports[i];
+
+        let response = if *has_article {
+            "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+        } else {
+            "430 No such article\r\n"
+        };
+
+        let handle = MockNntpServer::new(port)
+            .with_name(*name)
+            .on_command("DATE", "111 20251203120000\r\n")
+            .on_command("QUIT", "205 Goodbye\r\n")
+            .on_command("ARTICLE", response) // ARTICLE command (any message-ID)
+            .spawn();
+        mock_handles.push(handle);
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create proxy config
+    let config = create_test_config(
+        backend_ports
+            .iter()
+            .zip(backend_configs.iter())
+            .map(|(port, (name, _))| (*port, *name))
+            .collect(),
+    );
+
+    let proxy = NntpProxy::new(config, routing_mode)?;
+
+    // Start proxy accept loop
+    let proxy_for_spawn = proxy.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = proxy_listener.accept().await {
+                let proxy_clone = proxy_for_spawn.clone();
+                let mode = routing_mode;
+                tokio::spawn(async move {
+                    use nntp_proxy::RoutingMode;
+                    let result = match mode {
+                        RoutingMode::PerCommand | RoutingMode::Hybrid => {
+                            proxy_clone
+                                .handle_client_per_command_routing(stream, addr.into())
+                                .await
+                        }
+                        RoutingMode::Stateful => {
+                            proxy_clone.handle_client(stream, addr.into()).await
+                        }
+                    };
+                    if let Err(e) = result {
+                        eprintln!("Proxy error handling client: {}", e);
+                    }
+                });
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    Ok((proxy_port, backend_ports, mock_handles))
+}
+
+/// Connect to proxy and read greeting
+#[allow(dead_code)] // Used by test_430_retry.rs
+pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::TcpStream> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut reader = tokio::io::BufReader::new(&mut stream);
+    let mut line = String::new();
+
+    reader.read_line(&mut line).await?;
+    if !line.starts_with("200") {
+        anyhow::bail!("Expected 200 greeting, got: {}", line);
+    }
+
+    // Return the raw stream (reader consumed it, need to recreate)
+    drop(reader);
+    Ok(stream)
+}
+
+/// Send ARTICLE command and read full multiline response
+#[allow(dead_code)] // Used by test_430_retry.rs
+pub async fn send_article_read_full_response(
+    stream: &mut tokio::net::TcpStream,
+    message_id: &str,
+) -> Result<(String, Vec<String>)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    eprintln!("Sending: ARTICLE {}", message_id);
+    stream
+        .write_all(format!("ARTICLE {}\r\n", message_id).as_bytes())
+        .await?;
+
+    let mut reader = tokio::io::BufReader::new(&mut *stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).await?;
+
+    eprintln!("Received status: {}", status_line.trim());
+
+    let mut body_lines = Vec::new();
+
+    // If 220, read multiline body
+    if status_line.starts_with("220") {
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            if line == ".\r\n" {
+                break;
+            }
+            body_lines.push(line);
+        }
+    }
+
+    Ok((status_line, body_lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_spawn_mock_server() {
-        // Use port 0 to let OS assign a random available port
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener); // Release port for mock server
+    async fn test_get_available_port() {
+        let port = get_available_port().await.unwrap();
+        // Port is u16, so always valid - just verify we got one
+        assert!(port > 0);
+    }
 
-        let _handle = spawn_mock_server(port, "TestServer");
+    #[tokio::test]
+    async fn test_mock_server_basic() {
+        let port = get_available_port().await.unwrap();
+        let _handle = MockNntpServer::new(port).with_name("TestServer").spawn();
 
         // Give server time to start
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -458,10 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_basic() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
+        let port = get_available_port().await.unwrap();
         let _handle = MockNntpServer::new(port).with_name("BuilderTest").spawn();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -480,10 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_with_auth() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
+        let port = get_available_port().await.unwrap();
         let _handle = MockNntpServer::new(port)
             .with_auth("testuser", "testpass")
             .spawn();
@@ -528,10 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_custom_commands() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
+        let port = get_available_port().await.unwrap();
         let _handle = MockNntpServer::new(port)
             .on_command("LIST", "215 list follows\r\n.\r\n")
             .on_command("GROUP", "211 100 1 100 alt.test\r\n")
@@ -574,11 +625,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_server() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let _handle = spawn_mock_server(port, "WaitTest");
+        let port = get_available_port().await.unwrap();
+        let _handle = MockNntpServer::new(port).with_name("WaitTest").spawn();
 
         let result = wait_for_server(&format!("127.0.0.1:{}", port), 20).await;
         assert!(result.is_ok());
