@@ -5,4 +5,4 @@
 
 mod article;
 
-pub use article::{ArticleCache, CachedArticle};
+pub use article::{ArticleCache, ArticleEntry};

@@ -475,9 +475,7 @@ impl ClientSession {
                         {
                             let cache_clone = cache.clone();
                             let msg_id_string = msg_id_str.to_string();
-                            let article = crate::cache::CachedArticle {
-                                response: captured.into(),
-                            };
+                            let article = crate::cache::ArticleEntry::new(captured, backend_id);
                             tokio::spawn(async move {
                                 // Use MessageId::new for owned String
                                 if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
@@ -646,10 +644,10 @@ impl ClientSession {
                 debug!(
                     "Cache HIT for message-ID: {} (size: {} bytes)",
                     message_id,
-                    cached.response.len()
+                    cached.response().len()
                 );
-                client_write.write_all(&cached.response).await?;
-                *backend_to_client_bytes = backend_to_client_bytes.add(cached.response.len());
+                client_write.write_all(cached.response()).await?;
+                *backend_to_client_bytes = backend_to_client_bytes.add(cached.response().len());
 
                 let backend_id = router.route_command(self.client_id, command)?;
                 router.complete_command(backend_id);
