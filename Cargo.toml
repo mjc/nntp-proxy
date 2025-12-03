@@ -49,8 +49,8 @@ dashmap = "6.1"  # Lock-free concurrent HashMap for metrics
 sysinfo = "0.37"  # System metrics (CPU, memory) for monitoring
 
 # Derive helpers to reduce newtype boilerplate
-nutype = { version = "0.5", features = ["serde"] }  # Validated newtypes with automatic derives
-derive_more = { version = "1.0", features = ["deref", "deref_mut", "display", "from", "into", "as_ref"] }  # Common derive macros
+nutype = { version = "0.6", features = ["serde"] }  # Validated newtypes with automatic derives
+derive_more = { version = "2.1", features = ["deref", "deref_mut", "display", "from", "into", "as_ref"] }  # Common derive macros
 
 # TLS dependencies - use ring for smaller binaries (pure Rust, no C dependencies)
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
@@ -60,8 +60,9 @@ rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
 rustls-pki-types = "1.8"  # PKI types for rustls
 webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
 crc32fast = "1.5.0"
-wide = "0.7"  # Portable SIMD (SSE2/AVX2) on stable Rust
+wide = "1.0"  # Portable SIMD (SSE2/AVX2) on stable Rust
 yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
+bytesize = { version = "2.3.1", features = ["serde"] }
 
 
 [dev-dependencies]
