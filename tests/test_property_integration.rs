@@ -199,18 +199,18 @@ proptest! {
 
                 // Either we get a response, or the connection closes
                 // (both are acceptable for malformed input)
-                if let Ok(Ok(n)) = read_result {
-                    if n > 0 {
-                        let response = String::from_utf8_lossy(&buffer[..n]);
-                        // Should be valid NNTP response format
-                        let first_line = response.lines().next().unwrap_or("");
-                        if first_line.len() >= 3 {
-                            assert!(
-                                first_line[0..3].chars().all(|c| c.is_ascii_digit()),
-                                "Invalid response format: {}",
-                                first_line
-                            );
-                        }
+                if let Ok(Ok(n)) = read_result
+                    && n > 0
+                {
+                    let response = String::from_utf8_lossy(&buffer[..n]);
+                    // Should be valid NNTP response format
+                    let first_line = response.lines().next().unwrap_or("");
+                    if first_line.len() >= 3 {
+                        assert!(
+                            first_line[0..3].chars().all(|c| c.is_ascii_digit()),
+                            "Invalid response format: {}",
+                            first_line
+                        );
                     }
                 }
             }

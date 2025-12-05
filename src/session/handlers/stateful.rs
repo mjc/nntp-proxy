@@ -209,4 +209,63 @@ impl ClientSession {
             backend_to_client: backend_to_client_bytes,
         })
     }
+
+    /// Handle stateful routing session - get pooled connection and proxy through it
+    ///
+    /// This is the top-level handler for stateful mode that orchestrates:
+    /// - Acquiring a pooled backend connection
+    /// - Sending client error if connection unavailable
+    /// - Proxying the full session through the dedicated backend
+    /// - Auto-returning connection to pool on completion (via Drop)
+    pub async fn handle_stateful_session(
+        &self,
+        mut client_stream: tokio::net::TcpStream,
+        backend_id: crate::types::BackendId,
+        connection_provider: &crate::pool::DeadpoolConnectionProvider,
+        server_name: &str,
+        enable_metrics: bool,
+    ) -> Result<TransferMetrics> {
+        use crate::protocol::BACKEND_UNAVAILABLE;
+        use tracing::{debug, error};
+
+        // Acquire backend connection
+        let mut backend_conn = match connection_provider.get_pooled_connection().await {
+            Ok(conn) => {
+                debug!("Got pooled connection for {}", server_name);
+                conn
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get pooled connection for {} (client {}): {}",
+                    server_name, self.client_addr, e
+                );
+
+                // Notify client before bailing
+                client_stream.write_all(BACKEND_UNAVAILABLE).await?;
+
+                anyhow::bail!(
+                    "Failed to get pooled connection for backend '{}' (client {}): {}",
+                    server_name,
+                    self.client_addr,
+                    e
+                );
+            }
+        };
+
+        // Proxy session through backend with optional metrics
+        match enable_metrics {
+            true => {
+                self.handle_with_pooled_backend_and_metrics(
+                    client_stream,
+                    &mut *backend_conn,
+                    backend_id,
+                )
+                .await
+            }
+            false => {
+                self.handle_with_pooled_backend(client_stream, &mut *backend_conn)
+                    .await
+            }
+        }
+    }
 }

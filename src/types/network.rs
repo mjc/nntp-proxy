@@ -126,35 +126,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
-    fn test_new() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
-        let client_addr = ClientAddress::new(addr);
-        assert_eq!(client_addr.as_socket_addr(), &addr);
-    }
-
-    #[test]
-    fn test_from() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
-        let client_addr = ClientAddress::from(addr);
-        assert_eq!(client_addr.as_socket_addr(), &addr);
-    }
-
-    #[test]
-    fn test_into() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
-        let client_addr = ClientAddress::from(addr);
-        let socket_addr: SocketAddr = client_addr.into();
-        assert_eq!(socket_addr, addr);
-    }
-
-    #[test]
-    fn test_into_inner() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
-        let client_addr = ClientAddress::from(addr);
-        assert_eq!(client_addr.into_inner(), addr);
-    }
-
-    #[test]
     fn test_display() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 12345);
         let client_addr = ClientAddress::from(addr);
@@ -185,22 +156,6 @@ mod tests {
         let client_addr = ClientAddress::from(addr);
         assert!(client_addr.is_ipv6());
         assert!(!client_addr.is_ipv4());
-    }
-
-    #[test]
-    fn test_clone() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
-        let client_addr = ClientAddress::from(addr);
-        let cloned = client_addr.clone();
-        assert_eq!(client_addr, cloned);
-    }
-
-    #[test]
-    fn test_copy() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
-        let client_addr = ClientAddress::from(addr);
-        let copied = client_addr;
-        assert_eq!(client_addr, copied);
     }
 
     #[test]

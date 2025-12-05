@@ -739,7 +739,7 @@ mod tests {
         for i in 1..=3 {
             let msgid_str = format!("<article{}@example.com>", i);
             let msgid = MessageId::new(msgid_str).unwrap();
-            let article = create_test_article(&msgid.to_string(), BackendId::from_index(0));
+            let article = create_test_article(msgid.as_ref(), BackendId::from_index(0));
             cache.insert(msgid, article).await;
             cache.sync().await; // Force eviction
         }
