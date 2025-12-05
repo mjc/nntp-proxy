@@ -359,7 +359,11 @@ pub async fn run_accept_loop(
                     };
 
                     if let Err(e) = result {
-                        error!("Error handling client {}: {}", addr, e);
+                        // Only log non-client-disconnect errors (avoid duplicate logging)
+                        // Client disconnects are already handled gracefully in session handlers
+                        if !crate::is_client_disconnect_error(&e) {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
                     }
                 });
             }

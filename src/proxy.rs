@@ -529,13 +529,14 @@ impl NntpProxy {
         Ok(backend_id)
     }
 
-    /// Prepare per-command connection - record, optimize
-    fn prepare_per_command_connection(
+    /// Prepare per-command connection - record, greet, optimize
+    async fn prepare_per_command_connection(
         &self,
-        client_stream: &TcpStream,
-        _client_addr: ClientAddress,
+        client_stream: &mut TcpStream,
+        client_addr: ClientAddress,
     ) -> Result<()> {
         self.record_connection_opened();
+        self.send_greeting(client_stream, client_addr).await?;
         self.apply_tcp_optimizations(client_stream);
         Ok(())
     }
@@ -655,7 +656,11 @@ impl NntpProxy {
                 {
                     self.metrics.record_error(bid);
                 }
-                warn!("Session error for client {}: {}", client_addr, e);
+
+                // Only log non-client-disconnect errors (avoid spam from normal disconnects)
+                if !is_client_disconnect_error(&e) {
+                    warn!("Session error for client {}: {}", client_addr, e);
+                }
                 Err(e)
             }
         }
@@ -719,7 +724,7 @@ impl NntpProxy {
     /// Handle a per-command routing session with optional caching
     async fn handle_per_command_client(
         &self,
-        client_stream: TcpStream,
+        mut client_stream: TcpStream,
         client_addr: ClientAddress,
         cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
@@ -729,7 +734,8 @@ impl NntpProxy {
             mode_label, client_addr
         );
 
-        self.prepare_per_command_connection(&client_stream, client_addr)?;
+        self.prepare_per_command_connection(&mut client_stream, client_addr)
+            .await?;
 
         let session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = self.generate_session_id(&session);
@@ -1170,15 +1176,19 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
-            // Spawn a simple acceptor
+            // Spawn a simple acceptor that reads greeting
             tokio::spawn(async move {
-                let (_stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.try_read(&mut buf); // Read greeting
             });
 
-            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             let client_addr = ClientAddress::from(stream.peer_addr().unwrap());
 
-            let result = proxy.prepare_per_command_connection(&stream, client_addr);
+            let result = proxy
+                .prepare_per_command_connection(&mut stream, client_addr)
+                .await;
             assert!(result.is_ok());
         }
 

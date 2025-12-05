@@ -14,7 +14,6 @@ use tracing::{debug, info};
 use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
-use crate::protocol::PROXY_GREETING_PCR;
 use crate::router::BackendSelector;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
@@ -94,14 +93,10 @@ impl ClientSession {
         // Auth state: username from AUTHINFO USER command
         let mut auth_username: Option<String> = None;
 
-        // Send initial greeting to client
-        client_write.write_all(PROXY_GREETING_PCR).await?;
-        client_write.flush().await?;
+        // NOTE: Greeting already sent by proxy.rs before session handler starts
+        // This ensures clients get immediate response and avoids timing issues
 
-        debug!(
-            "Client {} sent greeting, entering command loop",
-            self.client_addr
-        );
+        debug!("Client {} entering command loop", self.client_addr);
 
         // Reuse command buffer to avoid allocations per command
         let mut command = String::with_capacity(COMMAND);
