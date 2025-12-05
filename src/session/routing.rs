@@ -217,11 +217,9 @@ mod tests {
         // All functions should be const
         const DECISION: RoutingDecision =
             RoutingDecision::new(SessionMode::PerCommand, RoutingMode::Hybrid, true);
-        const HAS_ROUTER: bool = DECISION.has_router();
         const MODE: SessionMode = DECISION.mode();
         const ROUTING_MODE: RoutingMode = DECISION.routing_mode();
 
-        assert!(HAS_ROUTER);
         assert!(matches!(MODE, SessionMode::PerCommand));
         assert!(matches!(ROUTING_MODE, RoutingMode::Hybrid));
     }

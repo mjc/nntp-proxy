@@ -108,7 +108,7 @@ impl CacheArgs {
     /// Get cache capacity as usize
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.cache_capacity.into_inner()
+        self.cache_capacity.get() as usize
     }
 }
 

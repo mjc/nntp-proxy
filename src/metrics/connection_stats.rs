@@ -246,7 +246,7 @@ mod tests {
         stats.record_event(later);
 
         let duration = stats.duration_secs();
-        assert!(duration >= 3.0 && duration < 3.1);
+        assert!((3.0..3.1).contains(&duration));
     }
 
     #[test]

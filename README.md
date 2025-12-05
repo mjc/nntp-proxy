@@ -106,6 +106,14 @@ In **stateful mode** (`--routing-mode stateful`):
 - ✅ Each client connection maps to one backend connection (1:1)
 - ✅ Simple, predictable behavior
 
+### Backend Server Limits
+
+**Maximum 8 backend servers** - The current implementation uses an optimized u8 bitset for tracking article availability across backends during 430 retry. This limits the maximum number of backend servers to 8.
+
+If you need more than 8 backends:
+- Consider running multiple proxy instances with different backend subsets
+- File an issue on GitHub - expanding the bitset to u16/u32 is straightforward if there's demand
+
 ## Quick Start
 
 ### Prerequisites

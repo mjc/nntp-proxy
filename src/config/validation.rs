@@ -18,11 +18,20 @@ impl Config {
     /// Most validations are now enforced by type system (NonZero types, validated strings, etc.)
     /// This checks remaining semantic constraints:
     /// - At least one server configured
+    /// - Maximum 8 servers (bitset limitation for article availability tracking)
     /// - Keep-alive intervals are in recommended ranges
     pub fn validate(&self) -> Result<()> {
         if self.servers.is_empty() {
             return Err(anyhow::anyhow!(
                 "Configuration must have at least one server"
+            ));
+        }
+
+        if self.servers.len() > 8 {
+            return Err(anyhow::anyhow!(
+                "Configuration cannot have more than 8 servers (current limitation: u8 bitset for article availability tracking). \
+                 Found {} servers. Consider running multiple proxy instances or file an issue if you need more backends.",
+                self.servers.len()
             ));
         }
 
@@ -98,6 +107,35 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_eight_servers_succeeds() {
+        let config = Config {
+            servers: (0..8)
+                .map(|i| create_test_server(&format!("server{}", i), None))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_nine_servers_fails() {
+        let config = Config {
+            servers: (0..9)
+                .map(|i| create_test_server(&format!("server{}", i), None))
+                .collect(),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot have more than 8 servers")
+        );
     }
 
     #[test]

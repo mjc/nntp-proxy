@@ -47,6 +47,7 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
 
     runtime::spawn_connection_prewarming(&proxy);
     runtime::spawn_stats_flusher(proxy.connection_stats());
+    runtime::spawn_cache_stats_logger(&proxy);
 
     let shutdown_rx = runtime::spawn_shutdown_handler(&proxy);
 

@@ -168,37 +168,13 @@ name = "Test Server"
 
     // client_auth should use defaults (disabled)
     assert!(!config.client_auth.is_enabled());
-    assert!(config.client_auth.username.is_none());
-    assert!(config.client_auth.password.is_none());
+    assert!(config.client_auth.users.is_empty());
     assert!(config.client_auth.greeting.is_none());
 
     Ok(())
 }
 
-/// Test that client_auth with only username is not enabled
-#[test]
-fn test_client_auth_requires_both_username_and_password() -> Result<()> {
-    let toml = r#"
-[[servers]]
-host = "news.example.com"
-port = 119
-name = "Test Server"
-
-[client_auth]
-username = "testuser"
-"#;
-
-    let config: Config = toml::from_str(toml)?;
-
-    // Should not be enabled with only username
-    assert!(!config.client_auth.is_enabled());
-    assert!(config.client_auth.username.is_some());
-    assert!(config.client_auth.password.is_none());
-
-    Ok(())
-}
-
-/// Test that client_auth with both username and password is enabled
+/// Test that client_auth with user credentials is enabled
 #[test]
 fn test_client_auth_enabled_with_credentials() -> Result<()> {
     let toml = r#"
@@ -207,7 +183,7 @@ host = "news.example.com"
 port = 119
 name = "Test Server"
 
-[client_auth]
+[[client_auth.users]]
 username = "testuser"
 password = "testpass"
 "#;
@@ -215,10 +191,11 @@ password = "testpass"
     let config: Config = toml::from_str(toml)?;
     config.validate()?;
 
-    // Should be enabled with both username and password
+    // Should be enabled with user credentials
     assert!(config.client_auth.is_enabled());
-    assert_eq!(config.client_auth.username.as_deref(), Some("testuser"));
-    assert_eq!(config.client_auth.password.as_deref(), Some("testpass"));
+    assert_eq!(config.client_auth.users.len(), 1);
+    assert_eq!(config.client_auth.users[0].username, "testuser");
+    assert_eq!(config.client_auth.users[0].password, "testpass");
 
     Ok(())
 }
@@ -233,9 +210,11 @@ port = 119
 name = "Test Server"
 
 [client_auth]
+greeting = "200 Custom Greeting"
+
+[[client_auth.users]]
 username = "testuser"
 password = "testpass"
-greeting = "200 Custom Greeting"
 "#;
 
     let config: Config = toml::from_str(toml)?;
@@ -275,6 +254,8 @@ name = "Test Server"
 fn test_config_requires_server() {
     let toml = r#"
 [client_auth]
+
+[[client_auth.users]]
 username = "testuser"
 password = "testpass"
 "#;

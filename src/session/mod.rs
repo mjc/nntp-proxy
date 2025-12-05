@@ -203,8 +203,11 @@ pub struct ClientSession {
     /// Connection statistics aggregator for logging connection creation
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 
-    /// Optional article cache for ARTICLE responses
-    cache: Option<Arc<crate::cache::ArticleCache>>,
+    /// Article cache (always present - tracks backend availability even with capacity=0)
+    cache: Arc<crate::cache::ArticleCache>,
+
+    /// Whether to cache article bodies (config-driven)
+    cache_articles: bool,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -246,7 +249,8 @@ pub struct ClientSessionBuilder {
     auth_handler: Arc<AuthHandler>,
     metrics: Option<MetricsCollector>,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
-    cache: Option<Arc<crate::cache::ArticleCache>>,
+    cache: Arc<crate::cache::ArticleCache>,
+    cache_articles: bool,
 }
 
 impl ClientSessionBuilder {
@@ -296,10 +300,20 @@ impl ClientSessionBuilder {
         self
     }
 
-    /// Add article cache to this session
+    /// Add article cache to this session (always present for backend availability tracking)
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<crate::cache::ArticleCache>) -> Self {
-        self.cache = Some(cache);
+        self.cache = cache;
+        self
+    }
+
+    /// Set whether to cache article bodies (default: true)
+    ///
+    /// When false, only backend availability is tracked (saves memory).
+    /// When true, full article bodies are cached.
+    #[must_use]
+    pub fn with_cache_articles(mut self, cache: bool) -> Self {
+        self.cache_articles = cache;
         self
     }
 
@@ -331,6 +345,7 @@ impl ClientSessionBuilder {
             metrics: self.metrics,
             connection_stats: self.connection_stats,
             cache: self.cache,
+            cache_articles: self.cache_articles,
         }
     }
 }
@@ -353,7 +368,12 @@ impl ClientSession {
             auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
-            cache: None,
+            cache: Arc::new(crate::cache::ArticleCache::new(
+                0,
+                std::time::Duration::from_secs(3600),
+                false,
+            )),
+            cache_articles: true,
         }
     }
 
@@ -379,7 +399,12 @@ impl ClientSession {
             auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
-            cache: None,
+            cache: Arc::new(crate::cache::ArticleCache::new(
+                0,
+                std::time::Duration::from_secs(3600),
+                false,
+            )),
+            cache_articles: true,
         }
     }
 
@@ -396,7 +421,7 @@ impl ClientSession {
     /// use nntp_proxy::auth::AuthHandler;
     ///
     /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    /// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+    /// let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);::new(8192).unwrap(), 10);
     /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
     ///
     /// let session = ClientSession::builder(addr.into(), buffer_pool, auth_handler)
@@ -416,7 +441,12 @@ impl ClientSession {
             auth_handler,
             metrics: None,
             connection_stats: None,
-            cache: None,
+            cache: Arc::new(crate::cache::ArticleCache::new(
+                0,
+                std::time::Duration::from_secs(3600),
+                false,
+            )),
+            cache_articles: true,
         }
     }
 }
@@ -992,13 +1022,14 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
-        let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600)));
+        let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600), true));
 
         let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
-            .with_cache(cache)
+            .with_cache(cache.clone())
             .build();
 
-        assert!(session.cache.is_some());
+        // Cache is always present now (Arc not Option)
+        assert_eq!(session.cache.capacity(), 100);
     }
 
     #[test]
@@ -1163,7 +1194,7 @@ mod tests {
         session.user_bytes_received(2048);
 
         // Verify metrics were recorded (snapshot should have data)
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert!(!snapshot.backend_stats.is_empty());
         assert!(snapshot.backend_stats[0].total_commands.get() > 0);
     }
@@ -1184,7 +1215,7 @@ mod tests {
         let backend_id = BackendId::from_index(0);
         session.record_command(backend_id);
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
     }
 
@@ -1204,7 +1235,7 @@ mod tests {
         session.user_bytes_sent(1024);
         session.user_bytes_received(2048);
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         let user_stats = snapshot
             .user_stats
             .iter()
@@ -1230,12 +1261,12 @@ mod tests {
 
         session.stateful_session_started();
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.stateful_sessions, 1);
 
         session.stateful_session_ended();
 
-        let snapshot = metrics.snapshot();
+        let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.stateful_sessions, 0);
     }
 }

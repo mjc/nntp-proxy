@@ -257,6 +257,40 @@ pub fn spawn_stats_flusher(stats: &crate::metrics::ConnectionStatsAggregator) {
     });
 }
 
+/// Spawn background task to periodically log cache statistics
+///
+/// Only spawns if cache is enabled AND debug logging is enabled.
+/// Logs every 60 seconds.
+pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
+    use std::sync::Arc;
+    use tracing::debug;
+
+    // Only spawn if debug logging is enabled
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+
+    // Cache is always present now
+    let cache = Arc::clone(proxy.cache());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let entries = cache.entry_count();
+            let size_bytes = entries.saturating_mul(750_000 + 100);
+            let hit_rate = cache.hit_rate();
+            debug!(
+                "Cache stats: entries={}, size={} ({:.1}% hit rate)",
+                entries,
+                crate::formatting::format_bytes(size_bytes),
+                hit_rate
+            );
+        }
+    });
+}
+
 /// Spawn graceful shutdown handler
 ///
 /// Waits for shutdown signal, then:
@@ -325,7 +359,11 @@ pub async fn run_accept_loop(
                     };
 
                     if let Err(e) = result {
-                        error!("Error handling client {}: {}", addr, e);
+                        // Only log non-client-disconnect errors (avoid duplicate logging)
+                        // Client disconnects are already handled gracefully in session handlers
+                        if !crate::is_client_disconnect_error(&e) {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
                     }
                 });
             }

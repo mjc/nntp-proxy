@@ -124,6 +124,8 @@ struct MetricsInner {
     backend_metrics: Vec<BackendMetrics>,
     user_metrics: DashMap<String, UserMetrics>,
     start_time: Instant,
+    // Note: client_to_backend_bytes and backend_to_client_bytes are calculated
+    // from backend_metrics sums, not stored separately
 }
 
 impl MetricsCollector {
@@ -412,7 +414,7 @@ impl MetricsCollector {
     ///
     /// Returns cumulative counters - no rate calculations.
     /// Use `MetricsSnapshot::with_pool_status()` to add pool utilization data.
-    pub fn snapshot(&self) -> MetricsSnapshot {
+    pub fn snapshot(&self, cache: Option<&crate::cache::ArticleCache>) -> MetricsSnapshot {
         let backend_stats: Vec<BackendStats> = self
             .inner
             .backend_metrics
@@ -434,6 +436,16 @@ impl MetricsCollector {
             .map(|b| b.bytes_received.as_u64())
             .sum();
 
+        let (cache_entries, cache_size_bytes, cache_hit_rate) = cache
+            .map(|c| {
+                let entries = c.entry_count();
+                // weighted_size() returns total weight from weigher (bytes)
+                let size_bytes = c.weighted_size();
+                let hit_rate = c.hit_rate();
+                (entries, size_bytes, hit_rate)
+            })
+            .unwrap_or((0, 0, 0.0));
+
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),
             active_connections: self.inner.active_connections.load(Ordering::Relaxed),
@@ -443,6 +455,9 @@ impl MetricsCollector {
             uptime: self.inner.start_time.elapsed(),
             backend_stats: Arc::new(backend_stats),
             user_stats,
+            cache_entries,
+            cache_size_bytes,
+            cache_hit_rate,
         }
     }
 
@@ -525,7 +540,7 @@ mod tests {
         collector.record_command(backend_id);
         collector.record_command(backend_id);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector.snapshot(None);
         assert_eq!(snapshot.backend_stats[0].total_commands.get(), 2);
     }
 
@@ -537,7 +552,7 @@ mod tests {
         collector.record_client_to_backend_bytes_for(backend_id, 1024);
         collector.record_backend_to_client_bytes_for(backend_id, 2048);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector.snapshot(None);
         assert_eq!(snapshot.backend_stats[0].bytes_sent.as_u64(), 1024);
         assert_eq!(snapshot.backend_stats[0].bytes_received.as_u64(), 2048);
     }
@@ -551,7 +566,7 @@ mod tests {
         collector.record_error(backend_id);
         collector.record_error(backend_id);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector.snapshot(None);
         assert_eq!(snapshot.backend_stats[0].errors.get(), 3);
     }
 
@@ -559,20 +574,20 @@ mod tests {
     fn test_metrics_collector_connection_lifecycle() {
         let collector = MetricsCollector::new(1);
 
-        assert_eq!(collector.snapshot().active_connections, 0);
-        assert_eq!(collector.snapshot().total_connections, 0);
+        assert_eq!(collector.snapshot(None).active_connections, 0);
+        assert_eq!(collector.snapshot(None).total_connections, 0);
 
         collector.connection_opened();
-        assert_eq!(collector.snapshot().active_connections, 1);
-        assert_eq!(collector.snapshot().total_connections, 1);
+        assert_eq!(collector.snapshot(None).active_connections, 1);
+        assert_eq!(collector.snapshot(None).total_connections, 1);
 
         collector.connection_opened();
-        assert_eq!(collector.snapshot().active_connections, 2);
-        assert_eq!(collector.snapshot().total_connections, 2);
+        assert_eq!(collector.snapshot(None).active_connections, 2);
+        assert_eq!(collector.snapshot(None).total_connections, 2);
 
         collector.connection_closed();
-        assert_eq!(collector.snapshot().active_connections, 1);
-        assert_eq!(collector.snapshot().total_connections, 2);
+        assert_eq!(collector.snapshot(None).active_connections, 1);
+        assert_eq!(collector.snapshot(None).total_connections, 2);
     }
 
     #[test]
@@ -580,13 +595,13 @@ mod tests {
         let collector = MetricsCollector::new(1);
 
         collector.stateful_session_started();
-        assert_eq!(collector.snapshot().stateful_sessions, 1);
+        assert_eq!(collector.snapshot(None).stateful_sessions, 1);
 
         collector.stateful_session_started();
-        assert_eq!(collector.snapshot().stateful_sessions, 2);
+        assert_eq!(collector.snapshot(None).stateful_sessions, 2);
 
         collector.stateful_session_ended();
-        assert_eq!(collector.snapshot().stateful_sessions, 1);
+        assert_eq!(collector.snapshot(None).stateful_sessions, 1);
     }
 
     #[test]
@@ -598,7 +613,7 @@ mod tests {
         collector.user_bytes_received(Some("alice"), 2000);
         collector.user_command(Some("alice"));
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector.snapshot(None);
         let alice_stats = snapshot.user_stats.iter().find(|s| s.username == "alice");
         assert!(alice_stats.is_some());
 
@@ -618,7 +633,7 @@ mod tests {
         collector.user_connection_opened(Some("bob"));
         collector.user_bytes_sent(Some("bob"), 200);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector.snapshot(None);
         assert_eq!(snapshot.user_stats.len(), 2);
 
         let alice = snapshot.user_stats.iter().find(|s| s.username == "alice");
@@ -642,7 +657,7 @@ mod tests {
         collector.record_client_to_backend_bytes_for(BackendId::from_index(1), 500);
         collector.record_backend_to_client_bytes_for(BackendId::from_index(1), 1500);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector.snapshot(None);
 
         // Total should be sum of both backends
         assert_eq!(snapshot.client_to_backend_bytes.as_u64(), 1500);
@@ -659,11 +674,15 @@ mod tests {
 
         // Both should see the same data (Arc shared)
         assert_eq!(
-            collector1.snapshot().backend_stats[0].total_commands.get(),
+            collector1.snapshot(None).backend_stats[0]
+                .total_commands
+                .get(),
             2
         );
         assert_eq!(
-            collector2.snapshot().backend_stats[0].total_commands.get(),
+            collector2.snapshot(None).backend_stats[0]
+                .total_commands
+                .get(),
             2
         );
     }

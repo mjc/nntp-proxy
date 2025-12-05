@@ -118,6 +118,8 @@ where
 ///
 /// This uses two buffers to enable concurrent read/write operations for maximum throughput.
 /// Essential for large article downloads (50MB+) where buffering would kill performance.
+///
+/// If `capture` is Some, the response will be captured into the Vec for caching.
 pub async fn stream_multiline_response<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
@@ -126,6 +128,64 @@ pub async fn stream_multiline_response<R, W>(
     client_addr: impl std::fmt::Display,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
+) -> Result<u64>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    stream_multiline_response_impl(
+        backend_read,
+        client_write,
+        first_chunk,
+        first_n,
+        client_addr,
+        backend_id,
+        buffer_pool,
+        None,
+    )
+    .await
+}
+
+/// Stream multiline response and optionally capture for caching
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_and_capture_multiline_response<R, W>(
+    backend_read: &mut R,
+    client_write: &mut W,
+    first_chunk: &[u8],
+    first_n: usize,
+    client_addr: impl std::fmt::Display,
+    backend_id: crate::types::BackendId,
+    buffer_pool: &crate::pool::BufferPool,
+    capture: &mut Vec<u8>,
+) -> Result<u64>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    stream_multiline_response_impl(
+        backend_read,
+        client_write,
+        first_chunk,
+        first_n,
+        client_addr,
+        backend_id,
+        buffer_pool,
+        Some(capture),
+    )
+    .await
+}
+
+/// Internal implementation that optionally captures while streaming
+#[allow(clippy::too_many_arguments)]
+async fn stream_multiline_response_impl<R, W>(
+    backend_read: &mut R,
+    client_write: &mut W,
+    first_chunk: &[u8],
+    first_n: usize,
+    client_addr: impl std::fmt::Display,
+    backend_id: crate::types::BackendId,
+    buffer_pool: &crate::pool::BufferPool,
+    mut capture: Option<&mut Vec<u8>>,
 ) -> Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -155,6 +215,12 @@ where
         // Detect terminator location: within chunk or spanning boundary
         let status = tail.detect_terminator(data);
         let write_len = status.write_len(current_n);
+
+        // Capture data if requested (for caching)
+        if let Some(ref mut cap) = capture {
+            cap.extend_from_slice(&data[..write_len]);
+        }
+
         // Write current chunk (or portion up to terminator) to client
         if let Err(e) = client_write.write_all(&data[..write_len]).await {
             return Err(handle_client_write_error(

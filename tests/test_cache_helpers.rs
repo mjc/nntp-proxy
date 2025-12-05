@@ -7,22 +7,21 @@
 //! - TTL and capacity limits
 
 use anyhow::Result;
-use nntp_proxy::cache::{ArticleCache, CachedArticle};
-use nntp_proxy::types::MessageId;
+use nntp_proxy::cache::{ArticleCache, ArticleEntry};
+use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Test cache hit serves cached content
 #[tokio::test]
 async fn test_cache_hit() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(300)));
+    let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
 
     let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let article = CachedArticle {
-        response: Arc::new(
-            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
-        ),
-    };
+    let article = ArticleEntry::new(
+        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
+        BackendId::from_index(0),
+    );
 
     // Insert
     cache.insert(msgid.clone(), article.clone()).await;
@@ -31,8 +30,8 @@ async fn test_cache_hit() -> Result<()> {
     let retrieved = cache.get(&msgid).await;
     assert!(retrieved.is_some());
     assert_eq!(
-        retrieved.unwrap().response.as_ref(),
-        article.response.as_ref()
+        retrieved.unwrap().buffer().as_ref(),
+        article.buffer().as_ref()
     );
 
     Ok(())
@@ -41,7 +40,7 @@ async fn test_cache_hit() -> Result<()> {
 /// Test cache miss returns None
 #[tokio::test]
 async fn test_cache_miss() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(300)));
+    let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
 
     let msgid = MessageId::from_borrowed("<nonexistent@example.com>").unwrap();
     let result = cache.get(&msgid).await;
@@ -53,14 +52,15 @@ async fn test_cache_miss() -> Result<()> {
 /// Test multiple message IDs can be cached
 #[tokio::test]
 async fn test_multiple_cache_entries() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(300)));
+    let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
 
     for i in 1..=5 {
         let msg_str = format!("<test{}@example.com>", i);
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
-        let article = CachedArticle {
-            response: Arc::new(format!("220 Body {}\r\n.\r\n", i).into_bytes()),
-        };
+        let article = ArticleEntry::new(
+            format!("220 Body {}\r\n.\r\n", i).into_bytes(),
+            BackendId::from_index(0),
+        );
         cache.insert(msgid, article).await;
     }
 
@@ -83,12 +83,13 @@ async fn test_multiple_cache_entries() -> Result<()> {
 /// Test cache respects TTL
 #[tokio::test]
 async fn test_cache_ttl_expiration() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_millis(100)));
+    let cache = Arc::new(ArticleCache::new(20000, Duration::from_millis(100), true));
 
     let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let article = CachedArticle {
-        response: Arc::new(b"220 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec()),
-    };
+    let article = ArticleEntry::new(
+        b"220 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec(),
+        BackendId::from_index(0),
+    );
 
     // Insert article
     cache.insert(msgid.clone(), article).await;
@@ -108,15 +109,16 @@ async fn test_cache_ttl_expiration() -> Result<()> {
 /// Test cache capacity limits (LRU eviction)
 #[tokio::test]
 async fn test_cache_capacity_limit() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(2, Duration::from_secs(300))); // Only 2 entries
+    let cache = Arc::new(ArticleCache::new(2, Duration::from_secs(300), true)); // Only 2 entries
 
     // Insert 3 articles with delays for deterministic eviction
     for i in 1..=3 {
         let msg_str = format!("<test{}@example.com>", i);
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
-        let article = CachedArticle {
-            response: Arc::new(format!("220 Body {}\r\n.\r\n", i).into_bytes()),
-        };
+        let article = ArticleEntry::new(
+            format!("220 Body {}\r\n.\r\n", i).into_bytes(),
+            BackendId::from_index(0),
+        );
         cache.insert(msgid, article).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -134,7 +136,7 @@ async fn test_cache_capacity_limit() -> Result<()> {
 /// Test cache with different MessageId formats
 #[tokio::test]
 async fn test_cache_different_message_id_formats() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(300)));
+    let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
 
     // Different valid message-ID formats
     let test_cases = vec![
@@ -146,9 +148,10 @@ async fn test_cache_different_message_id_formats() -> Result<()> {
 
     for msg_str in test_cases {
         let msgid = MessageId::from_borrowed(msg_str).unwrap();
-        let article = CachedArticle {
-            response: Arc::new(format!("220 {}\r\n.\r\n", msg_str).into_bytes()),
-        };
+        let article = ArticleEntry::new(
+            format!("220 {}\r\n.\r\n", msg_str).into_bytes(),
+            BackendId::from_index(0),
+        );
         cache.insert(msgid.clone(), article).await;
 
         // Verify retrievable
@@ -161,7 +164,7 @@ async fn test_cache_different_message_id_formats() -> Result<()> {
 /// Test cache stats reporting
 #[tokio::test]
 async fn test_cache_stats() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(300)));
+    let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
 
     // Initially empty
     let stats = cache.stats().await;
@@ -171,10 +174,10 @@ async fn test_cache_stats() -> Result<()> {
     for i in 1..=10 {
         let msg_str = format!("<test{}@example.com>", i);
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
-        let article = CachedArticle {
-            response: Arc::new(vec![0u8; 1024]), // 1KB each
-        };
-        cache.insert(msgid, article).await;
+        let mut buffer = vec![0u8; 1024];
+        // Put valid status code at start
+        buffer[0..3].copy_from_slice(b"220");
+        cache.upsert(msgid, buffer, BackendId::from_index(0)).await;
     }
 
     // Run pending background tasks to ensure cache is fully updated
@@ -190,12 +193,10 @@ async fn test_cache_stats() -> Result<()> {
 /// Test Arc<str> borrow lookup (zero-allocation cache get)
 #[tokio::test]
 async fn test_zero_allocation_lookup() -> Result<()> {
-    let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(300)));
+    let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
 
     let msgid1 = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let article = CachedArticle {
-        response: Arc::new(b"220 Body\r\n.\r\n".to_vec()),
-    };
+    let article = ArticleEntry::new(b"220 Body\r\n.\r\n".to_vec(), BackendId::from_index(0));
 
     cache.insert(msgid1, article).await;
 

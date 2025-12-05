@@ -151,12 +151,30 @@ impl Default for Proxy {
 /// Cache configuration for article caching
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Cache {
-    /// Maximum number of articles to cache
+    /// Maximum cache size in bytes
+    ///
+    /// Supports human-readable formats:
+    /// - \"1gb\" = 1 GB
+    /// - \"500mb\" = 500 MB
+    /// - \"64mb\" = 64 MB (default)
+    /// - 10000 = 10,000 bytes
     #[serde(default = "super::defaults::cache_max_capacity")]
     pub max_capacity: CacheCapacity,
     /// Time-to-live for cached articles
     #[serde(with = "duration_serde", default = "super::defaults::cache_ttl")]
     pub ttl: Duration,
+    /// Whether to cache article bodies (default: true)
+    ///
+    /// When false:
+    /// - Cache still tracks backend availability (smart routing, 430 retry)
+    /// - Article bodies are NOT stored (saves ~750KB per article)
+    /// - Useful for availability-only mode with limited memory
+    ///
+    /// When true:
+    /// - Full caching mode (bodies + availability tracking)
+    /// - Can serve articles from cache without backend query
+    #[serde(default = "super::defaults::cache_articles")]
+    pub cache_articles: bool,
 }
 
 impl Default for Cache {
@@ -164,6 +182,7 @@ impl Default for Cache {
         Self {
             max_capacity: defaults::cache_max_capacity(),
             ttl: defaults::cache_ttl(),
+            cache_articles: defaults::cache_articles(),
         }
     }
 }
@@ -201,18 +220,10 @@ impl Default for HealthCheck {
 /// Client authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ClientAuth {
-    /// Required username for client authentication (if set, auth is enabled)
-    /// DEPRECATED: Use `users` instead for multi-user support
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-    /// Required password for client authentication
-    /// DEPRECATED: Use `users` instead for multi-user support
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
     /// Optional custom greeting message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub greeting: Option<String>,
-    /// List of authorized users (replaces username/password for multi-user support)
+    /// List of authorized users for client authentication
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub users: Vec<UserCredentials>,
 }
@@ -227,25 +238,15 @@ pub struct UserCredentials {
 impl ClientAuth {
     /// Check if authentication is enabled
     pub fn is_enabled(&self) -> bool {
-        // Auth is enabled if either the legacy single-user config or multi-user list is populated
-        (!self.users.is_empty()) || (self.username.is_some() && self.password.is_some())
+        !self.users.is_empty()
     }
 
-    /// Get all users (combines legacy + new format)
+    /// Get all users
     pub fn all_users(&self) -> Vec<(&str, &str)> {
-        let mut users = Vec::new();
-
-        // Add legacy single user if present
-        if let (Some(u), Some(p)) = (&self.username, &self.password) {
-            users.push((u.as_str(), p.as_str()));
-        }
-
-        // Add multi-user list
-        for user in &self.users {
-            users.push((user.username.as_str(), user.password.as_str()));
-        }
-
-        users
+        self.users
+            .iter()
+            .map(|user| (user.username.as_str(), user.password.as_str()))
+            .collect()
     }
 }
 
@@ -304,16 +305,16 @@ pub struct Server {
 /// use nntp_proxy::config::Server;
 ///
 /// // Minimal configuration
-/// let config = Server::builder("news.example.com", 119)
+/// let config = Server::builder("news.example.com", Port::try_new(119).unwrap())
 ///     .build()
 ///     .unwrap();
 ///
 /// // With authentication and TLS
-/// let config = Server::builder("secure.example.com", 563)
+/// let config = Server::builder("secure.example.com", Port::try_new(563).unwrap())
 ///     .name("Secure Server")
 ///     .username("user")
 ///     .password("pass")
-///     .max_connections(20)
+///     .max_connections(MaxConnections::try_new(20).unwrap())
 ///     .use_tls(true)
 ///     .build()
 ///     .unwrap();
@@ -483,9 +484,9 @@ impl Server {
     /// ```
     /// use nntp_proxy::config::Server;
     ///
-    /// let config = Server::builder("news.example.com", 119)
+    /// let config = Server::builder("news.example.com", Port::try_new(119).unwrap())
     ///     .name("Example Server")
-    ///     .max_connections(15)
+    ///     .max_connections(MaxConnections::try_new(15).unwrap())
     ///     .build()
     ///     .unwrap();
     /// ```
@@ -552,7 +553,7 @@ mod tests {
     #[test]
     fn test_cache_default() {
         let cache = Cache::default();
-        assert_eq!(cache.max_capacity.get(), 10000);
+        assert_eq!(cache.max_capacity.get(), 64 * 1024 * 1024); // 64 MB
         assert_eq!(cache.ttl, Duration::from_secs(3600));
     }
 
@@ -567,12 +568,14 @@ mod tests {
 
     // ClientAuth tests
     #[test]
-    fn test_client_auth_is_enabled_legacy() {
+    fn test_client_auth_is_enabled() {
         let mut auth = ClientAuth::default();
         assert!(!auth.is_enabled());
 
-        auth.username = Some("user".to_string());
-        auth.password = Some("pass".to_string());
+        auth.users.push(UserCredentials {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        });
         assert!(auth.is_enabled());
     }
 
@@ -587,10 +590,12 @@ mod tests {
     }
 
     #[test]
-    fn test_client_auth_all_users_legacy() {
+    fn test_client_auth_all_users_single() {
         let mut auth = ClientAuth::default();
-        auth.username = Some("user".to_string());
-        auth.password = Some("pass".to_string());
+        auth.users.push(UserCredentials {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        });
 
         let users = auth.all_users();
         assert_eq!(users.len(), 1);
@@ -613,22 +618,6 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert_eq!(users[0], ("alice", "alice_pw"));
         assert_eq!(users[1], ("bob", "bob_pw"));
-    }
-
-    #[test]
-    fn test_client_auth_all_users_combined() {
-        let mut auth = ClientAuth::default();
-        auth.username = Some("legacy".to_string());
-        auth.password = Some("legacy_pw".to_string());
-        auth.users.push(UserCredentials {
-            username: "alice".to_string(),
-            password: "alice_pw".to_string(),
-        });
-
-        let users = auth.all_users();
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0], ("legacy", "legacy_pw"));
-        assert_eq!(users[1], ("alice", "alice_pw"));
     }
 
     // ServerBuilder tests

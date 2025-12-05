@@ -34,6 +34,9 @@ pub struct MetricsSnapshot {
     pub uptime: Duration,
     pub backend_stats: Arc<Vec<BackendStats>>,
     pub user_stats: Vec<UserStats>,
+    pub cache_entries: u64,
+    pub cache_size_bytes: u64,
+    pub cache_hit_rate: f64,
 }
 
 impl MetricsSnapshot {
@@ -241,6 +244,9 @@ mod tests {
             uptime: Duration::from_secs(3600),
             backend_stats: Arc::new(vec![backend1, backend2]),
             user_stats: vec![],
+            cache_entries: 0,
+            cache_size_bytes: 0,
+            cache_hit_rate: 0.0,
         }
     }
 

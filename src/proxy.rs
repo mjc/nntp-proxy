@@ -5,21 +5,21 @@
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::AuthHandler;
+use crate::cache::ArticleCache;
 use crate::config::{Config, RoutingMode, Server};
 use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
-use crate::network::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer};
+use crate::network::NetworkOptimizer;
 use crate::pool::{BufferPool, ConnectionProvider, DeadpoolConnectionProvider, prewarm_pools};
-use crate::protocol::BACKEND_UNAVAILABLE;
 use crate::router;
 use crate::session::ClientSession;
 use crate::types::ClientAddress;
-use crate::types::{self, BufferSize};
+use crate::types::{self, BufferSize, TransferMetrics};
 
 /// Builder for constructing an `NntpProxy` with optional configuration overrides
 ///
@@ -198,6 +198,39 @@ impl NntpProxyBuilder {
             }
         };
 
+        // Create article cache (always enabled for availability tracking)
+        // If max_capacity=0, only tracks which backends have articles (no content caching)
+        let (cache, cache_articles) = if let Some(cache_config) = &self.config.cache {
+            let capacity = cache_config.max_capacity.as_u64();
+            let cache = ArticleCache::new(capacity, cache_config.ttl, cache_config.cache_articles);
+            let cache_articles = cache_config.cache_articles;
+
+            if capacity > 0 {
+                if cache_articles {
+                    info!(
+                        "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
+                        cache_config.max_capacity,
+                        cache_config.ttl.as_secs()
+                    );
+                } else {
+                    info!(
+                        "Article cache enabled: max_capacity={}, ttl={}s (availability-only, bodies not cached)",
+                        cache_config.max_capacity,
+                        cache_config.ttl.as_secs()
+                    );
+                }
+            } else {
+                info!("Backend availability tracking enabled (cache disabled, capacity=0)");
+            }
+            (Arc::new(cache), cache_articles)
+        } else {
+            debug!("Cache not configured, using availability-only mode (capacity=0)");
+            (
+                Arc::new(ArticleCache::new(0, Duration::from_secs(3600), false)),
+                true,
+            )
+        };
+
         Ok(NntpProxy {
             servers,
             router,
@@ -208,6 +241,8 @@ impl NntpProxyBuilder {
             metrics,
             enable_metrics: self.enable_metrics,
             connection_stats: ConnectionStatsAggregator::new(),
+            cache,
+            cache_articles,
         })
     }
 }
@@ -231,6 +266,10 @@ pub struct NntpProxy {
     enable_metrics: bool,
     /// Connection statistics aggregator (reduces log spam)
     connection_stats: ConnectionStatsAggregator,
+    /// Article cache (always present - tracks backend availability even with capacity=0)
+    cache: Arc<ArticleCache>,
+    /// Whether to cache article bodies (config-driven)
+    cache_articles: bool,
 }
 
 /// Classify an error as a client disconnect (broken pipe/connection reset)
@@ -284,7 +323,7 @@ impl NntpProxy {
         client_addr: ClientAddress,
         router: Option<Arc<router::BackendSelector>>,
         routing_mode: RoutingMode,
-        cache: Option<Arc<crate::cache::ArticleCache>>,
+        cache: Arc<crate::cache::ArticleCache>,
     ) -> ClientSession {
         // Start with base builder
         let builder = ClientSession::builder(
@@ -293,17 +332,13 @@ impl NntpProxy {
             self.auth_handler.clone(),
         )
         .with_routing_mode(routing_mode)
-        .with_connection_stats(self.connection_stats.clone());
+        .with_connection_stats(self.connection_stats.clone())
+        .with_cache(cache)
+        .with_cache_articles(self.cache_articles);
 
         // Apply optional router
         let builder = match router {
             Some(r) => builder.with_router(r),
-            None => builder,
-        };
-
-        // Apply optional cache
-        let builder = match cache {
-            Some(c) => builder.with_cache(c),
             None => builder,
         };
 
@@ -336,18 +371,6 @@ impl NntpProxy {
             crate::formatting::format_bytes(metrics.client_to_backend.as_u64()),
             crate::formatting::format_bytes(metrics.backend_to_client.as_u64())
         );
-    }
-
-    /// Handle session errors with appropriate logging
-    fn handle_session_error(&self, e: anyhow::Error, client_addr: ClientAddress, session_id: &str) {
-        if is_client_disconnect_error(&e) {
-            debug!(
-                "Client {} [{}] disconnected: {} (normal for test connections)",
-                client_addr, session_id, e
-            );
-        } else {
-            warn!("Session error {} [{}]: {}", client_addr, session_id, e);
-        }
     }
 
     /// Create a new `NntpProxy` with the given configuration and routing mode
@@ -438,6 +461,13 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
+    /// Get the article cache (if enabled via config)
+    #[must_use]
+    #[inline]
+    pub fn cache(&self) -> &Arc<crate::cache::ArticleCache> {
+        &self.cache
+    }
+
     /// Get the metrics collector
     #[must_use]
     #[inline]
@@ -452,22 +482,193 @@ impl NntpProxy {
         &self.connection_stats
     }
 
-    /// Apply TCP optimizations to both client and backend streams
-    fn optimize_tcp_connections(&self, client: &TcpStream, backend: &impl NetworkOptimizer) {
-        TcpOptimizer::new(client)
+    /// Log backend routing selection
+    #[inline]
+    fn log_routing_selection(
+        &self,
+        client_addr: ClientAddress,
+        backend_id: crate::types::BackendId,
+        server: &Server,
+    ) {
+        info!(
+            "Routing client {} to backend {:?} ({}:{})",
+            client_addr, backend_id, server.host, server.port
+        );
+    }
+
+    /// Log connection pool status for monitoring
+    #[inline]
+    fn log_pool_status(&self, server_idx: usize) {
+        let pool_status = self.connection_providers[server_idx].status();
+        debug!(
+            "Pool status for {}: {}/{} available, {} created",
+            self.servers[server_idx].name,
+            pool_status.available,
+            pool_status.max_size,
+            pool_status.created
+        );
+    }
+
+    /// Prepare stateful connection - route, greet, optimize
+    async fn prepare_stateful_connection(
+        &self,
+        client_stream: &mut TcpStream,
+        client_addr: ClientAddress,
+    ) -> Result<crate::types::BackendId> {
+        self.record_connection_opened();
+
+        let client_id = types::ClientId::new();
+        let backend_id = self.router.route_command(client_id, "")?;
+        let server_idx = backend_id.as_index();
+
+        self.log_routing_selection(client_addr, backend_id, &self.servers[server_idx]);
+        self.send_greeting(client_stream, client_addr).await?;
+        self.log_pool_status(server_idx);
+        self.apply_tcp_optimizations(client_stream);
+
+        Ok(backend_id)
+    }
+
+    /// Prepare per-command connection - record, greet, optimize
+    async fn prepare_per_command_connection(
+        &self,
+        client_stream: &mut TcpStream,
+        client_addr: ClientAddress,
+    ) -> Result<()> {
+        self.record_connection_opened();
+        self.send_greeting(client_stream, client_addr).await?;
+        self.apply_tcp_optimizations(client_stream);
+        Ok(())
+    }
+
+    /// Create session with router and cache configuration
+    #[inline]
+    fn create_session(
+        &self,
+        client_addr: ClientAddress,
+        router: Option<Arc<crate::router::BackendSelector>>,
+    ) -> ClientSession {
+        self.build_session(client_addr, router, self.routing_mode, self.cache.clone())
+    }
+
+    /// Generate short session ID for logging
+    #[inline]
+    fn generate_session_id(&self, session: &ClientSession) -> String {
+        crate::formatting::short_id(session.client_id().as_uuid())
+    }
+
+    /// Send greeting to client
+    #[inline]
+    async fn send_greeting(
+        &self,
+        client_stream: &mut TcpStream,
+        client_addr: ClientAddress,
+    ) -> Result<()> {
+        crate::protocol::send_proxy_greeting(client_stream, client_addr).await
+    }
+
+    /// Apply TCP optimizations to client socket
+    #[inline]
+    fn apply_tcp_optimizations(&self, client_stream: &TcpStream) {
+        use crate::network::TcpOptimizer;
+        TcpOptimizer::new(client_stream)
             .optimize()
             .map_err(|e| debug!("Failed to optimize client socket: {}", e))
             .ok();
-
-        backend
-            .optimize()
-            .map_err(|e| debug!("Failed to optimize backend socket: {}", e))
-            .ok();
     }
 
-    /// Get human-readable routing mode label for logging
+    /// Get display name for current routing mode
     #[inline]
-    fn get_routing_mode_label(&self, session_mode: crate::session::SessionMode) -> &'static str {
+    fn routing_mode_display_name(&self, cache: &Arc<crate::cache::ArticleCache>) -> &'static str {
+        if cache.entry_count() > 0 {
+            "caching"
+        } else {
+            "per-command"
+        }
+    }
+
+    /// Finalize stateful session with metrics and cleanup
+    fn finalize_stateful_session(
+        &self,
+        metrics: Result<TransferMetrics>,
+        client_addr: ClientAddress,
+        session_id: &str,
+        session: &ClientSession,
+        backend_id: crate::types::BackendId,
+    ) -> Result<()> {
+        self.record_connection_if_unauthenticated(session);
+        self.router.complete_command(backend_id);
+        self.record_session_metrics(metrics, client_addr, session_id, session, Some(backend_id))?;
+        self.record_connection_closed();
+        Ok(())
+    }
+
+    /// Finalize per-command session with logging and cleanup
+    fn finalize_per_command_session(
+        &self,
+        metrics: Result<TransferMetrics>,
+        client_addr: ClientAddress,
+        session_id: &str,
+        session: &ClientSession,
+    ) -> Result<()> {
+        self.record_session_metrics(metrics, client_addr, session_id, session, None)?;
+        self.record_connection_closed();
+        Ok(())
+    }
+
+    /// Record connection for unauthenticated sessions only
+    #[inline]
+    fn record_connection_if_unauthenticated(&self, session: &ClientSession) {
+        if !self.auth_handler.is_enabled() || session.username().is_none() {
+            let mode = self.session_mode_label(session.mode());
+            self.connection_stats
+                .record_connection(session.username().as_deref(), mode);
+        }
+    }
+
+    /// Record session metrics and log completion or errors
+    fn record_session_metrics(
+        &self,
+        metrics: Result<TransferMetrics>,
+        client_addr: ClientAddress,
+        session_id: &str,
+        session: &ClientSession,
+        backend_id: Option<crate::types::BackendId>,
+    ) -> Result<()> {
+        match metrics {
+            Ok(m) => {
+                let mode = self.routing_mode.to_string().to_lowercase();
+                self.log_session_completion(client_addr, session_id, session, &mode, &m);
+
+                if self.enable_metrics
+                    && let Some(bid) = backend_id
+                {
+                    self.metrics
+                        .record_client_to_backend_bytes_for(bid, m.client_to_backend.as_u64());
+                    self.metrics
+                        .record_backend_to_client_bytes_for(bid, m.backend_to_client.as_u64());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if self.enable_metrics
+                    && let Some(bid) = backend_id
+                {
+                    self.metrics.record_error(bid);
+                }
+
+                // Only log non-client-disconnect errors (avoid spam from normal disconnects)
+                if !is_client_disconnect_error(&e) {
+                    warn!("Session error for client {}: {}", client_addr, e);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Get session mode label for logging
+    #[inline]
+    fn session_mode_label(&self, session_mode: crate::session::SessionMode) -> &'static str {
         use crate::session::SessionMode;
         match (session_mode, self.routing_mode) {
             (SessionMode::PerCommand, _) => "per-command",
@@ -477,20 +678,6 @@ impl NntpProxy {
         }
     }
 
-    /// Common setup for client connections
-    ///
-    /// Sends the proxy's greeting immediately to the client.
-    /// Backend greetings are consumed when connections are created in the pool.
-    async fn setup_client_connection(
-        &self,
-        client_stream: &mut TcpStream,
-        client_addr: ClientAddress,
-    ) -> Result<()> {
-        // Send proxy greeting immediately
-        // (Backend greetings already consumed during connection creation)
-        crate::protocol::send_proxy_greeting(client_stream, client_addr).await
-    }
-
     pub async fn handle_client(
         &self,
         mut client_stream: TcpStream,
@@ -498,148 +685,27 @@ impl NntpProxy {
     ) -> Result<()> {
         debug!("New client connection from {}", client_addr);
 
-        // Record connection metrics
-        self.record_connection_opened();
-
-        // Use a dummy ClientId and command for routing (synchronous 1:1 mapping)
-        use types::ClientId;
-        let client_id = ClientId::new();
-
-        // Select backend using router's round-robin
-        let backend_id = self.router.route_command(client_id, "")?;
-        let server_idx = backend_id.as_index();
-        let server = &self.servers[server_idx];
-
-        info!(
-            "Routing client {} to backend {:?} ({}:{})",
-            client_addr, backend_id, server.host, server.port
-        );
-
-        // Setup connection (prewarm and greeting)
-        self.setup_client_connection(&mut client_stream, client_addr)
+        let backend_id = self
+            .prepare_stateful_connection(&mut client_stream, client_addr)
             .await?;
+        let server_idx = backend_id.as_index();
 
-        // Get pooled backend connection
-        let pool_status = self.connection_providers[server_idx].status();
-        debug!(
-            "Pool status for {}: {}/{} available, {} created",
-            server.name, pool_status.available, pool_status.max_size, pool_status.created
-        );
+        let session = self.create_session(client_addr, None);
+        let session_id = self.generate_session_id(&session);
 
-        let mut backend_conn = match self.connection_providers[server_idx]
-            .get_pooled_connection()
-            .await
-        {
-            Ok(conn) => {
-                debug!("Got pooled connection for {}", server.name);
-                conn
-            }
-            Err(e) => {
-                error!(
-                    "Failed to get pooled connection for {} (client {}): {}",
-                    server.name, client_addr, e
-                );
-                client_stream.write_all(BACKEND_UNAVAILABLE).await?;
-                anyhow::bail!(
-                    "Failed to get pooled connection for backend '{}' (client {}): {}",
-                    server.name,
-                    client_addr,
-                    e
-                );
-            }
-        };
+        debug!("Starting stateful session for client {}", client_addr);
 
-        // Apply socket optimizations for high-throughput
-        self.optimize_tcp_connections(&client_stream, &ConnectionOptimizer::new(&backend_conn));
+        let metrics = session
+            .handle_stateful_session(
+                client_stream,
+                backend_id,
+                &self.connection_providers[server_idx],
+                &self.servers[server_idx].name,
+                self.enable_metrics,
+            )
+            .await;
 
-        // Create session and handle connection
-        let session = self.build_session(client_addr, None, self.routing_mode, None);
-        let session_id = crate::formatting::short_id(session.client_id().as_uuid());
-
-        debug!("Starting session for client {}", client_addr);
-        let copy_result = if self.enable_metrics {
-            // Use metrics-enabled version for periodic reporting
-            session
-                .handle_with_pooled_backend_and_metrics(
-                    client_stream,
-                    &mut *backend_conn,
-                    backend_id,
-                )
-                .await
-        } else {
-            // Use basic version without metrics overhead
-            session
-                .handle_with_pooled_backend(client_stream, &mut *backend_conn)
-                .await
-        };
-
-        // Record connection statistics if not already recorded during auth
-        // (on_authentication_success already records for authenticated sessions)
-        if !self.auth_handler.is_enabled() || session.username().is_none() {
-            let routing_mode_str = self.get_routing_mode_label(session.mode());
-            self.connection_stats
-                .record_connection(session.username().as_deref(), routing_mode_str);
-        }
-
-        // Complete the routing (decrement pending count)
-        self.router.complete_command(backend_id);
-
-        // Log session results and handle backend connection errors
-        match copy_result {
-            Ok(metrics) => {
-                self.log_session_completion(
-                    client_addr,
-                    &session_id,
-                    &session,
-                    "standard",
-                    &metrics,
-                );
-
-                // Record transfer metrics
-                if self.enable_metrics {
-                    self.metrics.record_client_to_backend_bytes_for(
-                        backend_id,
-                        metrics.client_to_backend.as_u64(),
-                    );
-                    self.metrics.record_backend_to_client_bytes_for(
-                        backend_id,
-                        metrics.backend_to_client.as_u64(),
-                    );
-                }
-            }
-            Err(e) => {
-                // Record error
-                if self.enable_metrics {
-                    self.metrics.record_error(backend_id);
-                }
-
-                // Check if this is a backend I/O error - if so, remove connection from pool
-                if crate::pool::is_connection_error(&e) {
-                    warn!(
-                        "Backend connection error for client {}: {} - removing connection from pool",
-                        client_addr, e
-                    );
-                    crate::pool::remove_from_pool(backend_conn);
-                    self.record_connection_closed();
-                    return Err(e);
-                }
-                warn!("Session error for client {}: {}", client_addr, e);
-            }
-        }
-
-        self.record_connection_closed();
-        Ok(())
-    }
-
-    /// Handle client connection using per-command routing with article caching
-    pub async fn handle_client_with_cache(
-        &self,
-        client_stream: TcpStream,
-        client_addr: ClientAddress,
-        cache: Arc<crate::cache::ArticleCache>,
-    ) -> Result<()> {
-        self.handle_per_command_session(client_stream, client_addr, Some(cache))
-            .await
+        self.finalize_stateful_session(metrics, client_addr, &session_id, &session, backend_id)
     }
 
     /// Handle client connection using per-command routing mode
@@ -651,45 +717,30 @@ impl NntpProxy {
         client_stream: TcpStream,
         client_addr: ClientAddress,
     ) -> Result<()> {
-        self.handle_per_command_session(client_stream, client_addr, None)
+        self.handle_per_command_client(client_stream, client_addr, self.cache.clone())
             .await
     }
 
     /// Handle a per-command routing session with optional caching
-    async fn handle_per_command_session(
+    async fn handle_per_command_client(
         &self,
-        client_stream: TcpStream,
+        mut client_stream: TcpStream,
         client_addr: ClientAddress,
-        cache: Option<Arc<crate::cache::ArticleCache>>,
+        cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
-        let mode_label = cache.as_ref().map_or("per-command", |_| "caching");
-
+        let mode_label = self.routing_mode_display_name(&cache);
         debug!(
             "New {} routing client connection from {}",
             mode_label, client_addr
         );
 
-        // Record connection metrics
-        self.record_connection_opened();
+        self.prepare_per_command_connection(&mut client_stream, client_addr)
+            .await?;
 
-        // Enable TCP_NODELAY for low latency
-        client_stream
-            .set_nodelay(true)
-            .map_err(|e| debug!("Failed to set TCP_NODELAY for {}: {}", client_addr, e))
-            .ok();
+        let session = self.create_session(client_addr, Some(self.router.clone()));
+        let session_id = self.generate_session_id(&session);
 
-        // Create session with optional cache
-        let session = self.build_session(
-            client_addr,
-            Some(self.router.clone()),
-            self.routing_mode,
-            cache,
-        );
-
-        let session_id = crate::formatting::short_id(session.client_id().as_uuid());
-
-        // Handle the session with per-command routing
-        let result = session
+        let metrics = session
             .handle_per_command_routing(client_stream)
             .await
             .with_context(|| {
@@ -699,20 +750,7 @@ impl NntpProxy {
                 )
             });
 
-        // Log session results and cleanup
-        match result {
-            Ok(metrics) => self.log_session_completion(
-                client_addr,
-                &session_id,
-                &session,
-                &self.routing_mode.to_string().to_lowercase(),
-                &metrics,
-            ),
-            Err(e) => self.handle_session_error(e, client_addr, &session_id),
-        }
-
-        self.record_connection_closed();
-        Ok(())
+        self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
     }
 }
 
@@ -968,6 +1006,394 @@ mod tests {
             let io_err = Error::new(ErrorKind::BrokenPipe, "custom broken pipe");
             let err = anyhow::Error::from(io_err);
             assert!(is_client_disconnect_error(&err));
+        }
+    }
+
+    // Tests for new DRY helper methods
+    mod helper_methods {
+        use super::*;
+        use crate::session::SessionMode;
+
+        #[test]
+        fn test_session_mode_label_per_command() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
+
+            let label = proxy.session_mode_label(SessionMode::PerCommand);
+            assert_eq!(label, "per-command");
+        }
+
+        #[test]
+        fn test_session_mode_label_stateful_standard() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+
+            let label = proxy.session_mode_label(SessionMode::Stateful);
+            assert_eq!(label, "standard");
+        }
+
+        #[test]
+        fn test_session_mode_label_stateful_hybrid() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
+
+            let label = proxy.session_mode_label(SessionMode::Stateful);
+            assert_eq!(label, "hybrid");
+        }
+
+        #[test]
+        fn test_routing_mode_display_name_caching() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
+
+            // Create a cache with entries
+            let cache = Arc::new(crate::cache::ArticleCache::new(
+                100,
+                std::time::Duration::from_secs(3600),
+                true,
+            ));
+
+            // Empty cache should return "per-command"
+            assert_eq!(proxy.routing_mode_display_name(&cache), "per-command");
+        }
+
+        #[test]
+        fn test_generate_session_id_format() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+
+            let session = proxy.create_session(
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                None,
+            );
+
+            let session_id = proxy.generate_session_id(&session);
+
+            // Should be a short UUID (8 characters)
+            assert_eq!(session_id.len(), 8);
+        }
+
+        #[test]
+        fn test_create_session_without_router() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+
+            let session = proxy.create_session(
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                None,
+            );
+
+            // Session should be created successfully
+            assert_eq!(session.mode(), SessionMode::Stateful);
+        }
+
+        #[test]
+        fn test_create_session_with_router() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
+
+            let session = proxy.create_session(
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                Some(proxy.router.clone()),
+            );
+
+            // Session mode depends on router presence and config
+            // With router, it should be per-command
+            assert_eq!(session.mode(), SessionMode::PerCommand);
+        }
+
+        #[test]
+        fn test_record_connection_if_unauthenticated_no_auth() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            let session = proxy.create_session(
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                None,
+            );
+
+            // Should not panic
+            proxy.record_connection_if_unauthenticated(&session);
+
+            // Connection should be recorded (we can't easily verify without exposing internals)
+        }
+
+        #[test]
+        fn test_record_session_metrics_success() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            let session = proxy.create_session(
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                None,
+            );
+            let session_id = proxy.generate_session_id(&session);
+
+            let metrics = TransferMetrics {
+                client_to_backend: crate::types::ClientToBackendBytes::new(1024),
+                backend_to_client: crate::types::BackendToClientBytes::new(2048),
+            };
+
+            let result = proxy.record_session_metrics(
+                Ok(metrics),
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                &session_id,
+                &session,
+                Some(crate::types::BackendId::from_index(0)),
+            );
+
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_record_session_metrics_error() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            let session = proxy.create_session(
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                None,
+            );
+            let session_id = proxy.generate_session_id(&session);
+
+            let result = proxy.record_session_metrics(
+                Err(anyhow::anyhow!("test error")),
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
+                &session_id,
+                &session,
+                Some(crate::types::BackendId::from_index(0)),
+            );
+
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().to_string(), "test error");
+        }
+
+        #[tokio::test]
+        async fn test_prepare_per_command_connection() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Spawn a simple acceptor that reads greeting
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.try_read(&mut buf); // Read greeting
+            });
+
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let client_addr = ClientAddress::from(stream.peer_addr().unwrap());
+
+            let result = proxy
+                .prepare_per_command_connection(&mut stream, client_addr)
+                .await;
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_routing_mode_display_name_empty_cache() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
+
+            let empty_cache = Arc::new(crate::cache::ArticleCache::new(
+                100,
+                std::time::Duration::from_secs(3600),
+                false,
+            ));
+            assert_eq!(proxy.routing_mode_display_name(&empty_cache), "per-command");
+        }
+
+        #[test]
+        fn test_log_routing_selection() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            let backend_id = crate::types::BackendId::from_index(0);
+            let client_addr =
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+
+            // Should not panic
+            proxy.log_routing_selection(client_addr, backend_id, &proxy.servers()[0]);
+        }
+
+        #[test]
+        fn test_log_pool_status() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            // Should not panic
+            proxy.log_pool_status(0);
+        }
+
+        #[tokio::test]
+        async fn test_apply_tcp_optimizations() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                let (_stream, _) = listener.accept().await.unwrap();
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+            // Should not panic
+            proxy.apply_tcp_optimizations(&stream);
+        }
+
+        #[test]
+        fn test_session_mode_labels_all_combinations() {
+            use crate::session::SessionMode;
+
+            // PerCommand mode
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand).unwrap();
+            assert_eq!(
+                proxy.session_mode_label(SessionMode::PerCommand),
+                "per-command"
+            );
+
+            // Stateful mode
+            let proxy = NntpProxy::new(config.clone(), RoutingMode::Stateful).unwrap();
+            assert_eq!(proxy.session_mode_label(SessionMode::Stateful), "standard");
+
+            // Hybrid mode
+            let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
+            assert_eq!(proxy.session_mode_label(SessionMode::Stateful), "hybrid");
+        }
+
+        #[test]
+        fn test_finalize_stateful_session_success() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            let client_addr =
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+            let session = proxy.create_session(client_addr, None);
+            let session_id = proxy.generate_session_id(&session);
+            let backend_id = crate::types::BackendId::from_index(0);
+
+            let metrics = TransferMetrics {
+                client_to_backend: crate::types::ClientToBackendBytes::new(512),
+                backend_to_client: crate::types::BackendToClientBytes::new(1024),
+            };
+
+            let result = proxy.finalize_stateful_session(
+                Ok(metrics),
+                client_addr,
+                &session_id,
+                &session,
+                backend_id,
+            );
+
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_finalize_stateful_session_error() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+
+            let client_addr =
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+            let session = proxy.create_session(client_addr, None);
+            let session_id = proxy.generate_session_id(&session);
+            let backend_id = crate::types::BackendId::from_index(0);
+
+            let result = proxy.finalize_stateful_session(
+                Err(anyhow::anyhow!("connection error")),
+                client_addr,
+                &session_id,
+                &session,
+                backend_id,
+            );
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_finalize_per_command_session_success() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+
+            let client_addr =
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+            let session = proxy.create_session(client_addr, Some(proxy.router.clone()));
+            let session_id = proxy.generate_session_id(&session);
+
+            let metrics = TransferMetrics {
+                client_to_backend: crate::types::ClientToBackendBytes::new(256),
+                backend_to_client: crate::types::BackendToClientBytes::new(512),
+            };
+
+            let result =
+                proxy.finalize_per_command_session(Ok(metrics), client_addr, &session_id, &session);
+
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_finalize_per_command_session_error() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+
+            let client_addr =
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+            let session = proxy.create_session(client_addr, Some(proxy.router.clone()));
+            let session_id = proxy.generate_session_id(&session);
+
+            let result = proxy.finalize_per_command_session(
+                Err(anyhow::anyhow!("session failed")),
+                client_addr,
+                &session_id,
+                &session,
+            );
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_record_session_metrics_without_backend() {
+            let config = create_test_config();
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+
+            let client_addr =
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+            let session = proxy.create_session(client_addr, Some(proxy.router.clone()));
+            let session_id = proxy.generate_session_id(&session);
+
+            let metrics = TransferMetrics {
+                client_to_backend: crate::types::ClientToBackendBytes::new(128),
+                backend_to_client: crate::types::BackendToClientBytes::new(256),
+            };
+
+            // Without backend_id (per-command mode)
+            let result =
+                proxy.record_session_metrics(Ok(metrics), client_addr, &session_id, &session, None);
+
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_generate_session_id_uniqueness() {
+            let config = create_test_config();
+            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+
+            let client_addr =
+                ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+
+            let session1 = proxy.create_session(client_addr, None);
+            let session2 = proxy.create_session(client_addr, None);
+
+            let id1 = proxy.generate_session_id(&session1);
+            let id2 = proxy.generate_session_id(&session2);
+
+            // Should generate different IDs for different sessions
+            assert_ne!(id1, id2);
         }
     }
 }

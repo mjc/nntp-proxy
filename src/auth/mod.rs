@@ -6,6 +6,4 @@
 mod backend;
 mod handler;
 
-#[allow(unused_imports)]
-pub use backend::BackendAuthenticator;
 pub use handler::AuthHandler;

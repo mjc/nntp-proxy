@@ -361,6 +361,61 @@ execute_command(&mut *conn, command).await?;
 - Prewarming - Create connections at startup
 - Graceful shutdown - Close idle connections cleanly
 
+### 6. Article Availability Tracking (CRITICAL - DO NOT MISUSE)
+
+**Type:** `cache::ArticleAvailability` - Bitset tracking which backends have a specific article
+
+**⚠️ DUAL PURPOSE - This type serves TWO critical functions:**
+
+1. **Cache persistence** - Track article availability across requests (long-lived)
+2. **430 retry tracking** - Track which backends tried during retry loop (transient, per-request)
+
+**Pattern for 430 retry loops:**
+
+```rust
+// Create fresh availability tracker for THIS request
+let mut availability = crate::cache::ArticleAvailability::new();
+
+loop {
+    let backend_id = router.route_command(client_id, command)?;
+    
+    // Check if we already tried this backend (it returned 430)
+    if availability.has(backend_id) == Some(false) {
+        // All backends exhausted - send 430 to client
+        break;
+    }
+    
+    // Execute command on backend
+    let response = execute_on_backend(backend_id)?;
+    
+    if response.status_code() == 430 {
+        // Mark this backend as NOT having the article
+        availability.mark_missing(backend_id);
+        continue; // Try next backend
+    }
+    
+    // Success - return response
+    return Ok(response);
+}
+```
+
+**Understanding the bitset semantics:**
+- `has(backend_id) == None` → Backend not yet tried, **attempt it**
+- `has(backend_id) == Some(false)` → Backend tried and returned 430, **skip it**
+- `has(backend_id) == Some(true)` → Backend has article (shouldn't happen in retry loop)
+
+**CRITICAL - DO NOT:**
+- ❌ Create a separate "tried backends" bitset - `ArticleAvailability` already does this!
+- ❌ Use `mark_has()` to track "tried" - that means backend HAS the article
+- ❌ Mark backends before trying them - mark AFTER getting the response
+- ❌ Confuse the semantics - `mark_missing()` is for 430, `mark_has()` is for success
+
+**WHY THIS WORKS:**
+- The `checked` bitset tracks which backends we've tried
+- The `has_article` bitset tracks the result (true=has, false=430)
+- Combined: `has(backend_id) == Some(false)` means "tried and returned 430"
+- This is exactly what we need - no duplicate tracking required
+
 ---
 
 ## Coding Standards
@@ -1110,6 +1165,35 @@ cargo llvm-cov --html
 **IMPORTANT:** Always use `cargo nextest run` for this project - it's ~7x faster than `cargo test` due to parallel execution. All tests use random ports to avoid conflicts during parallel runs.
 
 **DO NOT use `cargo test`** - it's significantly slower and should be avoided. Use `cargo nextest run` instead.
+
+**CRITICAL: When debugging tests or analyzing test output:**
+
+❌ **DO NOT** use `cargo nextest` when you need to see debug output (`eprintln!`, `println!`, etc.)
+- Nextest buffers and mangles output, making debug traces hard to read
+- Use `cargo test` instead for debugging sessions
+
+❌ **DO NOT** pipe test output through `grep`, `head`, or `tail` when debugging
+- These commands hide critical debug output and context
+- You WILL miss important information about test failures
+- Run tests without pipes to see full output
+
+✅ **DO** use these patterns for debugging:
+```bash
+# For seeing debug output - use cargo test with --nocapture
+cargo test --test test_430_retry test_name -- --nocapture
+
+# For comprehensive test output - no pipes
+cargo test --test test_name -- --nocapture 2>&1
+
+# For multiple tests with output
+cargo test --test test_file -- --nocapture
+```
+
+✅ **DO** use nextest for:
+- CI/CD pipelines
+- Running full test suites quickly
+- Tests that don't require debug output analysis
+- Coverage runs
 
 ### Benchmarking
 

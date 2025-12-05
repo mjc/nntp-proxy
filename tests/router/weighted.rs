@@ -346,7 +346,7 @@ fn test_weighted_with_varying_pool_sizes() {
     let mut selector = BackendSelector::new();
 
     // Real-world diverse pool sizes
-    let pool_sizes = vec![5, 10, 15, 20, 25, 30];
+    let pool_sizes = [5, 10, 15, 20, 25, 30];
     let total: usize = pool_sizes.iter().sum();
 
     for (i, &size) in pool_sizes.iter().enumerate() {

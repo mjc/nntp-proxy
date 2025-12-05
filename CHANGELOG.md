@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Backend Availability Tracking** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
+  - Automatic 430 retry across all backends when article not found
+  - Compact bitset tracking (u8) for up to 8 backends per article
+  - Progressive learning from cache hits, misses, and backend responses
+  - Zero-cost abstractions with O(1) bitwise operations (~2ns lookup)
+  
+- **Availability-Only Cache Mode** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
+  - New `cache_articles` config option (default: true)
+  - `cache_articles = false` tracks backend availability without caching article bodies
+  - Memory footprint: ~68 bytes/article (availability-only) vs ~1MB/article (full cache)
+  - Ideal for tracking which backends have articles with minimal memory usage
+
+- **Multi-User Authentication** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
+  - Support for multiple client credentials via `[[client_auth.users]]` array
+  - Each user can have different username/password combinations
+  - Backwards compatible with existing single-user configs
+
+### Changed
+
+- **Session Architecture Improvements** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
+  - Unified per-command handler with cache-aware execution
+  - Extracted stateful mode logic to dedicated `session/handlers/stateful.rs` module
+  - Refactored proxy lifecycle with 11 DRY helper methods
+  - Consistent TCP optimizations applied across all routing modes
+
+- **Error Handling & Logging** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
+  - Client disconnect detection suppresses spurious error logs
+  - Eliminated duplicate logging (WARN + ERROR for same event)
+  - Only logs actionable errors requiring attention
+
+### Fixed
+
+- **Proxy Greeting Timing** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
+  - Greeting now sent immediately on connection in all modes
+  - Fixes client disconnect errors caused by delayed greeting
+  - Session handlers no longer responsible for greeting (proxy owns it)
+
 ## [0.3.0] - 2025-11-21
 
 ### Added

@@ -222,10 +222,7 @@ mod tests {
     fn test_tls_handshake_error() {
         let err = ConnectionError::TlsHandshake {
             backend: "secure.server.com".to_string(),
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "TLS handshake failed",
-            )),
+            source: Box::new(std::io::Error::other("TLS handshake failed")),
         };
 
         let msg = err.to_string();

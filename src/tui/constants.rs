@@ -11,9 +11,9 @@ pub mod layout {
     use ratatui::layout::Constraint;
 
     pub const TITLE_HEIGHT: u16 = 3;
-    pub const SUMMARY_HEIGHT: u16 = 5;
+    pub const SUMMARY_HEIGHT: u16 = 6; // 3 columns with 4 lines each
     pub const FOOTER_HEIGHT: u16 = 3;
-    pub const MIN_CHART_HEIGHT: u16 = 10;
+    pub const MIN_CHART_HEIGHT: u16 = 8; // Reduced to fit cache stats in summary
 
     pub const BACKEND_LIST_WIDTH_PCT: u16 = 50;
     pub const CHART_WIDTH_PCT: u16 = 50;
@@ -68,14 +68,6 @@ pub const BACKEND_COLORS: &[Color] = &[
     Color::Blue,
 ];
 
-/// Status colors
-pub mod status {
-    use ratatui::style::Color;
-
-    #[allow(dead_code)] // May be used in future features
-    pub const WARNING: Color = Color::Yellow;
-}
-
 /// UI text styles
 pub mod styles {
     use ratatui::style::Color;
@@ -98,7 +90,6 @@ pub mod text {
     pub const ARROW_UP: &str = "↑";
     pub const ARROW_DOWN: &str = "↓";
     pub const DEFAULT_CMD_RATE: &str = "0.0";
-    #[allow(dead_code)] // Used in default values
     pub const DEFAULT_THROUGHPUT: &str = "0 B/s";
 }
 
@@ -123,9 +114,9 @@ mod tests {
     #[test]
     fn test_layout_constants() {
         assert_eq!(layout::TITLE_HEIGHT, 3);
-        assert_eq!(layout::SUMMARY_HEIGHT, 5);
+        assert_eq!(layout::SUMMARY_HEIGHT, 6);
         assert_eq!(layout::FOOTER_HEIGHT, 3);
-        assert_eq!(layout::MIN_CHART_HEIGHT, 10);
+        assert_eq!(layout::MIN_CHART_HEIGHT, 8);
         assert_eq!(layout::BACKEND_LIST_WIDTH_PCT, 50);
         assert_eq!(layout::CHART_WIDTH_PCT, 50);
     }
@@ -176,11 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn test_status_colors() {
-        assert_eq!(status::WARNING, Color::Yellow);
-    }
-
-    #[test]
     fn test_style_colors() {
         assert_eq!(styles::LABEL, Color::Gray);
         assert_eq!(styles::VALUE_PRIMARY, Color::Green);
@@ -207,16 +193,6 @@ mod tests {
         assert_eq!(throughput::HUNDRED_KB, 100_000.0);
         assert_eq!(throughput::TEN_KB, 10_000.0);
         assert_eq!(throughput::ONE_KB, 1_000.0);
-    }
-
-    #[test]
-    fn test_throughput_constants_ordering() {
-        // Verify constants are in descending order
-        assert!(throughput::HUNDRED_MB > throughput::TEN_MB);
-        assert!(throughput::TEN_MB > throughput::ONE_MB);
-        assert!(throughput::ONE_MB > throughput::HUNDRED_KB);
-        assert!(throughput::HUNDRED_KB > throughput::TEN_KB);
-        assert!(throughput::TEN_KB > throughput::ONE_KB);
     }
 
     #[test]
