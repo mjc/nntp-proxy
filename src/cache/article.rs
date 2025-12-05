@@ -297,7 +297,7 @@ impl ArticleCache {
         // If not caching full articles, create minimal stub from the article's buffer
         let entry = if !self.cache_articles {
             let buffer = article.buffer();
-            let stub_buffer = self.create_minimal_stub(&buffer);
+            let stub_buffer = self.create_minimal_stub(buffer);
             ArticleEntry::new(stub_buffer, article.backend_id)
         } else {
             article

@@ -270,21 +270,20 @@ impl ClientSession {
             .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
 
         // Check cache for full response (only works if cache_articles=true)
-        if let Some(msg_id_ref) = msg_id.as_ref() {
-            if self.cache_articles {
-                match self.cache.get(msg_id_ref).await {
-                    Some(cached) => {
-                        client_write.write_all(cached.response()).await?;
-                        *backend_to_client_bytes =
-                            backend_to_client_bytes.add(cached.response().len());
+        if let Some(msg_id_ref) = msg_id.as_ref()
+            && self.cache_articles
+        {
+            match self.cache.get(msg_id_ref).await {
+                Some(cached) => {
+                    client_write.write_all(cached.response()).await?;
+                    *backend_to_client_bytes = backend_to_client_bytes.add(cached.response().len());
 
-                        let backend_id = router.route_command(self.client_id, command)?;
-                        router.complete_command(backend_id);
-                        return Ok(backend_id);
-                    }
-                    None => {
-                        debug!("Cache MISS for message-ID: {}", msg_id_ref);
-                    }
+                    let backend_id = router.route_command(self.client_id, command)?;
+                    router.complete_command(backend_id);
+                    return Ok(backend_id);
+                }
+                None => {
+                    debug!("Cache MISS for message-ID: {}", msg_id_ref);
                 }
             }
         }
@@ -364,36 +363,36 @@ impl ClientSession {
             *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
             // Check for 430 (article not found) - retry with next backend
-            if let Some(code) = response_code.status_code() {
-                if code.as_u16() == 430 {
-                    // Record this backend as NOT having the article
-                    availability.record_missing(backend_id);
+            if let Some(code) = response_code.status_code()
+                && code.as_u16() == 430
+            {
+                // Record this backend as NOT having the article
+                availability.record_missing(backend_id);
 
-                    // Track availability in cache: this backend doesn't have it
-                    if let Some(ref msg_id_ref) = msg_id {
-                        let cache_clone = self.cache.clone();
-                        let msg_id_owned = msg_id_ref.to_owned();
-                        tokio::spawn(async move {
-                            cache_clone
-                                .record_backend_missing(msg_id_owned, backend_id)
-                                .await;
-                        });
-                    }
-
-                    // Track 430 as 4xx error for this backend
-                    if let Some(ref metrics) = self.metrics {
-                        metrics.record_error_4xx(backend_id);
-                    }
-
-                    router.complete_command(backend_id);
-
-                    // Save the 430 response in case this is the last backend
-                    // We'll send it to client only if all backends fail
-                    last_430_response = Some(buffer[..n].to_vec());
-
-                    // Try next backend (router will round-robin to next one)
-                    continue;
+                // Track availability in cache: this backend doesn't have it
+                if let Some(ref msg_id_ref) = msg_id {
+                    let cache_clone = self.cache.clone();
+                    let msg_id_owned = msg_id_ref.to_owned();
+                    tokio::spawn(async move {
+                        cache_clone
+                            .record_backend_missing(msg_id_owned, backend_id)
+                            .await;
+                    });
                 }
+
+                // Track 430 as 4xx error for this backend
+                if let Some(ref metrics) = self.metrics {
+                    metrics.record_error_4xx(backend_id);
+                }
+
+                router.complete_command(backend_id);
+
+                // Save the 430 response in case this is the last backend
+                // We'll send it to client only if all backends fail
+                last_430_response = Some(buffer[..n].to_vec());
+
+                // Try next backend (router will round-robin to next one)
+                continue;
             }
 
             // Non-430 response - this is the final result
@@ -404,7 +403,7 @@ impl ClientSession {
                 && msg_id.is_some()
                 && response_code
                     .status_code()
-                    .is_some_and(|c| matches!(c.as_u16(), 220 | 221 | 222));
+                    .is_some_and(|c| matches!(c.as_u16(), 220..=222));
 
             // Stream response to client
             let bytes_written = if is_multiline {
@@ -449,7 +448,7 @@ impl ClientSession {
                     let should_track = msg_id.is_some()
                         && response_code
                             .status_code()
-                            .is_some_and(|c| matches!(c.as_u16(), 220 | 221 | 222 | 223));
+                            .is_some_and(|c| matches!(c.as_u16(), 220..=223));
 
                     let bytes_result = streaming::stream_multiline_response(
                         &mut *pooled_conn,
@@ -465,18 +464,16 @@ impl ClientSession {
                     match bytes_result {
                         Ok(bytes) => {
                             // Pass status code to cache - it will create minimal stub
-                            if should_track {
-                                if let Some(msg_id_ref) = msg_id.as_ref() {
-                                    let cache_clone = self.cache.clone();
-                                    let msg_id_owned = msg_id_ref.to_owned();
-                                    // Pass response buffer (cache will strip to stub internally)
-                                    let buffer_for_cache = buffer[..n].to_vec();
-                                    tokio::spawn(async move {
-                                        cache_clone
-                                            .upsert(msg_id_owned, buffer_for_cache, backend_id)
-                                            .await;
-                                    });
-                                }
+                            if should_track && let Some(msg_id_ref) = msg_id.as_ref() {
+                                let cache_clone = self.cache.clone();
+                                let msg_id_owned = msg_id_ref.to_owned();
+                                // Pass response buffer (cache will strip to stub internally)
+                                let buffer_for_cache = buffer[..n].to_vec();
+                                tokio::spawn(async move {
+                                    cache_clone
+                                        .upsert(msg_id_owned, buffer_for_cache, backend_id)
+                                        .await;
+                                });
                             }
                             bytes
                         }
@@ -501,17 +498,15 @@ impl ClientSession {
                 match client_write.write_all(&buffer[..n]).await {
                     Ok(_) => {
                         // Track STAT responses
-                        if should_track {
-                            if let Some(msg_id_ref) = msg_id.as_ref() {
-                                let cache_clone = self.cache.clone();
-                                let msg_id_owned = msg_id_ref.to_owned();
-                                let buffer_for_cache = b"223\r\n".to_vec();
-                                tokio::spawn(async move {
-                                    cache_clone
-                                        .upsert(msg_id_owned, buffer_for_cache, backend_id)
-                                        .await;
-                                });
-                            }
+                        if should_track && let Some(msg_id_ref) = msg_id.as_ref() {
+                            let cache_clone = self.cache.clone();
+                            let msg_id_owned = msg_id_ref.to_owned();
+                            let buffer_for_cache = b"223\r\n".to_vec();
+                            tokio::spawn(async move {
+                                cache_clone
+                                    .upsert(msg_id_owned, buffer_for_cache, backend_id)
+                                    .await;
+                            });
                         }
                         n as u64
                     }
@@ -542,7 +537,7 @@ impl ClientSession {
                 }
 
                 // Track article size for successful article retrieval
-                if is_multiline && matches!(raw_code, 220 | 221 | 222) {
+                if is_multiline && matches!(raw_code, 220..=222) {
                     metrics.record_article(backend_id, bytes_written);
                 }
             }
@@ -624,7 +619,7 @@ impl ClientSession {
             && msgid.is_some()
             && response_code
                 .status_code()
-                .is_some_and(|c| matches!(c.as_u16(), 220 | 221 | 222));
+                .is_some_and(|c| matches!(c.as_u16(), 220..=222));
 
         // Stream response to client
         let bytes_written = if is_multiline {
@@ -670,7 +665,7 @@ impl ClientSession {
                 let should_track_availability = msgid.is_some()
                     && response_code
                         .status_code()
-                        .is_some_and(|c| matches!(c.as_u16(), 220 | 221 | 222 | 223));
+                        .is_some_and(|c| matches!(c.as_u16(), 220..=223));
 
                 match streaming::stream_multiline_response(
                     &mut **pooled_conn,
@@ -685,20 +680,17 @@ impl ClientSession {
                 {
                     Ok(bytes) => {
                         // Track availability - pass first chunk buffer to cache
-                        if should_track_availability {
-                            if let Some(msg_id_str) = msgid {
-                                let cache_clone = self.cache.clone();
-                                let msg_id_string = msg_id_str.to_string();
-                                let buffer_for_cache = chunk_buffer[..n].to_vec();
-                                tokio::spawn(async move {
-                                    if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string)
-                                    {
-                                        cache_clone
-                                            .upsert(msg_id, buffer_for_cache, backend_id)
-                                            .await;
-                                    }
-                                });
-                            }
+                        if should_track_availability && let Some(msg_id_str) = msgid {
+                            let cache_clone = self.cache.clone();
+                            let msg_id_string = msg_id_str.to_string();
+                            let buffer_for_cache = chunk_buffer[..n].to_vec();
+                            tokio::spawn(async move {
+                                if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
+                                    cache_clone
+                                        .upsert(msg_id, buffer_for_cache, backend_id)
+                                        .await;
+                                }
+                            });
                         }
                         bytes
                     }
@@ -722,19 +714,17 @@ impl ClientSession {
             match client_write.write_all(&chunk_buffer[..n]).await {
                 Ok(_) => {
                     // Track STAT responses for availability
-                    if should_track_availability {
-                        if let Some(msg_id_str) = msgid {
-                            let cache_clone = self.cache.clone();
-                            let msg_id_string = msg_id_str.to_string();
-                            let buffer_for_cache = chunk_buffer[..n].to_vec();
-                            tokio::spawn(async move {
-                                if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
-                                    cache_clone
-                                        .upsert(msg_id, buffer_for_cache, backend_id)
-                                        .await;
-                                }
-                            });
-                        }
+                    if should_track_availability && let Some(msg_id_str) = msgid {
+                        let cache_clone = self.cache.clone();
+                        let msg_id_string = msg_id_str.to_string();
+                        let buffer_for_cache = chunk_buffer[..n].to_vec();
+                        tokio::spawn(async move {
+                            if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
+                                cache_clone
+                                    .upsert(msg_id, buffer_for_cache, backend_id)
+                                    .await;
+                            }
+                        });
                     }
                     n as u64
                 }
@@ -765,7 +755,7 @@ impl ClientSession {
             }
 
             // Track article size for successful article retrieval
-            if is_multiline && matches!(raw_code, 220 | 221 | 222) {
+            if is_multiline && matches!(raw_code, 220..=222) {
                 metrics.record_article(backend_id, bytes_written);
             }
         }
