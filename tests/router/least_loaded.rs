@@ -102,8 +102,18 @@ fn test_least_loaded_respects_pending_counts() {
     }
 
     // Both backends now have 5 pending each (even distribution)
-    assert_eq!(selector.backend_load(BackendId::from_index(0)), Some(5));
-    assert_eq!(selector.backend_load(BackendId::from_index(1)), Some(5));
+    assert_eq!(
+        selector
+            .backend_load(BackendId::from_index(0))
+            .map(|c| c.get()),
+        Some(5)
+    );
+    assert_eq!(
+        selector
+            .backend_load(BackendId::from_index(1))
+            .map(|c| c.get()),
+        Some(5)
+    );
 
     // Complete 3 commands from backend 0
     for _ in 0..3 {

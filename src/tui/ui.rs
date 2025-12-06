@@ -4,8 +4,9 @@ use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
 use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::helpers::{
-    build_chart_data, calculate_chart_bounds, create_sparkline, format_summary_throughput,
-    format_throughput_label,
+    build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline,
+    error_count_color, error_rate_color, format_error_rate, format_summary_throughput,
+    format_throughput_label, health_indicator, load_percentage_color, pending_count_color,
 };
 use ratatui::{
     Frame,
@@ -310,6 +311,163 @@ fn render_backends(
     render_user_stats(f, chunks[2], snapshot);
 }
 
+// ============================================================================
+// Backend List Rendering Helpers
+// ============================================================================
+
+/// Create header line: health icon, server name, error rate
+fn backend_header_line<'a>(
+    health_icon: &'a str,
+    health_color: Color,
+    server_name: &'a str,
+    error_text: String,
+    error_rate: f64,
+) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            health_icon,
+            Style::default()
+                .fg(health_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            server_name,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            error_text,
+            Style::default().fg(error_rate_color(error_rate)),
+        ),
+    ])
+}
+
+/// Create address line: host:port with optional traffic share
+fn backend_address_line(host: &str, port: u16, traffic_share: Option<f64>) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{}:{}", host, port),
+            Style::default().fg(styles::LABEL),
+        ),
+    ];
+
+    if let Some(share) = traffic_share {
+        spans.push(Span::styled(
+            format!(" ({:.1}% share)", share),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+/// Create metrics line: connections, cmd/s, TTFB
+fn backend_metrics_line(
+    active: usize,
+    max: usize,
+    cmd_per_sec: String,
+    ttfb: String,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{}/{}", active, max),
+            Style::default().fg(styles::VALUE_SECONDARY),
+        ),
+        Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
+        Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
+        Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
+        Span::styled(ttfb, Style::default().fg(styles::VALUE_INFO)),
+    ])
+}
+
+/// Create transfer line: bytes sent/received with arrows
+fn backend_transfer_line(sent: u64, received: u64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {} ", text::ARROW_UP),
+            Style::default().fg(styles::VALUE_PRIMARY),
+        ),
+        Span::styled(
+            format_bytes(sent),
+            Style::default().fg(styles::VALUE_PRIMARY),
+        ),
+        Span::styled(
+            format!("  {} ", text::ARROW_DOWN),
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        ),
+        Span::styled(
+            format_bytes(received),
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        ),
+    ])
+}
+
+/// Create article stats line: average size and count
+fn backend_article_line(avg_size: String, count: u64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  Avg Article: ", Style::default().fg(styles::LABEL)),
+        Span::styled(avg_size, Style::default().fg(styles::VALUE_INFO)),
+        Span::styled(" | Articles: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{}", count),
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        ),
+    ])
+}
+
+/// Create error stats line: 4xx/5xx errors and connection failures
+fn backend_error_line(
+    errors_4xx: u64,
+    errors_5xx: u64,
+    has_errors: bool,
+    failures: u64,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  Errors: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("4xx:{} 5xx:{}", errors_4xx, errors_5xx),
+            Style::default().fg(error_count_color(has_errors)),
+        ),
+        Span::styled(" | Conn Fails: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{}", failures),
+            Style::default().fg(connection_failure_color(failures)),
+        ),
+    ])
+}
+
+/// Create details line: pending, load ratio, stateful connections
+fn backend_details_line(pending: usize, load_ratio: Option<f64>, stateful: usize) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("  Load: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{} in-flight", pending),
+            Style::default().fg(pending_count_color(pending)),
+        ),
+    ];
+
+    if let Some(ratio) = load_ratio {
+        let ratio_percent = ratio * 100.0;
+        spans.push(Span::styled(
+            format!(" ({:.0}%)", ratio_percent),
+            Style::default().fg(load_percentage_color(ratio_percent)),
+        ));
+    }
+
+    if stateful > 0 {
+        spans.push(Span::styled(
+            format!(" | Stateful: {}", stateful),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    Line::from(spans)
+}
+
 /// Render list of backend servers with their stats
 fn render_backend_list(
     f: &mut Frame,
@@ -324,163 +482,64 @@ fn render_backend_list(
         .zip(servers.iter())
         .enumerate()
         .map(|(i, (stats, server))| {
-            use crate::metrics::HealthStatus;
-
-            // Determine health status indicator
-            let (health_icon, health_color) = match stats.health_status {
-                HealthStatus::Healthy => ("●", Color::Green),
-                HealthStatus::Degraded => ("◐", Color::Yellow),
-                HealthStatus::Down => ("○", Color::Red),
-            };
-
-            // Format error rate
+            let (health_icon, health_color) = health_indicator(stats.health_status);
             let error_rate = stats.error_rate_percent();
-            let error_text = if error_rate > 5.0 {
-                format!(" ⚠ {:.1}%", error_rate)
-            } else if error_rate > 0.0 {
-                format!(" {:.1}%", error_rate)
-            } else {
-                String::new()
-            };
 
-            // Get latest commands/sec from throughput history
+            // Format dynamic text values
             let cmd_per_sec = app
                 .latest_backend_throughput(i)
-                .and_then(|point| point.commands_per_sec())
-                .map(|cps| format!("{:.0}", cps.get()))
-                .unwrap_or_else(|| String::from(text::DEFAULT_CMD_RATE));
+                .and_then(|p| p.commands_per_sec())
+                .map_or_else(
+                    || text::DEFAULT_CMD_RATE.to_string(),
+                    |cps| format!("{:.0}", cps.get()),
+                );
 
-            // Format TTFB (time to first byte)
-            let ttfb_text = stats
+            let ttfb = stats
                 .average_ttfb_ms()
-                .map(|ms| format!("{:.1}ms", ms))
-                .unwrap_or_else(|| "N/A".to_string());
+                .map_or_else(|| "N/A".to_string(), |ms| format!("{:.1}ms", ms));
 
-            // Format average article size
-            let avg_size_text = stats
+            let avg_size = stats
                 .average_article_size()
-                .map(format_bytes)
-                .unwrap_or_else(|| "N/A".to_string());
+                .map_or_else(|| "N/A".to_string(), format_bytes);
 
-            let content = vec![
-                Line::from(vec![
-                    Span::styled(
-                        health_icon,
-                        Style::default()
-                            .fg(health_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        server.name.as_str(),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        error_text,
-                        Style::default().fg(if error_rate > 5.0 {
-                            Color::Red
-                        } else {
-                            Color::Yellow
-                        }),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
-                        format!("{}:{}", server.host, server.port),
-                        Style::default().fg(styles::LABEL),
-                    ),
-                ]),
-                Line::from({
-                    let mut line = vec![
-                        Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
-                        Span::styled(
-                            format!("{}/{}", stats.active_connections, server.max_connections),
-                            Style::default().fg(styles::VALUE_SECONDARY),
-                        ),
-                    ];
-
-                    // Show pending count if details mode is enabled
-                    if app.show_details() {
-                        let pending = app.backend_pending_count(i);
-                        line.push(Span::styled(
-                            format!(" ({} pending)", pending),
-                            Style::default().fg(if pending > 0 {
-                                Color::Yellow
-                            } else {
-                                styles::LABEL
-                            }),
-                        ));
-                    }
-
-                    line.push(Span::styled(
-                        " | Cmd/s: ",
-                        Style::default().fg(styles::LABEL),
-                    ));
-                    line.push(Span::styled(
-                        cmd_per_sec,
-                        Style::default().fg(styles::VALUE_INFO),
-                    ));
-                    line.push(Span::styled(
-                        " | TTFB: ",
-                        Style::default().fg(styles::LABEL),
-                    ));
-                    line.push(Span::styled(
-                        ttfb_text,
-                        Style::default().fg(styles::VALUE_INFO),
-                    ));
-                    line
-                }),
-                Line::from(vec![
-                    Span::styled(
-                        format!("  {} ", text::ARROW_UP),
-                        Style::default().fg(styles::VALUE_PRIMARY),
-                    ),
-                    Span::styled(
-                        format_bytes(stats.bytes_sent.as_u64()),
-                        Style::default().fg(styles::VALUE_PRIMARY),
-                    ),
-                    Span::styled(
-                        format!("  {} ", text::ARROW_DOWN),
-                        Style::default().fg(styles::VALUE_NEUTRAL),
-                    ),
-                    Span::styled(
-                        format_bytes(stats.bytes_received.as_u64()),
-                        Style::default().fg(styles::VALUE_NEUTRAL),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Avg Article: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(avg_size_text, Style::default().fg(styles::VALUE_INFO)),
-                    Span::styled(" | Articles: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("{}", stats.article_count),
-                        Style::default().fg(styles::VALUE_NEUTRAL),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Errors: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("4xx:{} 5xx:{}", stats.errors_4xx, stats.errors_5xx),
-                        Style::default().fg(if !stats.errors.is_zero() {
-                            Color::Yellow
-                        } else {
-                            styles::VALUE_NEUTRAL
-                        }),
-                    ),
-                    Span::styled(" | Conn Fails: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("{}", stats.connection_failures),
-                        Style::default().fg(if stats.connection_failures.get() > 0 {
-                            Color::Red
-                        } else {
-                            styles::VALUE_NEUTRAL
-                        }),
-                    ),
-                ]),
+            // Build base content lines
+            let mut content = vec![
+                backend_header_line(
+                    health_icon,
+                    health_color,
+                    server.name.as_str(),
+                    format_error_rate(error_rate),
+                    error_rate,
+                ),
+                backend_address_line(
+                    &server.host,
+                    server.port.get(),
+                    app.backend_traffic_share(i),
+                ),
+                backend_metrics_line(
+                    stats.active_connections.get(),
+                    server.max_connections.get(),
+                    cmd_per_sec,
+                    ttfb,
+                ),
+                backend_transfer_line(stats.bytes_sent.as_u64(), stats.bytes_received.as_u64()),
+                backend_article_line(avg_size, stats.article_count.get()),
+                backend_error_line(
+                    stats.errors_4xx.get(),
+                    stats.errors_5xx.get(),
+                    !stats.errors.is_zero(),
+                    stats.connection_failures.get(),
+                ),
             ];
+
+            // Add details line in details mode
+            if app.show_details() {
+                content.push(backend_details_line(
+                    app.backend_pending_count(i),
+                    app.backend_load_ratio(i),
+                    app.backend_stateful_count(i),
+                ));
+            }
 
             ListItem::new(content)
         })

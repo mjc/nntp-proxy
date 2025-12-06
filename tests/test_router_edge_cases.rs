@@ -42,7 +42,7 @@ fn test_complete_command_on_wrong_backend() {
     router.complete_command(wrong_id);
 
     // Should not affect the real backend
-    assert_eq!(router.backend_load(backend_id), Some(0));
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(0));
 }
 
 #[test]
@@ -74,12 +74,12 @@ fn test_release_stateful_when_count_is_zero() {
 
     // Release without acquiring should not underflow (fetch_update prevents it)
     router.release_stateful(backend_id);
-    assert_eq!(router.stateful_count(backend_id), Some(0));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(0));
 
     // Multiple releases should still be safe
     router.release_stateful(backend_id);
     router.release_stateful(backend_id);
-    assert_eq!(router.stateful_count(backend_id), Some(0));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(0));
 }
 
 #[test]
@@ -105,11 +105,11 @@ fn test_excessive_complete_command_calls() {
 
     // Route one command
     router.route_command(client_id, "LIST").unwrap();
-    assert_eq!(router.backend_load(backend_id), Some(1));
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(1));
 
     // Complete it once
     router.complete_command(backend_id);
-    assert_eq!(router.backend_load(backend_id), Some(0));
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(0));
 
     // Excessive completes can cause the atomic counter to underflow (wrapping behavior)
     // This is known behavior for AtomicUsize - it will wrap around
@@ -117,7 +117,7 @@ fn test_excessive_complete_command_calls() {
     router.complete_command(backend_id);
 
     // After underflow, load will be very large (close to usize::MAX)
-    let load = router.backend_load(backend_id).unwrap();
+    let load = router.backend_load(backend_id).unwrap().get();
     // Check that it wrapped (should be > usize::MAX - 10)
     assert!(load > usize::MAX - 10, "Expected underflow, got {}", load);
 }
@@ -206,7 +206,7 @@ fn test_stateful_acquisition_with_max_connections_1() {
 
     // Should never be able to acquire stateful (all reserved for PCR)
     assert!(!router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(0));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(0));
 }
 
 #[test]
@@ -287,20 +287,20 @@ fn test_stateful_acquire_release_interleaved() {
 
     // Acquire, release, acquire pattern
     assert!(router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(1));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(1));
 
     assert!(router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(2));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(2));
 
     router.release_stateful(backend_id);
-    assert_eq!(router.stateful_count(backend_id), Some(1));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(1));
 
     assert!(router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(2));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(2));
 
     router.release_stateful(backend_id);
     router.release_stateful(backend_id);
-    assert_eq!(router.stateful_count(backend_id), Some(0));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(0));
 }
 
 #[test]

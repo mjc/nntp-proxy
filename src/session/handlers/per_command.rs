@@ -296,22 +296,36 @@ impl ClientSession {
         let mut availability = crate::cache::ArticleAvailability::new();
 
         // Try backends until we get a non-430 response
+        let mut attempts = 0;
+        let max_attempts = router.backend_count().get() * 2; // Allow 2 full rounds
+
         loop {
+            // Prevent infinite loop if all backends exhausted
+            if availability.all_exhausted(router.backend_count()) {
+                if let Some(response) = last_430_response {
+                    client_write.write_all(&response).await?;
+                    *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
+                }
+                anyhow::bail!("Article not found on any backend");
+            }
+
+            // Safety check: prevent infinite loops
+            attempts += 1;
+            if attempts > max_attempts {
+                anyhow::bail!(
+                    "Exceeded maximum retry attempts ({}) - possible infinite loop",
+                    max_attempts
+                );
+            }
+
             // Route to next backend
             let backend_id = router.route_command(self.client_id, command)?;
 
             // Check if we should try this backend (haven't tried it yet OR it didn't return 430)
             if !availability.should_try(backend_id) {
-                // This backend already returned 430 - check if all backends exhausted
-                let backend_count = router.backend_count();
-                if availability.all_exhausted(backend_count) {
-                    if let Some(response) = last_430_response {
-                        client_write.write_all(&response).await?;
-                        *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-                    }
-                    anyhow::bail!("Article not found on any backend");
-                }
-                // Some backends still untried - continue looping to get next backend
+                // This backend already returned 430 - complete the routing and try next
+                router.complete_command(backend_id);
+                // Continue to next backend (round-robin will give us a different one)
                 continue;
             }
 

@@ -1178,7 +1178,7 @@ mod tests {
 
             // Spawn a simple acceptor that reads greeting
             tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
                 let mut buf = [0u8; 1024];
                 let _ = stream.try_read(&mut buf); // Read greeting
             });

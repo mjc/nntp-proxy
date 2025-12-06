@@ -6,6 +6,7 @@
 //! This limit is enforced at config validation time.
 
 use crate::protocol::StatusCode;
+use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::future::Cache;
 use std::sync::Arc;
@@ -91,19 +92,20 @@ impl ArticleAvailability {
 
     /// Check if all backends in the pool have been tried and returned 430
     ///
-    /// This is the exit condition for 430 retry loops.
+    /// Check if all backends have been tried and returned 430
     ///
     /// # Panics (debug builds only)
     /// Panics if backend_count > 8. Config validation enforces max 8 backends.
     #[inline]
-    pub fn all_exhausted(&self, backend_count: usize) -> bool {
+    pub fn all_exhausted(&self, backend_count: BackendCount) -> bool {
+        let count = backend_count.get();
         debug_assert!(
-            backend_count <= MAX_BACKENDS,
+            count <= MAX_BACKENDS,
             "Backend count {} exceeds MAX_BACKENDS ({})",
-            backend_count,
+            count,
             MAX_BACKENDS
         );
-        match backend_count {
+        match count {
             0 => true,
             8 => self.missing == 0xFF,
             n => self.missing & ((1u8 << n) - 1) == (1u8 << n) - 1,
@@ -113,8 +115,11 @@ impl ArticleAvailability {
     /// Get an iterator over backends that should still be tried
     ///
     /// Returns backend IDs that haven't been marked missing yet.
-    pub fn available_backends(&self, backend_count: usize) -> impl Iterator<Item = BackendId> + '_ {
-        (0..backend_count.min(MAX_BACKENDS))
+    pub fn available_backends(
+        &self,
+        backend_count: BackendCount,
+    ) -> impl Iterator<Item = BackendId> + '_ {
+        (0..backend_count.get().min(MAX_BACKENDS))
             .map(BackendId::from_index)
             .filter(move |&backend_id| self.should_try(backend_id))
     }
@@ -198,14 +203,14 @@ impl ArticleEntry {
     }
 
     /// Check if all backends have been tried and none have the article
-    pub fn all_backends_exhausted(&self, total_backends: usize) -> bool {
+    pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
         self.backend_availability.all_exhausted(total_backends)
     }
 
     /// Get backends that might have this article
     pub fn available_backends(
         &self,
-        total_backends: usize,
+        total_backends: BackendCount,
     ) -> impl Iterator<Item = BackendId> + '_ {
         self.backend_availability.available_backends(total_backends)
     }
@@ -466,21 +471,22 @@ mod tests {
 
     #[test]
     fn test_backend_availability_all_exhausted() {
+        use crate::router::BackendCount;
         let mut avail = ArticleAvailability::new();
 
         // None missing yet
-        assert!(!avail.all_exhausted(2));
-        assert!(!avail.all_exhausted(3));
+        assert!(!avail.all_exhausted(BackendCount::new(2)));
+        assert!(!avail.all_exhausted(BackendCount::new(3)));
 
         // Record backends 0 and 1 as missing
         avail.record_missing(BackendId::from_index(0));
         avail.record_missing(BackendId::from_index(1));
 
         // All 2 backends exhausted
-        assert!(avail.all_exhausted(2));
+        assert!(avail.all_exhausted(BackendCount::new(2)));
 
         // But not all 3 backends (backend 2 still untried)
-        assert!(!avail.all_exhausted(3));
+        assert!(!avail.all_exhausted(BackendCount::new(3)));
     }
 
     #[test]
@@ -517,19 +523,20 @@ mod tests {
 
     #[test]
     fn test_article_entry_all_backends_exhausted() {
+        use crate::router::BackendCount;
         let backend0 = BackendId::from_index(0);
         let backend1 = BackendId::from_index(1);
         let mut entry = create_test_article("<test@example.com>", backend0);
 
         // Not all exhausted yet
-        assert!(!entry.all_backends_exhausted(2));
+        assert!(!entry.all_backends_exhausted(BackendCount::new(2)));
 
         // Record both as missing
         entry.record_backend_missing(backend0);
         entry.record_backend_missing(backend1);
 
         // Now all 2 backends are exhausted
-        assert!(entry.all_backends_exhausted(2));
+        assert!(entry.all_backends_exhausted(BackendCount::new(2)));
     }
 
     #[tokio::test]

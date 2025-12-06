@@ -173,6 +173,84 @@ pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) ->
 }
 
 // ============================================================================
+// Backend Display Helpers
+// ============================================================================
+
+/// Health status icon and color
+#[must_use]
+pub const fn health_indicator(status: crate::metrics::HealthStatus) -> (&'static str, Color) {
+    use crate::metrics::HealthStatus;
+    match status {
+        HealthStatus::Healthy => ("●", Color::Green),
+        HealthStatus::Degraded => ("◐", Color::Yellow),
+        HealthStatus::Down => ("○", Color::Red),
+    }
+}
+
+/// Format error rate with warning icon if critical
+#[must_use]
+pub fn format_error_rate(rate: f64) -> String {
+    match rate {
+        r if r > 5.0 => format!(" ⚠ {:.1}%", r),
+        r if r > 0.0 => format!(" {:.1}%", r),
+        _ => String::new(),
+    }
+}
+
+/// Color for error rate display
+#[must_use]
+pub const fn error_rate_color(rate: f64) -> Color {
+    if rate > 5.0 {
+        Color::Red
+    } else {
+        Color::Yellow
+    }
+}
+
+/// Color for load percentage (pending/capacity ratio)
+#[must_use]
+pub const fn load_percentage_color(percent: f64) -> Color {
+    use super::constants::styles;
+    match percent {
+        p if p > 90.0 => Color::Red,
+        p if p > 70.0 => Color::Yellow,
+        _ => styles::VALUE_NEUTRAL,
+    }
+}
+
+/// Color for pending count
+#[must_use]
+pub const fn pending_count_color(pending: usize) -> Color {
+    if pending > 0 {
+        Color::Yellow
+    } else {
+        super::constants::styles::VALUE_NEUTRAL
+    }
+}
+
+/// Color for error count
+#[must_use]
+pub const fn error_count_color(has_errors: bool) -> Color {
+    use super::constants::styles;
+    if has_errors {
+        Color::Yellow
+    } else {
+        styles::VALUE_NEUTRAL
+    }
+}
+
+/// Color for connection failures
+#[must_use]
+pub const fn connection_failure_color(failures: u64) -> Color {
+    use super::constants::styles;
+    if failures > 0 {
+        Color::Red
+    } else {
+        styles::VALUE_NEUTRAL
+    }
+}
+
+// ============================================================================
 // Chart Helpers
 // ============================================================================
 

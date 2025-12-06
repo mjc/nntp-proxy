@@ -452,7 +452,36 @@ impl TuiApp {
         use crate::types::BackendId;
         self.router
             .backend_load(BackendId::from_index(backend_idx))
+            .map(|pending| pending.get())
             .unwrap_or(0)
+    }
+
+    /// Get load ratio for a backend (pending / max_connections)
+    #[must_use]
+    pub fn backend_load_ratio(&self, backend_idx: usize) -> Option<f64> {
+        use crate::types::BackendId;
+        self.router
+            .backend_load_ratio(BackendId::from_index(backend_idx))
+            .map(|ratio| ratio.get())
+    }
+
+    /// Get stateful connection count for a backend
+    #[must_use]
+    pub fn backend_stateful_count(&self, backend_idx: usize) -> usize {
+        use crate::types::BackendId;
+        self.router
+            .stateful_count(BackendId::from_index(backend_idx))
+            .map(|count| count.get())
+            .unwrap_or(0)
+    }
+
+    /// Get traffic share percentage for a backend
+    #[must_use]
+    pub fn backend_traffic_share(&self, backend_idx: usize) -> Option<f64> {
+        use crate::types::BackendId;
+        self.router
+            .backend_traffic_share(BackendId::from_index(backend_idx))
+            .map(|share| share.get())
     }
 
     /// Get throughput history for a backend
