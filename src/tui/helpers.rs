@@ -43,17 +43,16 @@ pub fn create_sparkline(value: u64, max_value: u64) -> String {
 // Chart Data Building
 // ============================================================================
 
-/// Accumulator for building point vectors and tracking max in single fold
-type PointAccumulator = ((PointVec, PointVec), ChartY);
-
-/// Build chart data for all backends
+/// Build chart data for all backends using functional pipeline
 ///
-/// Single-pass functional pipeline:
-/// 1. Fold over servers to build chart data and track global max
-/// 2. For each server, fold over history to build points and track backend max
+/// Single-pass processing:
+/// 1. Maps over servers to extract history
+/// 2. Folds over history points to build point vectors and track max
+/// 3. Accumulates results with global max tracking
 ///
 /// Returns (chart_data, global_max_throughput)
 pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64) {
+    /// Extract data from a single throughput point
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
         let x = ChartX::from(idx);
@@ -66,41 +65,58 @@ pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64)
         )
     }
 
+    /// Accumulate points and track maximum (pure function)
     #[inline]
     fn accumulate_points(
-        ((mut sent_vec, mut recv_vec), max): PointAccumulator,
+        ((mut sent_vec, mut recv_vec), max): ((PointVec, PointVec), ChartY),
         (sent_point, recv_point, point_max): (ChartPoint, ChartPoint, ChartY),
-    ) -> PointAccumulator {
+    ) -> ((PointVec, PointVec), ChartY) {
         sent_vec.push(sent_point);
         recv_vec.push(recv_point);
         ((sent_vec, recv_vec), max.max(point_max))
     }
 
-    servers.iter().enumerate().fold(
-        (ChartDataVec::new(), 0.0_f64),
-        |(mut chart_data, global_max), (index, server)| {
-            let history = app.throughput_history(index);
+    /// Build chart data for a single backend (pure function)
+    fn build_backend_data(
+        index: usize,
+        server: &Server,
+        history: &std::collections::VecDeque<ThroughputPoint>,
+    ) -> (BackendChartData, f64) {
+        let ((sent_points, recv_points), backend_max) = history
+            .iter()
+            .enumerate()
+            .map(|(idx, point)| extract_point_data(idx, point))
+            .fold(
+                ((PointVec::new(), PointVec::new()), ChartY::from(0.0)),
+                accumulate_points,
+            );
 
-            // Build point vectors and calculate max in single pass over history
-            let ((sent_points, recv_points), backend_max) = history
-                .iter()
-                .enumerate()
-                .map(|(idx, point)| extract_point_data(idx, point))
-                .fold(
-                    ((PointVec::new(), PointVec::new()), ChartY::from(0.0)),
-                    accumulate_points,
-                );
-
-            chart_data.push(BackendChartData::new(
+        (
+            BackendChartData::new(
                 server.name.as_str().to_string(),
                 backend_color(BackendIndex::from(index)),
                 sent_points,
                 recv_points,
-            ));
+            ),
+            backend_max.get(),
+        )
+    }
 
-            (chart_data, global_max.max(backend_max.get()))
-        },
-    )
+    // Functional pipeline: enumerate → map → fold
+    servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| {
+            let history = app.throughput_history(index);
+            build_backend_data(index, server, history)
+        })
+        .fold(
+            (ChartDataVec::new(), 0.0_f64),
+            |(mut chart_data, global_max), (backend_data, backend_max)| {
+                chart_data.push(backend_data);
+                (chart_data, global_max.max(backend_max))
+            },
+        )
 }
 
 // ============================================================================

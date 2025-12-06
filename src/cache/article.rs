@@ -222,6 +222,23 @@ impl ArticleEntry {
     pub fn response(&self) -> &Arc<Vec<u8>> {
         &self.buffer
     }
+
+    /// Initialize availability tracker from this cached entry
+    ///
+    /// Creates a fresh ArticleAvailability with backends marked missing based on
+    /// cached knowledge (backends that previously returned 430).
+    pub fn to_availability(&self, total_backends: BackendCount) -> ArticleAvailability {
+        let mut availability = ArticleAvailability::new();
+
+        // Mark backends we know don't have this article
+        for backend_id in (0..total_backends.get()).map(BackendId::from_index) {
+            if !self.should_try_backend(backend_id) {
+                availability.record_missing(backend_id);
+            }
+        }
+
+        availability
+    }
 }
 
 /// Article cache using LRU eviction with TTL

@@ -71,6 +71,22 @@ pub(super) fn decide_command_routing(
     }
 }
 
+/// Result of attempting to execute a command on a backend
+enum BackendAttemptResult {
+    /// Article found - response streamed successfully
+    Success {
+        backend_id: crate::types::BackendId,
+        bytes_written: u64,
+    },
+    /// Article not found (430) - try next backend
+    ArticleNotFound {
+        backend_id: crate::types::BackendId,
+        response: Vec<u8>,
+    },
+    /// Backend unavailable or error - try next backend
+    BackendUnavailable,
+}
+
 impl ClientSession {
     /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
@@ -258,8 +274,6 @@ impl ClientSession {
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<crate::types::BackendId> {
-        use crate::types::MetricsBytes;
-
         // Extract message-ID early for cache/availability tracking
         let msg_id = common::extract_message_id(command)
             .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
@@ -283,287 +297,407 @@ impl ClientSession {
             }
         }
 
-        // Get reusable buffer from pool
+        // Execute command with availability-aware backend selection
+        self.execute_with_availability_routing(
+            router,
+            command,
+            msg_id.as_ref(),
+            client_write,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+        )
+        .await
+    }
+
+    /// Execute command with availability-aware backend selection
+    ///
+    /// Uses ArticleAvailability to intelligently select backends, automatically retrying
+    /// on 430 responses across backends that haven't returned 430 for this article yet.
+    async fn execute_with_availability_routing(
+        &self,
+        router: &BackendSelector,
+        command: &str,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+    ) -> Result<crate::types::BackendId> {
         let mut buffer = self.buffer_pool.acquire().await;
 
-        // Track 430 responses in case all backends fail
+        // Initialize availability tracker from cache
+        let mut availability = self.load_article_availability(msg_id, router).await;
+
+        // Track last 430 response to return if all backends fail
         let mut last_430_response: Option<Vec<u8>> = None;
+        let mut last_430_backend: Option<crate::types::BackendId> = None;
 
-        // Track article availability across backends (which ones DON'T have it)
-        // Default: assume all backends have the article (bitset = 0b00000000)
-        // When a backend returns 430, mark it as missing (set the bit)
-        // Exit when: article found OR all backends tried and returned 430
-        let mut availability = crate::cache::ArticleAvailability::new();
-
-        // Try backends until we get a non-430 response
-        let mut attempts = 0;
-        let max_attempts = router.backend_count().get() * 2; // Allow 2 full rounds
-
-        loop {
-            // Prevent infinite loop if all backends exhausted
-            if availability.all_exhausted(router.backend_count()) {
-                if let Some(response) = last_430_response {
-                    client_write.write_all(&response).await?;
-                    *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-                }
-                anyhow::bail!("Article not found on any backend");
-            }
-
-            // Safety check: prevent infinite loops
-            attempts += 1;
-            if attempts > max_attempts {
-                anyhow::bail!(
-                    "Exceeded maximum retry attempts ({}) - possible infinite loop",
-                    max_attempts
-                );
-            }
-
-            // Route to next backend
-            let backend_id = router.route_command(self.client_id, command)?;
-
-            // Check if we should try this backend (haven't tried it yet OR it didn't return 430)
-            if !availability.should_try(backend_id) {
-                // This backend already returned 430 - complete the routing and try next
-                router.complete_command(backend_id);
-                // Continue to next backend (round-robin will give us a different one)
-                continue;
-            }
-
-            // Get connection from pool
-            let Some(provider) = router.backend_provider(backend_id) else {
-                anyhow::bail!("Backend {:?} not found", backend_id);
-            };
-
-            let mut pooled_conn = provider.get_pooled_connection().await?;
-
-            // Record command execution
-            self.record_command(backend_id);
-            self.user_command();
-
-            // Send command and read first chunk
-            let (n, response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
-                match backend::send_command_and_read_first_chunk(
-                    &mut *pooled_conn,
+        // Try backends until success or exhaustion
+        while !availability.all_exhausted(router.backend_count()) {
+            match self
+                .try_backend_for_article(
+                    router,
                     command,
-                    backend_id,
-                    self.client_addr,
+                    msg_id,
+                    client_write,
+                    &mut availability,
                     &mut buffer,
+                    client_to_backend_bytes,
                 )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        if let Some(ref metrics) = self.metrics {
-                            metrics.record_error(backend_id);
-                            metrics.user_error(self.username().as_deref());
-                        }
-                        crate::pool::remove_from_pool(pooled_conn);
-                        router.complete_command(backend_id);
-                        return Err(e);
-                    }
-                };
-
-            // Record timing metrics
-            if let Some(ref metrics) = self.metrics {
-                metrics.record_ttfb_micros(backend_id, ttfb_micros);
-                metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
-            }
-
-            *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
-
-            // Check for 430 (article not found) - retry with next backend
-            if let Some(code) = response_code.status_code()
-                && code.as_u16() == 430
+                .await?
             {
-                // Record this backend as NOT having the article
-                availability.record_missing(backend_id);
+                BackendAttemptResult::Success {
+                    backend_id,
+                    bytes_written,
+                } => {
+                    *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
+                    router.complete_command(backend_id);
+                    return Ok(backend_id);
+                }
+                BackendAttemptResult::ArticleNotFound {
+                    backend_id,
+                    response,
+                } => {
+                    last_430_response = Some(response);
+                    last_430_backend = Some(backend_id);
+                }
+                BackendAttemptResult::BackendUnavailable => {
+                    // Continue to next backend
+                }
+            }
+        }
 
-                // Track availability in cache: this backend doesn't have it
-                if let Some(ref msg_id_ref) = msg_id {
+        // All backends exhausted - send final 430
+        self.send_final_430_response(client_write, backend_to_client_bytes, last_430_response)
+            .await?;
+
+        Ok(last_430_backend.expect("must have tried at least one backend"))
+    }
+
+    /// Load article availability from cache or create fresh tracker
+    async fn load_article_availability(
+        &self,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        router: &BackendSelector,
+    ) -> crate::cache::ArticleAvailability {
+        match msg_id {
+            Some(msg_id_ref) => self
+                .cache
+                .get(msg_id_ref)
+                .await
+                .map(|entry| entry.to_availability(router.backend_count()))
+                .unwrap_or_default(),
+            None => crate::cache::ArticleAvailability::new(),
+        }
+    }
+
+    /// Try executing command on next available backend
+    #[allow(clippy::too_many_arguments)]
+    async fn try_backend_for_article(
+        &self,
+        router: &BackendSelector,
+        command: &str,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        availability: &mut crate::cache::ArticleAvailability,
+        buffer: &mut crate::pool::PooledBuffer,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+    ) -> Result<BackendAttemptResult> {
+        // Select least-loaded available backend
+        let backend_id =
+            router.route_command_with_availability(self.client_id, command, Some(availability))?;
+
+        // Get connection provider
+        let Some(provider) = router.backend_provider(backend_id) else {
+            availability.record_missing(backend_id);
+            router.complete_command(backend_id);
+            return Ok(BackendAttemptResult::BackendUnavailable);
+        };
+
+        // Execute command
+        let mut conn = provider.get_pooled_connection().await?;
+        let (n, response_code, is_multiline, ttfb, send, recv) = match self
+            .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                self.handle_backend_error(backend_id, router);
+                crate::pool::remove_from_pool(conn);
+                return Err(e);
+            }
+        };
+
+        self.record_timing_metrics(backend_id, ttfb, send, recv);
+        *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+
+        // Handle 430 - article not found
+        if self.is_430_response(&response_code) {
+            self.handle_430_response(backend_id, msg_id, router, availability);
+            return Ok(BackendAttemptResult::ArticleNotFound {
+                backend_id,
+                response: buffer[..n].to_vec(),
+            });
+        }
+
+        // Success - stream response
+        let bytes_written = match self
+            .stream_response_to_client(
+                &mut conn,
+                client_write,
+                backend_id,
+                command,
+                msg_id,
+                &response_code,
+                is_multiline,
+                &buffer[..n],
+                n,
+            )
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.handle_backend_error(backend_id, router);
+                crate::pool::remove_from_pool(conn);
+                return Err(e);
+            }
+        };
+
+        self.record_response_metrics(
+            backend_id,
+            &response_code,
+            is_multiline,
+            command.len() as u64,
+            bytes_written,
+        );
+
+        Ok(BackendAttemptResult::Success {
+            backend_id,
+            bytes_written,
+        })
+    }
+
+    /// Execute command on backend and read first chunk
+    async fn execute_and_get_first_chunk(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        backend_id: crate::types::BackendId,
+        command: &str,
+        buffer: &mut crate::pool::PooledBuffer,
+    ) -> Result<(usize, crate::protocol::NntpResponse, bool, u64, u64, u64)> {
+        self.record_command(backend_id);
+        self.user_command();
+
+        backend::send_command_and_read_first_chunk(
+            &mut **pooled_conn,
+            command,
+            backend_id,
+            self.client_addr,
+            buffer,
+        )
+        .await
+    }
+
+    /// Check if response is 430 (article not found)
+    fn is_430_response(&self, response_code: &crate::protocol::NntpResponse) -> bool {
+        response_code
+            .status_code()
+            .is_some_and(|code| code.as_u16() == 430)
+    }
+
+    /// Record timing metrics for a backend response
+    fn record_timing_metrics(
+        &self,
+        backend_id: crate::types::BackendId,
+        ttfb: u64,
+        send: u64,
+        recv: u64,
+    ) {
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_ttfb_micros(backend_id, ttfb);
+            metrics.record_send_recv_micros(backend_id, send, recv);
+        }
+    }
+
+    /// Handle backend error (metrics and cleanup)
+    fn handle_backend_error(&self, backend_id: crate::types::BackendId, router: &BackendSelector) {
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_error(backend_id);
+            metrics.user_error(self.username().as_deref());
+        }
+        router.complete_command(backend_id);
+    }
+
+    /// Send final 430 response to client when all backends fail
+    async fn send_final_430_response(
+        &self,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+        last_430_response: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if let Some(response) = last_430_response {
+            client_write.write_all(&response).await?;
+            *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
+        }
+        Ok(())
+    }
+
+    /// Handle 430 response and prepare for retry
+    fn handle_430_response(
+        &self,
+        backend_id: crate::types::BackendId,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        router: &BackendSelector,
+        availability: &mut crate::cache::ArticleAvailability,
+    ) {
+        availability.record_missing(backend_id);
+
+        if let Some(msg_id_ref) = msg_id {
+            let cache_clone = self.cache.clone();
+            let msg_id_owned = msg_id_ref.to_owned();
+            tokio::spawn(async move {
+                cache_clone
+                    .record_backend_missing(msg_id_owned, backend_id)
+                    .await;
+            });
+        }
+
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_error_4xx(backend_id);
+        }
+
+        router.complete_command(backend_id);
+    }
+
+    /// Stream response from backend to client and handle caching
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_response_to_client(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_id: crate::types::BackendId,
+        command: &str,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        response_code: &crate::protocol::NntpResponse,
+        is_multiline: bool,
+        first_chunk: &[u8],
+        first_chunk_size: usize,
+    ) -> Result<u64> {
+        let should_capture = self.cache_articles
+            && is_multiline
+            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
+            && msg_id.is_some()
+            && response_code
+                .status_code()
+                .is_some_and(|c| matches!(c.as_u16(), 220..=222));
+
+        if is_multiline {
+            if should_capture {
+                let mut captured = Vec::with_capacity(first_chunk.len() * 2);
+                let bytes = streaming::stream_and_capture_multiline_response(
+                    &mut **pooled_conn,
+                    client_write,
+                    first_chunk,
+                    first_chunk_size,
+                    self.client_addr,
+                    backend_id,
+                    &self.buffer_pool,
+                    &mut captured,
+                )
+                .await?;
+
+                if let Some(msg_id_ref) = msg_id {
                     let cache_clone = self.cache.clone();
                     let msg_id_owned = msg_id_ref.to_owned();
                     tokio::spawn(async move {
-                        cache_clone
-                            .record_backend_missing(msg_id_owned, backend_id)
-                            .await;
+                        cache_clone.upsert(msg_id_owned, captured, backend_id).await;
                     });
                 }
-
-                // Track 430 as 4xx error for this backend
-                if let Some(ref metrics) = self.metrics {
-                    metrics.record_error_4xx(backend_id);
-                }
-
-                router.complete_command(backend_id);
-
-                // Save the 430 response in case this is the last backend
-                // We'll send it to client only if all backends fail
-                last_430_response = Some(buffer[..n].to_vec());
-
-                // Try next backend (router will round-robin to next one)
-                continue;
-            }
-
-            // Non-430 response - this is the final result
-            // Determine if we should capture the full body (only for ARTICLE/HEAD/BODY)
-            let should_capture = self.cache_articles
-                && is_multiline
-                && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
-                && msg_id.is_some()
-                && response_code
-                    .status_code()
-                    .is_some_and(|c| matches!(c.as_u16(), 220..=222));
-
-            // Stream response to client
-            let bytes_written = if is_multiline {
-                if should_capture {
-                    // Capture and cache the article body (upsert with full response)
-                    let mut captured = Vec::with_capacity(buffer.capacity());
-                    match streaming::stream_and_capture_multiline_response(
-                        &mut *pooled_conn,
-                        client_write,
-                        &buffer[..n],
-                        n,
-                        self.client_addr,
-                        backend_id,
-                        &self.buffer_pool,
-                        &mut captured,
-                    )
-                    .await
-                    {
-                        Ok(bytes) => {
-                            // Upsert into cache asynchronously (creates or updates entry)
-                            if let Some(msg_id_ref) = msg_id.as_ref() {
-                                let cache_clone = self.cache.clone();
-                                let msg_id_owned = msg_id_ref.to_owned();
-                                tokio::spawn(async move {
-                                    cache_clone.upsert(msg_id_owned, captured, backend_id).await;
-                                });
-                            }
-                            bytes
-                        }
-                        Err(e) => {
-                            if let Some(ref metrics) = self.metrics {
-                                metrics.record_error(backend_id);
-                                metrics.user_error(self.username().as_deref());
-                            }
-                            crate::pool::remove_from_pool(pooled_conn);
-                            router.complete_command(backend_id);
-                            return Err(e);
-                        }
-                    }
-                } else {
-                    // Stream without capturing for cache_articles=false
-                    let should_track = msg_id.is_some()
-                        && response_code
-                            .status_code()
-                            .is_some_and(|c| matches!(c.as_u16(), 220..=223));
-
-                    let bytes_result = streaming::stream_multiline_response(
-                        &mut *pooled_conn,
-                        client_write,
-                        &buffer[..n],
-                        n,
-                        self.client_addr,
-                        backend_id,
-                        &self.buffer_pool,
-                    )
-                    .await;
-
-                    match bytes_result {
-                        Ok(bytes) => {
-                            // Pass status code to cache - it will create minimal stub
-                            if should_track && let Some(msg_id_ref) = msg_id.as_ref() {
-                                let cache_clone = self.cache.clone();
-                                let msg_id_owned = msg_id_ref.to_owned();
-                                // Pass response buffer (cache will strip to stub internally)
-                                let buffer_for_cache = buffer[..n].to_vec();
-                                tokio::spawn(async move {
-                                    cache_clone
-                                        .upsert(msg_id_owned, buffer_for_cache, backend_id)
-                                        .await;
-                                });
-                            }
-                            bytes
-                        }
-                        Err(e) => {
-                            if let Some(ref metrics) = self.metrics {
-                                metrics.record_error(backend_id);
-                                metrics.user_error(self.username().as_deref());
-                            }
-                            crate::pool::remove_from_pool(pooled_conn);
-                            router.complete_command(backend_id);
-                            return Err(e);
-                        }
-                    }
-                }
+                Ok(bytes)
             } else {
-                // Single-line response (e.g., STAT 223)
                 let should_track = msg_id.is_some()
                     && response_code
                         .status_code()
-                        .is_some_and(|c| c.as_u16() == 223);
+                        .is_some_and(|c| matches!(c.as_u16(), 220..=223));
 
-                match client_write.write_all(&buffer[..n]).await {
-                    Ok(_) => {
-                        // Track STAT responses
-                        if should_track && let Some(msg_id_ref) = msg_id.as_ref() {
-                            let cache_clone = self.cache.clone();
-                            let msg_id_owned = msg_id_ref.to_owned();
-                            let buffer_for_cache = b"223\r\n".to_vec();
-                            tokio::spawn(async move {
-                                cache_clone
-                                    .upsert(msg_id_owned, buffer_for_cache, backend_id)
-                                    .await;
-                            });
-                        }
-                        n as u64
-                    }
-                    Err(e) => {
-                        if let Some(ref metrics) = self.metrics {
-                            metrics.record_error(backend_id);
-                            metrics.user_error(self.username().as_deref());
-                        }
-                        router.complete_command(backend_id);
-                        return Err(e.into());
-                    }
+                let bytes = streaming::stream_multiline_response(
+                    &mut **pooled_conn,
+                    client_write,
+                    first_chunk,
+                    first_chunk_size,
+                    self.client_addr,
+                    backend_id,
+                    &self.buffer_pool,
+                )
+                .await?;
+
+                if should_track && let Some(msg_id_ref) = msg_id {
+                    let cache_clone = self.cache.clone();
+                    let msg_id_owned = msg_id_ref.to_owned();
+                    let buffer_for_cache = first_chunk.to_vec();
+                    tokio::spawn(async move {
+                        cache_clone
+                            .upsert(msg_id_owned, buffer_for_cache, backend_id)
+                            .await;
+                    });
                 }
-            };
-
-            *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
-
-            // Track metrics based on response code
-            if let Some(ref metrics) = self.metrics
-                && let Some(code) = response_code.status_code()
-            {
-                let raw_code = code.as_u16();
-
-                // Track 4xx/5xx errors (excluding expected "not found" responses)
-                if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
-                    metrics.record_error_4xx(backend_id);
-                } else if raw_code >= 500 {
-                    metrics.record_error_5xx(backend_id);
-                }
-
-                // Track article size for successful article retrieval
-                if is_multiline && matches!(raw_code, 220..=222) {
-                    metrics.record_article(backend_id, bytes_written);
-                }
+                Ok(bytes)
             }
+        } else {
+            let should_track = msg_id.is_some()
+                && response_code
+                    .status_code()
+                    .is_some_and(|c| c.as_u16() == 223);
 
-            // Record metrics
-            if let Some(ref metrics) = self.metrics {
-                let cmd_bytes = MetricsBytes::new(command.len() as u64);
-                let resp_bytes = MetricsBytes::new(bytes_written);
-                let _ = metrics.record_command_execution(backend_id, cmd_bytes, resp_bytes);
-                self.user_bytes_sent(command.len() as u64);
-                self.user_bytes_received(bytes_written);
+            client_write.write_all(first_chunk).await?;
+
+            if should_track && let Some(msg_id_ref) = msg_id {
+                let cache_clone = self.cache.clone();
+                let msg_id_owned = msg_id_ref.to_owned();
+                let buffer_for_cache = b"223\r\n".to_vec();
+                tokio::spawn(async move {
+                    cache_clone
+                        .upsert(msg_id_owned, buffer_for_cache, backend_id)
+                        .await;
+                });
             }
-
-            router.complete_command(backend_id);
-
-            return Ok(backend_id);
+            Ok(first_chunk_size as u64)
         }
+    }
+
+    /// Record response metrics (errors, article sizes, command execution)
+    fn record_response_metrics(
+        &self,
+        backend_id: crate::types::BackendId,
+        response_code: &crate::protocol::NntpResponse,
+        is_multiline: bool,
+        cmd_bytes: u64,
+        resp_bytes: u64,
+    ) {
+        use crate::types::MetricsBytes;
+
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+
+        if let Some(code) = response_code.status_code() {
+            let raw_code = code.as_u16();
+
+            if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
+                metrics.record_error_4xx(backend_id);
+            } else if raw_code >= 500 {
+                metrics.record_error_5xx(backend_id);
+            }
+
+            if is_multiline && matches!(raw_code, 220..=222) {
+                metrics.record_article(backend_id, resp_bytes);
+            }
+        }
+
+        let cmd_bytes_metric = MetricsBytes::new(cmd_bytes);
+        let resp_bytes_metric = MetricsBytes::new(resp_bytes);
+        let _ = metrics.record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
+        self.user_bytes_sent(cmd_bytes);
+        self.user_bytes_received(resp_bytes);
     }
 
     /// Execute a command on a given backend connection (stateful mode helper)
@@ -593,7 +727,7 @@ impl ClientSession {
     ) {
         use crate::types::MetricsBytes;
 
-        // Send command and read first chunk
+        // Execute command and get first chunk
         let (n, response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
             match backend::send_command_and_read_first_chunk(
                 &mut **pooled_conn,
@@ -611,163 +745,50 @@ impl ClientSession {
             };
 
         // Record timing metrics
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_ttfb_micros(backend_id, ttfb_micros);
-            metrics.record_send_recv_micros(backend_id, send_micros, recv_micros);
-        }
+        self.record_timing_metrics(backend_id, ttfb_micros, send_micros, recv_micros);
 
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
-        // Extract message-ID for correlation
-        let msgid = common::extract_message_id(command);
+        // Extract message-ID for caching
+        let msg_id = common::extract_message_id(command)
+            .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
 
-        // Determine if we should capture the full body
-        let should_capture = self.cache_articles
-            && is_multiline
-            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
-            && msgid.is_some()
-            && response_code
-                .status_code()
-                .is_some_and(|c| matches!(c.as_u16(), 220..=222));
-
-        // Stream response to client
-        let bytes_written = if is_multiline {
-            if should_capture {
-                // Capture and cache the article body
-                let mut captured = Vec::with_capacity(chunk_buffer.capacity());
-                match streaming::stream_and_capture_multiline_response(
-                    &mut **pooled_conn,
-                    client_write,
-                    &chunk_buffer[..n],
-                    n,
-                    self.client_addr,
-                    backend_id,
-                    &self.buffer_pool,
-                    &mut captured,
-                )
-                .await
-                {
-                    Ok(bytes) => {
-                        // Insert into cache asynchronously (full body)
-                        if let Some(msg_id_str) = msgid {
-                            let cache_clone = self.cache.clone();
-                            let msg_id_string = msg_id_str.to_string();
-                            tokio::spawn(async move {
-                                if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
-                                    cache_clone.upsert(msg_id, captured, backend_id).await;
-                                }
-                            });
-                        }
-                        bytes
-                    }
-                    Err(e) => {
-                        return (
-                            Err(e),
-                            true,
-                            MetricsBytes::new(command.len() as u64),
-                            MetricsBytes::new(0),
-                        );
-                    }
-                }
-            } else {
-                // Stream without capturing - track availability only
-                let should_track_availability = msgid.is_some()
-                    && response_code
-                        .status_code()
-                        .is_some_and(|c| matches!(c.as_u16(), 220..=223));
-
-                match streaming::stream_multiline_response(
-                    &mut **pooled_conn,
-                    client_write,
-                    &chunk_buffer[..n],
-                    n,
-                    self.client_addr,
-                    backend_id,
-                    &self.buffer_pool,
-                )
-                .await
-                {
-                    Ok(bytes) => {
-                        // Track availability - pass first chunk buffer to cache
-                        if should_track_availability && let Some(msg_id_str) = msgid {
-                            let cache_clone = self.cache.clone();
-                            let msg_id_string = msg_id_str.to_string();
-                            let buffer_for_cache = chunk_buffer[..n].to_vec();
-                            tokio::spawn(async move {
-                                if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
-                                    cache_clone
-                                        .upsert(msg_id, buffer_for_cache, backend_id)
-                                        .await;
-                                }
-                            });
-                        }
-                        bytes
-                    }
-                    Err(e) => {
-                        return (
-                            Err(e),
-                            true,
-                            MetricsBytes::new(command.len() as u64),
-                            MetricsBytes::new(0),
-                        );
-                    }
-                }
-            }
-        } else {
-            // Single-line response (e.g., STAT 223)
-            let should_track_availability = msgid.is_some()
-                && response_code
-                    .status_code()
-                    .is_some_and(|c| c.as_u16() == 223);
-
-            match client_write.write_all(&chunk_buffer[..n]).await {
-                Ok(_) => {
-                    // Track STAT responses for availability
-                    if should_track_availability && let Some(msg_id_str) = msgid {
-                        let cache_clone = self.cache.clone();
-                        let msg_id_string = msg_id_str.to_string();
-                        let buffer_for_cache = chunk_buffer[..n].to_vec();
-                        tokio::spawn(async move {
-                            if let Ok(msg_id) = crate::types::MessageId::new(msg_id_string) {
-                                cache_clone
-                                    .upsert(msg_id, buffer_for_cache, backend_id)
-                                    .await;
-                            }
-                        });
-                    }
-                    n as u64
-                }
-                Err(e) => {
-                    return (
-                        Err(e.into()),
-                        true,
-                        MetricsBytes::new(command.len() as u64),
-                        MetricsBytes::new(0),
-                    );
-                }
+        // Stream response using shared logic
+        let bytes_written = match self
+            .stream_response_to_client(
+                pooled_conn,
+                client_write,
+                backend_id,
+                command,
+                msg_id.as_ref(),
+                &response_code,
+                is_multiline,
+                &chunk_buffer[..n],
+                n,
+            )
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return (
+                    Err(e),
+                    true,
+                    MetricsBytes::new(command.len() as u64),
+                    MetricsBytes::new(0),
+                );
             }
         };
 
         *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
 
-        // Track metrics based on response code
-        if let Some(ref metrics) = self.metrics
-            && let Some(code) = response_code.status_code()
-        {
-            let raw_code = code.as_u16();
-
-            // Track 4xx/5xx errors (excluding 423 which is group not selected)
-            if (400..500).contains(&raw_code) && raw_code != 423 {
-                metrics.record_error_4xx(backend_id);
-            } else if raw_code >= 500 {
-                metrics.record_error_5xx(backend_id);
-            }
-
-            // Track article size for successful article retrieval
-            if is_multiline && matches!(raw_code, 220..=222) {
-                metrics.record_article(backend_id, bytes_written);
-            }
-        }
+        // Record response metrics
+        self.record_response_metrics(
+            backend_id,
+            &response_code,
+            is_multiline,
+            command.len() as u64,
+            bytes_written,
+        );
 
         // Return unrecorded metrics bytes
         let cmd_bytes = MetricsBytes::new(command.len() as u64);

@@ -475,10 +475,20 @@ impl BackendSelector {
     ///
     /// - **Weighted round-robin**: Distributes proportionally to max_connections
     /// - **Least-loaded**: Routes to backend with fewest pending requests
-    fn select_backend(&self) -> Option<&BackendInfo> {
+    ///
+    /// # Arguments
+    /// * `availability` - Optional filter to restrict selection to available backends
+    fn select_backend(
+        &self,
+        availability: Option<&crate::cache::ArticleAvailability>,
+    ) -> Option<&BackendInfo> {
         if self.backends.is_empty() {
             return None;
         }
+
+        // Filter backends by availability if provided
+        let filter_fn =
+            |backend: &&BackendInfo| availability.is_none_or(|avail| avail.should_try(backend.id));
 
         match &self.strategy {
             SelectionStrategy::WeightedRoundRobin(wrr) => {
@@ -487,6 +497,7 @@ impl BackendSelector {
                 // Find backend owning this weighted position using cumulative weights
                 self.backends
                     .iter()
+                    .filter(filter_fn)
                     .scan(0, |cumulative, backend| {
                         *cumulative += backend.provider.max_size();
                         Some((*cumulative, backend))
@@ -494,14 +505,13 @@ impl BackendSelector {
                     .find(|(cumulative_weight, _)| weighted_position < *cumulative_weight)
                     .map(|(_, backend)| backend)
                     .or_else(|| {
-                        // Should never reach here if total_weight is correct
-                        debug_assert!(false, "Weighted position out of bounds");
-                        self.backends.first()
+                        // Fallback to first available backend
+                        self.backends.iter().find(filter_fn)
                     })
             }
             SelectionStrategy::LeastLoaded(_) => {
                 // Find backend with lowest load ratio using functional approach
-                self.backends.iter().min_by(|a, b| {
+                self.backends.iter().filter(filter_fn).min_by(|a, b| {
                     a.load_ratio()
                         .partial_cmp(&b.load_ratio())
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -513,7 +523,17 @@ impl BackendSelector {
     /// Select a backend for the given command using round-robin
     /// Returns the backend ID to use for this command
     pub fn route_command(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
-        let backend = self.select_backend().ok_or_else(|| {
+        self.route_command_with_availability(_client_id, _command, None)
+    }
+
+    /// Select a backend for the given command, optionally filtering by availability
+    pub fn route_command_with_availability(
+        &self,
+        _client_id: ClientId,
+        _command: &str,
+        availability: Option<&crate::cache::ArticleAvailability>,
+    ) -> Result<BackendId> {
+        let backend = self.select_backend(availability).ok_or_else(|| {
             anyhow::anyhow!(
                 "No backends available for routing (total backends: {})",
                 self.backends.len()
@@ -535,6 +555,14 @@ impl BackendSelector {
     pub fn complete_command(&self, backend_id: BackendId) {
         if let Some(backend) = self.find_backend(backend_id) {
             backend.pending_count.decrement();
+        }
+    }
+
+    /// Manually increment pending count for a specific backend
+    /// Used when directly selecting a backend instead of using route_command
+    pub fn mark_backend_pending(&self, backend_id: BackendId) {
+        if let Some(backend) = self.find_backend(backend_id) {
+            backend.pending_count.increment();
         }
     }
 
