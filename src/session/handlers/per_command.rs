@@ -843,12 +843,13 @@ impl ClientSession {
         (0..router.backend_count().get())
             .map(crate::types::BackendId::from_index)
             .for_each(|backend_id| {
-                let (tx, responded, router, cache, buffer_pool) = (
+                let (tx, responded, router, cache, buffer_pool, metrics) = (
                     tx.clone(),
                     responded.clone(),
                     router.clone(),
                     self.cache.clone(),
                     self.buffer_pool.clone(),
+                    self.metrics.clone(),
                 );
                 let (msg_id, command, client_addr) =
                     (msg_id.to_owned(), command.to_string(), self.client_addr);
@@ -873,7 +874,12 @@ impl ClientSession {
                     let response = buffer[..n].to_vec();
 
                     match code_num {
-                        430 => cache.record_backend_missing(msg_id, backend_id).await,
+                        430 => {
+                            cache.record_backend_missing(msg_id, backend_id).await;
+                            if let Some(ref m) = metrics {
+                                m.record_error_4xx(backend_id);
+                            }
+                        }
                         220..=223 => {
                             cache.upsert(msg_id, response.clone(), backend_id).await;
 
@@ -931,12 +937,13 @@ impl ClientSession {
         (0..router.backend_count().get())
             .map(crate::types::BackendId::from_index)
             .for_each(|backend_id| {
-                let (tx, responded, router, cache, buffer_pool) = (
+                let (tx, responded, router, cache, buffer_pool, metrics) = (
                     tx.clone(),
                     responded.clone(),
                     router.clone(),
                     self.cache.clone(),
                     self.buffer_pool.clone(),
+                    self.metrics.clone(),
                 );
                 let (msg_id, command, cache_articles, client_addr) = (
                     msg_id.to_owned(),
@@ -964,7 +971,12 @@ impl ClientSession {
                     let code_num = response_code.status_code()?.as_u16();
 
                     match code_num {
-                        430 => cache.record_backend_missing(msg_id, backend_id).await,
+                        430 => {
+                            cache.record_backend_missing(msg_id, backend_id).await;
+                            if let Some(ref m) = metrics {
+                                m.record_error_4xx(backend_id);
+                            }
+                        }
                         221 => {
                             // Read full multiline response if needed
                             let response_data = if is_multiline {
