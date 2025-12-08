@@ -175,6 +175,21 @@ pub struct Cache {
     /// - Can serve articles from cache without backend query
     #[serde(default = "super::defaults::cache_articles")]
     pub cache_articles: bool,
+    /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
+    ///
+    /// When true:
+    /// - STAT/HEAD commands with message-ID check all backends simultaneously
+    /// - Returns optimistic response to client immediately (assumes article exists)
+    /// - Updates availability cache in background based on actual backend responses
+    /// - Improves future routing decisions by learning which backends have articles
+    /// - For HEAD with cache_articles=true, also caches the headers
+    ///
+    /// When false:
+    /// - STAT/HEAD commands use normal routing (single backend check)
+    ///
+    /// Trade-off: Uses more backend connections but builds accurate availability data
+    #[serde(default = "super::defaults::adaptive_precheck")]
+    pub adaptive_precheck: bool,
 }
 
 impl Default for Cache {
@@ -183,6 +198,7 @@ impl Default for Cache {
             max_capacity: defaults::cache_max_capacity(),
             ttl: defaults::cache_ttl(),
             cache_articles: defaults::cache_articles(),
+            adaptive_precheck: defaults::adaptive_precheck(),
         }
     }
 }

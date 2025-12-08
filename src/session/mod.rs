@@ -208,6 +208,9 @@ pub struct ClientSession {
 
     /// Whether to cache article bodies (config-driven)
     cache_articles: bool,
+
+    /// Whether to use adaptive availability prechecking for STAT/HEAD
+    adaptive_precheck: bool,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -251,6 +254,7 @@ pub struct ClientSessionBuilder {
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: Arc<crate::cache::ArticleCache>,
     cache_articles: bool,
+    adaptive_precheck: bool,
 }
 
 impl ClientSessionBuilder {
@@ -317,6 +321,12 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Configure adaptive availability prechecking
+    pub fn with_adaptive_precheck(mut self, enable: bool) -> Self {
+        self.adaptive_precheck = enable;
+        self
+    }
+
     /// Build the client session
     ///
     /// Creates a new `ClientSession` with a unique client ID and the configured
@@ -346,6 +356,7 @@ impl ClientSessionBuilder {
             connection_stats: self.connection_stats,
             cache: self.cache,
             cache_articles: self.cache_articles,
+            adaptive_precheck: self.adaptive_precheck,
         }
     }
 }
@@ -374,6 +385,7 @@ impl ClientSession {
                 false,
             )),
             cache_articles: true,
+            adaptive_precheck: false,
         }
     }
 
@@ -405,6 +417,7 @@ impl ClientSession {
                 false,
             )),
             cache_articles: true,
+            adaptive_precheck: false,
         }
     }
 
@@ -447,6 +460,7 @@ impl ClientSession {
                 false,
             )),
             cache_articles: true,
+            adaptive_precheck: false,
         }
     }
 }

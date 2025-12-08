@@ -7,6 +7,8 @@
 use crate::session::common;
 use crate::session::{ClientSession, backend, connection, streaming};
 use anyhow::Result;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
@@ -206,7 +208,7 @@ impl ClientSession {
 
                 CommandRoutingDecision::Forward => {
                     self.route_and_execute_command(
-                        router,
+                        router.clone(),
                         &command,
                         &mut client_write,
                         &mut client_to_backend_bytes,
@@ -268,7 +270,7 @@ impl ClientSession {
     /// (such as `hybrid.rs`) that also need to route commands.
     pub(super) async fn route_and_execute_command(
         &self,
-        router: &BackendSelector,
+        router: Arc<BackendSelector>,
         command: &str,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
@@ -277,6 +279,28 @@ impl ClientSession {
         // Extract message-ID early for cache/availability tracking
         let msg_id = common::extract_message_id(command)
             .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
+
+        // Adaptive prechecking for STAT/HEAD commands (if enabled)
+        if self.adaptive_precheck
+            && let Some(ref msg_id_ref) = msg_id
+        {
+            let cmd_upper = command.to_uppercase();
+            if cmd_upper.starts_with("STAT ") {
+                return self
+                    .handle_stat_precheck(router, command, msg_id_ref, client_write)
+                    .await;
+            } else if cmd_upper.starts_with("HEAD ") {
+                return self
+                    .handle_head_precheck(
+                        router,
+                        command,
+                        msg_id_ref,
+                        client_write,
+                        backend_to_client_bytes,
+                    )
+                    .await;
+            }
+        }
 
         // Check cache for full response (only works if cache_articles=true)
         if let Some(msg_id_ref) = msg_id.as_ref()
@@ -315,7 +339,7 @@ impl ClientSession {
     /// on 430 responses across backends that haven't returned 430 for this article yet.
     async fn execute_with_availability_routing(
         &self,
-        router: &BackendSelector,
+        router: Arc<BackendSelector>,
         command: &str,
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
@@ -325,7 +349,7 @@ impl ClientSession {
         let mut buffer = self.buffer_pool.acquire().await;
 
         // Initialize availability tracker from cache
-        let mut availability = self.load_article_availability(msg_id, router).await;
+        let mut availability = self.load_article_availability(msg_id, router.clone()).await;
 
         // Track last 430 response to return if all backends fail
         let mut last_430_response: Option<Vec<u8>> = None;
@@ -335,7 +359,7 @@ impl ClientSession {
         while !availability.all_exhausted(router.backend_count()) {
             match self
                 .try_backend_for_article(
-                    router,
+                    router.clone(),
                     command,
                     msg_id,
                     client_write,
@@ -377,7 +401,7 @@ impl ClientSession {
     async fn load_article_availability(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        router: &BackendSelector,
+        router: Arc<BackendSelector>,
     ) -> crate::cache::ArticleAvailability {
         match msg_id {
             Some(msg_id_ref) => self
@@ -394,7 +418,7 @@ impl ClientSession {
     #[allow(clippy::too_many_arguments)]
     async fn try_backend_for_article(
         &self,
-        router: &BackendSelector,
+        router: Arc<BackendSelector>,
         command: &str,
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
@@ -421,7 +445,7 @@ impl ClientSession {
         {
             Ok(result) => result,
             Err(e) => {
-                self.handle_backend_error(backend_id, router);
+                self.handle_backend_error(backend_id, &router);
                 crate::pool::remove_from_pool(conn);
                 return Err(e);
             }
@@ -432,7 +456,7 @@ impl ClientSession {
 
         // Handle 430 - article not found
         if self.is_430_response(&response_code) {
-            self.handle_430_response(backend_id, msg_id, router, availability);
+            self.handle_430_response(backend_id, msg_id, router.clone(), availability);
             return Ok(BackendAttemptResult::ArticleNotFound {
                 backend_id,
                 response: buffer[..n].to_vec(),
@@ -456,7 +480,7 @@ impl ClientSession {
         {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.handle_backend_error(backend_id, router);
+                self.handle_backend_error(backend_id, &router);
                 crate::pool::remove_from_pool(conn);
                 return Err(e);
             }
@@ -546,7 +570,7 @@ impl ClientSession {
         &self,
         backend_id: crate::types::BackendId,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        router: &BackendSelector,
+        router: Arc<BackendSelector>,
         availability: &mut crate::cache::ArticleAvailability,
     ) {
         availability.record_missing(backend_id);
@@ -795,6 +819,215 @@ impl ClientSession {
         let resp_bytes = MetricsBytes::new(bytes_written);
 
         (Ok(()), true, cmd_bytes, resp_bytes)
+    }
+
+    /// Handle STAT command with adaptive prechecking
+    ///
+    /// Returns first successful response to client while continuing to check
+    /// remaining backends in background for cache population.
+    async fn handle_stat_precheck(
+        &self,
+        router: Arc<BackendSelector>,
+        command: &str,
+        msg_id: &crate::types::MessageId<'_>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    ) -> Result<crate::types::BackendId> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::oneshot;
+
+        let (tx, rx) = oneshot::channel();
+        let tx = Arc::new(Some(tx));
+        let responded = Arc::new(AtomicBool::new(false));
+
+        // Spawn concurrent tasks for all backends
+        (0..router.backend_count().get())
+            .map(crate::types::BackendId::from_index)
+            .for_each(|backend_id| {
+                let (tx, responded, router, cache, buffer_pool) = (
+                    tx.clone(),
+                    responded.clone(),
+                    router.clone(),
+                    self.cache.clone(),
+                    self.buffer_pool.clone(),
+                );
+                let (msg_id, command, client_addr) =
+                    (msg_id.to_owned(), command.to_string(), self.client_addr);
+
+                tokio::spawn(async move {
+                    let provider = router.backend_provider(backend_id)?;
+                    let mut conn = provider.get_pooled_connection().await.ok()?;
+                    let mut buffer = buffer_pool.acquire().await;
+
+                    let (n, response_code, _, _, _, _) =
+                        backend::send_command_and_read_first_chunk(
+                            &mut *conn,
+                            &command,
+                            backend_id,
+                            client_addr,
+                            &mut buffer,
+                        )
+                        .await
+                        .ok()?;
+
+                    let code_num = response_code.status_code()?.as_u16();
+                    let response = buffer[..n].to_vec();
+
+                    match code_num {
+                        430 => cache.record_backend_missing(msg_id, backend_id).await,
+                        220..=223 => {
+                            cache.upsert(msg_id, response.clone(), backend_id).await;
+
+                            // First responder wins
+                            if !responded.swap(true, Ordering::SeqCst) {
+                                Arc::try_unwrap(tx)
+                                    .ok()
+                                    .and_then(|opt| opt)
+                                    .map(|sender| sender.send((backend_id, response)));
+                            }
+                        }
+                        _ => {}
+                    }
+                    Some(())
+                });
+            });
+
+        // Wait for first successful response
+        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok((backend_id, response))) => {
+                client_write.write_all(&response).await?;
+                router.complete_command(backend_id);
+                Ok(backend_id)
+            }
+            Ok(Err(_)) | Err(_) => {
+                client_write.write_all(b"430 No such article\r\n").await?;
+                let backend_id = router.route_command(self.client_id, command)?;
+                router.complete_command(backend_id);
+                Ok(backend_id)
+            }
+        }
+    }
+
+    /// Handle HEAD command with adaptive prechecking
+    ///
+    /// Checks all backends simultaneously and returns the first successful response.
+    /// Continues updating availability cache in background for all responses.
+    /// If cache_articles=true, also caches the headers.
+    async fn handle_head_precheck(
+        &self,
+        router: Arc<BackendSelector>,
+        command: &str,
+        msg_id: &crate::types::MessageId<'_>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+    ) -> Result<crate::types::BackendId> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::oneshot;
+
+        let (tx, rx) = oneshot::channel();
+        let tx = Arc::new(Some(tx));
+        let responded = Arc::new(AtomicBool::new(false));
+
+        // Spawn concurrent tasks for all backends
+        (0..router.backend_count().get())
+            .map(crate::types::BackendId::from_index)
+            .for_each(|backend_id| {
+                let (tx, responded, router, cache, buffer_pool) = (
+                    tx.clone(),
+                    responded.clone(),
+                    router.clone(),
+                    self.cache.clone(),
+                    self.buffer_pool.clone(),
+                );
+                let (msg_id, command, cache_articles, client_addr) = (
+                    msg_id.to_owned(),
+                    command.to_string(),
+                    self.cache_articles,
+                    self.client_addr,
+                );
+
+                tokio::spawn(async move {
+                    let provider = router.backend_provider(backend_id)?;
+                    let mut conn = provider.get_pooled_connection().await.ok()?;
+                    let mut buffer = buffer_pool.acquire().await;
+
+                    let (n, response_code, is_multiline, _, _, _) =
+                        backend::send_command_and_read_first_chunk(
+                            &mut *conn,
+                            &command,
+                            backend_id,
+                            client_addr,
+                            &mut buffer,
+                        )
+                        .await
+                        .ok()?;
+
+                    let code_num = response_code.status_code()?.as_u16();
+
+                    match code_num {
+                        430 => cache.record_backend_missing(msg_id, backend_id).await,
+                        221 => {
+                            // Read full multiline response if needed
+                            let response_data = if is_multiline {
+                                use tokio::io::AsyncReadExt;
+                                let mut full = buffer[..n].to_vec();
+                                loop {
+                                    let read = conn
+                                        .as_mut()
+                                        .read(buffer.as_mut_slice())
+                                        .await
+                                        .unwrap_or(0);
+                                    if read == 0 || full.ends_with(b".\r\n") {
+                                        break;
+                                    }
+                                    full.extend_from_slice(&buffer[..read]);
+                                }
+                                full
+                            } else {
+                                buffer[..n].to_vec()
+                            };
+
+                            // Cache full response or just stub
+                            let cache_data = if cache_articles {
+                                response_data.clone()
+                            } else {
+                                b"221\r\n".to_vec()
+                            };
+                            cache.upsert(msg_id, cache_data, backend_id).await;
+
+                            // First responder wins
+                            if !responded.swap(true, Ordering::SeqCst) {
+                                Arc::try_unwrap(tx)
+                                    .ok()
+                                    .and_then(|opt| opt)
+                                    .map(|sender| sender.send((response_data, backend_id)));
+                            }
+                        }
+                        _ => {}
+                    }
+                    Some(())
+                });
+            });
+
+        // Wait for first successful response
+        match rx.await {
+            Ok((response_data, backend_id)) => {
+                client_write.write_all(&response_data).await?;
+                *backend_to_client_bytes = backend_to_client_bytes.add(response_data.len());
+                router.complete_command(backend_id);
+                Ok(backend_id)
+            }
+            Err(_) => {
+                // No backend had the article - return 430
+                let response = b"430 No such article\r\n";
+                client_write.write_all(response).await?;
+                *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
+
+                // Return arbitrary backend ID
+                let backend_id = router.route_command(self.client_id, command)?;
+                router.complete_command(backend_id);
+                Ok(backend_id)
+            }
+        }
     }
 }
 

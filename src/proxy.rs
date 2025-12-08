@@ -231,6 +231,14 @@ impl NntpProxyBuilder {
             )
         };
 
+        // Extract adaptive_precheck from cache config (default: false)
+        let adaptive_precheck = self
+            .config
+            .cache
+            .as_ref()
+            .map(|c| c.adaptive_precheck)
+            .unwrap_or(false);
+
         Ok(NntpProxy {
             servers,
             router,
@@ -243,6 +251,7 @@ impl NntpProxyBuilder {
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
             cache_articles,
+            adaptive_precheck,
         })
     }
 }
@@ -270,6 +279,8 @@ pub struct NntpProxy {
     cache: Arc<ArticleCache>,
     /// Whether to cache article bodies (config-driven)
     cache_articles: bool,
+    /// Whether to use adaptive availability prechecking for STAT/HEAD
+    adaptive_precheck: bool,
 }
 
 /// Classify an error as a client disconnect (broken pipe/connection reset)
@@ -334,7 +345,8 @@ impl NntpProxy {
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
         .with_cache(cache)
-        .with_cache_articles(self.cache_articles);
+        .with_cache_articles(self.cache_articles)
+        .with_adaptive_precheck(self.adaptive_precheck);
 
         // Apply optional router
         let builder = match router {

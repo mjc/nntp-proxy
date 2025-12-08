@@ -48,6 +48,12 @@ pub fn cache_articles() -> bool {
     true
 }
 
+/// Default for adaptive availability prechecking (false = disabled)
+#[inline]
+pub fn adaptive_precheck() -> bool {
+    false
+}
+
 /// Default for TLS certificate verification (true for security)
 #[inline]
 pub fn tls_verify_cert() -> bool {
