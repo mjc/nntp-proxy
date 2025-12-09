@@ -19,11 +19,11 @@
 //!
 //! # fn example() -> anyhow::Result<()> {
 //! let client_addr: SocketAddr = "127.0.0.1:50000".parse()?;
-//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
 //!
 //! // Create a simple 1:1 session (no load balancing)
-//! let session = ClientSession::new(client_addr, buffer_pool, auth);
+//! let session = ClientSession::new(client_addr.into(), buffer_pool, auth);
 //! assert_eq!(session.mode(), nntp_proxy::session::SessionMode::Stateful);
 //! # Ok(())
 //! # }
@@ -42,7 +42,7 @@
 //!
 //! # fn example() -> anyhow::Result<()> {
 //! let addr = "127.0.0.1:50000".parse()?;
-//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
 //!
@@ -70,7 +70,7 @@
 //!
 //! # fn example() -> anyhow::Result<()> {
 //! let addr = "127.0.0.1:50000".parse()?;
-//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
 //!
@@ -103,11 +103,11 @@
 //!
 //! # fn example() -> anyhow::Result<()> {
 //! let addr = "127.0.0.1:50000".parse()?;
-//! let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+//! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
 //! let metrics = MetricsCollector::new(2); // 2 backends
-//! let cache = Arc::new(ArticleCache::new(1000, Duration::from_secs(3600)));
+//! let cache = Arc::new(ArticleCache::new(1000, Duration::from_secs(3600), true));
 //!
 //! // Full-featured session with all bells and whistles
 //! let session = ClientSession::builder(addr.into(), buffer_pool, auth)
@@ -230,7 +230,7 @@ pub struct ClientSession {
 /// use nntp_proxy::auth::AuthHandler;
 ///
 /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-/// let buffer_pool = BufferPool::new(BufferSize::DEFAULT, 10);
+/// let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
 /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
 ///
 /// // Stateful 1:1 routing mode
@@ -434,7 +434,7 @@ impl ClientSession {
     /// use nntp_proxy::auth::AuthHandler;
     ///
     /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    /// let buffer_pool = BufferPool::new(BufferSize::new(8192).unwrap(), 10);::new(8192).unwrap(), 10);
+    /// let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
     /// let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
     ///
     /// let session = ClientSession::builder(addr.into(), buffer_pool, auth_handler)

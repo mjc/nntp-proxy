@@ -36,6 +36,7 @@ pub mod args;
 pub mod auth;
 pub mod connection_error;
 pub mod formatting;
+pub mod logging;
 pub mod metrics;
 pub mod network;
 pub mod protocol;

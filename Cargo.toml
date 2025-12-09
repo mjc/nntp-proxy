@@ -26,11 +26,13 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["net", "rt-multi-thread", "io-util", "time", "macros", "signal"] }
+futures = "0.3"  # Future combinators for join_all
 clap = { version = "4.0", features = ["derive", "env", "std", "help"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 toml = "0.9"
 tracing = { version = "0.1", features = ["std"], default-features = false }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"], default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "registry", "ansi"], default-features = false }
+tracing-appender = "0.2"
 anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations

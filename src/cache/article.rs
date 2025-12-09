@@ -10,31 +10,48 @@ use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::future::Cache;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Maximum number of backends supported by ArticleAvailability bitset
 pub const MAX_BACKENDS: usize = 8;
 
-/// Bitset tracking which backends DON'T have an article (returned 430)
+/// Track which backends have (or don't have) a specific article
 ///
-/// **DEFAULT ASSUMPTION**: All backends have the article until proven otherwise.
+/// Uses two u8 bitsets to track availability across up to 8 backends:
+/// - `checked`: Which backends we've queried (attempted to fetch from)
+/// - `missing`: Which backends returned 430 (don't have this article)
 ///
-/// Bit N is SET if BackendId::from_index(N) returned 430 (doesn't have article).
-/// Bit N is CLEAR if BackendId::from_index(N) might have article (not yet tried or has it).
+/// # Example with 2 backends
+/// - Initial state: `checked=00`, `missing=00` (haven't tried any backends yet)
+/// - After backend 0 returns 430: `checked=01`, `missing=01` (backend 0 doesn't have it)
+/// - After backend 1 returns 220: `checked=11`, `missing=01` (backend 1 has it)
+/// - If both return 430: `checked=11`, `missing=11` (all backends exhausted)
 ///
-/// **EXIT CONDITION**: Article found OR all bits are set (all backends tried and returned 430).
+/// # Usage Pattern
+/// This type serves TWO critical purposes:
 ///
-/// Examples (2 backends):
-/// - 0b00 = Assume both have article (initial state)
-/// - 0b01 = Backend 0 returned 430, try Backend 1
-/// - 0b10 = Backend 1 returned 430, try Backend 0
-/// - 0b11 = Both returned 430, give up
+/// 1. **Cache persistence** - Track availability across requests (long-lived)
+///    - Store in cache with article data
+///    - Avoid querying backends known to be missing
+///    - Updated after every successful/failed fetch
 ///
-/// **CRITICAL**: This is used for BOTH initial requests AND 430 retries.
-/// The algorithm is identical - keep trying backends until success or all bits set.
+/// 2. **430 retry loop** - Track which backends tried during single request (transient)
+///    - Create fresh instance for each ARTICLE request
+///    - Mark backends as missing when they return 430
+///    - Stop when all backends exhausted or one succeeds
+///
+/// # Thread Safety
+/// Wrapped in `Arc<Mutex<>>` when stored in cache entries for concurrent updates.
+/// The precheck pattern ensures serial updates to avoid races:
+/// 1. Query all backends concurrently
+/// 2. Wait for all to complete
+/// 3. Update cache serially with all results
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArticleAvailability {
+    /// Bitset of backends we've checked (tried to fetch from)
+    checked: u8,
     /// Bitset of backends that DON'T have this article (returned 430)
     missing: u8, // u8 supports up to 8 backends (plenty for NNTP)
 }
@@ -43,7 +60,10 @@ impl ArticleAvailability {
     /// Create empty availability - assume all backends have article until proven otherwise
     #[inline]
     pub const fn new() -> Self {
-        Self { missing: 0 }
+        Self {
+            checked: 0,
+            missing: 0,
+        }
     }
 
     /// Record that a backend returned 430 (doesn't have the article)
@@ -59,7 +79,26 @@ impl ArticleAvailability {
             idx,
             MAX_BACKENDS
         );
-        self.missing |= 1u8 << idx;
+        self.checked |= 1u8 << idx; // Mark as checked
+        self.missing |= 1u8 << idx; // Mark as missing
+        self
+    }
+
+    /// Record that a backend successfully provided the article (clear the missing flag)
+    ///
+    /// # Panics (debug builds only)
+    /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
+    #[inline]
+    pub fn record_has(&mut self, backend_id: BackendId) -> &mut Self {
+        let idx = backend_id.as_index();
+        debug_assert!(
+            idx < MAX_BACKENDS,
+            "Backend index {} exceeds MAX_BACKENDS ({})",
+            idx,
+            MAX_BACKENDS
+        );
+        self.checked |= 1u8 << idx; // Mark as checked
+        self.missing &= !(1u8 << idx); // Clear missing bit (has the article)
         self
     }
 
@@ -88,6 +127,18 @@ impl ArticleAvailability {
     #[inline]
     pub fn should_try(&self, backend_id: BackendId) -> bool {
         !self.is_missing(backend_id)
+    }
+
+    /// Get the raw missing bitset for debugging
+    #[inline]
+    pub const fn missing_bits(&self) -> u8 {
+        self.missing
+    }
+
+    /// Get the raw checked bitset for debugging
+    #[inline]
+    pub const fn checked_bits(&self) -> u8 {
+        self.checked
     }
 
     /// Check if all backends in the pool have been tried and returned 430
@@ -129,6 +180,16 @@ impl ArticleAvailability {
     pub const fn as_u8(&self) -> u8 {
         self.missing
     }
+
+    /// Check if we have any backend availability information
+    ///
+    /// Returns true if at least one backend has been checked.
+    /// If this returns false, we haven't tried any backends yet and shouldn't
+    /// serve from cache (should try backends first).
+    #[inline]
+    pub const fn has_availability_info(&self) -> bool {
+        self.checked != 0
+    }
 }
 
 impl Default for ArticleAvailability {
@@ -143,34 +204,29 @@ impl Default for ArticleAvailability {
 /// The buffer is validated once on insert, then can be served directly without re-parsing.
 #[derive(Clone, Debug)]
 pub struct ArticleEntry {
-    /// Backend availability bitset (2 bytes)
-    backend_availability: ArticleAvailability,
+    /// Backend availability bitset (2 bytes) - wrapped in Arc<Mutex<>> for thread-safe updates
+    backend_availability: Arc<Mutex<ArticleAvailability>>,
 
     /// Complete response buffer (Arc for cheap cloning)
     /// Format: "220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n"
     /// Status code is always at bytes [0..3]
     buffer: Arc<Vec<u8>>,
-
-    /// Backend ID that originally provided this article (for availability tracking)
-    backend_id: BackendId,
 }
 
 impl ArticleEntry {
-    /// Create from response buffer and backend ID
+    /// Create from response buffer
     ///
     /// The buffer should be a complete NNTP response (status line + data + terminator).
     /// No validation is performed here - caller must ensure buffer is valid.
     ///
     /// Backend availability starts with assumption all backends have the article.
-    /// The creating backend is implicitly assumed to have it (since we got it from there).
-    pub fn new(buffer: Vec<u8>, backend_id: BackendId) -> Self {
+    pub fn new(buffer: Vec<u8>) -> Self {
         // Start with fresh availability (assumes all backends have it)
         let availability = ArticleAvailability::new();
 
         Self {
-            backend_availability: availability,
+            backend_availability: Arc::new(Mutex::new(availability)),
             buffer: Arc::new(buffer),
-            backend_id,
         }
     }
 
@@ -194,25 +250,43 @@ impl ArticleEntry {
     /// Returns false if backend is known to not have this article (returned 430 before).
     #[inline]
     pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
-        self.backend_availability.should_try(backend_id)
+        self.backend_availability
+            .lock()
+            .unwrap()
+            .should_try(backend_id)
     }
 
     /// Record that a backend returned 430 (doesn't have this article)
     pub fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.backend_availability.record_missing(backend_id);
+        self.backend_availability
+            .lock()
+            .unwrap()
+            .record_missing(backend_id);
+    }
+
+    /// Record that a backend successfully provided this article
+    pub fn record_backend_has(&mut self, backend_id: BackendId) {
+        self.backend_availability
+            .lock()
+            .unwrap()
+            .record_has(backend_id);
     }
 
     /// Check if all backends have been tried and none have the article
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
-        self.backend_availability.all_exhausted(total_backends)
+        self.backend_availability
+            .lock()
+            .unwrap()
+            .all_exhausted(total_backends)
     }
 
     /// Get backends that might have this article
-    pub fn available_backends(
-        &self,
-        total_backends: BackendCount,
-    ) -> impl Iterator<Item = BackendId> + '_ {
-        self.backend_availability.available_backends(total_backends)
+    pub fn available_backends(&self, total_backends: BackendCount) -> Vec<BackendId> {
+        self.backend_availability
+            .lock()
+            .unwrap()
+            .available_backends(total_backends)
+            .collect()
     }
 
     /// Get response buffer (backward compatibility)
@@ -221,6 +295,19 @@ impl ArticleEntry {
     #[inline]
     pub fn response(&self) -> &Arc<Vec<u8>> {
         &self.buffer
+    }
+
+    /// Check if this cache entry has useful availability information
+    ///
+    /// Returns true if at least one backend has been tried (marked as missing or has article).
+    /// If false, we haven't tried any backends yet and should run precheck instead of
+    /// serving from cache.
+    #[inline]
+    pub fn has_availability_info(&self) -> bool {
+        self.backend_availability
+            .lock()
+            .unwrap()
+            .has_availability_info()
     }
 
     /// Initialize availability tracker from this cached entry
@@ -307,39 +394,15 @@ impl ArticleCache {
         result
     }
 
-    /// Insert article into cache
-    ///
-    /// Accepts any lifetime MessageId and stores using the ID content (without brackets) as key.
-    ///
-    /// When `cache_articles=false`, stores minimal stub (just status code) for availability tracking.
-    /// When `cache_articles=true`, stores the full article body.
-    ///
-    /// For production code, prefer `upsert` which handles buffer extraction and availability tracking.
-    pub async fn insert<'a>(&self, message_id: MessageId<'a>, article: ArticleEntry) {
-        // If not caching full articles, create minimal stub from the article's buffer
-        let entry = if !self.cache_articles {
-            let buffer = article.buffer();
-            let stub_buffer = self.create_minimal_stub(buffer);
-            ArticleEntry::new(stub_buffer, article.backend_id)
-        } else {
-            article
-        };
-
-        // Store using the message ID content without brackets as Arc<str>
-        let key: Arc<str> = message_id.without_brackets().into();
-        self.cache.insert(key, entry).await;
-    }
-
     /// Upsert cache entry (insert or update)
     ///
-    /// If entry exists: updates backend availability
+    /// If entry exists: updates the entry and marks backend as having the article
     /// If entry doesn't exist: inserts new entry
     ///
     /// When `cache_articles=false`, extracts status code from buffer and stores minimal stub.
     /// When `cache_articles=true`, stores full buffer.
     ///
-    /// With new semantics: all backends are assumed to have article until proven otherwise (430).
-    /// So we just insert the entry - no need to mark the backend explicitly.
+    /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
     pub async fn upsert<'a>(
         &self,
         message_id: MessageId<'a>,
@@ -348,9 +411,35 @@ impl ArticleCache {
     ) {
         let key: Arc<str> = message_id.without_brackets().into();
 
-        if let Some(_existing) = self.cache.get(key.as_ref()).await {
-            // Entry already exists - nothing to do
-            // Availability tracking starts fresh (assume all backends have it)
+        if let Some(mut existing) = self.cache.get(key.as_ref()).await {
+            // Entry exists - update buffer if caching, mark backend as having it
+            if self.cache_articles {
+                existing.buffer = Arc::new(buffer);
+            }
+            // Mark this backend as successfully having the article
+            use tracing::debug;
+            let (before_checked, before_missing) = {
+                let avail = existing.backend_availability.lock().unwrap();
+                (avail.checked, avail.missing)
+            };
+            debug!(
+                "upsert: article {} already cached, marking backend {} as HAS (before: checked={:08b}, missing={:08b})",
+                message_id,
+                backend_id.as_index(),
+                before_checked,
+                before_missing
+            );
+            existing.record_backend_has(backend_id);
+            let (after_checked, after_missing) = {
+                let avail = existing.backend_availability.lock().unwrap();
+                (avail.checked, avail.missing)
+            };
+            debug!(
+                "upsert: after record_backend_has: checked={:08b}, missing={:08b}",
+                after_checked, after_missing
+            );
+            // Re-insert to refresh TTL
+            self.cache.insert(key, existing).await;
         } else {
             // Create new entry - strip to stub if not caching bodies
             let storage_buffer = if self.cache_articles {
@@ -359,7 +448,10 @@ impl ArticleCache {
                 // Extract status code and create minimal stub
                 self.create_minimal_stub(&buffer)
             };
-            let entry = ArticleEntry::new(storage_buffer, backend_id);
+            let mut entry = ArticleEntry::new(storage_buffer);
+            // Mark the backend that successfully provided this article
+            entry.record_backend_has(backend_id);
+            // New entries start with this backend marked as having it
             self.cache.insert(key, entry).await;
         }
     }
@@ -385,18 +477,56 @@ impl ArticleCache {
     }
 
     /// Record that a backend returned 430 for this article
+    ///
+    /// If the article is already cached, updates the availability bitset.
+    /// If not cached, creates a new cache entry with the 430 response.
+    /// This prevents repeated queries to backends that don't have the article.
     pub async fn record_backend_missing<'a>(
         &self,
         message_id: MessageId<'a>,
         backend_id: BackendId,
+        response_buffer: Vec<u8>,
     ) {
-        let key = message_id.without_brackets();
+        let key: Arc<str> = message_id.without_brackets().into();
 
-        if let Some(mut entry) = self.cache.get(key).await {
+        if let Some(mut entry) = self.cache.get(key.as_ref()).await {
+            // Article already cached - update availability atomically via interior mutability
+            use tracing::debug;
+            let (before_checked, before_missing) = {
+                let avail = entry.backend_availability.lock().unwrap();
+                (avail.checked, avail.missing)
+            };
+            debug!(
+                "record_backend_missing: article {} already cached, marking backend {} as MISSING (before: checked={:08b}, missing={:08b})",
+                message_id,
+                backend_id.as_index(),
+                before_checked,
+                before_missing
+            );
             entry.record_backend_missing(backend_id);
-            self.cache.insert(key.into(), entry).await;
+            let (after_checked, after_missing) = {
+                let avail = entry.backend_availability.lock().unwrap();
+                (avail.checked, avail.missing)
+            };
+            debug!(
+                "record_backend_missing: after: checked={:08b}, missing={:08b}",
+                after_checked, after_missing
+            );
+            self.cache.insert(key, entry).await;
+        } else {
+            // First 430 for this article - create cache entry
+            // This prevents re-querying backends that returned 430
+            let storage_buffer = if self.cache_articles {
+                response_buffer
+            } else {
+                // Extract status code and create minimal stub
+                self.create_minimal_stub(&response_buffer)
+            };
+            let mut entry = ArticleEntry::new(storage_buffer);
+            entry.record_backend_missing(backend_id);
+            self.cache.insert(key, entry).await;
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
-        // Note: We don't cache negative-only entries (no article body)
     }
 
     /// Get cache statistics
@@ -405,6 +535,16 @@ impl ArticleCache {
             entry_count: self.cache.entry_count(),
             weighted_size: self.cache.weighted_size(),
         }
+    }
+
+    /// Insert an article entry directly (for testing)
+    ///
+    /// This is a low-level method that bypasses the usual upsert logic.
+    /// Only use this in tests where you need precise control over cache state.
+    #[cfg(test)]
+    pub async fn insert<'a>(&self, message_id: MessageId<'a>, entry: ArticleEntry) {
+        let key: Arc<str> = message_id.without_brackets().into();
+        self.cache.insert(key, entry).await;
     }
 
     /// Get maximum cache capacity
@@ -461,9 +601,9 @@ mod tests {
     use crate::types::MessageId;
     use std::time::Duration;
 
-    fn create_test_article(msgid: &str, backend_id: BackendId) -> ArticleEntry {
+    fn create_test_article(msgid: &str) -> ArticleEntry {
         let buffer = format!("220 0 {}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n", msgid).into_bytes();
-        ArticleEntry::new(buffer, backend_id)
+        ArticleEntry::new(buffer)
     }
 
     #[test]
@@ -509,14 +649,13 @@ mod tests {
     #[test]
     fn test_article_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
-        let backend_id = BackendId::from_index(0);
-        let entry = ArticleEntry::new(buffer.clone(), backend_id);
+        let entry = ArticleEntry::new(buffer.clone());
 
         assert_eq!(entry.status_code(), Some(StatusCode::new(220)));
         assert_eq!(entry.buffer().as_ref(), &buffer);
 
         // Default: should try all backends
-        assert!(entry.should_try_backend(backend_id));
+        assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
     }
 
@@ -524,7 +663,7 @@ mod tests {
     fn test_article_entry_record_backend_missing() {
         let backend0 = BackendId::from_index(0);
         let backend1 = BackendId::from_index(1);
-        let mut entry = create_test_article("<test@example.com>", backend0);
+        let mut entry = create_test_article("<test@example.com>");
 
         // Initially should try both
         assert!(entry.should_try_backend(backend0));
@@ -543,7 +682,7 @@ mod tests {
         use crate::router::BackendCount;
         let backend0 = BackendId::from_index(0);
         let backend1 = BackendId::from_index(1);
-        let mut entry = create_test_article("<test@example.com>", backend0);
+        let mut entry = create_test_article("<test@example.com>");
 
         // Not all exhausted yet
         assert!(!entry.all_backends_exhausted(BackendCount::new(2)));
@@ -563,7 +702,7 @@ mod tests {
 
         // Create a MessageId and insert an article
         let msgid = MessageId::from_borrowed("<test123@example.com>").unwrap();
-        let article = create_test_article("<test123@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<test123@example.com>");
 
         cache.insert(msgid.clone(), article.clone()).await;
 
@@ -601,7 +740,7 @@ mod tests {
         let cache = ArticleCache::new(10, Duration::from_secs(300), true);
 
         let msgid = MessageId::from_borrowed("<article@example.com>").unwrap();
-        let article = create_test_article("<article@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<article@example.com>");
 
         cache.insert(msgid.clone(), article.clone()).await;
 
@@ -655,19 +794,96 @@ mod tests {
         let cache = ArticleCache::new(100, Duration::from_secs(300), true);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let article = create_test_article("<test@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<test@example.com>");
 
         cache.insert(msgid.clone(), article).await;
 
         // Record backend 1 as missing
+        let response_430 = b"430 No such article\r\n".to_vec();
         cache
-            .record_backend_missing(msgid.clone(), BackendId::from_index(1))
+            .record_backend_missing(msgid.clone(), BackendId::from_index(1), response_430)
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
         // Backend 0 should still be tried, backend 1 should not
         assert!(retrieved.should_try_backend(BackendId::from_index(0)));
         assert!(!retrieved.should_try_backend(BackendId::from_index(1)));
+    }
+
+    /// CRITICAL BUG FIX TEST: record_backend_missing must create cache entries
+    /// for articles that don't exist anywhere (all backends return 430).
+    ///
+    /// Bug: Previously, if an article wasn't cached, record_backend_missing
+    /// would silently do nothing. This caused repeated queries to all backends
+    /// for missing articles, resulting in:
+    /// - Massive bandwidth waste
+    /// - SABnzbd reporting "gigabytes of missing articles"
+    /// - 4xx/5xx error counts not increasing (metrics bug)
+    #[tokio::test]
+    async fn test_record_backend_missing_creates_new_entry() {
+        let cache = ArticleCache::new(100, Duration::from_secs(300), true);
+
+        let msgid = MessageId::from_borrowed("<missing@example.com>").unwrap();
+
+        // Verify article is NOT in cache
+        assert!(cache.get(&msgid).await.is_none());
+
+        // Record backend 0 returned 430
+        let response_430 = b"430 No such article\r\n".to_vec();
+        cache
+            .record_backend_missing(
+                msgid.clone(),
+                BackendId::from_index(0),
+                response_430.clone(),
+            )
+            .await;
+
+        // CRITICAL: Cache entry MUST now exist
+        let entry = cache
+            .get(&msgid)
+            .await
+            .expect("Cache entry must exist after record_backend_missing");
+
+        // Verify backend 0 is marked as missing
+        assert!(
+            !entry.should_try_backend(BackendId::from_index(0)),
+            "Backend 0 should be marked missing"
+        );
+
+        // Verify backend 1 is still available (not tried yet)
+        assert!(
+            entry.should_try_backend(BackendId::from_index(1)),
+            "Backend 1 should still be available"
+        );
+
+        // Verify the cached response is the 430 response
+        assert_eq!(
+            entry.buffer().as_ref(),
+            &response_430,
+            "Cached buffer should be the 430 response"
+        );
+
+        // Record backend 1 also returned 430
+        cache
+            .record_backend_missing(
+                msgid.clone(),
+                BackendId::from_index(1),
+                response_430.clone(),
+            )
+            .await;
+
+        let entry = cache.get(&msgid).await.unwrap();
+
+        // Now both backends should be marked missing
+        assert!(!entry.should_try_backend(BackendId::from_index(0)));
+        assert!(!entry.should_try_backend(BackendId::from_index(1)));
+
+        // Verify all backends exhausted
+        use crate::router::BackendCount;
+        assert!(
+            entry.all_backends_exhausted(BackendCount::new(2)),
+            "All backends should be exhausted"
+        );
     }
 
     #[tokio::test]
@@ -680,7 +896,7 @@ mod tests {
 
         // Insert one article
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let article = create_test_article("<test@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<test@example.com>");
         cache.insert(msgid, article).await;
 
         // Wait for background tasks
@@ -696,7 +912,7 @@ mod tests {
         let cache = ArticleCache::new(1024 * 1024, Duration::from_millis(50), true); // 1MB
 
         let msgid = MessageId::from_borrowed("<expire@example.com>").unwrap();
-        let article = create_test_article("<expire@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<expire@example.com>");
 
         cache.insert(msgid.clone(), article).await;
 
@@ -717,10 +933,12 @@ mod tests {
         let cache_stub = ArticleCache::new(1024 * 1024, Duration::from_secs(300), false);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let full_article = create_test_article("<test@example.com>", BackendId::from_index(0));
-        let full_size = full_article.buffer().len();
+        let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+        let full_size = buffer.len();
 
-        cache_stub.insert(msgid.clone(), full_article).await;
+        cache_stub
+            .upsert(msgid.clone(), buffer, BackendId::from_index(0))
+            .await;
         cache_stub.sync().await;
 
         let retrieved = cache_stub.get(&msgid).await.unwrap();
@@ -743,10 +961,12 @@ mod tests {
         let cache_full = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true);
 
         let msgid2 = MessageId::from_borrowed("<test2@example.com>").unwrap();
-        let full_article2 = create_test_article("<test2@example.com>", BackendId::from_index(0));
-        let original_size = full_article2.buffer().len();
+        let buffer2 = b"220 0 <test2@example.com>\r\nSubject: Test2\r\n\r\nBody2\r\n.\r\n".to_vec();
+        let original_size = buffer2.len();
 
-        cache_full.insert(msgid2.clone(), full_article2).await;
+        cache_full
+            .upsert(msgid2.clone(), buffer2, BackendId::from_index(0))
+            .await;
         cache_full.sync().await;
 
         let retrieved2 = cache_full.get(&msgid2).await.unwrap();
@@ -763,7 +983,7 @@ mod tests {
         for i in 1..=3 {
             let msgid_str = format!("<article{}@example.com>", i);
             let msgid = MessageId::new(msgid_str).unwrap();
-            let article = create_test_article(msgid.as_ref(), BackendId::from_index(0));
+            let article = create_test_article(msgid.as_ref());
             cache.insert(msgid, article).await;
             cache.sync().await; // Force eviction
         }
@@ -781,7 +1001,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_article_entry_clone() {
-        let article = create_test_article("<test@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<test@example.com>");
 
         let cloned = article.clone();
         assert_eq!(article.buffer().as_ref(), cloned.buffer().as_ref());
@@ -794,7 +1014,7 @@ mod tests {
         let cache2 = cache1.clone();
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let article = create_test_article("<test@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<test@example.com>");
 
         cache1.insert(msgid.clone(), article).await;
         cache1.sync().await;
@@ -809,7 +1029,7 @@ mod tests {
 
         // Use owned MessageId
         let msgid = MessageId::new("<owned@example.com>".to_string()).unwrap();
-        let article = create_test_article("<owned@example.com>", BackendId::from_index(0));
+        let article = create_test_article("<owned@example.com>");
 
         cache.insert(msgid.clone(), article).await;
 

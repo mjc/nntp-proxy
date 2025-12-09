@@ -319,6 +319,7 @@ pub struct Server {
 ///
 /// ```
 /// use nntp_proxy::config::Server;
+/// use nntp_proxy::types::{Port, MaxConnections};
 ///
 /// // Minimal configuration
 /// let config = Server::builder("news.example.com", Port::try_new(119).unwrap())
@@ -499,6 +500,7 @@ impl Server {
     ///
     /// ```
     /// use nntp_proxy::config::Server;
+    /// use nntp_proxy::types::{Port, MaxConnections};
     ///
     /// let config = Server::builder("news.example.com", Port::try_new(119).unwrap())
     ///     .name("Example Server")
