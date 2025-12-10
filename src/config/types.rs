@@ -107,7 +107,7 @@ pub struct Config {
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheck,
-    /// Cache configuration (optional, for caching proxy)
+    /// Cache configuration (optional in config - defaults to 0 capacity for availability tracking only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
     /// Client authentication configuration

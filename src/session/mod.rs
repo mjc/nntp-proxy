@@ -362,6 +362,12 @@ impl ClientSessionBuilder {
 }
 
 impl ClientSession {
+    /// Create default cache for availability tracking only (no content caching)
+    fn default_cache() -> Arc<crate::cache::ArticleCache> {
+        const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+        Arc::new(crate::cache::ArticleCache::new(0, DEFAULT_TTL, false))
+    }
+
     /// Create a new client session for 1:1 backend mapping
     #[must_use]
     pub fn new(
@@ -379,11 +385,7 @@ impl ClientSession {
             auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
-            cache: Arc::new(crate::cache::ArticleCache::new(
-                0,
-                std::time::Duration::from_secs(3600),
-                false,
-            )),
+            cache: Self::default_cache(),
             cache_articles: true,
             adaptive_precheck: false,
         }
@@ -564,19 +566,13 @@ impl ClientSession {
         last_reported_c2b: &mut crate::types::ClientToBackendBytes,
         last_reported_b2c: &mut crate::types::BackendToClientBytes,
     ) {
-        let delta_c2b = client_to_backend.saturating_sub(*last_reported_c2b);
-        let delta_b2c = backend_to_client.saturating_sub(*last_reported_b2c);
-
-        if delta_c2b.as_u64() > 0 {
-            self.metrics
-                .record_client_to_backend_bytes_for(backend_id, delta_c2b.as_u64());
-            self.user_bytes_sent(delta_c2b.as_u64());
-        }
-        if delta_b2c.as_u64() > 0 {
-            self.metrics
-                .record_backend_to_client_bytes_for(backend_id, delta_b2c.as_u64());
-            self.user_bytes_received(delta_b2c.as_u64());
-        }
+        self.record_byte_deltas(
+            backend_id,
+            client_to_backend.as_u64(),
+            backend_to_client.as_u64(),
+            last_reported_c2b.as_u64(),
+            last_reported_b2c.as_u64(),
+        );
 
         *last_reported_c2b = client_to_backend;
         *last_reported_b2c = backend_to_client;
@@ -604,11 +600,30 @@ impl ClientSession {
         last_reported_c2b: u64,
         last_reported_b2c: u64,
     ) {
-        let current_c2b = client_to_backend.into();
-        let current_b2c = backend_to_client.into();
+        self.record_byte_deltas(
+            backend_id,
+            client_to_backend.into(),
+            backend_to_client.into(),
+            last_reported_c2b,
+            last_reported_b2c,
+        );
 
-        let delta_c2b = current_c2b.saturating_sub(last_reported_c2b);
-        let delta_b2c = current_b2c.saturating_sub(last_reported_b2c);
+        self.metrics
+            .user_connection_closed(self.username().as_deref());
+    }
+
+    /// Record byte transfer deltas to metrics (shared logic)
+    #[inline]
+    fn record_byte_deltas(
+        &self,
+        backend_id: crate::types::BackendId,
+        current_c2b: u64,
+        current_b2c: u64,
+        last_c2b: u64,
+        last_b2c: u64,
+    ) {
+        let delta_c2b = current_c2b.saturating_sub(last_c2b);
+        let delta_b2c = current_b2c.saturating_sub(last_b2c);
 
         if delta_c2b > 0 {
             self.metrics
@@ -620,9 +635,6 @@ impl ClientSession {
                 .record_backend_to_client_bytes_for(backend_id, delta_b2c);
             self.user_bytes_received(delta_b2c);
         }
-
-        self.metrics
-            .user_connection_closed(self.username().as_deref());
     }
 }
 

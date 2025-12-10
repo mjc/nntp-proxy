@@ -473,7 +473,7 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
-    /// Get the article cache (if enabled via config)
+    /// Get the article cache (always present - capacity 0 if not configured)
     #[must_use]
     #[inline]
     pub fn cache(&self) -> &Arc<crate::cache::ArticleCache> {
@@ -591,8 +591,8 @@ impl NntpProxy {
 
     /// Get display name for current routing mode
     #[inline]
-    fn routing_mode_display_name(&self, cache: &Arc<crate::cache::ArticleCache>) -> &'static str {
-        if cache.entry_count() > 0 {
+    fn routing_mode_display_name(&self) -> &'static str {
+        if self.cache.entry_count() > 0 {
             "caching"
         } else {
             "per-command"
@@ -729,18 +729,17 @@ impl NntpProxy {
         client_stream: TcpStream,
         client_addr: ClientAddress,
     ) -> Result<()> {
-        self.handle_per_command_client(client_stream, client_addr, self.cache.clone())
+        self.handle_per_command_client(client_stream, client_addr)
             .await
     }
 
-    /// Handle a per-command routing session with optional caching
+    /// Handle a per-command routing session
     async fn handle_per_command_client(
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
-        cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
-        let mode_label = self.routing_mode_display_name(&cache);
+        let mode_label = self.routing_mode_display_name();
         debug!(
             "New {} routing client connection from {}",
             mode_label, client_addr
@@ -1058,15 +1057,8 @@ mod tests {
             let config = create_test_config();
             let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
 
-            // Create a cache with entries
-            let cache = Arc::new(crate::cache::ArticleCache::new(
-                100,
-                std::time::Duration::from_secs(3600),
-                true,
-            ));
-
-            // Empty cache should return "per-command"
-            assert_eq!(proxy.routing_mode_display_name(&cache), "per-command");
+            // Empty cache (default 0 capacity) should return "per-command"
+            assert_eq!(proxy.routing_mode_display_name(), "per-command");
         }
 
         #[test]
