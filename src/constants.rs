@@ -101,6 +101,11 @@ pub mod timeout {
 
     /// Connection timeout for backend connections
     pub const CONNECTION: Duration = Duration::from_secs(10);
+
+    /// Timeout for adaptive precheck queries (STAT/HEAD)
+    /// If a backend doesn't respond within this time, treat as 430 (missing)
+    /// This prevents slow backends from blocking all client connections
+    pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
 }
 
 /// Connection pool constants

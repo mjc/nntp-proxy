@@ -10,13 +10,40 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
+use crate::connection_error::ConnectionError;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::router::BackendSelector;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+
+/// Calculate adaptive timeout based on average TTFB across backends
+///
+/// Returns TTFB³, with a minimum of 5 seconds.
+/// This prevents slow backends from blocking while allowing reasonable TTFB detection.
+fn calculate_adaptive_timeout(
+    metrics: Option<&crate::metrics::MetricsCollector>,
+) -> std::time::Duration {
+    metrics
+        .and_then(|m| {
+            let snapshot = m.snapshot(None);
+            let avg_ttfb_ms: f64 = snapshot
+                .backend_stats
+                .iter()
+                .filter_map(|b| b.average_ttfb_ms())
+                .sum::<f64>()
+                / snapshot.backend_stats.len().max(1) as f64;
+
+            (avg_ttfb_ms > 0.0).then(|| {
+                let ttfb_cubed = (avg_ttfb_ms / 1000.0).powi(3);
+                std::time::Duration::from_secs_f64(ttfb_cubed)
+            })
+        })
+        .unwrap_or(std::time::Duration::from_secs(5))
+        .max(std::time::Duration::from_secs(5))
+}
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, PartialEq, Eq)]
@@ -427,6 +454,18 @@ impl ClientSession {
             router.backend_count().get()
         );
 
+        // EARLY RETURN: If cache says all backends already returned 430, don't waste time
+        if availability.all_exhausted(router.backend_count()) {
+            debug!(
+                "Client {} cache shows all backends exhausted for {:?}, returning 430 immediately",
+                self.client_addr, msg_id
+            );
+            client_write.write_all(b"430 No such article\r\n").await?;
+            *backend_to_client_bytes = backend_to_client_bytes.add(22);
+            let backend_id = crate::types::BackendId::from_index(0);
+            return Ok(backend_id);
+        }
+
         // Track last 430 response to return if all backends fail
         let mut last_430_response: Option<Vec<u8>> = None;
         let mut last_430_backend: Option<crate::types::BackendId> = None;
@@ -443,24 +482,33 @@ impl ClientSession {
                     &mut buffer,
                     client_to_backend_bytes,
                 )
-                .await?
+                .await
             {
-                BackendAttemptResult::Success {
+                Ok(BackendAttemptResult::Success {
                     backend_id,
                     bytes_written,
-                } => {
+                }) => {
                     *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
                     router.complete_command(backend_id);
                     return Ok(backend_id);
                 }
-                BackendAttemptResult::ArticleNotFound {
+                Ok(BackendAttemptResult::ArticleNotFound {
                     backend_id,
                     response,
-                } => {
+                }) => {
                     last_430_response = Some(response);
                     last_430_backend = Some(backend_id);
                 }
-                BackendAttemptResult::BackendUnavailable => {
+                Ok(BackendAttemptResult::BackendUnavailable) => {
+                    // Continue to next backend
+                }
+                Err(e) => {
+                    // Backend error (timeout, connection error, etc.)
+                    // Log it but continue trying other backends
+                    debug!(
+                        "Client {} backend error (will try next): {:?}",
+                        self.client_addr, e
+                    );
                     // Continue to next backend
                 }
             }
@@ -526,15 +574,28 @@ impl ClientSession {
 
         // Execute command
         let mut conn = provider.get_pooled_connection().await?;
-        let (n, response_code, is_multiline, ttfb, send, recv) = match self
-            .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
-            .await
+
+        // Apply timeout at this level so we can handle drain properly
+        let timeout = calculate_adaptive_timeout(self.metrics.as_ref());
+        // Execute with timeout - flatten the Result<Result<...>> with `?`
+        let (n, response_code, is_multiline, ttfb, send, recv) = match tokio::time::timeout(
+            timeout,
+            self.execute_and_get_first_chunk(&mut conn, backend_id, command, buffer),
+        )
+        .await
         {
-            Ok(result) => result,
-            Err(e) => {
+            Ok(result) => result?, // Flatten: propagate execution errors
+            Err(_elapsed) => {
+                // Timeout - spawn task to drain and return to pool (backend throttles new connections)
                 self.handle_backend_error(backend_id, &router);
-                crate::pool::remove_from_pool(conn);
-                return Err(e);
+
+                // Spawn drain task - takes ownership of connection
+                tokio::spawn(crate::pool::drain_connection_async(
+                    conn,
+                    self.buffer_pool.clone(),
+                ));
+
+                return Err(ConnectionError::BackendTimeout { timeout }.into());
             }
         };
 
@@ -602,17 +663,79 @@ impl ClientSession {
         command: &str,
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(usize, crate::protocol::NntpResponse, bool, u64, u64, u64)> {
+        use std::time::Instant;
+        use tokio::io::AsyncWriteExt;
+
         self.record_command(backend_id);
         self.user_command();
 
-        backend::send_command_and_read_first_chunk(
-            &mut **pooled_conn,
-            command,
-            backend_id,
-            self.client_addr,
-            buffer,
-        )
-        .await
+        let start = Instant::now();
+
+        // Send command
+        let send_start = Instant::now();
+        pooled_conn.as_mut().write_all(command.as_bytes()).await?;
+        let send_elapsed = send_start.elapsed();
+
+        // Read first chunk
+        let recv_start = Instant::now();
+        let n = buffer.read_from(&mut **pooled_conn).await?;
+        if n == 0 {
+            anyhow::bail!("Backend connection closed unexpectedly");
+        }
+        let recv_elapsed = recv_start.elapsed();
+
+        // Validate response using pure function from backend module
+        let validated = backend::validate_backend_response(
+            &buffer[..n],
+            n,
+            crate::protocol::MIN_RESPONSE_LENGTH,
+        );
+
+        // Log warnings
+        for warning in &validated.warnings {
+            use backend::ResponseWarning;
+            match warning {
+                ResponseWarning::ShortResponse { bytes, min } => {
+                    warn!(
+                        "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
+                        self.client_addr,
+                        backend_id,
+                        bytes,
+                        min,
+                        &buffer[..n]
+                    );
+                }
+                ResponseWarning::InvalidResponse => {
+                    warn!(
+                        "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
+                        self.client_addr,
+                        backend_id,
+                        n,
+                        String::from_utf8_lossy(&buffer[..n.min(50)])
+                    );
+                }
+                ResponseWarning::UnusualStatusCode(code) => {
+                    warn!(
+                        "Client {} got unusual status code {} from backend {:?}: {:?}",
+                        self.client_addr,
+                        code,
+                        backend_id,
+                        String::from_utf8_lossy(&buffer[..n.min(50)])
+                    );
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+
+        Ok((
+            n,
+            validated.response,
+            validated.is_multiline,
+            elapsed.as_micros() as u64,
+            send_elapsed.as_micros() as u64,
+            recv_elapsed.as_micros() as u64,
+        ))
     }
 
     /// Check if response is 430 (article not found)
@@ -680,9 +803,9 @@ impl ClientSession {
             });
         }
 
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_error_4xx(backend_id);
-        }
+        // NOTE: 430 is NOT an error - it's normal retry behavior.
+        // The backend is correctly reporting it doesn't have the article.
+        // Error metrics should only track actual errors (connection failures, protocol violations, etc.)
 
         router.complete_command(backend_id);
     }
@@ -977,6 +1100,7 @@ impl ClientSession {
                                 .record_backend_missing(msg_id.clone(), backend_id, response)
                                 .await;
                             if let Some(ref m) = metrics {
+                                m.record_command(backend_id);
                                 m.record_error_4xx(backend_id);
                             }
                         }
@@ -1013,36 +1137,56 @@ impl ClientSession {
             Missing(BackendId, Vec<u8>), // 430 or other error
         }
 
+        // Calculate adaptive timeout: TTFB * 2
+        let timeout = calculate_adaptive_timeout(self.metrics.as_ref());
+
         // Query all backends concurrently
         let backend_queries = (0..router.backend_count().get())
             .map(BackendId::from_index)
             .map(|backend_id| {
-                let (router, buffer_pool, metrics, command, client_addr) = (
+                let (router, buffer_pool, metrics, command) = (
                     router.clone(),
                     self.buffer_pool.clone(),
                     self.metrics.clone(),
                     command.to_string(),
-                    self.client_addr,
                 );
 
                 tokio::spawn(async move {
-                    // Get connection and send STAT command
+                    use tokio::io::AsyncWriteExt;
+
+                    // Get connection and send STAT command (no timeout on write)
                     let provider = router.backend_provider(backend_id)?;
                     let mut conn = provider.get_pooled_connection().await.ok()?;
                     let mut buffer = buffer_pool.acquire().await;
 
-                    let (bytes_read, response_code, ..) =
-                        backend::send_command_and_read_first_chunk(
-                            &mut *conn,
-                            &command,
-                            backend_id,
-                            client_addr,
-                            &mut buffer,
-                        )
-                        .await
-                        .ok()?;
+                    // Send command without timeout
+                    conn.as_mut().write_all(command.as_bytes()).await.ok()?;
 
-                    let response_bytes = buffer[..bytes_read].to_vec();
+                    // Timeout only on first byte read (TTFB²)
+                    let read_result = tokio::time::timeout(timeout, async {
+                        let n = buffer.read_from(&mut *conn).await.ok()?;
+                        if n == 0 {
+                            return None;
+                        }
+                        Some((n, buffer[..n].to_vec()))
+                    })
+                    .await;
+
+                    let (_bytes_read, response_bytes) = match read_result {
+                        Ok(Some(data)) => data,
+                        Ok(None) => return None,
+                        Err(_) => {
+                            debug!(
+                                "STAT query to backend {} timed out waiting for first byte after {:?}",
+                                backend_id.as_index(),
+                                timeout
+                            );
+                            return None;
+                        }
+                    };
+
+                    // Parse response code
+                    let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
                     let status_code = response_code.status_code()?.as_u16();
 
                     // Classify result: has article, or missing/error
@@ -1050,6 +1194,7 @@ impl ClientSession {
                         220..=223 => StatResult::Has(backend_id, response_bytes),
                         430 => {
                             if let Some(m) = metrics.as_ref() {
+                                m.record_command(backend_id);
                                 m.record_error_4xx(backend_id);
                             }
                             StatResult::Missing(backend_id, response_bytes)
@@ -1060,7 +1205,7 @@ impl ClientSession {
             })
             .collect::<Vec<_>>();
 
-        // Wait for all backends to respond (avoid cache races)
+        // Wait for all backends to respond
         let all_results = futures::future::try_join_all(backend_queries)
             .await
             .unwrap_or_default()
@@ -1123,59 +1268,78 @@ impl ClientSession {
             Missing(BackendId, Vec<u8>), // 430 or other error
         }
 
+        // Calculate adaptive timeout: TTFB * 2
+        let timeout = calculate_adaptive_timeout(self.metrics.as_ref());
+
         // Query all backends concurrently
         let backend_queries = (0..router.backend_count().get())
             .map(BackendId::from_index)
             .map(|backend_id| {
-                let (router, buffer_pool, metrics, command, cache_articles, client_addr) = (
+                let (router, buffer_pool, metrics, command, cache_articles) = (
                     router.clone(),
                     self.buffer_pool.clone(),
                     self.metrics.clone(),
                     command.to_string(),
                     self.cache_articles,
-                    self.client_addr,
                 );
 
                 tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-                    // Get connection and send HEAD command
+                    // Get connection and send HEAD command (no timeout on write)
                     let provider = router.backend_provider(backend_id)?;
                     let mut conn = provider.get_pooled_connection().await.ok()?;
                     let mut buffer = buffer_pool.acquire().await;
 
-                    let (bytes_read, response_code, is_multiline, ..) =
-                        backend::send_command_and_read_first_chunk(
-                            &mut *conn,
-                            &command,
-                            backend_id,
-                            client_addr,
-                            &mut buffer,
-                        )
-                        .await
-                        .ok()?;
+                    // Send command without timeout
+                    conn.as_mut().write_all(command.as_bytes()).await.ok()?;
 
+                    // Timeout only on first byte read (TTFB²)
+                    let read_result = tokio::time::timeout(timeout, async {
+                        let n = buffer.read_from(&mut *conn).await.ok()?;
+                        if n == 0 {
+                            return None;
+                        }
+                        Some((n, buffer[..n].to_vec()))
+                    })
+                    .await;
+
+                    let (_bytes_read, mut response_bytes) = match read_result {
+                        Ok(Some(data)) => data,
+                        Ok(None) => return None,
+                        Err(_) => {
+                            debug!(
+                                "HEAD query to backend {} timed out waiting for first byte after {:?}",
+                                backend_id.as_index(),
+                                timeout
+                            );
+                            return None;
+                        }
+                    };
+
+                    // Parse response code
+                    let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
                     let status_code = response_code.status_code()?.as_u16();
+                    let is_multiline = response_code.is_multiline();
 
                     Some(match status_code {
                         221 => {
-                            // Read complete multiline response if needed
+                            // Read complete multiline response if needed (no timeout - we got first byte)
                             let full_response = if is_multiline {
-                                let mut response = buffer[..bytes_read].to_vec();
                                 loop {
                                     let n = conn
                                         .as_mut()
                                         .read(buffer.as_mut_slice())
                                         .await
                                         .unwrap_or(0);
-                                    if n == 0 || response.ends_with(b".\r\n") {
+                                    if n == 0 || response_bytes.ends_with(b".\r\n") {
                                         break;
                                     }
-                                    response.extend_from_slice(&buffer[..n]);
+                                    response_bytes.extend_from_slice(&buffer[..n]);
                                 }
-                                response
+                                response_bytes
                             } else {
-                                buffer[..bytes_read].to_vec()
+                                response_bytes
                             };
 
                             // Cache full headers or just availability marker
@@ -1189,17 +1353,18 @@ impl ClientSession {
                         }
                         430 => {
                             if let Some(m) = metrics.as_ref() {
+                                m.record_command(backend_id);
                                 m.record_error_4xx(backend_id);
                             }
-                            HeadResult::Missing(backend_id, buffer[..bytes_read].to_vec())
+                            HeadResult::Missing(backend_id, response_bytes)
                         }
-                        _ => HeadResult::Missing(backend_id, buffer[..bytes_read].to_vec()),
+                        _ => HeadResult::Missing(backend_id, response_bytes),
                     })
                 })
             })
             .collect::<Vec<_>>();
 
-        // Wait for all backends to respond (avoid cache races)
+        // Wait for all backends to respond
         let all_results = futures::future::try_join_all(backend_queries)
             .await
             .unwrap_or_default()

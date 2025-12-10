@@ -671,7 +671,7 @@ impl NntpProxy {
 
                 // Only log non-client-disconnect errors (avoid spam from normal disconnects)
                 if !is_client_disconnect_error(&e) {
-                    warn!("Session error for client {}: {}", client_addr, e);
+                    warn!("Session error for client {}: {:?}", client_addr, e);
                 }
                 Err(e)
             }

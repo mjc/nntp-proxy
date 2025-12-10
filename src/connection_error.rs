@@ -40,6 +40,9 @@ pub enum ConnectionError {
     #[error("Stale connection to backend '{backend}': {reason}")]
     StaleConnection { backend: String, reason: String },
 
+    #[error("Backend timeout waiting for first byte after {timeout:?}")]
+    BackendTimeout { timeout: std::time::Duration },
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -71,6 +74,12 @@ impl ConnectionError {
     #[must_use]
     pub const fn is_network_error(&self) -> bool {
         matches!(self, Self::TcpConnect { .. } | Self::DnsResolution { .. })
+    }
+
+    /// Check if this is a backend timeout error
+    #[must_use]
+    pub const fn is_backend_timeout(&self) -> bool {
+        matches!(self, Self::BackendTimeout { .. })
     }
 }
 
