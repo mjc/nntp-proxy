@@ -460,7 +460,9 @@ impl ClientSession {
                 "Client {} cache shows all backends exhausted for {:?}, returning 430 immediately",
                 self.client_addr, msg_id
             );
-            client_write.write_all(b"430 No such article\r\n").await?;
+            client_write
+                .write_all(crate::protocol::NO_SUCH_ARTICLE)
+                .await?;
             *backend_to_client_bytes = backend_to_client_bytes.add(22);
             let backend_id = crate::types::BackendId::from_index(0);
             return Ok(backend_id);
@@ -1243,7 +1245,9 @@ impl ClientSession {
             }
             None => {
                 // All backends returned 430 or failed
-                client_write.write_all(b"430 No such article\r\n").await?;
+                client_write
+                    .write_all(crate::protocol::NO_SUCH_ARTICLE)
+                    .await?;
                 let backend_id = router.route_command(self.client_id, command)?;
                 router.complete_command(backend_id);
                 Ok(backend_id)
@@ -1403,7 +1407,7 @@ impl ClientSession {
             }
             None => {
                 // All backends returned 430 or failed
-                let response = b"430 No such article\r\n";
+                let response = crate::protocol::NO_SUCH_ARTICLE;
                 client_write.write_all(response).await?;
                 *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                 let backend_id = router.route_command(self.client_id, command)?;
