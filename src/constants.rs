@@ -174,6 +174,17 @@ pub mod stateless_proxy {
     pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
 }
 
+/// Session and metrics constants
+pub mod session {
+    /// Flush incremental metrics every N commands for long-running sessions
+    ///
+    /// Prevents metrics from accumulating indefinitely without being recorded.
+    /// Value of 100 balances between:
+    /// - Frequent enough to avoid significant data loss on crashes
+    /// - Infrequent enough to avoid performance overhead
+    pub const METRICS_FLUSH_INTERVAL: u32 = 100;
+}
+
 /// Display strings for user metrics and logging
 pub mod user {
     /// Display name for anonymous/unauthenticated users

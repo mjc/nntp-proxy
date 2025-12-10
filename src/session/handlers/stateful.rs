@@ -83,7 +83,6 @@ impl ClientSession {
 
         // Counter for periodic metrics flush (every N iterations)
         let mut iteration_count = 0u32;
-        const METRICS_FLUSH_INTERVAL: u32 = 100; // Flush every 1000 commands
 
         loop {
             line.clear();
@@ -91,7 +90,7 @@ impl ClientSession {
 
             // Periodically flush metrics for long-running sessions
             iteration_count += 1;
-            if iteration_count >= METRICS_FLUSH_INTERVAL {
+            if iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL {
                 if let Some(bid) = backend_id {
                     self.flush_incremental_metrics(
                         bid,

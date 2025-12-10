@@ -118,7 +118,6 @@ impl ClientSession {
         let mut backend_to_client = backend_to_client_bytes.add_u64(initial_resp_bytes.into());
 
         // Track metrics incrementally for long-running sessions
-        const METRICS_FLUSH_INTERVAL: u32 = 100;
         let mut iteration_count: u32 = 0;
         let mut last_reported_c2b = client_to_backend;
         let mut last_reported_b2c = backend_to_client;
@@ -196,7 +195,7 @@ impl ClientSession {
 
                     // Periodically flush metrics for long-running sessions
                     iteration_count += 1;
-                    if iteration_count >= METRICS_FLUSH_INTERVAL {
+                    if iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL {
                         self.flush_incremental_metrics(
                             backend_id,
                             client_to_backend,
