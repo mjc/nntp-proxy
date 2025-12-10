@@ -164,6 +164,7 @@ pub mod error_classification;
 pub mod handlers;
 pub mod metrics_ext;
 pub mod mode_state;
+pub mod precheck;
 pub mod routing;
 pub mod streaming;
 

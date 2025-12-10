@@ -5,7 +5,7 @@
 //! logic used by all routing modes.
 
 use crate::session::common;
-use crate::session::{ClientSession, backend, connection, streaming};
+use crate::session::{ClientSession, backend, connection, precheck, streaming};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -18,32 +18,6 @@ use crate::connection_error::ConnectionError;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::router::BackendSelector;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
-
-/// Calculate adaptive timeout based on average TTFB across backends
-///
-/// Returns TTFB³, with a minimum of 5 seconds.
-/// This prevents slow backends from blocking while allowing reasonable TTFB detection.
-fn calculate_adaptive_timeout(
-    metrics: Option<&crate::metrics::MetricsCollector>,
-) -> std::time::Duration {
-    metrics
-        .and_then(|m| {
-            let snapshot = m.snapshot(None);
-            let avg_ttfb_ms: f64 = snapshot
-                .backend_stats
-                .iter()
-                .filter_map(|b| b.average_ttfb_ms())
-                .sum::<f64>()
-                / snapshot.backend_stats.len().max(1) as f64;
-
-            (avg_ttfb_ms > 0.0).then(|| {
-                let ttfb_cubed = (avg_ttfb_ms / 1000.0).powi(3);
-                std::time::Duration::from_secs_f64(ttfb_cubed)
-            })
-        })
-        .unwrap_or(std::time::Duration::from_secs(5))
-        .max(std::time::Duration::from_secs(5))
-}
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, PartialEq, Eq)]
@@ -578,7 +552,7 @@ impl ClientSession {
         let mut conn = provider.get_pooled_connection().await?;
 
         // Apply timeout at this level so we can handle drain properly
-        let timeout = calculate_adaptive_timeout(self.metrics.as_ref());
+        let timeout = precheck::calculate_adaptive_timeout(self.metrics.as_ref());
         // Execute with timeout - flatten the Result<Result<...>> with `?`
         let (n, response_code, is_multiline, ttfb, send, recv) = match tokio::time::timeout(
             timeout,
@@ -1140,7 +1114,7 @@ impl ClientSession {
         }
 
         // Calculate adaptive timeout: TTFB * 2
-        let timeout = calculate_adaptive_timeout(self.metrics.as_ref());
+        let timeout = precheck::calculate_adaptive_timeout(self.metrics.as_ref());
 
         // Query all backends concurrently
         let backend_queries = (0..router.backend_count().get())
@@ -1273,7 +1247,7 @@ impl ClientSession {
         }
 
         // Calculate adaptive timeout: TTFB * 2
-        let timeout = calculate_adaptive_timeout(self.metrics.as_ref());
+        let timeout = precheck::calculate_adaptive_timeout(self.metrics.as_ref());
 
         // Query all backends concurrently
         let backend_queries = (0..router.backend_count().get())
