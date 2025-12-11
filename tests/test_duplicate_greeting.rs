@@ -9,33 +9,17 @@ use nntp_proxy::{Config, NntpProxy, RoutingMode};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use tokio::net::TcpListener;
 
 mod config_helpers;
 mod test_helpers;
 use config_helpers::*;
-use test_helpers::{MockNntpServer, get_available_port};
+use test_helpers::{MockNntpServer, get_available_port, spawn_test_proxy};
 
 /// Helper function to find an available port (wraps get_available_port for convenience)
 async fn find_available_port() -> u16 {
     get_available_port()
         .await
         .expect("Failed to find available port")
-}
-
-/// Spawn a test proxy in the background
-async fn spawn_test_proxy(proxy: NntpProxy, port: u16, _with_auth: bool) {
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = TcpListener::bind(&addr).await.unwrap();
-
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                let _ = proxy.handle_client(stream, addr.into()).await;
-            });
-        }
-    });
 }
 
 /// Test that per-command routing mode sends exactly one greeting
@@ -139,7 +123,7 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
         ..Default::default()
     };
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
-    spawn_test_proxy(proxy, proxy_port, false).await;
+    spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect to proxy

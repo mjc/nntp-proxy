@@ -11,7 +11,7 @@ mod config_helpers;
 use config_helpers::*;
 
 mod test_helpers;
-use test_helpers::{MockNntpServer, create_test_config, get_available_port};
+use test_helpers::{MockNntpServer, create_test_config, get_available_port, spawn_test_proxy};
 
 /// Helper function to find an available port (wraps get_available_port for convenience)
 async fn find_available_port() -> u16 {
@@ -262,29 +262,6 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     assert!(response.contains("400 Backend server unavailable"));
 
     Ok(())
-}
-
-/// Helper to spawn a test proxy server
-async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool) {
-    let proxy_addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&proxy_addr).await.unwrap();
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    if per_command_routing {
-                        let _ = proxy_clone
-                            .handle_client_per_command_routing(stream, addr.into())
-                            .await;
-                    } else {
-                        let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                    }
-                });
-            }
-        }
-    });
 }
 
 /// Test that responses are delivered promptly - simulates rapid article requests
