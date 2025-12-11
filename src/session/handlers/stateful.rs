@@ -6,9 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::warn;
 
-use crate::command::CommandHandler;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
-use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+use crate::types::TransferMetrics;
 
 impl ClientSession {
     /// Handle a client connection with a dedicated backend connection (stateful 1:1 mode)
@@ -64,43 +63,27 @@ impl ClientSession {
         let (mut backend_read, mut backend_write) = tokio::io::split(backend_conn);
         let mut client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
 
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_to_client_bytes = BackendToClientBytes::zero();
-
-        // Track last reported values for incremental metrics updates
-        let mut last_reported_c2b = ClientToBackendBytes::zero();
-        let mut last_reported_b2c = BackendToClientBytes::zero();
+        // Initialize session loop state
+        let mut state = common::SessionLoopState::new(self.auth_handler.is_enabled());
 
         // Reuse line buffer to avoid per-iteration allocations
         let mut line = String::with_capacity(COMMAND);
-
-        // Auth state: username from AUTHINFO USER command
-        let mut auth_username: Option<String> = None;
-
-        // PERFORMANCE: Cache authenticated state to avoid atomic loads after auth succeeds
-        // Auth is disabled or auth happens once, then we skip checks for rest of session
-        let mut skip_auth_check = !self.auth_handler.is_enabled();
-
-        // Counter for periodic metrics flush (every N iterations)
-        let mut iteration_count = 0u32;
 
         loop {
             line.clear();
             let mut buffer = self.buffer_pool.acquire().await;
 
             // Periodically flush metrics for long-running sessions
-            iteration_count += 1;
-            if iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL {
-                if let Some(bid) = backend_id {
-                    self.flush_incremental_metrics(
-                        bid,
-                        client_to_backend_bytes,
-                        backend_to_client_bytes,
-                        &mut last_reported_c2b,
-                        &mut last_reported_b2c,
-                    );
-                }
-                iteration_count = 0;
+            if state.check_and_maybe_flush_metrics()
+                && let Some(bid) = backend_id
+            {
+                self.flush_incremental_metrics(
+                    bid,
+                    state.client_to_backend,
+                    state.backend_to_client,
+                    &mut state.last_reported_c2b,
+                    &mut state.last_reported_b2c,
+                );
             }
 
             tokio::select! {
@@ -114,54 +97,34 @@ impl ClientSession {
                             //
                             // Cache the authenticated state to avoid atomic loads on every command.
                             // Once authenticated, we never go back, so caching is safe.
-                            skip_auth_check = self.is_authenticated_cached(skip_auth_check);
-                            if skip_auth_check {
+                            state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+                            if state.skip_auth_check {
                                 // Already authenticated - just forward everything (HOT PATH)
                                 backend_write.write_all(line.as_bytes()).await?;
-                                client_to_backend_bytes = client_to_backend_bytes.add(line.len());
+                                state.client_to_backend = state.client_to_backend.add(line.len());
                             } else {
                                 // Not yet authenticated and auth is enabled - check for auth commands
-                                use crate::command::CommandAction;
-                                let action = CommandHandler::classify(&line);
-                                match action {
-                                    CommandAction::ForwardStateless => {
-                                        // Reject all non-auth commands before authentication
-                                        use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
-                                        client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
-                                        backend_to_client_bytes = backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
+                                match common::handle_stateful_auth_check(
+                                    &line,
+                                    &mut client_write,
+                                    &mut state.auth_username,
+                                    &self.auth_handler,
+                                    &self.auth_state,
+                                    &crate::config::RoutingMode::Stateful,
+                                    &self.metrics,
+                                    self.connection_stats(),
+                                    self.client_addr,
+                                    |username| self.set_username(username),
+                                ).await? {
+                                    common::AuthHandlerResult::Authenticated { bytes_written, skip_further_checks } => {
+                                        state.backend_to_client = state.backend_to_client.add_u64(bytes_written);
+                                        state.skip_auth_check = skip_further_checks;
                                     }
-                                    CommandAction::InterceptAuth(auth_action) => {
-                                        backend_to_client_bytes = backend_to_client_bytes.add_u64(
-                                            match crate::session::common::handle_auth_command(
-                                                &self.auth_handler,
-                                                auth_action,
-                                                &mut client_write,
-                                                &mut auth_username,
-                                                &self.auth_state,
-                                            )
-                                            .await?
-                                            {
-                                                crate::session::common::AuthResult::Authenticated(bytes) => {
-                                                    common::on_authentication_success(
-                                                        self.client_addr,
-                                                        auth_username.clone(),
-                                                        &crate::config::RoutingMode::Stateful,
-                                                        &self.metrics,
-                                                        self.connection_stats(),
-                                                        |username| self.set_username(username),
-                                                    );
-
-                                                    skip_auth_check = true;
-                                                    bytes
-                                                }
-                                                crate::session::common::AuthResult::NotAuthenticated(bytes) => bytes,
-                                            }.as_u64(),
-                                        );
+                                    common::AuthHandlerResult::NotAuthenticated { bytes_written } => {
+                                        state.backend_to_client = state.backend_to_client.add_u64(bytes_written);
                                     }
-                                    CommandAction::Reject(response) => {
-                                        // Send rejection response inline
-                                        client_write.write_all(response.as_bytes()).await?;
-                                        backend_to_client_bytes = backend_to_client_bytes.add(response.len());
+                                    common::AuthHandlerResult::Rejected { bytes_written } => {
+                                        state.backend_to_client = state.backend_to_client.add_u64(bytes_written);
                                     }
                                 }
                             }
@@ -181,7 +144,7 @@ impl ClientSession {
                         }
                         Ok(n) => {
                             client_write.write_all(&buffer[..n]).await?;
-                            backend_to_client_bytes = backend_to_client_bytes.add(n);
+                            state.backend_to_client = state.backend_to_client.add(n);
                         }
                         Err(e) => {
                             warn!("Error reading from backend for client {}: {}", self.client_addr, e);
@@ -196,16 +159,16 @@ impl ClientSession {
         if let Some(bid) = backend_id {
             self.report_final_metrics(
                 bid,
-                client_to_backend_bytes,
-                backend_to_client_bytes,
-                last_reported_c2b.as_u64(),
-                last_reported_b2c.as_u64(),
+                state.client_to_backend,
+                state.backend_to_client,
+                state.last_reported_c2b.as_u64(),
+                state.last_reported_b2c.as_u64(),
             );
         }
 
         Ok(TransferMetrics {
-            client_to_backend: client_to_backend_bytes,
-            backend_to_client: backend_to_client_bytes,
+            client_to_backend: state.client_to_backend,
+            backend_to_client: state.backend_to_client,
         })
     }
 

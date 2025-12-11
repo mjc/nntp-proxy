@@ -14,7 +14,7 @@ pub use loading::{
     load_config_with_fallback,
 };
 pub use types::{
-    BackendSelectionStrategy, Cache, ClientAuth, Config, HealthCheck, RoutingMode, Server,
+    BackendSelectionStrategy, Cache, ClientAuth, Config, HealthCheck, Proxy, RoutingMode, Server,
     UserCredentials,
 };
 

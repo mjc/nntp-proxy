@@ -229,3 +229,164 @@ mod tests {
         assert_ne!(quit1, cont);
     }
 }
+
+// ============================================================================
+// Session Loop Helpers
+// ============================================================================
+
+/// Result of handling an authentication command in a session loop
+#[derive(Debug)]
+pub enum AuthHandlerResult {
+    /// Authentication succeeded, session can continue
+    Authenticated {
+        bytes_written: u64,
+        skip_further_checks: bool,
+    },
+    /// Authentication required but not yet complete
+    NotAuthenticated { bytes_written: u64 },
+    /// Command rejected
+    Rejected { bytes_written: u64 },
+}
+
+/// Handle authentication logic for a command in a stateful session
+///
+/// This encapsulates the common pattern of:
+/// 1. Checking if authenticated
+/// 2. Handling auth commands
+/// 3. Rejecting non-auth commands when not authenticated
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_stateful_auth_check<W>(
+    command: &str,
+    client_write: &mut W,
+    auth_username: &mut Option<String>,
+    auth_handler: &std::sync::Arc<crate::auth::AuthHandler>,
+    auth_state: &crate::session::AuthState,
+    routing_mode: &crate::config::RoutingMode,
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
+    client_addr: impl std::fmt::Display + Clone,
+    set_username_fn: impl FnOnce(Option<String>),
+) -> anyhow::Result<AuthHandlerResult>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    use crate::command::{CommandAction, CommandHandler};
+
+    let action = CommandHandler::classify(command);
+    match action {
+        CommandAction::ForwardStateless => {
+            // Reject all non-auth commands before authentication
+            use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+            client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+            Ok(AuthHandlerResult::Rejected {
+                bytes_written: AUTH_REQUIRED_FOR_COMMAND.len() as u64,
+            })
+        }
+        CommandAction::InterceptAuth(auth_action) => {
+            let result = handle_auth_command(
+                auth_handler,
+                auth_action,
+                client_write,
+                auth_username,
+                auth_state,
+            )
+            .await?;
+
+            match result {
+                AuthResult::Authenticated(bytes) => {
+                    on_authentication_success(
+                        client_addr,
+                        auth_username.clone(),
+                        routing_mode,
+                        metrics,
+                        connection_stats,
+                        set_username_fn,
+                    );
+
+                    Ok(AuthHandlerResult::Authenticated {
+                        bytes_written: bytes.as_u64(),
+                        skip_further_checks: true,
+                    })
+                }
+                AuthResult::NotAuthenticated(bytes) => Ok(AuthHandlerResult::NotAuthenticated {
+                    bytes_written: bytes.as_u64(),
+                }),
+            }
+        }
+        CommandAction::Reject(response) => {
+            // Send rejection response inline
+            client_write.write_all(response.as_bytes()).await?;
+            Ok(AuthHandlerResult::Rejected {
+                bytes_written: response.len() as u64,
+            })
+        }
+    }
+}
+
+/// Update byte counters and check if metrics should be flushed
+///
+/// Returns true if metrics should be flushed this iteration
+#[inline]
+pub fn should_flush_metrics(iteration_count: &mut u32) -> bool {
+    *iteration_count += 1;
+    *iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL
+}
+
+/// Session loop state for tracking bytes, auth, and metrics
+pub struct SessionLoopState {
+    pub client_to_backend: crate::types::ClientToBackendBytes,
+    pub backend_to_client: crate::types::BackendToClientBytes,
+    pub last_reported_c2b: crate::types::ClientToBackendBytes,
+    pub last_reported_b2c: crate::types::BackendToClientBytes,
+    pub iteration_count: u32,
+    pub auth_username: Option<String>,
+    pub skip_auth_check: bool,
+}
+
+impl SessionLoopState {
+    /// Create new session loop state
+    pub fn new(auth_enabled: bool) -> Self {
+        use crate::types::{BackendToClientBytes, ClientToBackendBytes};
+        Self {
+            client_to_backend: ClientToBackendBytes::zero(),
+            backend_to_client: BackendToClientBytes::zero(),
+            last_reported_c2b: ClientToBackendBytes::zero(),
+            last_reported_b2c: BackendToClientBytes::zero(),
+            iteration_count: 0,
+            auth_username: None,
+            skip_auth_check: !auth_enabled,
+        }
+    }
+
+    /// Create session loop state with initial byte counts (for hybrid mode)
+    pub fn from_initial_bytes(
+        client_to_backend: u64,
+        backend_to_client: u64,
+        auth_enabled: bool,
+    ) -> Self {
+        use crate::types::{BackendToClientBytes, ClientToBackendBytes};
+        let c2b = ClientToBackendBytes::new(client_to_backend);
+        let b2c = BackendToClientBytes::new(backend_to_client);
+
+        Self {
+            client_to_backend: c2b,
+            backend_to_client: b2c,
+            last_reported_c2b: c2b,
+            last_reported_b2c: b2c,
+            iteration_count: 0,
+            auth_username: None,
+            skip_auth_check: !auth_enabled,
+        }
+    }
+
+    /// Check if metrics should be flushed and reset counter if so
+    #[inline]
+    pub fn check_and_maybe_flush_metrics(&mut self) -> bool {
+        if should_flush_metrics(&mut self.iteration_count) {
+            self.iteration_count = 0;
+            true
+        } else {
+            false
+        }
+    }
+}

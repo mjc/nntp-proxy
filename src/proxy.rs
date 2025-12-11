@@ -1201,12 +1201,12 @@ mod tests {
             let config = create_test_config();
             let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
 
-            let empty_cache = Arc::new(crate::cache::ArticleCache::new(
+            let _empty_cache = Arc::new(crate::cache::ArticleCache::new(
                 100,
                 std::time::Duration::from_secs(3600),
                 false,
             ));
-            assert_eq!(proxy.routing_mode_display_name(&empty_cache), "per-command");
+            assert_eq!(proxy.routing_mode_display_name(), "per-command");
         }
 
         #[test]

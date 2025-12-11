@@ -253,8 +253,8 @@ impl ClientSession {
                             client_reader,
                             client_write,
                             &command,
-                            client_to_backend_bytes,
-                            backend_to_client_bytes,
+                            client_to_backend_bytes.into(),
+                            backend_to_client_bytes.into(),
                         )
                         .await;
                 }

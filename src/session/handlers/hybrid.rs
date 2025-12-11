@@ -3,14 +3,13 @@
 //! This module implements the transition from per-command routing to stateful
 //! routing when a stateful command is encountered in hybrid mode.
 
-use crate::session::ClientSession;
-use crate::session::common;
+use crate::session::{ClientSession, common};
 use anyhow::Result;
 use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::{error, info, warn};
 
-use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+use crate::types::TransferMetrics;
 
 impl ClientSession {
     /// Switch from per-command routing to stateful mode by acquiring a dedicated backend connection
@@ -19,8 +18,8 @@ impl ClientSession {
         mut client_reader: BufReader<ReadHalf<'_>>,
         mut client_write: WriteHalf<'_>,
         initial_command: &str,
-        client_to_backend_bytes: ClientToBackendBytes,
-        backend_to_client_bytes: BackendToClientBytes,
+        client_to_backend_bytes: u64,
+        backend_to_client_bytes: u64,
     ) -> Result<TransferMetrics> {
         use tokio::io::AsyncBufReadExt;
 
@@ -58,19 +57,23 @@ impl ClientSession {
         // Get buffer from pool for command execution
         let mut buffer = self.buffer_pool.acquire().await;
 
-        // Track bytes for initial command
-        let mut initial_cmd_bytes = ClientToBackendBytes::zero();
-        let mut initial_resp_bytes = BackendToClientBytes::zero();
+        // Initialize session state from initial bytes
+        let mut state = common::SessionLoopState::from_initial_bytes(
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+            self.auth_handler.is_enabled(),
+        );
 
         // Execute the initial command that triggered the switch
+        // Note: execute_command_on_backend updates these counters by reference
         let (result, got_backend_data, cmd_bytes, resp_bytes) = self
             .execute_command_on_backend(
                 &mut pooled_conn,
                 initial_command,
                 &mut client_write,
                 backend_id,
-                &mut initial_cmd_bytes,
-                &mut initial_resp_bytes,
+                &mut state.client_to_backend,
+                &mut state.backend_to_client,
                 &mut buffer,
             )
             .await;
@@ -99,8 +102,8 @@ impl ClientSession {
             );
             router.complete_command(backend_id);
             return result.map(|_| TransferMetrics {
-                client_to_backend: client_to_backend_bytes,
-                backend_to_client: backend_to_client_bytes,
+                client_to_backend: state.client_to_backend,
+                backend_to_client: state.backend_to_client,
             });
         }
         // Client disconnected while receiving data, backend is healthy - continue
@@ -112,16 +115,6 @@ impl ClientSession {
         // This is the same as the standard 1:1 routing mode
         use crate::constants::buffer::COMMAND;
 
-        // Add initial command bytes to running totals
-        let mut client_to_backend = client_to_backend_bytes.add_u64(initial_cmd_bytes.into());
-
-        let mut backend_to_client = backend_to_client_bytes.add_u64(initial_resp_bytes.into());
-
-        // Track metrics incrementally for long-running sessions
-        let mut iteration_count: u32 = 0;
-        let mut last_reported_c2b = client_to_backend;
-        let mut last_reported_b2c = backend_to_client;
-
         // Reuse command buffer for remaining session
         let mut command = String::with_capacity(COMMAND);
 
@@ -131,23 +124,32 @@ impl ClientSession {
         loop {
             command.clear();
 
+            // Periodically flush metrics for long-running sessions
+            if state.check_and_maybe_flush_metrics() {
+                self.flush_incremental_metrics(
+                    backend_id,
+                    state.client_to_backend,
+                    state.backend_to_client,
+                    &mut state.last_reported_c2b,
+                    &mut state.last_reported_b2c,
+                );
+            }
+
             match client_reader.read_line(&mut command).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    client_to_backend = client_to_backend.add(n);
+                    state.client_to_backend = state.client_to_backend.add(n);
 
                     // Handle QUIT locally
                     if let common::QuitStatus::Quit(bytes) =
                         common::handle_quit_command(&command, &mut client_write).await?
                     {
-                        backend_to_client = backend_to_client.add_u64(bytes.into());
+                        state.backend_to_client = state.backend_to_client.add_u64(bytes.into());
                         break;
                     }
 
                     // Execute on dedicated backend connection
-                    let mut cmd_bytes = ClientToBackendBytes::new(command.len() as u64);
-                    let mut resp_bytes = BackendToClientBytes::zero();
-
+                    // Note: execute_command_on_backend updates state counters by reference
                     // Record command in metrics
                     self.record_command(backend_id);
                     self.user_command();
@@ -158,8 +160,8 @@ impl ClientSession {
                             &command,
                             &mut client_write,
                             backend_id,
-                            &mut cmd_bytes,
-                            &mut resp_bytes,
+                            &mut state.client_to_backend,
+                            &mut state.backend_to_client,
                             &mut buffer,
                         )
                         .await;
@@ -182,28 +184,12 @@ impl ClientSession {
                         self.user_bytes_received(resp_size);
                     }
 
-                    client_to_backend = client_to_backend.add_u64(cmd_bytes.into());
-                    backend_to_client = backend_to_client.add_u64(resp_bytes.into());
-
                     if let Err(e) = result {
                         warn!(
                             "Error executing command in stateful mode for client {}: {}",
                             self.client_addr, e
                         );
                         break;
-                    }
-
-                    // Periodically flush metrics for long-running sessions
-                    iteration_count += 1;
-                    if iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL {
-                        self.flush_incremental_metrics(
-                            backend_id,
-                            client_to_backend,
-                            backend_to_client,
-                            &mut last_reported_c2b,
-                            &mut last_reported_b2c,
-                        );
-                        iteration_count = 0;
                     }
                 }
                 Err(e) => {
@@ -215,8 +201,8 @@ impl ClientSession {
                         self.username().as_deref(),
                         &e,
                         TransferMetrics {
-                            client_to_backend,
-                            backend_to_client,
+                            client_to_backend: state.client_to_backend,
+                            backend_to_client: state.backend_to_client,
                         },
                     );
                     break;
@@ -228,8 +214,8 @@ impl ClientSession {
         self.stateful_session_ended();
 
         Ok(TransferMetrics {
-            client_to_backend,
-            backend_to_client,
+            client_to_backend: state.client_to_backend,
+            backend_to_client: state.backend_to_client,
         })
     }
 }
