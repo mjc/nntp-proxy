@@ -10,7 +10,6 @@ use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::future::Cache;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -204,8 +203,11 @@ impl Default for ArticleAvailability {
 /// The buffer is validated once on insert, then can be served directly without re-parsing.
 #[derive(Clone, Debug)]
 pub struct ArticleEntry {
-    /// Backend availability bitset (2 bytes) - wrapped in Arc<Mutex<>> for thread-safe updates
-    backend_availability: Arc<Mutex<ArticleAvailability>>,
+    /// Backend availability bitset (2 bytes)
+    ///
+    /// No mutex needed: moka clones entries on get(), and updates go through
+    /// cache.insert() which replaces the whole entry atomically.
+    backend_availability: ArticleAvailability,
 
     /// Complete response buffer (Arc for cheap cloning)
     /// Format: "220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n"
@@ -221,11 +223,8 @@ impl ArticleEntry {
     ///
     /// Backend availability starts with assumption all backends have the article.
     pub fn new(buffer: Vec<u8>) -> Self {
-        // Start with fresh availability (assumes all backends have it)
-        let availability = ArticleAvailability::new();
-
         Self {
-            backend_availability: Arc::new(Mutex::new(availability)),
+            backend_availability: ArticleAvailability::new(),
             buffer: Arc::new(buffer),
         }
     }
@@ -250,41 +249,27 @@ impl ArticleEntry {
     /// Returns false if backend is known to not have this article (returned 430 before).
     #[inline]
     pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
-        self.backend_availability
-            .lock()
-            .unwrap()
-            .should_try(backend_id)
+        self.backend_availability.should_try(backend_id)
     }
 
     /// Record that a backend returned 430 (doesn't have this article)
     pub fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.backend_availability
-            .lock()
-            .unwrap()
-            .record_missing(backend_id);
+        self.backend_availability.record_missing(backend_id);
     }
 
     /// Record that a backend successfully provided this article
     pub fn record_backend_has(&mut self, backend_id: BackendId) {
-        self.backend_availability
-            .lock()
-            .unwrap()
-            .record_has(backend_id);
+        self.backend_availability.record_has(backend_id);
     }
 
     /// Check if all backends have been tried and none have the article
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
-        self.backend_availability
-            .lock()
-            .unwrap()
-            .all_exhausted(total_backends)
+        self.backend_availability.all_exhausted(total_backends)
     }
 
     /// Get backends that might have this article
     pub fn available_backends(&self, total_backends: BackendCount) -> Vec<BackendId> {
         self.backend_availability
-            .lock()
-            .unwrap()
             .available_backends(total_backends)
             .collect()
     }
@@ -304,10 +289,7 @@ impl ArticleEntry {
     /// serving from cache.
     #[inline]
     pub fn has_availability_info(&self) -> bool {
-        self.backend_availability
-            .lock()
-            .unwrap()
-            .has_availability_info()
+        self.backend_availability.has_availability_info()
     }
 
     /// Initialize availability tracker from this cached entry
@@ -359,9 +341,8 @@ impl ArticleCache {
                 //
                 // Base sizes:
                 // - Key: Arc<str> = 8 bytes (pointer) + string data
-                // - Entry struct overhead = 16 bytes (2 Arc pointers)
+                // - ArticleEntry struct = 8 (Arc pointer) + 2 (availability) = 10 bytes
                 // - Arc<Vec<u8>>: Vec header = 24 bytes (ptr, len, cap) + buffer data
-                // - Arc<Mutex<ArticleAvailability>>: Mutex = ~16 bytes + data = 2 bytes
                 //
                 // Moka internal overhead (NOT just 40 bytes - much heavier):
                 // - Hash table node: ~64 bytes (key hash, pointers, metadata)
@@ -377,7 +358,7 @@ impl ArticleCache {
                 // Apply 2.5x correction factor to match observed memory usage.
                 let key_size = 8 + key.len();
                 let buffer_size = entry.buffer().len();
-                let entry_overhead = 16 + 24 + 16 + 2 + 200; // ~258 bytes
+                let entry_overhead = 10 + 24 + 200; // ~234 bytes (reduced from ~258)
                 let base_size = key_size + buffer_size + entry_overhead;
                 let corrected_size = (base_size as f64 * 2.5) as usize; // Apply 2.5x correction
                 corrected_size.try_into().unwrap_or(u32::MAX)
@@ -439,10 +420,10 @@ impl ArticleCache {
             }
             // Mark this backend as successfully having the article
             use tracing::debug;
-            let (before_checked, before_missing) = {
-                let avail = existing.backend_availability.lock().unwrap();
-                (avail.checked, avail.missing)
-            };
+            let (before_checked, before_missing) = (
+                existing.backend_availability.checked_bits(),
+                existing.backend_availability.missing_bits(),
+            );
             debug!(
                 "upsert: article {} already cached, marking backend {} as HAS (before: checked={:08b}, missing={:08b})",
                 message_id,
@@ -451,10 +432,10 @@ impl ArticleCache {
                 before_missing
             );
             existing.record_backend_has(backend_id);
-            let (after_checked, after_missing) = {
-                let avail = existing.backend_availability.lock().unwrap();
-                (avail.checked, avail.missing)
-            };
+            let (after_checked, after_missing) = (
+                existing.backend_availability.checked_bits(),
+                existing.backend_availability.missing_bits(),
+            );
             debug!(
                 "upsert: after record_backend_has: checked={:08b}, missing={:08b}",
                 after_checked, after_missing
@@ -511,12 +492,12 @@ impl ArticleCache {
         let key: Arc<str> = message_id.without_brackets().into();
 
         if let Some(mut entry) = self.cache.get(key.as_ref()).await {
-            // Article already cached - update availability atomically via interior mutability
+            // Article already cached - update availability
             use tracing::debug;
-            let (before_checked, before_missing) = {
-                let avail = entry.backend_availability.lock().unwrap();
-                (avail.checked, avail.missing)
-            };
+            let (before_checked, before_missing) = (
+                entry.backend_availability.checked_bits(),
+                entry.backend_availability.missing_bits(),
+            );
             debug!(
                 "record_backend_missing: article {} already cached, marking backend {} as MISSING (before: checked={:08b}, missing={:08b})",
                 message_id,
@@ -525,10 +506,10 @@ impl ArticleCache {
                 before_missing
             );
             entry.record_backend_missing(backend_id);
-            let (after_checked, after_missing) = {
-                let avail = entry.backend_availability.lock().unwrap();
-                (avail.checked, avail.missing)
-            };
+            let (after_checked, after_missing) = (
+                entry.backend_availability.checked_bits(),
+                entry.backend_availability.missing_bits(),
+            );
             debug!(
                 "record_backend_missing: after: checked={:08b}, missing={:08b}",
                 after_checked, after_missing
