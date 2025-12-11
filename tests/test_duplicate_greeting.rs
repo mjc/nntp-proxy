@@ -15,13 +15,6 @@ mod test_helpers;
 use config_helpers::*;
 use test_helpers::{MockNntpServer, get_available_port, spawn_test_proxy};
 
-/// Helper function to find an available port (wraps get_available_port for convenience)
-async fn find_available_port() -> u16 {
-    get_available_port()
-        .await
-        .expect("Failed to find available port")
-}
-
 /// Test that per-command routing mode sends exactly one greeting
 #[test]
 fn test_single_greeting_per_command_mode() -> Result<()> {
@@ -100,8 +93,10 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
-    // Start mock backend server
-    let mock_port = find_available_port().await;
+    // Start a mock backend server
+    let mock_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
     let _mock = MockNntpServer::new(mock_port)
         .with_name("Mock Server")
         .on_command(
@@ -113,7 +108,9 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Start proxy
-    let proxy_port = find_available_port().await;
+    let proxy_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
     let config = Config {
         servers: vec![create_test_server_config(
             "127.0.0.1",

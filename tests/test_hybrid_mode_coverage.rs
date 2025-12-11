@@ -12,19 +12,16 @@ use config_helpers::*;
 mod test_helpers;
 use test_helpers::{MockNntpServer, get_available_port};
 
-/// Helper function to find an available port (wraps get_available_port for convenience)
-async fn find_available_port() -> u16 {
-    get_available_port()
-        .await
-        .expect("Failed to find available port")
-}
-
 /// Test that hybrid mode handles long-running sessions and triggers metrics flushing
 /// This test sends >100 commands to trigger the METRICS_FLUSH_INTERVAL code path
 #[tokio::test]
 async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
-    let mock_port = find_available_port().await;
-    let proxy_port = find_available_port().await;
+    let mock_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
+    let proxy_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
 
     let _mock = MockNntpServer::new(mock_port)
         .with_name("Long Session Server")
@@ -115,8 +112,12 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
 /// This exercises the error handling code path that logs warnings and breaks the loop
 #[tokio::test]
 async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
-    let mock_port = find_available_port().await;
-    let proxy_port = find_available_port().await;
+    let mock_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
+    let proxy_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
 
     // Create a mock server that will close connection after GROUP to simulate backend error
     let mock_port_clone = mock_port;
