@@ -15,7 +15,8 @@ pub mod buffer {
     // Buffer pool configuration
 
     /// Page size for memory alignment (4KB = standard OS page)
-    #[allow(dead_code)]
+    /// Used in compile-time assertions below to verify alignment.
+    #[allow(dead_code)] // Used in const assertions which the compiler doesn't track
     const PAGE_SIZE: usize = 4096;
 
     /// Size of each pooled buffer (724KB, page-aligned)

@@ -245,21 +245,6 @@ impl BufferPool {
             max_pool_size: self.max_pool_size,
         }
     }
-
-    /// Return a buffer to the pool (lock-free)
-    ///
-    /// Note: Usually not needed as PooledBuffer returns itself automatically on drop
-    #[allow(dead_code)]
-    pub async fn return_buffer(&self, buffer: Vec<u8>) {
-        if buffer.len() == self.buffer_size.get() {
-            let current_size = self.pool_size.load(Ordering::Relaxed);
-            if current_size < self.max_pool_size {
-                self.pool.push(buffer);
-                self.pool_size.fetch_add(1, Ordering::Relaxed);
-            }
-            // If pool is full, just drop the buffer
-        }
-    }
 }
 
 #[cfg(test)]

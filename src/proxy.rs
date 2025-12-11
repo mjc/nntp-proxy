@@ -713,7 +713,6 @@ impl NntpProxy {
                 backend_id,
                 &self.connection_providers[server_idx],
                 &self.servers[server_idx].name,
-                self.enable_metrics,
             )
             .await;
 

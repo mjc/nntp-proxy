@@ -17,7 +17,7 @@ use crate::config::RoutingMode;
 use crate::connection_error::ConnectionError;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::router::BackendSelector;
-use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, PartialEq, Eq)]
@@ -87,6 +87,114 @@ enum BackendAttemptResult {
     },
     /// Backend unavailable or error - try next backend
     BackendUnavailable,
+}
+
+/// Check if a status code represents a 430 (article not found) response
+#[inline]
+pub(super) fn is_430_status_code(code: u16) -> bool {
+    code == 430
+}
+
+/// Check if a response should be captured for article caching
+///
+/// Only full article responses (220) should be cached.
+/// Response code 220 uniquely identifies ARTICLE command success:
+/// - 220 = ARTICLE (full article - cache this)
+/// - 221 = HEAD (headers only)
+/// - 222 = BODY (body only)
+/// - 223 = STAT (status only)
+pub(super) fn should_capture_for_cache(
+    response_code: u16,
+    is_multiline: bool,
+    cache_articles: bool,
+    has_message_id: bool,
+) -> bool {
+    cache_articles && is_multiline && has_message_id && response_code == 220
+}
+
+/// Check if a response should be tracked for availability (HEAD/BODY/ARTICLE/STAT success)
+pub(super) fn should_track_availability(response_code: u16, has_message_id: bool) -> bool {
+    has_message_id && matches!(response_code, 220..=223)
+}
+
+/// Determine what action to take for metrics recording based on response code
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetricsAction {
+    /// Record 4xx error (excluding 423, 430)
+    Error4xx,
+    /// Record 5xx error
+    Error5xx,
+    /// Record article metrics (success response for multiline)
+    Article,
+    /// No special recording needed
+    None,
+}
+
+/// Determine metrics recording action based on response code
+pub(super) fn determine_metrics_action(response_code: u16, is_multiline: bool) -> MetricsAction {
+    if (400..500).contains(&response_code) && response_code != 423 && response_code != 430 {
+        MetricsAction::Error4xx
+    } else if response_code >= 500 {
+        MetricsAction::Error5xx
+    } else if is_multiline && matches!(response_code, 220..=222) {
+        MetricsAction::Article
+    } else {
+        MetricsAction::None
+    }
+}
+
+/// Determine what caching action to take for a response
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheAction {
+    /// Capture full article content and cache it
+    CaptureArticle,
+    /// Track availability only (for HEAD/BODY/STAT success)
+    TrackAvailability,
+    /// Track STAT availability (223 response)
+    TrackStat,
+    /// No caching action needed
+    None,
+}
+
+/// Determine caching action for a response
+///
+/// Response codes uniquely identify the command type:
+/// - 220 = ARTICLE (cache full article if enabled)
+/// - 221 = HEAD (track availability)
+/// - 222 = BODY (track availability)
+/// - 223 = STAT (track availability)
+///
+/// The command is validated to ensure it's not a stateful command
+/// that would require mode switching (GROUP, NEXT, XOVER, etc.)
+pub(super) fn determine_cache_action(
+    command: &str,
+    response_code: u16,
+    is_multiline: bool,
+    cache_articles: bool,
+    has_message_id: bool,
+) -> CacheAction {
+    // Defensive check: don't cache responses from stateful commands
+    // (These should have triggered mode switch, so this shouldn't happen)
+    if NntpCommand::parse(command).is_stateful() {
+        return CacheAction::None;
+    }
+
+    if !has_message_id {
+        return CacheAction::None;
+    }
+
+    // Full article caching only for 220 response (ARTICLE command)
+    if should_capture_for_cache(response_code, is_multiline, cache_articles, has_message_id) {
+        CacheAction::CaptureArticle
+    } else if is_multiline && should_track_availability(response_code, has_message_id) {
+        // Track availability for HEAD (221), BODY (222), and ARTICLE (220) when cache disabled
+        CacheAction::TrackAvailability
+    } else if response_code == 223 {
+        // STAT response - not multiline but track availability
+        CacheAction::TrackStat
+    } else {
+        CacheAction::None
+    }
 }
 
 impl ClientSession {
@@ -339,10 +447,11 @@ impl ClientSession {
                         if self.adaptive_precheck {
                             let cmd_upper = command.to_uppercase();
                             if cmd_upper.starts_with("STAT ") {
-                                self.spawn_background_stat_precheck(
-                                    router.clone(),
+                                precheck::spawn_background_stat_precheck(
+                                    self.precheck_context(router.clone()),
                                     command.to_string(),
                                     msg_id_ref.to_owned(),
+                                    self.client_addr,
                                 );
                             }
                         }
@@ -371,19 +480,26 @@ impl ClientSession {
         {
             let cmd_upper = command.to_uppercase();
             if cmd_upper.starts_with("STAT ") {
-                return self
-                    .handle_stat_precheck(router, command, msg_id_ref, client_write)
-                    .await;
+                let ctx = self.precheck_context(router);
+                return precheck::handle_stat_precheck(
+                    &ctx,
+                    self.client_id,
+                    command,
+                    msg_id_ref,
+                    client_write,
+                )
+                .await;
             } else if cmd_upper.starts_with("HEAD ") {
-                return self
-                    .handle_head_precheck(
-                        router,
-                        command,
-                        msg_id_ref,
-                        client_write,
-                        backend_to_client_bytes,
-                    )
-                    .await;
+                let ctx = self.precheck_context(router);
+                return precheck::handle_head_precheck(
+                    &ctx,
+                    self.client_id,
+                    command,
+                    msg_id_ref,
+                    client_write,
+                    backend_to_client_bytes,
+                )
+                .await;
             }
         }
 
@@ -718,7 +834,7 @@ impl ClientSession {
     fn is_430_response(&self, response_code: &crate::protocol::NntpResponse) -> bool {
         response_code
             .status_code()
-            .is_some_and(|code| code.as_u16() == 430)
+            .is_some_and(|code| is_430_status_code(code.as_u16()))
     }
 
     /// Record timing metrics for a backend response
@@ -800,16 +916,17 @@ impl ClientSession {
         first_chunk: &[u8],
         first_chunk_size: usize,
     ) -> Result<u64> {
-        let should_capture = self.cache_articles
-            && is_multiline
-            && matches!(NntpCommand::parse(command), NntpCommand::ArticleByMessageId)
-            && msg_id.is_some()
-            && response_code
-                .status_code()
-                .is_some_and(|c| matches!(c.as_u16(), 220..=222));
+        let code = response_code.status_code().map(|c| c.as_u16()).unwrap_or(0);
+        let cache_action = determine_cache_action(
+            command,
+            code,
+            is_multiline,
+            self.cache_articles,
+            msg_id.is_some(),
+        );
 
-        if is_multiline {
-            if should_capture {
+        match (is_multiline, cache_action) {
+            (true, CacheAction::CaptureArticle) => {
                 let mut captured = Vec::with_capacity(first_chunk.len() * 2);
                 let bytes = streaming::stream_and_capture_multiline_response(
                     &mut **pooled_conn,
@@ -831,12 +948,8 @@ impl ClientSession {
                     });
                 }
                 Ok(bytes)
-            } else {
-                let should_track = msg_id.is_some()
-                    && response_code
-                        .status_code()
-                        .is_some_and(|c| matches!(c.as_u16(), 220..=223));
-
+            }
+            (true, CacheAction::TrackAvailability) => {
                 let bytes = streaming::stream_multiline_response(
                     &mut **pooled_conn,
                     client_write,
@@ -848,7 +961,7 @@ impl ClientSession {
                 )
                 .await?;
 
-                if should_track && let Some(msg_id_ref) = msg_id {
+                if let Some(msg_id_ref) = msg_id {
                     let cache_clone = self.cache.clone();
                     let msg_id_owned = msg_id_ref.to_owned();
                     let buffer_for_cache = first_chunk.to_vec();
@@ -860,25 +973,38 @@ impl ClientSession {
                 }
                 Ok(bytes)
             }
-        } else {
-            let should_track = msg_id.is_some()
-                && response_code
-                    .status_code()
-                    .is_some_and(|c| c.as_u16() == 223);
-
-            client_write.write_all(first_chunk).await?;
-
-            if should_track && let Some(msg_id_ref) = msg_id {
-                let cache_clone = self.cache.clone();
-                let msg_id_owned = msg_id_ref.to_owned();
-                let buffer_for_cache = b"223\r\n".to_vec();
-                tokio::spawn(async move {
-                    cache_clone
-                        .upsert(msg_id_owned, buffer_for_cache, backend_id)
-                        .await;
-                });
+            (true, _) => {
+                // Multiline but no caching
+                streaming::stream_multiline_response(
+                    &mut **pooled_conn,
+                    client_write,
+                    first_chunk,
+                    first_chunk_size,
+                    self.client_addr,
+                    backend_id,
+                    &self.buffer_pool,
+                )
+                .await
             }
-            Ok(first_chunk_size as u64)
+            (false, CacheAction::TrackStat) => {
+                client_write.write_all(first_chunk).await?;
+                if let Some(msg_id_ref) = msg_id {
+                    let cache_clone = self.cache.clone();
+                    let msg_id_owned = msg_id_ref.to_owned();
+                    let buffer_for_cache = b"223\r\n".to_vec();
+                    tokio::spawn(async move {
+                        cache_clone
+                            .upsert(msg_id_owned, buffer_for_cache, backend_id)
+                            .await;
+                    });
+                }
+                Ok(first_chunk_size as u64)
+            }
+            (false, _) => {
+                // Single-line, no caching
+                client_write.write_all(first_chunk).await?;
+                Ok(first_chunk_size as u64)
+            }
         }
     }
 
@@ -898,16 +1024,11 @@ impl ClientSession {
         };
 
         if let Some(code) = response_code.status_code() {
-            let raw_code = code.as_u16();
-
-            if (400..500).contains(&raw_code) && raw_code != 423 && raw_code != 430 {
-                metrics.record_error_4xx(backend_id);
-            } else if raw_code >= 500 {
-                metrics.record_error_5xx(backend_id);
-            }
-
-            if is_multiline && matches!(raw_code, 220..=222) {
-                metrics.record_article(backend_id, resp_bytes);
+            match determine_metrics_action(code.as_u16(), is_multiline) {
+                MetricsAction::Error4xx => metrics.record_error_4xx(backend_id),
+                MetricsAction::Error5xx => metrics.record_error_5xx(backend_id),
+                MetricsAction::Article => metrics.record_article(backend_id, resp_bytes),
+                MetricsAction::None => {}
             }
         }
 
@@ -918,476 +1039,14 @@ impl ClientSession {
         self.user_bytes_received(resp_bytes);
     }
 
-    /// Execute a command on a given backend connection (stateful mode helper)
-    ///
-    /// This is a simplified version for stateful/hybrid mode that doesn't handle routing or retries.
-    /// It just executes the command on the provided connection and streams the response.
-    ///
-    /// Returns `(Result<()>, got_backend_data, cmd_bytes, resp_bytes)` where:
-    /// - `got_backend_data = true` means we successfully read from backend before any error
-    /// - `cmd_bytes`: Unrecorded command bytes (MUST be recorded by caller)
-    /// - `resp_bytes`: Unrecorded response bytes (MUST be recorded by caller)
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn execute_command_on_backend(
-        &self,
-        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        command: &str,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_id: crate::types::BackendId,
-        client_to_backend_bytes: &mut ClientToBackendBytes,
-        backend_to_client_bytes: &mut BackendToClientBytes,
-        chunk_buffer: &mut crate::pool::PooledBuffer,
-    ) -> (
-        Result<()>,
-        bool,
-        crate::types::MetricsBytes<crate::types::Unrecorded>,
-        crate::types::MetricsBytes<crate::types::Unrecorded>,
-    ) {
-        use crate::types::MetricsBytes;
-
-        // Execute command and get first chunk
-        let (n, response_code, is_multiline, ttfb_micros, send_micros, recv_micros) =
-            match backend::send_command_and_read_first_chunk(
-                &mut **pooled_conn,
-                command,
-                backend_id,
-                self.client_addr,
-                chunk_buffer,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    return (Err(e), false, MetricsBytes::new(0), MetricsBytes::new(0));
-                }
-            };
-
-        // Record timing metrics
-        self.record_timing_metrics(backend_id, ttfb_micros, send_micros, recv_micros);
-
-        *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
-
-        // Extract message-ID for caching
-        let msg_id = common::extract_message_id(command)
-            .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
-
-        // Stream response using shared logic
-        let bytes_written = match self
-            .stream_response_to_client(
-                pooled_conn,
-                client_write,
-                backend_id,
-                command,
-                msg_id.as_ref(),
-                &response_code,
-                is_multiline,
-                &chunk_buffer[..n],
-                n,
-            )
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return (
-                    Err(e),
-                    true,
-                    MetricsBytes::new(command.len() as u64),
-                    MetricsBytes::new(0),
-                );
-            }
-        };
-
-        *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
-
-        // Record response metrics
-        self.record_response_metrics(
-            backend_id,
-            &response_code,
-            is_multiline,
-            command.len() as u64,
-            bytes_written,
-        );
-
-        // Return unrecorded metrics bytes
-        let cmd_bytes = MetricsBytes::new(command.len() as u64);
-        let resp_bytes = MetricsBytes::new(bytes_written);
-
-        (Ok(()), true, cmd_bytes, resp_bytes)
-    }
-
-    /// Spawn background STAT precheck to update cache (called after cache hit)
-    ///
-    /// Only checks backends that haven't been tried yet (not marked as missing or having).
-    /// This keeps cache fresh while avoiding duplicate queries to backends we already know about.
-    fn spawn_background_stat_precheck(
-        &self,
-        router: Arc<BackendSelector>,
-        command: String,
-        msg_id: crate::types::MessageId<'static>,
-    ) {
-        let cache = self.cache.clone();
-        let buffer_pool = self.buffer_pool.clone();
-        let metrics = self.metrics.clone();
-        let client_addr = self.client_addr;
-
-        tokio::spawn(async move {
-            // Get current cache entry to see which backends to check
-            let backends_to_check: Vec<_> = if let Some(entry) = cache.get(&msg_id).await {
-                // Only check backends we haven't tried yet
-                entry.available_backends(router.backend_count())
-            } else {
-                // Cache was evicted, check all backends
-                (0..router.backend_count().get())
-                    .map(crate::types::BackendId::from_index)
-                    .collect()
-            };
-
-            // Check only untried backends
-            for backend_id in backends_to_check {
-                let provider = match router.backend_provider(backend_id) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let mut conn = match provider.get_pooled_connection().await {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                let mut buffer = buffer_pool.acquire().await;
-
-                let result = backend::send_command_and_read_first_chunk(
-                    &mut *conn,
-                    &command,
-                    backend_id,
-                    client_addr,
-                    &mut buffer,
-                )
-                .await;
-
-                if let Ok((n, response_code, _, _, _, _)) = result
-                    && let Some(code_num) = response_code.status_code().map(|c| c.as_u16())
-                {
-                    let response = buffer[..n].to_vec();
-
-                    match code_num {
-                        430 => {
-                            cache
-                                .record_backend_missing(msg_id.clone(), backend_id, response)
-                                .await;
-                            if let Some(ref m) = metrics {
-                                m.record_command(backend_id);
-                                m.record_error_4xx(backend_id);
-                            }
-                        }
-                        220..=223 => {
-                            cache.upsert(msg_id.clone(), response, backend_id).await;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-    }
-
-    /// Handle STAT command with adaptive prechecking
-    ///
-    /// Returns first successful response to client while continuing to check
-    /// remaining backends in background for cache population.
-    /// Query all backends concurrently for article availability (STAT command)
-    ///
-    /// This eliminates cache race conditions by:
-    /// 1. Spawning concurrent STAT queries to ALL backends
-    /// 2. Waiting for ALL queries to complete
-    /// 3. Updating cache serially with all results
-    /// 4. Returning first successful response to client
-    async fn handle_stat_precheck(
-        &self,
-        router: Arc<BackendSelector>,
-        command: &str,
-        msg_id: &crate::types::MessageId<'_>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-    ) -> Result<crate::types::BackendId> {
-        enum StatResult {
-            Has(BackendId, Vec<u8>),     // 220-223: Article exists
-            Missing(BackendId, Vec<u8>), // 430 or other error
-        }
-
-        // Calculate adaptive timeout: TTFB * 2
-        let timeout = precheck::calculate_adaptive_timeout(self.metrics.as_ref());
-
-        // Query all backends concurrently
-        let backend_queries = (0..router.backend_count().get())
-            .map(BackendId::from_index)
-            .map(|backend_id| {
-                let (router, buffer_pool, metrics, command) = (
-                    router.clone(),
-                    self.buffer_pool.clone(),
-                    self.metrics.clone(),
-                    command.to_string(),
-                );
-
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-
-                    // Get connection and send STAT command (no timeout on write)
-                    let provider = router.backend_provider(backend_id)?;
-                    let mut conn = provider.get_pooled_connection().await.ok()?;
-                    let mut buffer = buffer_pool.acquire().await;
-
-                    // Send command without timeout
-                    conn.as_mut().write_all(command.as_bytes()).await.ok()?;
-
-                    // Timeout only on first byte read (TTFB²)
-                    let read_result = tokio::time::timeout(timeout, async {
-                        let n = buffer.read_from(&mut *conn).await.ok()?;
-                        if n == 0 {
-                            return None;
-                        }
-                        Some((n, buffer[..n].to_vec()))
-                    })
-                    .await;
-
-                    let (_bytes_read, response_bytes) = match read_result {
-                        Ok(Some(data)) => data,
-                        Ok(None) => return None,
-                        Err(_) => {
-                            debug!(
-                                "STAT query to backend {} timed out waiting for first byte after {:?}",
-                                backend_id.as_index(),
-                                timeout
-                            );
-                            return None;
-                        }
-                    };
-
-                    // Parse response code
-                    let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
-                    let status_code = response_code.status_code()?.as_u16();
-
-                    // Classify result: has article, or missing/error
-                    Some(match status_code {
-                        220..=223 => StatResult::Has(backend_id, response_bytes),
-                        430 => {
-                            if let Some(m) = metrics.as_ref() {
-                                m.record_command(backend_id);
-                                m.record_error_4xx(backend_id);
-                            }
-                            StatResult::Missing(backend_id, response_bytes)
-                        }
-                        _ => StatResult::Missing(backend_id, response_bytes),
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // Wait for all backends to respond
-        let all_results = futures::future::try_join_all(backend_queries)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        // Update cache serially (all backends reported, no races)
-        let first_success = all_results.iter().find_map(|result| match result {
-            StatResult::Has(backend_id, response) => Some((*backend_id, response.clone())),
-            _ => None,
-        });
-
-        for result in all_results {
-            match result {
-                StatResult::Has(backend_id, response) => {
-                    self.cache
-                        .upsert(msg_id.to_owned(), response, backend_id)
-                        .await;
-                }
-                StatResult::Missing(backend_id, response) => {
-                    self.cache
-                        .record_backend_missing(msg_id.to_owned(), backend_id, response)
-                        .await;
-                }
-            }
-        }
-
-        // Send response to client
-        match first_success {
-            Some((backend_id, response)) => {
-                client_write.write_all(&response).await?;
-                router.complete_command(backend_id);
-                Ok(backend_id)
-            }
-            None => {
-                // All backends returned 430 or failed
-                client_write
-                    .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                    .await?;
-                let backend_id = router.route_command(self.client_id, command)?;
-                router.complete_command(backend_id);
-                Ok(backend_id)
-            }
-        }
-    }
-
-    /// Query all backends concurrently for article headers (HEAD command)
-    ///
-    /// Same pattern as STAT precheck but handles multiline responses.
-    /// Optionally caches full headers if cache_articles=true.
-    async fn handle_head_precheck(
-        &self,
-        router: Arc<BackendSelector>,
-        command: &str,
-        msg_id: &crate::types::MessageId<'_>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<crate::types::BackendId> {
-        enum HeadResult {
-            Has(BackendId, Vec<u8>),     // 221: Headers retrieved
-            Missing(BackendId, Vec<u8>), // 430 or other error
-        }
-
-        // Calculate adaptive timeout: TTFB * 2
-        let timeout = precheck::calculate_adaptive_timeout(self.metrics.as_ref());
-
-        // Query all backends concurrently
-        let backend_queries = (0..router.backend_count().get())
-            .map(BackendId::from_index)
-            .map(|backend_id| {
-                let (router, buffer_pool, metrics, command, cache_articles) = (
-                    router.clone(),
-                    self.buffer_pool.clone(),
-                    self.metrics.clone(),
-                    command.to_string(),
-                    self.cache_articles,
-                );
-
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-                    // Get connection and send HEAD command (no timeout on write)
-                    let provider = router.backend_provider(backend_id)?;
-                    let mut conn = provider.get_pooled_connection().await.ok()?;
-                    let mut buffer = buffer_pool.acquire().await;
-
-                    // Send command without timeout
-                    conn.as_mut().write_all(command.as_bytes()).await.ok()?;
-
-                    // Timeout only on first byte read (TTFB²)
-                    let read_result = tokio::time::timeout(timeout, async {
-                        let n = buffer.read_from(&mut *conn).await.ok()?;
-                        if n == 0 {
-                            return None;
-                        }
-                        Some((n, buffer[..n].to_vec()))
-                    })
-                    .await;
-
-                    let (_bytes_read, mut response_bytes) = match read_result {
-                        Ok(Some(data)) => data,
-                        Ok(None) => return None,
-                        Err(_) => {
-                            debug!(
-                                "HEAD query to backend {} timed out waiting for first byte after {:?}",
-                                backend_id.as_index(),
-                                timeout
-                            );
-                            return None;
-                        }
-                    };
-
-                    // Parse response code
-                    let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
-                    let status_code = response_code.status_code()?.as_u16();
-                    let is_multiline = response_code.is_multiline();
-
-                    Some(match status_code {
-                        221 => {
-                            // Read complete multiline response if needed (no timeout - we got first byte)
-                            let full_response = if is_multiline {
-                                loop {
-                                    let n = conn
-                                        .as_mut()
-                                        .read(buffer.as_mut_slice())
-                                        .await
-                                        .unwrap_or(0);
-                                    if n == 0 || response_bytes.ends_with(b".\r\n") {
-                                        break;
-                                    }
-                                    response_bytes.extend_from_slice(&buffer[..n]);
-                                }
-                                response_bytes
-                            } else {
-                                response_bytes
-                            };
-
-                            // Cache full headers or just availability marker
-                            let cache_data = if cache_articles {
-                                full_response
-                            } else {
-                                b"221\r\n".to_vec() // Minimal availability marker
-                            };
-
-                            HeadResult::Has(backend_id, cache_data)
-                        }
-                        430 => {
-                            if let Some(m) = metrics.as_ref() {
-                                m.record_command(backend_id);
-                                m.record_error_4xx(backend_id);
-                            }
-                            HeadResult::Missing(backend_id, response_bytes)
-                        }
-                        _ => HeadResult::Missing(backend_id, response_bytes),
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // Wait for all backends to respond
-        let all_results = futures::future::try_join_all(backend_queries)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        // Update cache serially (all backends reported, no races)
-        let first_success = all_results.iter().find_map(|result| match result {
-            HeadResult::Has(backend_id, response) => Some((*backend_id, response.clone())),
-            _ => None,
-        });
-
-        for result in all_results {
-            match result {
-                HeadResult::Has(backend_id, cache_data) => {
-                    self.cache
-                        .upsert(msg_id.to_owned(), cache_data, backend_id)
-                        .await;
-                }
-                HeadResult::Missing(backend_id, response) => {
-                    self.cache
-                        .record_backend_missing(msg_id.to_owned(), backend_id, response)
-                        .await;
-                }
-            }
-        }
-
-        // Send response to client
-        match first_success {
-            Some((backend_id, response)) => {
-                client_write.write_all(&response).await?;
-                *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-                router.complete_command(backend_id);
-                Ok(backend_id)
-            }
-            None => {
-                // All backends returned 430 or failed
-                let response = crate::protocol::NO_SUCH_ARTICLE;
-                client_write.write_all(response).await?;
-                *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-                let backend_id = router.route_command(self.client_id, command)?;
-                router.complete_command(backend_id);
-                Ok(backend_id)
-            }
+    /// Create a PrecheckContext for precheck operations
+    fn precheck_context(&self, router: Arc<BackendSelector>) -> precheck::PrecheckContext {
+        precheck::PrecheckContext {
+            router,
+            cache: self.cache.clone(),
+            buffer_pool: self.buffer_pool.clone(),
+            metrics: self.metrics.clone(),
+            cache_articles: self.cache_articles,
         }
     }
 }
@@ -1540,6 +1199,224 @@ mod tests {
         assert_eq!(
             decide_command_routing("LIST", true, true, RoutingMode::PerCommand,),
             CommandRoutingDecision::Forward
+        );
+    }
+
+    // Tests for is_430_status_code
+
+    #[test]
+    fn test_is_430_status_code() {
+        assert!(is_430_status_code(430));
+        assert!(!is_430_status_code(429));
+        assert!(!is_430_status_code(431));
+        assert!(!is_430_status_code(200));
+        assert!(!is_430_status_code(500));
+    }
+
+    // Tests for should_capture_for_cache
+
+    #[test]
+    fn test_should_capture_for_cache_article_response() {
+        // 220 response (ARTICLE) with all conditions met should capture
+        assert!(should_capture_for_cache(220, true, true, true));
+
+        // 221 (HEAD) and 222 (BODY) should NOT capture full article
+        assert!(!should_capture_for_cache(221, true, true, true));
+        assert!(!should_capture_for_cache(222, true, true, true));
+    }
+
+    #[test]
+    fn test_should_capture_for_cache_requires_all_conditions() {
+        // Not multiline
+        assert!(!should_capture_for_cache(220, false, true, true));
+
+        // Cache disabled
+        assert!(!should_capture_for_cache(220, true, false, true));
+
+        // No message-ID
+        assert!(!should_capture_for_cache(220, true, true, false));
+
+        // Wrong response code
+        assert!(!should_capture_for_cache(430, true, true, true));
+    }
+
+    #[test]
+    fn test_should_capture_for_cache_only_220() {
+        // Only 220 (ARTICLE) responses should be captured
+        assert!(should_capture_for_cache(220, true, true, true));
+        assert!(!should_capture_for_cache(221, true, true, true)); // HEAD
+        assert!(!should_capture_for_cache(222, true, true, true)); // BODY
+        assert!(!should_capture_for_cache(223, true, true, true)); // STAT
+    }
+
+    // Tests for should_track_availability
+
+    #[test]
+    fn test_should_track_availability_success_responses() {
+        assert!(should_track_availability(220, true)); // ARTICLE
+        assert!(should_track_availability(221, true)); // HEAD
+        assert!(should_track_availability(222, true)); // BODY
+        assert!(should_track_availability(223, true)); // STAT
+    }
+
+    #[test]
+    fn test_should_track_availability_requires_message_id() {
+        assert!(!should_track_availability(220, false));
+        assert!(!should_track_availability(223, false));
+    }
+
+    #[test]
+    fn test_should_track_availability_error_responses() {
+        assert!(!should_track_availability(430, true)); // Article not found
+        assert!(!should_track_availability(500, true)); // Server error
+        assert!(!should_track_availability(200, true)); // Greeting
+    }
+
+    // Tests for determine_metrics_action
+
+    #[test]
+    fn test_determine_metrics_action_4xx_errors() {
+        // 4xx errors (excluding 423, 430) should record error_4xx
+        assert_eq!(
+            determine_metrics_action(400, false),
+            MetricsAction::Error4xx
+        );
+        assert_eq!(
+            determine_metrics_action(401, false),
+            MetricsAction::Error4xx
+        );
+        assert_eq!(
+            determine_metrics_action(480, false),
+            MetricsAction::Error4xx
+        );
+    }
+
+    #[test]
+    fn test_determine_metrics_action_4xx_exclusions() {
+        // 423 (no such article number) and 430 (no such article) are not errors
+        assert_eq!(determine_metrics_action(423, false), MetricsAction::None);
+        assert_eq!(determine_metrics_action(430, false), MetricsAction::None);
+    }
+
+    #[test]
+    fn test_determine_metrics_action_5xx_errors() {
+        assert_eq!(
+            determine_metrics_action(500, false),
+            MetricsAction::Error5xx
+        );
+        assert_eq!(
+            determine_metrics_action(502, false),
+            MetricsAction::Error5xx
+        );
+        assert_eq!(
+            determine_metrics_action(503, false),
+            MetricsAction::Error5xx
+        );
+    }
+
+    #[test]
+    fn test_determine_metrics_action_article_success() {
+        // Multiline 220-222 should record article
+        assert_eq!(determine_metrics_action(220, true), MetricsAction::Article);
+        assert_eq!(determine_metrics_action(221, true), MetricsAction::Article);
+        assert_eq!(determine_metrics_action(222, true), MetricsAction::Article);
+    }
+
+    #[test]
+    fn test_determine_metrics_action_article_not_multiline() {
+        // Non-multiline shouldn't record article
+        assert_eq!(determine_metrics_action(220, false), MetricsAction::None);
+    }
+
+    #[test]
+    fn test_determine_metrics_action_stat_not_article() {
+        // STAT (223) is not an article even if multiline flag is true
+        assert_eq!(determine_metrics_action(223, true), MetricsAction::None);
+    }
+
+    // Tests for determine_cache_action
+
+    #[test]
+    fn test_determine_cache_action_capture_article() {
+        // Full article capture for 220 response when cache enabled
+        assert_eq!(
+            determine_cache_action("ARTICLE <test@example.com>", 220, true, true, true),
+            CacheAction::CaptureArticle
+        );
+    }
+
+    #[test]
+    fn test_determine_cache_action_track_availability() {
+        // Track availability for HEAD (221) and BODY (222) responses
+        assert_eq!(
+            determine_cache_action("HEAD <test@example.com>", 221, true, true, true),
+            CacheAction::TrackAvailability
+        );
+        assert_eq!(
+            determine_cache_action("BODY <test@example.com>", 222, true, true, true),
+            CacheAction::TrackAvailability
+        );
+    }
+
+    #[test]
+    fn test_determine_cache_action_track_stat() {
+        // Track STAT (223) - not multiline
+        assert_eq!(
+            determine_cache_action("STAT <test@example.com>", 223, false, false, true),
+            CacheAction::TrackStat
+        );
+    }
+
+    #[test]
+    fn test_determine_cache_action_no_message_id() {
+        // No caching without message-ID
+        assert_eq!(
+            determine_cache_action("ARTICLE 123", 220, true, true, false),
+            CacheAction::None
+        );
+        assert_eq!(
+            determine_cache_action("STAT 123", 223, false, false, false),
+            CacheAction::None
+        );
+    }
+
+    #[test]
+    fn test_determine_cache_action_error_responses() {
+        // No caching for error responses
+        assert_eq!(
+            determine_cache_action("ARTICLE <test@example.com>", 430, true, true, true),
+            CacheAction::None
+        );
+        assert_eq!(
+            determine_cache_action("ARTICLE <test@example.com>", 500, true, true, true),
+            CacheAction::None
+        );
+    }
+
+    #[test]
+    fn test_determine_cache_action_cache_disabled() {
+        // When cache_articles is false, don't capture full article but still track availability
+        assert_eq!(
+            determine_cache_action("ARTICLE <test@example.com>", 220, true, false, true),
+            CacheAction::TrackAvailability
+        );
+    }
+
+    #[test]
+    fn test_determine_cache_action_rejects_stateful_commands() {
+        // Stateful commands should never reach cache action determination,
+        // but if they do, we defensively reject them
+        assert_eq!(
+            determine_cache_action("GROUP alt.test", 211, false, true, false),
+            CacheAction::None
+        );
+        assert_eq!(
+            determine_cache_action("XOVER 1-100", 224, true, true, true),
+            CacheAction::None
+        );
+        assert_eq!(
+            determine_cache_action("NEXT", 223, false, true, false),
+            CacheAction::None
         );
     }
 }

@@ -143,13 +143,13 @@
 //!
 //! ## Key Functions
 //!
-//! - `execute_command_on_backend()` - **PERFORMANCE CRITICAL HOT PATH**
-//!   - Pipelined streaming with double-buffering for 100x+ throughput
-//!   - DO NOT refactor to buffer entire responses
+//! - `handle_stateful_proxy_loop()` - **PERFORMANCE CRITICAL HOT PATH**
+//!   - Bidirectional streaming with tokio::select! for concurrent I/O
+//!   - Used by both stateful mode and hybrid mode after switching
 //!
 //! - `switch_to_stateful_mode()` - Hybrid mode transition
 //!   - Acquires dedicated backend connection
-//!   - Transitions from per-command to 1:1 mapping
+//!   - Hands off to stateful proxy loop
 //!
 //! - `route_and_execute_command()` - Per-command orchestration
 //!   - Routes command to backend
@@ -165,7 +165,6 @@ pub mod handlers;
 pub mod metrics_ext;
 pub mod mode_state;
 pub mod precheck;
-pub mod routing;
 pub mod streaming;
 
 use std::sync::Arc;
@@ -180,7 +179,6 @@ use crate::types::{ClientAddress, ClientId};
 pub use auth_state::AuthState;
 pub use metrics_ext::MetricsRecorder;
 pub use mode_state::{ModeState, SessionMode};
-pub use routing::RoutingDecision;
 
 // SessionMode is now exported from mode_state module
 

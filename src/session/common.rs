@@ -228,6 +228,169 @@ mod tests {
         assert_eq!(quit1, quit2);
         assert_ne!(quit1, cont);
     }
+
+    // =========================================================================
+    // AuthHandlerResult tests
+    // =========================================================================
+
+    #[test]
+    fn test_auth_handler_result_bytes_written() {
+        let auth = AuthHandlerResult::Authenticated {
+            bytes_written: 100,
+            skip_further_checks: true,
+        };
+        assert_eq!(auth.bytes_written(), 100);
+
+        let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
+        assert_eq!(not_auth.bytes_written(), 50);
+
+        let rejected = AuthHandlerResult::Rejected { bytes_written: 25 };
+        assert_eq!(rejected.bytes_written(), 25);
+    }
+
+    #[test]
+    fn test_auth_handler_result_should_skip_further_checks() {
+        let skip = AuthHandlerResult::Authenticated {
+            bytes_written: 100,
+            skip_further_checks: true,
+        };
+        assert!(skip.should_skip_further_checks());
+
+        let no_skip = AuthHandlerResult::Authenticated {
+            bytes_written: 100,
+            skip_further_checks: false,
+        };
+        assert!(!no_skip.should_skip_further_checks());
+
+        let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
+        assert!(!not_auth.should_skip_further_checks());
+
+        let rejected = AuthHandlerResult::Rejected { bytes_written: 25 };
+        assert!(!rejected.should_skip_further_checks());
+    }
+
+    // =========================================================================
+    // SessionLoopState tests
+    // =========================================================================
+
+    #[test]
+    fn test_session_loop_state_new() {
+        let state = SessionLoopState::new(true);
+        assert_eq!(state.client_to_backend.as_u64(), 0);
+        assert_eq!(state.backend_to_client.as_u64(), 0);
+        assert!(!state.skip_auth_check); // Auth enabled = don't skip
+        assert!(state.auth_username.is_none());
+
+        let state2 = SessionLoopState::new(false);
+        assert!(state2.skip_auth_check); // Auth disabled = skip
+    }
+
+    #[test]
+    fn test_session_loop_state_default() {
+        let state = SessionLoopState::default();
+        assert_eq!(state.client_to_backend.as_u64(), 0);
+        assert!(state.skip_auth_check); // Default = auth disabled
+    }
+
+    #[test]
+    fn test_session_loop_state_builder_pattern() {
+        let state = SessionLoopState::new(false).with_initial_bytes(1000, 500);
+
+        assert_eq!(state.client_to_backend.as_u64(), 1000);
+        assert_eq!(state.backend_to_client.as_u64(), 500);
+    }
+
+    #[test]
+    fn test_session_loop_state_from_initial_bytes() {
+        let state = SessionLoopState::from_initial_bytes(100, 200, true);
+        assert_eq!(state.client_to_backend.as_u64(), 100);
+        assert_eq!(state.backend_to_client.as_u64(), 200);
+        assert_eq!(state.last_reported_c2b.as_u64(), 100);
+        assert_eq!(state.last_reported_b2c.as_u64(), 200);
+        assert!(!state.skip_auth_check);
+    }
+
+    #[test]
+    fn test_session_loop_state_add_bytes() {
+        let mut state = SessionLoopState::new(false);
+
+        state.add_client_to_backend(100);
+        assert_eq!(state.client_to_backend.as_u64(), 100);
+
+        state.add_backend_to_client(200);
+        assert_eq!(state.backend_to_client.as_u64(), 200);
+
+        // Cumulative
+        state.add_client_to_backend(50);
+        state.add_backend_to_client(50);
+        assert_eq!(state.client_to_backend.as_u64(), 150);
+        assert_eq!(state.backend_to_client.as_u64(), 250);
+    }
+
+    #[test]
+    fn test_session_loop_state_mark_authenticated() {
+        let mut state = SessionLoopState::new(true);
+        assert!(!state.skip_auth_check);
+
+        state.mark_authenticated();
+        assert!(state.skip_auth_check);
+    }
+
+    #[test]
+    fn test_session_loop_state_apply_auth_result() {
+        let mut state = SessionLoopState::new(true);
+        assert!(!state.skip_auth_check);
+        assert_eq!(state.backend_to_client.as_u64(), 0);
+
+        // Authenticated result should update bytes and skip flag
+        let result = AuthHandlerResult::Authenticated {
+            bytes_written: 100,
+            skip_further_checks: true,
+        };
+        let bytes = state.apply_auth_result(&result);
+
+        assert_eq!(bytes, 100);
+        assert_eq!(state.backend_to_client.as_u64(), 100);
+        assert!(state.skip_auth_check);
+    }
+
+    #[test]
+    fn test_session_loop_state_apply_auth_result_not_authenticated() {
+        let mut state = SessionLoopState::new(true);
+
+        let result = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
+        state.apply_auth_result(&result);
+
+        assert_eq!(state.backend_to_client.as_u64(), 50);
+        assert!(!state.skip_auth_check); // Still need to check
+    }
+
+    #[test]
+    fn test_session_loop_state_into_metrics() {
+        let state = SessionLoopState::new(false).with_initial_bytes(1000, 2000);
+
+        let metrics = state.into_metrics();
+        assert_eq!(metrics.client_to_backend.as_u64(), 1000);
+        assert_eq!(metrics.backend_to_client.as_u64(), 2000);
+    }
+
+    #[test]
+    fn test_session_loop_state_metrics_flush_interval() {
+        use crate::constants::session::METRICS_FLUSH_INTERVAL;
+
+        let mut state = SessionLoopState::new(false);
+
+        // Should return false until we hit the interval
+        for _ in 0..(METRICS_FLUSH_INTERVAL - 1) {
+            assert!(!state.check_and_maybe_flush_metrics());
+        }
+
+        // Should return true at the interval
+        assert!(state.check_and_maybe_flush_metrics());
+
+        // Counter should reset, so next METRICS_FLUSH_INTERVAL-1 should be false
+        assert!(!state.check_and_maybe_flush_metrics());
+    }
 }
 
 // ============================================================================
@@ -235,7 +398,7 @@ mod tests {
 // ============================================================================
 
 /// Result of handling an authentication command in a session loop
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthHandlerResult {
     /// Authentication succeeded, session can continue
     Authenticated {
@@ -246,6 +409,30 @@ pub enum AuthHandlerResult {
     NotAuthenticated { bytes_written: u64 },
     /// Command rejected
     Rejected { bytes_written: u64 },
+}
+
+impl AuthHandlerResult {
+    /// Get the number of bytes written regardless of result type
+    #[inline]
+    pub const fn bytes_written(&self) -> u64 {
+        match self {
+            Self::Authenticated { bytes_written, .. }
+            | Self::NotAuthenticated { bytes_written }
+            | Self::Rejected { bytes_written } => *bytes_written,
+        }
+    }
+
+    /// Check if should skip further auth checks
+    #[inline]
+    pub const fn should_skip_further_checks(&self) -> bool {
+        matches!(
+            self,
+            Self::Authenticated {
+                skip_further_checks: true,
+                ..
+            }
+        )
+    }
 }
 
 /// Handle authentication logic for a command in a stateful session
@@ -323,28 +510,46 @@ where
     }
 }
 
-/// Update byte counters and check if metrics should be flushed
+/// Session loop state for tracking bytes, auth, and metrics
 ///
-/// Returns true if metrics should be flushed this iteration
-#[inline]
-pub fn should_flush_metrics(iteration_count: &mut u32) -> bool {
-    *iteration_count += 1;
-    *iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL
+/// This struct encapsulates all mutable state needed during a session loop,
+/// making it easy to pass around and test in isolation.
+///
+/// # Example
+/// ```ignore
+/// let state = SessionLoopState::new(auth_enabled)
+///     .with_initial_bytes(1000, 500);
+/// ```
+#[derive(Debug, Clone)]
+pub struct SessionLoopState {
+    /// Bytes sent from client to backend
+    pub client_to_backend: crate::types::ClientToBackendBytes,
+    /// Bytes sent from backend to client
+    pub backend_to_client: crate::types::BackendToClientBytes,
+    /// Last reported client-to-backend bytes (for incremental metrics)
+    pub last_reported_c2b: crate::types::ClientToBackendBytes,
+    /// Last reported backend-to-client bytes (for incremental metrics)
+    pub last_reported_b2c: crate::types::BackendToClientBytes,
+    /// Iteration counter for metrics flush timing
+    iteration_count: u32,
+    /// Username from AUTHINFO USER command (if any)
+    pub auth_username: Option<String>,
+    /// Whether to skip auth checking (optimization after first auth)
+    pub skip_auth_check: bool,
 }
 
-/// Session loop state for tracking bytes, auth, and metrics
-pub struct SessionLoopState {
-    pub client_to_backend: crate::types::ClientToBackendBytes,
-    pub backend_to_client: crate::types::BackendToClientBytes,
-    pub last_reported_c2b: crate::types::ClientToBackendBytes,
-    pub last_reported_b2c: crate::types::BackendToClientBytes,
-    pub iteration_count: u32,
-    pub auth_username: Option<String>,
-    pub skip_auth_check: bool,
+impl Default for SessionLoopState {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl SessionLoopState {
     /// Create new session loop state
+    ///
+    /// # Arguments
+    /// * `auth_enabled` - If true, auth checking starts enabled; if false, it's skipped
+    #[must_use]
     pub fn new(auth_enabled: bool) -> Self {
         use crate::types::{BackendToClientBytes, ClientToBackendBytes};
         Self {
@@ -358,35 +563,80 @@ impl SessionLoopState {
         }
     }
 
-    /// Create session loop state with initial byte counts (for hybrid mode)
+    /// Create session loop state with initial byte counts
+    ///
+    /// Used by hybrid mode when switching from per-command to stateful,
+    /// to carry forward the bytes already transferred.
+    #[must_use]
     pub fn from_initial_bytes(
         client_to_backend: u64,
         backend_to_client: u64,
         auth_enabled: bool,
     ) -> Self {
-        use crate::types::{BackendToClientBytes, ClientToBackendBytes};
-        let c2b = ClientToBackendBytes::new(client_to_backend);
-        let b2c = BackendToClientBytes::new(backend_to_client);
+        Self::new(auth_enabled).with_initial_bytes(client_to_backend, backend_to_client)
+    }
 
-        Self {
-            client_to_backend: c2b,
-            backend_to_client: b2c,
-            last_reported_c2b: c2b,
-            last_reported_b2c: b2c,
-            iteration_count: 0,
-            auth_username: None,
-            skip_auth_check: !auth_enabled,
-        }
+    /// Builder method: set initial byte counts
+    #[must_use]
+    pub fn with_initial_bytes(mut self, c2b: u64, b2c: u64) -> Self {
+        use crate::types::{BackendToClientBytes, ClientToBackendBytes};
+        self.client_to_backend = ClientToBackendBytes::new(c2b);
+        self.backend_to_client = BackendToClientBytes::new(b2c);
+        self.last_reported_c2b = self.client_to_backend;
+        self.last_reported_b2c = self.backend_to_client;
+        self
     }
 
     /// Check if metrics should be flushed and reset counter if so
+    ///
+    /// Returns `true` every `METRICS_FLUSH_INTERVAL` iterations.
     #[inline]
     pub fn check_and_maybe_flush_metrics(&mut self) -> bool {
-        if should_flush_metrics(&mut self.iteration_count) {
+        self.iteration_count += 1;
+        if self.iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL {
             self.iteration_count = 0;
             true
         } else {
             false
         }
+    }
+
+    /// Add bytes to client-to-backend counter
+    #[inline]
+    pub fn add_client_to_backend(&mut self, bytes: usize) {
+        self.client_to_backend = self.client_to_backend.add(bytes);
+    }
+
+    /// Add bytes to backend-to-client counter
+    #[inline]
+    pub fn add_backend_to_client(&mut self, bytes: u64) {
+        self.backend_to_client = self.backend_to_client.add_u64(bytes);
+    }
+
+    /// Convert to final transfer metrics
+    #[must_use]
+    pub fn into_metrics(self) -> crate::types::TransferMetrics {
+        crate::types::TransferMetrics {
+            client_to_backend: self.client_to_backend,
+            backend_to_client: self.backend_to_client,
+        }
+    }
+
+    /// Mark authentication as complete (skip future checks)
+    #[inline]
+    pub fn mark_authenticated(&mut self) {
+        self.skip_auth_check = true;
+    }
+
+    /// Update state based on auth handler result
+    ///
+    /// Returns the bytes written for convenience in chaining.
+    pub fn apply_auth_result(&mut self, result: &AuthHandlerResult) -> u64 {
+        let bytes = result.bytes_written();
+        self.add_backend_to_client(bytes);
+        if result.should_skip_further_checks() {
+            self.mark_authenticated();
+        }
+        bytes
     }
 }
