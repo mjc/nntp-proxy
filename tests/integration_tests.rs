@@ -11,13 +11,13 @@ mod config_helpers;
 use config_helpers::*;
 
 mod test_helpers;
-use test_helpers::MockNntpServer;
+use test_helpers::{MockNntpServer, create_test_config, get_available_port};
 
-/// Helper function to find an available port
+/// Helper function to find an available port (wraps get_available_port for convenience)
 async fn find_available_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    addr.port()
+    get_available_port()
+        .await
+        .expect("Failed to find available port")
 }
 
 #[tokio::test]
@@ -287,16 +287,6 @@ async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool
     });
 }
 
-/// Helper to create test config from port/name pairs
-fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
-    Config {
-        servers: server_ports
-            .into_iter()
-            .map(|(port, name)| create_test_server_config("127.0.0.1", port, name))
-            .collect(),
-        ..Default::default()
-    }
-}
 /// Test that responses are delivered promptly - simulates rapid article requests
 /// This test validates response delivery timing regardless of flush implementation.
 #[tokio::test]
