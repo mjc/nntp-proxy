@@ -578,6 +578,17 @@ impl ClientSession {
                     // Continue to next backend
                 }
                 Err(e) => {
+                    // Check if client disconnected - if so, stop trying backends
+                    if crate::session::error_classification::ErrorClassifier::is_client_disconnect(
+                        &e,
+                    ) {
+                        debug!(
+                            "Client {} disconnected, stopping retry loop",
+                            self.client_addr
+                        );
+                        return Err(e);
+                    }
+
                     // Backend error (timeout, connection error, etc.)
                     // Log it but continue trying other backends
                     debug!(
@@ -1366,6 +1377,35 @@ mod tests {
         assert_eq!(
             determine_cache_action("NEXT", 223, false, true, false),
             CacheAction::None
+        );
+    }
+
+    #[test]
+    fn test_client_disconnect_is_detected() {
+        use std::io::ErrorKind;
+
+        // Broken pipe should be detected as client disconnect
+        let broken_pipe = std::io::Error::new(ErrorKind::BrokenPipe, "broken pipe");
+        let err: anyhow::Error = broken_pipe.into();
+        assert!(
+            crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            "BrokenPipe should be classified as client disconnect"
+        );
+
+        // Timeout is not a client disconnect
+        let timeout = std::io::Error::new(ErrorKind::TimedOut, "timed out");
+        let err: anyhow::Error = timeout.into();
+        assert!(
+            !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            "TimedOut should NOT be classified as client disconnect"
+        );
+
+        // Other errors are not client disconnects
+        let other = std::io::Error::new(ErrorKind::Other, "other error");
+        let err: anyhow::Error = other.into();
+        assert!(
+            !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            "Other errors should NOT be classified as client disconnect"
         );
     }
 }
