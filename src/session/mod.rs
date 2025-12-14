@@ -165,6 +165,7 @@ pub mod handlers;
 pub mod metrics_ext;
 pub mod mode_state;
 pub mod precheck;
+pub(crate) mod routing;
 pub mod streaming;
 
 use std::sync::Arc;
