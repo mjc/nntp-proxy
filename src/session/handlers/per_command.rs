@@ -879,7 +879,7 @@ mod tests {
         );
 
         // Other errors are not client disconnects
-        let other = std::io::Error::new(ErrorKind::Other, "other error");
+        let other = std::io::Error::other("other error");
         let err: anyhow::Error = other.into();
         assert!(
             !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),

@@ -1,15 +1,9 @@
-//! Backend communication module
+//! Backend response validation module
 //!
-//! Handles sending commands to backend and reading initial response.
-//! Does NOT buffer entire responses - caller handles streaming.
+//! Provides pure functions for validating backend NNTP responses.
+//! Does NOT handle I/O - callers are responsible for actual communication.
 
-use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::warn;
-
-use crate::pool::PooledBuffer;
-use crate::protocol::{MIN_RESPONSE_LENGTH, NntpResponse};
-use crate::types::BackendId;
+use crate::protocol::NntpResponse;
 
 /// Response validation warnings (pure data)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,87 +74,6 @@ pub fn validate_backend_response(
         is_multiline,
         warnings,
     }
-}
-
-/// Send command to backend and read first chunk
-///
-/// Returns (bytes_read, response_code, is_multiline, ttfb_micros, send_micros, recv_micros)
-/// The first chunk is written into the provided buffer.
-pub async fn send_command_and_read_first_chunk<T>(
-    backend_conn: &mut T,
-    command: &str,
-    backend_id: BackendId,
-    client_addr: impl std::fmt::Display,
-    chunk: &mut PooledBuffer,
-) -> Result<(usize, NntpResponse, bool, u64, u64, u64)>
-where
-    T: AsyncReadExt + AsyncWriteExt + Unpin,
-{
-    use std::time::Instant;
-
-    let start = Instant::now();
-
-    // Write command to backend
-    let send_start = Instant::now();
-    backend_conn.write_all(command.as_bytes()).await?;
-    let send_elapsed = send_start.elapsed();
-
-    // Read first chunk to determine response type
-    let recv_start = Instant::now();
-    let n = chunk.read_from(backend_conn).await?;
-    let recv_elapsed = recv_start.elapsed();
-
-    if n == 0 {
-        return Err(anyhow::anyhow!("Backend connection closed unexpectedly"));
-    }
-
-    // Validate response using pure function
-    let validated = validate_backend_response(&chunk[..n], n, MIN_RESPONSE_LENGTH);
-
-    // Log warnings
-    for warning in &validated.warnings {
-        match warning {
-            ResponseWarning::ShortResponse { bytes, min } => {
-                warn!(
-                    "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
-                    client_addr,
-                    backend_id,
-                    bytes,
-                    min,
-                    &chunk[..n]
-                );
-            }
-            ResponseWarning::InvalidResponse => {
-                warn!(
-                    "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
-                    client_addr,
-                    backend_id,
-                    n,
-                    String::from_utf8_lossy(&chunk[..n.min(50)])
-                );
-            }
-            ResponseWarning::UnusualStatusCode(code) => {
-                warn!(
-                    "Client {} got unusual status code {} from backend {:?}: {:?}",
-                    client_addr,
-                    code,
-                    backend_id,
-                    String::from_utf8_lossy(&chunk[..n.min(50)])
-                );
-            }
-        }
-    }
-
-    let elapsed = start.elapsed();
-
-    Ok((
-        n,
-        validated.response,
-        validated.is_multiline,
-        elapsed.as_micros() as u64,
-        send_elapsed.as_micros() as u64,
-        recv_elapsed.as_micros() as u64,
-    ))
 }
 
 #[cfg(test)]
