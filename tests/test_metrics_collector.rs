@@ -3,7 +3,7 @@
 //! Tests lock-free metrics collection, recording, and snapshot generation.
 
 use nntp_proxy::constants::user::ANONYMOUS;
-use nntp_proxy::metrics::{HealthStatus, MetricsCollector};
+use nntp_proxy::metrics::{BackendHealthStatus, MetricsCollector};
 use nntp_proxy::types::{BackendId, MetricsBytes, Unrecorded};
 
 /// Test MetricsCollector creation
@@ -294,23 +294,26 @@ fn test_health_status_recording() {
     let collector = MetricsCollector::new(1);
     let backend = BackendId::from_index(0);
 
-    collector.set_backend_health(backend, HealthStatus::Healthy);
+    collector.set_backend_health(backend, BackendHealthStatus::Healthy);
     let snapshot = collector.snapshot(None);
     assert_eq!(
         snapshot.backend_stats[0].health_status,
-        HealthStatus::Healthy
+        BackendHealthStatus::Healthy
     );
 
-    collector.set_backend_health(backend, HealthStatus::Degraded);
+    collector.set_backend_health(backend, BackendHealthStatus::Degraded);
     let snapshot = collector.snapshot(None);
     assert_eq!(
         snapshot.backend_stats[0].health_status,
-        HealthStatus::Degraded
+        BackendHealthStatus::Degraded
     );
 
-    collector.set_backend_health(backend, HealthStatus::Down);
+    collector.set_backend_health(backend, BackendHealthStatus::Down);
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.backend_stats[0].health_status, HealthStatus::Down);
+    assert_eq!(
+        snapshot.backend_stats[0].health_status,
+        BackendHealthStatus::Down
+    );
 }
 
 /// Test user metrics: connection opened

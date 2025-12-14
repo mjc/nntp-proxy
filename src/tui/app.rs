@@ -4,7 +4,7 @@ use crate::config::Server;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
 use crate::tui::log_capture::LogBuffer;
-use crate::types::tui::{BytesPerSecond, CommandsPerSecond, HistorySize, Timestamp};
+use crate::types::tui::{CommandsPerSecond, HistorySize, Throughput, Timestamp};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -24,9 +24,9 @@ pub struct ThroughputPoint {
     /// Timestamp of this measurement
     timestamp: Timestamp,
     /// Bytes sent per second
-    sent_per_sec: BytesPerSecond,
+    sent_per_sec: Throughput,
     /// Bytes received per second
-    received_per_sec: BytesPerSecond,
+    received_per_sec: Throughput,
     /// Commands processed per second (backend only)
     commands_per_sec: Option<CommandsPerSecond>,
 }
@@ -36,8 +36,8 @@ impl ThroughputPoint {
     #[must_use]
     pub const fn new_backend(
         timestamp: Timestamp,
-        sent_per_sec: BytesPerSecond,
-        received_per_sec: BytesPerSecond,
+        sent_per_sec: Throughput,
+        received_per_sec: Throughput,
         commands_per_sec: CommandsPerSecond,
     ) -> Self {
         Self {
@@ -52,8 +52,8 @@ impl ThroughputPoint {
     #[must_use]
     pub const fn new_client(
         timestamp: Timestamp,
-        sent_per_sec: BytesPerSecond,
-        received_per_sec: BytesPerSecond,
+        sent_per_sec: Throughput,
+        received_per_sec: Throughput,
     ) -> Self {
         Self {
             timestamp,
@@ -73,14 +73,14 @@ impl ThroughputPoint {
     /// Get sent bytes per second
     #[must_use]
     #[inline]
-    pub const fn sent_per_sec(&self) -> BytesPerSecond {
+    pub const fn sent_per_sec(&self) -> Throughput {
         self.sent_per_sec
     }
 
     /// Get received bytes per second
     #[must_use]
     #[inline]
-    pub const fn received_per_sec(&self) -> BytesPerSecond {
+    pub const fn received_per_sec(&self) -> Throughput {
         self.received_per_sec
     }
 
@@ -287,11 +287,11 @@ impl TuiApp {
     /// Calculate throughput rate from byte delta and time delta
     /// Calculate byte transfer rate
     #[inline]
-    fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> BytesPerSecond {
+    fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> Throughput {
         if time_delta_secs > 0.0 {
-            BytesPerSecond::new((byte_delta as f64) / time_delta_secs)
+            Throughput::new((byte_delta as f64) / time_delta_secs)
         } else {
-            BytesPerSecond::zero()
+            Throughput::zero()
         }
     }
 
@@ -843,8 +843,8 @@ mod tests {
     fn test_throughput_point_accessors() {
         let point = ThroughputPoint::new_backend(
             Timestamp::now(),
-            BytesPerSecond::new(1000.0),
-            BytesPerSecond::new(2000.0),
+            Throughput::new(1000.0),
+            Throughput::new(2000.0),
             CommandsPerSecond::new(50.0),
         );
 
@@ -854,8 +854,8 @@ mod tests {
 
         let client_point = ThroughputPoint::new_client(
             Timestamp::now(),
-            BytesPerSecond::new(500.0),
-            BytesPerSecond::new(1500.0),
+            Throughput::new(500.0),
+            Throughput::new(1500.0),
         );
 
         assert_eq!(client_point.sent_per_sec().get(), 500.0);
@@ -871,8 +871,8 @@ mod tests {
 
         let point1 = ThroughputPoint::new_client(
             Timestamp::now(),
-            BytesPerSecond::new(100.0),
-            BytesPerSecond::new(200.0),
+            Throughput::new(100.0),
+            Throughput::new(200.0),
         );
         history.push(point1.clone());
 
@@ -881,8 +881,8 @@ mod tests {
 
         let point2 = ThroughputPoint::new_client(
             Timestamp::now(),
-            BytesPerSecond::new(300.0),
-            BytesPerSecond::new(400.0),
+            Throughput::new(300.0),
+            Throughput::new(400.0),
         );
         history.push(point2.clone());
 

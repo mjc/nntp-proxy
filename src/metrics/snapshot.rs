@@ -160,7 +160,7 @@ impl MetricsSnapshot {
     pub fn healthy_backends(&self) -> impl Iterator<Item = BackendId> + '_ {
         self.backend_stats
             .iter()
-            .filter(|stats| stats.health_status == HealthStatus::Healthy)
+            .filter(|stats| stats.health_status == BackendHealthStatus::Healthy)
             .map(|stats| stats.backend_id)
     }
 
@@ -181,9 +181,9 @@ impl MetricsSnapshot {
         self.backend_stats
             .iter()
             .fold((0, 0, 0), |(h, d, dn), stats| match stats.health_status {
-                HealthStatus::Healthy => (h + 1, d, dn),
-                HealthStatus::Degraded => (h, d + 1, dn),
-                HealthStatus::Down => (h, d, dn + 1),
+                BackendHealthStatus::Healthy => (h + 1, d, dn),
+                BackendHealthStatus::Degraded => (h, d + 1, dn),
+                BackendHealthStatus::Down => (h, d, dn + 1),
             })
     }
 }
@@ -203,7 +203,7 @@ mod tests {
             errors: ErrorCount::new(5),
             bytes_sent: BytesSent::new(1000),
             bytes_received: BytesReceived::new(2000),
-            health_status: HealthStatus::Healthy,
+            health_status: BackendHealthStatus::Healthy,
             active_connections: ActiveConnections::new(3),
             errors_4xx: ErrorCount::new(2),
             errors_5xx: ErrorCount::new(3),
@@ -222,7 +222,7 @@ mod tests {
             errors: ErrorCount::new(10),
             bytes_sent: BytesSent::new(500),
             bytes_received: BytesReceived::new(1500),
-            health_status: HealthStatus::Degraded,
+            health_status: BackendHealthStatus::Degraded,
             active_connections: ActiveConnections::new(2),
             errors_4xx: ErrorCount::new(5),
             errors_5xx: ErrorCount::new(5),
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn test_healthy_backends_all_down() {
         let backend = BackendStats {
-            health_status: HealthStatus::Down,
+            health_status: BackendHealthStatus::Down,
             ..Default::default()
         };
 
@@ -430,17 +430,17 @@ mod tests {
         let backends = vec![
             BackendStats {
                 backend_id: BackendId::from_index(0),
-                health_status: HealthStatus::Healthy,
+                health_status: BackendHealthStatus::Healthy,
                 ..Default::default()
             },
             BackendStats {
                 backend_id: BackendId::from_index(1),
-                health_status: HealthStatus::Healthy,
+                health_status: BackendHealthStatus::Healthy,
                 ..Default::default()
             },
             BackendStats {
                 backend_id: BackendId::from_index(2),
-                health_status: HealthStatus::Down,
+                health_status: BackendHealthStatus::Down,
                 ..Default::default()
             },
         ];

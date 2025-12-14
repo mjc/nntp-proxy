@@ -164,17 +164,6 @@ pub mod per_command_routing {
     pub const MAX_TERMINATOR_SPAN_CHECK: usize = 9;
 }
 
-/// Stateless proxy protocol constants
-pub mod stateless_proxy {
-    pub const NNTP_BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
-    pub const NNTP_COMMAND_NOT_SUPPORTED: &[u8] =
-        b"500 Command not supported by this proxy (stateless proxy mode)\r\n";
-
-    /// Prewarming configuration constants
-    pub const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5
-    pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
-}
-
 /// Session and metrics constants
 pub mod session {
     /// Flush incremental metrics every N commands for long-running sessions

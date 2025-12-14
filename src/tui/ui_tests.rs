@@ -7,7 +7,7 @@ mod tests {
     use crate::tui::helpers::{
         calculate_chart_bounds, format_summary_throughput, format_throughput_label,
     };
-    use crate::types::tui::{BytesPerSecond, Timestamp};
+    use crate::types::tui::{Throughput, Timestamp};
 
     // ========================================================================
     // Layout Tests
@@ -109,8 +109,8 @@ mod tests {
     fn test_summary_throughput_formatting() {
         let point = ThroughputPoint::new_client(
             Timestamp::now(),
-            BytesPerSecond::new(1_000_000.0),
-            BytesPerSecond::new(2_000_000.0),
+            Throughput::new(1_000_000.0),
+            Throughput::new(2_000_000.0),
         );
 
         let (up, down) = format_summary_throughput(Some(&point));

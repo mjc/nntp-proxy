@@ -25,12 +25,13 @@ use tracing::{debug, info, warn};
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
     name: String,
-    /// Keepalive interval for periodic health checks (stored for debugging/info)
-    #[allow(dead_code)]
+    /// Keepalive interval for periodic health checks.
+    /// Stored for Debug output and potential future status reporting.
+    #[allow(dead_code)] // Used in Debug derive, may be exposed in future status API
     keepalive_interval: Option<std::time::Duration>,
-    /// Shutdown signal sender for background health check task
-    /// Kept alive to enable graceful shutdown when the provider is dropped
-    #[allow(dead_code)]
+    /// Shutdown signal sender for background health check task.
+    /// Stored to keep the channel alive - when dropped, the background task will terminate.
+    /// Used by `shutdown()` method to gracefully stop health checks.
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Metrics for health check operations (lock-free)
     pub health_check_metrics: Arc<HealthCheckMetrics>,

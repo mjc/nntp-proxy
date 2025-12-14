@@ -304,9 +304,14 @@ mod tests {
 }
 
 // ============================================================================
-// Macro for Non-Byte Counter Types
+// Macro for Display-Oriented Counter Types (with unit strings)
 // ============================================================================
 
+/// Define a counter type with a unit string for display formatting.
+///
+/// Unlike `metrics::types::counter_type!` which is for internal counting operations
+/// with `increment()` and `saturating_sub()`, this macro creates types focused on
+/// display with a unit suffix (e.g., "42 connections").
 macro_rules! define_counter {
     ($name:ident, $unit:expr) => {
         #[repr(transparent)]

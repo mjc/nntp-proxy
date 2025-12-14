@@ -194,12 +194,14 @@ pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) ->
 
 /// Health status icon and color
 #[must_use]
-pub const fn health_indicator(status: crate::metrics::HealthStatus) -> (&'static str, Color) {
-    use crate::metrics::HealthStatus;
+pub const fn health_indicator(
+    status: crate::metrics::BackendHealthStatus,
+) -> (&'static str, Color) {
+    use crate::metrics::BackendHealthStatus;
     match status {
-        HealthStatus::Healthy => ("●", Color::Green),
-        HealthStatus::Degraded => ("◐", Color::Yellow),
-        HealthStatus::Down => ("○", Color::Red),
+        BackendHealthStatus::Healthy => ("●", Color::Green),
+        BackendHealthStatus::Degraded => ("◐", Color::Yellow),
+        BackendHealthStatus::Down => ("○", Color::Red),
     }
 }
 
@@ -412,12 +414,12 @@ mod tests {
     #[test]
     fn test_format_summary_throughput_with_data() {
         use super::super::constants::text;
-        use crate::types::tui::{BytesPerSecond, CommandsPerSecond, Timestamp};
+        use crate::types::tui::{CommandsPerSecond, Throughput, Timestamp};
 
         let point = ThroughputPoint::new_backend(
             Timestamp::now(),
-            BytesPerSecond::new(1_000_000.0),
-            BytesPerSecond::new(2_000_000.0),
+            Throughput::new(1_000_000.0),
+            Throughput::new(2_000_000.0),
             CommandsPerSecond::new(10.0),
         );
 

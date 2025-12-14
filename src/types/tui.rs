@@ -39,11 +39,14 @@ impl Default for HistorySize {
     }
 }
 
-/// Type-safe throughput in bytes per second
+/// Type-safe throughput in bytes per second (f64 for display formatting)
+///
+/// This is distinct from `metrics::BytesPerSecond` (u64) which is used for rate calculations.
+/// This type includes display formatting methods for the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct BytesPerSecond(f64);
+pub struct Throughput(f64);
 
-impl BytesPerSecond {
+impl Throughput {
     /// Create from raw value
     #[must_use]
     #[inline]
@@ -78,19 +81,19 @@ impl BytesPerSecond {
     }
 }
 
-impl Default for BytesPerSecond {
+impl Default for Throughput {
     fn default() -> Self {
         Self::zero()
     }
 }
 
-impl fmt::Display for BytesPerSecond {
+impl fmt::Display for Throughput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.format())
     }
 }
 
-impl From<f64> for BytesPerSecond {
+impl From<f64> for Throughput {
     fn from(bps: f64) -> Self {
         Self::new(bps)
     }
@@ -229,51 +232,51 @@ mod tests {
         assert_eq!(HistorySize::new(1000).get(), 1000);
     }
 
-    // BytesPerSecond tests
+    // Throughput tests
     #[test]
     fn test_bytes_per_second() {
-        let bps = BytesPerSecond::new(1_500_000.0);
+        let bps = Throughput::new(1_500_000.0);
         assert_eq!(bps.format(), "1.50 MB/s");
 
-        let bps2 = BytesPerSecond::new(2_500.0);
+        let bps2 = Throughput::new(2_500.0);
         assert_eq!(bps2.format(), "2.50 KB/s");
 
-        let bps3 = BytesPerSecond::new(500.0);
+        let bps3 = Throughput::new(500.0);
         assert_eq!(bps3.format(), "500 B/s");
 
-        assert_eq!(BytesPerSecond::zero().get(), 0.0);
+        assert_eq!(Throughput::zero().get(), 0.0);
     }
 
     #[test]
     fn test_bytes_per_second_format_boundaries() {
         // Just over 1 MB/s
-        assert_eq!(BytesPerSecond::new(1_000_001.0).format(), "1.00 MB/s");
+        assert_eq!(Throughput::new(1_000_001.0).format(), "1.00 MB/s");
         // Just under 1 MB/s
-        assert_eq!(BytesPerSecond::new(999_999.0).format(), "1000.00 KB/s");
+        assert_eq!(Throughput::new(999_999.0).format(), "1000.00 KB/s");
         // Just over 1 KB/s
-        assert_eq!(BytesPerSecond::new(1_001.0).format(), "1.00 KB/s");
+        assert_eq!(Throughput::new(1_001.0).format(), "1.00 KB/s");
         // Just under 1 KB/s
-        assert_eq!(BytesPerSecond::new(999.0).format(), "999 B/s");
+        assert_eq!(Throughput::new(999.0).format(), "999 B/s");
         // Zero
-        assert_eq!(BytesPerSecond::zero().format(), "0 B/s");
+        assert_eq!(Throughput::zero().format(), "0 B/s");
     }
 
     #[test]
     fn test_bytes_per_second_default() {
-        let bps = BytesPerSecond::default();
+        let bps = Throughput::default();
         assert_eq!(bps.get(), 0.0);
     }
 
     #[test]
     fn test_bytes_per_second_display() {
-        assert_eq!(BytesPerSecond::new(1_500_000.0).to_string(), "1.50 MB/s");
-        assert_eq!(BytesPerSecond::new(2_500.0).to_string(), "2.50 KB/s");
-        assert_eq!(BytesPerSecond::new(500.0).to_string(), "500 B/s");
+        assert_eq!(Throughput::new(1_500_000.0).to_string(), "1.50 MB/s");
+        assert_eq!(Throughput::new(2_500.0).to_string(), "2.50 KB/s");
+        assert_eq!(Throughput::new(500.0).to_string(), "500 B/s");
     }
 
     #[test]
     fn test_bytes_per_second_from_f64() {
-        let bps = BytesPerSecond::from(1234.5);
+        let bps = Throughput::from(1234.5);
         assert_eq!(bps.get(), 1234.5);
     }
 

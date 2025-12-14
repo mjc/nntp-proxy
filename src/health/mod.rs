@@ -2,34 +2,13 @@ mod types;
 
 pub use types::{BackendHealth, HealthMetrics, HealthStatus};
 
+use crate::config::HealthCheck;
 use crate::protocol::{DATE, StatusCode};
 use crate::types::BackendId;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time;
-
-/// Configuration for health checking
-#[derive(Debug, Clone)]
-pub struct HealthCheck {
-    /// Interval between health checks
-    pub check_interval: Duration,
-    /// Timeout for each health check
-    pub check_timeout: Duration,
-    /// Number of consecutive failures before marking unhealthy
-    pub unhealthy_threshold: u32,
-}
-
-impl Default for HealthCheck {
-    fn default() -> Self {
-        Self {
-            check_interval: Duration::from_secs(30),
-            check_timeout: Duration::from_secs(5),
-            unhealthy_threshold: 3,
-        }
-    }
-}
 
 /// Health checker for backend connections
 pub struct HealthChecker {
@@ -59,7 +38,7 @@ impl HealthChecker {
         providers: Vec<crate::pool::DeadpoolConnectionProvider>,
     ) {
         tokio::spawn(async move {
-            let mut interval = time::interval(self.config.check_interval);
+            let mut interval = time::interval(self.config.interval);
             loop {
                 interval.tick().await;
 
@@ -82,14 +61,14 @@ impl HealthChecker {
     ) {
         // Check if this backend needs a check
         if let Some(backend_health) = self.backend_health.get(&backend_id)
-            && !backend_health.needs_check(self.config.check_interval)
+            && !backend_health.needs_check(self.config.interval)
         {
             return;
         }
 
         // Perform the health check with timeout
         let check_result = time::timeout(
-            self.config.check_timeout,
+            self.config.timeout,
             self.perform_health_check(provider.clone(), backend_id),
         )
         .await;
@@ -99,7 +78,9 @@ impl HealthChecker {
 
         match check_result {
             Ok(Ok(())) => backend_health.record_success(),
-            Ok(Err(_)) | Err(_) => backend_health.record_failure(self.config.unhealthy_threshold),
+            Ok(Err(_)) | Err(_) => {
+                backend_health.record_failure(self.config.unhealthy_threshold.get())
+            }
         }
     }
 
@@ -176,6 +157,7 @@ impl HealthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MaxErrors;
     use std::time::Duration;
 
     #[tokio::test]
@@ -237,31 +219,31 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_config_default() {
         let config = HealthCheck::default();
-        assert_eq!(config.check_interval, Duration::from_secs(30));
-        assert_eq!(config.check_timeout, Duration::from_secs(5));
-        assert_eq!(config.unhealthy_threshold, 3);
+        assert_eq!(config.interval, Duration::from_secs(30));
+        assert_eq!(config.timeout, Duration::from_secs(5));
+        assert_eq!(config.unhealthy_threshold.get(), 3);
     }
 
     #[tokio::test]
     async fn test_health_check_config_custom() {
         let config = HealthCheck {
-            check_interval: Duration::from_secs(10),
-            check_timeout: Duration::from_secs(2),
-            unhealthy_threshold: 5,
+            interval: Duration::from_secs(10),
+            timeout: Duration::from_secs(2),
+            unhealthy_threshold: MaxErrors::try_new(5).unwrap(),
         };
 
         let checker = HealthChecker::new(config.clone());
-        assert_eq!(checker.config.check_interval, Duration::from_secs(10));
-        assert_eq!(checker.config.check_timeout, Duration::from_secs(2));
-        assert_eq!(checker.config.unhealthy_threshold, 5);
+        assert_eq!(checker.config.interval, Duration::from_secs(10));
+        assert_eq!(checker.config.timeout, Duration::from_secs(2));
+        assert_eq!(checker.config.unhealthy_threshold.get(), 5);
     }
 
     #[tokio::test]
     async fn test_simulated_connection_failure() {
         let config = HealthCheck {
-            check_interval: Duration::from_millis(100),
-            check_timeout: Duration::from_millis(50),
-            unhealthy_threshold: 2,
+            interval: Duration::from_millis(100),
+            timeout: Duration::from_millis(50),
+            unhealthy_threshold: MaxErrors::try_new(2).unwrap(),
         };
         let checker = HealthChecker::new(config);
         let backend_id = BackendId::from_index(0);
@@ -283,9 +265,9 @@ mod tests {
     #[tokio::test]
     async fn test_recovery_after_failures() {
         let config = HealthCheck {
-            check_interval: Duration::from_millis(100),
-            check_timeout: Duration::from_millis(50),
-            unhealthy_threshold: 2,
+            interval: Duration::from_millis(100),
+            timeout: Duration::from_millis(50),
+            unhealthy_threshold: MaxErrors::try_new(2).unwrap(),
         };
         let checker = HealthChecker::new(config);
         let backend_id = BackendId::from_index(0);
@@ -449,15 +431,15 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_clone() {
         let config1 = HealthCheck {
-            check_interval: Duration::from_secs(15),
-            check_timeout: Duration::from_secs(3),
-            unhealthy_threshold: 5,
+            interval: Duration::from_secs(15),
+            timeout: Duration::from_secs(3),
+            unhealthy_threshold: MaxErrors::try_new(5).unwrap(),
         };
 
         let config2 = config1.clone();
 
-        assert_eq!(config1.check_interval, config2.check_interval);
-        assert_eq!(config1.check_timeout, config2.check_timeout);
+        assert_eq!(config1.interval, config2.interval);
+        assert_eq!(config1.timeout, config2.timeout);
         assert_eq!(config1.unhealthy_threshold, config2.unhealthy_threshold);
     }
 
@@ -467,8 +449,8 @@ mod tests {
         let debug_str = format!("{:?}", config);
 
         assert!(debug_str.contains("HealthCheck"));
-        assert!(debug_str.contains("check_interval"));
-        assert!(debug_str.contains("check_timeout"));
+        assert!(debug_str.contains("interval"));
+        assert!(debug_str.contains("timeout"));
         assert!(debug_str.contains("unhealthy_threshold"));
     }
 
@@ -508,22 +490,22 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_custom_thresholds() {
         let config1 = HealthCheck {
-            check_interval: Duration::from_secs(1),
-            check_timeout: Duration::from_secs(1),
-            unhealthy_threshold: 1,
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            unhealthy_threshold: MaxErrors::try_new(1).unwrap(),
         };
 
         let config2 = HealthCheck {
-            check_interval: Duration::from_secs(60),
-            check_timeout: Duration::from_secs(10),
-            unhealthy_threshold: 10,
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(10),
+            unhealthy_threshold: MaxErrors::try_new(10).unwrap(),
         };
 
         let checker1 = HealthChecker::new(config1);
         let checker2 = HealthChecker::new(config2);
 
-        assert_eq!(checker1.config.unhealthy_threshold, 1);
-        assert_eq!(checker2.config.unhealthy_threshold, 10);
+        assert_eq!(checker1.config.unhealthy_threshold.get(), 1);
+        assert_eq!(checker2.config.unhealthy_threshold.get(), 10);
     }
 
     #[tokio::test]

@@ -14,7 +14,10 @@ use std::num::NonZeroU64;
 // Macros to reduce boilerplate
 // ============================================================================
 
-/// Define a simple u64-based counter newtype with standard operations
+/// Define a simple u64-based counter newtype with mutation operations.
+///
+/// Used for internal counting that needs `increment()` and `saturating_sub()`.
+/// For display-oriented types with unit strings, see `types::metrics::define_counter!`.
 macro_rules! counter_type {
     ($name:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -102,12 +105,15 @@ macro_rules! f64_type {
 }
 
 // ============================================================================
-// Health Status
+// Backend Health Status (for metrics display)
 // ============================================================================
 
-/// Backend health status
+/// Backend health status for metrics display (distinct from health::HealthStatus)
+///
+/// This 3-state enum is used for UI/metrics purposes, while `health::HealthStatus`
+/// is a binary Healthy/Unhealthy used for actual health checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthStatus {
+pub enum BackendHealthStatus {
     /// Backend is healthy and responding normally
     Healthy,
     /// Backend is degraded (high error rate or slow)
@@ -116,7 +122,7 @@ pub enum HealthStatus {
     Down,
 }
 
-impl From<u8> for HealthStatus {
+impl From<u8> for BackendHealthStatus {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Healthy,
@@ -127,12 +133,12 @@ impl From<u8> for HealthStatus {
     }
 }
 
-impl From<HealthStatus> for u8 {
-    fn from(status: HealthStatus) -> Self {
+impl From<BackendHealthStatus> for u8 {
+    fn from(status: BackendHealthStatus) -> Self {
         match status {
-            HealthStatus::Healthy => 0,
-            HealthStatus::Degraded => 1,
-            HealthStatus::Down => 2,
+            BackendHealthStatus::Healthy => 0,
+            BackendHealthStatus::Degraded => 1,
+            BackendHealthStatus::Down => 2,
         }
     }
 }
