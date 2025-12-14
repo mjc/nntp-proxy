@@ -54,7 +54,6 @@ pub mod cache;
 pub mod command;
 pub mod config;
 pub mod constants;
-pub mod health;
 pub mod pool;
 pub mod router;
 pub mod runtime;

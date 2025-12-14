@@ -7,7 +7,6 @@
 //! - Periodic health checks for idle connections
 //! - Graceful shutdown with QUIT commands
 
-use super::connection_pool::ConnectionPool;
 use super::connection_trait::ConnectionProvider;
 use super::deadpool_connection::{Pool, TcpManager};
 use super::health_check::{HealthCheckMetrics, check_date_response};
@@ -339,6 +338,27 @@ impl DeadpoolConnectionProvider {
         self.pool.status().max_size
     }
 
+    /// Get the name/identifier of this connection pool
+    #[must_use]
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the backend host this pool connects to
+    #[must_use]
+    #[inline]
+    pub fn host(&self) -> &str {
+        &self.pool.manager().host
+    }
+
+    /// Get the backend port this pool connects to
+    #[must_use]
+    #[inline]
+    pub fn port(&self) -> u16 {
+        self.pool.manager().port
+    }
+
     /// Get a reference to the health check metrics
     pub fn health_check_metrics(&self) -> &HealthCheckMetrics {
         &self.health_check_metrics
@@ -489,46 +509,6 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
     }
 }
 
-#[async_trait]
-impl ConnectionPool for DeadpoolConnectionProvider {
-    async fn get(&self) -> Result<crate::stream::ConnectionStream> {
-        let conn = self.get_pooled_connection().await?;
-
-        // Extract the ConnectionStream from the deadpool Object wrapper.
-        //
-        // IMPORTANT: Object::take() consumes the wrapper and returns the inner stream.
-        // This removes the connection from the pool permanently - it will NOT be
-        // automatically returned when dropped. This is intentional for the ConnectionPool
-        // trait which provides raw streams that the caller is responsible for managing.
-        //
-        // For automatic pool return, use get_pooled_connection() instead, which returns
-        // a managed::Object that auto-returns to the pool on drop.
-        let stream = deadpool::managed::Object::take(conn);
-        Ok(stream)
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn status(&self) -> PoolStatus {
-        use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
-        let status = self.pool.status();
-        PoolStatus {
-            available: AvailableConnections::new(status.available),
-            max_size: MaxPoolSize::new(status.max_size),
-            created: CreatedConnections::new(status.size),
-        }
-    }
-
-    fn host(&self) -> &str {
-        &self.pool.manager().host
-    }
-
-    fn port(&self) -> u16 {
-        self.pool.manager().port
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,12 +612,12 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_implements_connection_pool_trait() {
+    fn test_provider_inherent_methods() {
         let provider = DeadpoolConnectionProvider::builder("localhost", 119)
             .build()
             .unwrap();
 
-        // Should implement ConnectionPool trait methods
+        // Test inherent methods
         assert_eq!(provider.name(), "localhost:119");
         assert_eq!(provider.host(), "localhost");
         assert_eq!(provider.port(), 119);
@@ -660,7 +640,7 @@ mod tests {
         assert_eq!(provider.host(), "news.test.com");
         assert_eq!(provider.port(), 563);
 
-        let status = ConnectionPool::status(&provider);
+        let status = ConnectionProvider::status(&provider);
         assert_eq!(status.max_size.get(), 42);
     }
 
@@ -713,22 +693,6 @@ mod tests {
 
         let status = ConnectionProvider::status(&provider);
         assert_eq!(status.max_size.get(), 1000);
-    }
-
-    #[test]
-    fn test_connection_pool_trait_status_consistency() {
-        let provider = DeadpoolConnectionProvider::builder("localhost", 119)
-            .max_connections(20)
-            .build()
-            .unwrap();
-
-        // Both trait implementations should return same status
-        let status1 = <DeadpoolConnectionProvider as ConnectionProvider>::status(&provider);
-        let status2 = <DeadpoolConnectionProvider as ConnectionPool>::status(&provider);
-
-        assert_eq!(status1.max_size, status2.max_size);
-        assert_eq!(status1.available, status2.available);
-        assert_eq!(status1.created, status2.created);
     }
 
     #[test]

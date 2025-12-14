@@ -811,6 +811,23 @@ impl ClientSession {
             .is_some_and(|code| is_430_status_code(code.as_u16()))
     }
 
+    /// Spawn async cache upsert task
+    ///
+    /// This is fire-and-forget - we don't wait for the cache to update.
+    /// Used after successfully streaming a response to update availability tracking.
+    fn spawn_cache_upsert(
+        &self,
+        msg_id: &crate::types::MessageId<'_>,
+        buffer: Vec<u8>,
+        backend_id: crate::types::BackendId,
+    ) {
+        let cache_clone = self.cache.clone();
+        let msg_id_owned = msg_id.to_owned();
+        tokio::spawn(async move {
+            cache_clone.upsert(msg_id_owned, buffer, backend_id).await;
+        });
+    }
+
     /// Record timing metrics for a backend response
     fn record_timing_metrics(
         &self,
@@ -906,11 +923,7 @@ impl ClientSession {
                 .await?;
 
                 if let Some(msg_id_ref) = msg_id {
-                    let cache_clone = self.cache.clone();
-                    let msg_id_owned = msg_id_ref.to_owned();
-                    tokio::spawn(async move {
-                        cache_clone.upsert(msg_id_owned, captured, backend_id).await;
-                    });
+                    self.spawn_cache_upsert(msg_id_ref, captured, backend_id);
                 }
                 Ok(bytes)
             }
@@ -927,14 +940,7 @@ impl ClientSession {
                 .await?;
 
                 if let Some(msg_id_ref) = msg_id {
-                    let cache_clone = self.cache.clone();
-                    let msg_id_owned = msg_id_ref.to_owned();
-                    let buffer_for_cache = first_chunk.to_vec();
-                    tokio::spawn(async move {
-                        cache_clone
-                            .upsert(msg_id_owned, buffer_for_cache, backend_id)
-                            .await;
-                    });
+                    self.spawn_cache_upsert(msg_id_ref, first_chunk.to_vec(), backend_id);
                 }
                 Ok(bytes)
             }
@@ -954,14 +960,7 @@ impl ClientSession {
             (false, CacheAction::TrackStat) => {
                 client_write.write_all(first_chunk).await?;
                 if let Some(msg_id_ref) = msg_id {
-                    let cache_clone = self.cache.clone();
-                    let msg_id_owned = msg_id_ref.to_owned();
-                    let buffer_for_cache = b"223\r\n".to_vec();
-                    tokio::spawn(async move {
-                        cache_clone
-                            .upsert(msg_id_owned, buffer_for_cache, backend_id)
-                            .await;
-                    });
+                    self.spawn_cache_upsert(msg_id_ref, b"223\r\n".to_vec(), backend_id);
                 }
                 Ok(first_chunk_size as u64)
             }
