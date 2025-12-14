@@ -14,7 +14,6 @@ use tracing::{debug, info, warn};
 
 use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
-use crate::connection_error::ConnectionError;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::router::BackendSelector;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
@@ -667,29 +666,10 @@ impl ClientSession {
         // Execute command
         let mut conn = provider.get_pooled_connection().await?;
 
-        // Apply timeout at this level so we can handle drain properly
-        let timeout = precheck::calculate_adaptive_timeout(self.metrics.as_ref());
-        // Execute with timeout - flatten the Result<Result<...>> with `?`
-        let (n, response_code, is_multiline, ttfb, send, recv) = match tokio::time::timeout(
-            timeout,
-            self.execute_and_get_first_chunk(&mut conn, backend_id, command, buffer),
-        )
-        .await
-        {
-            Ok(result) => result?, // Flatten: propagate execution errors
-            Err(_elapsed) => {
-                // Timeout - spawn task to drain and return to pool (backend throttles new connections)
-                self.handle_backend_error(backend_id, &router);
-
-                // Spawn drain task - takes ownership of connection
-                tokio::spawn(crate::pool::drain_connection_async(
-                    conn,
-                    self.buffer_pool.clone(),
-                ));
-
-                return Err(ConnectionError::BackendTimeout { timeout }.into());
-            }
-        };
+        // Execute command without timeout
+        let (n, response_code, is_multiline, ttfb, send, recv) = self
+            .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
+            .await?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
@@ -865,12 +845,14 @@ impl ClientSession {
         &self,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
-        last_430_response: Option<Vec<u8>>,
+        _last_430_response: Option<Vec<u8>>,
     ) -> Result<()> {
-        if let Some(response) = last_430_response {
-            client_write.write_all(&response).await?;
-            *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-        }
+        // Always send our standardized 430, never forward backend's response
+        client_write
+            .write_all(crate::protocol::NO_SUCH_ARTICLE)
+            .await?;
+        *backend_to_client_bytes =
+            backend_to_client_bytes.add(crate::protocol::NO_SUCH_ARTICLE.len());
         Ok(())
     }
 

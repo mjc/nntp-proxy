@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
 
 use crate::cache::ArticleCache;
 use crate::metrics::MetricsCollector;
@@ -26,30 +25,6 @@ use crate::pool::BufferPool;
 use crate::router::BackendSelector;
 use crate::session::backend;
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
-
-/// Calculate adaptive timeout based on average TTFB across backends
-///
-/// Returns a timeout based on TTFB³, with a minimum of 5 seconds.
-/// This prevents slow backends from blocking while allowing reasonable TTFB detection.
-pub fn calculate_adaptive_timeout(metrics: Option<&MetricsCollector>) -> std::time::Duration {
-    metrics
-        .and_then(|m| {
-            let snapshot = m.snapshot(None);
-            let avg_ttfb_ms: f64 = snapshot
-                .backend_stats
-                .iter()
-                .filter_map(|b| b.average_ttfb_ms())
-                .sum::<f64>()
-                / snapshot.backend_stats.len().max(1) as f64;
-
-            (avg_ttfb_ms > 0.0).then(|| {
-                let ttfb_cubed = (avg_ttfb_ms / 1000.0).powi(3);
-                std::time::Duration::from_secs_f64(ttfb_cubed)
-            })
-        })
-        .unwrap_or(std::time::Duration::from_secs(5))
-        .max(std::time::Duration::from_secs(5))
-}
 
 /// Dependencies needed for precheck operations
 pub struct PrecheckContext {
@@ -156,8 +131,6 @@ pub async fn handle_stat_precheck(
     msg_id: &MessageId<'_>,
     client_write: &mut tokio::net::tcp::WriteHalf<'_>,
 ) -> Result<BackendId> {
-    let timeout = calculate_adaptive_timeout(ctx.metrics.as_ref());
-
     // Query all backends concurrently
     let backend_queries = (0..ctx.router.backend_count().get())
         .map(BackendId::from_index)
@@ -175,31 +148,15 @@ pub async fn handle_stat_precheck(
                 let mut conn = provider.get_pooled_connection().await.ok()?;
                 let mut buffer = buffer_pool.acquire().await;
 
-                // Send command without timeout
+                // Send command
                 conn.as_mut().write_all(command.as_bytes()).await.ok()?;
 
-                // Timeout only on first byte read
-                let read_result = tokio::time::timeout(timeout, async {
-                    let n = buffer.read_from(&mut *conn).await.ok()?;
-                    if n == 0 {
-                        return None;
-                    }
-                    Some((n, buffer[..n].to_vec()))
-                })
-                .await;
-
-                let (_bytes_read, response_bytes) = match read_result {
-                    Ok(Some(data)) => data,
-                    Ok(None) => return None,
-                    Err(_) => {
-                        debug!(
-                            backend = backend_id.as_index(),
-                            timeout_ms = timeout.as_millis(),
-                            "STAT query timed out waiting for first byte"
-                        );
-                        return None;
-                    }
-                };
+                // Read response
+                let n = buffer.read_from(&mut *conn).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                let response_bytes = buffer[..n].to_vec();
 
                 // Parse response code
                 let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
@@ -283,8 +240,6 @@ pub async fn handle_head_precheck(
 ) -> Result<BackendId> {
     use tokio::io::AsyncReadExt;
 
-    let timeout = calculate_adaptive_timeout(ctx.metrics.as_ref());
-
     // Query all backends concurrently
     let backend_queries = (0..ctx.router.backend_count().get())
         .map(BackendId::from_index)
@@ -303,31 +258,15 @@ pub async fn handle_head_precheck(
                 let mut conn = provider.get_pooled_connection().await.ok()?;
                 let mut buffer = buffer_pool.acquire().await;
 
-                // Send command without timeout
+                // Send command
                 conn.as_mut().write_all(command.as_bytes()).await.ok()?;
 
-                // Timeout only on first byte read
-                let read_result = tokio::time::timeout(timeout, async {
-                    let n = buffer.read_from(&mut *conn).await.ok()?;
-                    if n == 0 {
-                        return None;
-                    }
-                    Some((n, buffer[..n].to_vec()))
-                })
-                .await;
-
-                let (_bytes_read, mut response_bytes) = match read_result {
-                    Ok(Some(data)) => data,
-                    Ok(None) => return None,
-                    Err(_) => {
-                        debug!(
-                            backend = backend_id.as_index(),
-                            timeout_ms = timeout.as_millis(),
-                            "HEAD query timed out waiting for first byte"
-                        );
-                        return None;
-                    }
-                };
+                // Read response
+                let n = buffer.read_from(&mut *conn).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                let mut response_bytes = buffer[..n].to_vec();
 
                 // Parse response code
                 let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
@@ -416,23 +355,5 @@ pub async fn handle_head_precheck(
             ctx.router.complete_command(backend_id);
             Ok(backend_id)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_calculate_adaptive_timeout_no_metrics() {
-        let timeout = calculate_adaptive_timeout(None);
-        assert_eq!(timeout, std::time::Duration::from_secs(5));
-    }
-
-    #[test]
-    fn test_calculate_adaptive_timeout_minimum() {
-        // Even with 0 TTFB, should return minimum 5s
-        let timeout = calculate_adaptive_timeout(None);
-        assert!(timeout >= std::time::Duration::from_secs(5));
     }
 }
