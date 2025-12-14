@@ -29,7 +29,7 @@ pub fn unhealthy_threshold() -> MaxErrors {
     MaxErrors::try_new(3).expect("3 is non-zero")
 }
 
-/// Default cache max capacity (number of articles)
+/// Default cache max capacity in bytes
 #[inline]
 pub fn cache_max_capacity() -> CacheCapacity {
     // 64 MB default (good for availability-only mode)

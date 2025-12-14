@@ -696,7 +696,12 @@ impl ClientSession {
         {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.handle_backend_error(backend_id, &router);
+                // Only mark as backend error if it's NOT a client disconnect
+                // Client disconnects should not penalize the backend
+                if !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&e)
+                {
+                    self.handle_backend_error(backend_id, &router);
+                }
                 crate::pool::remove_from_pool(conn);
                 return Err(e);
             }

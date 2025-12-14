@@ -89,8 +89,8 @@ impl CommonArgs {
 /// Cache-specific arguments
 #[derive(Parser, Debug, Clone)]
 pub struct CacheArgs {
-    /// Cache max capacity (number of articles)
-    #[arg(long, default_value = "10000", env)]
+    /// Cache max capacity in bytes (default 64 MB)
+    #[arg(long, default_value = "67108864", env)]
     pub cache_capacity: CacheCapacity,
 
     /// Cache TTL in seconds
@@ -223,11 +223,11 @@ mod tests {
     #[test]
     fn test_cache_args_defaults() {
         let args = CacheArgs {
-            cache_capacity: CacheCapacity::try_new(10000).unwrap(),
+            cache_capacity: CacheCapacity::try_new(67108864).unwrap(), // 64 MB
             cache_ttl: 3600,
         };
 
-        assert_eq!(args.capacity(), 10000);
+        assert_eq!(args.capacity(), 67108864);
         assert_eq!(args.cache_ttl, 3600);
         assert_eq!(args.ttl(), std::time::Duration::from_secs(3600));
     }
@@ -235,11 +235,11 @@ mod tests {
     #[test]
     fn test_cache_args_custom_values() {
         let args = CacheArgs {
-            cache_capacity: CacheCapacity::try_new(50000).unwrap(),
+            cache_capacity: CacheCapacity::try_new(134217728).unwrap(), // 128 MB
             cache_ttl: 7200,
         };
 
-        assert_eq!(args.capacity(), 50000);
+        assert_eq!(args.capacity(), 134217728);
         assert_eq!(args.cache_ttl, 7200);
         assert_eq!(args.ttl(), std::time::Duration::from_secs(7200));
     }

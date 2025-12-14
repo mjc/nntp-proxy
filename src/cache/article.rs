@@ -337,7 +337,7 @@ impl ArticleCache {
     /// Create a new article cache
     ///
     /// # Arguments
-    /// * `max_capacity` - Maximum number of articles to cache
+    /// * `max_capacity` - Maximum cache size in bytes (uses weighted entries)
     /// * `ttl` - Time-to-live for cached articles
     /// * `cache_articles` - Whether to cache full article bodies (true) or just availability (false)
     pub fn new(max_capacity: u64, ttl: Duration, cache_articles: bool) -> Self {
