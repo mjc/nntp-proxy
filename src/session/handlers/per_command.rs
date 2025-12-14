@@ -16,7 +16,7 @@ use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::router::BackendSelector;
-use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, PartialEq, Eq)]
@@ -434,23 +434,20 @@ impl ClientSession {
                         self.client_addr, msg_id_ref, self.cache_articles
                     );
 
+                    // Spawn background precheck for STAT to update availability
+                    if self.adaptive_precheck && command.to_uppercase().starts_with("STAT ") {
+                        precheck::spawn_background_precheck(
+                            self.precheck_deps(&router),
+                            command.to_string(),
+                            msg_id_ref.to_owned(),
+                        );
+                    }
+
                     // If full article caching enabled, serve from cache
                     if self.cache_articles {
                         client_write.write_all(cached.response()).await?;
                         *backend_to_client_bytes =
                             backend_to_client_bytes.add(cached.response().len());
-
-                        // Spawn background precheck for STAT/HEAD to update cache
-                        if self.adaptive_precheck {
-                            let cmd_upper = command.to_uppercase();
-                            if cmd_upper.starts_with("STAT ") {
-                                precheck::spawn_background_stat_precheck(
-                                    self.precheck_deps(&router),
-                                    command.to_string(),
-                                    msg_id_ref.to_owned(),
-                                );
-                            }
-                        }
 
                         let backend_id = router.route_command(self.client_id, command)?;
                         router.complete_command(backend_id);
@@ -475,27 +472,18 @@ impl ClientSession {
             && let Some(ref msg_id_ref) = msg_id
         {
             let cmd_upper = command.to_uppercase();
-            if cmd_upper.starts_with("STAT ") {
+            let is_stat = cmd_upper.starts_with("STAT ");
+            let is_head = cmd_upper.starts_with("HEAD ");
+
+            if is_stat || is_head {
                 let deps = self.precheck_deps(&router);
-                return precheck::handle_stat_precheck(
-                    &deps,
-                    self.client_id,
-                    command,
-                    msg_id_ref,
-                    client_write,
-                )
-                .await;
-            } else if cmd_upper.starts_with("HEAD ") {
-                let deps = self.precheck_deps(&router);
-                return precheck::handle_head_precheck(
-                    &deps,
-                    self.client_id,
-                    command,
-                    msg_id_ref,
-                    client_write,
-                    backend_to_client_bytes,
-                )
-                .await;
+                let response = match precheck::precheck(&deps, command, msg_id_ref, is_head).await {
+                    Some(entry) => entry.buffer().to_vec(),
+                    None => crate::protocol::NO_SUCH_ARTICLE.to_vec(),
+                };
+                client_write.write_all(&response).await?;
+                *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
+                return Ok(BackendId::from_index(0));
             }
         }
 

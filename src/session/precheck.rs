@@ -5,31 +5,20 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::cache::ArticleCache;
+use crate::cache::{ArticleAvailability, ArticleCache, ArticleEntry};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
-use crate::types::{BackendId, BackendToClientBytes, ClientId, MessageId};
+use crate::types::{BackendId, MessageId};
 
 /// Result of querying a backend for an article.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryResult {
-    /// Backend has the article (220-223 response)
     Found(BackendId, Vec<u8>),
-    /// Backend doesn't have it (430 response)
     Missing(BackendId),
-    /// Query failed (connection error, protocol error, etc.)
     Error(BackendId),
-}
-
-/// Whether to read multiline responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseMode {
-    SingleLine,
-    Multiline,
 }
 
 /// Shared dependencies for precheck operations.
@@ -41,7 +30,6 @@ pub struct PrecheckDeps<'a> {
     pub cache_articles: bool,
 }
 
-/// Owned version for spawned tasks.
 #[derive(Clone)]
 struct OwnedDeps {
     router: Arc<BackendSelector>,
@@ -67,9 +55,8 @@ async fn query_backend(
     deps: &OwnedDeps,
     backend_id: BackendId,
     command: &str,
-    mode: ResponseMode,
+    multiline: bool,
 ) -> QueryResult {
-    // Get connection
     let Some(provider) = deps.router.backend_provider(backend_id) else {
         return QueryResult::Error(backend_id);
     };
@@ -77,13 +64,11 @@ async fn query_backend(
         return QueryResult::Error(backend_id);
     };
 
-    // Send command
     let mut buffer = deps.buffer_pool.acquire().await;
     if conn.as_mut().write_all(command.as_bytes()).await.is_err() {
         return QueryResult::Error(backend_id);
     }
 
-    // Read response
     let Ok(n) = buffer.read_from(&mut *conn).await else {
         return QueryResult::Error(backend_id);
     };
@@ -92,15 +77,12 @@ async fn query_backend(
     }
 
     let mut response = buffer[..n].to_vec();
-
-    // Parse status code
     let parsed = crate::protocol::NntpResponse::parse(&response);
     let Some(status_code) = parsed.status_code().map(|c| c.as_u16()) else {
         return QueryResult::Error(backend_id);
     };
 
-    // Read multiline if needed
-    if mode == ResponseMode::Multiline && parsed.is_multiline() {
+    if multiline && parsed.is_multiline() {
         while !response.ends_with(b".\r\n") {
             match conn.as_mut().read(buffer.as_mut_slice()).await {
                 Ok(0) | Err(_) => break,
@@ -109,16 +91,14 @@ async fn query_backend(
         }
     }
 
-    // Classify response
     match status_code {
         220..=223 => {
-            // For availability-only mode, just cache status code
-            let cache_data = if deps.cache_articles || mode == ResponseMode::SingleLine {
+            let data = if deps.cache_articles || !multiline {
                 response
             } else {
                 format!("{status_code}\r\n").into_bytes()
             };
-            QueryResult::Found(backend_id, cache_data)
+            QueryResult::Found(backend_id, data)
         }
         430 => {
             if let Some(m) = &deps.metrics {
@@ -131,17 +111,13 @@ async fn query_backend(
     }
 }
 
-async fn query_backends(
-    deps: &OwnedDeps,
-    backends: impl Iterator<Item = BackendId>,
-    command: &str,
-    mode: ResponseMode,
-) -> Vec<QueryResult> {
-    let tasks: Vec<_> = backends
+async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) -> Vec<QueryResult> {
+    let tasks: Vec<_> = (0..deps.router.backend_count().get())
+        .map(BackendId::from_index)
         .map(|id| {
             let deps = deps.clone();
             let cmd = command.to_string();
-            tokio::spawn(async move { query_backend(&deps, id, &cmd, mode).await })
+            tokio::spawn(async move { query_backend(&deps, id, &cmd, multiline).await })
         })
         .collect();
 
@@ -152,113 +128,91 @@ async fn query_backends(
         .collect()
 }
 
-fn first_found(results: &[QueryResult]) -> Option<(BackendId, &[u8])> {
-    results.iter().find_map(|r| match r {
-        QueryResult::Found(id, data) => Some((*id, data.as_slice())),
-        _ => None,
-    })
-}
+/// Extract first found response and build availability from results.
+fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, Vec<u8>)>, ArticleAvailability) {
+    let mut availability = ArticleAvailability::new();
+    let mut found = None;
 
-async fn cache_results(cache: &ArticleCache, msg_id: &MessageId<'_>, results: &[QueryResult]) {
-    for result in results {
-        match result {
-            QueryResult::Found(id, data) => {
-                cache.upsert(msg_id.to_owned(), data.clone(), *id).await;
+    for r in results {
+        match r {
+            QueryResult::Found(id, response) => {
+                availability.record_has(id);
+                if found.is_none() {
+                    found = Some((id, response));
+                }
             }
             QueryResult::Missing(id) => {
-                cache.record_backend_missing(msg_id.to_owned(), *id).await;
+                availability.record_missing(id);
             }
             QueryResult::Error(_) => {}
         }
     }
+
+    (found, availability)
+}
+
+/// Store precheck results in cache.
+///
+/// If found, upserts with data. Then syncs full availability state.
+/// Returns the cache entry if article was found.
+async fn cache_results(
+    cache: &ArticleCache,
+    msg_id: &MessageId<'_>,
+    found: Option<(BackendId, Vec<u8>)>,
+    availability: ArticleAvailability,
+) -> Option<ArticleEntry> {
+    let has_article = found.is_some();
+
+    if let Some((backend_id, data)) = found {
+        cache.upsert(msg_id.to_owned(), data, backend_id).await;
+    }
+    cache
+        .sync_availability(msg_id.to_owned(), &availability)
+        .await;
+
+    // Return cached entry if we found something
+    if has_article {
+        cache.get(msg_id).await
+    } else {
+        None
+    }
+}
+
+/// Precheck all backends for an article.
+///
+/// Queries concurrently, stores results in cache.
+/// Returns Some(entry) if any backend had it, None if all 430'd.
+pub async fn precheck(
+    deps: &PrecheckDeps<'_>,
+    command: &str,
+    msg_id: &MessageId<'_>,
+    multiline: bool,
+) -> Option<ArticleEntry> {
+    let owned = deps.to_owned();
+    let results = query_all_backends(&owned, command, multiline).await;
+    let (found, availability) = summarize(results);
+    cache_results(&owned.cache, msg_id, found, availability).await
 }
 
 /// Spawn background precheck. Results go to cache only.
-pub fn spawn_background_stat_precheck(deps: PrecheckDeps<'_>, command: String, msg_id: MessageId<'static>) {
+pub fn spawn_background_precheck(
+    deps: PrecheckDeps<'_>,
+    command: String,
+    msg_id: MessageId<'static>,
+) {
     let owned = deps.to_owned();
     tokio::spawn(async move {
-        let backend_count = owned.router.backend_count();
-        let backends: Vec<_> = owned
-            .cache
-            .get(&msg_id)
-            .await
-            .map(|entry| entry.available_backends(backend_count))
-            .unwrap_or_else(|| {
-                (0..backend_count.get())
-                    .map(BackendId::from_index)
-                    .collect()
-            });
+        let results = query_all_backends(&owned, &command, false).await;
+        let (found, availability) = summarize(results);
 
-        if backends.is_empty() {
-            return;
+        if let Some((backend_id, data)) = found {
+            owned
+                .cache
+                .upsert(msg_id.to_owned(), data, backend_id)
+                .await;
         }
-
-        let results = query_backends(
-            &owned,
-            backends.into_iter(),
-            &command,
-            ResponseMode::SingleLine,
-        )
-        .await;
-        cache_results(&owned.cache, &msg_id, &results).await;
+        owned.cache.sync_availability(msg_id, &availability).await;
     });
-}
-
-pub async fn handle_stat_precheck(
-    deps: &PrecheckDeps<'_>,
-    client_id: ClientId,
-    command: &str,
-    msg_id: &MessageId<'_>,
-    client: &mut tokio::net::tcp::WriteHalf<'_>,
-) -> Result<BackendId> {
-    let owned = deps.to_owned();
-    let backends = (0..owned.router.backend_count().get()).map(BackendId::from_index);
-    let results = query_backends(&owned, backends, command, ResponseMode::SingleLine).await;
-    cache_results(&owned.cache, msg_id, &results).await;
-
-    match first_found(&results) {
-        Some((backend_id, response)) => {
-            client.write_all(response).await?;
-            deps.router.complete_command(backend_id);
-            Ok(backend_id)
-        }
-        None => {
-            client.write_all(crate::protocol::NO_SUCH_ARTICLE).await?;
-            let backend_id = deps.router.route_command(client_id, command)?;
-            deps.router.complete_command(backend_id);
-            Ok(backend_id)
-        }
-    }
-}
-
-pub async fn handle_head_precheck(
-    deps: &PrecheckDeps<'_>,
-    client_id: ClientId,
-    command: &str,
-    msg_id: &MessageId<'_>,
-    client: &mut tokio::net::tcp::WriteHalf<'_>,
-    bytes_sent: &mut BackendToClientBytes,
-) -> Result<BackendId> {
-    let owned = deps.to_owned();
-    let backends = (0..owned.router.backend_count().get()).map(BackendId::from_index);
-    let results = query_backends(&owned, backends, command, ResponseMode::Multiline).await;
-    cache_results(&owned.cache, msg_id, &results).await;
-
-    match first_found(&results) {
-        Some((backend_id, response)) => {
-            *bytes_sent = bytes_sent.add(response.len());
-            client.write_all(response).await?;
-            deps.router.complete_command(backend_id);
-            Ok(backend_id)
-        }
-        None => {
-            *bytes_sent = bytes_sent.add(crate::protocol::NO_SUCH_ARTICLE.len());
-            client.write_all(crate::protocol::NO_SUCH_ARTICLE).await?;
-            let backend_id = deps.router.route_command(client_id, command)?;
-            deps.router.complete_command(backend_id);
-            Ok(backend_id)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -266,41 +220,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_result_variants() {
-        let found = QueryResult::Found(BackendId::from_index(0), b"220 ok\r\n".to_vec());
-        let missing = QueryResult::Missing(BackendId::from_index(1));
-        let error = QueryResult::Error(BackendId::from_index(2));
-
-        assert!(matches!(found, QueryResult::Found(_, _)));
-        assert!(matches!(missing, QueryResult::Missing(_)));
-        assert!(matches!(error, QueryResult::Error(_)));
-    }
-
-    #[test]
-    fn first_found_selects_first() {
+    fn summarize_finds_first() {
         let results = vec![
             QueryResult::Missing(BackendId::from_index(0)),
             QueryResult::Found(BackendId::from_index(1), b"first".to_vec()),
             QueryResult::Found(BackendId::from_index(2), b"second".to_vec()),
         ];
-
-        let (id, data) = first_found(&results).unwrap();
-        assert_eq!(id, BackendId::from_index(1));
-        assert_eq!(data, b"first");
+        let (found, avail) = summarize(results);
+        assert_eq!(found, Some((BackendId::from_index(1), b"first".to_vec())));
+        assert!(avail.is_missing(BackendId::from_index(0)));
+        assert!(!avail.is_missing(BackendId::from_index(1)));
+        assert!(!avail.is_missing(BackendId::from_index(2)));
     }
 
     #[test]
-    fn first_found_none_when_all_missing() {
+    fn summarize_all_missing() {
         let results = vec![
             QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Error(BackendId::from_index(1)),
+            QueryResult::Missing(BackendId::from_index(1)),
         ];
-
-        assert!(first_found(&results).is_none());
+        let (found, avail) = summarize(results);
+        assert!(found.is_none());
+        assert!(avail.is_missing(BackendId::from_index(0)));
+        assert!(avail.is_missing(BackendId::from_index(1)));
     }
 
     #[test]
-    fn first_found_none_when_empty() {
-        assert!(first_found(&[]).is_none());
+    fn summarize_empty() {
+        let (found, avail) = summarize(vec![]);
+        assert!(found.is_none());
+        assert_eq!(avail.checked_bits(), 0);
     }
 }
