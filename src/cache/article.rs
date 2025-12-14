@@ -101,6 +101,16 @@ impl ArticleAvailability {
         self
     }
 
+    /// Merge another availability's state into this one
+    ///
+    /// Used to sync local availability tracking back to cache.
+    /// Takes the union of checked backends and missing backends.
+    #[inline]
+    pub fn merge_from(&mut self, other: &Self) {
+        self.checked |= other.checked;
+        self.missing |= other.missing;
+    }
+
     /// Check if a backend is known to be missing (returned 430)
     ///
     /// # Panics (debug builds only)
@@ -481,13 +491,16 @@ impl ArticleCache {
     /// Record that a backend returned 430 for this article
     ///
     /// If the article is already cached, updates the availability bitset.
-    /// If not cached, creates a new cache entry with the 430 response.
+    /// If not cached, creates a new cache entry with a 430 stub.
     /// This prevents repeated queries to backends that don't have the article.
+    ///
+    /// Note: We don't store the actual backend 430 response because:
+    /// 1. We always send a standardized 430 to clients, never the backend's response
+    /// 2. The only info we need is the availability bitset (which backends returned 430)
     pub async fn record_backend_missing<'a>(
         &self,
         message_id: MessageId<'a>,
         backend_id: BackendId,
-        response_buffer: Vec<u8>,
     ) {
         let key: Arc<str> = message_id.without_brackets().into();
 
@@ -516,16 +529,40 @@ impl ArticleCache {
             );
             self.cache.insert(key, entry).await;
         } else {
-            // First 430 for this article - create cache entry
-            // This prevents re-querying backends that returned 430
-            let storage_buffer = if self.cache_articles {
-                response_buffer
-            } else {
-                // Extract status code and create minimal stub
-                self.create_minimal_stub(&response_buffer)
-            };
-            let mut entry = ArticleEntry::new(storage_buffer);
+            // First 430 for this article - create cache entry with minimal stub
+            // The stub just needs a valid 430 status code for status_code() method
+            let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
             entry.record_backend_missing(backend_id);
+            self.cache.insert(key, entry).await;
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Sync availability state from local tracker to cache
+    ///
+    /// This is called ONCE at the end of a retry loop to persist all the
+    /// backends that returned 430 during this request. Much more efficient
+    /// than calling record_backend_missing for each backend individually.
+    pub async fn sync_availability<'a>(
+        &self,
+        message_id: MessageId<'a>,
+        availability: &ArticleAvailability,
+    ) {
+        // Only sync if we actually tried some backends
+        if availability.checked_bits() == 0 {
+            return;
+        }
+
+        let key: Arc<str> = message_id.without_brackets().into();
+
+        if let Some(mut entry) = self.cache.get(key.as_ref()).await {
+            // Merge availability into existing entry
+            entry.backend_availability.merge_from(availability);
+            self.cache.insert(key, entry).await;
+        } else {
+            // Create new entry with 430 stub and the availability state
+            let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
+            entry.backend_availability = *availability;
             self.cache.insert(key, entry).await;
             self.misses.fetch_add(1, Ordering::Relaxed);
         }
@@ -801,9 +838,8 @@ mod tests {
         cache.insert(msgid.clone(), article).await;
 
         // Record backend 1 as missing
-        let response_430 = b"430 No such article\r\n".to_vec();
         cache
-            .record_backend_missing(msgid.clone(), BackendId::from_index(1), response_430)
+            .record_backend_missing(msgid.clone(), BackendId::from_index(1))
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
@@ -831,13 +867,8 @@ mod tests {
         assert!(cache.get(&msgid).await.is_none());
 
         // Record backend 0 returned 430
-        let response_430 = b"430 No such article\r\n".to_vec();
         cache
-            .record_backend_missing(
-                msgid.clone(),
-                BackendId::from_index(0),
-                response_430.clone(),
-            )
+            .record_backend_missing(msgid.clone(), BackendId::from_index(0))
             .await;
 
         // CRITICAL: Cache entry MUST now exist
@@ -858,20 +889,16 @@ mod tests {
             "Backend 1 should still be available"
         );
 
-        // Verify the cached response is the 430 response
+        // Verify the cached response is a 430 stub
         assert_eq!(
             entry.buffer().as_ref(),
-            &response_430,
-            "Cached buffer should be the 430 response"
+            b"430\r\n",
+            "Cached buffer should be a 430 stub"
         );
 
         // Record backend 1 also returned 430
         cache
-            .record_backend_missing(
-                msgid.clone(),
-                BackendId::from_index(1),
-                response_430.clone(),
-            )
+            .record_backend_missing(msgid.clone(), BackendId::from_index(1))
             .await;
 
         let entry = cache.get(&msgid).await.unwrap();

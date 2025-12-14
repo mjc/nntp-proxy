@@ -217,6 +217,7 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 /// let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
 /// spawn_test_proxy(proxy, 8119, true).await;
 /// ```
+#[allow(dead_code)]
 pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool) {
     let proxy_addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&proxy_addr).await.unwrap();

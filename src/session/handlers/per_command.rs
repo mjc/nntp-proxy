@@ -80,10 +80,8 @@ enum BackendAttemptResult {
         bytes_written: u64,
     },
     /// Article not found (430) - try next backend
-    ArticleNotFound {
-        backend_id: crate::types::BackendId,
-        response: Vec<u8>,
-    },
+    /// Note: The 430 response is read and drained, just not stored
+    ArticleNotFound { backend_id: crate::types::BackendId },
     /// Backend unavailable or error - try next backend
     BackendUnavailable,
 }
@@ -447,10 +445,9 @@ impl ClientSession {
                             let cmd_upper = command.to_uppercase();
                             if cmd_upper.starts_with("STAT ") {
                                 precheck::spawn_background_stat_precheck(
-                                    self.precheck_context(router.clone()),
+                                    self.precheck_deps(&router),
                                     command.to_string(),
                                     msg_id_ref.to_owned(),
-                                    self.client_addr,
                                 );
                             }
                         }
@@ -479,9 +476,9 @@ impl ClientSession {
         {
             let cmd_upper = command.to_uppercase();
             if cmd_upper.starts_with("STAT ") {
-                let ctx = self.precheck_context(router);
+                let deps = self.precheck_deps(&router);
                 return precheck::handle_stat_precheck(
-                    &ctx,
+                    &deps,
                     self.client_id,
                     command,
                     msg_id_ref,
@@ -489,9 +486,9 @@ impl ClientSession {
                 )
                 .await;
             } else if cmd_upper.starts_with("HEAD ") {
-                let ctx = self.precheck_context(router);
+                let deps = self.precheck_deps(&router);
                 return precheck::handle_head_precheck(
-                    &ctx,
+                    &deps,
                     self.client_id,
                     command,
                     msg_id_ref,
@@ -549,17 +546,13 @@ impl ClientSession {
                 "Client {} cache shows all backends exhausted for {:?}, returning 430 immediately",
                 self.client_addr, msg_id
             );
-            client_write
-                .write_all(crate::protocol::NO_SUCH_ARTICLE)
+            self.send_430_to_client(client_write, backend_to_client_bytes)
                 .await?;
-            *backend_to_client_bytes = backend_to_client_bytes.add(22);
-            let backend_id = crate::types::BackendId::from_index(0);
-            return Ok(backend_id);
+            return Ok(crate::types::BackendId::from_index(0));
         }
 
-        // Track last 430 response to return if all backends fail
-        let mut last_430_response: Option<Vec<u8>> = None;
-        let mut last_430_backend: Option<crate::types::BackendId> = None;
+        // Track last backend tried for metrics/return value
+        let mut last_backend: Option<crate::types::BackendId> = None;
 
         // Try backends until success or exhaustion
         while !availability.all_exhausted(router.backend_count()) {
@@ -581,14 +574,17 @@ impl ClientSession {
                 }) => {
                     *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
                     router.complete_command(backend_id);
+                    // Sync availability to cache before returning (got a success, but we may have
+                    // recorded some 430s from other backends along the way)
+                    if let Some(msg_id_ref) = msg_id {
+                        self.cache
+                            .sync_availability(msg_id_ref.clone(), &availability)
+                            .await;
+                    }
                     return Ok(backend_id);
                 }
-                Ok(BackendAttemptResult::ArticleNotFound {
-                    backend_id,
-                    response,
-                }) => {
-                    last_430_response = Some(response);
-                    last_430_backend = Some(backend_id);
+                Ok(BackendAttemptResult::ArticleNotFound { backend_id }) => {
+                    last_backend = Some(backend_id);
                 }
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     // Continue to next backend
@@ -605,17 +601,20 @@ impl ClientSession {
             }
         }
 
-        // All backends exhausted - send final 430
+        // All backends exhausted - sync availability to cache and send final 430
         debug!(
             "Client {} all backends exhausted for {:?}, sending 430",
             self.client_addr, msg_id
         );
-        self.send_final_430_response(client_write, backend_to_client_bytes, last_430_response)
+        if let Some(msg_id_ref) = msg_id {
+            self.cache
+                .sync_availability(msg_id_ref.clone(), &availability)
+                .await;
+        }
+        self.send_430_to_client(client_write, backend_to_client_bytes)
             .await?;
 
-        // Return the last backend we tried, or the first backend if none were tried
-        // (shouldn't happen but handle gracefully)
-        Ok(last_430_backend.unwrap_or_else(|| crate::types::BackendId::from_index(0)))
+        Ok(last_backend.unwrap_or_else(|| crate::types::BackendId::from_index(0)))
     }
 
     /// Load article availability from cache or create fresh tracker
@@ -675,19 +674,10 @@ impl ClientSession {
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
         // Handle 430 - article not found
+        // Note: response is already read into buffer, keeping connection clean
         if self.is_430_response(&response_code) {
-            let response_buffer = buffer[..n].to_vec();
-            self.handle_430_response(
-                backend_id,
-                msg_id,
-                router.clone(),
-                availability,
-                response_buffer.clone(),
-            );
-            return Ok(BackendAttemptResult::ArticleNotFound {
-                backend_id,
-                response: response_buffer,
-            });
+            self.handle_430_response(backend_id, router.clone(), availability);
+            return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
         }
 
         // Success - stream response
@@ -840,14 +830,12 @@ impl ClientSession {
         router.complete_command(backend_id);
     }
 
-    /// Send final 430 response to client when all backends fail
-    async fn send_final_430_response(
+    /// Send standardized 430 response to client
+    async fn send_430_to_client(
         &self,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
-        _last_430_response: Option<Vec<u8>>,
     ) -> Result<()> {
-        // Always send our standardized 430, never forward backend's response
         client_write
             .write_all(crate::protocol::NO_SUCH_ARTICLE)
             .await?;
@@ -856,26 +844,17 @@ impl ClientSession {
         Ok(())
     }
 
-    /// Handle 430 response and prepare for retry
+    /// Handle 430 response - update local availability tracker
+    ///
+    /// Note: Cache sync happens ONCE at end of retry loop via sync_availability,
+    /// not here. This avoids spawning async tasks for each 430.
     fn handle_430_response(
         &self,
         backend_id: crate::types::BackendId,
-        msg_id: Option<&crate::types::MessageId<'_>>,
         router: Arc<BackendSelector>,
         availability: &mut crate::cache::ArticleAvailability,
-        response_buffer: Vec<u8>,
     ) {
         availability.record_missing(backend_id);
-
-        if let Some(msg_id_ref) = msg_id {
-            let cache_clone = self.cache.clone();
-            let msg_id_owned = msg_id_ref.to_owned();
-            tokio::spawn(async move {
-                cache_clone
-                    .record_backend_missing(msg_id_owned, backend_id, response_buffer)
-                    .await;
-            });
-        }
 
         // NOTE: 430 is NOT an error - it's normal retry behavior.
         // The backend is correctly reporting it doesn't have the article.
@@ -1021,13 +1000,13 @@ impl ClientSession {
         self.user_bytes_received(resp_bytes);
     }
 
-    /// Create a PrecheckContext for precheck operations
-    fn precheck_context(&self, router: Arc<BackendSelector>) -> precheck::PrecheckContext {
-        precheck::PrecheckContext {
+    /// Create precheck dependencies
+    fn precheck_deps<'a>(&'a self, router: &'a Arc<BackendSelector>) -> precheck::PrecheckDeps<'a> {
+        precheck::PrecheckDeps {
             router,
-            cache: self.cache.clone(),
-            buffer_pool: self.buffer_pool.clone(),
-            metrics: self.metrics.clone(),
+            cache: &self.cache,
+            buffer_pool: &self.buffer_pool,
+            metrics: self.metrics.as_ref(),
             cache_articles: self.cache_articles,
         }
     }

@@ -1,359 +1,306 @@
-//! Adaptive precheck utilities
+//! Adaptive precheck for concurrent backend queries.
 //!
-//! This module provides utilities for adaptive prechecking - querying multiple
-//! backends concurrently to find article availability before committing to a
-//! single backend.
-//!
-//! # Architecture
-//!
-//! Prechecking allows the proxy to:
-//! 1. Query all backends concurrently for article availability
-//! 2. Cache results to avoid redundant queries
-//! 3. Return the first successful response to the client
-//!
-//! This is particularly useful for STAT and HEAD commands where we want to
-//! quickly determine which backend has an article.
+//! Queries all backends simultaneously, uses first successful response.
+//! Results cached to avoid redundant queries on future requests.
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::cache::ArticleCache;
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
-use crate::session::backend;
-use crate::types::{BackendId, BackendToClientBytes, MessageId};
+use crate::types::{BackendId, BackendToClientBytes, ClientId, MessageId};
 
-/// Dependencies needed for precheck operations
-pub struct PrecheckContext {
-    pub router: Arc<BackendSelector>,
-    pub cache: Arc<ArticleCache>,
-    pub buffer_pool: BufferPool,
-    pub metrics: Option<MetricsCollector>,
+/// Result of querying a backend for an article.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryResult {
+    /// Backend has the article (220-223 response)
+    Found(BackendId, Vec<u8>),
+    /// Backend doesn't have it (430 response)
+    Missing(BackendId),
+    /// Query failed (connection error, protocol error, etc.)
+    Error(BackendId),
+}
+
+/// Whether to read multiline responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
+    SingleLine,
+    Multiline,
+}
+
+/// Shared dependencies for precheck operations.
+pub struct PrecheckDeps<'a> {
+    pub router: &'a Arc<BackendSelector>,
+    pub cache: &'a Arc<ArticleCache>,
+    pub buffer_pool: &'a BufferPool,
+    pub metrics: Option<&'a MetricsCollector>,
     pub cache_articles: bool,
 }
 
-/// Result of a single backend precheck query
-enum PrecheckResult {
-    /// Backend has the article (2xx response)
-    Has(BackendId, Vec<u8>),
-    /// Backend doesn't have the article (430 or error)
-    Missing(BackendId, Vec<u8>),
+/// Owned version for spawned tasks.
+#[derive(Clone)]
+struct OwnedDeps {
+    router: Arc<BackendSelector>,
+    cache: Arc<ArticleCache>,
+    buffer_pool: BufferPool,
+    metrics: Option<MetricsCollector>,
+    cache_articles: bool,
 }
 
-/// Spawn a background STAT precheck to update cache
-///
-/// Only checks backends that haven't been tried yet (not marked as missing or having).
-/// This keeps cache fresh while avoiding duplicate queries to backends we already know about.
-pub fn spawn_background_stat_precheck(
-    ctx: PrecheckContext,
-    command: String,
-    msg_id: MessageId<'static>,
-    client_addr: crate::types::ClientAddress,
-) {
-    let client_addr = *client_addr.as_socket_addr();
+impl<'a> PrecheckDeps<'a> {
+    fn to_owned(&self) -> OwnedDeps {
+        OwnedDeps {
+            router: Arc::clone(self.router),
+            cache: Arc::clone(self.cache),
+            buffer_pool: self.buffer_pool.clone(),
+            metrics: self.metrics.cloned(),
+            cache_articles: self.cache_articles,
+        }
+    }
+}
+
+async fn query_backend(
+    deps: &OwnedDeps,
+    backend_id: BackendId,
+    command: &str,
+    mode: ResponseMode,
+) -> QueryResult {
+    // Get connection
+    let Some(provider) = deps.router.backend_provider(backend_id) else {
+        return QueryResult::Error(backend_id);
+    };
+    let Ok(mut conn) = provider.get_pooled_connection().await else {
+        return QueryResult::Error(backend_id);
+    };
+
+    // Send command
+    let mut buffer = deps.buffer_pool.acquire().await;
+    if conn.as_mut().write_all(command.as_bytes()).await.is_err() {
+        return QueryResult::Error(backend_id);
+    }
+
+    // Read response
+    let Ok(n) = buffer.read_from(&mut *conn).await else {
+        return QueryResult::Error(backend_id);
+    };
+    if n == 0 {
+        return QueryResult::Error(backend_id);
+    }
+
+    let mut response = buffer[..n].to_vec();
+
+    // Parse status code
+    let parsed = crate::protocol::NntpResponse::parse(&response);
+    let Some(status_code) = parsed.status_code().map(|c| c.as_u16()) else {
+        return QueryResult::Error(backend_id);
+    };
+
+    // Read multiline if needed
+    if mode == ResponseMode::Multiline && parsed.is_multiline() {
+        while !response.ends_with(b".\r\n") {
+            match conn.as_mut().read(buffer.as_mut_slice()).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => response.extend_from_slice(&buffer[..n]),
+            }
+        }
+    }
+
+    // Classify response
+    match status_code {
+        220..=223 => {
+            // For availability-only mode, just cache status code
+            let cache_data = if deps.cache_articles || mode == ResponseMode::SingleLine {
+                response
+            } else {
+                format!("{status_code}\r\n").into_bytes()
+            };
+            QueryResult::Found(backend_id, cache_data)
+        }
+        430 => {
+            if let Some(m) = &deps.metrics {
+                m.record_command(backend_id);
+                m.record_error_4xx(backend_id);
+            }
+            QueryResult::Missing(backend_id)
+        }
+        _ => QueryResult::Error(backend_id),
+    }
+}
+
+async fn query_backends(
+    deps: &OwnedDeps,
+    backends: impl Iterator<Item = BackendId>,
+    command: &str,
+    mode: ResponseMode,
+) -> Vec<QueryResult> {
+    let tasks: Vec<_> = backends
+        .map(|id| {
+            let deps = deps.clone();
+            let cmd = command.to_string();
+            tokio::spawn(async move { query_backend(&deps, id, &cmd, mode).await })
+        })
+        .collect();
+
+    futures::future::join_all(tasks)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+fn first_found(results: &[QueryResult]) -> Option<(BackendId, &[u8])> {
+    results.iter().find_map(|r| match r {
+        QueryResult::Found(id, data) => Some((*id, data.as_slice())),
+        _ => None,
+    })
+}
+
+async fn cache_results(cache: &ArticleCache, msg_id: &MessageId<'_>, results: &[QueryResult]) {
+    for result in results {
+        match result {
+            QueryResult::Found(id, data) => {
+                cache.upsert(msg_id.to_owned(), data.clone(), *id).await;
+            }
+            QueryResult::Missing(id) => {
+                cache.record_backend_missing(msg_id.to_owned(), *id).await;
+            }
+            QueryResult::Error(_) => {}
+        }
+    }
+}
+
+/// Spawn background precheck. Results go to cache only.
+pub fn spawn_background_stat_precheck(deps: PrecheckDeps<'_>, command: String, msg_id: MessageId<'static>) {
+    let owned = deps.to_owned();
     tokio::spawn(async move {
-        // Get current cache entry to see which backends to check
-        let backends_to_check: Vec<_> = if let Some(entry) = ctx.cache.get(&msg_id).await {
-            // Only check backends we haven't tried yet
-            entry.available_backends(ctx.router.backend_count())
-        } else {
-            // Cache was evicted, check all backends
-            (0..ctx.router.backend_count().get())
-                .map(BackendId::from_index)
-                .collect()
-        };
+        let backend_count = owned.router.backend_count();
+        let backends: Vec<_> = owned
+            .cache
+            .get(&msg_id)
+            .await
+            .map(|entry| entry.available_backends(backend_count))
+            .unwrap_or_else(|| {
+                (0..backend_count.get())
+                    .map(BackendId::from_index)
+                    .collect()
+            });
 
-        // Check only untried backends
-        for backend_id in backends_to_check {
-            let provider = match ctx.router.backend_provider(backend_id) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            let mut conn = match provider.get_pooled_connection().await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let mut buffer = ctx.buffer_pool.acquire().await;
-
-            let result = backend::send_command_and_read_first_chunk(
-                &mut *conn,
-                &command,
-                backend_id,
-                client_addr,
-                &mut buffer,
-            )
-            .await;
-
-            if let Ok((n, response_code, _, _, _, _)) = result
-                && let Some(code_num) = response_code.status_code().map(|c| c.as_u16())
-            {
-                let response = buffer[..n].to_vec();
-
-                match code_num {
-                    430 => {
-                        ctx.cache
-                            .record_backend_missing(msg_id.clone(), backend_id, response)
-                            .await;
-                        if let Some(ref m) = ctx.metrics {
-                            m.record_command(backend_id);
-                            m.record_error_4xx(backend_id);
-                        }
-                    }
-                    220..=223 => {
-                        ctx.cache.upsert(msg_id.clone(), response, backend_id).await;
-                    }
-                    _ => {}
-                }
-            }
+        if backends.is_empty() {
+            return;
         }
+
+        let results = query_backends(
+            &owned,
+            backends.into_iter(),
+            &command,
+            ResponseMode::SingleLine,
+        )
+        .await;
+        cache_results(&owned.cache, &msg_id, &results).await;
     });
 }
 
-/// Handle STAT command with adaptive prechecking
-///
-/// Queries all backends concurrently for article availability, updates cache
-/// with all results, and returns the first successful response to the client.
-///
-/// This eliminates cache race conditions by:
-/// 1. Spawning concurrent STAT queries to ALL backends
-/// 2. Waiting for ALL queries to complete
-/// 3. Updating cache serially with all results
-/// 4. Returning first successful response to client
 pub async fn handle_stat_precheck(
-    ctx: &PrecheckContext,
-    client_id: crate::types::ClientId,
+    deps: &PrecheckDeps<'_>,
+    client_id: ClientId,
     command: &str,
     msg_id: &MessageId<'_>,
-    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    client: &mut tokio::net::tcp::WriteHalf<'_>,
 ) -> Result<BackendId> {
-    // Query all backends concurrently
-    let backend_queries = (0..ctx.router.backend_count().get())
-        .map(BackendId::from_index)
-        .map(|backend_id| {
-            let (router, buffer_pool, metrics, command) = (
-                ctx.router.clone(),
-                ctx.buffer_pool.clone(),
-                ctx.metrics.clone(),
-                command.to_string(),
-            );
+    let owned = deps.to_owned();
+    let backends = (0..owned.router.backend_count().get()).map(BackendId::from_index);
+    let results = query_backends(&owned, backends, command, ResponseMode::SingleLine).await;
+    cache_results(&owned.cache, msg_id, &results).await;
 
-            tokio::spawn(async move {
-                // Get connection and send STAT command
-                let provider = router.backend_provider(backend_id)?;
-                let mut conn = provider.get_pooled_connection().await.ok()?;
-                let mut buffer = buffer_pool.acquire().await;
-
-                // Send command
-                conn.as_mut().write_all(command.as_bytes()).await.ok()?;
-
-                // Read response
-                let n = buffer.read_from(&mut *conn).await.ok()?;
-                if n == 0 {
-                    return None;
-                }
-                let response_bytes = buffer[..n].to_vec();
-
-                // Parse response code
-                let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
-                let status_code = response_code.status_code()?.as_u16();
-
-                Some(match status_code {
-                    220..=223 => PrecheckResult::Has(backend_id, response_bytes),
-                    430 => {
-                        if let Some(m) = metrics.as_ref() {
-                            m.record_command(backend_id);
-                            m.record_error_4xx(backend_id);
-                        }
-                        PrecheckResult::Missing(backend_id, response_bytes)
-                    }
-                    _ => PrecheckResult::Missing(backend_id, response_bytes),
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for all backends to respond
-    let all_results = futures::future::try_join_all(backend_queries)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    // Find first success
-    let first_success = all_results.iter().find_map(|result| match result {
-        PrecheckResult::Has(backend_id, response) => Some((*backend_id, response.clone())),
-        _ => None,
-    });
-
-    // Update cache serially (all backends reported, no races)
-    for result in all_results {
-        match result {
-            PrecheckResult::Has(backend_id, response) => {
-                ctx.cache
-                    .upsert(msg_id.to_owned(), response, backend_id)
-                    .await;
-            }
-            PrecheckResult::Missing(backend_id, response) => {
-                ctx.cache
-                    .record_backend_missing(msg_id.to_owned(), backend_id, response)
-                    .await;
-            }
-        }
-    }
-
-    // Send response to client
-    match first_success {
+    match first_found(&results) {
         Some((backend_id, response)) => {
-            client_write.write_all(&response).await?;
-            ctx.router.complete_command(backend_id);
+            client.write_all(response).await?;
+            deps.router.complete_command(backend_id);
             Ok(backend_id)
         }
         None => {
-            // All backends returned 430 or failed
-            client_write
-                .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                .await?;
-            let backend_id = ctx.router.route_command(client_id, command)?;
-            ctx.router.complete_command(backend_id);
+            client.write_all(crate::protocol::NO_SUCH_ARTICLE).await?;
+            let backend_id = deps.router.route_command(client_id, command)?;
+            deps.router.complete_command(backend_id);
             Ok(backend_id)
         }
     }
 }
 
-/// Handle HEAD command with adaptive prechecking
-///
-/// Same pattern as STAT precheck but handles multiline responses.
-/// Optionally caches full headers if cache_articles=true.
 pub async fn handle_head_precheck(
-    ctx: &PrecheckContext,
-    client_id: crate::types::ClientId,
+    deps: &PrecheckDeps<'_>,
+    client_id: ClientId,
     command: &str,
     msg_id: &MessageId<'_>,
-    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-    backend_to_client_bytes: &mut BackendToClientBytes,
+    client: &mut tokio::net::tcp::WriteHalf<'_>,
+    bytes_sent: &mut BackendToClientBytes,
 ) -> Result<BackendId> {
-    use tokio::io::AsyncReadExt;
+    let owned = deps.to_owned();
+    let backends = (0..owned.router.backend_count().get()).map(BackendId::from_index);
+    let results = query_backends(&owned, backends, command, ResponseMode::Multiline).await;
+    cache_results(&owned.cache, msg_id, &results).await;
 
-    // Query all backends concurrently
-    let backend_queries = (0..ctx.router.backend_count().get())
-        .map(BackendId::from_index)
-        .map(|backend_id| {
-            let (router, buffer_pool, metrics, command, cache_articles) = (
-                ctx.router.clone(),
-                ctx.buffer_pool.clone(),
-                ctx.metrics.clone(),
-                command.to_string(),
-                ctx.cache_articles,
-            );
-
-            tokio::spawn(async move {
-                // Get connection and send HEAD command
-                let provider = router.backend_provider(backend_id)?;
-                let mut conn = provider.get_pooled_connection().await.ok()?;
-                let mut buffer = buffer_pool.acquire().await;
-
-                // Send command
-                conn.as_mut().write_all(command.as_bytes()).await.ok()?;
-
-                // Read response
-                let n = buffer.read_from(&mut *conn).await.ok()?;
-                if n == 0 {
-                    return None;
-                }
-                let mut response_bytes = buffer[..n].to_vec();
-
-                // Parse response code
-                let response_code = crate::protocol::NntpResponse::parse(&response_bytes);
-                let status_code = response_code.status_code()?.as_u16();
-                let is_multiline = response_code.is_multiline();
-
-                Some(match status_code {
-                    221 => {
-                        // Read complete multiline response if needed
-                        if is_multiline {
-                            loop {
-                                let n =
-                                    conn.as_mut().read(buffer.as_mut_slice()).await.unwrap_or(0);
-                                if n == 0 || response_bytes.ends_with(b".\r\n") {
-                                    break;
-                                }
-                                response_bytes.extend_from_slice(&buffer[..n]);
-                            }
-                        }
-
-                        // Cache full headers or just availability marker
-                        let cache_data = if cache_articles {
-                            response_bytes
-                        } else {
-                            b"221\r\n".to_vec()
-                        };
-
-                        PrecheckResult::Has(backend_id, cache_data)
-                    }
-                    430 => {
-                        if let Some(m) = metrics.as_ref() {
-                            m.record_command(backend_id);
-                            m.record_error_4xx(backend_id);
-                        }
-                        PrecheckResult::Missing(backend_id, response_bytes)
-                    }
-                    _ => PrecheckResult::Missing(backend_id, response_bytes),
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for all backends to respond
-    let all_results = futures::future::try_join_all(backend_queries)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    // Find first success
-    let first_success = all_results.iter().find_map(|result| match result {
-        PrecheckResult::Has(backend_id, response) => Some((*backend_id, response.clone())),
-        _ => None,
-    });
-
-    // Update cache serially
-    for result in all_results {
-        match result {
-            PrecheckResult::Has(backend_id, cache_data) => {
-                ctx.cache
-                    .upsert(msg_id.to_owned(), cache_data, backend_id)
-                    .await;
-            }
-            PrecheckResult::Missing(backend_id, response) => {
-                ctx.cache
-                    .record_backend_missing(msg_id.to_owned(), backend_id, response)
-                    .await;
-            }
-        }
-    }
-
-    // Send response to client
-    match first_success {
+    match first_found(&results) {
         Some((backend_id, response)) => {
-            client_write.write_all(&response).await?;
-            *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-            ctx.router.complete_command(backend_id);
+            *bytes_sent = bytes_sent.add(response.len());
+            client.write_all(response).await?;
+            deps.router.complete_command(backend_id);
             Ok(backend_id)
         }
         None => {
-            let response = crate::protocol::NO_SUCH_ARTICLE;
-            client_write.write_all(response).await?;
-            *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-            let backend_id = ctx.router.route_command(client_id, command)?;
-            ctx.router.complete_command(backend_id);
+            *bytes_sent = bytes_sent.add(crate::protocol::NO_SUCH_ARTICLE.len());
+            client.write_all(crate::protocol::NO_SUCH_ARTICLE).await?;
+            let backend_id = deps.router.route_command(client_id, command)?;
+            deps.router.complete_command(backend_id);
             Ok(backend_id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_result_variants() {
+        let found = QueryResult::Found(BackendId::from_index(0), b"220 ok\r\n".to_vec());
+        let missing = QueryResult::Missing(BackendId::from_index(1));
+        let error = QueryResult::Error(BackendId::from_index(2));
+
+        assert!(matches!(found, QueryResult::Found(_, _)));
+        assert!(matches!(missing, QueryResult::Missing(_)));
+        assert!(matches!(error, QueryResult::Error(_)));
+    }
+
+    #[test]
+    fn first_found_selects_first() {
+        let results = vec![
+            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Found(BackendId::from_index(1), b"first".to_vec()),
+            QueryResult::Found(BackendId::from_index(2), b"second".to_vec()),
+        ];
+
+        let (id, data) = first_found(&results).unwrap();
+        assert_eq!(id, BackendId::from_index(1));
+        assert_eq!(data, b"first");
+    }
+
+    #[test]
+    fn first_found_none_when_all_missing() {
+        let results = vec![
+            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Error(BackendId::from_index(1)),
+        ];
+
+        assert!(first_found(&results).is_none());
+    }
+
+    #[test]
+    fn first_found_none_when_empty() {
+        assert!(first_found(&[]).is_none());
     }
 }

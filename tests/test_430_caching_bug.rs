@@ -27,13 +27,8 @@ async fn test_430_response_creates_cache_entry() {
     assert!(cache.get(&msgid).await.is_none());
 
     // Backend 0 returns 430
-    let response_430 = b"430 No such article\r\n".to_vec();
     cache
-        .record_backend_missing(
-            msgid.clone(),
-            BackendId::from_index(0),
-            response_430.clone(),
-        )
+        .record_backend_missing(msgid.clone(), BackendId::from_index(0))
         .await;
 
     // MUST create cache entry
@@ -55,24 +50,15 @@ async fn test_multiple_430s_update_same_entry() {
     let cache = ArticleCache::new(1000, Duration::from_secs(300), true);
 
     let msgid = MessageId::from_borrowed("<missing@example.com>").unwrap();
-    let response_430 = b"430 No such article\r\n".to_vec();
 
     // Backend 0 returns 430
     cache
-        .record_backend_missing(
-            msgid.clone(),
-            BackendId::from_index(0),
-            response_430.clone(),
-        )
+        .record_backend_missing(msgid.clone(), BackendId::from_index(0))
         .await;
 
     // Backend 1 returns 430
     cache
-        .record_backend_missing(
-            msgid.clone(),
-            BackendId::from_index(1),
-            response_430.clone(),
-        )
+        .record_backend_missing(msgid.clone(), BackendId::from_index(1))
         .await;
 
     let entry = cache.get(&msgid).await.unwrap();
@@ -134,10 +120,9 @@ async fn test_cache_grows_with_430_responses() {
     for i in 0..100 {
         let msg_id_str = format!("<missing{}@example.com>", i);
         let msgid = MessageId::from_borrowed(&msg_id_str).unwrap();
-        let response_430 = b"430 No such article\r\n".to_vec();
 
         cache
-            .record_backend_missing(msgid, BackendId::from_index(0), response_430)
+            .record_backend_missing(msgid, BackendId::from_index(0))
             .await;
         msg_ids.push(msg_id_str);
     }
@@ -167,13 +152,12 @@ async fn test_regression_bug_symptoms_fixed() {
     for i in 0..500 {
         let msg_id_str = format!("<missing{}@example.com>", i);
         let msgid = MessageId::from_borrowed(&msg_id_str).unwrap();
-        let response_430 = b"430 No such article\r\n".to_vec();
 
         // Both backends return 430
         for backend_idx in 0..2 {
             let backend_id = BackendId::from_index(backend_idx);
             cache
-                .record_backend_missing(msgid.clone(), backend_id, response_430.clone())
+                .record_backend_missing(msgid.clone(), backend_id)
                 .await;
             metrics.record_error_4xx(backend_id);
         }
