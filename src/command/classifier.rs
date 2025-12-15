@@ -437,7 +437,7 @@ pub enum NntpCommand {
     /// [RFC 3977 §7](https://datatracker.ietf.org/doc/html/rfc3977#section-7)
     Stateless,
 
-    /// Article retrieval by message-ID: ARTICLE/BODY/HEAD/STAT <msgid> (70%+ of traffic)
+    /// Article retrieval by message-ID: `ARTICLE/BODY/HEAD/STAT <msgid>` (70%+ of traffic)
     /// [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2)
     ArticleByMessageId,
 }

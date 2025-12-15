@@ -220,7 +220,7 @@ pub struct ArticleEntry {
     backend_availability: ArticleAvailability,
 
     /// Complete response buffer (Arc for cheap cloning)
-    /// Format: "220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n"
+    /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
     /// Status code is always at bytes [0..3]
     buffer: Arc<Vec<u8>>,
 }
@@ -322,8 +322,8 @@ impl ArticleEntry {
 
 /// Article cache using LRU eviction with TTL
 ///
-/// Uses Arc<str> (message ID content without brackets) as key for zero-allocation lookups.
-/// Arc<str> implements Borrow<str>, allowing cache.get(&str) without allocation.
+/// Uses `Arc<str>` (message ID content without brackets) as key for zero-allocation lookups.
+/// `Arc<str>` implements `Borrow<str>`, allowing `cache.get(&str)` without allocation.
 #[derive(Clone, Debug)]
 pub struct ArticleCache {
     cache: Arc<Cache<Arc<str>, ArticleEntry>>,

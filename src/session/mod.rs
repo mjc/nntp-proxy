@@ -499,7 +499,8 @@ impl ClientSession {
     }
 
     /// Get the authenticated username (if any) - zero-cost reference
-    ///\n    /// Returns the authenticated username as an Arc<str> for cheap cloning.
+    ///
+    /// Returns the authenticated username as an `Arc<str>` for cheap cloning.
     /// Returns None if the client has not authenticated yet.
     #[inline]
     #[must_use]
