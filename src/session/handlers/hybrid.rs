@@ -17,8 +17,8 @@
 //!                                          handle_stateful_proxy_loop()
 //! ```
 
+use crate::session::ClientSession;
 use crate::session::metrics_ext::MetricsRecorder;
-use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -82,7 +82,7 @@ impl ClientSession {
 
         // Build initial state with carried-over byte counts
         let initial_bytes = client_to_backend_bytes + initial_command.len() as u64;
-        let state = common::SessionLoopState::from_initial_bytes(
+        let state = crate::session::state::SessionLoopState::from_initial_bytes(
             initial_bytes,
             backend_to_client_bytes,
             self.auth_handler.is_enabled(),

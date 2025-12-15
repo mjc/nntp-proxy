@@ -1,4 +1,4 @@
-//! Backend response validation module
+//! Backend response validation
 //!
 //! Provides pure functions for validating backend NNTP responses.
 //! Does NOT handle I/O - callers are responsible for actual communication.

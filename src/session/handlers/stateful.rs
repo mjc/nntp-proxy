@@ -44,7 +44,7 @@ impl ClientSession {
         let (client_read, client_write) = client_stream.split();
         let client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
         let (backend_read, backend_write) = tokio::io::split(&mut *backend_conn);
-        let state = common::SessionLoopState::new(self.auth_handler.is_enabled());
+        let state = crate::session::state::SessionLoopState::new(self.auth_handler.is_enabled());
 
         self.run_stateful_proxy_loop(
             client_reader,
@@ -66,7 +66,7 @@ impl ClientSession {
         mut client_write: W,
         mut backend_read: BR,
         mut backend_write: BW,
-        mut state: common::SessionLoopState,
+        mut state: crate::session::state::SessionLoopState,
         backend_id: crate::types::BackendId,
     ) -> Result<TransferMetrics>
     where

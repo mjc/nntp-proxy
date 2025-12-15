@@ -166,6 +166,7 @@ pub mod metrics_ext;
 pub mod mode_state;
 pub mod precheck;
 pub(crate) mod routing;
+pub mod state;
 pub mod streaming;
 
 use std::sync::Arc;
@@ -180,6 +181,7 @@ use crate::types::{ClientAddress, ClientId};
 pub use auth_state::AuthState;
 pub use metrics_ext::MetricsRecorder;
 pub use mode_state::{ModeState, SessionMode};
+pub use state::SessionLoopState;
 
 // SessionMode is now exported from mode_state module
 
