@@ -33,6 +33,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
+//! use std::net::SocketAddr;
 //! use nntp_proxy::session::ClientSession;
 //! use nntp_proxy::pool::BufferPool;
 //! use nntp_proxy::router::BackendSelector;
@@ -41,7 +42,7 @@
 //! use nntp_proxy::auth::AuthHandler;
 //!
 //! # fn example() -> anyhow::Result<()> {
-//! let addr = "127.0.0.1:50000".parse()?;
+//! let addr: SocketAddr = "127.0.0.1:50000".parse()?;
 //! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
@@ -61,6 +62,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
+//! use std::net::SocketAddr;
 //! use nntp_proxy::session::ClientSession;
 //! use nntp_proxy::pool::BufferPool;
 //! use nntp_proxy::router::BackendSelector;
@@ -69,7 +71,7 @@
 //! use nntp_proxy::auth::AuthHandler;
 //!
 //! # fn example() -> anyhow::Result<()> {
-//! let addr = "127.0.0.1:50000".parse()?;
+//! let addr: SocketAddr = "127.0.0.1:50000".parse()?;
 //! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
@@ -91,6 +93,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
+//! use std::net::SocketAddr;
 //! use std::time::Duration;
 //! use nntp_proxy::session::ClientSession;
 //! use nntp_proxy::pool::BufferPool;
@@ -102,7 +105,7 @@
 //! use nntp_proxy::cache::ArticleCache;
 //!
 //! # fn example() -> anyhow::Result<()> {
-//! let addr = "127.0.0.1:50000".parse()?;
+//! let addr: SocketAddr = "127.0.0.1:50000".parse()?;
 //! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
