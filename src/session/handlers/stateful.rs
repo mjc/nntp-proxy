@@ -2,6 +2,7 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
+use crate::session::metrics_ext::MetricsRecorder;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -82,13 +83,31 @@ impl ClientSession {
 
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
-                self.flush_incremental_metrics(
-                    backend_id,
-                    state.client_to_backend,
-                    state.backend_to_client,
-                    &mut state.last_reported_c2b,
-                    &mut state.last_reported_b2c,
-                );
+                // Report byte deltas since last flush
+                let delta_c2b = state
+                    .client_to_backend
+                    .as_u64()
+                    .saturating_sub(state.last_reported_c2b.as_u64());
+                let delta_b2c = state
+                    .backend_to_client
+                    .as_u64()
+                    .saturating_sub(state.last_reported_b2c.as_u64());
+
+                if delta_c2b > 0 {
+                    self.metrics
+                        .record_client_to_backend_bytes_for(backend_id, delta_c2b);
+                    self.metrics
+                        .user_bytes_sent(self.username().as_deref(), delta_c2b);
+                }
+                if delta_b2c > 0 {
+                    self.metrics
+                        .record_backend_to_client_bytes_for(backend_id, delta_b2c);
+                    self.metrics
+                        .user_bytes_received(self.username().as_deref(), delta_b2c);
+                }
+
+                state.last_reported_c2b = state.client_to_backend;
+                state.last_reported_b2c = state.backend_to_client;
             }
 
             tokio::select! {
@@ -144,14 +163,31 @@ impl ClientSession {
             }
         }
 
-        // Final metrics
-        self.report_final_metrics(
-            backend_id,
-            state.client_to_backend,
-            state.backend_to_client,
-            state.last_reported_c2b.as_u64(),
-            state.last_reported_b2c.as_u64(),
-        );
+        // Final metrics - report any remaining byte deltas
+        let delta_c2b = state
+            .client_to_backend
+            .as_u64()
+            .saturating_sub(state.last_reported_c2b.as_u64());
+        let delta_b2c = state
+            .backend_to_client
+            .as_u64()
+            .saturating_sub(state.last_reported_b2c.as_u64());
+
+        if delta_c2b > 0 {
+            self.metrics
+                .record_client_to_backend_bytes_for(backend_id, delta_c2b);
+            self.metrics
+                .user_bytes_sent(self.username().as_deref(), delta_c2b);
+        }
+        if delta_b2c > 0 {
+            self.metrics
+                .record_backend_to_client_bytes_for(backend_id, delta_b2c);
+            self.metrics
+                .user_bytes_received(self.username().as_deref(), delta_b2c);
+        }
+
+        self.metrics
+            .user_connection_closed(self.username().as_deref());
 
         Ok(state.into_metrics())
     }

@@ -465,9 +465,9 @@ impl ClientSession {
             adaptive_precheck: false,
         }
     }
-}
 
-impl ClientSession {
+    // Getters and helper methods
+
     /// Get the unique client ID
     #[must_use]
     #[inline]
@@ -519,65 +519,6 @@ impl ClientSession {
         self.connection_stats.as_ref()
     }
 
-    // Metrics helper methods - delegate to MetricsRecorder trait
-
-    #[inline]
-    pub(crate) fn record_command(&self, backend_id: crate::types::BackendId) {
-        self.metrics.record_command(backend_id);
-    }
-
-    #[inline]
-    pub(crate) fn user_command(&self) {
-        self.metrics.user_command(self.username().as_deref());
-    }
-
-    #[inline]
-    pub(crate) fn stateful_session_started(&self) {
-        self.metrics.stateful_session_started();
-    }
-
-    #[inline]
-    pub(crate) fn stateful_session_ended(&self) {
-        self.metrics.stateful_session_ended();
-    }
-
-    #[inline]
-    pub(crate) fn user_bytes_sent(&self, bytes: u64) {
-        self.metrics
-            .user_bytes_sent(self.username().as_deref(), bytes);
-    }
-
-    #[inline]
-    pub(crate) fn user_bytes_received(&self, bytes: u64) {
-        self.metrics
-            .user_bytes_received(self.username().as_deref(), bytes);
-    }
-
-    /// Flush incremental metrics for long-running sessions
-    ///
-    /// This should be called periodically (e.g., every 100 iterations) to report
-    /// byte transfer progress for the TUI without waiting until session end.
-    #[inline]
-    pub(crate) fn flush_incremental_metrics(
-        &self,
-        backend_id: crate::types::BackendId,
-        client_to_backend: crate::types::ClientToBackendBytes,
-        backend_to_client: crate::types::BackendToClientBytes,
-        last_reported_c2b: &mut crate::types::ClientToBackendBytes,
-        last_reported_b2c: &mut crate::types::BackendToClientBytes,
-    ) {
-        self.record_byte_deltas(
-            backend_id,
-            client_to_backend.as_u64(),
-            backend_to_client.as_u64(),
-            last_reported_c2b.as_u64(),
-            last_reported_b2c.as_u64(),
-        );
-
-        *last_reported_c2b = client_to_backend;
-        *last_reported_b2c = backend_to_client;
-    }
-
     /// Check if already authenticated (cached for performance)
     ///
     /// # Arguments
@@ -588,53 +529,6 @@ impl ClientSession {
     #[inline]
     pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
         self.auth_state.is_authenticated_or_skipped(skip_auth_check)
-    }
-
-    /// Report final session metrics before ending
-    #[inline]
-    pub(crate) fn report_final_metrics(
-        &self,
-        backend_id: crate::types::BackendId,
-        client_to_backend: impl Into<u64>,
-        backend_to_client: impl Into<u64>,
-        last_reported_c2b: u64,
-        last_reported_b2c: u64,
-    ) {
-        self.record_byte_deltas(
-            backend_id,
-            client_to_backend.into(),
-            backend_to_client.into(),
-            last_reported_c2b,
-            last_reported_b2c,
-        );
-
-        self.metrics
-            .user_connection_closed(self.username().as_deref());
-    }
-
-    /// Record byte transfer deltas to metrics (shared logic)
-    #[inline]
-    fn record_byte_deltas(
-        &self,
-        backend_id: crate::types::BackendId,
-        current_c2b: u64,
-        current_b2c: u64,
-        last_c2b: u64,
-        last_b2c: u64,
-    ) {
-        let delta_c2b = current_c2b.saturating_sub(last_c2b);
-        let delta_b2c = current_b2c.saturating_sub(last_b2c);
-
-        if delta_c2b > 0 {
-            self.metrics
-                .record_client_to_backend_bytes_for(backend_id, delta_c2b);
-            self.user_bytes_sent(delta_c2b);
-        }
-        if delta_b2c > 0 {
-            self.metrics
-                .record_backend_to_client_bytes_for(backend_id, delta_b2c);
-            self.user_bytes_received(delta_b2c);
-        }
     }
 }
 
@@ -1180,25 +1074,31 @@ mod tests {
     // ==================== Metrics Helper Methods Tests ====================
 
     #[test]
-    fn test_metrics_helpers_no_metrics() {
+    fn test_metrics_direct_calls_no_metrics() {
+        use crate::session::metrics_ext::MetricsRecorder;
         use crate::types::BackendId;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let session = ClientSession::new(addr.into(), buffer_pool, test_auth_handler());
 
-        // Should not panic when metrics is None
-        session.record_command(BackendId::from_index(0));
-        session.user_command();
-        session.stateful_session_started();
-        session.stateful_session_ended();
-        session.user_bytes_sent(1024);
-        session.user_bytes_received(2048);
+        // Should not panic when metrics is None (trait provides no-op implementation)
+        session.metrics.record_command(BackendId::from_index(0));
+        session.metrics.user_command(session.username().as_deref());
+        session.metrics.stateful_session_started();
+        session.metrics.stateful_session_ended();
+        session
+            .metrics
+            .user_bytes_sent(session.username().as_deref(), 1024);
+        session
+            .metrics
+            .user_bytes_received(session.username().as_deref(), 2048);
     }
 
     #[test]
-    fn test_metrics_helpers_with_metrics() {
+    fn test_metrics_direct_calls_with_metrics() {
         use crate::metrics::MetricsCollector;
+        use crate::session::metrics_ext::MetricsRecorder;
         use crate::types::BackendId;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
@@ -1211,13 +1111,17 @@ mod tests {
 
         session.set_username(Some("testuser".to_string()));
 
-        // Call all metrics helpers - should not panic
-        session.record_command(BackendId::from_index(0));
-        session.user_command();
-        session.stateful_session_started();
-        session.stateful_session_ended();
-        session.user_bytes_sent(1024);
-        session.user_bytes_received(2048);
+        // Call metrics directly through Option - should record
+        session.metrics.record_command(BackendId::from_index(0));
+        session.metrics.user_command(session.username().as_deref());
+        session.metrics.stateful_session_started();
+        session.metrics.stateful_session_ended();
+        session
+            .metrics
+            .user_bytes_sent(session.username().as_deref(), 1024);
+        session
+            .metrics
+            .user_bytes_received(session.username().as_deref(), 2048);
 
         // Verify metrics were recorded (snapshot should have data)
         let snapshot = metrics.snapshot(None);
@@ -1239,7 +1143,7 @@ mod tests {
             .build();
 
         let backend_id = BackendId::from_index(0);
-        session.record_command(backend_id);
+        session.metrics.record_command(backend_id);
 
         let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
@@ -1248,6 +1152,7 @@ mod tests {
     #[test]
     fn test_user_bytes_tracking() {
         use crate::metrics::MetricsCollector;
+        use crate::session::metrics_ext::MetricsRecorder;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
@@ -1258,8 +1163,12 @@ mod tests {
             .build();
 
         session.set_username(Some("testuser".to_string()));
-        session.user_bytes_sent(1024);
-        session.user_bytes_received(2048);
+        session
+            .metrics
+            .user_bytes_sent(session.username().as_deref(), 1024);
+        session
+            .metrics
+            .user_bytes_received(session.username().as_deref(), 2048);
 
         let snapshot = metrics.snapshot(None);
         let user_stats = snapshot
@@ -1285,12 +1194,12 @@ mod tests {
             .with_metrics(metrics.clone())
             .build();
 
-        session.stateful_session_started();
+        session.metrics.stateful_session_started();
 
         let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.stateful_sessions, 1);
 
-        session.stateful_session_ended();
+        session.metrics.stateful_session_ended();
 
         let snapshot = metrics.snapshot(None);
         assert_eq!(snapshot.stateful_sessions, 0);

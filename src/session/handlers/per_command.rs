@@ -5,6 +5,7 @@
 //! logic used by all routing modes.
 
 use crate::session::common;
+use crate::session::metrics_ext::MetricsRecorder;
 use crate::session::routing::{
     CacheAction, CommandRoutingDecision, MetricsAction, decide_command_routing,
     determine_cache_action, determine_metrics_action, is_430_status_code,
@@ -573,8 +574,8 @@ impl ClientSession {
         use std::time::Instant;
         use tokio::io::AsyncWriteExt;
 
-        self.record_command(backend_id);
-        self.user_command();
+        self.metrics.record_command(backend_id);
+        self.metrics.user_command(self.username().as_deref());
 
         let start = Instant::now();
 
@@ -840,8 +841,10 @@ impl ClientSession {
         let cmd_bytes_metric = MetricsBytes::new(cmd_bytes);
         let resp_bytes_metric = MetricsBytes::new(resp_bytes);
         let _ = metrics.record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
-        self.user_bytes_sent(cmd_bytes);
-        self.user_bytes_received(resp_bytes);
+        self.metrics
+            .user_bytes_sent(self.username().as_deref(), cmd_bytes);
+        self.metrics
+            .user_bytes_received(self.username().as_deref(), resp_bytes);
     }
 
     /// Create precheck dependencies

@@ -17,6 +17,7 @@
 //!                                          handle_stateful_proxy_loop()
 //! ```
 
+use crate::session::metrics_ext::MetricsRecorder;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::{Context, Result};
@@ -71,7 +72,7 @@ impl ClientSession {
         );
 
         // Track session lifecycle
-        self.stateful_session_started();
+        self.metrics.stateful_session_started();
 
         // Forward the triggering command (response handled by proxy loop)
         pooled_conn
@@ -102,7 +103,7 @@ impl ClientSession {
             )
             .await?;
 
-        self.stateful_session_ended();
+        self.metrics.stateful_session_ended();
         Ok(metrics)
     }
 
