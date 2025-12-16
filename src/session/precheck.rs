@@ -5,12 +5,13 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use crate::cache::{ArticleAvailability, ArticleCache, ArticleEntry};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
+use crate::session::backend;
 use crate::types::{BackendId, MessageId};
 
 /// Result of querying a backend for an article.
@@ -65,24 +66,20 @@ async fn query_backend(
     };
 
     let mut buffer = deps.buffer_pool.acquire().await;
-    if conn.as_mut().write_all(command.as_bytes()).await.is_err() {
-        return QueryResult::Error(backend_id);
-    }
 
-    let Ok(n) = buffer.read_from(&mut *conn).await else {
-        return QueryResult::Error(backend_id);
+    // Use shared backend command execution
+    let cmd_response = match backend::send_command(&mut *conn, command, &mut buffer).await {
+        Ok(r) => r,
+        Err(_) => return QueryResult::Error(backend_id),
     };
-    if n == 0 {
-        return QueryResult::Error(backend_id);
-    }
 
-    let mut response = buffer[..n].to_vec();
-    let parsed = crate::protocol::NntpResponse::parse(&response);
-    let Some(status_code) = parsed.status_code().map(|c| c.as_u16()) else {
+    let Some(status_code) = cmd_response.status_code() else {
         return QueryResult::Error(backend_id);
     };
 
-    if multiline && parsed.is_multiline() {
+    // For multiline responses, read remaining data
+    let mut response = buffer[..cmd_response.bytes_read].to_vec();
+    if multiline && cmd_response.is_multiline {
         while !response.ends_with(b".\r\n") {
             match conn.as_mut().read(buffer.as_mut_slice()).await {
                 Ok(0) | Err(_) => break,

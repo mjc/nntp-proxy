@@ -15,7 +15,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
@@ -571,78 +571,28 @@ impl ClientSession {
         command: &str,
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(usize, crate::protocol::NntpResponse, bool, u64, u64, u64)> {
-        use std::time::Instant;
-        use tokio::io::AsyncWriteExt;
-
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username().as_deref());
 
-        let start = Instant::now();
+        let (response, ttfb, send, recv) =
+            backend::send_command_timed(&mut **pooled_conn, command, buffer).await?;
 
-        // Send command
-        let send_start = Instant::now();
-        pooled_conn.as_mut().write_all(command.as_bytes()).await?;
-        let send_elapsed = send_start.elapsed();
-
-        // Read first chunk
-        let recv_start = Instant::now();
-        let n = buffer.read_from(&mut **pooled_conn).await?;
-        if n == 0 {
-            anyhow::bail!("Backend connection closed unexpectedly");
-        }
-        let recv_elapsed = recv_start.elapsed();
-
-        // Validate response using pure function from backend module
-        let validated = backend::validate_backend_response(
-            &buffer[..n],
-            n,
-            crate::protocol::MIN_RESPONSE_LENGTH,
+        // Log any validation warnings
+        backend::log_warnings(
+            &response.warnings,
+            &buffer[..response.bytes_read],
+            response.bytes_read,
+            self.client_addr,
+            backend_id,
         );
 
-        // Log warnings
-        for warning in &validated.warnings {
-            use backend::ResponseWarning;
-            match warning {
-                ResponseWarning::ShortResponse { bytes, min } => {
-                    warn!(
-                        "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
-                        self.client_addr,
-                        backend_id,
-                        bytes,
-                        min,
-                        &buffer[..n]
-                    );
-                }
-                ResponseWarning::InvalidResponse => {
-                    warn!(
-                        "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
-                        self.client_addr,
-                        backend_id,
-                        n,
-                        String::from_utf8_lossy(&buffer[..n.min(50)])
-                    );
-                }
-                ResponseWarning::UnusualStatusCode(code) => {
-                    warn!(
-                        "Client {} got unusual status code {} from backend {:?}: {:?}",
-                        self.client_addr,
-                        code,
-                        backend_id,
-                        String::from_utf8_lossy(&buffer[..n.min(50)])
-                    );
-                }
-            }
-        }
-
-        let elapsed = start.elapsed();
-
         Ok((
-            n,
-            validated.response,
-            validated.is_multiline,
-            elapsed.as_micros() as u64,
-            send_elapsed.as_micros() as u64,
-            recv_elapsed.as_micros() as u64,
+            response.bytes_read,
+            response.response,
+            response.is_multiline,
+            ttfb,
+            send,
+            recv,
         ))
     }
 
