@@ -303,12 +303,7 @@ pub struct NntpProxy {
 /// ```
 #[inline]
 pub fn is_client_disconnect_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
-        matches!(
-            io_err.kind(),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-        )
-    })
+    crate::session::error_classification::ErrorClassifier::is_client_disconnect(e)
 }
 
 impl NntpProxy {
