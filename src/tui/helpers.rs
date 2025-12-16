@@ -3,9 +3,7 @@
 use ratatui::style::Color;
 
 use super::constants::{BACKEND_COLORS, throughput};
-use super::types::{
-    BackendChartData, BackendIndex, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec,
-};
+use super::types::{BackendChartData, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec};
 use crate::config::Server;
 use crate::tui::TuiApp;
 use crate::tui::app::ThroughputPoint;
@@ -94,7 +92,7 @@ pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64)
         (
             BackendChartData::new(
                 server.name.as_str().to_string(),
-                backend_color(BackendIndex::from(index)),
+                backend_color(index),
                 sent_points,
                 recv_points,
             ),
@@ -126,8 +124,8 @@ pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64)
 /// Get color for backend by index (round-robin through palette)
 #[inline]
 #[must_use]
-pub fn backend_color(index: BackendIndex) -> Color {
-    BACKEND_COLORS[index.get() % BACKEND_COLORS.len()]
+pub fn backend_color(index: usize) -> Color {
+    BACKEND_COLORS[index % BACKEND_COLORS.len()]
 }
 
 /// Round throughput value up to next nice number for chart axis
@@ -287,17 +285,17 @@ mod tests {
 
     #[test]
     fn test_backend_color_cycles() {
-        let color0 = backend_color(BackendIndex::from(0));
-        let color_wrap = backend_color(BackendIndex::from(BACKEND_COLORS.len()));
+        let color0 = backend_color(0);
+        let color_wrap = backend_color(BACKEND_COLORS.len());
         assert_eq!(color0, color_wrap, "Should wrap around");
     }
 
     #[test]
     fn test_backend_color_distinct() {
         // First few backends should have distinct colors
-        let color0 = backend_color(BackendIndex::from(0));
-        let color1 = backend_color(BackendIndex::from(1));
-        let color2 = backend_color(BackendIndex::from(2));
+        let color0 = backend_color(0);
+        let color1 = backend_color(1);
+        let color2 = backend_color(2);
 
         assert_ne!(color0, color1);
         assert_ne!(color1, color2);
@@ -369,7 +367,7 @@ mod tests {
         for i in 0..8 {
             chart_data.push(BackendChartData::new(
                 format!("Server {}", i),
-                backend_color(BackendIndex::from(i)),
+                backend_color(i),
                 PointVec::new(),
                 PointVec::new(),
             ));
@@ -384,7 +382,7 @@ mod tests {
     fn test_backend_chart_data_structure() {
         let data = BackendChartData::new(
             "Test Server".to_string(),
-            backend_color(BackendIndex::from(0)),
+            backend_color(0),
             PointVec::new(),
             PointVec::new(),
         );

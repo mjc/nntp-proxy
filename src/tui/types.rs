@@ -4,42 +4,6 @@ use ratatui::style::Color;
 use smallvec::SmallVec;
 
 // ============================================================================
-// Index Types
-// ============================================================================
-
-/// Type-safe backend index
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BackendIndex(usize);
-
-impl BackendIndex {
-    /// Create from raw index
-    #[must_use]
-    #[inline]
-    pub const fn new(index: usize) -> Self {
-        Self(index)
-    }
-
-    /// Get raw index
-    #[must_use]
-    #[inline]
-    pub const fn get(&self) -> usize {
-        self.0
-    }
-}
-
-impl From<usize> for BackendIndex {
-    fn from(index: usize) -> Self {
-        Self::new(index)
-    }
-}
-
-impl From<BackendIndex> for usize {
-    fn from(index: BackendIndex) -> Self {
-        index.get()
-    }
-}
-
-// ============================================================================
 // Chart Coordinate Types
 // ============================================================================
 
