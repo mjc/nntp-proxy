@@ -277,7 +277,10 @@ impl ClientSession {
                     );
 
                     // Spawn background precheck for STAT to update availability
-                    if self.adaptive_precheck && command.to_uppercase().starts_with("STAT ") {
+                    if self.adaptive_precheck
+                        && command.len() >= 5
+                        && command.as_bytes()[..5].eq_ignore_ascii_case(b"STAT ")
+                    {
                         precheck::spawn_background_precheck(
                             self.precheck_deps(&router),
                             command.to_string(),
@@ -313,9 +316,11 @@ impl ClientSession {
         if self.adaptive_precheck
             && let Some(ref msg_id_ref) = msg_id
         {
-            let cmd_upper = command.to_uppercase();
-            let is_stat = cmd_upper.starts_with("STAT ");
-            let is_head = cmd_upper.starts_with("HEAD ");
+            // Use case-insensitive comparison without allocation
+            let is_stat =
+                command.len() >= 5 && command.as_bytes()[..5].eq_ignore_ascii_case(b"STAT ");
+            let is_head =
+                command.len() >= 5 && command.as_bytes()[..5].eq_ignore_ascii_case(b"HEAD ");
 
             if is_stat || is_head {
                 let deps = self.precheck_deps(&router);
