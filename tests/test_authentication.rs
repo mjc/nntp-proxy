@@ -9,16 +9,14 @@
 //! - Security (credential redaction)
 
 use std::sync::Arc;
-use tokio::net::TcpListener;
 
 mod config_helpers;
 mod test_helpers;
-use config_helpers::create_test_server_config;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
-use nntp_proxy::config::{Config, RoutingMode};
+use nntp_proxy::config::RoutingMode;
 use nntp_proxy::session::ClientSession;
-use test_helpers::{MockNntpServer, create_config_with_auth, spawn_mock_backend};
+use test_helpers::{create_config_with_auth, spawn_mock_backend};
 
 #[tokio::test]
 async fn test_auth_handler_disabled_by_default() {

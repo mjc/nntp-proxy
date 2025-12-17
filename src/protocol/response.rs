@@ -250,7 +250,7 @@ impl StatusCode {
 }
 
 #[cfg(test)]
-mod inline_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -276,53 +276,139 @@ mod inline_tests {
     #[test]
     fn test_status_code_parsing() {
         assert_eq!(StatusCode::parse(b"200"), Some(StatusCode::new(200)));
+        assert_eq!(
+            StatusCode::parse(b"200 Ready\r\n"),
+            Some(StatusCode::new(200))
+        );
+        assert_eq!(
+            StatusCode::parse(b"381 Password required\r\n"),
+            Some(StatusCode::new(381))
+        );
+        assert_eq!(
+            StatusCode::parse(b"500 Error\r\n"),
+            Some(StatusCode::new(500))
+        );
         assert_eq!(StatusCode::parse(b""), None);
         assert_eq!(StatusCode::parse(b"XX"), None);
+        assert_eq!(StatusCode::parse(b"ABC Invalid\r\n"), None);
+        assert_eq!(StatusCode::parse(b"20"), None);
+        assert_eq!(StatusCode::parse(b"2X0 Error\r\n"), None);
     }
 
     #[test]
     fn test_nntp_response_categorization() {
+        // Greetings
         assert!(matches!(
             NntpResponse::parse(b"200 OK\r\n"),
             NntpResponse::Greeting(_)
         ));
+        assert!(matches!(
+            NntpResponse::parse(b"201 No posting\r\n"),
+            NntpResponse::Greeting(_)
+        ));
+
+        // Disconnect
         assert_eq!(
             NntpResponse::parse(b"205 Bye\r\n"),
             NntpResponse::Disconnect
         );
+
+        // Auth
         assert!(matches!(
             NntpResponse::parse(b"381 Pass\r\n"),
+            NntpResponse::AuthRequired(_)
+        ));
+        assert!(matches!(
+            NntpResponse::parse(b"480 Auth required\r\n"),
             NntpResponse::AuthRequired(_)
         ));
         assert_eq!(
             NntpResponse::parse(b"281 OK\r\n"),
             NntpResponse::AuthSuccess
         );
+
+        // Multiline
         assert!(matches!(
             NntpResponse::parse(b"220 Art\r\n"),
             NntpResponse::MultilineData(_)
         ));
         assert!(matches!(
+            NntpResponse::parse(b"215 LIST\r\n"),
+            NntpResponse::MultilineData(_)
+        ));
+        assert!(matches!(
+            NntpResponse::parse(b"100 Help\r\n"),
+            NntpResponse::MultilineData(_)
+        ));
+
+        // Single-line
+        assert!(matches!(
             NntpResponse::parse(b"211 Group\r\n"),
             NntpResponse::SingleLine(_)
         ));
+        assert!(matches!(
+            NntpResponse::parse(b"400 Error\r\n"),
+            NntpResponse::SingleLine(_)
+        ));
+
+        // Invalid
         assert_eq!(NntpResponse::parse(b""), NntpResponse::Invalid);
+        assert_eq!(NntpResponse::parse(b"XXX\r\n"), NntpResponse::Invalid);
     }
 
     #[test]
     fn test_response_is_success() {
         assert!(NntpResponse::parse(b"200 OK\r\n").is_success());
         assert!(NntpResponse::parse(b"281 Auth\r\n").is_success());
+        assert!(NntpResponse::parse(b"381 Password required\r\n").is_success()); // 3xx is success
         assert!(!NntpResponse::parse(b"400 Error\r\n").is_success());
         assert!(!NntpResponse::parse(b"500 Error\r\n").is_success());
+        assert!(!NntpResponse::Invalid.is_success());
     }
 
     #[test]
     fn test_response_is_multiline() {
         assert!(NntpResponse::parse(b"220 Article\r\n").is_multiline());
+        assert!(NntpResponse::parse(b"215 LIST\r\n").is_multiline());
         assert!(!NntpResponse::parse(b"200 OK\r\n").is_multiline());
+        assert!(!NntpResponse::parse(b"211 Group\r\n").is_multiline());
+    }
+
+    #[test]
+    fn test_response_status_code() {
+        assert_eq!(
+            NntpResponse::parse(b"200 OK\r\n").status_code(),
+            Some(StatusCode::new(200))
+        );
+        assert_eq!(
+            NntpResponse::Disconnect.status_code(),
+            Some(StatusCode::new(205))
+        );
+        assert_eq!(
+            NntpResponse::AuthSuccess.status_code(),
+            Some(StatusCode::new(281))
+        );
+        assert_eq!(NntpResponse::Invalid.status_code(), None);
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // UTF-8 in responses
+        let utf8_response = "200 Привет мир\r\n".as_bytes();
+        assert_eq!(StatusCode::parse(utf8_response), Some(StatusCode::new(200)));
+
+        // Response with binary data
+        let with_null = b"200 Test\x00Message\r\n";
+        assert_eq!(StatusCode::parse(with_null), Some(StatusCode::new(200)));
+
+        // Boundary status codes
+        assert_eq!(
+            StatusCode::parse(b"100 Info\r\n"),
+            Some(StatusCode::new(100))
+        );
+        assert_eq!(
+            StatusCode::parse(b"599 Error\r\n"),
+            Some(StatusCode::new(599))
+        );
     }
 }
-
-#[cfg(test)]
-mod tests;
