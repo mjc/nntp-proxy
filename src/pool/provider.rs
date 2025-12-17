@@ -201,6 +201,52 @@ impl DeadpoolConnectionProvider {
     pub fn builder(host: impl Into<String>, port: u16) -> Builder {
         Builder::new(host, port)
     }
+
+    /// Create a simple connection provider with defaults
+    ///
+    /// Useful for testing and simple use cases. Uses 10 connections, no auth.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::simple("news.example.com", 119)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn simple(host: impl Into<String>, port: u16) -> Result<Self> {
+        Self::builder(host, port).build()
+    }
+
+    /// Create a connection provider with authentication
+    ///
+    /// Convenience constructor for the common case of username/password auth.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::with_auth(
+    ///     "news.example.com",
+    ///     119,
+    ///     "myuser",
+    ///     "mypass",
+    /// )?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn with_auth(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self> {
+        Self::builder(host, port)
+            .username(username)
+            .password(password)
+            .build()
+    }
+
     /// Create a new connection provider
     pub fn new(
         host: String,

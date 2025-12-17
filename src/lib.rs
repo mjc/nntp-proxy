@@ -34,6 +34,7 @@
 // Module declarations
 pub mod args;
 pub mod auth;
+pub mod client;
 pub mod connection_error;
 pub mod formatting;
 pub mod logging;
@@ -64,3 +65,22 @@ pub use config::{
 };
 pub use proxy::{NntpProxy, NntpProxyBuilder, is_client_disconnect_error};
 pub use runtime::{RuntimeConfig, shutdown_signal};
+
+// Re-export streaming utilities for standalone client use
+pub mod streaming {
+    //! Streaming utilities for reading NNTP multiline responses
+    //!
+    //! These are useful when building standalone NNTP clients that need to
+    //! fetch articles directly from servers.
+    pub use crate::session::streaming::{
+        stream_and_capture_multiline_response, stream_multiline_response,
+    };
+}
+
+// Re-export backend command utilities for standalone client use
+pub mod backend {
+    //! Backend communication utilities for NNTP client operations
+    //!
+    //! Use these when building standalone NNTP clients.
+    pub use crate::session::backend::{CommandResponse, send_command};
+}
