@@ -300,20 +300,20 @@ command_cases!(
 // Fast-path matchers for hot commands (40Gbit optimization)
 // =============================================================================
 
-/// Check if command matches any of 3 case variations (UPPER, lower, Title)
+/// Check if command matches any of N case variations
 ///
 /// Per [RFC 3977 §3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.1),
-/// NNTP commands are case-insensitive. This function checks all three common
-/// case variations used by different NNTP clients.
+/// NNTP commands are case-insensitive. This function checks multiple case
+/// variations used by different NNTP clients.
 ///
-/// **Optimization**: UPPERCASE checked first (index 0) - represents 95% of real
-/// NNTP traffic. Manually unrolled loop for predictable branch prediction.
+/// **Optimization**: UPPERCASE should be at index 0 - represents 95% of real
+/// NNTP traffic. Compiler unrolls contains check for small N (typically N=3).
 ///
-/// Uses const generic to enforce 3-variant array at compile time.
+/// Uses const generic to support flexible case counts at compile time.
 #[inline(always)]
-pub fn matches_any(cmd: &[u8], cases: &[&[u8]; 3]) -> bool {
-    // Check UPPERCASE first (index 0) - most NNTP clients use uppercase
-    cmd == cases[0] || cmd == cases[1] || cmd == cases[2]
+pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
+    // Compiler optimizes contains() to unrolled comparisons for small N
+    cases.contains(&cmd)
 }
 
 /// Ultra-fast detection of article retrieval commands with message-ID

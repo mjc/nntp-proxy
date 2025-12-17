@@ -200,14 +200,14 @@ async fn test_auth_command_sequence_valid() {
     let user_action = CommandHandler::classify("AUTHINFO USER alice\r\n");
     assert!(matches!(
         user_action,
-        CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) if u == "alice"
+        CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) if *u == "alice"
     ));
 
     // AUTHINFO PASS should validate and respond
     let pass_action = CommandHandler::classify("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         pass_action,
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password == "secret"
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if *password == "secret"
     ));
 }
 
@@ -234,7 +234,7 @@ async fn test_auth_handler_processes_auth_commands() {
     let mut output = Vec::new();
 
     // Test USER command
-    let user_action = AuthAction::RequestPassword("testuser".to_string());
+    let user_action = AuthAction::RequestPassword("testuser");
     let (bytes, auth_success) = handler
         .handle_auth_command(user_action, &mut output, None)
         .await
@@ -246,9 +246,7 @@ async fn test_auth_handler_processes_auth_commands() {
 
     // Test PASS command with validation
     output.clear();
-    let pass_action = AuthAction::ValidateAndRespond {
-        password: "pass".to_string(),
-    };
+    let pass_action = AuthAction::ValidateAndRespond { password: "pass" };
     let (bytes, auth_success) = handler
         .handle_auth_command(pass_action, &mut output, Some("user"))
         .await
@@ -604,12 +602,8 @@ async fn test_auth_handler_with_concurrent_requests() {
         let h = handler.clone();
         set.spawn(async move {
             let mut output = Vec::new();
-            h.handle_auth_command(
-                AuthAction::RequestPassword("test".to_string()),
-                &mut output,
-                None,
-            )
-            .await
+            h.handle_auth_command(AuthAction::RequestPassword("test"), &mut output, None)
+                .await
         });
     }
 
