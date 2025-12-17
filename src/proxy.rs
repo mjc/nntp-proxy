@@ -365,11 +365,11 @@ impl NntpProxy {
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
-        routing_mode_str: &str,
+        routing_mode: crate::config::RoutingMode,
         metrics: &types::TransferMetrics,
     ) {
         self.connection_stats
-            .record_disconnection(session.username().as_deref(), routing_mode_str);
+            .record_disconnection(session.username().as_deref(), routing_mode.short_name());
 
         debug!(
             "Session {} [{}] ↑{} ↓{}",
@@ -644,8 +644,13 @@ impl NntpProxy {
     ) -> Result<()> {
         match metrics {
             Ok(m) => {
-                let mode = self.routing_mode.to_string().to_lowercase();
-                self.log_session_completion(client_addr, session_id, session, &mode, &m);
+                self.log_session_completion(
+                    client_addr,
+                    session_id,
+                    session,
+                    self.routing_mode,
+                    &m,
+                );
 
                 if self.enable_metrics
                     && let Some(bid) = backend_id

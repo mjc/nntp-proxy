@@ -111,10 +111,7 @@ pub(crate) fn on_authentication_success(
 
     // Record connection for aggregation (after auth so we have username)
     if let Some(stats) = connection_stats {
-        stats.record_connection(
-            username.as_deref(),
-            &routing_mode.to_string().to_lowercase(),
-        );
+        stats.record_connection(username.as_deref(), routing_mode.short_name());
     }
 
     // Track user connection in metrics

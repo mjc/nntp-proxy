@@ -44,6 +44,16 @@ impl RoutingMode {
         matches!(self, Self::Stateful | Self::Hybrid)
     }
 
+    /// Get short lowercase name for metrics/logging (no allocation)
+    #[must_use]
+    pub const fn short_name(&self) -> &'static str {
+        match self {
+            Self::Stateful => "stateful",
+            Self::PerCommand => "per-command",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
     /// Get a human-readable description of this routing mode
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
