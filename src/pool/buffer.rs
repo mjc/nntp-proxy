@@ -219,6 +219,16 @@ impl BufferPool {
         }
     }
 
+    /// Create a buffer pool suitable for testing
+    ///
+    /// Uses sensible defaults (8KB buffers, pool of 4) that work for most tests.
+    /// Prefer this over manually constructing BufferPool in tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self::new(BufferSize::try_new(8192).expect("valid size"), 4)
+    }
+
     /// Get a buffer from the pool or create a new one (lock-free)
     ///
     /// Returns a PooledBuffer that automatically returns to the pool when dropped.
