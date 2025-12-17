@@ -9,12 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Standalone NNTP Client Module** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
+  - New `NntpClient` for standalone article fetching without proxy overhead
+  - Methods: `fetch_article()`, `fetch_body()`, `fetch_head()`, `stat()`
+  - Zero-copy streaming with buffer pooling for memory efficiency
+  - Supports TLS/SSL and backend authentication
+
+- **Connection Pool Convenience Constructors** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
+  - `DeadpoolConnectionProvider::simple()` for unencrypted connections
+  - `with_auth()` for credential-based authentication
+  - `with_tls()` for encrypted connections
+  - `with_tls_auth()` for TLS + authentication (most common use case)
+  - Enables quick setup of Usenet provider connections in ~2 lines
+
+- **Test Convenience Methods** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
+  - `BufferPool::for_tests()` - Creates test-sized buffer pools with sane defaults
+  - Consolidates test configuration helpers across test suites
+
 - **Backend Availability Tracking** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
   - Automatic 430 retry across all backends when article not found
   - Compact bitset tracking (u8) for up to 8 backends per article
   - Progressive learning from cache hits, misses, and backend responses
   - Zero-cost abstractions with O(1) bitwise operations (~2ns lookup)
-  
+
 - **Availability-Only Cache Mode** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
   - New `cache_articles` config option (default: true)
   - `cache_articles = false` tracks backend availability without caching article bodies
@@ -27,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Backwards compatible with existing single-user configs
 
 ### Changed
+
+- **Public API Enhancements** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
+  - Exported `streaming` and `backend` modules for external use
+  - Added `pub use` re-exports in `lib.rs` for convenient access
+  - Enables library usage patterns for third-party integrations
+  - Better ergonomics for connection provider initialization
 
 - **Session Architecture Improvements** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
   - Unified per-command handler with cache-aware execution
@@ -243,13 +266,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Extracted `route_command_with_error_handling` helper to reduce duplication
   - Simplified `PooledBuffer` API to prevent undefined behavior
   - Removed unused macro parameters from `validated_string!`
-  
+
 ### Fixed
+
 - **Response Parsing**
   - Fixed bug in `has_spanning_terminator` with comprehensive test coverage
   - Proper tracking of initialized bytes in `PooledBuffer` to prevent reading uninitialized memory
-  
+
 ### Improved
+
 - **Test Coverage**
   - Added comprehensive authentication tests (bypass prevention, integration, security scenarios)
   - Added tests for RFC-compliant response codes
@@ -259,12 +284,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.1] - 2025-10-27
 
 ### Fixed
+
 - **Error handling and logging improvements** ([#24](https://github.com/mjc/nntp-proxy/pull/24))
   - Fixed spurious "broken pipe" error logs that masked real issues like authentication failures
   - Client disconnects after successful data transfer now correctly log at DEBUG level instead of ERROR/WARN
   - Authentication failures now prominently visible in logs with full context (backend name, host, port, username, server response)
-  
+
 ### Changed
+
 - **Code quality and maintainability**
   - Refactored per-command routing handler to eliminate nested helper functions
   - Reduced `per_command.rs` from 620 to 550 lines (-11%)
@@ -272,13 +299,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Simplified error handling with inline logic instead of jumping between functions
   - Added `ErrorClassifier` utility for consistent error classification across codebase
   - Enhanced `ConnectionError` with classification methods (`is_client_disconnect()`, `is_authentication_error()`, `is_network_error()`)
-  
+
 - **Streaming improvements**
   - Refactored `handle_client_write_error()` to distinguish complete vs incomplete chunk disconnects
   - Complete chunk disconnects now log at DEBUG (normal behavior)
   - Incomplete chunk disconnects log at WARN (unusual but handled)
-  
+
 ### Added
+
 - **Test coverage**
   - Added 8 tests for ConnectionError classification
   - Added 7 tests for ErrorClassifier functionality
@@ -289,6 +317,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] - 2025-10-09
 
 ### Added
+
 - **SSL/TLS Support**
   - Full SSL/TLS implementation for secure connections
   - Configurable certificate validation
@@ -311,44 +340,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Configurable health check intervals and failure thresholds
   - Automatic backend recovery tracking
   - Health metrics for monitoring
-  
+
 - **Builder Patterns**
   - `ServerConfigBuilder` for cleaner test code
   - `ClientSessionBuilder` for flexible session creation
   - `DeadpoolConnectionProviderBuilder` for connection provider setup
-  
+
 ### Changed
+
 - **Architecture improvements**
   - Split session handlers into routing mode modules (standard, per-command, hybrid)
   - Reorganized types/config into focused submodules
   - Modularized codebase for better maintainability
   - Consolidated constants into dedicated module
-  
+
 - **Performance optimizations**
   - Line buffer reuse in streaming to avoid allocations
   - Optimized cache session memory operations
   - Capacity hints for allocations
   - Inline hints for frequently-called functions
   - Iterator combinators instead of manual loops
-  
+
 - **Configuration**
   - Added environment variable support for CLI and backend servers
   - Comprehensive configuration validation with error messages
   - Removed duplicate buffer constants
-  
+
 ### Fixed
+
 - **Per-command routing fixes**
   - Fixed multiline response detection
   - Removed unnecessary flush calls
   - Fixed duplicate greeting in per-command routing mode
   - Fixed QUIT command broken pipe errors
-  
+
 - **Connection management**
   - Fixed connection pool exhaustion by using correct pooled connection method
   - Fixed TCP stream corruption in connection recycling
   - Proper handling of fresh vs pooled connections
-  
+
 ### Improved
+
 - **Code quality**
   - Applied clippy suggestions for idiomatic Rust
   - Added comprehensive documentation with `#[must_use]` attributes
@@ -359,13 +391,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2025-09-05
 
 ### Added
+
 - **Core NNTP Proxy Functionality**
   - High-performance NNTP proxy server
   - Connection pooling with deadpool
   - Multiple routing modes (standard, per-command, hybrid)
   - Round-robin load balancing across backend servers
   - Stateful and stateless connection modes
-  
+
 - **Authentication**
   - Client authentication interception
   - Backend authentication handling
