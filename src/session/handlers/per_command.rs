@@ -37,7 +37,215 @@ enum BackendAttemptResult {
     BackendUnavailable,
 }
 
+/// Result of executing a routing decision
+enum CommandResult {
+    /// Continue processing commands
+    Continue { auth_succeeded: bool },
+    /// Switch to stateful mode (early return from loop)
+    SwitchToStateful,
+}
+
+/// Parameters for executing a command decision
+struct CommandExecutionParams<'a, 'b> {
+    command: &'a str,
+    skip_auth_check: bool,
+    router: &'a Arc<BackendSelector>,
+    client_reader: &'a mut tokio::io::BufReader<tokio::net::tcp::ReadHalf<'b>>,
+    client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
+    auth_username: &'a mut Option<String>,
+    client_to_backend_bytes: ClientToBackendBytes,
+    backend_to_client_bytes: &'a mut BackendToClientBytes,
+}
+
 impl ClientSession {
+    /// Try to serve from cache
+    ///
+    /// Returns Some(backend_id) if served from cache, None if cache miss or availability-only mode
+    async fn try_serve_from_cache(
+        &self,
+        msg_id: &Option<crate::types::MessageId<'_>>,
+        command: &str,
+        router: &Arc<BackendSelector>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+    ) -> Result<Option<crate::types::BackendId>> {
+        let Some(msg_id_ref) = msg_id.as_ref() else {
+            return Ok(None);
+        };
+
+        debug!(
+            "Client {} checking cache for {}",
+            self.client_addr, msg_id_ref
+        );
+
+        let Some(cached) = self.cache.get(msg_id_ref).await else {
+            debug!("Cache MISS for message-ID: {}", msg_id_ref);
+            return Ok(None);
+        };
+
+        if !cached.has_availability_info() {
+            debug!(
+                "Cache entry exists for {} but no availability info (missing=0) - running precheck",
+                msg_id_ref
+            );
+            return Ok(None);
+        }
+
+        debug!(
+            "Client {} cache HIT for {} (cache_articles={})",
+            self.client_addr, msg_id_ref, self.cache_articles
+        );
+
+        // Spawn background precheck for STAT to update availability
+        if self.adaptive_precheck {
+            let bytes = command.as_bytes();
+            let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+            if cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES) {
+                precheck::spawn_background_precheck(
+                    self.precheck_deps(router),
+                    command.to_string(),
+                    msg_id_ref.to_owned(),
+                );
+            }
+        }
+
+        // If full article caching enabled, serve from cache
+        if !self.cache_articles {
+            // Availability-only mode - fall through to use availability info for routing
+            return Ok(None);
+        }
+
+        client_write.write_all(cached.response()).await?;
+        *backend_to_client_bytes = backend_to_client_bytes.add(cached.response().len());
+
+        let backend_id = router.route_command(self.client_id, command)?;
+        router.complete_command(backend_id);
+        Ok(Some(backend_id))
+    }
+
+    /// Execute a command routing decision
+    ///
+    /// Handles all routing decision types: auth, forwarding, rejection, etc.
+    async fn execute_command_decision(
+        &self,
+        params: CommandExecutionParams<'_, '_>,
+    ) -> Result<CommandResult> {
+        let CommandExecutionParams {
+            command,
+            skip_auth_check,
+            router,
+            client_reader: _client_reader,
+            client_write,
+            auth_username,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+        } = params;
+
+        let decision = decide_command_routing(
+            command,
+            skip_auth_check,
+            self.auth_handler.is_enabled(),
+            self.mode_state.routing_mode(),
+        );
+
+        let trimmed = command.trim();
+        match decision {
+            CommandRoutingDecision::InterceptAuth => {
+                debug!("Client {} decision: InterceptAuth", self.client_addr);
+                let action = CommandHandler::classify(command);
+                let auth_action = match action {
+                    CommandAction::InterceptAuth(a) => a,
+                    _ => unreachable!("InterceptAuth decision must come from InterceptAuth action"),
+                };
+
+                let auth_succeeded = match common::handle_auth_command(
+                    &self.auth_handler,
+                    auth_action,
+                    client_write,
+                    auth_username,
+                    &self.auth_state,
+                )
+                .await?
+                {
+                    common::AuthResult::Authenticated(bytes) => {
+                        common::on_authentication_success(
+                            self.client_addr,
+                            auth_username.clone(),
+                            &self.mode_state.routing_mode(),
+                            &self.metrics,
+                            self.connection_stats(),
+                            |username| self.set_username(username),
+                        );
+                        *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.as_u64());
+                        true
+                    }
+                    common::AuthResult::NotAuthenticated(bytes) => {
+                        *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.as_u64());
+                        false
+                    }
+                };
+
+                Ok(CommandResult::Continue { auth_succeeded })
+            }
+
+            CommandRoutingDecision::Forward => {
+                debug!(
+                    "Client {} decision: Forward ({})",
+                    self.client_addr, trimmed
+                );
+                let mut c2b_mutable = client_to_backend_bytes;
+                self.route_and_execute_command(
+                    router.clone(),
+                    command,
+                    client_write,
+                    &mut c2b_mutable,
+                    backend_to_client_bytes,
+                )
+                .await?;
+                Ok(CommandResult::Continue {
+                    auth_succeeded: false,
+                })
+            }
+
+            CommandRoutingDecision::RequireAuth => {
+                debug!("Client {} decision: RequireAuth", self.client_addr);
+                use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+                client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+                *backend_to_client_bytes =
+                    backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
+                Ok(CommandResult::Continue {
+                    auth_succeeded: false,
+                })
+            }
+
+            CommandRoutingDecision::SwitchToStateful => {
+                debug!(
+                    "Client {} decision: SwitchToStateful ({})",
+                    self.client_addr, trimmed
+                );
+                info!(
+                    "Client {} switching to stateful mode (command: {})",
+                    self.client_addr, trimmed
+                );
+                Ok(CommandResult::SwitchToStateful)
+            }
+
+            CommandRoutingDecision::Reject => {
+                debug!("Client {} decision: Reject", self.client_addr);
+                let action = CommandHandler::classify(command);
+                let response = match action {
+                    CommandAction::Reject(r) => r,
+                    _ => unreachable!("Reject decision must come from Reject action"),
+                };
+                client_write.write_all(response.as_bytes()).await?;
+                *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
+                Ok(CommandResult::Continue {
+                    auth_succeeded: false,
+                })
+            }
+        }
+    }
+
     /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
     pub async fn handle_per_command_routing(
@@ -105,7 +313,6 @@ impl ClientSession {
             };
 
             client_to_backend_bytes = client_to_backend_bytes.add(n);
-            let trimmed = command.trim();
 
             // Handle QUIT locally
             if let common::QuitStatus::Quit(bytes) =
@@ -117,85 +324,25 @@ impl ClientSession {
 
             skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
-            let decision = decide_command_routing(
-                &command,
-                skip_auth_check,
-                self.auth_handler.is_enabled(),
-                self.mode_state.routing_mode(),
-            );
-
-            match decision {
-                CommandRoutingDecision::InterceptAuth => {
-                    debug!("Client {} decision: InterceptAuth", self.client_addr);
-                    // Re-classify to extract auth action
-                    let action = CommandHandler::classify(&command);
-                    let auth_action = match action {
-                        CommandAction::InterceptAuth(a) => a,
-                        _ => unreachable!(
-                            "InterceptAuth decision must come from InterceptAuth action"
-                        ),
-                    };
-
-                    backend_to_client_bytes = backend_to_client_bytes.add_u64(
-                        match common::handle_auth_command(
-                            &self.auth_handler,
-                            auth_action,
-                            &mut client_write,
-                            &mut auth_username,
-                            &self.auth_state,
-                        )
-                        .await?
-                        {
-                            common::AuthResult::Authenticated(bytes) => {
-                                common::on_authentication_success(
-                                    self.client_addr,
-                                    auth_username.clone(),
-                                    &self.mode_state.routing_mode(),
-                                    &self.metrics,
-                                    self.connection_stats(),
-                                    |username| self.set_username(username),
-                                );
-                                skip_auth_check = true;
-                                bytes
-                            }
-                            common::AuthResult::NotAuthenticated(bytes) => bytes,
-                        }
-                        .as_u64(),
-                    );
+            match self
+                .execute_command_decision(CommandExecutionParams {
+                    command: &command,
+                    skip_auth_check,
+                    router,
+                    client_reader: &mut client_reader,
+                    client_write: &mut client_write,
+                    auth_username: &mut auth_username,
+                    client_to_backend_bytes,
+                    backend_to_client_bytes: &mut backend_to_client_bytes,
+                })
+                .await?
+            {
+                CommandResult::Continue { auth_succeeded } => {
+                    if auth_succeeded {
+                        skip_auth_check = true;
+                    }
                 }
-
-                CommandRoutingDecision::Forward => {
-                    debug!(
-                        "Client {} decision: Forward ({})",
-                        self.client_addr, trimmed
-                    );
-                    self.route_and_execute_command(
-                        router.clone(),
-                        &command,
-                        &mut client_write,
-                        &mut client_to_backend_bytes,
-                        &mut backend_to_client_bytes,
-                    )
-                    .await?;
-                }
-
-                CommandRoutingDecision::RequireAuth => {
-                    debug!("Client {} decision: RequireAuth", self.client_addr);
-                    use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
-                    client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
-                    backend_to_client_bytes =
-                        backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
-                }
-
-                CommandRoutingDecision::SwitchToStateful => {
-                    debug!(
-                        "Client {} decision: SwitchToStateful ({})",
-                        self.client_addr, trimmed
-                    );
-                    info!(
-                        "Client {} switching to stateful mode (command: {})",
-                        self.client_addr, trimmed
-                    );
+                CommandResult::SwitchToStateful => {
                     return self
                         .switch_to_stateful_mode(
                             client_reader,
@@ -205,18 +352,6 @@ impl ClientSession {
                             backend_to_client_bytes.into(),
                         )
                         .await;
-                }
-
-                CommandRoutingDecision::Reject => {
-                    debug!("Client {} decision: Reject", self.client_addr);
-                    // Re-classify to extract reject message
-                    let action = CommandHandler::classify(&command);
-                    let response = match action {
-                        CommandAction::Reject(r) => r,
-                        _ => unreachable!("Reject decision must come from Reject action"),
-                    };
-                    client_write.write_all(response.as_bytes()).await?;
-                    backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                 }
             }
         }
@@ -258,60 +393,18 @@ impl ClientSession {
             self.client_addr, msg_id, self.cache_articles
         );
 
-        // CRITICAL: Check cache FIRST before doing expensive backend queries
-        // This must come before adaptive prechecking to avoid unnecessary backend load
-        //
-        // Cache serving logic:
-        // - missing == 0: No backends tried yet → run precheck to find which backend has it
-        // - missing != 0 with 430: At least one backend tried, all returned 430 → serve 430, run precheck
-        // - missing != 0 with 2xx: At least one backend succeeded → serve 2xx, run precheck
-        if let Some(msg_id_ref) = msg_id.as_ref() {
-            debug!(
-                "Client {} checking cache for {}",
-                self.client_addr, msg_id_ref
-            );
-            match self.cache.get(msg_id_ref).await {
-                Some(cached) if cached.has_availability_info() => {
-                    debug!(
-                        "Client {} cache HIT for {} (cache_articles={})",
-                        self.client_addr, msg_id_ref, self.cache_articles
-                    );
-
-                    // Spawn background precheck for STAT to update availability
-                    if self.adaptive_precheck {
-                        let bytes = command.as_bytes();
-                        let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-                        if cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES) {
-                            precheck::spawn_background_precheck(
-                                self.precheck_deps(&router),
-                                command.to_string(),
-                                msg_id_ref.to_owned(),
-                            );
-                        }
-                    }
-
-                    // If full article caching enabled, serve from cache
-                    if self.cache_articles {
-                        client_write.write_all(cached.response()).await?;
-                        *backend_to_client_bytes =
-                            backend_to_client_bytes.add(cached.response().len());
-
-                        let backend_id = router.route_command(self.client_id, command)?;
-                        router.complete_command(backend_id);
-                        return Ok(backend_id);
-                    }
-                    // else: availability-only mode - fall through to use availability info for routing
-                }
-                Some(_cached) => {
-                    debug!(
-                        "Cache entry exists for {} but no availability info (missing=0) - running precheck",
-                        msg_id_ref
-                    );
-                }
-                None => {
-                    debug!("Cache MISS for message-ID: {}", msg_id_ref);
-                }
-            }
+        // Try cache first - may return early if cache hit
+        if let Some(backend_id) = self
+            .try_serve_from_cache(
+                &msg_id,
+                command,
+                &router,
+                client_write,
+                backend_to_client_bytes,
+            )
+            .await?
+        {
+            return Ok(backend_id);
         }
 
         // Adaptive prechecking for STAT/HEAD commands (if enabled and cache missed)
