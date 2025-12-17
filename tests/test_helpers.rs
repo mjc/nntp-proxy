@@ -336,53 +336,6 @@ pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandle
     create_test_auth_handler_with("user", "pass")
 }
 
-/// Create a config with client authentication enabled
-pub fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
-    use nntp_proxy::config::{ClientAuth, UserCredentials};
-    Config {
-        servers: backend_ports
-            .into_iter()
-            .map(|port| {
-                use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
-                Server {
-                    host: HostName::try_new("127.0.0.1".to_string()).unwrap(),
-                    port: Port::try_new(port).unwrap(),
-                    name: ServerName::try_new(format!("backend-{}", port)).unwrap(),
-                    username: None,
-                    password: None,
-                    max_connections: MaxConnections::try_new(5).unwrap(),
-                    use_tls: false,
-                    tls_verify_cert: true,
-                    tls_cert_path: None,
-                    connection_keepalive: None,
-                    health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-                    health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
-                }
-            })
-            .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: None,
-        client_auth: ClientAuth {
-            users: vec![UserCredentials {
-                username: username.to_string(),
-                password: password.to_string(),
-            }],
-            greeting: None,
-        },
-    }
-}
-
-/// Spawn a mock NNTP backend server and return (port, handle)
-pub async fn spawn_mock_backend() -> (u16, AbortHandle) {
-    let port = get_available_port().await.unwrap();
-    let handle = MockNntpServer::new(port)
-        .with_name("Mock NNTP Server")
-        .spawn();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (port, handle)
-}
-
 /// Create a test auth handler with custom credentials
 pub fn create_test_auth_handler_with(
     username: &str,

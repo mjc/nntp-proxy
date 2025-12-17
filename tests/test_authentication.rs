@@ -16,7 +16,7 @@ use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::config::RoutingMode;
 use nntp_proxy::session::ClientSession;
-use test_helpers::{create_config_with_auth, spawn_mock_backend};
+use test_helpers::{get_available_port, spawn_mock_server};
 
 #[tokio::test]
 async fn test_auth_handler_disabled_by_default() {
@@ -251,7 +251,8 @@ async fn test_command_classification_for_stateless() {
 async fn test_session_with_auth_handler() {
     use test_helpers::{create_test_addr, create_test_auth_handler_with, create_test_buffer_pool};
 
-    let (_backend_port, _handle) = spawn_mock_backend().await;
+    let backend_port = get_available_port().await.unwrap();
+    let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_with("testuser", "testpass");
 
@@ -267,7 +268,8 @@ async fn test_session_with_disabled_auth() {
         create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
     };
 
-    let (_backend_port, _handle) = spawn_mock_backend().await;
+    let backend_port = get_available_port().await.unwrap();
+    let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_disabled();
 
@@ -407,9 +409,11 @@ async fn test_session_builder_with_router_and_auth() {
 
 #[tokio::test]
 async fn test_proxy_creates_auth_handler_from_config() {
-    let (backend_port, _handle) = spawn_mock_backend().await;
+    let backend_port = get_available_port().await.unwrap();
+    let _handle = spawn_mock_server(backend_port, "Mock Backend");
 
-    let config = create_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
+    let config =
+        config_helpers::create_test_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
 
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
 
