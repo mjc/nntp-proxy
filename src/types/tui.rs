@@ -1,6 +1,5 @@
 //! Type-safe domain values for TUI
 
-use nutype::nutype;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -196,15 +195,6 @@ impl From<Timestamp> for Instant {
         ts.into_inner()
     }
 }
-
-/// Type-safe connection count
-#[nutype(
-    derive(
-        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, From, AsRef, Deref
-    ),
-    default = 0
-)]
-pub struct ConnectionCount(usize);
 
 #[cfg(test)]
 mod tests {
