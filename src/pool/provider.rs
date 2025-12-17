@@ -24,10 +24,6 @@ use tracing::{debug, info, warn};
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
     name: String,
-    /// Keepalive interval for periodic health checks.
-    /// Stored for Debug output and potential future status reporting.
-    #[allow(dead_code)] // Used in Debug derive, may be exposed in future status API
-    keepalive_interval: Option<std::time::Duration>,
     /// Shutdown signal sender for background health check task.
     /// Stored to keep the channel alive - when dropped, the background task will terminate.
     /// Used by `shutdown()` method to gracefully stop health checks.
@@ -160,7 +156,6 @@ impl Builder {
             Ok(DeadpoolConnectionProvider {
                 pool,
                 name,
-                keepalive_interval: None,
                 shutdown_tx: None,
                 health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
@@ -181,7 +176,6 @@ impl Builder {
             Ok(DeadpoolConnectionProvider {
                 pool,
                 name,
-                keepalive_interval: None,
                 shutdown_tx: None,
                 health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
@@ -225,7 +219,6 @@ impl DeadpoolConnectionProvider {
         Self {
             pool,
             name,
-            keepalive_interval: None,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         }
@@ -251,7 +244,6 @@ impl DeadpoolConnectionProvider {
         Ok(Self {
             pool,
             name,
-            keepalive_interval: None,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         })
@@ -317,7 +309,6 @@ impl DeadpoolConnectionProvider {
         Ok(Self {
             pool,
             name: server.name.to_string(),
-            keepalive_interval,
             shutdown_tx,
             health_check_metrics: metrics,
         })

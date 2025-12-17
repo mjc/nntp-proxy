@@ -62,14 +62,12 @@ rustls-pemfile = "2.2"  # PEM file parsing for custom certificates
 rustls-pki-types = "1.8"  # PKI types for rustls
 webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
 crc32fast = "1.5.0"
-wide = "1.0"  # Portable SIMD (SSE2/AVX2) on stable Rust
 yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
 bytesize = { version = "2.3.1", features = ["serde"] }
 
 
 [dev-dependencies]
 tempfile = "3.23"
-serial_test = "3.2"
 serde_json = "1.0"  # For testing serde implementations
 divan = "0.1"  # Modern benchmarking framework
 proptest = "1.5"  # Property-based testing for comprehensive coverage

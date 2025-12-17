@@ -225,7 +225,6 @@ impl TuiAppBuilder {
             client_history: ThroughputHistory::new(self.history_size),
             previous_snapshot: None,
             last_update: Timestamp::now(),
-            history_size: self.history_size,
             log_buffer: Arc::new(self.log_buffer.unwrap_or_default()),
             view_mode: ViewMode::default(),
             show_details: false,
@@ -253,9 +252,6 @@ pub struct TuiApp {
     previous_snapshot: Option<Arc<MetricsSnapshot>>,
     /// Last update time
     last_update: Timestamp,
-    /// History capacity
-    #[allow(dead_code)]
-    history_size: HistorySize,
     /// Log buffer for displaying recent log messages
     log_buffer: Arc<LogBuffer>,
     /// Current view mode (normal or log fullscreen)
@@ -924,21 +920,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_with_custom_history_size() {
-        let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
-        let servers = create_test_servers(1);
-
-        let custom_size = HistorySize::new(120);
-        let app = TuiAppBuilder::new(metrics, router, servers)
-            .with_history_size(custom_size)
-            .build();
-
-        // Verify history size is set
-        assert_eq!(app.history_size, custom_size);
-    }
-
-    #[test]
     fn test_builder_chaining() {
         use crate::tui::log_capture::LogBuffer;
 
@@ -953,6 +934,5 @@ mod tests {
             .build();
 
         assert_eq!(app.backend_history.len(), 3);
-        assert_eq!(app.history_size.get(), 90);
     }
 }
