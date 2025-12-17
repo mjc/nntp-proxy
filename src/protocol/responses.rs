@@ -51,6 +51,9 @@ pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 /// Backend server unavailable response (400)
 pub const BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
 
+/// No such article response (430)
+pub const NO_SUCH_ARTICLE: &[u8] = b"430 No such article\r\n";
+
 /// Command not supported in stateless proxy mode (500)
 pub const COMMAND_NOT_SUPPORTED_STATELESS: &[u8] =
     b"500 Command not supported by this proxy (stateless proxy mode)\r\n";

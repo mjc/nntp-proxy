@@ -61,9 +61,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
     let mut output = Vec::new();
     let (_, auth_success) = auth_handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             &mut output,
             Some("user"),
         )
@@ -113,7 +111,9 @@ async fn test_no_auth_username_race_condition() {
             let (_, auth_success) = self
                 .auth_handler
                 .handle_auth_command(
-                    AuthAction::ValidateAndRespond { password },
+                    AuthAction::ValidateAndRespond {
+                        password: &password,
+                    },
                     &mut output,
                     auth_username.as_deref(),
                 )
@@ -178,9 +178,7 @@ async fn test_auth_attempts_are_serialized_per_connection() {
     let mut output = Vec::new();
     let (_, success1) = auth_handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "wrong".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "wrong" },
             &mut output,
             auth_username.as_deref(),
         )
@@ -192,9 +190,7 @@ async fn test_auth_attempts_are_serialized_per_connection() {
     output.clear();
     let (_, success2) = auth_handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             &mut output,
             auth_username.as_deref(),
         )
@@ -207,9 +203,7 @@ async fn test_auth_attempts_are_serialized_per_connection() {
     output.clear();
     let (_, success3) = auth_handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             &mut output,
             auth_username.as_deref(),
         )

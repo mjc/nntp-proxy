@@ -18,8 +18,10 @@ tls_verify_cert = true
 
 # Cache configuration
 [cache]
-# Maximum number of articles to cache
-max_capacity = 10000
+# Maximum cache size in bytes (64 MB default)
+# For availability-only mode: ~1000 bytes per article
+# For full caching: depends on article sizes (avg ~700 KB)
+max_capacity = 67108864
 # Time-to-live for cached articles in seconds (1 hour)
 ttl_secs = 3600
 

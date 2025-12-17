@@ -44,6 +44,16 @@ impl RoutingMode {
         matches!(self, Self::Stateful | Self::Hybrid)
     }
 
+    /// Get short lowercase name for metrics/logging (no allocation)
+    #[must_use]
+    pub const fn short_name(&self) -> &'static str {
+        match self {
+            Self::Stateful => "stateful",
+            Self::PerCommand => "per-command",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
     /// Get a human-readable description of this routing mode
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -107,7 +117,7 @@ pub struct Config {
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheck,
-    /// Cache configuration (optional, for caching proxy)
+    /// Cache configuration (optional in config - defaults to 0 capacity for availability tracking only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
     /// Client authentication configuration
@@ -175,6 +185,21 @@ pub struct Cache {
     /// - Can serve articles from cache without backend query
     #[serde(default = "super::defaults::cache_articles")]
     pub cache_articles: bool,
+    /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
+    ///
+    /// When true:
+    /// - STAT/HEAD commands with message-ID check all backends simultaneously
+    /// - Returns optimistic response to client immediately (assumes article exists)
+    /// - Updates availability cache in background based on actual backend responses
+    /// - Improves future routing decisions by learning which backends have articles
+    /// - For HEAD with cache_articles=true, also caches the headers
+    ///
+    /// When false:
+    /// - STAT/HEAD commands use normal routing (single backend check)
+    ///
+    /// Trade-off: Uses more backend connections but builds accurate availability data
+    #[serde(default = "super::defaults::adaptive_precheck")]
+    pub adaptive_precheck: bool,
 }
 
 impl Default for Cache {
@@ -183,6 +208,7 @@ impl Default for Cache {
             max_capacity: defaults::cache_max_capacity(),
             ttl: defaults::cache_ttl(),
             cache_articles: defaults::cache_articles(),
+            adaptive_precheck: defaults::adaptive_precheck(),
         }
     }
 }
@@ -303,6 +329,7 @@ pub struct Server {
 ///
 /// ```
 /// use nntp_proxy::config::Server;
+/// use nntp_proxy::types::{Port, MaxConnections};
 ///
 /// // Minimal configuration
 /// let config = Server::builder("news.example.com", Port::try_new(119).unwrap())
@@ -483,6 +510,7 @@ impl Server {
     ///
     /// ```
     /// use nntp_proxy::config::Server;
+    /// use nntp_proxy::types::{Port, MaxConnections};
     ///
     /// let config = Server::builder("news.example.com", Port::try_new(119).unwrap())
     ///     .name("Example Server")

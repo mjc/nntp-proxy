@@ -33,6 +33,57 @@ pub fn remove_from_pool(conn: Object<TcpManager>) {
     drop(Object::take(conn));
 }
 
+/// Drain response data from timed-out connection to allow pool reuse
+///
+/// Backend connection limits require us to reuse connections instead of creating new ones.
+/// When a backend times out on first byte, we spawn this task to:
+/// 1. Read until multiline terminator found (connection clean → return to pool)
+/// 2. Timeout/error/EOF → remove from pool (connection broken)
+///
+/// This prevents hitting backend connection limits while letting clients retry immediately.
+///
+/// # Arguments
+/// * `conn` - Pooled connection to drain
+/// * `buffer_pool` - Buffer pool for reading response data
+pub async fn drain_connection_async(
+    mut conn: Object<TcpManager>,
+    buffer_pool: crate::pool::BufferPool,
+) {
+    use crate::protocol::MULTILINE_TERMINATOR;
+    use std::time::Duration;
+    use tracing::debug;
+
+    const MAX_DRAIN_ITERATIONS: usize = 1500; // 5 minutes at 200ms/iteration
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+
+    let mut buffer = buffer_pool.acquire().await;
+
+    for _ in 0..MAX_DRAIN_ITERATIONS {
+        match tokio::time::timeout(DRAIN_TIMEOUT, buffer.read_from(&mut *conn)).await {
+            Ok(Ok(n)) if n > 0 => {
+                // Check for terminator - connection clean if found
+                if buffer[..n]
+                    .windows(MULTILINE_TERMINATOR.len())
+                    .any(|w| w == MULTILINE_TERMINATOR)
+                {
+                    debug!("Successfully drained connection - returning to pool");
+                    return; // Drop returns connection to pool
+                }
+            }
+            _ => {
+                // Timeout, EOF, or error - connection broken
+                debug!("Failed to drain connection - removing from pool");
+                remove_from_pool(conn);
+                return;
+            }
+        }
+    }
+
+    // Exceeded max time - connection likely broken
+    debug!("Drain exceeded 5 minutes - removing connection from pool");
+    remove_from_pool(conn);
+}
+
 /// Execute a function with a pooled connection, automatically removing it from
 /// the pool if a connection-level I/O error occurs.
 ///

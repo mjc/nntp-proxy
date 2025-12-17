@@ -23,7 +23,7 @@ pub struct BackendStats {
     pub send_micros_total: SendMicros,
     pub recv_micros_total: RecvMicros,
     pub connection_failures: FailureCount,
-    pub health_status: HealthStatus,
+    pub health_status: BackendHealthStatus,
 }
 
 impl Default for BackendStats {
@@ -44,7 +44,7 @@ impl Default for BackendStats {
             send_micros_total: SendMicros::default(),
             recv_micros_total: RecvMicros::default(),
             connection_failures: FailureCount::default(),
-            health_status: HealthStatus::Healthy,
+            health_status: BackendHealthStatus::Healthy,
         }
     }
 }
@@ -112,21 +112,21 @@ impl BackendStats {
     #[must_use]
     #[inline]
     pub fn is_healthy(&self) -> bool {
-        self.health_status == HealthStatus::Healthy
+        self.health_status == BackendHealthStatus::Healthy
     }
 
     /// Check if backend is degraded
     #[must_use]
     #[inline]
     pub fn is_degraded(&self) -> bool {
-        self.health_status == HealthStatus::Degraded
+        self.health_status == BackendHealthStatus::Degraded
     }
 
     /// Check if backend is down
     #[must_use]
     #[inline]
     pub fn is_down(&self) -> bool {
-        self.health_status == HealthStatus::Down
+        self.health_status == BackendHealthStatus::Down
     }
 
     /// Get total bytes transferred
@@ -164,7 +164,7 @@ mod tests {
             ttfb_count: TimingMeasurementCount::new(10),
             send_micros_total: SendMicros::new(3000),
             recv_micros_total: RecvMicros::new(5000),
-            health_status: HealthStatus::Healthy,
+            health_status: BackendHealthStatus::Healthy,
             ..Default::default()
         }
     }
@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(stats.errors.get(), 0);
         assert_eq!(stats.bytes_sent.as_u64(), 0);
         assert_eq!(stats.bytes_received.as_u64(), 0);
-        assert_eq!(stats.health_status, HealthStatus::Healthy);
+        assert_eq!(stats.health_status, BackendHealthStatus::Healthy);
     }
 
     #[test]
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn test_is_healthy() {
         let stats = BackendStats {
-            health_status: HealthStatus::Healthy,
+            health_status: BackendHealthStatus::Healthy,
             ..Default::default()
         };
         assert!(stats.is_healthy());
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn test_is_degraded() {
         let stats = BackendStats {
-            health_status: HealthStatus::Degraded,
+            health_status: BackendHealthStatus::Degraded,
             ..Default::default()
         };
         assert!(!stats.is_healthy());
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn test_is_down() {
         let stats = BackendStats {
-            health_status: HealthStatus::Down,
+            health_status: BackendHealthStatus::Down,
             ..Default::default()
         };
         assert!(!stats.is_healthy());

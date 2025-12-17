@@ -66,6 +66,32 @@ pub fn create_test_server_config_with_max_connections(
         .expect("Valid server config")
 }
 
+/// Create a full Config with client authentication enabled
+pub fn create_test_config_with_auth(
+    backend_ports: Vec<u16>,
+    username: &str,
+    password: &str,
+) -> nntp_proxy::config::Config {
+    use nntp_proxy::config::{ClientAuth, Config, UserCredentials};
+
+    Config {
+        servers: backend_ports
+            .into_iter()
+            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
+            .collect(),
+        proxy: Default::default(),
+        health_check: Default::default(),
+        cache: None,
+        client_auth: ClientAuth {
+            users: vec![UserCredentials {
+                username: username.to_string(),
+                password: password.to_string(),
+            }],
+            greeting: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

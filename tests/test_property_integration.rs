@@ -224,8 +224,8 @@ proptest! {
 
         // Create handler with random credentials
         let handler = AuthHandler::new(
-            Some(username.clone()),
-            Some(password.clone())
+            Some(username.to_string()),
+            Some(password.to_string())
         ).unwrap();
 
         // Should validate exact match

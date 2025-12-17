@@ -231,6 +231,14 @@ impl NntpProxyBuilder {
             )
         };
 
+        // Extract adaptive_precheck from cache config (default: false)
+        let adaptive_precheck = self
+            .config
+            .cache
+            .as_ref()
+            .map(|c| c.adaptive_precheck)
+            .unwrap_or(false);
+
         Ok(NntpProxy {
             servers,
             router,
@@ -243,6 +251,7 @@ impl NntpProxyBuilder {
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
             cache_articles,
+            adaptive_precheck,
         })
     }
 }
@@ -270,6 +279,8 @@ pub struct NntpProxy {
     cache: Arc<ArticleCache>,
     /// Whether to cache article bodies (config-driven)
     cache_articles: bool,
+    /// Whether to use adaptive availability prechecking for STAT/HEAD
+    adaptive_precheck: bool,
 }
 
 /// Classify an error as a client disconnect (broken pipe/connection reset)
@@ -292,12 +303,7 @@ pub struct NntpProxy {
 /// ```
 #[inline]
 pub fn is_client_disconnect_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
-        matches!(
-            io_err.kind(),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-        )
-    })
+    crate::session::error_classification::ErrorClassifier::is_client_disconnect(e)
 }
 
 impl NntpProxy {
@@ -334,7 +340,8 @@ impl NntpProxy {
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
         .with_cache(cache)
-        .with_cache_articles(self.cache_articles);
+        .with_cache_articles(self.cache_articles)
+        .with_adaptive_precheck(self.adaptive_precheck);
 
         // Apply optional router
         let builder = match router {
@@ -358,11 +365,11 @@ impl NntpProxy {
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
-        routing_mode_str: &str,
+        routing_mode: crate::config::RoutingMode,
         metrics: &types::TransferMetrics,
     ) {
         self.connection_stats
-            .record_disconnection(session.username().as_deref(), routing_mode_str);
+            .record_disconnection(session.username().as_deref(), routing_mode.short_name());
 
         debug!(
             "Session {} [{}] ↑{} ↓{}",
@@ -461,7 +468,7 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
-    /// Get the article cache (if enabled via config)
+    /// Get the article cache (always present - capacity 0 if not configured)
     #[must_use]
     #[inline]
     pub fn cache(&self) -> &Arc<crate::cache::ArticleCache> {
@@ -579,8 +586,8 @@ impl NntpProxy {
 
     /// Get display name for current routing mode
     #[inline]
-    fn routing_mode_display_name(&self, cache: &Arc<crate::cache::ArticleCache>) -> &'static str {
-        if cache.entry_count() > 0 {
+    fn routing_mode_display_name(&self) -> &'static str {
+        if self.cache.entry_count() > 0 {
             "caching"
         } else {
             "per-command"
@@ -637,8 +644,13 @@ impl NntpProxy {
     ) -> Result<()> {
         match metrics {
             Ok(m) => {
-                let mode = self.routing_mode.to_string().to_lowercase();
-                self.log_session_completion(client_addr, session_id, session, &mode, &m);
+                self.log_session_completion(
+                    client_addr,
+                    session_id,
+                    session,
+                    self.routing_mode,
+                    &m,
+                );
 
                 if self.enable_metrics
                     && let Some(bid) = backend_id
@@ -659,7 +671,7 @@ impl NntpProxy {
 
                 // Only log non-client-disconnect errors (avoid spam from normal disconnects)
                 if !is_client_disconnect_error(&e) {
-                    warn!("Session error for client {}: {}", client_addr, e);
+                    warn!("Session error for client {}: {:?}", client_addr, e);
                 }
                 Err(e)
             }
@@ -701,7 +713,6 @@ impl NntpProxy {
                 backend_id,
                 &self.connection_providers[server_idx],
                 &self.servers[server_idx].name,
-                self.enable_metrics,
             )
             .await;
 
@@ -717,18 +728,17 @@ impl NntpProxy {
         client_stream: TcpStream,
         client_addr: ClientAddress,
     ) -> Result<()> {
-        self.handle_per_command_client(client_stream, client_addr, self.cache.clone())
+        self.handle_per_command_client(client_stream, client_addr)
             .await
     }
 
-    /// Handle a per-command routing session with optional caching
+    /// Handle a per-command routing session
     async fn handle_per_command_client(
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
-        cache: Arc<crate::cache::ArticleCache>,
     ) -> Result<()> {
-        let mode_label = self.routing_mode_display_name(&cache);
+        let mode_label = self.routing_mode_display_name();
         debug!(
             "New {} routing client connection from {}",
             mode_label, client_addr
@@ -1046,15 +1056,8 @@ mod tests {
             let config = create_test_config();
             let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
 
-            // Create a cache with entries
-            let cache = Arc::new(crate::cache::ArticleCache::new(
-                100,
-                std::time::Duration::from_secs(3600),
-                true,
-            ));
-
-            // Empty cache should return "per-command"
-            assert_eq!(proxy.routing_mode_display_name(&cache), "per-command");
+            // Empty cache (default 0 capacity) should return "per-command"
+            assert_eq!(proxy.routing_mode_display_name(), "per-command");
         }
 
         #[test]
@@ -1178,7 +1181,7 @@ mod tests {
 
             // Spawn a simple acceptor that reads greeting
             tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
                 let mut buf = [0u8; 1024];
                 let _ = stream.try_read(&mut buf); // Read greeting
             });
@@ -1197,12 +1200,12 @@ mod tests {
             let config = create_test_config();
             let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
 
-            let empty_cache = Arc::new(crate::cache::ArticleCache::new(
+            let _empty_cache = Arc::new(crate::cache::ArticleCache::new(
                 100,
                 std::time::Duration::from_secs(3600),
                 false,
             ));
-            assert_eq!(proxy.routing_mode_display_name(&empty_cache), "per-command");
+            assert_eq!(proxy.routing_mode_display_name(), "per-command");
         }
 
         #[test]

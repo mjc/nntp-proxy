@@ -9,34 +9,11 @@ use nntp_proxy::{Config, NntpProxy, RoutingMode};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use tokio::net::TcpListener;
 
 mod config_helpers;
 mod test_helpers;
 use config_helpers::*;
-use test_helpers::MockNntpServer;
-
-/// Helper function to find an available port
-async fn find_available_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    addr.port()
-}
-
-/// Spawn a test proxy in the background
-async fn spawn_test_proxy(proxy: NntpProxy, port: u16, _with_auth: bool) {
-    tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = TcpListener::bind(&addr).await.unwrap();
-
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                let _ = proxy.handle_client(stream, addr.into()).await;
-            });
-        }
-    });
-}
+use test_helpers::{MockNntpServer, get_available_port, spawn_test_proxy};
 
 /// Test that per-command routing mode sends exactly one greeting
 #[test]
@@ -116,8 +93,10 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
-    // Start mock backend server
-    let mock_port = find_available_port().await;
+    // Start a mock backend server
+    let mock_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
     let _mock = MockNntpServer::new(mock_port)
         .with_name("Mock Server")
         .on_command(
@@ -129,7 +108,9 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Start proxy
-    let proxy_port = find_available_port().await;
+    let proxy_port = get_available_port()
+        .await
+        .expect("Failed to get available port");
     let config = Config {
         servers: vec![create_test_server_config(
             "127.0.0.1",
@@ -139,7 +120,7 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
         ..Default::default()
     };
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
-    spawn_test_proxy(proxy, proxy_port, false).await;
+    spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect to proxy

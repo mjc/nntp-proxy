@@ -22,17 +22,13 @@ async fn test_standard_handler_validates_credentials() {
     // Step 1: AUTHINFO USER
     let action = CommandHandler::classify("AUTHINFO USER testuser\r\n");
     let username = match action {
-        CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) => u.clone(),
+        CommandAction::InterceptAuth(AuthAction::RequestPassword(u)) => u,
         _ => panic!("Expected RequestPassword action"),
     };
 
     let mut output = Vec::new();
     let (_, auth_success) = auth_handler
-        .handle_auth_command(
-            AuthAction::RequestPassword(username.clone()),
-            &mut output,
-            None,
-        )
+        .handle_auth_command(AuthAction::RequestPassword(username), &mut output, None)
         .await
         .unwrap();
 
@@ -42,9 +38,7 @@ async fn test_standard_handler_validates_credentials() {
     // Step 2: AUTHINFO PASS with WRONG password
     let action = CommandHandler::classify("AUTHINFO PASS wrongpass\r\n");
     let password = match action {
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) => {
-            password.clone()
-        }
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) => password,
         _ => panic!("Expected ValidateAndRespond action"),
     };
 
@@ -69,9 +63,7 @@ async fn test_standard_handler_validates_credentials() {
     // Step 3: AUTHINFO PASS with CORRECT password
     let action = CommandHandler::classify("AUTHINFO PASS testpass\r\n");
     let password = match action {
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) => {
-            password.clone()
-        }
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) => password,
         _ => panic!("Expected ValidateAndRespond action"),
     };
 
@@ -104,9 +96,7 @@ async fn test_pass_before_user_rejected() {
     // Try to send AUTHINFO PASS without first sending USER
     let action = CommandHandler::classify("AUTHINFO PASS testpass\r\n");
     let password = match action {
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) => {
-            password.clone()
-        }
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) => password,
         _ => panic!("Expected ValidateAndRespond action"),
     };
 
@@ -139,9 +129,7 @@ async fn test_auth_state_isolation() {
     let mut output = Vec::new();
     let (_, auth_success) = auth_handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "pass1".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass1" },
             &mut output,
             Some("user1"),
         )
@@ -159,7 +147,7 @@ async fn test_auth_state_isolation() {
     let (_, auth_success) = auth_handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "wrongpass".to_string(),
+                password: "wrongpass",
             },
             &mut output,
             Some("user1"),
@@ -187,11 +175,12 @@ async fn test_repeated_failures_dont_succeed() {
 
     // Try 100 times with wrong password
     for i in 0..100 {
+        let wrong_password = format!("wrongpass{}", i);
         let mut output = Vec::new();
         let (_, auth_success) = auth_handler
             .handle_auth_command(
                 AuthAction::ValidateAndRespond {
-                    password: format!("wrongpass{}", i),
+                    password: &wrong_password,
                 },
                 &mut output,
                 Some("user"),
@@ -223,25 +212,19 @@ async fn test_auth_success_is_only_path_to_authentication() {
 
     // Try various auth actions
     let test_cases = vec![
-        (AuthAction::RequestPassword("user".to_string()), None, false),
+        (AuthAction::RequestPassword("user"), None, false),
         (
-            AuthAction::ValidateAndRespond {
-                password: "wrong".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "wrong" },
             Some("user"),
             false,
         ),
         (
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             Some("wrong"),
             false,
         ),
         (
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             Some("user"),
             true,
         ),
@@ -282,12 +265,13 @@ async fn test_concurrent_auth_attempts() {
     for i in 0..50 {
         let handler = auth_handler.clone();
         set.spawn(async move {
+            let wrong_password = format!("wrongpass{}", i);
             let authenticated = Arc::new(AtomicBool::new(false));
             let mut output = Vec::new();
             let (_, auth_success) = handler
                 .handle_auth_command(
                     AuthAction::ValidateAndRespond {
-                        password: format!("wrongpass{}", i),
+                        password: &wrong_password,
                     },
                     &mut output,
                     Some("user"),
@@ -310,9 +294,7 @@ async fn test_concurrent_auth_attempts() {
             let mut output = Vec::new();
             let (_, auth_success) = handler
                 .handle_auth_command(
-                    AuthAction::ValidateAndRespond {
-                        password: "pass".to_string(),
-                    },
+                    AuthAction::ValidateAndRespond { password: "pass" },
                     &mut output,
                     Some("user"),
                 )
@@ -357,7 +339,7 @@ async fn test_session_handler_respects_auth_success() {
     // Step 1: AUTHINFO USER
     let action = CommandHandler::classify("AUTHINFO USER user\r\n");
     if let CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) = action {
-        auth_username = Some(username.clone());
+        auth_username = Some(username.to_string());
 
         let mut output = Vec::new();
         let (_, auth_success) = auth_handler

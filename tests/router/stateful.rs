@@ -26,20 +26,20 @@ fn test_stateful_connection_reservation() {
 
     // Should be able to acquire 2 stateful connections
     assert!(router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(1));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(1));
 
     assert!(router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(2));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(2));
 
     // Third attempt should fail (max_connections - 1 = 2)
     assert!(!router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(2));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(2));
 
     // Release one connection and try again
     router.release_stateful(backend_id);
-    assert_eq!(router.stateful_count(backend_id), Some(1));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(1));
     assert!(router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(2));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(2));
 }
 
 #[test]
@@ -77,7 +77,10 @@ fn test_stateful_connection_concurrent_access() {
     // At least some threads should have succeeded
     assert!(total_acquired > 0);
     // Final count should be 0 (all released)
-    assert_eq!(router_arc.stateful_count(backend_id), Some(0));
+    assert_eq!(
+        router_arc.stateful_count(backend_id).map(|c| c.get()),
+        Some(0)
+    );
 }
 
 #[test]
@@ -121,8 +124,8 @@ fn test_stateful_connection_multiple_backends() {
     assert!(router.try_acquire_stateful(backend1));
     assert!(router.try_acquire_stateful(backend2));
 
-    assert_eq!(router.stateful_count(backend1), Some(1));
-    assert_eq!(router.stateful_count(backend2), Some(1));
+    assert_eq!(router.stateful_count(backend1).map(|c| c.get()), Some(1));
+    assert_eq!(router.stateful_count(backend2).map(|c| c.get()), Some(1));
 
     // Should be able to max out both backends independently
     assert!(router.try_acquire_stateful(backend1)); // backend1 now at 2/2
@@ -133,8 +136,8 @@ fn test_stateful_connection_multiple_backends() {
 
     // Release from backend1, should not affect backend2
     router.release_stateful(backend1);
-    assert_eq!(router.stateful_count(backend1), Some(1));
-    assert_eq!(router.stateful_count(backend2), Some(2));
+    assert_eq!(router.stateful_count(backend1).map(|c| c.get()), Some(1));
+    assert_eq!(router.stateful_count(backend2).map(|c| c.get()), Some(2));
 
     assert!(router.try_acquire_stateful(backend1)); // Should work
     assert!(!router.try_acquire_stateful(backend2)); // Should still fail
@@ -179,9 +182,9 @@ fn test_stateful_reservation_edge_cases() {
     router.release_stateful(backend_id);
 
     // Count should stay at 0
-    assert_eq!(router.stateful_count(backend_id), Some(0));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(0));
 
     // Should still be able to acquire after over-releasing
     assert!(router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id), Some(1));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(1));
 }

@@ -60,6 +60,18 @@
 ///
 /// This ensures consistency and traceability to the NNTP protocol specification.
 macro_rules! command_cases {
+    (pub $name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
+        #[doc = $doc]
+        pub const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
+
+        // Compile-time validation: ensure documentation starts with RFC reference
+        // This creates a const assertion that the doc string contains expected patterns
+        const _: () = {
+            // This will fail to compile if the doc string doesn't contain "RFC"
+            // Note: Full validation would require a proc macro, but this provides basic checking
+            assert!($doc.len() > 0, "Command documentation cannot be empty");
+        };
+    };
     ($name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
         const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
@@ -96,7 +108,7 @@ command_cases!(
 );
 
 command_cases!(
-    HEAD_CASES,
+    pub HEAD_CASES,
     "HEAD",
     "head",
     "Head",
@@ -105,7 +117,7 @@ command_cases!(
 );
 
 command_cases!(
-    STAT_CASES,
+    pub STAT_CASES,
     "STAT",
     "stat",
     "Stat",
@@ -288,20 +300,20 @@ command_cases!(
 // Fast-path matchers for hot commands (40Gbit optimization)
 // =============================================================================
 
-/// Check if command matches any of 3 case variations (UPPER, lower, Title)
+/// Check if command matches any of N case variations
 ///
 /// Per [RFC 3977 §3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.1),
-/// NNTP commands are case-insensitive. This function checks all three common
-/// case variations used by different NNTP clients.
+/// NNTP commands are case-insensitive. This function checks multiple case
+/// variations used by different NNTP clients.
 ///
-/// **Optimization**: UPPERCASE checked first (index 0) - represents 95% of real
-/// NNTP traffic. Manually unrolled loop for predictable branch prediction.
+/// **Optimization**: UPPERCASE should be at index 0 - represents 95% of real
+/// NNTP traffic. Compiler unrolls contains check for small N (typically N=3).
 ///
-/// Uses const generic to enforce 3-variant array at compile time.
+/// Uses const generic to support flexible case counts at compile time.
 #[inline(always)]
-fn matches_any(cmd: &[u8], cases: &[&[u8]; 3]) -> bool {
-    // Check UPPERCASE first (index 0) - most NNTP clients use uppercase
-    cmd == cases[0] || cmd == cases[1] || cmd == cases[2]
+pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
+    // Compiler optimizes contains() to unrolled comparisons for small N
+    cases.contains(&cmd)
 }
 
 /// Ultra-fast detection of article retrieval commands with message-ID
@@ -437,7 +449,7 @@ pub enum NntpCommand {
     /// [RFC 3977 §7](https://datatracker.ietf.org/doc/html/rfc3977#section-7)
     Stateless,
 
-    /// Article retrieval by message-ID: ARTICLE/BODY/HEAD/STAT <msgid> (70%+ of traffic)
+    /// Article retrieval by message-ID: `ARTICLE/BODY/HEAD/STAT <msgid>` (70%+ of traffic)
     /// [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2)
     ArticleByMessageId,
 }

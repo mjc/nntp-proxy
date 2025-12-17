@@ -15,7 +15,8 @@ pub mod buffer {
     // Buffer pool configuration
 
     /// Page size for memory alignment (4KB = standard OS page)
-    #[allow(dead_code)]
+    /// Used in compile-time assertions below to verify alignment.
+    #[allow(dead_code)] // Used in const assertions which the compiler doesn't track
     const PAGE_SIZE: usize = 4096;
 
     /// Size of each pooled buffer (724KB, page-aligned)
@@ -101,6 +102,11 @@ pub mod timeout {
 
     /// Connection timeout for backend connections
     pub const CONNECTION: Duration = Duration::from_secs(10);
+
+    /// Timeout for adaptive precheck queries (STAT/HEAD)
+    /// If a backend doesn't respond within this time, treat as 430 (missing)
+    /// This prevents slow backends from blocking all client connections
+    pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
 }
 
 /// Connection pool constants
@@ -158,15 +164,15 @@ pub mod per_command_routing {
     pub const MAX_TERMINATOR_SPAN_CHECK: usize = 9;
 }
 
-/// Stateless proxy protocol constants
-pub mod stateless_proxy {
-    pub const NNTP_BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
-    pub const NNTP_COMMAND_NOT_SUPPORTED: &[u8] =
-        b"500 Command not supported by this proxy (stateless proxy mode)\r\n";
-
-    /// Prewarming configuration constants
-    pub const PREWARMING_BATCH_SIZE: usize = 5; // Create connections in batches of 5
-    pub const BATCH_DELAY_MS: u64 = 100; // Wait 100ms between prewarming batches
+/// Session and metrics constants
+pub mod session {
+    /// Flush incremental metrics every N commands for long-running sessions
+    ///
+    /// Prevents metrics from accumulating indefinitely without being recorded.
+    /// Value of 100 balances between:
+    /// - Frequent enough to avoid significant data loss on crashes
+    /// - Infrequent enough to avoid performance overhead
+    pub const METRICS_FLUSH_INTERVAL: u32 = 100;
 }
 
 /// Display strings for user metrics and logging

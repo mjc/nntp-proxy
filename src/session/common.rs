@@ -37,7 +37,7 @@ pub(crate) fn extract_message_id(command: &str) -> Option<&str> {
 /// Handle AUTHINFO command and update auth state
 pub(crate) async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
-    auth_action: AuthAction,
+    auth_action: AuthAction<'_>,
     client_write: &mut W,
     auth_username: &mut Option<String>,
     auth_state: &crate::session::AuthState,
@@ -45,8 +45,8 @@ pub(crate) async fn handle_auth_command<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if let AuthAction::RequestPassword(ref username) = auth_action {
-        *auth_username = Some(username.clone());
+    if let AuthAction::RequestPassword(username) = auth_action {
+        *auth_username = Some(username.to_string());
     }
 
     let (bytes, auth_success) = auth_handler
@@ -111,10 +111,7 @@ pub(crate) fn on_authentication_success(
 
     // Record connection for aggregation (after auth so we have username)
     if let Some(stats) = connection_stats {
-        stats.record_connection(
-            username.as_deref(),
-            &routing_mode.to_string().to_lowercase(),
-        );
+        stats.record_connection(username.as_deref(), routing_mode.short_name());
     }
 
     // Track user connection in metrics
@@ -227,5 +224,162 @@ mod tests {
 
         assert_eq!(quit1, quit2);
         assert_ne!(quit1, cont);
+    }
+
+    // =========================================================================
+    // AuthHandlerResult tests
+    // =========================================================================
+
+    #[test]
+    fn test_auth_handler_result_bytes_written() {
+        let auth = AuthHandlerResult::Authenticated {
+            bytes_written: 100,
+            skip_further_checks: true,
+        };
+        assert_eq!(auth.bytes_written(), 100);
+
+        let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
+        assert_eq!(not_auth.bytes_written(), 50);
+
+        let rejected = AuthHandlerResult::Rejected { bytes_written: 25 };
+        assert_eq!(rejected.bytes_written(), 25);
+    }
+
+    #[test]
+    fn test_auth_handler_result_should_skip_further_checks() {
+        let skip = AuthHandlerResult::Authenticated {
+            bytes_written: 100,
+            skip_further_checks: true,
+        };
+        assert!(skip.should_skip_further_checks());
+
+        let no_skip = AuthHandlerResult::Authenticated {
+            bytes_written: 100,
+            skip_further_checks: false,
+        };
+        assert!(!no_skip.should_skip_further_checks());
+
+        let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
+        assert!(!not_auth.should_skip_further_checks());
+
+        let rejected = AuthHandlerResult::Rejected { bytes_written: 25 };
+        assert!(!rejected.should_skip_further_checks());
+    }
+}
+
+// ============================================================================
+// Session Loop Helpers
+// ============================================================================
+
+/// Result of handling an authentication command in a session loop
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthHandlerResult {
+    /// Authentication succeeded, session can continue
+    Authenticated {
+        bytes_written: u64,
+        skip_further_checks: bool,
+    },
+    /// Authentication required but not yet complete
+    NotAuthenticated { bytes_written: u64 },
+    /// Command rejected
+    Rejected { bytes_written: u64 },
+}
+
+impl AuthHandlerResult {
+    /// Get the number of bytes written regardless of result type
+    #[inline]
+    pub const fn bytes_written(&self) -> u64 {
+        match self {
+            Self::Authenticated { bytes_written, .. }
+            | Self::NotAuthenticated { bytes_written }
+            | Self::Rejected { bytes_written } => *bytes_written,
+        }
+    }
+
+    /// Check if should skip further auth checks
+    #[inline]
+    pub const fn should_skip_further_checks(&self) -> bool {
+        matches!(
+            self,
+            Self::Authenticated {
+                skip_further_checks: true,
+                ..
+            }
+        )
+    }
+}
+
+/// Handle authentication logic for a command in a stateful session
+///
+/// This encapsulates the common pattern of:
+/// 1. Checking if authenticated
+/// 2. Handling auth commands
+/// 3. Rejecting non-auth commands when not authenticated
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_stateful_auth_check<W>(
+    command: &str,
+    client_write: &mut W,
+    auth_username: &mut Option<String>,
+    auth_handler: &std::sync::Arc<crate::auth::AuthHandler>,
+    auth_state: &crate::session::AuthState,
+    routing_mode: &crate::config::RoutingMode,
+    metrics: &Option<crate::metrics::MetricsCollector>,
+    connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
+    client_addr: impl std::fmt::Display + Clone,
+    set_username_fn: impl FnOnce(Option<String>),
+) -> anyhow::Result<AuthHandlerResult>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    use crate::command::{CommandAction, CommandHandler};
+
+    let action = CommandHandler::classify(command);
+    match action {
+        CommandAction::ForwardStateless => {
+            // Reject all non-auth commands before authentication
+            use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
+            client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+            Ok(AuthHandlerResult::Rejected {
+                bytes_written: AUTH_REQUIRED_FOR_COMMAND.len() as u64,
+            })
+        }
+        CommandAction::InterceptAuth(auth_action) => {
+            let result = handle_auth_command(
+                auth_handler,
+                auth_action,
+                client_write,
+                auth_username,
+                auth_state,
+            )
+            .await?;
+
+            match result {
+                AuthResult::Authenticated(bytes) => {
+                    on_authentication_success(
+                        client_addr,
+                        auth_username.clone(),
+                        routing_mode,
+                        metrics,
+                        connection_stats,
+                        set_username_fn,
+                    );
+
+                    Ok(AuthHandlerResult::Authenticated {
+                        bytes_written: bytes.as_u64(),
+                        skip_further_checks: true,
+                    })
+                }
+                AuthResult::NotAuthenticated(bytes) => Ok(AuthHandlerResult::NotAuthenticated {
+                    bytes_written: bytes.as_u64(),
+                }),
+            }
+        }
+        CommandAction::Reject(response) => {
+            // Send rejection response inline
+            client_write.write_all(response.as_bytes()).await?;
+            Ok(AuthHandlerResult::Rejected {
+                bytes_written: response.len() as u64,
+            })
+        }
     }
 }

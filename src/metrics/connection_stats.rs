@@ -21,8 +21,8 @@ use crate::constants::user::ANONYMOUS;
 struct UserConnectionStats {
     /// Number of connections in this window
     count: AtomicU64,
-    /// Routing mode used
-    routing_mode: String,
+    /// Routing mode used (static string - no allocation)
+    routing_mode: &'static str,
     /// First connection timestamp  
     first_seen: Instant,
     /// Last connection timestamp (needs Mutex for interior mutability)
@@ -31,7 +31,7 @@ struct UserConnectionStats {
 
 impl UserConnectionStats {
     /// Create new stats for a single event
-    fn new(routing_mode: String, timestamp: Instant) -> Self {
+    fn new(routing_mode: &'static str, timestamp: Instant) -> Self {
         Self {
             count: AtomicU64::new(1),
             routing_mode,
@@ -147,7 +147,12 @@ impl ConnectionStatsAggregator {
     }
 
     /// Record a connection or disconnection event
-    fn record_event(&self, username: Option<&str>, routing_mode: &str, is_connection: bool) {
+    fn record_event(
+        &self,
+        username: Option<&str>,
+        routing_mode: &'static str,
+        is_connection: bool,
+    ) {
         // Fast path: only flush if actually needed (check lock-free first)
         let now = Instant::now();
 
@@ -166,16 +171,16 @@ impl ConnectionStatsAggregator {
         stats
             .entry(username)
             .and_modify(|s| s.record_event(now))
-            .or_insert_with(|| UserConnectionStats::new(routing_mode.to_string(), now));
+            .or_insert_with(|| UserConnectionStats::new(routing_mode, now));
     }
 
     /// Record a new connection
-    pub fn record_connection(&self, username: Option<&str>, routing_mode: &str) {
+    pub fn record_connection(&self, username: Option<&str>, routing_mode: &'static str) {
         self.record_event(username, routing_mode, true);
     }
 
     /// Record a disconnection
-    pub fn record_disconnection(&self, username: Option<&str>, routing_mode: &str) {
+    pub fn record_disconnection(&self, username: Option<&str>, routing_mode: &'static str) {
         self.record_event(username, routing_mode, false);
     }
 
@@ -212,7 +217,7 @@ mod tests {
     #[test]
     fn test_user_connection_stats_new() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("per-command".to_string(), now);
+        let stats = UserConnectionStats::new("per-command", now);
 
         assert_eq!(stats.get_count(), 1);
         assert_eq!(stats.routing_mode, "per-command");
@@ -222,7 +227,7 @@ mod tests {
     #[test]
     fn test_user_connection_stats_record_event() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+        let stats = UserConnectionStats::new("hybrid", now);
 
         assert_eq!(stats.get_count(), 1);
 
@@ -236,7 +241,7 @@ mod tests {
     #[test]
     fn test_user_connection_stats_duration_secs() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("stateful".to_string(), now);
+        let stats = UserConnectionStats::new("stateful", now);
 
         // Immediately after creation, duration should be near 0
         assert!(stats.duration_secs() < 0.1);
@@ -359,7 +364,7 @@ mod tests {
     #[test]
     fn test_user_connection_stats_log_connection_single() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+        let stats = UserConnectionStats::new("hybrid", now);
 
         // Should not panic when logging
         stats.log_connection("testuser");
@@ -368,7 +373,7 @@ mod tests {
     #[test]
     fn test_user_connection_stats_log_connection_plural() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("per-command".to_string(), now);
+        let stats = UserConnectionStats::new("per-command", now);
         stats.record_event(now + Duration::from_secs(1));
         stats.record_event(now + Duration::from_secs(2));
 
@@ -379,7 +384,7 @@ mod tests {
     #[test]
     fn test_user_connection_stats_log_disconnection_single() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("stateful".to_string(), now);
+        let stats = UserConnectionStats::new("stateful", now);
 
         // Should not panic when logging
         stats.log_disconnection("testuser");
@@ -388,7 +393,7 @@ mod tests {
     #[test]
     fn test_user_connection_stats_log_disconnection_plural() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+        let stats = UserConnectionStats::new("hybrid", now);
         stats.record_event(now + Duration::from_secs(1));
         stats.record_event(now + Duration::from_secs(2));
 
@@ -445,7 +450,7 @@ mod tests {
     #[test]
     fn test_duration_zero_for_single_event() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("hybrid".to_string(), now);
+        let stats = UserConnectionStats::new("hybrid", now);
 
         // Single event should have near-zero duration
         let duration = stats.duration_secs();
@@ -455,7 +460,7 @@ mod tests {
     #[test]
     fn test_get_count_after_multiple_records() {
         let now = Instant::now();
-        let stats = UserConnectionStats::new("stateful".to_string(), now);
+        let stats = UserConnectionStats::new("stateful", now);
 
         for i in 1..=10 {
             stats.record_event(now + Duration::from_millis(i * 100));

@@ -16,21 +16,21 @@ fn test_backend_load_tracking() {
     );
 
     // Initially no load
-    assert_eq!(router.backend_load(backend_id), Some(0));
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(0));
 
     // Route a command
-    router.route_command(client_id, "LIST\r\n").unwrap();
-    assert_eq!(router.backend_load(backend_id), Some(1));
+    router.route_command(client_id, "LIST").unwrap();
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(1));
 
     // Route another
-    router.route_command(client_id, "DATE\r\n").unwrap();
-    assert_eq!(router.backend_load(backend_id), Some(2));
+    router.route_command(client_id, "LIST").unwrap();
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(2));
 
     // Complete one
     router.complete_command(backend_id);
-    assert_eq!(router.backend_load(backend_id), Some(1));
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(1));
 
-    // Complete the other
+    // Complete another
     router.complete_command(backend_id);
-    assert_eq!(router.backend_load(backend_id), Some(0));
+    assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(0));
 }

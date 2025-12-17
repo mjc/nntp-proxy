@@ -4,8 +4,9 @@ use crate::formatting::format_bytes;
 use crate::tui::app::TuiApp;
 use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::helpers::{
-    build_chart_data, calculate_chart_bounds, create_sparkline, format_summary_throughput,
-    format_throughput_label,
+    build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline,
+    error_count_color, error_rate_color, format_error_rate, format_summary_throughput,
+    format_throughput_label, health_indicator, load_percentage_color, pending_count_color,
 };
 use ratatui::{
     Frame,
@@ -15,6 +16,40 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph},
 };
+
+// ============================================================================
+// Widget Creation Helpers (Pure Functions)
+// ============================================================================
+
+/// Create a styled span with given text, color, and optional modifiers
+#[inline]
+fn styled_span(text: &'static str, color: Color) -> Span<'static> {
+    Span::styled(text, Style::new().fg(color))
+}
+
+/// Create a bold styled span
+#[inline]
+fn bold_span(text: &'static str, color: Color) -> Span<'static> {
+    Span::styled(text, Style::new().fg(color).add_modifier(Modifier::BOLD))
+}
+
+/// Create a bordered block with title and color
+#[inline]
+fn bordered_block(title: &'static str, border_color: Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(border_color))
+}
+
+/// Create a label-value span pair (common pattern)
+#[inline]
+fn label_value_spans(label: &'static str, value: String, value_color: Color) -> Vec<Span<'static>> {
+    vec![
+        styled_span(label, styles::LABEL),
+        Span::styled(value, Style::default().fg(value_color)),
+    ]
+}
 
 // ============================================================================
 // Render Functions
@@ -92,51 +127,39 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
 
 /// Render the title bar
 fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
-    let title = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                "NNTP Proxy ",
-                Style::default()
-                    .fg(styles::BORDER_ACTIVE)
-                    .add_modifier(Modifier::BOLD),
+    let title_line = Line::from(vec![
+        bold_span("NNTP Proxy ", styles::BORDER_ACTIVE),
+        styled_span("- Real-Time Metrics Dashboard", Color::White),
+    ]);
+
+    let info_line = Line::from(
+        [
+            vec![
+                styled_span("Uptime: ", styles::LABEL),
+                Span::styled(
+                    snapshot.format_uptime(),
+                    Style::default()
+                        .fg(styles::VALUE_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            label_value_spans(
+                "  |  Active: ",
+                format!("{} connections", snapshot.active_connections),
+                styles::VALUE_SECONDARY,
             ),
-            Span::styled(
-                "- Real-Time Metrics Dashboard",
-                Style::default().fg(Color::White),
+            label_value_spans(
+                "  |  Total: ",
+                format!("{} connections", snapshot.total_connections),
+                styles::VALUE_NEUTRAL,
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Uptime: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                snapshot.format_uptime(),
-                Style::default()
-                    .fg(styles::VALUE_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  |  Active: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{}", snapshot.active_connections),
-                Style::default()
-                    .fg(styles::VALUE_SECONDARY)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " connections  |  Total: ",
-                Style::default().fg(styles::LABEL),
-            ),
-            Span::styled(
-                format!("{}", snapshot.total_connections),
-                Style::default().fg(styles::VALUE_NEUTRAL),
-            ),
-            Span::styled(" connections", Style::default().fg(styles::LABEL)),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(styles::BORDER_ACTIVE)),
-    )
-    .alignment(Alignment::Center);
+        ]
+        .concat(),
+    );
+
+    let title = Paragraph::new(vec![title_line, info_line])
+        .block(bordered_block("", styles::BORDER_ACTIVE))
+        .alignment(Alignment::Center);
 
     f.render_widget(title, area);
 }
@@ -162,129 +185,14 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
         .split(area);
 
     // Left: App summary (uptime, sessions)
-    let left_summary = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Uptime: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                snapshot.format_uptime(),
-                Style::default().fg(styles::VALUE_PRIMARY),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Stateful Sessions: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{}", snapshot.stateful_sessions),
-                Style::default().fg(if snapshot.stateful_sessions > 0 {
-                    styles::VALUE_PRIMARY
-                } else {
-                    styles::VALUE_NEUTRAL
-                }),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("CPU: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{:.1}%", system_stats.cpu_usage),
-                Style::default().fg(if system_stats.cpu_usage > 80.0 {
-                    Color::Red
-                } else if system_stats.cpu_usage > 50.0 {
-                    Color::Yellow
-                } else {
-                    styles::VALUE_INFO
-                }),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Memory: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format_bytes(system_stats.memory_bytes),
-                Style::default().fg(styles::VALUE_INFO),
-            ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("App")
-            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
-    )
-    .alignment(Alignment::Left);
+    let left_summary = create_app_summary(snapshot, system_stats);
 
     // Middle: Cache summary
-    let middle_summary = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Entries: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{}", snapshot.cache_entries),
-                Style::default().fg(if snapshot.cache_entries > 0 {
-                    styles::VALUE_INFO
-                } else {
-                    styles::VALUE_NEUTRAL
-                }),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Size: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format_bytes(snapshot.cache_size_bytes),
-                Style::default().fg(styles::VALUE_NEUTRAL),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Hit Rate: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format!("{:.1}%", snapshot.cache_hit_rate),
-                Style::default().fg(if snapshot.cache_hit_rate > 50.0 {
-                    styles::VALUE_PRIMARY
-                } else if snapshot.cache_hit_rate > 0.0 {
-                    styles::VALUE_INFO
-                } else {
-                    styles::VALUE_NEUTRAL
-                }),
-            ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Cache")
-            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
-    )
-    .alignment(Alignment::Left);
+    let middle_summary = create_cache_summary(snapshot);
 
     // Right: Data transfer summary
-    let right_summary = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Client → Backend: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                &client_to_backend_str,
-                Style::default().fg(styles::VALUE_SECONDARY),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Backend → Client: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                &backend_to_client_str,
-                Style::default()
-                    .fg(styles::VALUE_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Total: ", Style::default().fg(styles::LABEL)),
-            Span::styled(
-                format_bytes(snapshot.total_bytes()),
-                Style::default().fg(styles::VALUE_PRIMARY),
-            ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Data Transfer")
-            .border_style(Style::default().fg(styles::BORDER_NORMAL)),
-    )
-    .alignment(Alignment::Left);
+    let right_summary =
+        create_transfer_summary(snapshot, &client_to_backend_str, &backend_to_client_str);
 
     f.render_widget(left_summary, summary_chunks[0]);
     f.render_widget(middle_summary, summary_chunks[1]);
@@ -310,6 +218,292 @@ fn render_backends(
     render_user_stats(f, chunks[2], snapshot);
 }
 
+// ============================================================================
+// Summary Panel Builders (Pure Functions)
+// ============================================================================
+
+/// Create app summary panel (uptime, CPU, memory)
+fn create_app_summary(
+    snapshot: &crate::metrics::MetricsSnapshot,
+    system_stats: &crate::tui::SystemStats,
+) -> Paragraph<'static> {
+    /// Color for CPU usage based on threshold
+    const fn cpu_color(usage: f32) -> Color {
+        if usage > 80.0 {
+            Color::Red
+        } else if usage > 50.0 {
+            Color::Yellow
+        } else {
+            styles::VALUE_INFO
+        }
+    }
+
+    /// Color for session count (highlight if active)
+    const fn session_color(count: usize) -> Color {
+        if count > 0 {
+            styles::VALUE_PRIMARY
+        } else {
+            styles::VALUE_NEUTRAL
+        }
+    }
+
+    Paragraph::new(vec![
+        Line::from(label_value_spans(
+            "Uptime: ",
+            snapshot.format_uptime(),
+            styles::VALUE_PRIMARY,
+        )),
+        Line::from(label_value_spans(
+            "Stateful Sessions: ",
+            format!("{}", snapshot.stateful_sessions),
+            session_color(snapshot.stateful_sessions),
+        )),
+        Line::from(label_value_spans(
+            "CPU: ",
+            format!("{:.1}%", system_stats.cpu_usage),
+            cpu_color(system_stats.cpu_usage),
+        )),
+        Line::from(label_value_spans(
+            "Memory: ",
+            format_bytes(system_stats.memory_bytes),
+            styles::VALUE_INFO,
+        )),
+    ])
+    .block(bordered_block("App", styles::BORDER_NORMAL))
+    .alignment(Alignment::Left)
+}
+
+/// Create cache summary panel
+fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph<'static> {
+    /// Color for cache entries (highlight if non-empty)
+    const fn entries_color(count: u64) -> Color {
+        if count > 0 {
+            styles::VALUE_INFO
+        } else {
+            styles::VALUE_NEUTRAL
+        }
+    }
+
+    /// Color for hit rate (green if >50%, blue if >0%, gray otherwise)
+    const fn hit_rate_color(rate: f64) -> Color {
+        if rate > 50.0 {
+            styles::VALUE_PRIMARY
+        } else if rate > 0.0 {
+            styles::VALUE_INFO
+        } else {
+            styles::VALUE_NEUTRAL
+        }
+    }
+
+    Paragraph::new(vec![
+        Line::from(label_value_spans(
+            "Entries: ",
+            format!("{}", snapshot.cache_entries),
+            entries_color(snapshot.cache_entries),
+        )),
+        Line::from(label_value_spans(
+            "Size: ",
+            format_bytes(snapshot.cache_size_bytes),
+            styles::VALUE_NEUTRAL,
+        )),
+        Line::from(label_value_spans(
+            "Hit Rate: ",
+            format!("{:.1}%", snapshot.cache_hit_rate),
+            hit_rate_color(snapshot.cache_hit_rate),
+        )),
+    ])
+    .block(bordered_block("Cache", styles::BORDER_NORMAL))
+    .alignment(Alignment::Left)
+}
+
+/// Create data transfer summary panel
+fn create_transfer_summary<'a>(
+    snapshot: &crate::metrics::MetricsSnapshot,
+    client_to_backend: &'a str,
+    backend_to_client: &'a str,
+) -> Paragraph<'a> {
+    Paragraph::new(vec![
+        Line::from(label_value_spans(
+            "Client → Backend: ",
+            client_to_backend.to_string(),
+            styles::VALUE_SECONDARY,
+        )),
+        Line::from(vec![
+            styled_span("Backend → Client: ", styles::LABEL),
+            Span::styled(
+                backend_to_client,
+                Style::default()
+                    .fg(styles::VALUE_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(label_value_spans(
+            "Total: ",
+            format_bytes(snapshot.total_bytes()),
+            styles::VALUE_PRIMARY,
+        )),
+    ])
+    .block(bordered_block("Data Transfer", styles::BORDER_NORMAL))
+    .alignment(Alignment::Left)
+}
+
+// ============================================================================
+// Backend List Rendering Helpers
+// ============================================================================
+
+/// Create header line: health icon, server name, error rate
+fn backend_header_line<'a>(
+    health_icon: &'a str,
+    health_color: Color,
+    server_name: &'a str,
+    error_text: String,
+    error_rate: f64,
+) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            health_icon,
+            Style::default()
+                .fg(health_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            server_name,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            error_text,
+            Style::default().fg(error_rate_color(error_rate)),
+        ),
+    ])
+}
+
+/// Create address line: host:port with optional traffic share
+fn backend_address_line(host: &str, port: u16, traffic_share: Option<f64>) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{}:{}", host, port),
+            Style::default().fg(styles::LABEL),
+        ),
+    ];
+
+    if let Some(share) = traffic_share {
+        spans.push(Span::styled(
+            format!(" ({:.1}% share)", share),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+/// Create metrics line: connections, cmd/s, TTFB
+fn backend_metrics_line(
+    active: usize,
+    max: usize,
+    cmd_per_sec: String,
+    ttfb: String,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{}/{}", active, max),
+            Style::default().fg(styles::VALUE_SECONDARY),
+        ),
+        Span::styled(" | Cmd/s: ", Style::default().fg(styles::LABEL)),
+        Span::styled(cmd_per_sec, Style::default().fg(styles::VALUE_INFO)),
+        Span::styled(" | TTFB: ", Style::default().fg(styles::LABEL)),
+        Span::styled(ttfb, Style::default().fg(styles::VALUE_INFO)),
+    ])
+}
+
+/// Create transfer line: bytes sent/received with arrows
+fn backend_transfer_line(sent: u64, received: u64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {} ", text::ARROW_UP),
+            Style::default().fg(styles::VALUE_PRIMARY),
+        ),
+        Span::styled(
+            format_bytes(sent),
+            Style::default().fg(styles::VALUE_PRIMARY),
+        ),
+        Span::styled(
+            format!("  {} ", text::ARROW_DOWN),
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        ),
+        Span::styled(
+            format_bytes(received),
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        ),
+    ])
+}
+
+/// Create article stats line: average size and count
+fn backend_article_line(avg_size: String, count: u64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  Avg Article: ", Style::default().fg(styles::LABEL)),
+        Span::styled(avg_size, Style::default().fg(styles::VALUE_INFO)),
+        Span::styled(" | Articles: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{}", count),
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        ),
+    ])
+}
+
+/// Create error stats line: 4xx/5xx errors and connection failures
+fn backend_error_line(
+    errors_4xx: u64,
+    errors_5xx: u64,
+    has_errors: bool,
+    failures: u64,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  Errors: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("4xx:{} 5xx:{}", errors_4xx, errors_5xx),
+            Style::default().fg(error_count_color(has_errors)),
+        ),
+        Span::styled(" | Conn Fails: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{}", failures),
+            Style::default().fg(connection_failure_color(failures)),
+        ),
+    ])
+}
+
+/// Create details line: pending, load ratio, stateful connections
+fn backend_details_line(pending: usize, load_ratio: Option<f64>, stateful: usize) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("  Load: ", Style::default().fg(styles::LABEL)),
+        Span::styled(
+            format!("{} in-flight", pending),
+            Style::default().fg(pending_count_color(pending)),
+        ),
+    ];
+
+    if let Some(ratio) = load_ratio {
+        let ratio_percent = ratio * 100.0;
+        spans.push(Span::styled(
+            format!(" ({:.0}%)", ratio_percent),
+            Style::default().fg(load_percentage_color(ratio_percent)),
+        ));
+    }
+
+    if stateful > 0 {
+        spans.push(Span::styled(
+            format!(" | Stateful: {}", stateful),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    Line::from(spans)
+}
+
 /// Render list of backend servers with their stats
 fn render_backend_list(
     f: &mut Frame,
@@ -324,163 +518,64 @@ fn render_backend_list(
         .zip(servers.iter())
         .enumerate()
         .map(|(i, (stats, server))| {
-            use crate::metrics::HealthStatus;
-
-            // Determine health status indicator
-            let (health_icon, health_color) = match stats.health_status {
-                HealthStatus::Healthy => ("●", Color::Green),
-                HealthStatus::Degraded => ("◐", Color::Yellow),
-                HealthStatus::Down => ("○", Color::Red),
-            };
-
-            // Format error rate
+            let (health_icon, health_color) = health_indicator(stats.health_status);
             let error_rate = stats.error_rate_percent();
-            let error_text = if error_rate > 5.0 {
-                format!(" ⚠ {:.1}%", error_rate)
-            } else if error_rate > 0.0 {
-                format!(" {:.1}%", error_rate)
-            } else {
-                String::new()
-            };
 
-            // Get latest commands/sec from throughput history
+            // Format dynamic text values
             let cmd_per_sec = app
                 .latest_backend_throughput(i)
-                .and_then(|point| point.commands_per_sec())
-                .map(|cps| format!("{:.0}", cps.get()))
-                .unwrap_or_else(|| String::from(text::DEFAULT_CMD_RATE));
+                .and_then(|p| p.commands_per_sec())
+                .map_or_else(
+                    || text::DEFAULT_CMD_RATE.to_string(),
+                    |cps| format!("{:.0}", cps.get()),
+                );
 
-            // Format TTFB (time to first byte)
-            let ttfb_text = stats
+            let ttfb = stats
                 .average_ttfb_ms()
-                .map(|ms| format!("{:.1}ms", ms))
-                .unwrap_or_else(|| "N/A".to_string());
+                .map_or_else(|| "N/A".to_string(), |ms| format!("{:.1}ms", ms));
 
-            // Format average article size
-            let avg_size_text = stats
+            let avg_size = stats
                 .average_article_size()
-                .map(format_bytes)
-                .unwrap_or_else(|| "N/A".to_string());
+                .map_or_else(|| "N/A".to_string(), format_bytes);
 
-            let content = vec![
-                Line::from(vec![
-                    Span::styled(
-                        health_icon,
-                        Style::default()
-                            .fg(health_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        server.name.as_str(),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        error_text,
-                        Style::default().fg(if error_rate > 5.0 {
-                            Color::Red
-                        } else {
-                            Color::Yellow
-                        }),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
-                        format!("{}:{}", server.host, server.port),
-                        Style::default().fg(styles::LABEL),
-                    ),
-                ]),
-                Line::from({
-                    let mut line = vec![
-                        Span::styled("  Used/Max: ", Style::default().fg(styles::LABEL)),
-                        Span::styled(
-                            format!("{}/{}", stats.active_connections, server.max_connections),
-                            Style::default().fg(styles::VALUE_SECONDARY),
-                        ),
-                    ];
-
-                    // Show pending count if details mode is enabled
-                    if app.show_details() {
-                        let pending = app.backend_pending_count(i);
-                        line.push(Span::styled(
-                            format!(" ({} pending)", pending),
-                            Style::default().fg(if pending > 0 {
-                                Color::Yellow
-                            } else {
-                                styles::LABEL
-                            }),
-                        ));
-                    }
-
-                    line.push(Span::styled(
-                        " | Cmd/s: ",
-                        Style::default().fg(styles::LABEL),
-                    ));
-                    line.push(Span::styled(
-                        cmd_per_sec,
-                        Style::default().fg(styles::VALUE_INFO),
-                    ));
-                    line.push(Span::styled(
-                        " | TTFB: ",
-                        Style::default().fg(styles::LABEL),
-                    ));
-                    line.push(Span::styled(
-                        ttfb_text,
-                        Style::default().fg(styles::VALUE_INFO),
-                    ));
-                    line
-                }),
-                Line::from(vec![
-                    Span::styled(
-                        format!("  {} ", text::ARROW_UP),
-                        Style::default().fg(styles::VALUE_PRIMARY),
-                    ),
-                    Span::styled(
-                        format_bytes(stats.bytes_sent.as_u64()),
-                        Style::default().fg(styles::VALUE_PRIMARY),
-                    ),
-                    Span::styled(
-                        format!("  {} ", text::ARROW_DOWN),
-                        Style::default().fg(styles::VALUE_NEUTRAL),
-                    ),
-                    Span::styled(
-                        format_bytes(stats.bytes_received.as_u64()),
-                        Style::default().fg(styles::VALUE_NEUTRAL),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Avg Article: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(avg_size_text, Style::default().fg(styles::VALUE_INFO)),
-                    Span::styled(" | Articles: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("{}", stats.article_count),
-                        Style::default().fg(styles::VALUE_NEUTRAL),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Errors: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("4xx:{} 5xx:{}", stats.errors_4xx, stats.errors_5xx),
-                        Style::default().fg(if !stats.errors.is_zero() {
-                            Color::Yellow
-                        } else {
-                            styles::VALUE_NEUTRAL
-                        }),
-                    ),
-                    Span::styled(" | Conn Fails: ", Style::default().fg(styles::LABEL)),
-                    Span::styled(
-                        format!("{}", stats.connection_failures),
-                        Style::default().fg(if stats.connection_failures.get() > 0 {
-                            Color::Red
-                        } else {
-                            styles::VALUE_NEUTRAL
-                        }),
-                    ),
-                ]),
+            // Build base content lines
+            let mut content = vec![
+                backend_header_line(
+                    health_icon,
+                    health_color,
+                    server.name.as_str(),
+                    format_error_rate(error_rate),
+                    error_rate,
+                ),
+                backend_address_line(
+                    &server.host,
+                    server.port.get(),
+                    app.backend_traffic_share(i),
+                ),
+                backend_metrics_line(
+                    stats.active_connections.get(),
+                    server.max_connections.get(),
+                    cmd_per_sec,
+                    ttfb,
+                ),
+                backend_transfer_line(stats.bytes_sent.as_u64(), stats.bytes_received.as_u64()),
+                backend_article_line(avg_size, stats.article_count.get()),
+                backend_error_line(
+                    stats.errors_4xx.get(),
+                    stats.errors_5xx.get(),
+                    !stats.errors.is_zero(),
+                    stats.connection_failures.get(),
+                ),
             ];
+
+            // Add details line in details mode
+            if app.show_details() {
+                content.push(backend_details_line(
+                    app.backend_pending_count(i),
+                    app.backend_load_ratio(i),
+                    app.backend_stateful_count(i),
+                ));
+            }
 
             ListItem::new(content)
         })
@@ -589,49 +684,26 @@ fn render_data_flow(f: &mut Frame, area: Rect, servers: &[crate::config::Server]
 
 /// Render footer with help text
 fn render_footer(f: &mut Frame, area: Rect) {
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("Press ", Style::default().fg(styles::LABEL)),
-        Span::styled(
-            "q",
-            Style::default()
-                .fg(styles::VALUE_INFO)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" or ", Style::default().fg(styles::LABEL)),
-        Span::styled(
-            "Esc",
-            Style::default()
-                .fg(styles::VALUE_INFO)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" to exit  |  ", Style::default().fg(styles::LABEL)),
-        Span::styled(
-            "L",
-            Style::default()
-                .fg(styles::VALUE_INFO)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" to toggle logs  |  ", Style::default().fg(styles::LABEL)),
-        Span::styled(
-            "d",
-            Style::default()
-                .fg(styles::VALUE_INFO)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" for details  |  ", Style::default().fg(styles::LABEL)),
-        Span::styled(
-            "Ctrl+C",
-            Style::default()
-                .fg(styles::VALUE_INFO)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" to shutdown", Style::default().fg(styles::LABEL)),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(styles::LABEL)),
-    )
+    /// Create a key-help span pair (key in bold info color, help in label color)
+    fn key_help(key: &'static str, help: &'static str) -> Vec<Span<'static>> {
+        vec![
+            bold_span(key, styles::VALUE_INFO),
+            styled_span(help, styles::LABEL),
+        ]
+    }
+
+    let footer = Paragraph::new(Line::from(
+        [
+            vec![styled_span("Press ", styles::LABEL)],
+            key_help("q", " or "),
+            key_help("Esc", " to exit  |  "),
+            key_help("L", " to toggle logs  |  "),
+            key_help("d", " for details  |  "),
+            key_help("Ctrl+C", " to shutdown"),
+        ]
+        .concat(),
+    ))
+    .block(bordered_block("", styles::LABEL))
     .alignment(Alignment::Center);
 
     f.render_widget(footer, area);
@@ -671,62 +743,26 @@ fn render_logs(f: &mut Frame, area: Rect, app: &TuiApp) {
 
 /// Render per-user statistics panel
 fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
-    // Sort users by total bytes transferred (sent + received) descending
-    let mut sorted_users = snapshot.user_stats.iter().collect::<Vec<_>>();
-    sorted_users.sort_by(|a, b| {
-        let a_total = a.total_bytes();
-        let b_total = b.total_bytes();
-        b_total.cmp(&a_total)
-    });
-
-    // Take top 10 users or all if less than 10
-    let top_users: Vec<_> = sorted_users.iter().take(10).collect();
-
-    // Find max total bytes for scaling sparkline
-    let max_total = top_users.iter().map(|u| u.total_bytes()).max().unwrap_or(1);
-
-    let mut items = Vec::with_capacity(top_users.len() + 1);
-
-    // Header
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled(
-            "User",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Bandwidth",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("       "),
-        Span::styled(
-            "Conns",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])));
-
-    // User rows with sparkline
-    for user in top_users {
-        let username = if user.username.len() > 12 {
-            format!("{}...", &user.username[..9])
+    /// Truncate username to fit display width
+    fn format_username(username: &str) -> String {
+        const MAX_LEN: usize = 12;
+        if username.len() > MAX_LEN {
+            format!("{}...", &username[..9])
         } else {
-            format!("{:<12}", user.username)
-        };
+            format!("{:<MAX_LEN$}", username)
+        }
+    }
 
-        let total_bytes = user.total_bytes();
-        let bar = create_sparkline(total_bytes, max_total);
-
-        items.push(ListItem::new(vec![
+    /// Create user stat lines (functional pipeline)
+    fn user_stat_lines(user: &crate::metrics::UserStats, sparkline: String) -> Vec<Line<'static>> {
+        vec![
             Line::from(vec![
-                Span::styled(username, Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format_username(&user.username),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(" "),
-                Span::styled(bar, Style::default().fg(Color::Blue)),
+                Span::styled(sparkline, Style::default().fg(Color::Blue)),
                 Span::raw(" "),
                 Span::styled(
                     format!("{:>5}", user.active_connections),
@@ -757,15 +793,40 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
-        ]));
+        ]
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Top Users ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(styles::BORDER_ACTIVE)),
-    );
+    // Functional pipeline: sort → take top 10 → find max → build items
+    let mut sorted_users = snapshot.user_stats.iter().collect::<Vec<_>>();
+    sorted_users.sort_by_key(|u| std::cmp::Reverse(u.total_bytes()));
+
+    let top_users: Vec<_> = sorted_users.into_iter().take(10).collect();
+    let max_total = top_users.iter().map(|u| u.total_bytes()).max().unwrap_or(1);
+
+    // Header row
+    let header = ListItem::new(Line::from(vec![
+        bold_span("User", Color::Yellow),
+        Span::raw("  "),
+        bold_span("Bandwidth", Color::Yellow),
+        Span::raw("       "),
+        bold_span("Conns", Color::Yellow),
+    ]));
+
+    // User rows - functional map
+    let user_items: Vec<ListItem> = top_users
+        .into_iter()
+        .map(|user| {
+            let sparkline = create_sparkline(user.total_bytes(), max_total);
+            ListItem::new(user_stat_lines(user, sparkline))
+        })
+        .collect();
+
+    // Combine header + users
+    let items = std::iter::once(header)
+        .chain(user_items)
+        .collect::<Vec<_>>();
+
+    let list = List::new(items).block(bordered_block(" Top Users ", styles::BORDER_ACTIVE));
 
     f.render_widget(list, area);
 }

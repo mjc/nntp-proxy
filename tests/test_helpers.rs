@@ -4,6 +4,7 @@
 //! in integration tests.
 
 use anyhow::Result;
+use nntp_proxy::NntpProxy;
 use nntp_proxy::config::{Config, Server};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -202,6 +203,41 @@ impl MockNntpServer {
 #[allow(dead_code)]
 pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
     MockNntpServer::new(port).with_name(server_name).spawn()
+}
+
+/// Spawn a test proxy server in the background
+///
+/// # Arguments
+/// * `proxy` - The NntpProxy instance to run
+/// * `port` - Port to listen on
+/// * `per_command_routing` - If true, use per-command routing; otherwise use stateful mode
+///
+/// # Example
+/// ```ignore
+/// let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+/// spawn_test_proxy(proxy, 8119, true).await;
+/// ```
+#[allow(dead_code)]
+pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool) {
+    let proxy_addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&proxy_addr).await.unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = listener.accept().await {
+                let proxy_clone = proxy.clone();
+                tokio::spawn(async move {
+                    if per_command_routing {
+                        let _ = proxy_clone
+                            .handle_client_per_command_routing(stream, addr.into())
+                            .await;
+                    } else {
+                        let _ = proxy_clone.handle_client(stream, addr.into()).await;
+                    }
+                });
+            }
+        }
+    });
 }
 
 /// Get an available port from the OS

@@ -9,16 +9,23 @@ use std::io::ErrorKind;
 pub struct ErrorClassifier;
 
 impl ErrorClassifier {
-    /// Check if error is a client disconnect (broken pipe)
+    /// Check if error is a client disconnect (broken pipe or connection reset)
+    ///
+    /// When a client disconnects, we can receive either:
+    /// - `BrokenPipe` (os error 32) - writing to a closed socket
+    /// - `ConnectionReset` (os error 104) - peer forcibly closed the connection
     pub fn is_client_disconnect(error: &anyhow::Error) -> bool {
         // First check if it's a ConnectionError
         if let Some(conn_err) = error.downcast_ref::<ConnectionError>() {
             return conn_err.is_client_disconnect();
         }
 
-        // Check raw IO error
+        // Check raw IO error for both BrokenPipe and ConnectionReset
         if let Some(io_err) = error.downcast_ref::<std::io::Error>() {
-            return io_err.kind() == ErrorKind::BrokenPipe;
+            return matches!(
+                io_err.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+            );
         }
 
         false
@@ -105,11 +112,11 @@ mod tests {
         assert!(ErrorClassifier::is_client_disconnect(&err));
         assert!(ErrorClassifier::should_skip_client_error_response(&err));
 
-        // Verify other errors are NOT client disconnects
+        // ConnectionReset is ALSO a client disconnect (peer forcibly closed)
         let reset = std::io::Error::new(ErrorKind::ConnectionReset, "reset");
         let err: anyhow::Error = reset.into();
-        assert!(!ErrorClassifier::is_client_disconnect(&err));
-        assert!(!ErrorClassifier::should_skip_client_error_response(&err));
+        assert!(ErrorClassifier::is_client_disconnect(&err));
+        assert!(ErrorClassifier::should_skip_client_error_response(&err));
     }
 
     #[test]

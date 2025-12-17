@@ -424,7 +424,7 @@ fn test_weighted_distribution_precision() {
 
     // Issue exactly total_weight * N requests for perfect distribution test
     let cycles = 10;
-    let num_requests = selector.total_weight() * cycles;
+    let num_requests = selector.total_weight().get() * cycles;
     let mut counts = [0; 2];
 
     for _ in 0..num_requests {

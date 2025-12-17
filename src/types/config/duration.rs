@@ -26,7 +26,7 @@ pub mod duration_serde {
     }
 }
 
-/// Helper for deserializing Option<Duration> from seconds
+/// Helper for deserializing `Option<Duration>` from seconds
 pub mod option_duration_serde {
     use super::*;
 

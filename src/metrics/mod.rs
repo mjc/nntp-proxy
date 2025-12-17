@@ -10,7 +10,7 @@
 //! - **snapshot**: MetricsSnapshot with aggregation/query methods
 //! - **backend_stats**: BackendStats with calculation methods
 //! - **user_stats**: UserStats with helper methods
-//! - **types**: Type-safe newtypes for all metric values (including HealthStatus)
+//! - **types**: Type-safe newtypes for all metric values (including BackendHealthStatus)
 //!
 //! ## Rate Calculations
 //!

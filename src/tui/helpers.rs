@@ -3,9 +3,7 @@
 use ratatui::style::Color;
 
 use super::constants::{BACKEND_COLORS, throughput};
-use super::types::{
-    BackendChartData, BackendIndex, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec,
-};
+use super::types::{BackendChartData, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec};
 use crate::config::Server;
 use crate::tui::TuiApp;
 use crate::tui::app::ThroughputPoint;
@@ -43,17 +41,16 @@ pub fn create_sparkline(value: u64, max_value: u64) -> String {
 // Chart Data Building
 // ============================================================================
 
-/// Accumulator for building point vectors and tracking max in single fold
-type PointAccumulator = ((PointVec, PointVec), ChartY);
-
-/// Build chart data for all backends
+/// Build chart data for all backends using functional pipeline
 ///
-/// Single-pass functional pipeline:
-/// 1. Fold over servers to build chart data and track global max
-/// 2. For each server, fold over history to build points and track backend max
+/// Single-pass processing:
+/// 1. Maps over servers to extract history
+/// 2. Folds over history points to build point vectors and track max
+/// 3. Accumulates results with global max tracking
 ///
 /// Returns (chart_data, global_max_throughput)
 pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64) {
+    /// Extract data from a single throughput point
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
         let x = ChartX::from(idx);
@@ -66,41 +63,58 @@ pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64)
         )
     }
 
+    /// Accumulate points and track maximum (pure function)
     #[inline]
     fn accumulate_points(
-        ((mut sent_vec, mut recv_vec), max): PointAccumulator,
+        ((mut sent_vec, mut recv_vec), max): ((PointVec, PointVec), ChartY),
         (sent_point, recv_point, point_max): (ChartPoint, ChartPoint, ChartY),
-    ) -> PointAccumulator {
+    ) -> ((PointVec, PointVec), ChartY) {
         sent_vec.push(sent_point);
         recv_vec.push(recv_point);
         ((sent_vec, recv_vec), max.max(point_max))
     }
 
-    servers.iter().enumerate().fold(
-        (ChartDataVec::new(), 0.0_f64),
-        |(mut chart_data, global_max), (index, server)| {
-            let history = app.throughput_history(index);
+    /// Build chart data for a single backend (pure function)
+    fn build_backend_data(
+        index: usize,
+        server: &Server,
+        history: &std::collections::VecDeque<ThroughputPoint>,
+    ) -> (BackendChartData, f64) {
+        let ((sent_points, recv_points), backend_max) = history
+            .iter()
+            .enumerate()
+            .map(|(idx, point)| extract_point_data(idx, point))
+            .fold(
+                ((PointVec::new(), PointVec::new()), ChartY::from(0.0)),
+                accumulate_points,
+            );
 
-            // Build point vectors and calculate max in single pass over history
-            let ((sent_points, recv_points), backend_max) = history
-                .iter()
-                .enumerate()
-                .map(|(idx, point)| extract_point_data(idx, point))
-                .fold(
-                    ((PointVec::new(), PointVec::new()), ChartY::from(0.0)),
-                    accumulate_points,
-                );
-
-            chart_data.push(BackendChartData::new(
+        (
+            BackendChartData::new(
                 server.name.as_str().to_string(),
-                backend_color(BackendIndex::from(index)),
+                backend_color(index),
                 sent_points,
                 recv_points,
-            ));
+            ),
+            backend_max.get(),
+        )
+    }
 
-            (chart_data, global_max.max(backend_max.get()))
-        },
-    )
+    // Functional pipeline: enumerate → map → fold
+    servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| {
+            let history = app.throughput_history(index);
+            build_backend_data(index, server, history)
+        })
+        .fold(
+            (ChartDataVec::new(), 0.0_f64),
+            |(mut chart_data, global_max), (backend_data, backend_max)| {
+                chart_data.push(backend_data);
+                (chart_data, global_max.max(backend_max))
+            },
+        )
 }
 
 // ============================================================================
@@ -110,8 +124,8 @@ pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64)
 /// Get color for backend by index (round-robin through palette)
 #[inline]
 #[must_use]
-pub fn backend_color(index: BackendIndex) -> Color {
-    BACKEND_COLORS[index.get() % BACKEND_COLORS.len()]
+pub fn backend_color(index: usize) -> Color {
+    BACKEND_COLORS[index % BACKEND_COLORS.len()]
 }
 
 /// Round throughput value up to next nice number for chart axis
@@ -173,6 +187,86 @@ pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) ->
 }
 
 // ============================================================================
+// Backend Display Helpers
+// ============================================================================
+
+/// Health status icon and color
+#[must_use]
+pub const fn health_indicator(
+    status: crate::metrics::BackendHealthStatus,
+) -> (&'static str, Color) {
+    use crate::metrics::BackendHealthStatus;
+    match status {
+        BackendHealthStatus::Healthy => ("●", Color::Green),
+        BackendHealthStatus::Degraded => ("◐", Color::Yellow),
+        BackendHealthStatus::Down => ("○", Color::Red),
+    }
+}
+
+/// Format error rate with warning icon if critical
+#[must_use]
+pub fn format_error_rate(rate: f64) -> String {
+    match rate {
+        r if r > 5.0 => format!(" ⚠ {:.1}%", r),
+        r if r > 0.0 => format!(" {:.1}%", r),
+        _ => String::new(),
+    }
+}
+
+/// Color for error rate display
+#[must_use]
+pub const fn error_rate_color(rate: f64) -> Color {
+    if rate > 5.0 {
+        Color::Red
+    } else {
+        Color::Yellow
+    }
+}
+
+/// Color for load percentage (pending/capacity ratio)
+#[must_use]
+pub const fn load_percentage_color(percent: f64) -> Color {
+    use super::constants::styles;
+    match percent {
+        p if p > 90.0 => Color::Red,
+        p if p > 70.0 => Color::Yellow,
+        _ => styles::VALUE_NEUTRAL,
+    }
+}
+
+/// Color for pending count
+#[must_use]
+pub const fn pending_count_color(pending: usize) -> Color {
+    if pending > 0 {
+        Color::Yellow
+    } else {
+        super::constants::styles::VALUE_NEUTRAL
+    }
+}
+
+/// Color for error count
+#[must_use]
+pub const fn error_count_color(has_errors: bool) -> Color {
+    use super::constants::styles;
+    if has_errors {
+        Color::Yellow
+    } else {
+        styles::VALUE_NEUTRAL
+    }
+}
+
+/// Color for connection failures
+#[must_use]
+pub const fn connection_failure_color(failures: u64) -> Color {
+    use super::constants::styles;
+    if failures > 0 {
+        Color::Red
+    } else {
+        styles::VALUE_NEUTRAL
+    }
+}
+
+// ============================================================================
 // Chart Helpers
 // ============================================================================
 
@@ -191,17 +285,17 @@ mod tests {
 
     #[test]
     fn test_backend_color_cycles() {
-        let color0 = backend_color(BackendIndex::from(0));
-        let color_wrap = backend_color(BackendIndex::from(BACKEND_COLORS.len()));
+        let color0 = backend_color(0);
+        let color_wrap = backend_color(BACKEND_COLORS.len());
         assert_eq!(color0, color_wrap, "Should wrap around");
     }
 
     #[test]
     fn test_backend_color_distinct() {
         // First few backends should have distinct colors
-        let color0 = backend_color(BackendIndex::from(0));
-        let color1 = backend_color(BackendIndex::from(1));
-        let color2 = backend_color(BackendIndex::from(2));
+        let color0 = backend_color(0);
+        let color1 = backend_color(1);
+        let color2 = backend_color(2);
 
         assert_ne!(color0, color1);
         assert_ne!(color1, color2);
@@ -273,7 +367,7 @@ mod tests {
         for i in 0..8 {
             chart_data.push(BackendChartData::new(
                 format!("Server {}", i),
-                backend_color(BackendIndex::from(i)),
+                backend_color(i),
                 PointVec::new(),
                 PointVec::new(),
             ));
@@ -288,7 +382,7 @@ mod tests {
     fn test_backend_chart_data_structure() {
         let data = BackendChartData::new(
             "Test Server".to_string(),
-            backend_color(BackendIndex::from(0)),
+            backend_color(0),
             PointVec::new(),
             PointVec::new(),
         );
@@ -318,12 +412,12 @@ mod tests {
     #[test]
     fn test_format_summary_throughput_with_data() {
         use super::super::constants::text;
-        use crate::types::tui::{BytesPerSecond, CommandsPerSecond, Timestamp};
+        use crate::types::tui::{CommandsPerSecond, Throughput, Timestamp};
 
         let point = ThroughputPoint::new_backend(
             Timestamp::now(),
-            BytesPerSecond::new(1_000_000.0),
-            BytesPerSecond::new(2_000_000.0),
+            Throughput::new(1_000_000.0),
+            Throughput::new(2_000_000.0),
             CommandsPerSecond::new(10.0),
         );
 

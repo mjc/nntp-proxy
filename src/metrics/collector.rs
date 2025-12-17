@@ -1,6 +1,6 @@
 //! Lock-free metrics collector
 
-use super::{BackendStats, HealthStatus, MetricsSnapshot, UserStats};
+use super::{BackendHealthStatus, BackendStats, MetricsSnapshot, UserStats};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -370,7 +370,7 @@ impl MetricsCollector {
     }
 
     #[inline]
-    pub fn set_backend_health(&self, backend_id: BackendId, health: HealthStatus) {
+    pub fn set_backend_health(&self, backend_id: BackendId, health: BackendHealthStatus) {
         self.with_backend(backend_id, |b| {
             b.health_status.store(health.into(), Ordering::Relaxed);
         });

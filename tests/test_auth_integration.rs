@@ -310,11 +310,7 @@ async fn test_auth_handler_integration() {
     // Test auth handler responses
     let mut output = Vec::new();
     let (bytes, _) = handler
-        .handle_auth_command(
-            AuthAction::RequestPassword("alice".to_string()),
-            &mut output,
-            None,
-        )
+        .handle_auth_command(AuthAction::RequestPassword("alice"), &mut output, None)
         .await
         .unwrap();
     assert!(bytes > 0);
@@ -323,9 +319,7 @@ async fn test_auth_handler_integration() {
     output.clear();
     let (bytes, auth_success) = handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "secret".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "secret" },
             &mut output,
             Some("alice"),
         )

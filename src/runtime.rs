@@ -279,7 +279,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
         loop {
             interval.tick().await;
             let entries = cache.entry_count();
-            let size_bytes = entries.saturating_mul(750_000 + 100);
+            let size_bytes = cache.weighted_size();
             let hit_rate = cache.hit_rate();
             debug!(
                 "Cache stats: entries={}, size={} ({:.1}% hit rate)",
@@ -362,7 +362,7 @@ pub async fn run_accept_loop(
                         // Only log non-client-disconnect errors (avoid duplicate logging)
                         // Client disconnects are already handled gracefully in session handlers
                         if !crate::is_client_disconnect_error(&e) {
-                            error!("Error handling client {}: {}", addr, e);
+                            error!("Error handling client {}: {:?}", addr, e);
                         }
                     }
                 });

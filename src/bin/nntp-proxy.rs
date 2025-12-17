@@ -12,21 +12,12 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    init_logging();
+    nntp_proxy::logging::init_dual_logging();
 
     let args = Args::parse();
     let (config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
 
     build_runtime(&args, &config)?.block_on(run_proxy(args, config))
-}
-
-fn init_logging() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
 }
 
 fn build_runtime(

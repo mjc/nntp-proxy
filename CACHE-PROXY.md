@@ -50,8 +50,8 @@ password = "your_password"
 max_connections = 10
 
 [cache]
-max_capacity = 10000  # Number of articles to cache
-ttl_secs = 3600       # 1 hour cache lifetime
+max_capacity = 67108864  # Cache size in bytes (64 MB)
+ttl_secs = 3600          # 1 hour cache lifetime
 ```
 
 ### 3. Start the Caching Proxy
@@ -98,8 +98,8 @@ The caching proxy uses the same configuration format as the main proxy, with an 
 
 ```toml
 [cache]
-max_capacity = 10000  # Maximum number of articles to cache
-ttl_secs = 3600       # Time-to-live in seconds
+max_capacity = 67108864  # Cache size in bytes (64 MB)
+ttl_secs = 3600          # Time-to-live in seconds
 ```
 
 ## How It Works
@@ -166,13 +166,17 @@ For users with:
 
 ### Memory Usage
 
-Each cached article consumes memory. Estimate requirements:
+Cache memory usage depends on the mode:
 
-- Average article size: ~50 KB
-- Cache capacity: 10,000 articles
-- Estimated memory: ~500 MB
+**Availability-only mode** (`cache_articles = false`, default):
+- ~1 KB per article (key + metadata + overhead)
+- 64 MB capacity ≈ 60,000+ articles tracked
 
-Adjust `max_capacity` based on available RAM.
+**Full caching mode** (`cache_articles = true`):
+- ~700 KB per article (typical Usenet article)
+- 512 MB capacity ≈ ~700 articles cached
+
+Set `max_capacity` to the desired cache size in bytes.
 
 ### CPU Usage
 

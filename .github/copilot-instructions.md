@@ -1227,13 +1227,35 @@ cargo bench
 
 ## Common Tasks
 
-### Important note about editing files
+### CRITICAL: Tools to NEVER use
 
-Do NOT use `sed`, `python`, or `perl` one-liners or scripts to modify repository files.
-These line-oriented or regex-driven edits are error-prone and have repeatedly caused
-incorrect substitutions and broken builds during refactors. Instead, use repository-aware
-tools (for example, apply_patch, editor-based changes, or proper git commands) and open
-a pull request so changes can be reviewed. This preserves context and prevents unsafe edits.
+**FORBIDDEN tools that waste time and tokens:**
+- ❌ `sed` - Causes regex errors, incorrect substitutions, broken syntax
+- ❌ `grep` - Use semantic_search or read_file instead
+- ❌ `head` / `tail` - Truncates critical output, use full reads
+- ❌ `perl` - Same issues as sed, plus availability problems
+- ❌ `python` one-liners - Fragile, breaks on edge cases
+
+**Why these fail:**
+- Line-oriented tools don't understand code structure
+- Regex edits repeatedly cause syntax errors and broken builds
+- Output truncation hides critical errors and context
+- They waste hours debugging what should be simple edits
+
+**Use instead:**
+- ✅ `replace_string_in_file` - Context-aware, validates syntax
+- ✅ `multi_replace_string_in_file` - Batch edits efficiently
+- ✅ `read_file` - Full file context, no truncation
+- ✅ `semantic_search` - Understands code structure
+- ✅ `run_in_terminal` - But NEVER pipe through head/tail/grep when debugging
+
+### Important note about terminal commands
+
+**DO NOT** interrupt long-running commands (Ctrl-C) - they often complete successfully if you wait.
+Let commands finish naturally, especially:
+- `cargo check` / `cargo build` - compilation takes time
+- `cargo test` / `cargo nextest run` - test suites run fully
+- File operations - I/O can be slow on some systems
 
 
 ### 1. Adding a New Backend Server

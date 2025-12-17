@@ -21,7 +21,7 @@ async fn test_invalid_credentials_rejected() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "correctpass".to_string(),
+                password: "correctpass",
             },
             &mut output,
             Some("wronguser"),
@@ -35,7 +35,7 @@ async fn test_invalid_credentials_rejected() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "wrongpass".to_string(),
+                password: "wrongpass",
             },
             &mut output,
             Some("correctuser"),
@@ -49,7 +49,7 @@ async fn test_invalid_credentials_rejected() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "wrongpass".to_string(),
+                password: "wrongpass",
             },
             &mut output,
             Some("wronguser"),
@@ -74,7 +74,7 @@ async fn test_valid_credentials_accepted() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "correctpass".to_string(),
+                password: "correctpass",
             },
             &mut output,
             Some("correctuser"),
@@ -94,9 +94,7 @@ async fn test_password_without_username_rejected() {
     let mut output = Vec::new();
     let (_, auth_success) = handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             &mut output,
             None, // No username stored
         )
@@ -119,9 +117,7 @@ async fn test_credentials_case_sensitive() {
     let mut output = Vec::new();
     let (_, auth_success) = handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "Pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "Pass" },
             &mut output,
             Some("user"),
         )
@@ -133,9 +129,7 @@ async fn test_credentials_case_sensitive() {
     output.clear();
     let (_, auth_success) = handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             &mut output,
             Some("User"),
         )
@@ -147,9 +141,7 @@ async fn test_credentials_case_sensitive() {
     output.clear();
     let (_, auth_success) = handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "Pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "Pass" },
             &mut output,
             Some("User"),
         )
@@ -169,9 +161,7 @@ async fn test_empty_credentials_rejected() {
     let mut output = Vec::new();
     let (_, auth_success) = handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "pass".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "pass" },
             &mut output,
             Some(""),
         )
@@ -183,9 +173,7 @@ async fn test_empty_credentials_rejected() {
     output.clear();
     let (_, auth_success) = handler
         .handle_auth_command(
-            AuthAction::ValidateAndRespond {
-                password: "".to_string(),
-            },
+            AuthAction::ValidateAndRespond { password: "" },
             &mut output,
             Some("user"),
         )
@@ -224,9 +212,7 @@ async fn test_auth_success_flag_reliability() {
 
         let (_, auth_success) = handler
             .handle_auth_command(
-                AuthAction::ValidateAndRespond {
-                    password: password.to_string(),
-                },
+                AuthAction::ValidateAndRespond { password: password },
                 &mut output,
                 stored_username,
             )
@@ -250,11 +236,7 @@ async fn test_request_password_never_authenticates() {
 
     let mut output = Vec::new();
     let (_, auth_success) = handler
-        .handle_auth_command(
-            AuthAction::RequestPassword("user".to_string()),
-            &mut output,
-            None,
-        )
+        .handle_auth_command(AuthAction::RequestPassword("user"), &mut output, None)
         .await
         .unwrap();
 
@@ -275,7 +257,7 @@ async fn test_disabled_auth_accepts_all() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "anypass".to_string(),
+                password: "anypass",
             },
             &mut output,
             Some("anyuser"),
@@ -308,9 +290,7 @@ async fn test_validate_matches_handle_auth_command() {
         let mut output = Vec::new();
         let (_, auth_success) = handler
             .handle_auth_command(
-                AuthAction::ValidateAndRespond {
-                    password: password.to_string(),
-                },
+                AuthAction::ValidateAndRespond { password: password },
                 &mut output,
                 Some(username),
             )
@@ -350,7 +330,7 @@ async fn test_special_characters_in_credentials() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "p@ss!w0rd#$%".to_string(),
+                password: "p@ss!w0rd#$%",
             },
             &mut output,
             Some("user@host.com"),
@@ -365,7 +345,7 @@ async fn test_special_characters_in_credentials() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "p@ss!w0rd#$".to_string(), // Missing %
+                password: "p@ss!w0rd#$", // Missing %
             },
             &mut output,
             Some("user@host.com"),
@@ -388,7 +368,7 @@ async fn property_auth_success_implies_valid_credentials() {
     let (_, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond {
-                password: "validpass".to_string(),
+                password: "validpass",
             },
             &mut output,
             Some("validuser"),
@@ -431,9 +411,7 @@ async fn property_invalid_credentials_implies_no_auth_success() {
         let mut output = Vec::new();
         let (_, auth_success) = handler
             .handle_auth_command(
-                AuthAction::ValidateAndRespond {
-                    password: password.to_string(),
-                },
+                AuthAction::ValidateAndRespond { password: password },
                 &mut output,
                 stored_username,
             )

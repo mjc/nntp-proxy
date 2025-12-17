@@ -19,7 +19,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let log_buffer = setup_logging(args.no_tui);
+    let log_buffer = nntp_proxy::logging::init_tui_logging(args.no_tui);
 
     RuntimeConfig::from_args(args.common.threads)
         .build_runtime()?
@@ -69,29 +69,6 @@ fn build_proxy_with_metrics(
             .with_metrics()
             .build()?,
     ))
-}
-
-fn setup_logging(headless: bool) -> Option<tui::LogBuffer> {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    if headless {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-        return None;
-    }
-
-    let log_buffer = tui::LogBuffer::new();
-    let log_writer = tui::LogMakeWriter::new(log_buffer.clone());
-
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_writer(log_writer)
-        .with_ansi(false)
-        .with_target(false)
-        .compact()
-        .init();
-
-    Some(log_buffer)
 }
 
 fn launch_tui(

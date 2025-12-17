@@ -219,6 +219,16 @@ impl BufferPool {
         }
     }
 
+    /// Create a buffer pool suitable for testing
+    ///
+    /// Uses sensible defaults (8KB buffers, pool of 4) that work for most tests.
+    /// Prefer this over manually constructing BufferPool in tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self::new(BufferSize::try_new(8192).expect("valid size"), 4)
+    }
+
     /// Get a buffer from the pool or create a new one (lock-free)
     ///
     /// Returns a PooledBuffer that automatically returns to the pool when dropped.
@@ -243,21 +253,6 @@ impl BufferPool {
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
-        }
-    }
-
-    /// Return a buffer to the pool (lock-free)
-    ///
-    /// Note: Usually not needed as PooledBuffer returns itself automatically on drop
-    #[allow(dead_code)]
-    pub async fn return_buffer(&self, buffer: Vec<u8>) {
-        if buffer.len() == self.buffer_size.get() {
-            let current_size = self.pool_size.load(Ordering::Relaxed);
-            if current_size < self.max_pool_size {
-                self.pool.push(buffer);
-                self.pool_size.fetch_add(1, Ordering::Relaxed);
-            }
-            // If pool is full, just drop the buffer
         }
     }
 }

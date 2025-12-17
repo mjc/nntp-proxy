@@ -8,6 +8,7 @@
 //! - Multi-backend exhaustion scenarios
 
 use nntp_proxy::cache::ArticleAvailability;
+use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::BackendId;
 
 #[test]
@@ -44,28 +45,28 @@ fn test_all_exhausted_with_single_backend() {
     let mut avail = ArticleAvailability::new();
 
     // Not all exhausted initially
-    assert!(!avail.all_exhausted(1));
+    assert!(!avail.all_exhausted(BackendCount::new(1)));
 
     // Record the only backend as missing
     avail.record_missing(BackendId::from_index(0));
 
     // Now all backends are exhausted
-    assert!(avail.all_exhausted(1));
+    assert!(avail.all_exhausted(BackendCount::new(1)));
 }
 
 #[test]
 fn test_all_exhausted_with_two_backends() {
     let mut avail = ArticleAvailability::new();
 
-    assert!(!avail.all_exhausted(2));
+    assert!(!avail.all_exhausted(BackendCount::new(2)));
 
     // Record first backend as missing
     avail.record_missing(BackendId::from_index(0));
-    assert!(!avail.all_exhausted(2)); // Still have backend 1
+    assert!(!avail.all_exhausted(BackendCount::new(2))); // Still have backend 1
 
     // Record second backend as missing
     avail.record_missing(BackendId::from_index(1));
-    assert!(avail.all_exhausted(2)); // Now all exhausted
+    assert!(avail.all_exhausted(BackendCount::new(2))); // Now all exhausted
 }
 
 #[test]
@@ -76,7 +77,7 @@ fn test_all_exhausted_with_eight_backends() {
     for i in 0..7 {
         avail.record_missing(BackendId::from_index(i));
         assert!(
-            !avail.all_exhausted(8),
+            !avail.all_exhausted(BackendCount::new(8)),
             "Should not be all exhausted with backend 7 untried"
         );
     }
@@ -84,7 +85,7 @@ fn test_all_exhausted_with_eight_backends() {
     // Record the last backend
     avail.record_missing(BackendId::from_index(7));
     assert!(
-        avail.all_exhausted(8),
+        avail.all_exhausted(BackendCount::new(8)),
         "All 8 backends should be exhausted now"
     );
 }
@@ -107,7 +108,7 @@ fn test_partial_backend_subset() {
     assert!(avail.should_try(BackendId::from_index(5))); // untried
 
     // Not all exhausted (only tested 3 of 6 backends)
-    assert!(!avail.all_exhausted(6));
+    assert!(!avail.all_exhausted(BackendCount::new(6)));
 }
 
 #[test]
@@ -160,7 +161,7 @@ fn test_retry_loop_simulation_two_backends() {
     assert!(avail.should_try(b0));
     attempts.push(b0);
     avail.record_missing(b0);
-    assert!(!avail.all_exhausted(backend_count));
+    assert!(!avail.all_exhausted(BackendCount::new(backend_count)));
 
     // Attempt 2: Try backend 1, gets 430
     let b1 = BackendId::from_index(1);
@@ -169,7 +170,7 @@ fn test_retry_loop_simulation_two_backends() {
     avail.record_missing(b1);
 
     // Now all backends exhausted
-    assert!(avail.all_exhausted(backend_count));
+    assert!(avail.all_exhausted(BackendCount::new(backend_count)));
 
     // Verify we tried both backends
     assert_eq!(attempts.len(), 2);
@@ -203,7 +204,7 @@ fn test_retry_loop_simulation_finds_on_third() {
     // Don't record missing - we got the article
 
     // Verify state
-    assert!(!avail.all_exhausted(4));
+    assert!(!avail.all_exhausted(BackendCount::new(4)));
     assert_eq!(attempts.len(), 3);
 
     // Verify backends 0 and 1 won't be tried again
@@ -249,7 +250,7 @@ fn test_all_exhausted_edge_case_zero_backends() {
     let avail = ArticleAvailability::new();
 
     // Edge case: zero backends means all are exhausted
-    assert!(avail.all_exhausted(0));
+    assert!(avail.all_exhausted(BackendCount::new(0)));
 }
 
 #[test]
@@ -264,7 +265,7 @@ fn test_all_exhausted_panics_with_nine_backends() {
     }
 
     // This should panic in debug builds (config validation prevents this)
-    avail.all_exhausted(9);
+    avail.all_exhausted(BackendCount::new(9));
 }
 
 #[test]

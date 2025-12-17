@@ -34,8 +34,10 @@
 // Module declarations
 pub mod args;
 pub mod auth;
+pub mod client;
 pub mod connection_error;
 pub mod formatting;
+pub mod logging;
 pub mod metrics;
 pub mod network;
 pub mod protocol;
@@ -43,17 +45,11 @@ mod proxy;
 pub mod stream;
 pub mod tui;
 
-// Test utilities (macros for reducing newtype test boilerplate)
-#[cfg(test)]
-#[macro_use]
-mod test_macros;
-
 // Public modules for integration tests
 pub mod cache;
 pub mod command;
 pub mod config;
 pub mod constants;
-pub mod health;
 pub mod pool;
 pub mod router;
 pub mod runtime;
@@ -67,6 +63,24 @@ pub use config::{
     Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
     load_config, load_config_from_env, load_config_with_fallback,
 };
-pub use network::SocketOptimizer;
 pub use proxy::{NntpProxy, NntpProxyBuilder, is_client_disconnect_error};
 pub use runtime::{RuntimeConfig, shutdown_signal};
+
+// Re-export streaming utilities for standalone client use
+pub mod streaming {
+    //! Streaming utilities for reading NNTP multiline responses
+    //!
+    //! These are useful when building standalone NNTP clients that need to
+    //! fetch articles directly from servers.
+    pub use crate::session::streaming::{
+        stream_and_capture_multiline_response, stream_multiline_response,
+    };
+}
+
+// Re-export backend command utilities for standalone client use
+pub mod backend {
+    //! Backend communication utilities for NNTP client operations
+    //!
+    //! Use these when building standalone NNTP clients.
+    pub use crate::session::backend::{CommandResponse, send_command};
+}

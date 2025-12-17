@@ -9,50 +9,14 @@
 //! - Security (credential redaction)
 
 use std::sync::Arc;
-use tokio::net::TcpListener;
 
 mod config_helpers;
 mod test_helpers;
-use config_helpers::create_test_server_config;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
-use nntp_proxy::config::{Config, RoutingMode};
+use nntp_proxy::config::RoutingMode;
 use nntp_proxy::session::ClientSession;
-use test_helpers::MockNntpServer;
-
-/// Create test config with client auth enabled
-fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
-    use nntp_proxy::config::{ClientAuth, UserCredentials};
-    Config {
-        servers: backend_ports
-            .into_iter()
-            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
-            .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: None,
-        client_auth: ClientAuth {
-            users: vec![UserCredentials {
-                username: username.to_string(),
-                password: password.to_string(),
-            }],
-            greeting: None,
-        },
-    }
-}
-
-/// Spawn a mock NNTP backend server
-async fn spawn_mock_backend() -> (u16, tokio::task::AbortHandle) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let handle = MockNntpServer::new(port)
-        .with_name("Mock NNTP Server")
-        .spawn();
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    (port, handle)
-}
+use test_helpers::{get_available_port, spawn_mock_server};
 
 #[tokio::test]
 async fn test_auth_handler_disabled_by_default() {
@@ -200,14 +164,14 @@ async fn test_auth_command_sequence_valid() {
     let user_action = CommandHandler::classify("AUTHINFO USER alice\r\n");
     assert!(matches!(
         user_action,
-        CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) if u == "alice"
+        CommandAction::InterceptAuth(AuthAction::RequestPassword(ref u)) if *u == "alice"
     ));
 
     // AUTHINFO PASS should validate and respond
     let pass_action = CommandHandler::classify("AUTHINFO PASS secret\r\n");
     assert!(matches!(
         pass_action,
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password == "secret"
+        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if *password == "secret"
     ));
 }
 
@@ -234,7 +198,7 @@ async fn test_auth_handler_processes_auth_commands() {
     let mut output = Vec::new();
 
     // Test USER command
-    let user_action = AuthAction::RequestPassword("testuser".to_string());
+    let user_action = AuthAction::RequestPassword("testuser");
     let (bytes, auth_success) = handler
         .handle_auth_command(user_action, &mut output, None)
         .await
@@ -246,9 +210,7 @@ async fn test_auth_handler_processes_auth_commands() {
 
     // Test PASS command with validation
     output.clear();
-    let pass_action = AuthAction::ValidateAndRespond {
-        password: "pass".to_string(),
-    };
+    let pass_action = AuthAction::ValidateAndRespond { password: "pass" };
     let (bytes, auth_success) = handler
         .handle_auth_command(pass_action, &mut output, Some("user"))
         .await
@@ -289,7 +251,8 @@ async fn test_command_classification_for_stateless() {
 async fn test_session_with_auth_handler() {
     use test_helpers::{create_test_addr, create_test_auth_handler_with, create_test_buffer_pool};
 
-    let (_backend_port, _handle) = spawn_mock_backend().await;
+    let backend_port = get_available_port().await.unwrap();
+    let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_with("testuser", "testpass");
 
@@ -305,7 +268,8 @@ async fn test_session_with_disabled_auth() {
         create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
     };
 
-    let (_backend_port, _handle) = spawn_mock_backend().await;
+    let backend_port = get_available_port().await.unwrap();
+    let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_disabled();
 
@@ -445,9 +409,11 @@ async fn test_session_builder_with_router_and_auth() {
 
 #[tokio::test]
 async fn test_proxy_creates_auth_handler_from_config() {
-    let (backend_port, _handle) = spawn_mock_backend().await;
+    let backend_port = get_available_port().await.unwrap();
+    let _handle = spawn_mock_server(backend_port, "Mock Backend");
 
-    let config = create_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
+    let config =
+        config_helpers::create_test_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
 
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
 
@@ -604,12 +570,8 @@ async fn test_auth_handler_with_concurrent_requests() {
         let h = handler.clone();
         set.spawn(async move {
             let mut output = Vec::new();
-            h.handle_auth_command(
-                AuthAction::RequestPassword("test".to_string()),
-                &mut output,
-                None,
-            )
-            .await
+            h.handle_auth_command(AuthAction::RequestPassword("test"), &mut output, None)
+                .await
         });
     }
 

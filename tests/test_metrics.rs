@@ -183,14 +183,14 @@ fn test_metrics_snapshot_format_uptime() {
 
 #[test]
 fn test_health_status_conversion() {
-    assert_eq!(u8::from(HealthStatus::Healthy), 0);
-    assert_eq!(u8::from(HealthStatus::Degraded), 1);
-    assert_eq!(u8::from(HealthStatus::Down), 2);
+    assert_eq!(u8::from(BackendHealthStatus::Healthy), 0);
+    assert_eq!(u8::from(BackendHealthStatus::Degraded), 1);
+    assert_eq!(u8::from(BackendHealthStatus::Down), 2);
 
-    assert_eq!(HealthStatus::from(0), HealthStatus::Healthy);
-    assert_eq!(HealthStatus::from(1), HealthStatus::Degraded);
-    assert_eq!(HealthStatus::from(2), HealthStatus::Down);
-    assert_eq!(HealthStatus::from(99), HealthStatus::Healthy); // Invalid treated as 0
+    assert_eq!(BackendHealthStatus::from(0), BackendHealthStatus::Healthy);
+    assert_eq!(BackendHealthStatus::from(1), BackendHealthStatus::Degraded);
+    assert_eq!(BackendHealthStatus::from(2), BackendHealthStatus::Down);
+    assert_eq!(BackendHealthStatus::from(99), BackendHealthStatus::Healthy); // Invalid treated as 0
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn test_backend_stats_with_realistic_values() {
     stats.send_micros_total = SendMicros::new(50000);
     stats.recv_micros_total = RecvMicros::new(400000);
     stats.connection_failures = FailureCount::new(2);
-    stats.health_status = HealthStatus::Healthy;
+    stats.health_status = BackendHealthStatus::Healthy;
 
     // Verify calculations
     assert_eq!(stats.error_rate_percent(), 1.0);

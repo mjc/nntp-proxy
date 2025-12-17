@@ -7,7 +7,6 @@
 //! - Periodic health checks for idle connections
 //! - Graceful shutdown with QUIT commands
 
-use super::connection_pool::ConnectionPool;
 use super::connection_trait::ConnectionProvider;
 use super::deadpool_connection::{Pool, TcpManager};
 use super::health_check::{HealthCheckMetrics, check_date_response};
@@ -25,12 +24,9 @@ use tracing::{debug, info, warn};
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
     name: String,
-    /// Keepalive interval for periodic health checks (stored for debugging/info)
-    #[allow(dead_code)]
-    keepalive_interval: Option<std::time::Duration>,
-    /// Shutdown signal sender for background health check task
-    /// Kept alive to enable graceful shutdown when the provider is dropped
-    #[allow(dead_code)]
+    /// Shutdown signal sender for background health check task.
+    /// Stored to keep the channel alive - when dropped, the background task will terminate.
+    /// Used by `shutdown()` method to gracefully stop health checks.
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Metrics for health check operations (lock-free)
     pub health_check_metrics: Arc<HealthCheckMetrics>,
@@ -160,7 +156,6 @@ impl Builder {
             Ok(DeadpoolConnectionProvider {
                 pool,
                 name,
-                keepalive_interval: None,
                 shutdown_tx: None,
                 health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
@@ -181,7 +176,6 @@ impl Builder {
             Ok(DeadpoolConnectionProvider {
                 pool,
                 name,
-                keepalive_interval: None,
                 shutdown_tx: None,
                 health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             })
@@ -207,6 +201,102 @@ impl DeadpoolConnectionProvider {
     pub fn builder(host: impl Into<String>, port: u16) -> Builder {
         Builder::new(host, port)
     }
+
+    /// Create a simple connection provider with defaults
+    ///
+    /// Useful for testing and simple use cases. Uses 10 connections, no auth.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::simple("news.example.com", 119)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn simple(host: impl Into<String>, port: u16) -> Result<Self> {
+        Self::builder(host, port).build()
+    }
+
+    /// Create a connection provider with authentication
+    ///
+    /// Convenience constructor for the common case of username/password auth.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::with_auth(
+    ///     "news.example.com",
+    ///     119,
+    ///     "myuser",
+    ///     "mypass",
+    /// )?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn with_auth(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self> {
+        Self::builder(host, port)
+            .username(username)
+            .password(password)
+            .build()
+    }
+
+    /// Create a TLS-enabled connection provider
+    ///
+    /// Uses default TLS settings (verify certificates, system CA store).
+    /// For NNTPS (port 563) or STARTTLS.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::with_tls("news.example.com", 563)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn with_tls(host: impl Into<String>, port: u16) -> Result<Self> {
+        Self::builder(host, port)
+            .tls_config(TlsConfig::default())
+            .build()
+    }
+
+    /// Create a TLS-enabled connection provider with authentication
+    ///
+    /// Combines TLS with username/password auth - the most common setup
+    /// for commercial Usenet providers.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::with_tls_auth(
+    ///     "news.example.com",
+    ///     563,
+    ///     "myuser",
+    ///     "mypass",
+    /// )?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn with_tls_auth(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self> {
+        Self::builder(host, port)
+            .username(username)
+            .password(password)
+            .tls_config(TlsConfig::default())
+            .build()
+    }
+
     /// Create a new connection provider
     pub fn new(
         host: String,
@@ -225,7 +315,6 @@ impl DeadpoolConnectionProvider {
         Self {
             pool,
             name,
-            keepalive_interval: None,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         }
@@ -251,7 +340,6 @@ impl DeadpoolConnectionProvider {
         Ok(Self {
             pool,
             name,
-            keepalive_interval: None,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
         })
@@ -317,7 +405,6 @@ impl DeadpoolConnectionProvider {
         Ok(Self {
             pool,
             name: server.name.to_string(),
-            keepalive_interval,
             shutdown_tx,
             health_check_metrics: metrics,
         })
@@ -336,6 +423,27 @@ impl DeadpoolConnectionProvider {
     #[inline]
     pub fn max_size(&self) -> usize {
         self.pool.status().max_size
+    }
+
+    /// Get the name/identifier of this connection pool
+    #[must_use]
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the backend host this pool connects to
+    #[must_use]
+    #[inline]
+    pub fn host(&self) -> &str {
+        &self.pool.manager().host
+    }
+
+    /// Get the backend port this pool connects to
+    #[must_use]
+    #[inline]
+    pub fn port(&self) -> u16 {
+        self.pool.manager().port
     }
 
     /// Get a reference to the health check metrics
@@ -488,46 +596,6 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
     }
 }
 
-#[async_trait]
-impl ConnectionPool for DeadpoolConnectionProvider {
-    async fn get(&self) -> Result<crate::stream::ConnectionStream> {
-        let conn = self.get_pooled_connection().await?;
-
-        // Extract the ConnectionStream from the deadpool Object wrapper.
-        //
-        // IMPORTANT: Object::take() consumes the wrapper and returns the inner stream.
-        // This removes the connection from the pool permanently - it will NOT be
-        // automatically returned when dropped. This is intentional for the ConnectionPool
-        // trait which provides raw streams that the caller is responsible for managing.
-        //
-        // For automatic pool return, use get_pooled_connection() instead, which returns
-        // a managed::Object that auto-returns to the pool on drop.
-        let stream = deadpool::managed::Object::take(conn);
-        Ok(stream)
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn status(&self) -> PoolStatus {
-        use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};
-        let status = self.pool.status();
-        PoolStatus {
-            available: AvailableConnections::new(status.available),
-            max_size: MaxPoolSize::new(status.max_size),
-            created: CreatedConnections::new(status.size),
-        }
-    }
-
-    fn host(&self) -> &str {
-        &self.pool.manager().host
-    }
-
-    fn port(&self) -> u16 {
-        self.pool.manager().port
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,12 +699,12 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_implements_connection_pool_trait() {
+    fn test_provider_inherent_methods() {
         let provider = DeadpoolConnectionProvider::builder("localhost", 119)
             .build()
             .unwrap();
 
-        // Should implement ConnectionPool trait methods
+        // Test inherent methods
         assert_eq!(provider.name(), "localhost:119");
         assert_eq!(provider.host(), "localhost");
         assert_eq!(provider.port(), 119);
@@ -659,7 +727,7 @@ mod tests {
         assert_eq!(provider.host(), "news.test.com");
         assert_eq!(provider.port(), 563);
 
-        let status = ConnectionPool::status(&provider);
+        let status = ConnectionProvider::status(&provider);
         assert_eq!(status.max_size.get(), 42);
     }
 
@@ -712,22 +780,6 @@ mod tests {
 
         let status = ConnectionProvider::status(&provider);
         assert_eq!(status.max_size.get(), 1000);
-    }
-
-    #[test]
-    fn test_connection_pool_trait_status_consistency() {
-        let provider = DeadpoolConnectionProvider::builder("localhost", 119)
-            .max_connections(20)
-            .build()
-            .unwrap();
-
-        // Both trait implementations should return same status
-        let status1 = <DeadpoolConnectionProvider as ConnectionProvider>::status(&provider);
-        let status2 = <DeadpoolConnectionProvider as ConnectionPool>::status(&provider);
-
-        assert_eq!(status1.max_size, status2.max_size);
-        assert_eq!(status1.available, status2.available);
-        assert_eq!(status1.created, status2.created);
     }
 
     #[test]
