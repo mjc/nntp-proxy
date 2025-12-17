@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
+use crate::command::classifier::{HEAD_CASES, STAT_CASES, matches_any};
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::router::BackendSelector;
@@ -277,15 +278,16 @@ impl ClientSession {
                     );
 
                     // Spawn background precheck for STAT to update availability
-                    if self.adaptive_precheck
-                        && command.len() >= 5
-                        && command.as_bytes()[..5].eq_ignore_ascii_case(b"STAT ")
-                    {
-                        precheck::spawn_background_precheck(
-                            self.precheck_deps(&router),
-                            command.to_string(),
-                            msg_id_ref.to_owned(),
-                        );
+                    if self.adaptive_precheck {
+                        let bytes = command.as_bytes();
+                        let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+                        if cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES) {
+                            precheck::spawn_background_precheck(
+                                self.precheck_deps(&router),
+                                command.to_string(),
+                                msg_id_ref.to_owned(),
+                            );
+                        }
                     }
 
                     // If full article caching enabled, serve from cache
@@ -316,11 +318,11 @@ impl ClientSession {
         if self.adaptive_precheck
             && let Some(ref msg_id_ref) = msg_id
         {
-            // Use case-insensitive comparison without allocation
-            let is_stat =
-                command.len() >= 5 && command.as_bytes()[..5].eq_ignore_ascii_case(b"STAT ");
-            let is_head =
-                command.len() >= 5 && command.as_bytes()[..5].eq_ignore_ascii_case(b"HEAD ");
+            // Use optimized command matching from classifier (direct byte comparison)
+            let bytes = command.as_bytes();
+            let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+            let is_stat = cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES);
+            let is_head = cmd_end >= 4 && matches_any(&bytes[..cmd_end], HEAD_CASES);
 
             if is_stat || is_head {
                 let deps = self.precheck_deps(&router);

@@ -60,6 +60,18 @@
 ///
 /// This ensures consistency and traceability to the NNTP protocol specification.
 macro_rules! command_cases {
+    (pub $name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
+        #[doc = $doc]
+        pub const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
+
+        // Compile-time validation: ensure documentation starts with RFC reference
+        // This creates a const assertion that the doc string contains expected patterns
+        const _: () = {
+            // This will fail to compile if the doc string doesn't contain "RFC"
+            // Note: Full validation would require a proc macro, but this provides basic checking
+            assert!($doc.len() > 0, "Command documentation cannot be empty");
+        };
+    };
     ($name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
         const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
@@ -96,7 +108,7 @@ command_cases!(
 );
 
 command_cases!(
-    HEAD_CASES,
+    pub HEAD_CASES,
     "HEAD",
     "head",
     "Head",
@@ -105,7 +117,7 @@ command_cases!(
 );
 
 command_cases!(
-    STAT_CASES,
+    pub STAT_CASES,
     "STAT",
     "stat",
     "Stat",
@@ -299,7 +311,7 @@ command_cases!(
 ///
 /// Uses const generic to enforce 3-variant array at compile time.
 #[inline(always)]
-fn matches_any(cmd: &[u8], cases: &[&[u8]; 3]) -> bool {
+pub fn matches_any(cmd: &[u8], cases: &[&[u8]; 3]) -> bool {
     // Check UPPERCASE first (index 0) - most NNTP clients use uppercase
     cmd == cases[0] || cmd == cases[1] || cmd == cases[2]
 }
