@@ -5,60 +5,17 @@
 //!
 //! The module is organized into:
 //! - `optimizers`: Trait-based optimization strategies for different connection types
-//! - `SocketOptimizer`: Convenience wrappers for common optimization patterns
 
 pub mod optimizers;
 
-use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
-use crate::stream::ConnectionStream;
-use std::io;
-use tokio::net::TcpStream;
-use tracing::debug;
-
-// Re-export the new optimizers for easier access
+// Re-export the optimizers for easier access
 pub use optimizers::{ConnectionOptimizer, NetworkOptimizer, TcpOptimizer, TlsOptimizer};
-
-/// Socket optimizer for high-throughput scenarios
-pub struct SocketOptimizer;
-
-impl SocketOptimizer {
-    /// Set socket optimizations for high-throughput transfers using socket2
-    pub fn optimize_for_throughput(stream: &TcpStream) -> Result<(), io::Error> {
-        use socket2::SockRef;
-
-        let sock_ref = SockRef::from(stream);
-
-        // Set larger buffer sizes for high throughput
-        sock_ref.set_recv_buffer_size(HIGH_THROUGHPUT_RECV_BUFFER)?;
-        sock_ref.set_send_buffer_size(HIGH_THROUGHPUT_SEND_BUFFER)?;
-
-        // Keep Nagle's algorithm enabled for large transfers to reduce packet overhead
-        // (socket2 doesn't expose some advanced TCP options like TCP_QUICKACK, TCP_CORK)
-        // but the basic optimizations are sufficient for most use cases
-
-        Ok(())
-    }
-
-    /// Apply optimizations using the new trait-based approach (recommended)
-    pub fn apply_to_connection_streams(
-        client_stream: &ConnectionStream,
-        backend_stream: &ConnectionStream,
-    ) -> anyhow::Result<()> {
-        debug!("Applying connection optimizations with trait-based approach");
-
-        let client_optimizer = ConnectionOptimizer::new(client_stream);
-        let backend_optimizer = ConnectionOptimizer::new(backend_stream);
-
-        client_optimizer.optimize()?;
-        backend_optimizer.optimize()?;
-
-        Ok(())
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::socket::{HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER};
+    use tokio::net::TcpStream;
 
     #[test]
     fn test_constants() {
@@ -69,91 +26,27 @@ mod tests {
     #[test]
     fn test_buffer_size_is_reasonable() {
         // Buffer sizes should be large but not excessive
-        // Compile-time assertions
         const _: () = assert!(HIGH_THROUGHPUT_RECV_BUFFER >= 1024 * 1024); // At least 1MB
         const _: () = assert!(HIGH_THROUGHPUT_RECV_BUFFER <= 128 * 1024 * 1024); // At most 128MB
-
         const _: () = assert!(HIGH_THROUGHPUT_SEND_BUFFER >= 1024 * 1024);
         const _: () = assert!(HIGH_THROUGHPUT_SEND_BUFFER <= 128 * 1024 * 1024);
     }
 
     #[test]
     fn test_buffer_sizes_are_equal() {
-        // Send and receive buffers should be the same for bidirectional transfers
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER, HIGH_THROUGHPUT_SEND_BUFFER);
     }
 
     #[test]
     fn test_buffer_sizes_are_power_of_two_or_multiple() {
-        // Should be aligned to reasonable boundaries
         let size = HIGH_THROUGHPUT_RECV_BUFFER;
-
-        // Should be a multiple of 1MB for efficient allocation
         assert_eq!(size % (1024 * 1024), 0);
-    }
-
-    #[test]
-    fn test_socket_optimizer_exists() {
-        // Verify SocketOptimizer can be instantiated
-        let _ = SocketOptimizer;
-    }
-
-    #[tokio::test]
-    async fn test_optimize_for_throughput_with_real_socket() {
-        // Create a real TCP listener and connection
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // Connect to it
-        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-
-        // Try to optimize (might fail on some systems, but shouldn't panic)
-        let result = SocketOptimizer::optimize_for_throughput(&client_stream);
-
-        // On most systems this should succeed, but some might not support large buffers
-        // The important thing is it doesn't panic
-        match result {
-            Ok(()) => {
-                // Success - verify we can still use the socket
-                assert!(client_stream.peer_addr().is_ok());
-            }
-            Err(e) => {
-                // Some systems might not support these buffer sizes
-                eprintln!("Warning: Failed to set buffer size: {}", e);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_apply_to_connection_streams() {
-        use crate::stream::ConnectionStream;
-
-        // Create two TCP connections
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (server_tcp, _) = listener.accept().await.unwrap();
-
-        let client_stream = ConnectionStream::plain(client_tcp);
-        let server_stream = ConnectionStream::plain(server_tcp);
-
-        // Apply optimizations using the trait-based approach
-        let result = SocketOptimizer::apply_to_connection_streams(&client_stream, &server_stream);
-
-        // Should always succeed
-        assert!(result.is_ok());
-
-        // Streams should still be usable
-        assert!(client_stream.as_tcp_stream().unwrap().peer_addr().is_ok());
-        assert!(server_stream.as_tcp_stream().unwrap().peer_addr().is_ok());
     }
 
     #[tokio::test]
     async fn test_connection_optimizer() {
         use crate::stream::ConnectionStream;
 
-        // Create a test server and connection
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -163,7 +56,6 @@ mod tests {
 
         let conn_stream = ConnectionStream::plain(tokio_stream);
 
-        // Should successfully optimize ConnectionStream using trait-based approach
         let optimizer = ConnectionOptimizer::new(&conn_stream);
         let result = optimizer.optimize();
         assert!(result.is_ok());
@@ -171,54 +63,17 @@ mod tests {
 
     #[test]
     fn test_buffer_size_calculation() {
-        // Verify buffer sizes are calculated correctly
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER, 16 * 1024 * 1024);
-
-        // Verify it's 16MB in bytes
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER, 16_777_216);
-
-        // Verify relationship to KB/MB
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER / 1024, 16384); // KB
         assert_eq!(HIGH_THROUGHPUT_RECV_BUFFER / (1024 * 1024), 16); // MB
     }
 
     #[test]
     fn test_buffer_size_for_large_articles() {
-        // Typical large Usenet article is 1-100MB
-        // Our 16MB buffer should handle most efficiently
         let typical_large_article = 10 * 1024 * 1024; // 10MB
         let very_large_article = 100 * 1024 * 1024; // 100MB
-
-        // Buffer should be larger than typical article
         assert!(HIGH_THROUGHPUT_RECV_BUFFER > typical_large_article);
-
-        // But we accept that very large articles will require multiple buffers
         assert!(HIGH_THROUGHPUT_RECV_BUFFER < very_large_article);
-    }
-
-    #[tokio::test]
-    async fn test_new_trait_based_approach() {
-        use crate::stream::ConnectionStream;
-
-        // Create two TCP connections
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (server_tcp, _) = listener.accept().await.unwrap();
-
-        let client_stream = ConnectionStream::plain(client_tcp);
-        let server_stream = ConnectionStream::plain(server_tcp);
-
-        // Use the new trait-based approach
-        let result = SocketOptimizer::apply_to_connection_streams(&client_stream, &server_stream);
-        assert!(result.is_ok());
-
-        // Test individual optimizers
-        let client_optimizer = ConnectionOptimizer::new(&client_stream);
-        let server_optimizer = ConnectionOptimizer::new(&server_stream);
-
-        assert!(client_optimizer.optimize().is_ok());
-        assert!(server_optimizer.optimize().is_ok());
     }
 }

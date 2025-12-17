@@ -62,6 +62,5 @@ pub use config::{
     Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
     load_config, load_config_from_env, load_config_with_fallback,
 };
-pub use network::SocketOptimizer;
 pub use proxy::{NntpProxy, NntpProxyBuilder, is_client_disconnect_error};
 pub use runtime::{RuntimeConfig, shutdown_signal};
