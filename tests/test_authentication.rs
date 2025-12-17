@@ -18,41 +18,7 @@ use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::config::{Config, RoutingMode};
 use nntp_proxy::session::ClientSession;
-use test_helpers::MockNntpServer;
-
-/// Create test config with client auth enabled
-fn create_config_with_auth(backend_ports: Vec<u16>, username: &str, password: &str) -> Config {
-    use nntp_proxy::config::{ClientAuth, UserCredentials};
-    Config {
-        servers: backend_ports
-            .into_iter()
-            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
-            .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: None,
-        client_auth: ClientAuth {
-            users: vec![UserCredentials {
-                username: username.to_string(),
-                password: password.to_string(),
-            }],
-            greeting: None,
-        },
-    }
-}
-
-/// Spawn a mock NNTP backend server
-async fn spawn_mock_backend() -> (u16, tokio::task::AbortHandle) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let handle = MockNntpServer::new(port)
-        .with_name("Mock NNTP Server")
-        .spawn();
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    (port, handle)
-}
+use test_helpers::{MockNntpServer, create_config_with_auth, spawn_mock_backend};
 
 #[tokio::test]
 async fn test_auth_handler_disabled_by_default() {

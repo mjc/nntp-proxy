@@ -22,7 +22,7 @@ async fn test_standard_handler_validates_credentials() {
     // Step 1: AUTHINFO USER
     let action = CommandHandler::classify("AUTHINFO USER testuser\r\n");
     let username = match action {
-        CommandAction::InterceptAuth(AuthAction::RequestPassword(u)) => u.clone(),
+        CommandAction::InterceptAuth(AuthAction::RequestPassword(u)) => u,
         _ => panic!("Expected RequestPassword action"),
     };
 

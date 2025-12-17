@@ -47,7 +47,7 @@ impl StatusCode {
     #[inline]
     #[must_use]
     pub fn as_u16(&self) -> u16 {
-        **self
+        self.into_inner()
     }
 
     /// Check if this is a success code (2xx or 3xx)

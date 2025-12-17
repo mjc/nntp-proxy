@@ -145,7 +145,7 @@ impl managed::Manager for TcpManager {
         let mut stream = self.create_optimized_stream().await?;
 
         // Consume greeting
-        let mut buffer = vec![0u8; 4096];
+        let mut buffer = [0u8; 4096];
         let n = stream.read(&mut buffer).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);

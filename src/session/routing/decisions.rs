@@ -71,7 +71,7 @@ pub(crate) fn decide_command_routing(
 
 /// Check if a status code represents a 430 (article not found) response
 #[inline]
-pub(crate) fn is_430_status_code(code: u16) -> bool {
+pub(crate) const fn is_430_status_code(code: u16) -> bool {
     code == 430
 }
 
