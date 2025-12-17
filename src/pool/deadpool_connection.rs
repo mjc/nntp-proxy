@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
+use crate::protocol::{authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
 
@@ -133,18 +134,6 @@ impl TcpManager {
 // ============================================================================
 // Manager trait implementation
 // ============================================================================
-
-/// Helper function to create an AUTHINFO USER command
-#[inline]
-fn authinfo_user(username: &str) -> String {
-    format!("AUTHINFO USER {}\r\n", username)
-}
-
-/// Helper function to create an AUTHINFO PASS command
-#[inline]
-fn authinfo_pass(password: &str) -> String {
-    format!("AUTHINFO PASS {}\r\n", password)
-}
 
 impl managed::Manager for TcpManager {
     type Type = ConnectionStream;
@@ -344,51 +333,6 @@ mod tests {
         assert_eq!(cloned.name, manager.name);
         assert_eq!(cloned.username, manager.username);
         assert_eq!(cloned.password, manager.password);
-    }
-
-    #[test]
-    fn test_authinfo_user_command() {
-        let cmd = authinfo_user("testuser");
-        assert_eq!(cmd, "AUTHINFO USER testuser\r\n");
-    }
-
-    #[test]
-    fn test_authinfo_user_command_special_chars() {
-        let cmd = authinfo_user("user@example.com");
-        assert_eq!(cmd, "AUTHINFO USER user@example.com\r\n");
-    }
-
-    #[test]
-    fn test_authinfo_user_command_spaces() {
-        let cmd = authinfo_user("user name");
-        assert_eq!(cmd, "AUTHINFO USER user name\r\n");
-    }
-
-    #[test]
-    fn test_authinfo_pass_command() {
-        let cmd = authinfo_pass("secretpass");
-        assert_eq!(cmd, "AUTHINFO PASS secretpass\r\n");
-    }
-
-    #[test]
-    fn test_authinfo_pass_command_special_chars() {
-        let cmd = authinfo_pass("p@ssw0rd!#$");
-        assert_eq!(cmd, "AUTHINFO PASS p@ssw0rd!#$\r\n");
-    }
-
-    #[test]
-    fn test_authinfo_pass_command_spaces() {
-        let cmd = authinfo_pass("pass word");
-        assert_eq!(cmd, "AUTHINFO PASS pass word\r\n");
-    }
-
-    #[test]
-    fn test_authinfo_commands_crlf_termination() {
-        let user_cmd = authinfo_user("user");
-        let pass_cmd = authinfo_pass("pass");
-
-        assert!(user_cmd.ends_with("\r\n"));
-        assert!(pass_cmd.ends_with("\r\n"));
     }
 
     #[test]

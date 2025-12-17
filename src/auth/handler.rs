@@ -96,7 +96,7 @@ impl AuthHandler {
     /// This is the ONE place where auth interception happens
     pub async fn handle_auth_command<W>(
         &self,
-        auth_action: AuthAction,
+        auth_action: AuthAction<'_>,
         writer: &mut W,
         stored_username: Option<&str>,
     ) -> std::io::Result<(usize, bool)>
@@ -112,7 +112,7 @@ impl AuthHandler {
             AuthAction::ValidateAndRespond { password } => {
                 // Validate credentials
                 let auth_success = if let Some(username) = stored_username {
-                    self.validate_credentials(username, &password)
+                    self.validate_credentials(username, password)
                 } else {
                     // No username was stored (client sent AUTHINFO PASS without USER)
                     false

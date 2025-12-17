@@ -37,7 +37,7 @@ pub(crate) fn extract_message_id(command: &str) -> Option<&str> {
 /// Handle AUTHINFO command and update auth state
 pub(crate) async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
-    auth_action: AuthAction,
+    auth_action: AuthAction<'_>,
     client_write: &mut W,
     auth_username: &mut Option<String>,
     auth_state: &crate::session::AuthState,
@@ -45,8 +45,8 @@ pub(crate) async fn handle_auth_command<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if let AuthAction::RequestPassword(ref username) = auth_action {
-        *auth_username = Some(username.clone());
+    if let AuthAction::RequestPassword(username) = auth_action {
+        *auth_username = Some(username.to_string());
     }
 
     let (bytes, auth_success) = auth_handler

@@ -20,11 +20,11 @@
 use super::classifier::NntpCommand;
 
 /// Action to take in response to a command
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
-pub enum CommandAction {
+pub enum CommandAction<'a> {
     /// Intercept and send authentication response to client
-    InterceptAuth(AuthAction),
+    InterceptAuth(AuthAction<'a>),
     /// Reject the command with an error message (NNTP response format with CRLF)
     Reject(&'static str),
     /// Forward the command to backend (stateless)
@@ -32,13 +32,13 @@ pub enum CommandAction {
 }
 
 /// Specific authentication action
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
-pub enum AuthAction {
+pub enum AuthAction<'a> {
     /// Send password required response (username provided)
-    RequestPassword(String),
+    RequestPassword(&'a str),
     /// Validate credentials and send appropriate response
-    ValidateAndRespond { password: String },
+    ValidateAndRespond { password: &'a str },
 }
 
 /// Handler for processing commands and determining actions
@@ -46,28 +46,26 @@ pub struct CommandHandler;
 
 impl CommandHandler {
     /// Classify a command and return the action to take
-    pub fn classify(command: &str) -> CommandAction {
+    pub fn classify(command: &str) -> CommandAction<'_> {
         match NntpCommand::parse(command) {
             NntpCommand::AuthUser => {
-                // Extract username from "AUTHINFO USER <username>"
+                // Extract username from "AUTHINFO USER <username>" (zero-allocation)
                 let username = command
                     .trim()
                     .strip_prefix("AUTHINFO USER")
                     .or_else(|| command.trim().strip_prefix("authinfo user"))
                     .unwrap_or("")
-                    .trim()
-                    .to_string();
+                    .trim();
                 CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
             }
             NntpCommand::AuthPass => {
-                // Extract password from "AUTHINFO PASS <password>"
+                // Extract password from "AUTHINFO PASS <password>" (zero-allocation)
                 let password = command
                     .trim()
                     .strip_prefix("AUTHINFO PASS")
                     .or_else(|| command.trim().strip_prefix("authinfo pass"))
                     .unwrap_or("")
-                    .trim()
-                    .to_string();
+                    .trim();
                 CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
             }
             NntpCommand::Stateful => {
@@ -95,7 +93,7 @@ mod tests {
         let action = CommandHandler::classify("AUTHINFO USER test");
         assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword(ref username)) if username == "test"
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username == "test"
         ));
     }
 
@@ -104,7 +102,7 @@ mod tests {
         let action = CommandHandler::classify("AUTHINFO PASS secret");
         assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password == "secret"
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if password == "secret"
         ));
     }
 
@@ -237,7 +235,7 @@ mod tests {
         let action = CommandHandler::classify("  AUTHINFO USER test  ");
         assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword(ref username)) if username == "test"
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username == "test"
         ));
     }
 
@@ -258,14 +256,14 @@ mod tests {
         let action = CommandHandler::classify("AUTHINFO USER");
         assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword(ref username)) if username.is_empty()
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username.is_empty()
         ));
 
         // AUTHINFO PASS without password (still intercept, empty password)
         let action = CommandHandler::classify("AUTHINFO PASS");
         assert!(matches!(
             action,
-            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { ref password }) if password.is_empty()
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if password.is_empty()
         ));
     }
 
@@ -303,16 +301,14 @@ mod tests {
             CommandAction::ForwardStateless
         );
         assert_eq!(
-            CommandAction::InterceptAuth(AuthAction::RequestPassword("test".to_string())),
-            CommandAction::InterceptAuth(AuthAction::RequestPassword("test".to_string()))
+            CommandAction::InterceptAuth(AuthAction::RequestPassword("test")),
+            CommandAction::InterceptAuth(AuthAction::RequestPassword("test"))
         );
 
         // Test inequality
         assert_ne!(
-            CommandAction::InterceptAuth(AuthAction::RequestPassword("user1".to_string())),
-            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond {
-                password: "pass1".to_string()
-            })
+            CommandAction::InterceptAuth(AuthAction::RequestPassword("user1")),
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password: "pass1" })
         );
     }
 

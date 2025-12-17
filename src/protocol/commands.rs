@@ -77,6 +77,18 @@ mod tests {
     fn test_authinfo_user() {
         assert_eq!(authinfo_user("testuser"), "AUTHINFO USER testuser\r\n");
         assert_eq!(authinfo_user(""), "AUTHINFO USER \r\n");
+    }
+
+    #[test]
+    fn test_authinfo_user_special_chars() {
+        assert_eq!(
+            authinfo_user("user@example.com"),
+            "AUTHINFO USER user@example.com\r\n"
+        );
+    }
+
+    #[test]
+    fn test_authinfo_user_spaces() {
         assert_eq!(
             authinfo_user("user with spaces"),
             "AUTHINFO USER user with spaces\r\n"
@@ -87,7 +99,25 @@ mod tests {
     fn test_authinfo_pass() {
         assert_eq!(authinfo_pass("secret"), "AUTHINFO PASS secret\r\n");
         assert_eq!(authinfo_pass(""), "AUTHINFO PASS \r\n");
-        assert_eq!(authinfo_pass("p@ssw0rd!"), "AUTHINFO PASS p@ssw0rd!\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_pass_special_chars() {
+        assert_eq!(
+            authinfo_pass("p@ssw0rd!#$"),
+            "AUTHINFO PASS p@ssw0rd!#$\r\n"
+        );
+    }
+
+    #[test]
+    fn test_authinfo_pass_spaces() {
+        assert_eq!(authinfo_pass("pass word"), "AUTHINFO PASS pass word\r\n");
+    }
+
+    #[test]
+    fn test_authinfo_crlf_termination() {
+        assert!(authinfo_user("user").ends_with("\r\n"));
+        assert!(authinfo_pass("pass").ends_with("\r\n"));
     }
 
     #[test]
