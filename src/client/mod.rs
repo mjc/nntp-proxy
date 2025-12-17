@@ -11,8 +11,13 @@
 //! use nntp_proxy::pool::DeadpoolConnectionProvider;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Create a connection pool
-//! let pool = DeadpoolConnectionProvider::simple("news.example.com", 119)?;
+//! // Create a TLS connection pool with authentication (typical Usenet provider)
+//! let pool = DeadpoolConnectionProvider::with_tls_auth(
+//!     "news.example.com",
+//!     563,
+//!     "username",
+//!     "password",
+//! )?;
 //!
 //! // Create client
 //! let client = NntpClient::new(pool);

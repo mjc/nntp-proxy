@@ -247,6 +247,56 @@ impl DeadpoolConnectionProvider {
             .build()
     }
 
+    /// Create a TLS-enabled connection provider
+    ///
+    /// Uses default TLS settings (verify certificates, system CA store).
+    /// For NNTPS (port 563) or STARTTLS.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::with_tls("news.example.com", 563)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn with_tls(host: impl Into<String>, port: u16) -> Result<Self> {
+        Self::builder(host, port)
+            .tls_config(TlsConfig::default())
+            .build()
+    }
+
+    /// Create a TLS-enabled connection provider with authentication
+    ///
+    /// Combines TLS with username/password auth - the most common setup
+    /// for commercial Usenet providers.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use nntp_proxy::pool::DeadpoolConnectionProvider;
+    ///
+    /// let provider = DeadpoolConnectionProvider::with_tls_auth(
+    ///     "news.example.com",
+    ///     563,
+    ///     "myuser",
+    ///     "mypass",
+    /// )?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn with_tls_auth(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self> {
+        Self::builder(host, port)
+            .username(username)
+            .password(password)
+            .tls_config(TlsConfig::default())
+            .build()
+    }
+
     /// Create a new connection provider
     pub fn new(
         host: String,
