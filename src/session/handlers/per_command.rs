@@ -127,6 +127,19 @@ impl ClientSession {
             return Ok(None);
         }
 
+        // Check if cached response type matches the requested command
+        // E.g., if we have BODY (222) cached but client requests ARTICLE (220),
+        // we need to fetch HEAD and combine them
+        if !cached.matches_command_type(command) {
+            debug!(
+                "Client {} cached response type (code={:?}) doesn't match command '{}', need to fetch",
+                self.client_addr,
+                cached.status_code().map(|c| c.as_u16()),
+                command.split_whitespace().next().unwrap_or(command)
+            );
+            return Ok(None);
+        }
+
         client_write.write_all(cached.response()).await?;
         *backend_to_client_bytes = backend_to_client_bytes.add(cached.response().len());
 
@@ -827,6 +840,12 @@ impl ClientSession {
                 .await?;
 
                 if let Some(msg_id_ref) = msg_id {
+                    debug!(
+                        "Client {} caching full article for {} ({} bytes captured)",
+                        self.client_addr,
+                        msg_id_ref,
+                        captured.len()
+                    );
                     self.spawn_cache_upsert(msg_id_ref, captured, backend_id);
                 }
                 Ok(bytes)

@@ -428,10 +428,27 @@ fn test_is_complete_article_accepts_real_articles() {
 
 /// Test that is_complete_article requires 220 status code
 #[test]
-fn test_is_complete_article_requires_220() {
+fn test_is_complete_article_accepts_220_and_222() {
     use nntp_proxy::cache::ArticleEntry;
 
-    // HEAD response (221) with body - should NOT be considered complete article
+    // ARTICLE response (220) should be considered complete
+    let article_response = ArticleEntry::new(
+        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
+    );
+    assert!(
+        article_response.is_complete_article(),
+        "ARTICLE response (220) should be complete article"
+    );
+
+    // BODY response (222) with content should be considered complete
+    let body_response =
+        ArticleEntry::new(b"222 0 <test@example.com>\r\nThis is body text.\r\n.\r\n".to_vec());
+    assert!(
+        body_response.is_complete_article(),
+        "BODY response (222) with content should be complete article"
+    );
+
+    // HEAD response (221) should NOT be considered complete article
     let head_response = ArticleEntry::new(
         b"221 0 <test@example.com>\r\nSubject: Test\r\nFrom: test@example.com\r\n.\r\n".to_vec(),
     );
@@ -440,12 +457,11 @@ fn test_is_complete_article_requires_220() {
         "HEAD response (221) should not be complete article"
     );
 
-    // BODY response (222) - should NOT be considered complete article
-    let body_response =
-        ArticleEntry::new(b"222 0 <test@example.com>\r\nThis is body text.\r\n.\r\n".to_vec());
+    // STAT response (223) should NOT be complete article
+    let stat_response = ArticleEntry::new(b"223 0 <test@example.com>\r\n".to_vec());
     assert!(
-        !body_response.is_complete_article(),
-        "BODY response (222) should not be complete article"
+        !stat_response.is_complete_article(),
+        "STAT response (223) should not be complete article"
     );
 }
 

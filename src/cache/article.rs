@@ -313,33 +313,69 @@ impl ArticleEntry {
         self.backend_availability.has_availability_info()
     }
 
-    /// Check if this cache entry contains a complete article body
+    /// Check if this cache entry contains a complete article (220) or body (222)
     ///
-    /// Returns true only if:
-    /// 1. Status code is 220 (ARTICLE response)
+    /// Returns true if:
+    /// 1. Status code is 220 (ARTICLE) or 222 (BODY)
     /// 2. Buffer contains actual content (not just a stub like "220\r\n")
     ///
-    /// A complete ARTICLE response ends with ".\r\n" and is significantly longer
+    /// A complete response ends with ".\r\n" and is significantly longer
     /// than a stub. Stubs are typically 5-6 bytes (e.g., "220\r\n" or "223\r\n").
     ///
     /// This is used when `cache_articles=true` to determine if we can serve
-    /// directly from cache or need to fetch the actual article body.
+    /// directly from cache or need to fetch additional data.
     #[inline]
     pub fn is_complete_article(&self) -> bool {
-        // Must be a 220 response (ARTICLE)
+        // Must be a 220 (ARTICLE) or 222 (BODY) response
         let Some(code) = self.status_code() else {
             return false;
         };
-        if code.as_u16() != 220 {
+        if code.as_u16() != 220 && code.as_u16() != 222 {
             return false;
         }
 
         // Must have actual content, not just a stub
-        // A stub is typically "220\r\n" (5 bytes) or "220 0 <msgid>\r\n" (~20 bytes)
-        // A real article has headers + body + terminator
+        // A stub is typically "220\r\n" (5 bytes) or "223\r\n" (~20 bytes)
+        // A real article/body has content + terminator
         // Minimum valid: "220 0 <x@y>\r\nX: Y\r\n\r\nB\r\n.\r\n" = 30 bytes
         const MIN_ARTICLE_SIZE: usize = 30;
         self.buffer.len() >= MIN_ARTICLE_SIZE && self.buffer.ends_with(b".\r\n")
+    }
+
+    /// Check if the cached response matches the requested command type
+    ///
+    /// Returns true if cached response can directly satisfy the command:
+    /// - ARTICLE (220) matches: ARTICLE, BODY, HEAD requests
+    /// - BODY (222) matches: BODY requests only
+    /// - HEAD (221) matches: HEAD requests only
+    #[inline]
+    pub fn matches_command_type(&self, command: &str) -> bool {
+        let Some(code) = self.status_code() else {
+            return false;
+        };
+
+        // Extract command verb (first word, case-insensitive)
+        let cmd_verb = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+
+        match code.as_u16() {
+            220 => {
+                // ARTICLE response has everything - can serve ARTICLE, BODY, or HEAD
+                matches!(cmd_verb.as_str(), "ARTICLE" | "BODY" | "HEAD")
+            }
+            222 => {
+                // BODY response - can only serve BODY requests
+                cmd_verb == "BODY"
+            }
+            221 => {
+                // HEAD response - can only serve HEAD requests
+                cmd_verb == "HEAD"
+            }
+            _ => false,
+        }
     }
 
     /// Initialize availability tracker from this cached entry
@@ -386,32 +422,34 @@ impl ArticleCache {
         let cache = Cache::builder()
             .max_capacity(max_capacity)
             .time_to_live(ttl)
-            .weigher(|key: &Arc<str>, entry: &ArticleEntry| -> u32 {
+            .weigher(move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
                 // Calculate memory footprint with moka internal overhead correction.
                 //
-                // Base sizes:
-                // - Key: Arc<str> = 8 bytes (pointer) + string data
-                // - ArticleEntry struct = 8 (Arc pointer) + 2 (availability) = 10 bytes
-                // - Arc<Vec<u8>>: Vec header = 24 bytes (ptr, len, cap) + buffer data
+                // When cache_articles=true with large buffers (full articles):
+                // - We know the exact size, so use actual buffer size + overhead
+                // - No multiplier needed - we're not guessing
                 //
-                // Moka internal overhead (NOT just 40 bytes - much heavier):
-                // - Hash table node: ~64 bytes (key hash, pointers, metadata)
-                // - LRU queue nodes: ~48 bytes (doubly-linked list nodes)
-                // - Frequency sketch: ~16 bytes (TinyLFU tracking)
-                // - Access order queue: ~32 bytes (TTL expiration tracking)
-                // - Expiration wheel: ~24 bytes (timer heap node)
-                // - Internal Arc wrappers: ~16 bytes
-                // Total moka overhead: ~200 bytes per entry
-                //
-                // Additionally, empirical testing shows a 2-3x multiplier on the total
-                // due to memory allocator overhead, padding, and fragmentation.
-                // Apply 2.5x correction factor to match observed memory usage.
+                // When cache_articles=false (stubs only) or small buffers:
+                // - Overhead dominates, apply 2.5x correction factor
+                // - Accounts for moka internal structures, allocator overhead, padding
                 let key_size = 8 + key.len();
                 let buffer_size = entry.buffer().len();
-                let entry_overhead = 10 + 24 + 200; // ~234 bytes (reduced from ~258)
+                let entry_overhead = 10 + 24 + 200; // ~234 bytes
                 let base_size = key_size + buffer_size + entry_overhead;
-                let corrected_size = (base_size as f64 * 2.5) as usize; // Apply 2.5x correction
-                corrected_size.try_into().unwrap_or(u32::MAX)
+
+                // When we have full articles (cache_articles=true and large buffer),
+                // use actual size (no multiplier). Otherwise apply 2.5x for overhead.
+                let weighted_size = if cache_articles && buffer_size > 10_000 {
+                    // Full article: use actual size + overhead
+                    // No multiplier needed - we know the exact content
+                    base_size
+                } else {
+                    // Stubs or small entries: apply 2.5x multiplier
+                    // Overhead dominates when buffer is small
+                    (base_size as f64 * 2.5) as usize
+                };
+
+                weighted_size.try_into().unwrap_or(u32::MAX)
             })
             .build();
 
@@ -464,9 +502,31 @@ impl ArticleCache {
         let key: Arc<str> = message_id.without_brackets().into();
 
         if let Some(mut existing) = self.cache.get(key.as_ref()).await {
-            // Entry exists - update buffer if caching, mark backend as having it
-            if self.cache_articles {
+            // Entry exists - update buffer if caching AND new buffer is larger (more complete)
+            if self.cache_articles && buffer.len() > existing.buffer.len() {
+                use tracing::debug;
+                debug!(
+                    "upsert: updating existing entry for {} from {} bytes to {} bytes",
+                    message_id,
+                    existing.buffer.len(),
+                    buffer.len()
+                );
                 existing.buffer = Arc::new(buffer);
+            } else if self.cache_articles {
+                use tracing::debug;
+                debug!(
+                    "upsert: NOT updating buffer for {} (existing {} bytes >= new {} bytes)",
+                    message_id,
+                    existing.buffer.len(),
+                    buffer.len()
+                );
+            } else {
+                use tracing::debug;
+                debug!(
+                    "upsert: NOT updating buffer for {} (cache_articles=false, keeping {} bytes)",
+                    message_id,
+                    existing.buffer.len()
+                );
             }
             // Mark this backend as successfully having the article
             use tracing::debug;
@@ -1170,6 +1230,93 @@ mod tests {
 
         // Should be accessible from cloned cache
         assert!(cache2.get(&msgid).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_weigher_large_articles() {
+        // Test that large article bodies use ACTUAL SIZE (no multiplier)
+        // when cache_articles=true and buffer >10KB
+        let cache = ArticleCache::new(10 * 1024 * 1024, Duration::from_secs(300), true); // 10MB capacity
+
+        // Create a 750KB article (typical size)
+        let body = vec![b'X'; 750_000];
+        let response = format!(
+            "222 0 <test@example.com>\r\n{}\r\n.\r\n",
+            std::str::from_utf8(&body).unwrap()
+        );
+        let article = ArticleEntry::new(response.as_bytes().to_vec());
+
+        let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
+        cache.insert(msgid.clone(), article).await;
+        cache.sync().await;
+
+        // With actual size (no multiplier): 750KB per entry
+        // 10MB capacity should fit ~13 articles
+        // With old 1.8x multiplier: 750KB * 1.8 ≈ 1.35MB per entry, fits ~7 articles
+        // With old 2.5x multiplier: 750KB * 2.5 ≈ 1.875MB per entry, fits ~5 articles
+
+        // Insert 12 more articles (13 total)
+        for i in 2..=13 {
+            let msgid_str = format!("<article{}@example.com>", i);
+            let msgid = MessageId::new(msgid_str).unwrap();
+            let response = format!(
+                "222 0 {}\r\n{}\r\n.\r\n",
+                msgid.as_str(),
+                std::str::from_utf8(&body).unwrap()
+            );
+            let article = ArticleEntry::new(response.as_bytes().to_vec());
+            cache.insert(msgid, article).await;
+            cache.sync().await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cache.sync().await;
+
+        let stats = cache.stats().await;
+        // With actual size (no multiplier), should fit 11-13 large articles
+        assert!(
+            stats.entry_count >= 11,
+            "Cache should fit at least 11 large articles with actual size (no multiplier) (got {})",
+            stats.entry_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_weigher_small_stubs() {
+        // Test that small stubs use the 2.5x multiplier
+        let cache = ArticleCache::new(100_000, Duration::from_secs(300), false); // 100KB capacity
+
+        // Create small stub (53 bytes)
+        let stub = b"223 0 <test@example.com>\r\n".to_vec();
+        let article = ArticleEntry::new(stub);
+
+        let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
+        cache.insert(msgid, article).await;
+        cache.sync().await;
+
+        // With 2.5x multiplier: (53 + 234 overhead) * 2.5 ≈ 717 bytes per stub
+        // 100KB capacity should fit ~140 stubs
+
+        // Insert many small stubs
+        for i in 2..=150 {
+            let msgid_str = format!("<stub{}@example.com>", i);
+            let msgid = MessageId::new(msgid_str).unwrap();
+            let stub = format!("223 0 {}\r\n", msgid.as_str());
+            let article = ArticleEntry::new(stub.as_bytes().to_vec());
+            cache.insert(msgid, article).await;
+        }
+
+        cache.sync().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cache.sync().await;
+
+        let stats = cache.stats().await;
+        // Should be able to fit ~120-140 small stubs
+        assert!(
+            stats.entry_count >= 100,
+            "Cache should fit many small stubs with 2.5x multiplier (got {})",
+            stats.entry_count
+        );
     }
 
     #[tokio::test]

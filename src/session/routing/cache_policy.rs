@@ -20,11 +20,11 @@ pub(crate) enum CacheAction {
 
 /// Check if a response should be captured for article caching
 ///
-/// Only full article responses (220) should be cached.
-/// Response code 220 uniquely identifies ARTICLE command success:
-/// - 220 = ARTICLE (full article - cache this)
-/// - 221 = HEAD (headers only)
-/// - 222 = BODY (body only)
+/// Cache full article responses (220) AND body responses (222).
+/// Response codes:
+/// - 220 = ARTICLE (full article - headers + body)
+/// - 221 = HEAD (headers only - don't cache)
+/// - 222 = BODY (body only - cache this for yEnc content)
 /// - 223 = STAT (status only)
 #[inline]
 pub(crate) fn should_capture_for_cache(
@@ -33,7 +33,10 @@ pub(crate) fn should_capture_for_cache(
     cache_articles: bool,
     has_message_id: bool,
 ) -> bool {
-    cache_articles && is_multiline && has_message_id && response_code == 220
+    cache_articles
+        && is_multiline
+        && has_message_id
+        && (response_code == 220 || response_code == 222)
 }
 
 /// Check if a response should be tracked for availability (HEAD/BODY/ARTICLE/STAT success)
@@ -91,12 +94,12 @@ mod tests {
 
     #[test]
     fn test_should_capture_for_cache_article_response() {
-        // 220 response (ARTICLE) with all conditions met should capture
+        // 220 (ARTICLE) and 222 (BODY) with all conditions met should capture
         assert!(should_capture_for_cache(220, true, true, true));
+        assert!(should_capture_for_cache(222, true, true, true));
 
-        // 221 (HEAD) and 222 (BODY) should NOT capture full article
+        // 221 (HEAD) should NOT capture (headers only)
         assert!(!should_capture_for_cache(221, true, true, true));
-        assert!(!should_capture_for_cache(222, true, true, true));
     }
 
     #[test]
@@ -115,11 +118,11 @@ mod tests {
     }
 
     #[test]
-    fn test_should_capture_for_cache_only_220() {
-        // Only 220 (ARTICLE) responses should be captured
+    fn test_should_capture_for_cache_220_and_222() {
+        // 220 (ARTICLE) and 222 (BODY) responses should be captured
         assert!(should_capture_for_cache(220, true, true, true));
+        assert!(should_capture_for_cache(222, true, true, true)); // BODY
         assert!(!should_capture_for_cache(221, true, true, true)); // HEAD
-        assert!(!should_capture_for_cache(222, true, true, true)); // BODY
         assert!(!should_capture_for_cache(223, true, true, true)); // STAT
     }
 
@@ -159,13 +162,19 @@ mod tests {
 
     #[test]
     fn test_determine_cache_action_track_availability() {
-        // Track availability for HEAD (221) and BODY (222) responses
+        // HEAD (221) only tracks availability (headers only)
         assert_eq!(
             determine_cache_action("HEAD <test@example.com>", 221, true, true, true),
             CacheAction::TrackAvailability
         );
+        // BODY (222) now captures full article when cache_articles=true
         assert_eq!(
             determine_cache_action("BODY <test@example.com>", 222, true, true, true),
+            CacheAction::CaptureArticle
+        );
+        // BODY (222) with cache_articles=false only tracks availability
+        assert_eq!(
+            determine_cache_action("BODY <test@example.com>", 222, true, false, true),
             CacheAction::TrackAvailability
         );
     }
