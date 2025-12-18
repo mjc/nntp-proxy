@@ -4,7 +4,10 @@
 //! independent of the proxy functionality. Useful for building downloaders,
 //! indexers, or testing tools.
 //!
-//! # Example
+//! # Zero-Allocation Design
+//!
+//! The `*_into` methods accept a caller-provided buffer for zero allocations
+//! in the hot path. Reuse the same buffer across multiple fetches:
 //!
 //! ```no_run
 //! use nntp_proxy::client::NntpClient;
@@ -12,7 +15,6 @@
 //! use nntp_proxy::types::MessageId;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Create a TLS connection pool with authentication (typical Usenet provider)
 //! let pool = DeadpoolConnectionProvider::with_tls_auth(
 //!     "news.example.com",
 //!     563,
@@ -20,17 +22,21 @@
 //!     "password",
 //! )?;
 //!
-//! // Create client
 //! let client = NntpClient::new(pool);
 //!
-//! // Create validated message-ID (angle brackets required at compile time)
-//! let msg_id = MessageId::from_str_or_wrap("message-id@example.com")?;
+//! // Pre-allocate buffer once, reuse for all fetches (ZERO ALLOCS in loop)
+//! let mut buffer = Vec::with_capacity(1024 * 1024); // 1MB initial
 //!
-//! // Fetch article body
-//! let body = client.fetch_body(&msg_id).await?;
+//! let article_ids = vec![
+//!     MessageId::from_str_or_wrap("article1@example.com")?,
+//!     MessageId::from_str_or_wrap("article2@example.com")?,
+//! ];
 //!
-//! // Check if article exists
-//! let exists = client.stat(&msg_id).await?;
+//! for msg_id in &article_ids {
+//!     client.fetch_body_into(msg_id, &mut buffer).await?;
+//!     // Process buffer contents...
+//!     // buffer is cleared automatically on next fetch
+//! }
 //! # Ok(())
 //! # }
 //! ```

@@ -335,7 +335,7 @@ impl ArticleEntry {
         }
 
         // Must have actual content, not just a stub
-        // A stub is typically "220\r\n" (5 bytes) or "223\r\n" (~20 bytes)
+        // A stub is typically "220\r\n" (5 bytes) or "222 0 <test@example.com>\r\n" (25-30 bytes)
         // A real article/body has content + terminator
         // Minimum valid: "220 0 <x@y>\r\nX: Y\r\n\r\nB\r\n.\r\n" = 30 bytes
         const MIN_ARTICLE_SIZE: usize = 30;
@@ -502,31 +502,48 @@ impl ArticleCache {
         let key: Arc<str> = message_id.without_brackets().into();
 
         if let Some(mut existing) = self.cache.get(key.as_ref()).await {
-            // Entry exists - update buffer if caching AND new buffer is larger (more complete)
-            if self.cache_articles && buffer.len() > existing.buffer.len() {
-                use tracing::debug;
-                debug!(
-                    "upsert: updating existing entry for {} from {} bytes to {} bytes",
-                    message_id,
-                    existing.buffer.len(),
-                    buffer.len()
-                );
-                existing.buffer = Arc::new(buffer);
-            } else if self.cache_articles {
-                use tracing::debug;
-                debug!(
-                    "upsert: NOT updating buffer for {} (existing {} bytes >= new {} bytes)",
-                    message_id,
-                    existing.buffer.len(),
-                    buffer.len()
-                );
+            // Entry exists - decide whether to update buffer
+            if self.cache_articles {
+                // When caching full articles: only update if new buffer is larger (more complete)
+                if buffer.len() > existing.buffer.len() {
+                    use tracing::debug;
+                    debug!(
+                        "upsert: updating existing entry for {} from {} bytes to {} bytes",
+                        message_id,
+                        existing.buffer.len(),
+                        buffer.len()
+                    );
+                    existing.buffer = Arc::new(buffer);
+                } else {
+                    use tracing::debug;
+                    debug!(
+                        "upsert: NOT updating buffer for {} (existing {} bytes >= new {} bytes)",
+                        message_id,
+                        existing.buffer.len(),
+                        buffer.len()
+                    );
+                }
             } else {
-                use tracing::debug;
-                debug!(
-                    "upsert: NOT updating buffer for {} (cache_articles=false, keeping {} bytes)",
-                    message_id,
-                    existing.buffer.len()
-                );
+                // When NOT caching full articles: allow updating if new buffer is larger
+                // This allows swapping between different stub formats or more complete stubs
+                if buffer.len() > existing.buffer.len() {
+                    use tracing::debug;
+                    debug!(
+                        "upsert: updating stub for {} ({} bytes -> {} bytes)",
+                        message_id,
+                        existing.buffer.len(),
+                        buffer.len()
+                    );
+                    existing.buffer = Arc::new(buffer);
+                } else {
+                    use tracing::debug;
+                    debug!(
+                        "upsert: keeping stub for {} ({} bytes, new {} bytes)",
+                        message_id,
+                        existing.buffer.len(),
+                        buffer.len()
+                    );
+                }
             }
             // Mark this backend as successfully having the article
             use tracing::debug;
