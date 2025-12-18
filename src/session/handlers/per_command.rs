@@ -109,9 +109,39 @@ impl ClientSession {
             }
         }
 
-        // If full article caching enabled, serve from cache
+        // If full article caching enabled, try to serve from cache
         if !self.cache_articles {
             // Availability-only mode - fall through to use availability info for routing
+            return Ok(None);
+        }
+
+        // Check if this is a complete article we can serve
+        // Stubs from STAT/HEAD precheck or availability tracking should not be served
+        if !cached.is_complete_article() {
+            debug!(
+                "Client {} cache entry for {} is a stub (len={}), fetching full article",
+                self.client_addr,
+                msg_id_ref,
+                cached.buffer().len()
+            );
+            return Ok(None);
+        }
+
+        // Check if cached response type matches the requested command
+        // E.g., if we have BODY (222) cached but client requests ARTICLE (220),
+        // we need to fetch HEAD and combine them
+        let cmd_verb = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !cached.matches_command_type_verb(&cmd_verb) {
+            debug!(
+                "Client {} cached response type (code={:?}) doesn't match command '{}', need to fetch",
+                self.client_addr,
+                cached.status_code().map(|c| c.as_u16()),
+                cmd_verb
+            );
             return Ok(None);
         }
 
@@ -815,6 +845,12 @@ impl ClientSession {
                 .await?;
 
                 if let Some(msg_id_ref) = msg_id {
+                    debug!(
+                        "Client {} caching full article for {} ({} bytes captured)",
+                        self.client_addr,
+                        msg_id_ref,
+                        captured.len()
+                    );
                     self.spawn_cache_upsert(msg_id_ref, captured, backend_id);
                 }
                 Ok(bytes)

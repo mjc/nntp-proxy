@@ -3,16 +3,14 @@
 //! Adaptive prechecking allows STAT/HEAD commands to check all backends
 //! simultaneously to build accurate availability cache while serving clients efficiently.
 
-mod config_helpers;
 mod test_helpers;
 
 use anyhow::Result;
-use config_helpers::create_test_server_config;
 use nntp_proxy::{Cache, Config, NntpProxy, RoutingMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use test_helpers::MockNntpServer;
+use test_helpers::{MockNntpServer, create_test_server_config};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};

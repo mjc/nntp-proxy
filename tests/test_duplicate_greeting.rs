@@ -10,10 +10,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-mod config_helpers;
 mod test_helpers;
-use config_helpers::*;
-use test_helpers::{MockNntpServer, get_available_port, spawn_test_proxy};
+use test_helpers::*;
 
 /// Test that per-command routing mode sends exactly one greeting
 #[test]

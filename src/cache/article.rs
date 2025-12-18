@@ -199,6 +199,17 @@ impl ArticleAvailability {
     pub const fn has_availability_info(&self) -> bool {
         self.checked != 0
     }
+
+    /// Check if any backend is known to HAVE the article
+    ///
+    /// Returns true if at least one backend was checked and did NOT return 430.
+    /// This is the inverse check from `all_exhausted` - at least one success.
+    #[inline]
+    pub const fn any_backend_has_article(&self) -> bool {
+        // A backend "has" the article if it's checked but not missing
+        // checked & !missing gives us the backends that have it
+        (self.checked & !self.missing) != 0
+    }
 }
 
 impl Default for ArticleAvailability {
@@ -302,6 +313,83 @@ impl ArticleEntry {
         self.backend_availability.has_availability_info()
     }
 
+    /// Check if this cache entry contains a complete article (220) or body (222)
+    ///
+    /// Returns true if:
+    /// 1. Status code is 220 (ARTICLE) or 222 (BODY)
+    /// 2. Buffer contains actual content (not just a stub like "220\r\n")
+    ///
+    /// A complete response ends with ".\r\n" and is significantly longer
+    /// than a stub. Stubs are typically 5-6 bytes (e.g., "220\r\n" or "223\r\n").
+    ///
+    /// This is used when `cache_articles=true` to determine if we can serve
+    /// directly from cache or need to fetch additional data.
+    #[inline]
+    pub fn is_complete_article(&self) -> bool {
+        // Must be a 220 (ARTICLE) or 222 (BODY) response
+        let Some(code) = self.status_code() else {
+            return false;
+        };
+        if code.as_u16() != 220 && code.as_u16() != 222 {
+            return false;
+        }
+
+        // Must have actual content, not just a stub
+        // A stub is typically "220\r\n" (5 bytes) or "222 0 <test@example.com>\r\n" (25-30 bytes)
+        // A real article/body has content + terminator
+        // Minimum valid: "220 0 <x@y>\r\nX: Y\r\n\r\nB\r\n.\r\n" = 30 bytes
+        const MIN_ARTICLE_SIZE: usize = 30;
+        self.buffer.len() >= MIN_ARTICLE_SIZE && self.buffer.ends_with(b".\r\n")
+    }
+
+    /// Check if the cached response matches the requested command type
+    ///
+    /// Returns true if cached response can directly satisfy the command.
+    /// Accepts pre-parsed command verb for hot-path efficiency.
+    ///
+    /// Command matching rules:
+    /// - ARTICLE (220) matches: ARTICLE, BODY, HEAD requests
+    /// - BODY (222) matches: BODY requests only
+    /// - HEAD (221) matches: HEAD requests only
+    #[inline]
+    pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
+        let Some(code) = self.status_code() else {
+            return false;
+        };
+
+        match code.as_u16() {
+            220 => {
+                // ARTICLE response has everything - can serve ARTICLE, BODY, or HEAD
+                matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD")
+            }
+            222 => {
+                // BODY response - can only serve BODY requests
+                cmd_verb == "BODY"
+            }
+            221 => {
+                // HEAD response - can only serve HEAD requests
+                cmd_verb == "HEAD"
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if the cached response matches the requested command type
+    ///
+    /// Returns true if cached response can directly satisfy the command:
+    /// - ARTICLE (220) matches: ARTICLE, BODY, HEAD requests
+    /// - BODY (222) matches: BODY requests only
+    /// - HEAD (221) matches: HEAD requests only
+    #[inline]
+    pub fn matches_command_type(&self, command: &str) -> bool {
+        let cmd_verb = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        self.matches_command_type_verb(&cmd_verb)
+    }
+
     /// Initialize availability tracker from this cached entry
     ///
     /// Creates a fresh ArticleAvailability with backends marked missing based on
@@ -346,32 +434,35 @@ impl ArticleCache {
         let cache = Cache::builder()
             .max_capacity(max_capacity)
             .time_to_live(ttl)
-            .weigher(|key: &Arc<str>, entry: &ArticleEntry| -> u32 {
+            .weigher(move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
                 // Calculate memory footprint with moka internal overhead correction.
                 //
-                // Base sizes:
-                // - Key: Arc<str> = 8 bytes (pointer) + string data
-                // - ArticleEntry struct = 8 (Arc pointer) + 2 (availability) = 10 bytes
-                // - Arc<Vec<u8>>: Vec header = 24 bytes (ptr, len, cap) + buffer data
+                // Key insight: Use `is_complete_article()` to determine multiplier, not buffer size.
+                // A "complete" article has actual content (headers + body + terminator).
+                // A "stub" has only metadata like status code and message-ID.
                 //
-                // Moka internal overhead (NOT just 40 bytes - much heavier):
-                // - Hash table node: ~64 bytes (key hash, pointers, metadata)
-                // - LRU queue nodes: ~48 bytes (doubly-linked list nodes)
-                // - Frequency sketch: ~16 bytes (TinyLFU tracking)
-                // - Access order queue: ~32 bytes (TTL expiration tracking)
-                // - Expiration wheel: ~24 bytes (timer heap node)
-                // - Internal Arc wrappers: ~16 bytes
-                // Total moka overhead: ~200 bytes per entry
+                // Complete articles: Use actual size (no multiplier)
+                // - We know the exact content, so overhead is predictable
                 //
-                // Additionally, empirical testing shows a 2-3x multiplier on the total
-                // due to memory allocator overhead, padding, and fragmentation.
-                // Apply 2.5x correction factor to match observed memory usage.
+                // Stubs: Apply 2.5x multiplier
+                // - Overhead dominates for small entries
+                // - Accounts for moka internal structures, allocator overhead, padding
                 let key_size = 8 + key.len();
                 let buffer_size = entry.buffer().len();
-                let entry_overhead = 10 + 24 + 200; // ~234 bytes (reduced from ~258)
+                let entry_overhead = 10 + 24 + 200; // ~234 bytes
                 let base_size = key_size + buffer_size + entry_overhead;
-                let corrected_size = (base_size as f64 * 2.5) as usize; // Apply 2.5x correction
-                corrected_size.try_into().unwrap_or(u32::MAX)
+
+                let weighted_size = if entry.is_complete_article() {
+                    // Complete article (has content): use actual size + overhead
+                    // No multiplier needed - content dominates total memory
+                    base_size
+                } else {
+                    // Stub (only metadata): apply 2.5x multiplier
+                    // Overhead is 2-3x the actual stub size
+                    (base_size as f64 * 2.5) as usize
+                };
+
+                weighted_size.try_into().unwrap_or(u32::MAX)
             })
             .build();
 
@@ -421,15 +512,85 @@ impl ArticleCache {
         buffer: Vec<u8>,
         backend_id: BackendId,
     ) {
+        use tracing::debug;
+
         let key: Arc<str> = message_id.without_brackets().into();
 
         if let Some(mut existing) = self.cache.get(key.as_ref()).await {
-            // Entry exists - update buffer if caching, mark backend as having it
-            if self.cache_articles {
+            // Entry exists - decide whether to update buffer
+            // Use is_complete_article() to determine replacement strategy:
+            // - Stub → Complete: Always replace (complete is better)
+            // - Complete → Stub: Never replace (keep complete)
+            // - Complete → Complete: Keep larger (more headers/body)
+            // - Stub → Stub: Use size comparison
+            let existing_complete = existing.is_complete_article();
+            let new_complete = {
+                // Check if new buffer is complete without creating full entry
+                buffer.len() >= 30 && buffer.ends_with(b".\r\n")
+            };
+
+            let should_replace = match (existing_complete, new_complete) {
+                (false, true) => {
+                    debug!(
+                        "upsert: replacing stub for {} with complete article",
+                        message_id
+                    );
+                    true
+                }
+                (true, false) => {
+                    debug!(
+                        "upsert: keeping existing complete article for {}, ignoring stub",
+                        message_id
+                    );
+                    false
+                }
+                (true, true) => {
+                    // Both complete - keep the larger one (more content)
+                    if buffer.len() > existing.buffer.len() {
+                        debug!(
+                            "upsert: replacing article for {} ({} -> {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        true
+                    } else {
+                        debug!(
+                            "upsert: keeping existing article for {} ({} bytes >= new {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        false
+                    }
+                }
+                (false, false) => {
+                    // Both stubs - use size comparison
+                    if buffer.len() > existing.buffer.len() {
+                        debug!(
+                            "upsert: replacing stub for {} ({} -> {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        true
+                    } else {
+                        debug!(
+                            "upsert: keeping existing stub for {} ({} bytes >= new {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        false
+                    }
+                }
+            };
+
+            if should_replace {
                 existing.buffer = Arc::new(buffer);
             }
+
             // Mark this backend as successfully having the article
-            use tracing::debug;
             let (before_checked, before_missing) = (
                 existing.backend_availability.checked_bits(),
                 existing.backend_availability.missing_bits(),
@@ -543,6 +704,10 @@ impl ArticleCache {
     /// This is called ONCE at the end of a retry loop to persist all the
     /// backends that returned 430 during this request. Much more efficient
     /// than calling record_backend_missing for each backend individually.
+    ///
+    /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
+    /// If any backend successfully provided the article, we skip creating an entry
+    /// (the actual article will be cached via upsert, which may race with this call).
     pub async fn sync_availability<'a>(
         &self,
         message_id: MessageId<'a>,
@@ -560,7 +725,15 @@ impl ArticleCache {
             entry.backend_availability.merge_from(availability);
             self.cache.insert(key, entry).await;
         } else {
-            // Create new entry with 430 stub and the availability state
+            // No existing entry - only create a 430 stub if ALL backends returned 430
+            // If any backend has the article, skip this - the upsert will create the real entry
+            if availability.any_backend_has_article() {
+                // A backend successfully provided the article.
+                // Don't create a 430 stub - let upsert() handle it with the real article data.
+                return;
+            }
+
+            // All checked backends returned 430 - create stub to track this
             let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
             entry.backend_availability = *availability;
             self.cache.insert(key, entry).await;
@@ -666,6 +839,44 @@ mod tests {
     }
 
     #[test]
+    fn test_any_backend_has_article() {
+        let mut avail = ArticleAvailability::new();
+        let b0 = BackendId::from_index(0);
+        let b1 = BackendId::from_index(1);
+
+        // Empty availability - no backend has it (nothing checked)
+        assert!(!avail.any_backend_has_article());
+
+        // Record b0 as missing - still none have it
+        avail.record_missing(b0);
+        assert!(!avail.any_backend_has_article());
+
+        // Record b1 as having it - now one has it
+        avail.record_has(b1);
+        assert!(avail.any_backend_has_article());
+
+        // Record b1 as missing (overwrite) - none have it again
+        avail.record_missing(b1);
+        assert!(!avail.any_backend_has_article());
+    }
+
+    #[test]
+    fn test_record_has_clears_missing_bit() {
+        let mut avail = ArticleAvailability::new();
+        let b0 = BackendId::from_index(0);
+
+        // First mark as missing
+        avail.record_missing(b0);
+        assert!(avail.is_missing(b0));
+        assert!(!avail.any_backend_has_article());
+
+        // Now mark as has - should clear missing
+        avail.record_has(b0);
+        assert!(!avail.is_missing(b0));
+        assert!(avail.any_backend_has_article());
+    }
+
+    #[test]
     fn test_backend_availability_all_exhausted() {
         use crate::router::BackendCount;
         let mut avail = ArticleAvailability::new();
@@ -696,6 +907,36 @@ mod tests {
         // Default: should try all backends
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn test_is_complete_article() {
+        // Stubs should NOT be complete articles
+        let stub_430 = ArticleEntry::new(b"430\r\n".to_vec());
+        assert!(!stub_430.is_complete_article());
+
+        let stub_220 = ArticleEntry::new(b"220\r\n".to_vec());
+        assert!(!stub_220.is_complete_article());
+
+        let stub_223 = ArticleEntry::new(b"223\r\n".to_vec());
+        assert!(!stub_223.is_complete_article());
+
+        // Full article SHOULD be complete
+        let full = ArticleEntry::new(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
+        );
+        assert!(full.is_complete_article());
+
+        // Wrong status code (not 220) should NOT be complete article
+        let head_response =
+            ArticleEntry::new(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec());
+        assert!(!head_response.is_complete_article());
+
+        // Missing terminator should NOT be complete
+        let no_terminator = ArticleEntry::new(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec(),
+        );
+        assert!(!no_terminator.is_complete_article());
     }
 
     #[test]
@@ -1050,6 +1291,93 @@ mod tests {
 
         // Should be accessible from cloned cache
         assert!(cache2.get(&msgid).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_weigher_large_articles() {
+        // Test that large article bodies use ACTUAL SIZE (no multiplier)
+        // when cache_articles=true and buffer >10KB
+        let cache = ArticleCache::new(10 * 1024 * 1024, Duration::from_secs(300), true); // 10MB capacity
+
+        // Create a 750KB article (typical size)
+        let body = vec![b'X'; 750_000];
+        let response = format!(
+            "222 0 <test@example.com>\r\n{}\r\n.\r\n",
+            std::str::from_utf8(&body).unwrap()
+        );
+        let article = ArticleEntry::new(response.as_bytes().to_vec());
+
+        let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
+        cache.insert(msgid.clone(), article).await;
+        cache.sync().await;
+
+        // With actual size (no multiplier): 750KB per entry
+        // 10MB capacity should fit ~13 articles
+        // With old 1.8x multiplier: 750KB * 1.8 ≈ 1.35MB per entry, fits ~7 articles
+        // With old 2.5x multiplier: 750KB * 2.5 ≈ 1.875MB per entry, fits ~5 articles
+
+        // Insert 12 more articles (13 total)
+        for i in 2..=13 {
+            let msgid_str = format!("<article{}@example.com>", i);
+            let msgid = MessageId::new(msgid_str).unwrap();
+            let response = format!(
+                "222 0 {}\r\n{}\r\n.\r\n",
+                msgid.as_str(),
+                std::str::from_utf8(&body).unwrap()
+            );
+            let article = ArticleEntry::new(response.as_bytes().to_vec());
+            cache.insert(msgid, article).await;
+            cache.sync().await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cache.sync().await;
+
+        let stats = cache.stats().await;
+        // With actual size (no multiplier), should fit 11-13 large articles
+        assert!(
+            stats.entry_count >= 11,
+            "Cache should fit at least 11 large articles with actual size (no multiplier) (got {})",
+            stats.entry_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_weigher_small_stubs() {
+        // Test that small stubs use the 2.5x multiplier
+        let cache = ArticleCache::new(100_000, Duration::from_secs(300), false); // 100KB capacity
+
+        // Create small stub (53 bytes)
+        let stub = b"223 0 <test@example.com>\r\n".to_vec();
+        let article = ArticleEntry::new(stub);
+
+        let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
+        cache.insert(msgid, article).await;
+        cache.sync().await;
+
+        // With 2.5x multiplier: (53 + 234 overhead) * 2.5 ≈ 717 bytes per stub
+        // 100KB capacity should fit ~140 stubs
+
+        // Insert many small stubs
+        for i in 2..=150 {
+            let msgid_str = format!("<stub{}@example.com>", i);
+            let msgid = MessageId::new(msgid_str).unwrap();
+            let stub = format!("223 0 {}\r\n", msgid.as_str());
+            let article = ArticleEntry::new(stub.as_bytes().to_vec());
+            cache.insert(msgid, article).await;
+        }
+
+        cache.sync().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cache.sync().await;
+
+        let stats = cache.stats().await;
+        // Should be able to fit ~120-140 small stubs
+        assert!(
+            stats.entry_count >= 100,
+            "Cache should fit many small stubs with 2.5x multiplier (got {})",
+            stats.entry_count
+        );
     }
 
     #[tokio::test]

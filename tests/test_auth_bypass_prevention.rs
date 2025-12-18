@@ -47,7 +47,7 @@ async fn test_standard_handler_validates_credentials() {
         .handle_auth_command(
             AuthAction::ValidateAndRespond { password },
             &mut output,
-            Some(&username),
+            Some(username),
         )
         .await
         .unwrap();
@@ -72,7 +72,7 @@ async fn test_standard_handler_validates_credentials() {
         .handle_auth_command(
             AuthAction::ValidateAndRespond { password },
             &mut output,
-            Some(&username),
+            Some(username),
         )
         .await
         .unwrap();

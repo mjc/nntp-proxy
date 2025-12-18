@@ -9,11 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-mod config_helpers;
 mod test_helpers;
-use config_helpers::create_test_server_config;
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
-use test_helpers::MockNntpServer;
+use test_helpers::{MockNntpServer, create_test_server_config};
 
 /// Strategy for generating valid NNTP message IDs
 fn message_id_strategy() -> impl Strategy<Value = String> {
