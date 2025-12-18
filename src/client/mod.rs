@@ -9,6 +9,7 @@
 //! ```no_run
 //! use nntp_proxy::client::NntpClient;
 //! use nntp_proxy::pool::DeadpoolConnectionProvider;
+//! use nntp_proxy::types::MessageId;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! // Create a TLS connection pool with authentication (typical Usenet provider)
@@ -22,11 +23,14 @@
 //! // Create client
 //! let client = NntpClient::new(pool);
 //!
+//! // Create validated message-ID (angle brackets required at compile time)
+//! let msg_id = MessageId::from_str_or_wrap("message-id@example.com")?;
+//!
 //! // Fetch article body
-//! let body = client.fetch_body("<message-id@example.com>").await?;
+//! let body = client.fetch_body(&msg_id).await?;
 //!
 //! // Check if article exists
-//! let exists = client.stat("<message-id@example.com>").await?;
+//! let exists = client.stat(&msg_id).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -38,7 +42,7 @@ use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::protocol::{article_by_msgid, body_by_msgid, head_by_msgid, stat_by_msgid};
 use crate::session::backend::send_command;
-use crate::types::BufferSize;
+use crate::types::{BufferSize, MessageId};
 
 /// NNTP multiline terminator
 const TERMINATOR: &[u8] = b"\r\n.\r\n";
@@ -77,48 +81,48 @@ impl NntpClient {
     /// decode with `yenc::decode_buffer()`.
     ///
     /// # Arguments
-    /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
+    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
     ///
     /// # Returns
     /// Raw body bytes (may be yEnc encoded)
-    pub async fn fetch_body(&self, message_id: &str) -> Result<Vec<u8>> {
-        let command = body_by_msgid(message_id);
+    pub async fn fetch_body(&self, message_id: &MessageId<'_>) -> Result<Vec<u8>> {
+        let command = body_by_msgid(message_id.as_str());
         self.fetch_multiline(&command).await
     }
 
     /// Fetch article headers by message-ID (HEAD command)
     ///
     /// # Arguments
-    /// * `message_id` - Message-ID including angle brackets
+    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
     ///
     /// # Returns
     /// Raw header bytes
-    pub async fn fetch_head(&self, message_id: &str) -> Result<Vec<u8>> {
-        let command = head_by_msgid(message_id);
+    pub async fn fetch_head(&self, message_id: &MessageId<'_>) -> Result<Vec<u8>> {
+        let command = head_by_msgid(message_id.as_str());
         self.fetch_multiline(&command).await
     }
 
     /// Fetch full article by message-ID (ARTICLE command)
     ///
     /// # Arguments
-    /// * `message_id` - Message-ID including angle brackets
+    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
     ///
     /// # Returns
     /// Raw article bytes (headers + body)
-    pub async fn fetch_article(&self, message_id: &str) -> Result<Vec<u8>> {
-        let command = article_by_msgid(message_id);
+    pub async fn fetch_article(&self, message_id: &MessageId<'_>) -> Result<Vec<u8>> {
+        let command = article_by_msgid(message_id.as_str());
         self.fetch_multiline(&command).await
     }
 
     /// Check if article exists (STAT command)
     ///
     /// # Arguments
-    /// * `message_id` - Message-ID including angle brackets
+    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
     ///
     /// # Returns
     /// `true` if article exists, `false` if 430 (not found)
-    pub async fn stat(&self, message_id: &str) -> Result<bool> {
-        let command = stat_by_msgid(message_id);
+    pub async fn stat(&self, message_id: &MessageId<'_>) -> Result<bool> {
+        let command = stat_by_msgid(message_id.as_str());
         let mut conn = self
             .pool
             .get_pooled_connection()
