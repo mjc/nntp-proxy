@@ -109,9 +109,21 @@ impl ClientSession {
             }
         }
 
-        // If full article caching enabled, serve from cache
+        // If full article caching enabled, try to serve from cache
         if !self.cache_articles {
             // Availability-only mode - fall through to use availability info for routing
+            return Ok(None);
+        }
+
+        // Check if this is a complete article we can serve
+        // Stubs from STAT/HEAD precheck or availability tracking should not be served
+        if !cached.is_complete_article() {
+            debug!(
+                "Client {} cache entry for {} is a stub (len={}), fetching full article",
+                self.client_addr,
+                msg_id_ref,
+                cached.buffer().len()
+            );
             return Ok(None);
         }
 

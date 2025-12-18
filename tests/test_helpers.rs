@@ -6,6 +6,7 @@
 use anyhow::Result;
 use nntp_proxy::NntpProxy;
 use nntp_proxy::config::{Config, Server};
+use nntp_proxy::types::{MaxConnections, Port};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -518,6 +519,106 @@ pub async fn send_article_read_full_response(
     }
 
     Ok((status_line, body_lines))
+}
+
+// =============================================================================
+// Server Configuration Helpers
+// =============================================================================
+
+// These functions are used across different test files. Since each test file
+// compiles test_helpers.rs as a module, they appear "unused" in some compilations.
+// This is expected behavior for the `mod test_helpers;` pattern.
+
+/// Create a basic server configuration for testing (no TLS)
+#[allow(dead_code)]
+pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
+    Server::builder(host, Port::try_new(port).unwrap())
+        .name(name)
+        .max_connections(MaxConnections::try_new(5).unwrap())
+        .build()
+        .expect("Valid server config")
+}
+
+/// Create a server configuration with authentication
+#[allow(dead_code)]
+pub fn create_test_server_config_with_auth(
+    host: &str,
+    port: u16,
+    name: &str,
+    username: &str,
+    password: &str,
+) -> Server {
+    Server::builder(host, Port::try_new(port).unwrap())
+        .name(name)
+        .username(username)
+        .password(password)
+        .max_connections(MaxConnections::try_new(5).unwrap())
+        .build()
+        .expect("Valid server config")
+}
+
+/// Create a TLS-enabled server configuration
+#[allow(dead_code)]
+pub fn create_test_server_config_with_tls(
+    host: &str,
+    port: u16,
+    name: &str,
+    tls_verify_cert: bool,
+    tls_cert_path: Option<String>,
+) -> Server {
+    let mut builder = Server::builder(host, Port::try_new(port).unwrap())
+        .name(name)
+        .max_connections(MaxConnections::try_new(5).unwrap())
+        .use_tls(true)
+        .tls_verify_cert(tls_verify_cert);
+
+    if let Some(path) = tls_cert_path {
+        builder = builder.tls_cert_path(path);
+    }
+
+    builder.build().expect("Valid server config")
+}
+
+/// Create a server configuration with custom max_connections
+#[allow(dead_code)]
+pub fn create_test_server_config_with_max_connections(
+    host: &str,
+    port: u16,
+    name: &str,
+    max_connections: usize,
+) -> Server {
+    Server::builder(host, Port::try_new(port).unwrap())
+        .name(name)
+        .max_connections(MaxConnections::try_new(max_connections).unwrap())
+        .build()
+        .expect("Valid server config")
+}
+
+/// Create a full Config with client authentication enabled
+#[allow(dead_code)]
+pub fn create_test_config_with_auth(
+    backend_ports: Vec<u16>,
+    username: &str,
+    password: &str,
+) -> Config {
+    use nntp_proxy::config::{ClientAuth, UserCredentials};
+
+    Config {
+        servers: backend_ports
+            .into_iter()
+            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
+            .collect(),
+        proxy: Default::default(),
+        health_check: Default::default(),
+        cache: None,
+        client_auth: ClientAuth {
+            users: vec![UserCredentials {
+                username: username.to_string(),
+                password: password.to_string(),
+            }],
+            greeting: None,
+        },
+    }
 }
 
 #[cfg(test)]

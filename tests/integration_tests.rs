@@ -7,11 +7,8 @@ use tokio::time::{Duration, timeout};
 
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
-mod config_helpers;
-use config_helpers::*;
-
 mod test_helpers;
-use test_helpers::{MockNntpServer, create_test_config, get_available_port, spawn_test_proxy};
+use test_helpers::*;
 
 #[tokio::test]
 async fn test_proxy_with_mock_servers() -> Result<()> {

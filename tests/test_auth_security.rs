@@ -212,7 +212,7 @@ async fn test_auth_success_flag_reliability() {
 
         let (_, auth_success) = handler
             .handle_auth_command(
-                AuthAction::ValidateAndRespond { password: password },
+                AuthAction::ValidateAndRespond { password },
                 &mut output,
                 stored_username,
             )
@@ -290,7 +290,7 @@ async fn test_validate_matches_handle_auth_command() {
         let mut output = Vec::new();
         let (_, auth_success) = handler
             .handle_auth_command(
-                AuthAction::ValidateAndRespond { password: password },
+                AuthAction::ValidateAndRespond { password },
                 &mut output,
                 Some(username),
             )
@@ -411,7 +411,7 @@ async fn property_invalid_credentials_implies_no_auth_success() {
         let mut output = Vec::new();
         let (_, auth_success) = handler
             .handle_auth_command(
-                AuthAction::ValidateAndRespond { password: password },
+                AuthAction::ValidateAndRespond { password },
                 &mut output,
                 stored_username,
             )

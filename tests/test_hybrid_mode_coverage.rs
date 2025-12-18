@@ -6,11 +6,8 @@ use tokio::time::{Duration, timeout};
 
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
 
-mod config_helpers;
-use config_helpers::*;
-
 mod test_helpers;
-use test_helpers::{MockNntpServer, get_available_port};
+use test_helpers::*;
 
 /// Test that hybrid mode handles long-running sessions and triggers metrics flushing
 /// This test sends >100 commands to trigger the METRICS_FLUSH_INTERVAL code path

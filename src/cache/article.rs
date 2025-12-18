@@ -199,6 +199,17 @@ impl ArticleAvailability {
     pub const fn has_availability_info(&self) -> bool {
         self.checked != 0
     }
+
+    /// Check if any backend is known to HAVE the article
+    ///
+    /// Returns true if at least one backend was checked and did NOT return 430.
+    /// This is the inverse check from `all_exhausted` - at least one success.
+    #[inline]
+    pub const fn any_backend_has_article(&self) -> bool {
+        // A backend "has" the article if it's checked but not missing
+        // checked & !missing gives us the backends that have it
+        (self.checked & !self.missing) != 0
+    }
 }
 
 impl Default for ArticleAvailability {
@@ -300,6 +311,35 @@ impl ArticleEntry {
     #[inline]
     pub fn has_availability_info(&self) -> bool {
         self.backend_availability.has_availability_info()
+    }
+
+    /// Check if this cache entry contains a complete article body
+    ///
+    /// Returns true only if:
+    /// 1. Status code is 220 (ARTICLE response)
+    /// 2. Buffer contains actual content (not just a stub like "220\r\n")
+    ///
+    /// A complete ARTICLE response ends with ".\r\n" and is significantly longer
+    /// than a stub. Stubs are typically 5-6 bytes (e.g., "220\r\n" or "223\r\n").
+    ///
+    /// This is used when `cache_articles=true` to determine if we can serve
+    /// directly from cache or need to fetch the actual article body.
+    #[inline]
+    pub fn is_complete_article(&self) -> bool {
+        // Must be a 220 response (ARTICLE)
+        let Some(code) = self.status_code() else {
+            return false;
+        };
+        if code.as_u16() != 220 {
+            return false;
+        }
+
+        // Must have actual content, not just a stub
+        // A stub is typically "220\r\n" (5 bytes) or "220 0 <msgid>\r\n" (~20 bytes)
+        // A real article has headers + body + terminator
+        // Minimum valid: "220 0 <x@y>\r\nX: Y\r\n\r\nB\r\n.\r\n" = 30 bytes
+        const MIN_ARTICLE_SIZE: usize = 30;
+        self.buffer.len() >= MIN_ARTICLE_SIZE && self.buffer.ends_with(b".\r\n")
     }
 
     /// Initialize availability tracker from this cached entry
@@ -543,6 +583,10 @@ impl ArticleCache {
     /// This is called ONCE at the end of a retry loop to persist all the
     /// backends that returned 430 during this request. Much more efficient
     /// than calling record_backend_missing for each backend individually.
+    ///
+    /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
+    /// If any backend successfully provided the article, we skip creating an entry
+    /// (the actual article will be cached via upsert, which may race with this call).
     pub async fn sync_availability<'a>(
         &self,
         message_id: MessageId<'a>,
@@ -560,7 +604,15 @@ impl ArticleCache {
             entry.backend_availability.merge_from(availability);
             self.cache.insert(key, entry).await;
         } else {
-            // Create new entry with 430 stub and the availability state
+            // No existing entry - only create a 430 stub if ALL backends returned 430
+            // If any backend has the article, skip this - the upsert will create the real entry
+            if availability.any_backend_has_article() {
+                // A backend successfully provided the article.
+                // Don't create a 430 stub - let upsert() handle it with the real article data.
+                return;
+            }
+
+            // All checked backends returned 430 - create stub to track this
             let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
             entry.backend_availability = *availability;
             self.cache.insert(key, entry).await;
@@ -666,6 +718,44 @@ mod tests {
     }
 
     #[test]
+    fn test_any_backend_has_article() {
+        let mut avail = ArticleAvailability::new();
+        let b0 = BackendId::from_index(0);
+        let b1 = BackendId::from_index(1);
+
+        // Empty availability - no backend has it (nothing checked)
+        assert!(!avail.any_backend_has_article());
+
+        // Record b0 as missing - still none have it
+        avail.record_missing(b0);
+        assert!(!avail.any_backend_has_article());
+
+        // Record b1 as having it - now one has it
+        avail.record_has(b1);
+        assert!(avail.any_backend_has_article());
+
+        // Record b1 as missing (overwrite) - none have it again
+        avail.record_missing(b1);
+        assert!(!avail.any_backend_has_article());
+    }
+
+    #[test]
+    fn test_record_has_clears_missing_bit() {
+        let mut avail = ArticleAvailability::new();
+        let b0 = BackendId::from_index(0);
+
+        // First mark as missing
+        avail.record_missing(b0);
+        assert!(avail.is_missing(b0));
+        assert!(!avail.any_backend_has_article());
+
+        // Now mark as has - should clear missing
+        avail.record_has(b0);
+        assert!(!avail.is_missing(b0));
+        assert!(avail.any_backend_has_article());
+    }
+
+    #[test]
     fn test_backend_availability_all_exhausted() {
         use crate::router::BackendCount;
         let mut avail = ArticleAvailability::new();
@@ -696,6 +786,36 @@ mod tests {
         // Default: should try all backends
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn test_is_complete_article() {
+        // Stubs should NOT be complete articles
+        let stub_430 = ArticleEntry::new(b"430\r\n".to_vec());
+        assert!(!stub_430.is_complete_article());
+
+        let stub_220 = ArticleEntry::new(b"220\r\n".to_vec());
+        assert!(!stub_220.is_complete_article());
+
+        let stub_223 = ArticleEntry::new(b"223\r\n".to_vec());
+        assert!(!stub_223.is_complete_article());
+
+        // Full article SHOULD be complete
+        let full = ArticleEntry::new(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
+        );
+        assert!(full.is_complete_article());
+
+        // Wrong status code (not 220) should NOT be complete article
+        let head_response =
+            ArticleEntry::new(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec());
+        assert!(!head_response.is_complete_article());
+
+        // Missing terminator should NOT be complete
+        let no_terminator = ArticleEntry::new(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec(),
+        );
+        assert!(!no_terminator.is_complete_article());
     }
 
     #[test]
