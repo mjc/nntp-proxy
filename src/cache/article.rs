@@ -344,27 +344,23 @@ impl ArticleEntry {
 
     /// Check if the cached response matches the requested command type
     ///
-    /// Returns true if cached response can directly satisfy the command:
+    /// Returns true if cached response can directly satisfy the command.
+    /// Accepts pre-parsed command verb for hot-path efficiency.
+    ///
+    /// Command matching rules:
     /// - ARTICLE (220) matches: ARTICLE, BODY, HEAD requests
     /// - BODY (222) matches: BODY requests only
     /// - HEAD (221) matches: HEAD requests only
     #[inline]
-    pub fn matches_command_type(&self, command: &str) -> bool {
+    pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
         let Some(code) = self.status_code() else {
             return false;
         };
 
-        // Extract command verb (first word, case-insensitive)
-        let cmd_verb = command
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-
         match code.as_u16() {
             220 => {
                 // ARTICLE response has everything - can serve ARTICLE, BODY, or HEAD
-                matches!(cmd_verb.as_str(), "ARTICLE" | "BODY" | "HEAD")
+                matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD")
             }
             222 => {
                 // BODY response - can only serve BODY requests
@@ -376,6 +372,22 @@ impl ArticleEntry {
             }
             _ => false,
         }
+    }
+
+    /// Check if the cached response matches the requested command type
+    ///
+    /// Returns true if cached response can directly satisfy the command:
+    /// - ARTICLE (220) matches: ARTICLE, BODY, HEAD requests
+    /// - BODY (222) matches: BODY requests only
+    /// - HEAD (221) matches: HEAD requests only
+    #[inline]
+    pub fn matches_command_type(&self, command: &str) -> bool {
+        let cmd_verb = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        self.matches_command_type_verb(&cmd_verb)
     }
 
     /// Initialize availability tracker from this cached entry
@@ -425,27 +437,28 @@ impl ArticleCache {
             .weigher(move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
                 // Calculate memory footprint with moka internal overhead correction.
                 //
-                // When cache_articles=true with large buffers (full articles):
-                // - We know the exact size, so use actual buffer size + overhead
-                // - No multiplier needed - we're not guessing
+                // Key insight: Use `is_complete_article()` to determine multiplier, not buffer size.
+                // A "complete" article has actual content (headers + body + terminator).
+                // A "stub" has only metadata like status code and message-ID.
                 //
-                // When cache_articles=false (stubs only) or small buffers:
-                // - Overhead dominates, apply 2.5x correction factor
+                // Complete articles: Use actual size (no multiplier)
+                // - We know the exact content, so overhead is predictable
+                //
+                // Stubs: Apply 2.5x multiplier
+                // - Overhead dominates for small entries
                 // - Accounts for moka internal structures, allocator overhead, padding
                 let key_size = 8 + key.len();
                 let buffer_size = entry.buffer().len();
                 let entry_overhead = 10 + 24 + 200; // ~234 bytes
                 let base_size = key_size + buffer_size + entry_overhead;
 
-                // When we have full articles (cache_articles=true and large buffer),
-                // use actual size (no multiplier). Otherwise apply 2.5x for overhead.
-                let weighted_size = if cache_articles && buffer_size > 10_000 {
-                    // Full article: use actual size + overhead
-                    // No multiplier needed - we know the exact content
+                let weighted_size = if entry.is_complete_article() {
+                    // Complete article (has content): use actual size + overhead
+                    // No multiplier needed - content dominates total memory
                     base_size
                 } else {
-                    // Stubs or small entries: apply 2.5x multiplier
-                    // Overhead dominates when buffer is small
+                    // Stub (only metadata): apply 2.5x multiplier
+                    // Overhead is 2-3x the actual stub size
                     (base_size as f64 * 2.5) as usize
                 };
 
@@ -499,54 +512,85 @@ impl ArticleCache {
         buffer: Vec<u8>,
         backend_id: BackendId,
     ) {
+        use tracing::debug;
+
         let key: Arc<str> = message_id.without_brackets().into();
 
         if let Some(mut existing) = self.cache.get(key.as_ref()).await {
             // Entry exists - decide whether to update buffer
-            if self.cache_articles {
-                // When caching full articles: only update if new buffer is larger (more complete)
-                if buffer.len() > existing.buffer.len() {
-                    use tracing::debug;
+            // Use is_complete_article() to determine replacement strategy:
+            // - Stub → Complete: Always replace (complete is better)
+            // - Complete → Stub: Never replace (keep complete)
+            // - Complete → Complete: Keep larger (more headers/body)
+            // - Stub → Stub: Use size comparison
+            let existing_complete = existing.is_complete_article();
+            let new_complete = {
+                // Check if new buffer is complete without creating full entry
+                buffer.len() >= 30 && buffer.ends_with(b".\r\n")
+            };
+
+            let should_replace = match (existing_complete, new_complete) {
+                (false, true) => {
                     debug!(
-                        "upsert: updating existing entry for {} from {} bytes to {} bytes",
-                        message_id,
-                        existing.buffer.len(),
-                        buffer.len()
+                        "upsert: replacing stub for {} with complete article",
+                        message_id
                     );
-                    existing.buffer = Arc::new(buffer);
-                } else {
-                    use tracing::debug;
-                    debug!(
-                        "upsert: NOT updating buffer for {} (existing {} bytes >= new {} bytes)",
-                        message_id,
-                        existing.buffer.len(),
-                        buffer.len()
-                    );
+                    true
                 }
-            } else {
-                // When NOT caching full articles: allow updating if new buffer is larger
-                // This allows swapping between different stub formats or more complete stubs
-                if buffer.len() > existing.buffer.len() {
-                    use tracing::debug;
+                (true, false) => {
                     debug!(
-                        "upsert: updating stub for {} ({} bytes -> {} bytes)",
-                        message_id,
-                        existing.buffer.len(),
-                        buffer.len()
+                        "upsert: keeping existing complete article for {}, ignoring stub",
+                        message_id
                     );
-                    existing.buffer = Arc::new(buffer);
-                } else {
-                    use tracing::debug;
-                    debug!(
-                        "upsert: keeping stub for {} ({} bytes, new {} bytes)",
-                        message_id,
-                        existing.buffer.len(),
-                        buffer.len()
-                    );
+                    false
                 }
+                (true, true) => {
+                    // Both complete - keep the larger one (more content)
+                    if buffer.len() > existing.buffer.len() {
+                        debug!(
+                            "upsert: replacing article for {} ({} -> {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        true
+                    } else {
+                        debug!(
+                            "upsert: keeping existing article for {} ({} bytes >= new {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        false
+                    }
+                }
+                (false, false) => {
+                    // Both stubs - use size comparison
+                    if buffer.len() > existing.buffer.len() {
+                        debug!(
+                            "upsert: replacing stub for {} ({} -> {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        true
+                    } else {
+                        debug!(
+                            "upsert: keeping existing stub for {} ({} bytes >= new {} bytes)",
+                            message_id,
+                            existing.buffer.len(),
+                            buffer.len()
+                        );
+                        false
+                    }
+                }
+            };
+
+            if should_replace {
+                existing.buffer = Arc::new(buffer);
             }
+
             // Mark this backend as successfully having the article
-            use tracing::debug;
             let (before_checked, before_missing) = (
                 existing.backend_availability.checked_bits(),
                 existing.backend_availability.missing_bits(),

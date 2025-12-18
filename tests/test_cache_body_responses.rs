@@ -16,7 +16,7 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
-    let cache = ArticleCache::new(1000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
     let msg_id = MessageId::from_str_or_wrap("test@example.com")?;
     let backend_id = BackendId::from_index(0);
 
@@ -60,7 +60,7 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
 
 #[tokio::test]
 async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
-    let cache = ArticleCache::new(1000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
     let msg_id = MessageId::from_str_or_wrap("test@example.com")?;
     let backend_id = BackendId::from_index(0);
 
@@ -222,4 +222,45 @@ fn test_status_code_parsing() {
 
     let entry_221 = ArticleEntry::new(b"221 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
     assert_eq!(entry_221.status_code().unwrap().as_u16(), 221);
+}
+#[test]
+fn test_body_article_command_type_mismatch() {
+    // When a BODY (222) response is cached and a client requests ARTICLE (220),
+    // it should NOT match because BODY doesn't include headers
+    let body_response =
+        ArticleEntry::new(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n".to_vec());
+
+    // BODY response should NOT match ARTICLE request (no headers)
+    assert!(
+        !body_response.matches_command_type("ARTICLE <test@example.com>"),
+        "ARTICLE command should not match BODY (222) response"
+    );
+
+    // But BODY response should match BODY request
+    assert!(
+        body_response.matches_command_type("BODY <test@example.com>"),
+        "BODY command should match BODY (222) response"
+    );
+
+    // And should not match HEAD request (no body)
+    assert!(
+        !body_response.matches_command_type("HEAD <test@example.com>"),
+        "HEAD command should not match BODY (222) response"
+    );
+
+    // ARTICLE (220) response matches all three
+    let article_response =
+        ArticleEntry::new(b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec());
+    assert!(
+        article_response.matches_command_type("ARTICLE <test@example.com>"),
+        "ARTICLE command should match ARTICLE (220) response"
+    );
+    assert!(
+        article_response.matches_command_type("BODY <test@example.com>"),
+        "BODY command should match ARTICLE (220) response"
+    );
+    assert!(
+        article_response.matches_command_type("HEAD <test@example.com>"),
+        "HEAD command should match ARTICLE (220) response"
+    );
 }

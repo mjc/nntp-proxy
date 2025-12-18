@@ -130,12 +130,17 @@ impl ClientSession {
         // Check if cached response type matches the requested command
         // E.g., if we have BODY (222) cached but client requests ARTICLE (220),
         // we need to fetch HEAD and combine them
-        if !cached.matches_command_type(command) {
+        let cmd_verb = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !cached.matches_command_type_verb(&cmd_verb) {
             debug!(
                 "Client {} cached response type (code={:?}) doesn't match command '{}', need to fetch",
                 self.client_addr,
                 cached.status_code().map(|c| c.as_u16()),
-                command.split_whitespace().next().unwrap_or(command)
+                cmd_verb
             );
             return Ok(None);
         }
