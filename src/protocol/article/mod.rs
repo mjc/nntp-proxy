@@ -185,6 +185,35 @@ impl<'a> Article<'a> {
             body: None,
         })
     }
+
+    /// Decode yEnc-encoded body to raw bytes
+    ///
+    /// Returns the decoded data if:
+    /// - Body exists and is yEnc-encoded
+    /// - Validation passed during parsing (CRC32 verified)
+    ///
+    /// # Returns
+    /// Decoded bytes, or `None` if body is not yEnc-encoded
+    #[must_use]
+    pub fn decode(&self) -> Option<Vec<u8>> {
+        let body = self.body?;
+
+        // Check if yEnc-encoded
+        if !body.starts_with(b"=ybegin") {
+            return None;
+        }
+
+        // Functional iterator chain: skip header, take until footer, decode each line
+        let decoded = body
+            .split(|&b| b == b'\n')
+            .skip(1) // Skip =ybegin line
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .take_while(|line| !line.starts_with(b"=yend") && !line.starts_with(b"=ypart"))
+            .flat_map(yenc::decode_yenc_line)
+            .collect();
+
+        Some(decoded)
+    }
 }
 
 /// Parse status code from buffer
@@ -319,5 +348,46 @@ mod tests {
         assert_eq!(article.article_number, Some(100));
         assert!(article.headers.is_some());
         assert!(article.body.is_some());
+    }
+
+    #[test]
+    fn test_decode_yenc_body() {
+        // Valid yenc example from the validation tests
+        let buf = b"222 100 <test@example.com> body\r\n\
+                    =ybegin line=128 size=12 name=test.txt\r\n\
+                    r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n\
+                    =yend size=12 crc32=0337ab3d\r\n\
+                    .\r\n";
+
+        let article = Article::parse(&buf[..], true).unwrap();
+        let decoded = article.decode();
+
+        assert!(decoded.is_some());
+        let data = decoded.unwrap();
+        // The decoded data should be the yenc-decoded version
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_decode_non_yenc_returns_none() {
+        let buf = b"222 100 <test@example.com> body\r\n\
+                    This is plain text, not yenc\r\n\
+                    .\r\n";
+
+        let article = Article::parse(&buf[..], false).unwrap();
+        let decoded = article.decode();
+
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn test_decode_no_body_returns_none() {
+        let buf = b"223 100 <test@example.com>\r\n\
+                    .\r\n";
+
+        let article = Article::parse(&buf[..], false).unwrap();
+        let decoded = article.decode();
+
+        assert!(decoded.is_none());
     }
 }

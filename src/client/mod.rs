@@ -1,231 +1,229 @@
 //! Standalone NNTP client for fetching articles
 //!
-//! This module provides a simple API for fetching articles from NNTP servers,
+//! This module provides a zero-allocation API for fetching articles from NNTP servers,
 //! independent of the proxy functionality. Useful for building downloaders,
 //! indexers, or testing tools.
 //!
 //! # Zero-Allocation Design
 //!
-//! The `*_into` methods accept a caller-provided buffer for zero allocations
-//! in the hot path. Reuse the same buffer across multiple fetches:
+//! Uses buffer pool for all allocations. Returns `PooledBuffer` - caller parses:
 //!
 //! ```no_run
 //! use nntp_proxy::client::NntpClient;
-//! use nntp_proxy::pool::DeadpoolConnectionProvider;
-//! use nntp_proxy::types::MessageId;
+//! use nntp_proxy::pool::{BufferPool, DeadpoolConnectionProvider};
+//! use nntp_proxy::protocol::Article;
+//! use nntp_proxy::types::BufferSize;
 //!
 //! # async fn example() -> anyhow::Result<()> {
+//! // Create connection pool
 //! let pool = DeadpoolConnectionProvider::with_tls_auth(
-//!     "news.example.com",
-//!     563,
-//!     "username",
-//!     "password",
+//!     "news.example.com", 563, "user", "pass"
 //! )?;
-//!
 //! let client = NntpClient::new(pool);
 //!
-//! // Pre-allocate buffer once, reuse for all fetches (ZERO ALLOCS in loop)
-//! let mut buffer = Vec::with_capacity(1024 * 1024); // 1MB initial
+//! // Create buffer pool once
+//! let buffer_pool = BufferPool::new(BufferSize::try_new(256 * 1024)?, 8);
 //!
-//! let article_ids = vec![
-//!     MessageId::from_str_or_wrap("article1@example.com")?,
-//!     MessageId::from_str_or_wrap("article2@example.com")?,
-//! ];
-//!
-//! for msg_id in &article_ids {
-//!     client.fetch_body_into(msg_id, &mut buffer).await?;
-//!     // Process buffer contents...
-//!     // buffer is cleared automatically on next fetch
+//! // Fetch returns buffer, caller parses
+//! for msg_id in message_ids {
+//!     let buffer = client.fetch_body(&msg_id, &buffer_pool).await?;
+//!     let article = Article::parse(&buffer, true)?;
+//!     if let Some(decoded) = article.decode() {
+//!         process(&decoded);
+//!     }
+//!     // Buffer returns to pool when dropped
 //! }
 //! # Ok(())
 //! # }
+//! # fn process(_: &[u8]) {}
+//! # let message_ids: Vec<String> = vec![];
 //! ```
 
 use anyhow::{Context, Result};
-use tokio::io::AsyncReadExt;
 
-use crate::constants::buffer::{POOL, POOL_COUNT};
-use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
 use crate::protocol::{article_by_msgid, body_by_msgid, head_by_msgid, stat_by_msgid};
 use crate::session::backend::send_command;
-use crate::types::{BufferSize, MessageId};
 
 /// NNTP multiline terminator
 const TERMINATOR: &[u8] = b"\r\n.\r\n";
 
 /// Standalone NNTP client for fetching articles
 ///
-/// Wraps a connection pool and provides high-level methods for common operations.
+/// Zero-allocation design using buffer pool.
+/// Returns `PooledBuffer` - caller parses with `Article::parse()`.
 #[derive(Clone)]
 pub struct NntpClient {
     pool: DeadpoolConnectionProvider,
-    buffer_pool: BufferPool,
 }
 
 impl NntpClient {
     /// Create a new client with the given connection pool
-    ///
-    /// Uses default buffer pool settings.
     #[must_use]
     pub fn new(pool: DeadpoolConnectionProvider) -> Self {
-        let buffer_size = BufferSize::try_new(POOL).expect("valid buffer size");
-        Self {
-            pool,
-            buffer_pool: BufferPool::new(buffer_size, POOL_COUNT),
-        }
+        Self { pool }
     }
 
-    /// Create a new client with custom buffer pool
-    #[must_use]
-    pub fn with_buffer_pool(pool: DeadpoolConnectionProvider, buffer_pool: BufferPool) -> Self {
-        Self { pool, buffer_pool }
-    }
-
-    /// Fetch article body by message-ID (BODY command)
+    /// Fetch article body (BODY command)
     ///
-    /// Returns the raw body bytes. For yEnc-encoded articles, you'll need to
-    /// decode with `yenc::decode_buffer()`.
+    /// Returns `PooledBuffer` with the raw response.
+    /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
-    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
-    ///
-    /// # Returns
-    /// Raw body bytes (may be yEnc encoded)
-    pub async fn fetch_body(&self, message_id: &MessageId<'_>) -> Result<Vec<u8>> {
-        let command = body_by_msgid(message_id.as_str());
-        self.fetch_multiline(&command).await
+    /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
+    /// * `buffer_pool` - Buffer pool for I/O and output
+    #[inline]
+    pub async fn fetch_body(
+        &self,
+        message_id: &str,
+        buffer_pool: &BufferPool,
+    ) -> Result<PooledBuffer> {
+        let command = body_by_msgid(message_id);
+        self.fetch_response(&command, buffer_pool).await
     }
 
-    /// Fetch article headers by message-ID (HEAD command)
+    /// Fetch article headers (HEAD command)
+    ///
+    /// Returns `PooledBuffer` with the raw response.
+    /// Parse with `Article::parse(&buffer, false)`.
     ///
     /// # Arguments
-    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
-    ///
-    /// # Returns
-    /// Raw header bytes
-    pub async fn fetch_head(&self, message_id: &MessageId<'_>) -> Result<Vec<u8>> {
-        let command = head_by_msgid(message_id.as_str());
-        self.fetch_multiline(&command).await
+    /// * `message_id` - Message-ID including angle brackets
+    /// * `buffer_pool` - Buffer pool for I/O and output
+    #[inline]
+    pub async fn fetch_head(
+        &self,
+        message_id: &str,
+        buffer_pool: &BufferPool,
+    ) -> Result<PooledBuffer> {
+        let command = head_by_msgid(message_id);
+        self.fetch_response(&command, buffer_pool).await
     }
 
-    /// Fetch full article by message-ID (ARTICLE command)
+    /// Fetch full article (ARTICLE command)
+    ///
+    /// Returns `PooledBuffer` with the raw response.
+    /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
-    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
-    ///
-    /// # Returns
-    /// Raw article bytes (headers + body)
-    pub async fn fetch_article(&self, message_id: &MessageId<'_>) -> Result<Vec<u8>> {
-        let command = article_by_msgid(message_id.as_str());
-        self.fetch_multiline(&command).await
+    /// * `message_id` - Message-ID including angle brackets
+    /// * `buffer_pool` - Buffer pool for I/O and output
+    #[inline]
+    pub async fn fetch_article(
+        &self,
+        message_id: &str,
+        buffer_pool: &BufferPool,
+    ) -> Result<PooledBuffer> {
+        let command = article_by_msgid(message_id);
+        self.fetch_response(&command, buffer_pool).await
     }
 
     /// Check if article exists (STAT command)
     ///
     /// # Arguments
-    /// * `message_id` - Validated message-ID (with angle brackets enforced at compile time)
+    /// * `message_id` - Message-ID including angle brackets
+    /// * `buffer_pool` - Caller-owned buffer pool for I/O operations
     ///
     /// # Returns
     /// `true` if article exists, `false` if 430 (not found)
-    pub async fn stat(&self, message_id: &MessageId<'_>) -> Result<bool> {
-        let command = stat_by_msgid(message_id.as_str());
+    pub async fn stat(&self, message_id: &str, buffer_pool: &BufferPool) -> Result<bool> {
+        let command = stat_by_msgid(message_id);
         let mut conn = self
             .pool
             .get_pooled_connection()
             .await
             .context("Failed to get connection from pool")?;
-        let mut buffer = self.buffer_pool.acquire().await;
+        let mut buffer = buffer_pool.acquire().await;
 
         let response = send_command(&mut *conn, &command, &mut buffer).await?;
 
-        match response.status_code() {
-            Some(223) => Ok(true),  // Article exists
-            Some(430) => Ok(false), // No such article
-            Some(code) => anyhow::bail!("Unexpected STAT response: {}", code),
-            None => anyhow::bail!("Invalid STAT response"),
-        }
+        response
+            .status_code()
+            .ok_or_else(|| anyhow::anyhow!("Invalid STAT response"))
+            .and_then(|code| match code {
+                223 => Ok(true),  // Article exists
+                430 => Ok(false), // No such article
+                _ => anyhow::bail!("Unexpected STAT response: {}", code),
+            })
     }
 
-    /// Internal: fetch a multiline response and return all bytes
-    async fn fetch_multiline(&self, command: &str) -> Result<Vec<u8>> {
+    /// Internal: fetch response into PooledBuffer
+    async fn fetch_response(
+        &self,
+        command: &str,
+        buffer_pool: &BufferPool,
+    ) -> Result<PooledBuffer> {
         let mut conn = self
             .pool
             .get_pooled_connection()
             .await
             .context("Failed to get connection from pool")?;
-        let mut buffer = self.buffer_pool.acquire().await;
+        let mut io_buffer = buffer_pool.acquire().await;
 
-        let response = send_command(&mut *conn, command, &mut buffer).await?;
+        let response = send_command(&mut *conn, command, &mut io_buffer).await?;
 
-        // Check for errors
-        match response.status_code() {
-            Some(430) => anyhow::bail!("Article not found (430)"),
-            Some(code) if code >= 400 => {
-                anyhow::bail!("Server error: {}", code)
-            }
-            None => anyhow::bail!("Invalid response from server"),
-            _ => {}
-        }
+        // Validate response - early return on errors
+        self.validate_response(&response)?;
 
+        // Single-line response - copy directly
         if !response.is_multiline {
-            // Single-line response, just return first line
-            return Ok(buffer[..response.bytes_read].to_vec());
+            let mut output = buffer_pool.acquire().await;
+            output.copy_from_slice(&io_buffer[..response.bytes_read]);
+            return Ok(output);
         }
 
-        // Read multiline response into buffer
-        self.read_multiline_to_vec(&mut *conn, &buffer[..response.bytes_read])
-            .await
+        // Multiline response - stream until terminator
+        let accumulated = self
+            .stream_until_terminator(&mut conn, &mut io_buffer, response.bytes_read)
+            .await?;
+
+        // Copy complete response to output buffer
+        let mut output = buffer_pool.acquire().await;
+        output.copy_from_slice(&accumulated);
+        Ok(output)
     }
 
-    /// Read remaining multiline response into a Vec
-    async fn read_multiline_to_vec<C>(&self, conn: &mut C, first_chunk: &[u8]) -> Result<Vec<u8>>
-    where
-        C: AsyncReadExt + Unpin,
-    {
-        // Pre-allocate with estimate
-        let mut result = Vec::with_capacity(first_chunk.len() * 4);
-        result.extend_from_slice(first_chunk);
+    /// Validate NNTP response status code
+    #[inline]
+    fn validate_response(&self, response: &crate::session::backend::CommandResponse) -> Result<()> {
+        match response.response.status_code() {
+            Some(code) if code.as_u16() == 430 => anyhow::bail!("Article not found (430)"),
+            Some(code) if code.as_u16() >= 400 => anyhow::bail!("Server error: {}", code),
+            None => anyhow::bail!("Invalid response from server"),
+            Some(_) => Ok(()),
+        }
+    }
 
-        // Check if first chunk already has terminator
-        if has_terminator(&result) {
-            strip_terminator(&mut result);
-            return Ok(result);
+    /// Stream multiline response until terminator
+    async fn stream_until_terminator(
+        &self,
+        conn: &mut crate::stream::ConnectionStream,
+        io_buffer: &mut PooledBuffer,
+        first_chunk_size: usize,
+    ) -> Result<Vec<u8>> {
+        let mut accumulated = Vec::with_capacity(first_chunk_size * 2);
+        accumulated.extend_from_slice(&io_buffer[..first_chunk_size]);
+
+        // Early return if first chunk contains terminator
+        if accumulated.ends_with(TERMINATOR) {
+            return Ok(accumulated);
         }
 
-        // Get a buffer for reading
-        let mut read_buffer = self.buffer_pool.acquire().await;
-
-        // Read remaining chunks
+        // Stream remaining chunks
         loop {
-            let n = read_buffer.read_from(conn).await?;
+            let n = io_buffer.read_from(conn).await?;
             if n == 0 {
                 break; // EOF
             }
 
-            result.extend_from_slice(&read_buffer[..n]);
+            accumulated.extend_from_slice(&io_buffer[..n]);
 
-            // Check for terminator at end
-            if has_terminator(&result) {
-                strip_terminator(&mut result);
+            if accumulated.ends_with(TERMINATOR) {
                 break;
             }
         }
 
-        Ok(result)
-    }
-}
-
-/// Check if buffer ends with NNTP terminator
-#[inline]
-fn has_terminator(data: &[u8]) -> bool {
-    data.ends_with(TERMINATOR)
-}
-
-/// Strip NNTP terminator from end of buffer
-#[inline]
-fn strip_terminator(data: &mut Vec<u8>) {
-    if data.ends_with(TERMINATOR) {
-        data.truncate(data.len() - TERMINATOR.len());
+        Ok(accumulated)
     }
 }
 
@@ -234,16 +232,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_has_terminator() {
-        assert!(has_terminator(b"data\r\n.\r\n"));
-        assert!(!has_terminator(b"data\r\n"));
-        assert!(!has_terminator(b"data"));
-    }
+    fn test_terminator_detection() {
+        let with_term = b"content\r\n.\r\n";
+        let without_term = b"content\r\n";
 
-    #[test]
-    fn test_strip_terminator() {
-        let mut data = b"content\r\n.\r\n".to_vec();
-        strip_terminator(&mut data);
-        assert_eq!(data, b"content");
+        assert!(with_term.ends_with(TERMINATOR));
+        assert!(!without_term.ends_with(TERMINATOR));
     }
 }
