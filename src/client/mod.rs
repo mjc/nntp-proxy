@@ -128,17 +128,18 @@ impl NntpClient {
     /// `true` if article exists, `false` if 430 (not found)
     pub async fn stat(&self, message_id: &str, buffer_pool: &BufferPool) -> Result<bool> {
         let command = stat_by_msgid(message_id);
-        let mut conn = self
-            .pool
-            .get_pooled_connection()
-            .await
-            .context("Failed to get connection from pool")?;
+        let mut conn = self.get_connection().await?;
         let mut buffer = buffer_pool.acquire().await;
 
         let response = send_command(&mut *conn, &command, &mut buffer).await?;
 
-        response
-            .status_code()
+        Self::parse_stat_response(response.status_code())
+    }
+
+    /// Parse STAT response code into existence check
+    #[inline]
+    fn parse_stat_response(status_code: Option<u16>) -> Result<bool> {
+        status_code
             .ok_or_else(|| anyhow::anyhow!("Invalid STAT response"))
             .and_then(|code| match code {
                 223 => Ok(true),  // Article exists
@@ -147,54 +148,97 @@ impl NntpClient {
             })
     }
 
+    /// Get a connection from the pool
+    #[inline]
+    async fn get_connection(
+        &self,
+    ) -> Result<impl std::ops::DerefMut<Target = crate::stream::ConnectionStream>> {
+        self.pool
+            .get_pooled_connection()
+            .await
+            .context("Failed to get connection from pool")
+    }
+
     /// Internal: fetch response into PooledBuffer
     async fn fetch_response(
         &self,
         command: &str,
         buffer_pool: &BufferPool,
     ) -> Result<PooledBuffer> {
-        let mut conn = self
-            .pool
-            .get_pooled_connection()
-            .await
-            .context("Failed to get connection from pool")?;
+        let mut conn = self.get_connection().await?;
         let mut io_buffer = buffer_pool.acquire().await;
 
         let response = send_command(&mut *conn, command, &mut io_buffer).await?;
 
         // Validate response - early return on errors
-        self.validate_response(&response)?;
+        Self::validate_response(&response)?;
 
-        // Single-line response - copy directly
-        if !response.is_multiline {
-            let mut output = buffer_pool.acquire().await;
-            output.copy_from_slice(&io_buffer[..response.bytes_read]);
-            return Ok(output);
+        // Handle based on response type
+        match response.is_multiline {
+            false => {
+                Self::handle_single_line_response(&io_buffer, response.bytes_read, buffer_pool)
+                    .await
+            }
+            true => {
+                self.handle_multiline_response(
+                    &mut conn,
+                    &mut io_buffer,
+                    response.bytes_read,
+                    buffer_pool,
+                )
+                .await
+            }
         }
+    }
 
-        // Multiline response - stream until terminator
+    /// Handle single-line response - copy directly to output buffer
+    #[inline]
+    async fn handle_single_line_response(
+        io_buffer: &PooledBuffer,
+        bytes_read: usize,
+        buffer_pool: &BufferPool,
+    ) -> Result<PooledBuffer> {
+        let mut output = buffer_pool.acquire().await;
+        output.copy_from_slice(&io_buffer[..bytes_read]);
+        Ok(output)
+    }
+
+    /// Handle multiline response - stream until terminator
+    async fn handle_multiline_response(
+        &self,
+        conn: &mut crate::stream::ConnectionStream,
+        io_buffer: &mut PooledBuffer,
+        first_chunk_size: usize,
+        buffer_pool: &BufferPool,
+    ) -> Result<PooledBuffer> {
         let accumulated = self
-            .stream_until_terminator(&mut conn, &mut io_buffer, response.bytes_read)
+            .stream_until_terminator(conn, io_buffer, first_chunk_size)
             .await?;
 
-        // Copy complete response to output buffer
         let mut output = buffer_pool.acquire().await;
         output.copy_from_slice(&accumulated);
         Ok(output)
     }
 
     /// Validate NNTP response status code
+    ///
+    /// Pure function - no side effects, easier to test
     #[inline]
-    fn validate_response(&self, response: &crate::session::backend::CommandResponse) -> Result<()> {
-        match response.response.status_code() {
-            Some(code) if code.as_u16() == 430 => anyhow::bail!("Article not found (430)"),
-            Some(code) if code.as_u16() >= 400 => anyhow::bail!("Server error: {}", code),
-            None => anyhow::bail!("Invalid response from server"),
-            Some(_) => Ok(()),
-        }
+    fn validate_response(response: &crate::session::backend::CommandResponse) -> Result<()> {
+        response
+            .response
+            .status_code()
+            .ok_or_else(|| anyhow::anyhow!("Invalid response from server"))
+            .and_then(|code| match code.as_u16() {
+                430 => anyhow::bail!("Article not found (430)"),
+                code if code >= 400 => anyhow::bail!("Server error: {}", code),
+                _ => Ok(()),
+            })
     }
 
     /// Stream multiline response until terminator
+    ///
+    /// Returns accumulated bytes including terminator
     async fn stream_until_terminator(
         &self,
         conn: &mut crate::stream::ConnectionStream,
@@ -205,25 +249,30 @@ impl NntpClient {
         accumulated.extend_from_slice(&io_buffer[..first_chunk_size]);
 
         // Early return if first chunk contains terminator
-        if accumulated.ends_with(TERMINATOR) {
+        if Self::has_terminator(&accumulated) {
             return Ok(accumulated);
         }
 
-        // Stream remaining chunks
-        loop {
-            let n = io_buffer.read_from(conn).await?;
+        // Stream remaining chunks until terminator or EOF
+        while let Ok(n) = io_buffer.read_from(conn).await {
             if n == 0 {
                 break; // EOF
             }
 
             accumulated.extend_from_slice(&io_buffer[..n]);
 
-            if accumulated.ends_with(TERMINATOR) {
+            if Self::has_terminator(&accumulated) {
                 break;
             }
         }
 
         Ok(accumulated)
+    }
+
+    /// Check if data contains NNTP multiline terminator
+    #[inline]
+    fn has_terminator(data: &[u8]) -> bool {
+        data.ends_with(TERMINATOR)
     }
 }
 
@@ -238,5 +287,55 @@ mod tests {
 
         assert!(with_term.ends_with(TERMINATOR));
         assert!(!without_term.ends_with(TERMINATOR));
+    }
+
+    #[test]
+    fn test_has_terminator() {
+        // Exact terminator
+        assert!(NntpClient::has_terminator(b"\r\n.\r\n"));
+
+        // Content with terminator at end
+        assert!(NntpClient::has_terminator(b"data\r\n.\r\n"));
+
+        // Terminator in middle (should not match - ends_with check)
+        assert!(!NntpClient::has_terminator(b"\r\n.\r\nmore"));
+
+        // No terminator
+        assert!(!NntpClient::has_terminator(b"data\r\n"));
+        assert!(!NntpClient::has_terminator(b""));
+
+        // Partial terminators
+        assert!(!NntpClient::has_terminator(b"\r\n."));
+        assert!(!NntpClient::has_terminator(b".\r\n"));
+    }
+
+    #[test]
+    fn test_parse_stat_response_success() {
+        // Article exists (223)
+        assert_eq!(NntpClient::parse_stat_response(Some(223)).unwrap(), true);
+
+        // Article not found (430)
+        assert_eq!(NntpClient::parse_stat_response(Some(430)).unwrap(), false);
+    }
+
+    #[test]
+    fn test_parse_stat_response_errors() {
+        // No status code
+        assert!(NntpClient::parse_stat_response(None).is_err());
+
+        // Unexpected codes
+        assert!(NntpClient::parse_stat_response(Some(500)).is_err());
+        assert!(NntpClient::parse_stat_response(Some(200)).is_err());
+        assert!(NntpClient::parse_stat_response(Some(400)).is_err());
+    }
+
+    // Note: validate_response tests require integration testing with real CommandResponse
+    // objects - they are covered by integration tests in tests/ directory
+
+    #[test]
+    fn test_terminator_constant() {
+        // Verify TERMINATOR constant is correct
+        assert_eq!(TERMINATOR, b"\r\n.\r\n");
+        assert_eq!(TERMINATOR.len(), 5);
     }
 }
