@@ -418,6 +418,31 @@ impl DeadpoolConnectionProvider {
             .map_err(|e| anyhow::anyhow!("Failed to get connection from {}: {}", self.name, e))
     }
 
+    /// Clear all idle connections from the pool
+    ///
+    /// This drops all idle connections by resizing the pool to 0 and back.
+    /// Active (checked-out) connections are not affected - they will be discarded
+    /// when returned instead of being recycled.
+    ///
+    /// Use this to clear potentially stale connections after an idle period.
+    pub fn clear_idle_connections(&self) {
+        let max_size = self.pool.status().max_size;
+        let available = self.pool.status().available;
+
+        if available > 0 {
+            debug!(
+                pool = %self.name,
+                available = available,
+                "Clearing idle connections from pool"
+            );
+
+            // Resize to 0 drops all idle connections
+            self.pool.resize(0);
+            // Resize back to original allows new connections
+            self.pool.resize(max_size);
+        }
+    }
+
     /// Get the maximum pool size
     #[must_use]
     #[inline]

@@ -2,6 +2,25 @@
 //!
 //! This module provides article caching with per-backend availability tracking.
 //!
+//! # NNTP Response Semantics (CRITICAL)
+//!
+//! **430 "No Such Article" is AUTHORITATIVE** - NNTP servers NEVER give false negatives.
+//! If a server returns 430, the article is definitively not present on that server.
+//! This is a fundamental property of NNTP: servers only return 430 when they are
+//! certain they don't have the article.
+//!
+//! **2xx success responses are UNRELIABLE** - servers CAN give false positives.
+//! A server might return 220/222/223 but then provide:
+//! - Corrupt or incomplete article data
+//! - Truncated responses due to connection issues
+//! - Stale data that gets cleaned up moments later
+//!
+//! **Therefore: 430 (missing) ALWAYS takes precedence over "has" state.**
+//! - When merging availability info, 430s accumulate and never get cleared
+//! - A previous "has" can be overwritten by a later 430
+//! - A previous 430 should NOT be overwritten by a later "has"
+//! - Cache entries with 430 persist until TTL expiry
+//!
 //! **BACKEND LIMIT**: Maximum 8 backends supported due to u8 bitset optimization.
 //! This limit is enforced at config validation time.
 
@@ -67,6 +86,11 @@ impl ArticleAvailability {
 
     /// Record that a backend returned 430 (doesn't have the article)
     ///
+    /// # NNTP Semantics
+    /// **430 is AUTHORITATIVE** - this is a definitive "no". Once marked missing,
+    /// the backend should not be retried for this article until cache TTL expires.
+    /// See module-level docs for full explanation.
+    ///
     /// # Panics (debug builds only)
     /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
     #[inline]
@@ -83,7 +107,13 @@ impl ArticleAvailability {
         self
     }
 
-    /// Record that a backend successfully provided the article (clear the missing flag)
+    /// Record that a backend returned a success response (2xx) for this article
+    ///
+    /// # NNTP Semantics Warning
+    /// **2xx responses are UNRELIABLE** - servers can give false positives.
+    /// This clears the missing bit for fresh `ArticleAvailability` instances,
+    /// but when merged via `merge_from()`, existing 430s take precedence.
+    /// See module-level docs for full explanation.
     ///
     /// # Panics (debug builds only)
     /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
@@ -105,8 +135,22 @@ impl ArticleAvailability {
     ///
     /// Used to sync local availability tracking back to cache.
     /// Takes the union of checked backends and missing backends.
+    ///
+    /// # NNTP Semantics (CRITICAL)
+    ///
+    /// **430 responses are AUTHORITATIVE** - NNTP servers NEVER give false negatives.
+    /// If a server says "no such article" (430), the article is definitively not there.
+    ///
+    /// **2xx responses are UNRELIABLE** - servers CAN give false positives.
+    /// A server might claim to have an article but return corrupt data, or the
+    /// article might be incomplete/unavailable due to propagation delays.
+    ///
+    /// Therefore: `missing` state ALWAYS wins over `has` state.
+    /// We trust 430s absolutely but treat successes with skepticism.
     #[inline]
     pub fn merge_from(&mut self, other: &Self) {
+        // Simple union: trust all 430s from both sources
+        // 430 is authoritative, so missing bits should accumulate
         self.checked |= other.checked;
         self.missing |= other.missing;
     }
@@ -435,31 +479,42 @@ impl ArticleCache {
             .max_capacity(max_capacity)
             .time_to_live(ttl)
             .weigher(move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
-                // Calculate memory footprint with moka internal overhead correction.
+                // Calculate actual memory footprint for accurate capacity tracking.
                 //
-                // Key insight: Use `is_complete_article()` to determine multiplier, not buffer size.
-                // A "complete" article has actual content (headers + body + terminator).
-                // A "stub" has only metadata like status code and message-ID.
+                // Memory layout per cache entry:
                 //
-                // Complete articles: Use actual size (no multiplier)
-                // - We know the exact content, so overhead is predictable
+                // Key: Arc<str>
+                //   - Arc control block: 16 bytes (strong_count + weak_count)
+                //   - String data: key.len() bytes
+                //   - Allocator overhead: ~16 bytes (malloc metadata, alignment)
                 //
-                // Stubs: Apply 2.5x multiplier
-                // - Overhead dominates for small entries
-                // - Accounts for moka internal structures, allocator overhead, padding
-                let key_size = 8 + key.len();
-                let buffer_size = entry.buffer().len();
-                let entry_overhead = 10 + 24 + 200; // ~234 bytes
-                let base_size = key_size + buffer_size + entry_overhead;
+                // Value: ArticleEntry
+                //   - Struct inline: 16 bytes (ArticleAvailability: 2 + padding: 6 + Arc ptr: 8)
+                //   - Arc<Vec<u8>> control block: 16 bytes
+                //   - Vec<u8> struct: 24 bytes (ptr + len + capacity)
+                //   - Vec data: buffer.len() bytes
+                //   - Allocator overhead: ~32 bytes (two allocations: Arc+Vec, Vec data)
+                //
+                // Moka internal per-entry: ~200 bytes
+                //   - Hash bucket entry, pointers, TTL tracking, LRU links
+                //
+                const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
+                const ENTRY_STRUCT: usize = 16; // ArticleEntry inline size
+                const ARC_VEC_OVERHEAD: usize = 16 + 24 + 32; // Arc + Vec struct + allocator
+                const MOKA_OVERHEAD: usize = 200; // moka internal structures
 
+                let key_size = ARC_STR_OVERHEAD + key.len();
+                let buffer_size = ARC_VEC_OVERHEAD + entry.buffer().len();
+                let base_size = key_size + buffer_size + ENTRY_STRUCT + MOKA_OVERHEAD;
+
+                // Stubs (availability-only entries) have higher relative overhead
+                // due to allocator fragmentation on small allocations.
+                // Complete articles are dominated by content size, so no multiplier needed.
                 let weighted_size = if entry.is_complete_article() {
-                    // Complete article (has content): use actual size + overhead
-                    // No multiplier needed - content dominates total memory
                     base_size
                 } else {
-                    // Stub (only metadata): apply 2.5x multiplier
-                    // Overhead is 2-3x the actual stub size
-                    (base_size as f64 * 2.5) as usize
+                    // Small allocations have ~50% more overhead from allocator fragmentation
+                    (base_size * 3) / 2
                 };
 
                 weighted_size.try_into().unwrap_or(u32::MAX)
@@ -874,6 +929,102 @@ mod tests {
         avail.record_has(b0);
         assert!(!avail.is_missing(b0));
         assert!(avail.any_backend_has_article());
+    }
+
+    #[test]
+    fn test_merge_from_430_overrides_has() {
+        // NNTP SEMANTICS:
+        // - 430 "No Such Article" is AUTHORITATIVE - servers NEVER give false negatives
+        // - 2xx success is UNRELIABLE - servers CAN give false positives
+        // Therefore: 430 always wins over previous "has" state
+        let mut cache_entry = ArticleAvailability::new();
+        let b0 = BackendId::from_index(0);
+        let b1 = BackendId::from_index(1);
+
+        // Previous request got success from backend 0 (might be false positive)
+        cache_entry.record_has(b0);
+        assert!(!cache_entry.is_missing(b0));
+        assert!(cache_entry.any_backend_has_article());
+
+        // Later request gets 430 from backend 0 (AUTHORITATIVE)
+        let mut new_result = ArticleAvailability::new();
+        new_result.record_missing(b0); // 430 is definitive
+        new_result.record_missing(b1); // Backend 1 also returned 430
+
+        // Merge new results into cache entry
+        cache_entry.merge_from(&new_result);
+
+        // CRITICAL: 430 is authoritative, so it MUST override the previous "has"
+        // The earlier success might have been a false positive (corrupt data, etc.)
+        assert!(
+            cache_entry.is_missing(b0),
+            "430 must override previous has - 430 is authoritative"
+        );
+        assert!(!cache_entry.any_backend_has_article());
+
+        // Backend 1 should also be marked as missing
+        assert!(
+            cache_entry.is_missing(b1),
+            "Backend 1 should be marked missing"
+        );
+    }
+
+    #[test]
+    fn test_merge_from_can_add_new_missing() {
+        let mut avail1 = ArticleAvailability::new();
+        let mut avail2 = ArticleAvailability::new();
+
+        // avail1 knows backend 0 is missing
+        avail1.record_missing(BackendId::from_index(0));
+
+        // avail2 knows backend 1 is missing
+        avail2.record_missing(BackendId::from_index(1));
+
+        // Merge avail2 into avail1
+        avail1.merge_from(&avail2);
+
+        // avail1 should now know both are missing
+        assert!(avail1.is_missing(BackendId::from_index(0)));
+        assert!(avail1.is_missing(BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn test_merge_from_has_does_not_clear_missing() {
+        // NNTP SEMANTICS:
+        // - 430 is AUTHORITATIVE - if server says "no", article is NOT there
+        // - 2xx is UNRELIABLE - server might lie (corrupt data, propagation issues)
+        // Therefore: "has" from new fetch should NOT clear existing 430
+        let mut cache_state = ArticleAvailability::new();
+        let b0 = BackendId::from_index(0);
+        let b1 = BackendId::from_index(1);
+
+        // Cache says both backends returned 430 (authoritative)
+        cache_state.record_missing(b0);
+        cache_state.record_missing(b1);
+        assert!(cache_state.is_missing(b0));
+        assert!(cache_state.is_missing(b1));
+        assert!(!cache_state.any_backend_has_article());
+
+        // New request claims success from backend 0 (but 2xx is unreliable!)
+        let mut new_fetch = ArticleAvailability::new();
+        new_fetch.record_has(b0);
+
+        // Merge new fetch into cache
+        cache_state.merge_from(&new_fetch);
+
+        // Backend 0 should STILL be missing - we trust the 430 over the 2xx
+        // because 2xx can be false positive but 430 is never false negative
+        assert!(
+            cache_state.is_missing(b0),
+            "2xx should NOT override 430 - 430 is authoritative"
+        );
+        assert!(!cache_state.any_backend_has_article());
+
+        // Backend 1 is still missing
+        assert!(
+            cache_state.is_missing(b1),
+            "Backend 1 should still be missing"
+        );
     }
 
     #[test]

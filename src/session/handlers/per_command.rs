@@ -500,16 +500,15 @@ impl ClientSession {
             router.backend_count().get()
         );
 
-        // EARLY RETURN: If cache says all backends already returned 430, don't waste time
-        if availability.all_exhausted(router.backend_count()) {
-            debug!(
-                "Client {} cache shows all backends exhausted for {:?}, returning 430 immediately",
-                self.client_addr, msg_id
-            );
-            self.send_430_to_client(client_write, backend_to_client_bytes)
-                .await?;
-            return Ok(crate::types::BackendId::from_index(0));
-        }
+        // NOTE: We do NOT early-return on cached all_exhausted() here!
+        // Cached 430s can become stale if:
+        // - Backends come back online after being down
+        // - New articles arrive on backends
+        // - Cache entry is old (close to TTL expiration)
+        //
+        // Always try at least one backend to validate cached 430 is still accurate.
+        // The availability tracking will still skip backends we know returned 430,
+        // but we'll try at least one to verify the article really doesn't exist.
 
         // Track last backend tried for metrics/return value
         let mut last_backend: Option<crate::types::BackendId> = None;
@@ -611,6 +610,9 @@ impl ClientSession {
     }
 
     /// Try executing command on next available backend
+    ///
+    /// If the pooled connection is stale (connection error), automatically retries
+    /// with a fresh connection before returning an error.
     #[allow(clippy::too_many_arguments)]
     async fn try_backend_for_article(
         &self,
@@ -633,64 +635,89 @@ impl ClientSession {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        // Execute command
-        let mut conn = provider.get_pooled_connection().await?;
+        // Try up to 2 times - handles stale pooled connections
+        for attempt in 0..2 {
+            // Execute command
+            let mut conn = provider.get_pooled_connection().await?;
 
-        // Execute command without timeout
-        let (n, response_code, is_multiline, ttfb, send, recv) = self
-            .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
-            .await?;
+            // Execute command without timeout
+            let result = self
+                .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
+                .await;
 
-        self.record_timing_metrics(backend_id, ttfb, send, recv);
-        *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+            let (n, response_code, is_multiline, ttfb, send, recv) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Connection error - remove stale connection and retry once
+                    crate::pool::remove_from_pool(conn);
+                    if attempt == 0 {
+                        debug!(
+                            "Client {} stale connection to backend {}, retrying with fresh connection",
+                            self.client_addr,
+                            backend_id.as_index()
+                        );
+                        continue;
+                    }
+                    // Second attempt also failed - propagate error
+                    return Err(e);
+                }
+            };
 
-        // Handle 430 - article not found
-        // Note: response is already read into buffer, keeping connection clean
-        if self.is_430_response(&response_code) {
-            self.handle_430_response(backend_id, router.clone(), availability);
-            return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
-        }
+            self.record_timing_metrics(backend_id, ttfb, send, recv);
+            *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
-        // Success - stream response
-        let bytes_written = match self
-            .stream_response_to_client(
-                &mut conn,
-                client_write,
+            // Handle 430 - article not found
+            // Note: response is already read into buffer, keeping connection clean
+            if self.is_430_response(&response_code) {
+                self.handle_430_response(backend_id, router.clone(), availability);
+                return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
+            }
+
+            // Success - stream response
+            let bytes_written = match self
+                .stream_response_to_client(
+                    &mut conn,
+                    client_write,
+                    backend_id,
+                    command,
+                    msg_id,
+                    &response_code,
+                    is_multiline,
+                    &buffer[..n],
+                    n,
+                )
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // Only mark as backend error if it's NOT a client disconnect
+                    // Client disconnects should not penalize the backend
+                    if !crate::session::error_classification::ErrorClassifier::is_client_disconnect(
+                        &e,
+                    ) {
+                        self.handle_backend_error(backend_id, &router);
+                    }
+                    crate::pool::remove_from_pool(conn);
+                    return Err(e);
+                }
+            };
+
+            self.record_response_metrics(
                 backend_id,
-                command,
-                msg_id,
                 &response_code,
                 is_multiline,
-                &buffer[..n],
-                n,
-            )
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                // Only mark as backend error if it's NOT a client disconnect
-                // Client disconnects should not penalize the backend
-                if !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&e)
-                {
-                    self.handle_backend_error(backend_id, &router);
-                }
-                crate::pool::remove_from_pool(conn);
-                return Err(e);
-            }
-        };
+                command.len() as u64,
+                bytes_written,
+            );
 
-        self.record_response_metrics(
-            backend_id,
-            &response_code,
-            is_multiline,
-            command.len() as u64,
-            bytes_written,
-        );
+            return Ok(BackendAttemptResult::Success {
+                backend_id,
+                bytes_written,
+            });
+        }
 
-        Ok(BackendAttemptResult::Success {
-            backend_id,
-            bytes_written,
-        })
+        // Should not reach here, but handle gracefully
+        Ok(BackendAttemptResult::BackendUnavailable)
     }
 
     /// Execute command on backend and read first chunk
@@ -788,6 +815,10 @@ impl ClientSession {
     }
 
     /// Handle 430 response - update local availability tracker
+    ///
+    /// # NNTP Semantics
+    /// 430 "No Such Article" is AUTHORITATIVE - the backend definitively does not
+    /// have this article. See `crate::cache::article` module docs for full explanation.
     ///
     /// Note: Cache sync happens ONCE at end of retry loop via sync_availability,
     /// not here. This avoids spawning async tasks for each 430.
