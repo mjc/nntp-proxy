@@ -152,9 +152,10 @@ async fn test_cache_different_message_id_formats() -> Result<()> {
 /// Test cache stats reporting
 #[tokio::test]
 async fn test_cache_stats() -> Result<()> {
-    // Increased capacity to account for corrected weigher (2.5x correction factor)
-    // Each 1KB entry now weighs ~3.2KB after correction, so 10 entries need ~32KB
-    let cache = Arc::new(ArticleCache::new(40000, Duration::from_secs(300), true));
+    // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
+    // Each 1KB entry weighs approx (1024 + 68 + 40 + 2000) * 2.5 ≈ 7830 bytes
+    // So 10 entries need ~78KB capacity
+    let cache = Arc::new(ArticleCache::new(100_000, Duration::from_secs(300), true));
 
     // Initially empty
     let stats = cache.stats().await;

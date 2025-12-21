@@ -495,13 +495,21 @@ impl ArticleCache {
                 //   - Vec data: buffer.len() bytes
                 //   - Allocator overhead: ~32 bytes (two allocations: Arc+Vec, Vec data)
                 //
-                // Moka internal per-entry: ~200 bytes
-                //   - Hash bucket entry, pointers, TTL tracking, LRU links
+                // Moka internal per-entry overhead is MUCH larger than the data itself:
+                //   - Key stored twice: Bucket.key AND ValueEntry.info.key_hash.key
+                //   - EntryInfo<K> struct: ~72 bytes (atomics, timestamps, counters)
+                //   - LRU deque nodes and frequency sketch entries
+                //   - Timer wheel entries for TTL tracking
+                //   - crossbeam-epoch deferred garbage (can retain 2x entries)
+                //   - HashMap segments with open addressing (~2x load factor)
+                //
+                // Empirical testing shows ~10x actual RSS vs weighted_size().
+                // Our observed ratio: 362MB RSS / 36MB weighted = 10x
                 //
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
                 const ENTRY_STRUCT: usize = 16; // ArticleEntry inline size
                 const ARC_VEC_OVERHEAD: usize = 16 + 24 + 32; // Arc + Vec struct + allocator
-                const MOKA_OVERHEAD: usize = 200; // moka internal structures
+                const MOKA_OVERHEAD: usize = 2000; // moka internal structures (empirically measured)
 
                 let key_size = ARC_STR_OVERHEAD + key.len();
                 let buffer_size = ARC_VEC_OVERHEAD + entry.buffer().len();
@@ -552,7 +560,11 @@ impl ArticleCache {
         result
     }
 
-    /// Upsert cache entry (insert or update)
+    /// Upsert cache entry (insert or update) - ATOMIC OPERATION
+    ///
+    /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
+    /// This eliminates the race condition of separate get() + insert() calls
+    /// and provides key-level locking for concurrent operations.
     ///
     /// If entry exists: updates the entry and marks backend as having the article
     /// If entry doesn't exist: inserts new entry
@@ -567,121 +579,52 @@ impl ArticleCache {
         buffer: Vec<u8>,
         backend_id: BackendId,
     ) {
-        use tracing::debug;
-
         let key: Arc<str> = message_id.without_brackets().into();
+        let cache_articles = self.cache_articles;
 
-        if let Some(mut existing) = self.cache.get(key.as_ref()).await {
-            // Entry exists - decide whether to update buffer
-            // Use is_complete_article() to determine replacement strategy:
-            // - Stub → Complete: Always replace (complete is better)
-            // - Complete → Stub: Never replace (keep complete)
-            // - Complete → Complete: Keep larger (more headers/body)
-            // - Stub → Stub: Use size comparison
-            let existing_complete = existing.is_complete_article();
-            let new_complete = {
-                // Check if new buffer is complete without creating full entry
-                buffer.len() >= 30 && buffer.ends_with(b".\r\n")
-            };
-
-            let should_replace = match (existing_complete, new_complete) {
-                (false, true) => {
-                    debug!(
-                        "upsert: replacing stub for {} with complete article",
-                        message_id
-                    );
-                    true
-                }
-                (true, false) => {
-                    debug!(
-                        "upsert: keeping existing complete article for {}, ignoring stub",
-                        message_id
-                    );
-                    false
-                }
-                (true, true) => {
-                    // Both complete - keep the larger one (more content)
-                    if buffer.len() > existing.buffer.len() {
-                        debug!(
-                            "upsert: replacing article for {} ({} -> {} bytes)",
-                            message_id,
-                            existing.buffer.len(),
-                            buffer.len()
-                        );
-                        true
-                    } else {
-                        debug!(
-                            "upsert: keeping existing article for {} ({} bytes >= new {} bytes)",
-                            message_id,
-                            existing.buffer.len(),
-                            buffer.len()
-                        );
-                        false
-                    }
-                }
-                (false, false) => {
-                    // Both stubs - use size comparison
-                    if buffer.len() > existing.buffer.len() {
-                        debug!(
-                            "upsert: replacing stub for {} ({} -> {} bytes)",
-                            message_id,
-                            existing.buffer.len(),
-                            buffer.len()
-                        );
-                        true
-                    } else {
-                        debug!(
-                            "upsert: keeping existing stub for {} ({} bytes >= new {} bytes)",
-                            message_id,
-                            existing.buffer.len(),
-                            buffer.len()
-                        );
-                        false
-                    }
-                }
-            };
-
-            if should_replace {
-                existing.buffer = Arc::new(buffer);
-            }
-
-            // Mark this backend as successfully having the article
-            let (before_checked, before_missing) = (
-                existing.backend_availability.checked_bits(),
-                existing.backend_availability.missing_bits(),
-            );
-            debug!(
-                "upsert: article {} already cached, marking backend {} as HAS (before: checked={:08b}, missing={:08b})",
-                message_id,
-                backend_id.as_index(),
-                before_checked,
-                before_missing
-            );
-            existing.record_backend_has(backend_id);
-            let (after_checked, after_missing) = (
-                existing.backend_availability.checked_bits(),
-                existing.backend_availability.missing_bits(),
-            );
-            debug!(
-                "upsert: after record_backend_has: checked={:08b}, missing={:08b}",
-                after_checked, after_missing
-            );
-            // Re-insert to refresh TTL
-            self.cache.insert(key, existing).await;
+        // Prepare the new buffer outside the closure for stub extraction
+        let new_buffer = if cache_articles {
+            buffer
         } else {
-            // Create new entry - strip to stub if not caching bodies
-            let storage_buffer = if self.cache_articles {
-                buffer
-            } else {
-                // Extract status code and create minimal stub
-                self.create_minimal_stub(&buffer)
-            };
-            let mut entry = ArticleEntry::new(storage_buffer);
-            // Mark the backend that successfully provided this article
-            entry.record_backend_has(backend_id);
-            // New entries start with this backend marked as having it
-            self.cache.insert(key, entry).await;
-        }
+            self.create_minimal_stub(&buffer)
+        };
+
+        // Use atomic upsert - this provides key-level locking and eliminates
+        // the race condition between get() and insert() calls
+        self.cache
+            .entry(key)
+            .and_upsert_with(|maybe_entry| {
+                let new_entry = if let Some(existing) = maybe_entry {
+                    let mut entry = existing.into_value();
+
+                    // Decide whether to update buffer based on completeness
+                    let existing_complete = entry.is_complete_article();
+                    let new_complete = new_buffer.len() >= 30 && new_buffer.ends_with(b".\r\n");
+
+                    let should_replace = match (existing_complete, new_complete) {
+                        (false, true) => true,  // Stub → Complete: Always replace
+                        (true, false) => false, // Complete → Stub: Never replace
+                        (true, true) => new_buffer.len() > entry.buffer.len(), // Both complete: larger wins
+                        (false, false) => new_buffer.len() > entry.buffer.len(), // Both stubs: larger wins
+                    };
+
+                    if should_replace {
+                        entry.buffer = Arc::new(new_buffer.clone());
+                    }
+
+                    // Mark backend as having the article
+                    entry.record_backend_has(backend_id);
+                    entry
+                } else {
+                    // New entry
+                    let mut entry = ArticleEntry::new(new_buffer.clone());
+                    entry.record_backend_has(backend_id);
+                    entry
+                };
+
+                std::future::ready(new_entry)
+            })
+            .await;
     }
 
     /// Create minimal stub from response buffer
@@ -704,7 +647,11 @@ impl ArticleCache {
         b"200\r\n".to_vec()
     }
 
-    /// Record that a backend returned 430 for this article
+    /// Record that a backend returned 430 for this article - ATOMIC OPERATION
+    ///
+    /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
+    /// This eliminates the race condition of separate get() + insert() calls
+    /// and provides key-level locking for concurrent operations.
     ///
     /// If the article is already cached, updates the availability bitset.
     /// If not cached, creates a new cache entry with a 430 stub.
@@ -719,42 +666,39 @@ impl ArticleCache {
         backend_id: BackendId,
     ) {
         let key: Arc<str> = message_id.without_brackets().into();
+        let misses = &self.misses;
 
-        if let Some(mut entry) = self.cache.get(key.as_ref()).await {
-            // Article already cached - update availability
-            use tracing::debug;
-            let (before_checked, before_missing) = (
-                entry.backend_availability.checked_bits(),
-                entry.backend_availability.missing_bits(),
-            );
-            debug!(
-                "record_backend_missing: article {} already cached, marking backend {} as MISSING (before: checked={:08b}, missing={:08b})",
-                message_id,
-                backend_id.as_index(),
-                before_checked,
-                before_missing
-            );
-            entry.record_backend_missing(backend_id);
-            let (after_checked, after_missing) = (
-                entry.backend_availability.checked_bits(),
-                entry.backend_availability.missing_bits(),
-            );
-            debug!(
-                "record_backend_missing: after: checked={:08b}, missing={:08b}",
-                after_checked, after_missing
-            );
-            self.cache.insert(key, entry).await;
-        } else {
-            // First 430 for this article - create cache entry with minimal stub
-            // The stub just needs a valid 430 status code for status_code() method
-            let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
-            entry.record_backend_missing(backend_id);
-            self.cache.insert(key, entry).await;
-            self.misses.fetch_add(1, Ordering::Relaxed);
+        // Use atomic upsert - this provides key-level locking
+        let entry = self
+            .cache
+            .entry(key)
+            .and_upsert_with(|maybe_entry| {
+                let new_entry = if let Some(existing) = maybe_entry {
+                    let mut entry = existing.into_value();
+                    entry.record_backend_missing(backend_id);
+                    entry
+                } else {
+                    // First 430 for this article - create cache entry with minimal stub
+                    let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
+                    entry.record_backend_missing(backend_id);
+                    entry
+                };
+
+                std::future::ready(new_entry)
+            })
+            .await;
+
+        // Track misses for new entries
+        if entry.is_fresh() {
+            misses.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// Sync availability state from local tracker to cache
+    /// Sync availability state from local tracker to cache - ATOMIC OPERATION
+    ///
+    /// Uses moka's `entry().and_compute_with()` for atomic get-modify-store.
+    /// This eliminates the race condition of separate get() + insert() calls
+    /// and provides key-level locking for concurrent operations.
     ///
     /// This is called ONCE at the end of a retry loop to persist all the
     /// backends that returned 430 during this request. Much more efficient
@@ -768,31 +712,48 @@ impl ArticleCache {
         message_id: MessageId<'a>,
         availability: &ArticleAvailability,
     ) {
+        use moka::ops::compute::Op;
+
         // Only sync if we actually tried some backends
         if availability.checked_bits() == 0 {
             return;
         }
 
         let key: Arc<str> = message_id.without_brackets().into();
+        let availability = *availability; // Copy for the closure
+        let misses = &self.misses;
 
-        if let Some(mut entry) = self.cache.get(key.as_ref()).await {
-            // Merge availability into existing entry
-            entry.backend_availability.merge_from(availability);
-            self.cache.insert(key, entry).await;
-        } else {
-            // No existing entry - only create a 430 stub if ALL backends returned 430
-            // If any backend has the article, skip this - the upsert will create the real entry
-            if availability.any_backend_has_article() {
-                // A backend successfully provided the article.
-                // Don't create a 430 stub - let upsert() handle it with the real article data.
-                return;
-            }
+        // Use atomic compute - allows us to conditionally insert/update
+        let result = self
+            .cache
+            .entry(key)
+            .and_compute_with(|maybe_entry| {
+                let op = if let Some(existing) = maybe_entry {
+                    // Merge availability into existing entry
+                    let mut entry = existing.into_value();
+                    entry.backend_availability.merge_from(&availability);
+                    Op::Put(entry)
+                } else {
+                    // No existing entry - only create a 430 stub if ALL backends returned 430
+                    if availability.any_backend_has_article() {
+                        // A backend successfully provided the article.
+                        // Don't create a 430 stub - let upsert() handle it with the real article data.
+                        Op::Nop
+                    } else {
+                        // All checked backends returned 430 - create stub to track this
+                        let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
+                        entry.backend_availability = availability;
+                        Op::Put(entry)
+                    }
+                };
 
-            // All checked backends returned 430 - create stub to track this
-            let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
-            entry.backend_availability = *availability;
-            self.cache.insert(key, entry).await;
-            self.misses.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(op)
+            })
+            .await;
+
+        // Track misses for new entries
+        if matches!(result, moka::ops::compute::CompResult::Inserted(_)) {
+            misses.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1495,8 +1456,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_weigher_small_stubs() {
-        // Test that small stubs use the 2.5x multiplier
-        let cache = ArticleCache::new(100_000, Duration::from_secs(300), false); // 100KB capacity
+        // Test that small stubs account for moka internal overhead correctly
+        // With MOKA_OVERHEAD = 2000 bytes (based on empirical 10x memory ratio from moka issue #473)
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), false); // 1MB capacity
 
         // Create small stub (53 bytes)
         let stub = b"223 0 <test@example.com>\r\n".to_vec();
@@ -1506,11 +1468,13 @@ mod tests {
         cache.insert(msgid, article).await;
         cache.sync().await;
 
-        // With 2.5x multiplier: (53 + 234 overhead) * 2.5 ≈ 717 bytes per stub
-        // 100KB capacity should fit ~140 stubs
+        // With MOKA_OVERHEAD = 2000: stub + Arc + availability + overhead
+        // ~53 + 68 + 40 + 2000 = ~2161 bytes per small stub
+        // With 2.5x small stub multiplier: ~5400 bytes per stub
+        // 1MB capacity should fit ~185 stubs
 
         // Insert many small stubs
-        for i in 2..=150 {
+        for i in 2..=200 {
             let msgid_str = format!("<stub{}@example.com>", i);
             let msgid = MessageId::new(msgid_str).unwrap();
             let stub = format!("223 0 {}\r\n", msgid.as_str());
@@ -1523,10 +1487,10 @@ mod tests {
         cache.sync().await;
 
         let stats = cache.stats().await;
-        // Should be able to fit ~120-140 small stubs
+        // Should be able to fit ~150-185 small stubs in 1MB
         assert!(
             stats.entry_count >= 100,
-            "Cache should fit many small stubs with 2.5x multiplier (got {})",
+            "Cache should fit many small stubs (got {})",
             stats.entry_count
         );
     }

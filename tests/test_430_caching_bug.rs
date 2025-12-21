@@ -107,8 +107,10 @@ async fn test_430_increments_4xx_metrics() {
 /// Test cache growth with missing articles
 #[tokio::test]
 async fn test_cache_grows_with_430_responses() {
-    // Use larger capacity to avoid eviction during test
-    let cache = ArticleCache::new(100_000, Duration::from_secs(300), true);
+    // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
+    // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes
+    // So 100 entries need ~528KB capacity
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
 
     // Initial stats
     let stats = cache.stats().await;
@@ -142,8 +144,10 @@ async fn test_cache_grows_with_430_responses() {
 /// Regression test: Verify bug symptoms are fixed
 #[tokio::test]
 async fn test_regression_bug_symptoms_fixed() {
-    // Use larger capacity to hold all entries
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
+    // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes
+    // So 500 entries need ~2.64MB capacity
+    let cache = ArticleCache::new(5_000_000, Duration::from_secs(300), true);
     let metrics = MetricsCollector::new(2);
 
     // Simulate SABnzbd requesting hundreds of missing articles
