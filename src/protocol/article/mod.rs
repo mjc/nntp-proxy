@@ -188,31 +188,57 @@ impl<'a> Article<'a> {
 
     /// Decode yEnc-encoded body to raw bytes
     ///
-    /// Returns the decoded data if:
-    /// - Body exists and is yEnc-encoded
-    /// - Validation passed during parsing (CRC32 verified)
+    /// This method allocates a new `Vec<u8>` for each call. For hot paths where
+    /// articles are frequently decoded, prefer [`Article::decode_into`] to
+    /// reuse a caller-provided buffer and avoid per-call allocations.
     ///
     /// # Returns
     /// Decoded bytes, or `None` if body is not yEnc-encoded
     #[must_use]
     pub fn decode(&self) -> Option<Vec<u8>> {
-        let body = self.body?;
-
-        // Check if yEnc-encoded
-        if !body.starts_with(b"=ybegin") {
+        // Allocate once and delegate decoding to the zero-allocation helper
+        let mut decoded = Vec::with_capacity(self.body?.len());
+        if !self.decode_into(&mut decoded) {
             return None;
         }
+        Some(decoded)
+    }
 
-        // Functional iterator chain: skip header, take until footer, decode each line
-        let decoded = body
+    /// Decode yEnc-encoded body into the provided buffer
+    ///
+    /// This method reuses the capacity of `output` and performs no allocations
+    /// if the buffer is already large enough, making it suitable for hot paths.
+    ///
+    /// # Behavior
+    /// - Returns `false` if:
+    ///   - The article has no body, or
+    ///   - The body is not yEnc-encoded (does not start with `=ybegin`)
+    /// - Returns `true` and writes the decoded bytes into `output` otherwise.
+    ///
+    /// On success, `output` is cleared before writing the decoded bytes.
+    #[must_use]
+    pub fn decode_into(&self, output: &mut Vec<u8>) -> bool {
+        // Ensure we have a yEnc-encoded body
+        let body = match self.body {
+            Some(b) if b.starts_with(b"=ybegin") => b,
+            _ => return false,
+        };
+
+        output.clear();
+
+        // Skip the =ybegin line, strip trailing CRs, stop at =yend/=ypart,
+        // and decode each line into the output buffer.
+        for byte in body
             .split(|&b| b == b'\n')
             .skip(1) // Skip =ybegin line
             .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
             .take_while(|line| !line.starts_with(b"=yend") && !line.starts_with(b"=ypart"))
             .flat_map(yenc::decode_yenc_line)
-            .collect();
+        {
+            output.push(byte);
+        }
 
-        Some(decoded)
+        true
     }
 }
 

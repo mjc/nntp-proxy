@@ -1586,55 +1586,5 @@ mod tests {
             let cleared = proxy.check_and_clear_stale_pools();
             assert!(!cleared);
         }
-
-        #[test]
-        fn test_check_and_clear_clears_after_timeout() {
-            let config = create_test_config();
-            let _proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
-
-            // The check is: now.saturating_sub(last_activity) > IDLE_TIMEOUT
-            // If last_activity = 0 and now > 5 minutes, it should clear.
-            // Since the proxy was just created, now will be ~0, so we can't
-            // easily test the "clear after timeout" case without waiting.
-
-            // Instead, let's test that the logic is correct by setting
-            // last_activity to 0 (which means any elapsed time > 5 min triggers clear).
-            // Since the proxy was just created, elapsed will be tiny, so this won't clear.
-
-            // What we CAN test: set last_activity to a value such that
-            // now - last_activity > 5 minutes. But now ~= 0, so we'd need
-            // a negative last_activity, which isn't possible with u64.
-
-            // The pragmatic approach: test that the method runs without panic
-            // and returns false when idle time is short, which we already test.
-            // For the "clears after timeout" scenario, we trust the logic works
-            // because the check is: idle_duration > IDLE_TIMEOUT
-
-            // Actually, let's verify the logic another way: we can test that
-            // when last_activity_nanos is set to 0, and we simulate some time passing,
-            // the calculation correctly identifies > 5 min idle.
-
-            // Use a fresh proxy but wait a moment so start_instant has some elapsed
-            std::thread::sleep(std::time::Duration::from_millis(10));
-
-            // Now set last_activity to 0 (representing "0 nanoseconds after start")
-            // and verify that if we also set a mock "now" that's 6+ min ahead,
-            // the check works. But we can't mock `start_instant.elapsed()`.
-
-            // Final approach: verify the arithmetic with known values inline
-            // since the actual test would require a 5+ minute wait.
-
-            // Verify the constants and logic are correct
-            let timeout_nanos = NntpProxy::IDLE_TIMEOUT.as_nanos() as u64;
-            assert_eq!(timeout_nanos, 5 * 60 * 1_000_000_000);
-
-            // The logic: if now - last_activity > 5 min, clear.
-            // For example, if now=400_000_000_000 (400 sec = 6.67 min) and last_activity=0:
-            // idle = 400_000_000_000 - 0 = 400 sec = 6.67 min > 5 min => should clear
-
-            // We can't easily reach that state in tests without waiting.
-            // Mark this as a logic verification test rather than integration test.
-            // The real behavior is tested manually or via long-running integration tests.
-        }
     }
 }

@@ -285,10 +285,12 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
     );
     line.clear();
 
-    // Small delay to let connection go back to pool
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // NOTE: No sleep needed here. The StaleConnectionServer will close the connection
+    // after 2 commands (DATE healthcheck + this STAT). By the time we send the next
+    // command, the pooled connection is already stale (closed by server). The retry
+    // logic should detect the closed connection and establish a fresh one.
 
-    // Second STAT - connection is stale, should retry with new connection
+    // Second STAT - connection is stale (closed by server), should retry with new connection
     reader
         .get_mut()
         .write_all(b"STAT <test2@example.com>\r\n")

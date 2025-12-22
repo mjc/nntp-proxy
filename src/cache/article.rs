@@ -294,6 +294,16 @@ impl ArticleEntry {
         }
     }
 
+    /// Create from pre-wrapped Arc buffer
+    ///
+    /// Use this when the buffer is already wrapped in Arc to avoid double wrapping.
+    pub fn from_arc(buffer: Arc<Vec<u8>>) -> Self {
+        Self {
+            backend_availability: ArticleAvailability::new(),
+            buffer,
+        }
+    }
+
     /// Get raw buffer for serving to client
     #[inline]
     pub fn buffer(&self) -> &Arc<Vec<u8>> {
@@ -509,7 +519,10 @@ impl ArticleCache {
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
                 const ENTRY_STRUCT: usize = 16; // ArticleEntry inline size
                 const ARC_VEC_OVERHEAD: usize = 16 + 24 + 32; // Arc + Vec struct + allocator
-                const MOKA_OVERHEAD: usize = 2000; // moka internal structures (empirically measured)
+                // Moka internal structures - empirically measured to address memory reporting gap.
+                // See moka issue #473: https://github.com/moka-rs/moka/issues/473
+                // Observed ratio: 362MB RSS / 36MB weighted_size() = 10x
+                const MOKA_OVERHEAD: usize = 2000;
 
                 let key_size = ARC_STR_OVERHEAD + key.len();
                 let buffer_size = ARC_VEC_OVERHEAD + entry.buffer().len();
@@ -521,8 +534,9 @@ impl ArticleCache {
                 let weighted_size = if entry.is_complete_article() {
                     base_size
                 } else {
-                    // Small allocations have ~50% more overhead from allocator fragmentation
-                    (base_size * 3) / 2
+                    // Small allocations have ~50% more overhead from allocator fragmentation.
+                    // Use a 1.5x multiplier, rounding up, to avoid underestimating small entries.
+                    (base_size * 3).div_ceil(2)
                 };
 
                 weighted_size.try_into().unwrap_or(u32::MAX)
@@ -589,6 +603,10 @@ impl ArticleCache {
             self.create_minimal_stub(&buffer)
         };
 
+        // Wrap in Arc so we can efficiently share/move into closure without clone.
+        // Arc::try_unwrap will give us the Vec back if we're the only owner.
+        let new_buffer = Arc::new(new_buffer);
+
         // Use atomic upsert - this provides key-level locking and eliminates
         // the race condition between get() and insert() calls
         self.cache
@@ -609,15 +627,16 @@ impl ArticleCache {
                     };
 
                     if should_replace {
-                        entry.buffer = Arc::new(new_buffer.clone());
+                        // Already wrapped in Arc, just clone the Arc (cheap)
+                        entry.buffer = Arc::clone(&new_buffer);
                     }
 
                     // Mark backend as having the article
                     entry.record_backend_has(backend_id);
                     entry
                 } else {
-                    // New entry
-                    let mut entry = ArticleEntry::new(new_buffer.clone());
+                    // New entry - clone Arc (cheap, just reference count bump)
+                    let mut entry = ArticleEntry::from_arc(Arc::clone(&new_buffer));
                     entry.record_backend_has(backend_id);
                     entry
                 };

@@ -62,69 +62,87 @@ async fn query_backend(
         return QueryResult::Error(backend_id);
     };
 
-    // Try up to 2 times - first with pooled connection, then with fresh one if stale
-    for attempt in 0..2 {
-        let Ok(mut conn) = provider.get_pooled_connection().await else {
-            return QueryResult::Error(backend_id);
-        };
+    // Functional retry: try once, on error retry with fresh connection
+    let result = execute_backend_query(deps, provider, backend_id, command, multiline).await;
 
-        let mut buffer = deps.buffer_pool.acquire().await;
+    match result {
+        Ok(query_result) => query_result,
+        Err(_first_error) => {
+            tracing::debug!(
+                backend = backend_id.as_index(),
+                "Stale connection detected, retrying with fresh connection"
+            );
 
-        // Use shared backend command execution
-        match backend::send_command(&mut *conn, command, &mut buffer).await {
-            Ok(cmd_response) => {
-                let Some(status_code) = cmd_response.status_code() else {
-                    // Invalid response - drop connection, try again
-                    crate::pool::remove_from_pool(conn);
-                    continue;
-                };
-
-                // For multiline responses, read remaining data
-                let mut response = buffer[..cmd_response.bytes_read].to_vec();
-                if multiline && cmd_response.is_multiline {
-                    while !response.ends_with(b".\r\n") {
-                        match conn.as_mut().read(buffer.as_mut_slice()).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => response.extend_from_slice(&buffer[..n]),
-                        }
-                    }
-                }
-
-                return match status_code {
-                    220..=223 => {
-                        let data = if deps.cache_articles || !multiline {
-                            response
-                        } else {
-                            format!("{status_code}\r\n").into_bytes()
-                        };
-                        QueryResult::Found(backend_id, data)
-                    }
-                    430 => {
-                        if let Some(m) = &deps.metrics {
-                            m.record_command(backend_id);
-                            m.record_error_4xx(backend_id);
-                        }
-                        QueryResult::Missing(backend_id)
-                    }
-                    _ => QueryResult::Error(backend_id),
-                };
-            }
-            Err(_) => {
-                // Connection error - remove stale connection from pool and retry
-                crate::pool::remove_from_pool(conn);
-                if attempt == 0 {
-                    tracing::debug!(
-                        backend = backend_id.as_index(),
-                        "Stale connection detected, retrying with fresh connection"
-                    );
-                }
-                continue;
-            }
+            // Retry once with fresh connection
+            execute_backend_query(deps, provider, backend_id, command, multiline)
+                .await
+                .unwrap_or(QueryResult::Error(backend_id))
         }
     }
+}
 
-    // Both attempts failed
-    QueryResult::Error(backend_id)
+/// Execute a single backend query attempt
+///
+/// Returns Ok(QueryResult) on successful communication (even if article not found).
+/// Returns Err on connection errors (caller should retry).
+async fn execute_backend_query(
+    deps: &OwnedDeps,
+    provider: &crate::pool::DeadpoolConnectionProvider,
+    backend_id: BackendId,
+    command: &str,
+    multiline: bool,
+) -> Result<QueryResult, ()> {
+    let Ok(mut conn) = provider.get_pooled_connection().await else {
+        return Ok(QueryResult::Error(backend_id));
+    };
+
+    let mut buffer = deps.buffer_pool.acquire().await;
+
+    // Use shared backend command execution
+    match backend::send_command(&mut *conn, command, &mut buffer).await {
+        Ok(cmd_response) => {
+            let Some(status_code) = cmd_response.status_code() else {
+                // Invalid response - drop connection
+                crate::pool::remove_from_pool(conn);
+                return Err(());
+            };
+
+            // For multiline responses, read remaining data
+            let mut response = buffer[..cmd_response.bytes_read].to_vec();
+            if multiline && cmd_response.is_multiline {
+                while !response.ends_with(b".\r\n") {
+                    match conn.as_mut().read(buffer.as_mut_slice()).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => response.extend_from_slice(&buffer[..n]),
+                    }
+                }
+            }
+
+            Ok(match status_code {
+                220..=223 => {
+                    let data = if deps.cache_articles || !multiline {
+                        response
+                    } else {
+                        format!("{status_code}\r\n").into_bytes()
+                    };
+                    QueryResult::Found(backend_id, data)
+                }
+                430 => {
+                    if let Some(m) = &deps.metrics {
+                        m.record_command(backend_id);
+                        m.record_error_4xx(backend_id);
+                    }
+                    QueryResult::Missing(backend_id)
+                }
+                _ => QueryResult::Error(backend_id),
+            })
+        }
+        Err(_) => {
+            // Connection error - remove stale connection from pool
+            crate::pool::remove_from_pool(conn);
+            Err(())
+        }
+    }
 }
 
 async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) -> Vec<QueryResult> {

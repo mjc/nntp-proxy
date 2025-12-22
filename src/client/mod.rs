@@ -6,7 +6,7 @@
 //!
 //! # Zero-Allocation Design
 //!
-//! Uses buffer pool for all allocations. Returns `PooledBuffer` - caller parses:
+//! The caller provides a shared buffer pool. One pool can serve multiple clients:
 //!
 //! ```no_run
 //! use nntp_proxy::client::NntpClient;
@@ -15,23 +15,21 @@
 //! use nntp_proxy::types::BufferSize;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Create connection pool
-//! let pool = DeadpoolConnectionProvider::with_tls_auth(
-//!     "news.example.com", 563, "user", "pass"
-//! )?;
-//! let client = NntpClient::new(pool);
-//!
-//! // Create buffer pool once
+//! // One buffer pool shared across all clients
 //! let buffer_pool = BufferPool::new(BufferSize::try_new(256 * 1024)?, 8);
 //!
-//! // Fetch returns buffer, caller parses
+//! let conn_pool = DeadpoolConnectionProvider::with_tls_auth(
+//!     "news.example.com", 563, "user", "pass"
+//! )?;
+//! let client = NntpClient::new(conn_pool, buffer_pool.clone());
+//!
 //! for msg_id in message_ids {
-//!     let buffer = client.fetch_body(&msg_id, &buffer_pool).await?;
+//!     let buffer = client.fetch_body(&msg_id).await?;
 //!     let article = Article::parse(&buffer, true)?;
 //!     if let Some(decoded) = article.decode() {
 //!         process(&decoded);
 //!     }
-//!     // Buffer returns to pool when dropped
+//!     // Buffer returns to shared pool when dropped
 //! }
 //! # Ok(())
 //! # }
@@ -50,18 +48,25 @@ const TERMINATOR: &[u8] = b"\r\n.\r\n";
 
 /// Standalone NNTP client for fetching articles
 ///
-/// Zero-allocation design using buffer pool.
+/// Zero-allocation design using caller-provided buffer pool.
+/// Share one pool across multiple clients for minimal allocations.
 /// Returns `PooledBuffer` - caller parses with `Article::parse()`.
 #[derive(Clone)]
 pub struct NntpClient {
-    pool: DeadpoolConnectionProvider,
+    conn_pool: DeadpoolConnectionProvider,
+    buffer_pool: BufferPool,
 }
 
 impl NntpClient {
-    /// Create a new client with the given connection pool
+    /// Create a new client with connection pool and buffer pool
+    ///
+    /// The buffer pool can be shared across multiple clients via `Clone`.
     #[must_use]
-    pub fn new(pool: DeadpoolConnectionProvider) -> Self {
-        Self { pool }
+    pub fn new(conn_pool: DeadpoolConnectionProvider, buffer_pool: BufferPool) -> Self {
+        Self {
+            conn_pool,
+            buffer_pool,
+        }
     }
 
     /// Fetch article body (BODY command)
@@ -71,15 +76,10 @@ impl NntpClient {
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
-    /// * `buffer_pool` - Buffer pool for I/O and output
     #[inline]
-    pub async fn fetch_body(
-        &self,
-        message_id: &str,
-        buffer_pool: &BufferPool,
-    ) -> Result<PooledBuffer> {
+    pub async fn fetch_body(&self, message_id: &str) -> Result<PooledBuffer> {
         let command = body_by_msgid(message_id);
-        self.fetch_response(&command, buffer_pool).await
+        self.fetch_response(&command).await
     }
 
     /// Fetch article headers (HEAD command)
@@ -89,15 +89,10 @@ impl NntpClient {
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
-    /// * `buffer_pool` - Buffer pool for I/O and output
     #[inline]
-    pub async fn fetch_head(
-        &self,
-        message_id: &str,
-        buffer_pool: &BufferPool,
-    ) -> Result<PooledBuffer> {
+    pub async fn fetch_head(&self, message_id: &str) -> Result<PooledBuffer> {
         let command = head_by_msgid(message_id);
-        self.fetch_response(&command, buffer_pool).await
+        self.fetch_response(&command).await
     }
 
     /// Fetch full article (ARTICLE command)
@@ -107,29 +102,23 @@ impl NntpClient {
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
-    /// * `buffer_pool` - Buffer pool for I/O and output
     #[inline]
-    pub async fn fetch_article(
-        &self,
-        message_id: &str,
-        buffer_pool: &BufferPool,
-    ) -> Result<PooledBuffer> {
+    pub async fn fetch_article(&self, message_id: &str) -> Result<PooledBuffer> {
         let command = article_by_msgid(message_id);
-        self.fetch_response(&command, buffer_pool).await
+        self.fetch_response(&command).await
     }
 
     /// Check if article exists (STAT command)
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
-    /// * `buffer_pool` - Caller-owned buffer pool for I/O operations
     ///
     /// # Returns
     /// `true` if article exists, `false` if 430 (not found)
-    pub async fn stat(&self, message_id: &str, buffer_pool: &BufferPool) -> Result<bool> {
+    pub async fn stat(&self, message_id: &str) -> Result<bool> {
         let command = stat_by_msgid(message_id);
         let mut conn = self.get_connection().await?;
-        let mut buffer = buffer_pool.acquire().await;
+        let mut buffer = self.buffer_pool.acquire().await;
 
         let response = send_command(&mut *conn, &command, &mut buffer).await?;
 
@@ -153,76 +142,69 @@ impl NntpClient {
     async fn get_connection(
         &self,
     ) -> Result<impl std::ops::DerefMut<Target = crate::stream::ConnectionStream>> {
-        self.pool
+        self.conn_pool
             .get_pooled_connection()
             .await
             .context("Failed to get connection from pool")
     }
 
     /// Internal: fetch response into PooledBuffer
-    async fn fetch_response(
-        &self,
-        command: &str,
-        buffer_pool: &BufferPool,
-    ) -> Result<PooledBuffer> {
+    async fn fetch_response(&self, command: &str) -> Result<PooledBuffer> {
         let mut conn = self.get_connection().await?;
-        let mut io_buffer = buffer_pool.acquire().await;
+        let mut io_buffer = self.buffer_pool.acquire().await;
 
         let response = send_command(&mut *conn, command, &mut io_buffer).await?;
 
         // Validate response - early return on errors
         Self::validate_response(&response)?;
 
-        // Handle based on response type
-        match response.is_multiline {
-            false => {
-                Self::handle_single_line_response(&io_buffer, response.bytes_read, buffer_pool)
-                    .await
-            }
-            true => {
-                self.handle_multiline_response(
-                    &mut conn,
-                    &mut io_buffer,
-                    response.bytes_read,
-                    buffer_pool,
-                )
-                .await
-            }
+        // Handle multiline responses - need to stream remaining data
+        // For single-line responses, io_buffer already has correct initialized count
+        if response.is_multiline {
+            self.handle_multiline_response(&mut conn, &mut io_buffer, response.bytes_read)
+                .await?;
         }
+
+        Ok(io_buffer)
     }
 
-    /// Handle single-line response - copy directly to output buffer
-    #[inline]
-    async fn handle_single_line_response(
-        io_buffer: &PooledBuffer,
-        bytes_read: usize,
-        buffer_pool: &BufferPool,
-    ) -> Result<PooledBuffer> {
-        let mut output = buffer_pool.acquire().await;
-        output.copy_from_slice(&io_buffer[..bytes_read]);
-        Ok(output)
-    }
-
-    /// Handle multiline response - stream until terminator
+    /// Handle multiline response - stream until terminator, extending io_buffer in-place
     async fn handle_multiline_response(
         &self,
         conn: &mut crate::stream::ConnectionStream,
         io_buffer: &mut PooledBuffer,
         first_chunk_size: usize,
-        buffer_pool: &BufferPool,
-    ) -> Result<PooledBuffer> {
-        let accumulated = self
-            .stream_until_terminator(conn, io_buffer, first_chunk_size)
-            .await?;
+    ) -> Result<()> {
+        // Early return if first chunk contains terminator
+        let first_chunk = &io_buffer.as_mut_slice()[..first_chunk_size];
+        if first_chunk.ends_with(TERMINATOR) {
+            return Ok(());
+        }
 
-        let mut output = buffer_pool.acquire().await;
-        output.copy_from_slice(&accumulated);
-        Ok(output)
+        // Stream remaining chunks until terminator
+        // Note: We need to accumulate because io_buffer has fixed capacity
+        // and articles can exceed it. Using Vec for dynamic growth.
+        let mut accumulated = Vec::with_capacity(first_chunk_size * 2);
+        accumulated.extend_from_slice(first_chunk);
+
+        while let Ok(n) = io_buffer.read_from(conn).await {
+            if n == 0 {
+                break; // EOF
+            }
+
+            accumulated.extend_from_slice(&io_buffer.as_mut_slice()[..n]);
+
+            if accumulated.ends_with(TERMINATOR) {
+                break;
+            }
+        }
+
+        // Copy accumulated data back to io_buffer (sets initialized count)
+        io_buffer.copy_from_slice(&accumulated);
+        Ok(())
     }
 
     /// Validate NNTP response status code
-    ///
-    /// Pure function - no side effects, easier to test
     #[inline]
     fn validate_response(response: &crate::session::backend::CommandResponse) -> Result<()> {
         response
@@ -234,45 +216,6 @@ impl NntpClient {
                 code if code >= 400 => anyhow::bail!("Server error: {}", code),
                 _ => Ok(()),
             })
-    }
-
-    /// Stream multiline response until terminator
-    ///
-    /// Returns accumulated bytes including terminator
-    async fn stream_until_terminator(
-        &self,
-        conn: &mut crate::stream::ConnectionStream,
-        io_buffer: &mut PooledBuffer,
-        first_chunk_size: usize,
-    ) -> Result<Vec<u8>> {
-        let mut accumulated = Vec::with_capacity(first_chunk_size * 2);
-        accumulated.extend_from_slice(&io_buffer[..first_chunk_size]);
-
-        // Early return if first chunk contains terminator
-        if Self::has_terminator(&accumulated) {
-            return Ok(accumulated);
-        }
-
-        // Stream remaining chunks until terminator or EOF
-        while let Ok(n) = io_buffer.read_from(conn).await {
-            if n == 0 {
-                break; // EOF
-            }
-
-            accumulated.extend_from_slice(&io_buffer[..n]);
-
-            if Self::has_terminator(&accumulated) {
-                break;
-            }
-        }
-
-        Ok(accumulated)
-    }
-
-    /// Check if data contains NNTP multiline terminator
-    #[inline]
-    fn has_terminator(data: &[u8]) -> bool {
-        data.ends_with(TERMINATOR)
     }
 }
 
@@ -290,32 +233,12 @@ mod tests {
     }
 
     #[test]
-    fn test_has_terminator() {
-        // Exact terminator
-        assert!(NntpClient::has_terminator(b"\r\n.\r\n"));
-
-        // Content with terminator at end
-        assert!(NntpClient::has_terminator(b"data\r\n.\r\n"));
-
-        // Terminator in middle (should not match - ends_with check)
-        assert!(!NntpClient::has_terminator(b"\r\n.\r\nmore"));
-
-        // No terminator
-        assert!(!NntpClient::has_terminator(b"data\r\n"));
-        assert!(!NntpClient::has_terminator(b""));
-
-        // Partial terminators
-        assert!(!NntpClient::has_terminator(b"\r\n."));
-        assert!(!NntpClient::has_terminator(b".\r\n"));
-    }
-
-    #[test]
     fn test_parse_stat_response_success() {
         // Article exists (223)
-        assert_eq!(NntpClient::parse_stat_response(Some(223)).unwrap(), true);
+        assert!(NntpClient::parse_stat_response(Some(223)).unwrap());
 
         // Article not found (430)
-        assert_eq!(NntpClient::parse_stat_response(Some(430)).unwrap(), false);
+        assert!(!NntpClient::parse_stat_response(Some(430)).unwrap());
     }
 
     #[test]
@@ -329,12 +252,8 @@ mod tests {
         assert!(NntpClient::parse_stat_response(Some(400)).is_err());
     }
 
-    // Note: validate_response tests require integration testing with real CommandResponse
-    // objects - they are covered by integration tests in tests/ directory
-
     #[test]
     fn test_terminator_constant() {
-        // Verify TERMINATOR constant is correct
         assert_eq!(TERMINATOR, b"\r\n.\r\n");
         assert_eq!(TERMINATOR.len(), 5);
     }
