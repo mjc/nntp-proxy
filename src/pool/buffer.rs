@@ -189,6 +189,20 @@ impl BufferPool {
     /// * `buffer_size` - Size of each buffer in bytes (must be non-zero)
     /// * `max_pool_size` - Maximum number of buffers to pool
     ///
+    /// # Design Philosophy
+    ///
+    /// **Buffer pools are allocated ONCE at application boot**, providing a
+    /// zero-allocation hot path for I/O operations. This is a critical performance
+    /// optimization:
+    ///
+    /// - **Boot time**: All buffers pre-allocated (one-time cost)
+    /// - **Runtime**: Zero allocations in hot path (acquire/release from pool)
+    /// - **Per-connection**: Buffers are borrowed and returned, never owned
+    ///
+    /// **IMPORTANT**: Do NOT create a BufferPool per-client, per-connection, or
+    /// per-request. Create ONE pool at application startup and share it across
+    /// all operations via Arc or static reference.
+    ///
     /// All buffers are pre-allocated at creation time for optimal performance.
     #[must_use]
     pub fn new(buffer_size: BufferSize, max_pool_size: usize) -> Self {
@@ -232,6 +246,18 @@ impl BufferPool {
     /// Get a buffer from the pool or create a new one (lock-free)
     ///
     /// Returns a PooledBuffer that automatically returns to the pool when dropped.
+    ///
+    /// # Performance: Zero-Allocation Hot Path
+    ///
+    /// When the pool was created with sufficient `max_pool_size`, this method
+    /// performs ZERO allocations - it just pops from the lock-free queue.
+    /// This is the critical hot path for I/O operations.
+    ///
+    /// Only if the pool is exhausted (all buffers in use) will a new buffer
+    /// be allocated. Size the pool appropriately to avoid this fallback.
+    ///
+    /// # Safety Notes
+    ///
     /// The buffer may contain old data, but this is safe because:
     /// - Callers use AsyncRead which writes into the buffer
     /// - They get back `n` bytes written and access only `&buf[..n]`

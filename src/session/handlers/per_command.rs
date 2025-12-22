@@ -500,16 +500,29 @@ impl ClientSession {
             router.backend_count().get()
         );
 
-        // EARLY RETURN: If cache says all backends already returned 430, don't waste time
-        if availability.all_exhausted(router.backend_count()) {
-            debug!(
-                "Client {} cache shows all backends exhausted for {:?}, returning 430 immediately",
-                self.client_addr, msg_id
-            );
-            self.send_430_to_client(client_write, backend_to_client_bytes)
-                .await?;
-            return Ok(crate::types::BackendId::from_index(0));
-        }
+        // DESIGN DECISION: No early-return on cached all_exhausted()
+        //
+        // We intentionally DO NOT return 430 immediately when cache indicates all
+        // backends returned 430, even though this would be faster. Reasons:
+        //
+        // 1. 430 responses don't mean "article doesn't exist" - they mean "this
+        //    backend doesn't have it right now". Backends can acquire articles
+        //    via propagation or spool reconstruction.
+        //
+        // 2. Cached 430s can become stale:
+        //    - Backends come back online after being down
+        //    - New articles arrive on backends via propagation
+        //    - Cache entry is old (close to TTL expiration)
+        //
+        // 3. The cache TTL (default 5-10 min) isn't an authoritative staleness
+        //    indicator - it's a tradeoff between memory and query reduction.
+        //
+        // Trade-off: We prefer resilience (always checking) over latency (trusting
+        // cache completely). The availability tracking still skips backends we
+        // know returned 430, so we only try backends we haven't heard from.
+        //
+        // Future: This could be made configurable if latency becomes critical for
+        // workloads where articles definitively don't exist.
 
         // Track last backend tried for metrics/return value
         let mut last_backend: Option<crate::types::BackendId> = None;
@@ -611,6 +624,9 @@ impl ClientSession {
     }
 
     /// Try executing command on next available backend
+    ///
+    /// If the pooled connection is stale (connection error), automatically retries
+    /// with a fresh connection before returning an error.
     #[allow(clippy::too_many_arguments)]
     async fn try_backend_for_article(
         &self,
@@ -633,13 +649,26 @@ impl ClientSession {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        // Execute command
-        let mut conn = provider.get_pooled_connection().await?;
+        // Functional retry: try first attempt, on connection error retry once with fresh connection
+        let attempt_result = self
+            .execute_backend_attempt(provider, backend_id, command, buffer)
+            .await;
 
-        // Execute command without timeout
-        let (n, response_code, is_multiline, ttfb, send, recv) = self
-            .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
-            .await?;
+        let (conn, n, response_code, is_multiline, ttfb, send, recv) = match attempt_result {
+            Ok(result) => result,
+            Err(first_error) => {
+                // First attempt failed - retry once with fresh connection
+                debug!(
+                    "Client {} stale connection to backend {}, retrying with fresh connection",
+                    self.client_addr,
+                    backend_id.as_index()
+                );
+
+                self.execute_backend_attempt(provider, backend_id, command, buffer)
+                    .await
+                    .map_err(|_| first_error)? // On retry failure, return original error
+            }
+        };
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
@@ -652,6 +681,7 @@ impl ClientSession {
         }
 
         // Success - stream response
+        let mut conn = conn;
         let bytes_written = match self
             .stream_response_to_client(
                 &mut conn,
@@ -691,6 +721,41 @@ impl ClientSession {
             backend_id,
             bytes_written,
         })
+    }
+
+    /// Execute a single backend attempt - get connection and execute command
+    ///
+    /// Returns the connection and response data on success.
+    /// On error, the connection is removed from pool before returning.
+    async fn execute_backend_attempt(
+        &self,
+        provider: &crate::pool::DeadpoolConnectionProvider,
+        backend_id: crate::types::BackendId,
+        command: &str,
+        buffer: &mut crate::pool::PooledBuffer,
+    ) -> Result<(
+        deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        usize,
+        crate::protocol::NntpResponse,
+        bool,
+        u64,
+        u64,
+        u64,
+    )> {
+        let mut conn = provider.get_pooled_connection().await?;
+
+        match self
+            .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
+            .await
+        {
+            Ok((n, response_code, is_multiline, ttfb, send, recv)) => {
+                Ok((conn, n, response_code, is_multiline, ttfb, send, recv))
+            }
+            Err(e) => {
+                crate::pool::remove_from_pool(conn);
+                Err(e)
+            }
+        }
     }
 
     /// Execute command on backend and read first chunk
@@ -788,6 +853,10 @@ impl ClientSession {
     }
 
     /// Handle 430 response - update local availability tracker
+    ///
+    /// # NNTP Semantics
+    /// 430 "No Such Article" is AUTHORITATIVE - the backend definitively does not
+    /// have this article. See `crate::cache::article` module docs for full explanation.
     ///
     /// Note: Cache sync happens ONCE at end of retry loop via sync_availability,
     /// not here. This avoids spawning async tasks for each 430.
