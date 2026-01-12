@@ -62,10 +62,13 @@ async fn query_backend(
         return QueryResult::Error(backend_id);
     };
 
+    // Track pending count for load balancing
+    deps.router.mark_backend_pending(backend_id);
+
     // Functional retry: try once, on error retry with fresh connection
     let result = execute_backend_query(deps, provider, backend_id, command, multiline).await;
 
-    match result {
+    let query_result = match result {
         Ok(query_result) => query_result,
         Err(_first_error) => {
             tracing::debug!(
@@ -78,7 +81,12 @@ async fn query_backend(
                 .await
                 .unwrap_or(QueryResult::Error(backend_id))
         }
-    }
+    };
+
+    // Always decrement pending count when done
+    deps.router.complete_command(backend_id);
+
+    query_result
 }
 
 /// Execute a single backend query attempt

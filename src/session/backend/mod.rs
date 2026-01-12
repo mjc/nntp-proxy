@@ -82,25 +82,9 @@ pub async fn send_command<C>(
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // Send command
-    conn.write_all(command.as_bytes()).await?;
-
-    // Read first chunk
-    let n = buffer.read_from(conn).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
-
-    // Validate response
-    let validated =
-        validate_backend_response(&buffer[..n], n, crate::protocol::MIN_RESPONSE_LENGTH);
-
-    Ok(CommandResponse {
-        bytes_read: n,
-        response: validated.response,
-        is_multiline: validated.is_multiline,
-        warnings: validated.warnings,
-    })
+    // Delegate to timed version, discard timing
+    let (response, _, _, _) = send_command_timed(conn, command, buffer).await?;
+    Ok(response)
 }
 
 /// Send command with timing measurements
@@ -108,7 +92,7 @@ where
 /// Like `send_command` but also returns timing information for metrics.
 ///
 /// # Returns
-/// Tuple of (CommandResponse, total_micros, send_micros, recv_micros)
+/// Tuple of (CommandResponse, ttfb_micros, send_micros, recv_micros)
 pub async fn send_command_timed<C>(
     conn: &mut C,
     command: &str,
