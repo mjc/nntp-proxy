@@ -413,7 +413,7 @@ async fn test_proxy_creates_auth_handler_from_config() {
 
     let config = create_test_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
 
-    let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await.unwrap();
 
     // Proxy should be created successfully with auth config
     assert!(!proxy.servers().is_empty());

@@ -37,6 +37,27 @@ pub struct MetricsSnapshot {
     pub cache_entries: u64,
     pub cache_size_bytes: u64,
     pub cache_hit_rate: f64,
+    /// Disk cache statistics (only present when using hybrid cache)
+    pub disk_cache: Option<DiskCacheStats>,
+}
+
+/// Disk cache statistics for hybrid cache mode
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiskCacheStats {
+    /// Number of cache hits from disk tier
+    pub disk_hits: u64,
+    /// Disk hit rate (percentage of hits served from disk vs total hits)
+    pub disk_hit_rate: f64,
+    /// Configured disk cache capacity in bytes
+    pub disk_capacity: u64,
+    /// Bytes actually written to disk (from foyer statistics)
+    pub bytes_written: u64,
+    /// Bytes read from disk (from foyer statistics)
+    pub bytes_read: u64,
+    /// Number of write I/O operations
+    pub write_ios: u64,
+    /// Number of read I/O operations
+    pub read_ios: u64,
 }
 
 impl MetricsSnapshot {
@@ -247,6 +268,7 @@ mod tests {
             cache_entries: 0,
             cache_size_bytes: 0,
             cache_hit_rate: 0.0,
+            disk_cache: None,
         }
     }
 

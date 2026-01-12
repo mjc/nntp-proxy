@@ -42,7 +42,9 @@ async fn test_auth_flow_complete_with_valid_credentials() {
 
     // Start proxy
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful)
+            .await
+            .unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -113,7 +115,9 @@ async fn test_auth_disabled_allows_immediate_commands() {
 
     // Start proxy
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful)
+            .await
+            .unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -169,7 +173,9 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
     };
 
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful)
+            .await
+            .unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -230,7 +236,9 @@ async fn test_multiple_clients_with_auth() {
     };
 
     let proxy = Arc::new(
-        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful).unwrap(),
+        nntp_proxy::NntpProxy::new(config, nntp_proxy::config::RoutingMode::Stateful)
+            .await
+            .unwrap(),
     );
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();

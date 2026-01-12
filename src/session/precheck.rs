@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
 
-use crate::cache::{ArticleAvailability, ArticleCache, ArticleEntry};
+use crate::cache::{ArticleAvailability, ArticleEntry, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::router::BackendSelector;
@@ -25,7 +25,7 @@ pub enum QueryResult {
 /// Shared dependencies for precheck operations.
 pub struct PrecheckDeps<'a> {
     pub router: &'a Arc<BackendSelector>,
-    pub cache: &'a Arc<ArticleCache>,
+    pub cache: &'a Arc<UnifiedCache>,
     pub buffer_pool: &'a BufferPool,
     pub metrics: Option<&'a MetricsCollector>,
     pub cache_articles: bool,
@@ -34,7 +34,7 @@ pub struct PrecheckDeps<'a> {
 #[derive(Clone)]
 struct OwnedDeps {
     router: Arc<BackendSelector>,
-    cache: Arc<ArticleCache>,
+    cache: Arc<UnifiedCache>,
     buffer_pool: BufferPool,
     metrics: Option<MetricsCollector>,
     cache_articles: bool,
@@ -120,6 +120,13 @@ async fn execute_backend_query(
 
             Ok(match status_code {
                 220..=223 => {
+                    // Record successful command
+                    if let Some(m) = &deps.metrics {
+                        tracing::debug!(backend = backend_id.as_index(), "precheck recording command to metrics");
+                        m.record_command(backend_id);
+                    } else {
+                        tracing::warn!(backend = backend_id.as_index(), "precheck: metrics is None, cannot record command");
+                    }
                     let data = if deps.cache_articles || !multiline {
                         response
                     } else {
@@ -194,7 +201,7 @@ fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, Vec<u8>)>, Articl
 /// If found, upserts with data. Then syncs full availability state.
 /// Returns the cache entry if article was found.
 async fn cache_results(
-    cache: &ArticleCache,
+    cache: &UnifiedCache,
     msg_id: &MessageId<'_>,
     found: Option<(BackendId, Vec<u8>)>,
     availability: ArticleAvailability,
@@ -220,12 +227,21 @@ async fn cache_results(
 ///
 /// Queries concurrently, stores results in cache.
 /// Returns Some(entry) if any backend had it, None if all 430'd.
+///
+/// Skips backend queries entirely if we already have a complete article cached.
 pub async fn precheck(
     deps: &PrecheckDeps<'_>,
     command: &str,
     msg_id: &MessageId<'_>,
     multiline: bool,
 ) -> Option<ArticleEntry> {
+    // Check cache first - if we have a complete article, return it immediately
+    if let Some(cached) = deps.cache.get(msg_id).await {
+        if cached.is_complete_article() {
+            return Some(cached);
+        }
+    }
+
     let owned = deps.to_owned();
     let results = query_all_backends(&owned, command, multiline).await;
     let (found, availability) = summarize(results);
@@ -233,6 +249,8 @@ pub async fn precheck(
 }
 
 /// Spawn background precheck. Results go to cache only.
+///
+/// Skips backend queries entirely if we already have a complete article cached.
 pub fn spawn_background_precheck(
     deps: PrecheckDeps<'_>,
     command: String,
@@ -240,6 +258,14 @@ pub fn spawn_background_precheck(
 ) {
     let owned = deps.to_owned();
     tokio::spawn(async move {
+        // Check cache first - if we have a complete article, no need to query backends
+        if let Some(cached) = owned.cache.get(&msg_id).await {
+            if cached.is_complete_article() {
+                // Already have full article cached - nothing to do
+                return;
+            }
+        }
+
         let results = query_all_backends(&owned, &command, false).await;
         let (found, availability) = summarize(results);
 

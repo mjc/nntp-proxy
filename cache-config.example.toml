@@ -18,12 +18,37 @@ tls_verify_cert = true
 
 # Cache configuration
 [cache]
-# Maximum cache size in bytes (64 MB default)
+# Maximum memory cache size (default: 64mb)
+# Supports human-readable formats: "1gb", "500mb", "64mb"
 # For availability-only mode: ~1000 bytes per article
 # For full caching: depends on article sizes (avg ~700 KB)
-max_capacity = 67108864
-# Time-to-live for cached articles in seconds (1 hour)
+max_capacity = "64mb"
+# Time-to-live for cached articles (default: 1 hour)
 ttl_secs = 3600
+# Cache article bodies (default: true)
+# Set to false for availability-only mode (tracks which backends have articles)
+cache_articles = true
+# Enable adaptive prechecking for STAT/HEAD commands (default: false)
+# Queries all backends simultaneously to build availability data
+adaptive_precheck = false
+
+# Disk Cache Configuration (optional)
+# When configured, creates two-tier cache: memory -> disk -> backend
+# Articles evicted from memory are written to disk for later retrieval
+#
+# [cache.disk]
+# # Path to disk cache directory (will be created if needed)
+# # Recommended: Use a fast SSD or NVMe drive
+# path = "/var/cache/nntp-proxy"
+# # Maximum disk cache size (default: 10gb)
+# # Supports: "100gb", "10gb", "1tb", or raw bytes
+# capacity = "10gb"
+# # Enable LZ4 compression (default: true)
+# # Reduces disk usage by ~60% for typical NNTP articles
+# compression = true
+# # Number of shards for concurrent disk access (default: 4)
+# # Higher values improve concurrency but use more file handles
+# shards = 4
 
 # Health check configuration
 [health_check]

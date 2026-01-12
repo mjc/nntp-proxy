@@ -295,25 +295,82 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
         }
     }
 
-    Paragraph::new(vec![
-        Line::from(label_value_spans(
-            "Entries: ",
-            format!("{}", snapshot.cache_entries),
-            entries_color(snapshot.cache_entries),
-        )),
-        Line::from(label_value_spans(
-            "Size: ",
-            format_bytes(snapshot.cache_size_bytes),
-            styles::VALUE_NEUTRAL,
-        )),
-        Line::from(label_value_spans(
-            "Hit Rate: ",
-            format!("{:.1}%", snapshot.cache_hit_rate),
-            hit_rate_color(snapshot.cache_hit_rate),
-        )),
-    ])
-    .block(bordered_block("Cache", styles::BORDER_NORMAL))
-    .alignment(Alignment::Left)
+    // Check if this is hybrid cache mode
+    let is_hybrid = snapshot.disk_cache.is_some();
+
+    // Build lines based on cache type
+    let lines = if is_hybrid {
+        // Hybrid cache: show disk-relevant stats
+        let disk = snapshot.disk_cache.as_ref().unwrap();
+        vec![
+            Line::from(label_value_spans(
+                "Hit Rate: ",
+                format!("{:.1}%", snapshot.cache_hit_rate),
+                hit_rate_color(snapshot.cache_hit_rate),
+            )),
+            Line::from(label_value_spans(
+                "Disk Written: ",
+                format_bytes(disk.bytes_written),
+                if disk.bytes_written > 0 {
+                    styles::VALUE_INFO
+                } else {
+                    styles::VALUE_NEUTRAL
+                },
+            )),
+            Line::from(label_value_spans(
+                "Disk Read: ",
+                format_bytes(disk.bytes_read),
+                if disk.bytes_read > 0 {
+                    styles::VALUE_INFO
+                } else {
+                    styles::VALUE_NEUTRAL
+                },
+            )),
+            Line::from(label_value_spans(
+                "Disk Hits: ",
+                format!("{} ({:.1}%)", disk.disk_hits, disk.disk_hit_rate),
+                if disk.disk_hits > 0 {
+                    styles::VALUE_INFO
+                } else {
+                    styles::VALUE_NEUTRAL
+                },
+            )),
+            Line::from(label_value_spans(
+                "Write I/Os: ",
+                format!("{}", disk.write_ios),
+                styles::VALUE_NEUTRAL,
+            )),
+        ]
+    } else {
+        // Memory-only cache: show memory stats
+        vec![
+            Line::from(label_value_spans(
+                "Entries: ",
+                format!("{}", snapshot.cache_entries),
+                entries_color(snapshot.cache_entries),
+            )),
+            Line::from(label_value_spans(
+                "Size: ",
+                format_bytes(snapshot.cache_size_bytes),
+                styles::VALUE_NEUTRAL,
+            )),
+            Line::from(label_value_spans(
+                "Hit Rate: ",
+                format!("{:.1}%", snapshot.cache_hit_rate),
+                hit_rate_color(snapshot.cache_hit_rate),
+            )),
+        ]
+    };
+
+    let title = if is_hybrid {
+        "Cache (Hybrid)"
+    } else {
+        "Cache"
+    };
+
+    Paragraph::new(lines)
+        .block(bordered_block(title, styles::BORDER_NORMAL))
+        .alignment(Alignment::Left)
 }
 
 /// Create data transfer summary panel

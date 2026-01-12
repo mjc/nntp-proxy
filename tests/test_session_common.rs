@@ -40,7 +40,7 @@ async fn test_quit_command_integration() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     tokio::spawn(async move {
         loop {
@@ -109,7 +109,7 @@ async fn test_auth_command_integration() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     tokio::spawn(async move {
         loop {
@@ -226,7 +226,7 @@ async fn test_concurrent_auth_sessions() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     tokio::spawn(async move {
         loop {

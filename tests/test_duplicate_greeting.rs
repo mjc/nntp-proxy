@@ -117,7 +117,7 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
         )],
         ..Default::default()
     };
-    let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 

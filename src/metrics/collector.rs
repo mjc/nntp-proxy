@@ -414,7 +414,19 @@ impl MetricsCollector {
     ///
     /// Returns cumulative counters - no rate calculations.
     /// Use `MetricsSnapshot::with_pool_status()` to add pool utilization data.
-    pub fn snapshot(&self, cache: Option<&crate::cache::ArticleCache>) -> MetricsSnapshot {
+    pub fn snapshot(&self, cache: Option<&crate::cache::UnifiedCache>) -> MetricsSnapshot {
+        let cache_stats = cache.map(|c| c as &dyn crate::cache::CacheStatsProvider);
+        self.snapshot_with_cache(cache_stats)
+    }
+
+    /// Create a snapshot with any cache type that implements CacheStatsProvider
+    ///
+    /// Returns cumulative counters - no rate calculations.
+    /// Use `MetricsSnapshot::with_pool_status()` to add pool utilization data.
+    pub fn snapshot_with_cache(
+        &self,
+        cache: Option<&dyn crate::cache::CacheStatsProvider>,
+    ) -> MetricsSnapshot {
         let backend_stats: Vec<BackendStats> = self
             .inner
             .backend_metrics
@@ -436,15 +448,21 @@ impl MetricsCollector {
             .map(|b| b.bytes_received.as_u64())
             .sum();
 
-        let (cache_entries, cache_size_bytes, cache_hit_rate) = cache
+        let (cache_entries, cache_size_bytes, cache_hit_rate, disk_cache) = cache
             .map(|c| {
-                let entries = c.entry_count();
-                // weighted_size() returns total weight from weigher (bytes)
-                let size_bytes = c.weighted_size();
-                let hit_rate = c.hit_rate();
-                (entries, size_bytes, hit_rate)
+                let stats = c.display_stats();
+                let disk = stats.disk.map(|d| super::snapshot::DiskCacheStats {
+                    disk_hits: d.disk_hits,
+                    disk_hit_rate: d.disk_hit_rate,
+                    disk_capacity: d.capacity,
+                    bytes_written: d.bytes_written,
+                    bytes_read: d.bytes_read,
+                    write_ios: d.write_ios,
+                    read_ios: d.read_ios,
+                });
+                (stats.entry_count, stats.size_bytes, stats.hit_rate, disk)
             })
-            .unwrap_or((0, 0, 0.0));
+            .unwrap_or((0, 0, 0.0, None));
 
         MetricsSnapshot {
             total_connections: self.inner.total_connections.load(Ordering::Relaxed),
@@ -458,6 +476,7 @@ impl MetricsCollector {
             cache_entries,
             cache_size_bytes,
             cache_hit_rate,
+            disk_cache,
         }
     }
 

@@ -3,6 +3,7 @@
 //! This module centralizes all default value functions used in serde deserialization.
 
 use crate::types::{CacheCapacity, MaxConnections, MaxErrors};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Default maximum connections per server
@@ -29,7 +30,7 @@ pub fn unhealthy_threshold() -> MaxErrors {
     MaxErrors::try_new(3).expect("3 is non-zero")
 }
 
-/// Default cache max capacity in bytes
+/// Default cache max capacity in bytes (memory tier)
 #[inline]
 pub fn cache_max_capacity() -> CacheCapacity {
     // 64 MB default (good for availability-only mode)
@@ -72,4 +73,30 @@ pub fn health_check_max_per_cycle() -> usize {
 pub fn health_check_pool_timeout() -> Duration {
     use crate::constants::pool::HEALTH_CHECK_POOL_TIMEOUT_MS;
     Duration::from_millis(HEALTH_CHECK_POOL_TIMEOUT_MS)
+}
+
+// Disk cache defaults (for hybrid-cache feature)
+
+/// Default disk cache path
+#[inline]
+pub fn disk_cache_path() -> PathBuf {
+    PathBuf::from("/var/cache/nntp-proxy")
+}
+
+/// Default disk cache capacity (10 GB)
+#[inline]
+pub fn disk_cache_capacity() -> CacheCapacity {
+    CacheCapacity::try_new(10 * 1024 * 1024 * 1024).expect("10GB is non-zero")
+}
+
+/// Default disk cache compression (true = LZ4 enabled)
+#[inline]
+pub fn disk_cache_compression() -> bool {
+    true
+}
+
+/// Default disk cache shards
+#[inline]
+pub fn disk_cache_shards() -> usize {
+    4
 }

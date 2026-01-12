@@ -102,7 +102,7 @@
 //! use nntp_proxy::types::BufferSize;
 //! use nntp_proxy::auth::AuthHandler;
 //! use nntp_proxy::metrics::MetricsCollector;
-//! use nntp_proxy::cache::ArticleCache;
+//! use nntp_proxy::cache::UnifiedCache;
 //!
 //! # fn example() -> anyhow::Result<()> {
 //! let addr: SocketAddr = "127.0.0.1:50000".parse()?;
@@ -110,7 +110,7 @@
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
 //! let metrics = MetricsCollector::new(2); // 2 backends
-//! let cache = Arc::new(ArticleCache::new(1000, Duration::from_secs(3600), true));
+//! let cache = Arc::new(UnifiedCache::memory(1000, Duration::from_secs(3600), true));
 //!
 //! // Full-featured session with all bells and whistles
 //! let session = ClientSession::builder(addr.into(), buffer_pool, auth)
@@ -209,7 +209,7 @@ pub struct ClientSession {
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 
     /// Article cache (always present - tracks backend availability even with capacity=0)
-    cache: Arc<crate::cache::ArticleCache>,
+    cache: Arc<crate::cache::UnifiedCache>,
 
     /// Whether to cache article bodies (config-driven)
     cache_articles: bool,
@@ -257,7 +257,7 @@ pub struct ClientSessionBuilder {
     auth_handler: Arc<AuthHandler>,
     metrics: Option<MetricsCollector>,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
-    cache: Arc<crate::cache::ArticleCache>,
+    cache: Arc<crate::cache::UnifiedCache>,
     cache_articles: bool,
     adaptive_precheck: bool,
 }
@@ -311,7 +311,7 @@ impl ClientSessionBuilder {
 
     /// Add article cache to this session (always present for backend availability tracking)
     #[must_use]
-    pub fn with_cache(mut self, cache: Arc<crate::cache::ArticleCache>) -> Self {
+    pub fn with_cache(mut self, cache: Arc<crate::cache::UnifiedCache>) -> Self {
         self.cache = cache;
         self
     }
@@ -368,9 +368,9 @@ impl ClientSessionBuilder {
 
 impl ClientSession {
     /// Create default cache for availability tracking only (no content caching)
-    fn default_cache() -> Arc<crate::cache::ArticleCache> {
+    fn default_cache() -> Arc<crate::cache::UnifiedCache> {
         const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-        Arc::new(crate::cache::ArticleCache::new(0, DEFAULT_TTL, false))
+        Arc::new(crate::cache::UnifiedCache::memory(0, DEFAULT_TTL, false))
     }
 
     /// Create a new client session for 1:1 backend mapping
@@ -418,7 +418,7 @@ impl ClientSession {
             auth_state: AuthState::new(),
             metrics: None,
             connection_stats: None,
-            cache: Arc::new(crate::cache::ArticleCache::new(
+            cache: Arc::new(crate::cache::UnifiedCache::memory(
                 0,
                 std::time::Duration::from_secs(3600),
                 false,
@@ -461,7 +461,7 @@ impl ClientSession {
             auth_handler,
             metrics: None,
             connection_stats: None,
-            cache: Arc::new(crate::cache::ArticleCache::new(
+            cache: Arc::new(crate::cache::UnifiedCache::memory(
                 0,
                 std::time::Duration::from_secs(3600),
                 false,
@@ -943,12 +943,12 @@ mod tests {
 
     #[test]
     fn test_builder_with_cache() {
-        use crate::cache::ArticleCache;
+        use crate::cache::UnifiedCache;
         use std::time::Duration;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
-        let cache = Arc::new(ArticleCache::new(100, Duration::from_secs(3600), true));
+        let cache = Arc::new(UnifiedCache::memory(100, Duration::from_secs(3600), true));
 
         let session = ClientSession::builder(addr.into(), buffer_pool, test_auth_handler())
             .with_cache(cache.clone())

@@ -122,3 +122,33 @@ tls_verify_cert = true
 # Note: max_connections defaults to 10 if not specified
 # Each server can have different limits based on your provider's restrictions
 # Common NNTP ports: 119 (plain), 563 (NNTPS/SSL), 8119 (custom)
+
+# Cache Configuration (optional)
+# Uncomment to enable article caching
+#
+# [cache]
+# # Maximum memory cache size (default: 64mb)
+# # Supports: "1gb", "500mb", "64mb", or raw bytes
+# max_capacity = "64mb"
+# # Time-to-live for cached articles (default: 1 hour)
+# ttl_secs = 3600
+# # Cache article bodies (default: true)
+# # Set to false for availability-only mode (tracks which backends have articles)
+# cache_articles = true
+# # Enable adaptive prechecking for STAT/HEAD commands (default: false)
+# # Queries all backends simultaneously to build availability data
+# adaptive_precheck = false
+#
+# # Disk Cache Configuration (optional)
+# # When configured, creates two-tier cache: memory -> disk -> backend
+# # Articles evicted from memory are written to disk for later retrieval
+# [cache.disk]
+# # Path to disk cache directory (will be created if needed)
+# path = "/var/cache/nntp-proxy"
+# # Maximum disk cache size (default: 10gb)
+# # Supports: "100gb", "10gb", "1tb", or raw bytes
+# capacity = "10gb"
+# # Enable LZ4 compression (default: true, ~60% space savings)
+# compression = true
+# # Number of shards for concurrent access (default: 4)
+# shards = 4

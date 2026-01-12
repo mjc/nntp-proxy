@@ -43,6 +43,7 @@ async-trait = "0.1.89"
 memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
 moka = { version = "0.12", features = ["future"], default-features = false }  # Async LRU cache, minimal features
+foyer = { version = "0.21", features = ["serde"] }  # Hybrid memory+disk cache for large article caching
 bytes = "1.0"  # Efficient byte buffer for zero-copy operations
 ratatui = "0.29"  # Terminal UI framework
 crossterm = "0.29"  # Cross-platform terminal manipulation
@@ -64,6 +65,8 @@ webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
 crc32fast = "1.5.0"
 yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
 bytesize = { version = "2.3.1", features = ["serde"] }
+serde_bytes = "0.11.19"
+twox-hash = "2.1.2"
 
 
 [dev-dependencies]
@@ -72,6 +75,9 @@ serde_json = "1.0"  # For testing serde implementations
 divan = "0.1"  # Modern benchmarking framework
 proptest = "1.5"  # Property-based testing for comprehensive coverage
 yenc = "0.2.2"  # For benchmark comparison only
+
+[features]
+default = []
 
 [[bench]]
 name = "command_parsing"

@@ -158,7 +158,7 @@ pub struct TuiAppBuilder {
     metrics: MetricsCollector,
     router: Arc<BackendSelector>,
     servers: Arc<Vec<Server>>,
-    cache: Option<Arc<crate::cache::ArticleCache>>,
+    cache: Option<Arc<crate::cache::UnifiedCache>>,
     log_buffer: Option<LogBuffer>,
     history_size: HistorySize,
 }
@@ -183,7 +183,7 @@ impl TuiAppBuilder {
 
     /// Set the article cache for monitoring cache statistics
     #[must_use]
-    pub fn with_cache(mut self, cache: Arc<crate::cache::ArticleCache>) -> Self {
+    pub fn with_cache(mut self, cache: Arc<crate::cache::UnifiedCache>) -> Self {
         self.cache = Some(cache);
         self
     }
@@ -263,7 +263,7 @@ pub struct TuiApp {
     /// Current system stats (CPU, memory, threads)
     system_stats: crate::tui::SystemStats,
     /// Article cache (optional - only present in caching mode)
-    cache: Option<Arc<crate::cache::ArticleCache>>,
+    cache: Option<Arc<crate::cache::UnifiedCache>>,
 }
 
 impl TuiApp {

@@ -66,8 +66,21 @@ pub const MAX_BACKENDS: usize = 8;
 /// 1. Query all backends concurrently
 /// 2. Wait for all to complete
 /// 3. Update cache serially with all results
+
+/// Status of a backend for a specific article
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendStatus {
+    /// Backend hasn't been checked yet
+    Unknown,
+    /// Backend was checked and returned 430 (doesn't have article)
+    Missing,
+    /// Backend was checked and has the article
+    HasArticle,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArticleAvailability {
+
     /// Bitset of backends we've checked (tried to fetch from)
     checked: u8,
     /// Bitset of backends that DON'T have this article (returned 430)
@@ -234,6 +247,16 @@ impl ArticleAvailability {
         self.missing
     }
 
+    /// Reconstruct from raw bitset values (used for deserialization)
+    ///
+    /// # Safety
+    /// The caller must ensure the bits represent valid backend states.
+    /// This is primarily used when deserializing from disk cache.
+    #[inline]
+    pub const fn from_bits(checked: u8, missing: u8) -> Self {
+        Self { checked, missing }
+    }
+
     /// Check if we have any backend availability information
     ///
     /// Returns true if at least one backend has been checked.
@@ -253,6 +276,29 @@ impl ArticleAvailability {
         // A backend "has" the article if it's checked but not missing
         // checked & !missing gives us the backends that have it
         (self.checked & !self.missing) != 0
+    }
+
+    /// Query backend availability status
+    ///
+    /// # Panics (debug builds only)
+    /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
+    #[inline]
+    pub fn status(&self, backend_id: BackendId) -> BackendStatus {
+        let idx = backend_id.as_index();
+        debug_assert!(
+            idx < MAX_BACKENDS,
+            "Backend index {} exceeds MAX_BACKENDS ({})",
+            idx,
+            MAX_BACKENDS
+        );
+        let mask = 1u8 << idx;
+        if self.checked & mask == 0 {
+            BackendStatus::Unknown
+        } else if self.missing & mask != 0 {
+            BackendStatus::Missing
+        } else {
+            BackendStatus::HasArticle
+        }
     }
 }
 
@@ -337,6 +383,11 @@ impl ArticleEntry {
         self.backend_availability.record_has(backend_id);
     }
 
+    /// Set backend availability (used for hydrating from hybrid cache)
+    pub fn set_availability(&mut self, availability: ArticleAvailability) {
+        self.backend_availability = availability;
+    }
+
     /// Check if all backends have been tried and none have the article
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
         self.backend_availability.all_exhausted(total_backends)
@@ -396,15 +447,87 @@ impl ArticleEntry {
         self.buffer.len() >= MIN_ARTICLE_SIZE && self.buffer.ends_with(b".\r\n")
     }
 
-    /// Check if the cached response matches the requested command type
+    /// Get the appropriate response for a command, if this cache entry can serve it
     ///
-    /// Returns true if cached response can directly satisfy the command.
-    /// Accepts pre-parsed command verb for hot-path efficiency.
+    /// Returns `Some(response_bytes)` if cache can satisfy the command:
+    /// - ARTICLE (220 cached) → returns full cached response
+    /// - BODY (222 cached or 220 cached) → returns cached response  
+    /// - HEAD (221 cached or 220 cached) → returns cached response
+    /// - STAT → synthesizes "223 0 <msg-id>\r\n" (we know article exists)
     ///
-    /// Command matching rules:
-    /// - ARTICLE (220) matches: ARTICLE, BODY, HEAD requests
-    /// - BODY (222) matches: BODY requests only
-    /// - HEAD (221) matches: HEAD requests only
+    /// Returns `None` if cached response can't serve this command type or if
+    /// the cached buffer fails validation.
+    pub fn response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
+        let code = self.status_code()?.as_u16();
+        
+        match (code, cmd_verb) {
+            // STAT just needs existence confirmation - synthesize response
+            (220 | 221 | 222, "STAT") => {
+                Some(format!("223 0 {}\r\n", message_id).into_bytes())
+            }
+            // Direct match - return cached buffer if valid
+            (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
+                if self.is_valid_response() {
+                    Some(self.buffer.to_vec())
+                } else {
+                    tracing::warn!(
+                        code = code,
+                        len = self.buffer.len(),
+                        "Cached buffer failed validation, discarding"
+                    );
+                    None
+                }
+            }
+            // ARTICLE (220) contains everything, can serve BODY or HEAD requests
+            (220, "BODY" | "HEAD") => {
+                if self.is_valid_response() {
+                    Some(self.buffer.to_vec())
+                } else {
+                    tracing::warn!(
+                        code = code,
+                        len = self.buffer.len(),
+                        "Cached buffer failed validation, discarding"
+                    );
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if buffer contains a valid NNTP multiline response
+    ///
+    /// A valid response must:
+    /// 1. Start with 3 ASCII digits (status code)
+    /// 2. Have CRLF somewhere (line terminator)
+    /// 3. End with .\r\n for multiline responses (220/221/222)
+    #[inline]
+    fn is_valid_response(&self) -> bool {
+        // Must have at least "NNN \r\n.\r\n" = 9 bytes
+        if self.buffer.len() < 9 {
+            return false;
+        }
+        
+        // First 3 bytes must be ASCII digits
+        if !self.buffer[0].is_ascii_digit()
+            || !self.buffer[1].is_ascii_digit()
+            || !self.buffer[2].is_ascii_digit()
+        {
+            return false;
+        }
+        
+        // Must end with .\r\n for multiline responses
+        if !self.buffer.ends_with(b".\r\n") {
+            return false;
+        }
+        
+        // Must have CRLF in first line (status line)
+        memchr::memmem::find(&self.buffer[..self.buffer.len().min(256)], b"\r\n").is_some()
+    }
+
+    /// Check if this entry can serve a given command type
+    ///
+    /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
     pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
         let Some(code) = self.status_code() else {
@@ -412,36 +535,11 @@ impl ArticleEntry {
         };
 
         match code.as_u16() {
-            220 => {
-                // ARTICLE response has everything - can serve ARTICLE, BODY, or HEAD
-                matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD")
-            }
-            222 => {
-                // BODY response - can only serve BODY requests
-                cmd_verb == "BODY"
-            }
-            221 => {
-                // HEAD response - can only serve HEAD requests
-                cmd_verb == "HEAD"
-            }
+            220 => matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD" | "STAT"),
+            222 => matches!(cmd_verb, "BODY" | "STAT"),
+            221 => matches!(cmd_verb, "HEAD" | "STAT"),
             _ => false,
         }
-    }
-
-    /// Check if the cached response matches the requested command type
-    ///
-    /// Returns true if cached response can directly satisfy the command:
-    /// - ARTICLE (220) matches: ARTICLE, BODY, HEAD requests
-    /// - BODY (222) matches: BODY requests only
-    /// - HEAD (221) matches: HEAD requests only
-    #[inline]
-    pub fn matches_command_type(&self, command: &str) -> bool {
-        let cmd_verb = command
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        self.matches_command_type_verb(&cmd_verb)
     }
 
     /// Initialize availability tracker from this cached entry

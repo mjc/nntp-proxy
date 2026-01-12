@@ -14,13 +14,13 @@ pub use loading::{
     load_config_with_fallback,
 };
 pub use types::{
-    BackendSelectionStrategy, Cache, ClientAuth, Config, HealthCheck, Proxy, RoutingMode, Server,
-    UserCredentials,
+    BackendSelectionStrategy, Cache, ClientAuth, Config, DiskCache, HealthCheck, Proxy,
+    RoutingMode, Server, UserCredentials,
 };
 
 // Re-export default functions for use in tests and other modules
 pub use defaults::{
-    cache_max_capacity, cache_ttl, health_check_interval, health_check_max_per_cycle,
-    health_check_pool_timeout, health_check_timeout, max_connections, tls_verify_cert,
-    unhealthy_threshold,
+    cache_max_capacity, cache_ttl, disk_cache_capacity, disk_cache_compression, disk_cache_path,
+    disk_cache_shards, health_check_interval, health_check_max_per_cycle, health_check_pool_timeout,
+    health_check_timeout, max_connections, tls_verify_cert, unhealthy_threshold,
 };

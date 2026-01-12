@@ -96,19 +96,24 @@ fn test_matches_command_type_article_response() {
     let article_response =
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(article_response);
+    let msg_id = "<test@example.com>";
 
-    // ARTICLE response can serve ARTICLE, BODY, or HEAD requests
+    // ARTICLE response can serve ARTICLE, BODY, HEAD, or STAT requests
     assert!(
-        entry.matches_command_type("ARTICLE <test@example.com>"),
+        entry.response_for_command("ARTICLE", msg_id).is_some(),
         "ARTICLE (220) should match ARTICLE command"
     );
     assert!(
-        entry.matches_command_type("BODY <test@example.com>"),
+        entry.response_for_command("BODY", msg_id).is_some(),
         "ARTICLE (220) should match BODY command"
     );
     assert!(
-        entry.matches_command_type("HEAD <test@example.com>"),
+        entry.response_for_command("HEAD", msg_id).is_some(),
         "ARTICLE (220) should match HEAD command"
+    );
+    assert!(
+        entry.response_for_command("STAT", msg_id).is_some(),
+        "ARTICLE (220) should match STAT command"
     );
 }
 
@@ -117,19 +122,24 @@ fn test_matches_command_type_body_response() {
     // Create BODY response (222)
     let body_response = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(body_response);
+    let msg_id = "<test@example.com>";
 
-    // BODY response can only serve BODY requests
+    // BODY response can serve BODY and STAT requests
     assert!(
-        entry.matches_command_type("BODY <test@example.com>"),
+        entry.response_for_command("BODY", msg_id).is_some(),
         "BODY (222) should match BODY command"
     );
     assert!(
-        !entry.matches_command_type("ARTICLE <test@example.com>"),
+        entry.response_for_command("ARTICLE", msg_id).is_none(),
         "BODY (222) should NOT match ARTICLE command"
     );
     assert!(
-        !entry.matches_command_type("HEAD <test@example.com>"),
+        entry.response_for_command("HEAD", msg_id).is_none(),
         "BODY (222) should NOT match HEAD command"
+    );
+    assert!(
+        entry.response_for_command("STAT", msg_id).is_some(),
+        "BODY (222) should match STAT command (article exists)"
     );
 }
 
@@ -138,32 +148,35 @@ fn test_matches_command_type_head_response() {
     // Create HEAD response (221)
     let head_response = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(head_response);
+    let msg_id = "<test@example.com>";
 
-    // HEAD response can only serve HEAD requests
+    // HEAD response can serve HEAD and STAT requests
     assert!(
-        entry.matches_command_type("HEAD <test@example.com>"),
+        entry.response_for_command("HEAD", msg_id).is_some(),
         "HEAD (221) should match HEAD command"
     );
     assert!(
-        !entry.matches_command_type("ARTICLE <test@example.com>"),
+        entry.response_for_command("ARTICLE", msg_id).is_none(),
         "HEAD (221) should NOT match ARTICLE command"
     );
     assert!(
-        !entry.matches_command_type("BODY <test@example.com>"),
+        entry.response_for_command("BODY", msg_id).is_none(),
         "HEAD (221) should NOT match BODY command"
+    );
+    assert!(
+        entry.response_for_command("STAT", msg_id).is_some(),
+        "HEAD (221) should match STAT command (article exists)"
     );
 }
 
 #[test]
-fn test_matches_command_type_case_insensitive() {
+fn test_response_for_command_verbs_uppercase() {
     let body_response = b"222 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(body_response);
+    let msg_id = "<test@example.com>";
 
-    // Case variations should all work
-    assert!(entry.matches_command_type("BODY <test@example.com>"));
-    assert!(entry.matches_command_type("body <test@example.com>"));
-    assert!(entry.matches_command_type("Body <test@example.com>"));
-    assert!(entry.matches_command_type("bOdY <test@example.com>"));
+    // Only uppercase verbs are expected (caller is responsible for uppercasing)
+    assert!(entry.response_for_command("BODY", msg_id).is_some());
 }
 
 #[test]
@@ -229,38 +242,49 @@ fn test_body_article_command_type_mismatch() {
     // it should NOT match because BODY doesn't include headers
     let body_response =
         ArticleEntry::new(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n".to_vec());
+    let msg_id = "<test@example.com>";
 
     // BODY response should NOT match ARTICLE request (no headers)
     assert!(
-        !body_response.matches_command_type("ARTICLE <test@example.com>"),
+        body_response.response_for_command("ARTICLE", msg_id).is_none(),
         "ARTICLE command should not match BODY (222) response"
     );
 
     // But BODY response should match BODY request
     assert!(
-        body_response.matches_command_type("BODY <test@example.com>"),
+        body_response.response_for_command("BODY", msg_id).is_some(),
         "BODY command should match BODY (222) response"
     );
 
     // And should not match HEAD request (no body)
     assert!(
-        !body_response.matches_command_type("HEAD <test@example.com>"),
+        body_response.response_for_command("HEAD", msg_id).is_none(),
         "HEAD command should not match BODY (222) response"
+    );
+    
+    // STAT should work - we know the article exists
+    assert!(
+        body_response.response_for_command("STAT", msg_id).is_some(),
+        "STAT should match BODY (222) response (article exists)"
     );
 
     // ARTICLE (220) response matches all three
     let article_response =
         ArticleEntry::new(b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec());
     assert!(
-        article_response.matches_command_type("ARTICLE <test@example.com>"),
+        article_response.response_for_command("ARTICLE", msg_id).is_some(),
         "ARTICLE command should match ARTICLE (220) response"
     );
     assert!(
-        article_response.matches_command_type("BODY <test@example.com>"),
+        article_response.response_for_command("BODY", msg_id).is_some(),
         "BODY command should match ARTICLE (220) response"
     );
     assert!(
-        article_response.matches_command_type("HEAD <test@example.com>"),
+        article_response.response_for_command("HEAD", msg_id).is_some(),
         "HEAD command should match ARTICLE (220) response"
+    );
+    assert!(
+        article_response.response_for_command("STAT", msg_id).is_some(),
+        "STAT should match ARTICLE (220) response"
     );
 }
