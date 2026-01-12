@@ -98,9 +98,9 @@ async fn execute_backend_query(
 
     let mut buffer = deps.buffer_pool.acquire().await;
 
-    // Use shared backend command execution
-    match backend::send_command(&mut *conn, command, &mut buffer).await {
-        Ok(cmd_response) => {
+    // Use shared backend command execution with timing
+    match backend::send_command_timed(&mut *conn, command, &mut buffer).await {
+        Ok((cmd_response, ttfb, send, recv)) => {
             let Some(status_code) = cmd_response.status_code() else {
                 // Invalid response - drop connection
                 crate::pool::remove_from_pool(conn);
@@ -120,12 +120,15 @@ async fn execute_backend_query(
 
             Ok(match status_code {
                 220..=223 => {
-                    // Record successful command
+                    // Record successful command and timing
                     tracing::debug!(
                         backend = backend_id.as_index(),
+                        ttfb_us = ttfb,
                         "precheck recording command to metrics"
                     );
                     deps.metrics.record_command(backend_id);
+                    deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                    deps.metrics.record_send_recv_micros(backend_id, send, recv);
                     let data = if deps.cache_articles || !multiline {
                         response
                     } else {
@@ -135,6 +138,8 @@ async fn execute_backend_query(
                 }
                 430 => {
                     deps.metrics.record_command(backend_id);
+                    deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                    deps.metrics.record_send_recv_micros(backend_id, send, recv);
                     deps.metrics.record_error_4xx(backend_id);
                     QueryResult::Missing(backend_id)
                 }
