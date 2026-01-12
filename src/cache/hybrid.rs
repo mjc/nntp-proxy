@@ -73,20 +73,30 @@ pub struct HybridArticleEntry {
 impl Code for HybridArticleEntry {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         // Format: status (2) + checked (1) + missing (1) + len (4) + buffer
-        writer.write_all(&self.status_code.to_le_bytes()).map_err(foyer::Error::io_error)?;
-        writer.write_all(&[self.checked, self.missing]).map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&self.status_code.to_le_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&[self.checked, self.missing])
+            .map_err(foyer::Error::io_error)?;
         let len = self.buffer.len() as u32;
-        writer.write_all(&len.to_le_bytes()).map_err(foyer::Error::io_error)?;
-        writer.write_all(&self.buffer).map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&len.to_le_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&self.buffer)
+            .map_err(foyer::Error::io_error)?;
         Ok(())
     }
 
     fn decode(reader: &mut impl Read) -> foyer::Result<Self> {
         // Read status code
         let mut status_bytes = [0u8; 2];
-        reader.read_exact(&mut status_bytes).map_err(foyer::Error::io_error)?;
+        reader
+            .read_exact(&mut status_bytes)
+            .map_err(foyer::Error::io_error)?;
         let status_code = u16::from_le_bytes(status_bytes);
-        
+
         // Validate status code on decode - reject corrupted entries
         if !Self::is_valid_status_code(status_code) {
             return Err(foyer::Error::io_error(std::io::Error::new(
@@ -94,20 +104,26 @@ impl Code for HybridArticleEntry {
                 format!("Invalid cached status code: {}", status_code),
             )));
         }
-        
+
         // Read header: checked + missing
         let mut header = [0u8; 2];
-        reader.read_exact(&mut header).map_err(foyer::Error::io_error)?;
-        
+        reader
+            .read_exact(&mut header)
+            .map_err(foyer::Error::io_error)?;
+
         // Read length and pre-allocate buffer (no resizing!)
         let mut len_bytes = [0u8; 4];
-        reader.read_exact(&mut len_bytes).map_err(foyer::Error::io_error)?;
+        reader
+            .read_exact(&mut len_bytes)
+            .map_err(foyer::Error::io_error)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
-        
+
         // Pre-allocate exact size - this is the key optimization
         let mut buffer = vec![0u8; len];
-        reader.read_exact(&mut buffer).map_err(foyer::Error::io_error)?;
-        
+        reader
+            .read_exact(&mut buffer)
+            .map_err(foyer::Error::io_error)?;
+
         Ok(Self {
             status_code,
             checked: header[0],
@@ -124,23 +140,23 @@ impl Code for HybridArticleEntry {
 impl HybridArticleEntry {
     /// Valid NNTP status codes for cached articles
     const VALID_CODES: [u16; 5] = [220, 221, 222, 223, 430];
-    
+
     /// Check if a status code is valid for caching
     #[inline]
     fn is_valid_status_code(code: u16) -> bool {
         Self::VALID_CODES.contains(&code)
     }
-    
+
     /// Create from response buffer - returns None if buffer has invalid status code
     ///
     /// This is the ONLY way to create an entry. Invalid buffers are rejected.
     pub fn new(buffer: Vec<u8>) -> Option<Self> {
         let status_code = StatusCode::parse(&buffer)?.as_u16();
-        
+
         if !Self::is_valid_status_code(status_code) {
             return None;
         }
-        
+
         Some(Self {
             status_code,
             checked: 0,
@@ -225,12 +241,10 @@ impl HybridArticleEntry {
     /// Returns `None` if cached response can't serve this command type.
     pub fn response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
         let code = self.status_code;
-        
+
         match (code, cmd_verb) {
             // STAT just needs existence confirmation - synthesize response
-            (220 | 221 | 222, "STAT") => {
-                Some(format!("223 0 {}\r\n", message_id).into_bytes())
-            }
+            (220 | 221 | 222, "STAT") => Some(format!("223 0 {}\r\n", message_id).into_bytes()),
             // Direct match - return cached buffer if valid
             (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
                 // Validate buffer is a well-formed NNTP response
@@ -276,7 +290,7 @@ impl HybridArticleEntry {
         if self.buffer.len() < 9 {
             return false;
         }
-        
+
         // First 3 bytes must be ASCII digits
         if !self.buffer[0].is_ascii_digit()
             || !self.buffer[1].is_ascii_digit()
@@ -284,12 +298,12 @@ impl HybridArticleEntry {
         {
             return false;
         }
-        
+
         // Must end with .\r\n for multiline responses
         if !self.buffer.ends_with(b".\r\n") {
             return false;
         }
-        
+
         // Must have CRLF in first line (status line)
         memchr::memmem::find(&self.buffer[..self.buffer.len().min(256)], b"\r\n").is_some()
     }
@@ -311,6 +325,33 @@ impl HybridArticleEntry {
     #[inline]
     pub fn availability(&self) -> ArticleAvailability {
         ArticleAvailability::from_bits(self.checked, self.missing)
+    }
+
+    /// Check if we have any backend availability information
+    ///
+    /// Returns true if at least one backend has been checked.
+    /// Wrapper around `ArticleAvailability::has_availability_info()` for convenience.
+    #[inline]
+    pub fn has_availability_info(&self) -> bool {
+        self.checked != 0
+    }
+
+    /// Check if availability information is stale (older than ttl_secs)
+    ///
+    /// Since HybridArticleEntry doesn't track timestamps, this always returns false.
+    /// The foyer cache handles eviction separately.
+    #[inline]
+    pub fn is_availability_stale(&self, _ttl_secs: u64) -> bool {
+        // HybridArticleEntry doesn't track timestamps - foyer handles TTL
+        false
+    }
+
+    /// Clear stale availability information
+    ///
+    /// Since HybridArticleEntry doesn't track timestamps, this is a no-op.
+    #[inline]
+    pub fn clear_stale_availability(&mut self, _ttl_secs: u64) {
+        // No-op: HybridArticleEntry doesn't track timestamps
     }
 }
 
@@ -336,7 +377,7 @@ pub struct HybridCacheConfig {
 impl Default for HybridCacheConfig {
     fn default() -> Self {
         Self {
-            memory_capacity: 256 * 1024 * 1024, // 256 MB memory
+            memory_capacity: 256 * 1024 * 1024,     // 256 MB memory
             disk_capacity: 10 * 1024 * 1024 * 1024, // 10 GB disk
             disk_path: std::path::PathBuf::from("/var/cache/nntp-proxy"),
             ttl: Duration::from_secs(3600), // 1 hour
@@ -469,7 +510,7 @@ impl HybridArticleCache {
                 let cloned = entry.value().clone();
                 let clone_time = clone_start.elapsed();
                 let total = start.elapsed();
-                
+
                 // Log slow disk reads
                 if source == Source::Disk && total.as_millis() > 5 {
                     warn!(
@@ -546,12 +587,12 @@ impl HybridArticleCache {
             );
             return;
         };
-        
+
         entry.record_backend_has(backend_id);
 
         let entry_len = entry.buffer.len();
         self.cache.insert(key.clone(), entry);
-        
+
         debug!(
             msg_id = %key,
             original_bytes = buffer_len,
@@ -583,6 +624,61 @@ impl HybridArticleCache {
         };
 
         self.cache.insert(key, entry);
+    }
+
+    /// Sync availability information at the end of a retry loop
+    ///
+    /// This is called ONCE at the end of a retry loop to persist all the
+    /// backends that returned 430 during this request. Much more efficient
+    /// than calling record_missing for each backend individually.
+    ///
+    /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
+    /// If any backend successfully provided the article, we skip creating an entry
+    /// (the actual article will be cached via upsert, which may race with this call).
+    pub async fn sync_availability<'a>(
+        &self,
+        message_id: MessageId<'a>,
+        availability: &ArticleAvailability,
+    ) {
+        // Only sync if we actually tried some backends
+        if availability.checked_bits() == 0 {
+            return;
+        }
+
+        let key = message_id.without_brackets().to_string();
+
+        // Get existing entry or conditionally create a stub
+        let updated_entry = match self.cache.get(&key).await {
+            Ok(Some(existing)) => {
+                // Merge availability into existing entry
+                let mut entry = existing.value().clone();
+                // Merge: union of checked bits, union of missing bits
+                entry.checked |= availability.checked_bits();
+                entry.missing |= availability.missing_bits();
+                Some(entry)
+            }
+            _ => {
+                // No existing entry - only create a 430 stub if ALL backends returned 430
+                if availability.any_backend_has_article() {
+                    // A backend successfully provided the article.
+                    // Don't create a 430 stub - let upsert() handle it with the real article data.
+                    None
+                } else {
+                    // All checked backends returned 430 - create stub to track this
+                    // SAFETY: "430\r\n" is a valid NNTP response
+                    let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec())
+                        .expect("430 is a valid status code");
+                    entry.checked = availability.checked_bits();
+                    entry.missing = availability.missing_bits();
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    Some(entry)
+                }
+            }
+        };
+
+        if let Some(entry) = updated_entry {
+            self.cache.insert(key, entry);
+        }
     }
 
     /// Create a minimal stub from a response buffer (for availability-only mode)
@@ -740,7 +836,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "foyer HybridCache hangs in test context - run manually with --ignored"]
     async fn test_hybrid_cache_basic() {
-        let cache = HybridArticleCache::new_memory_only(1024 * 1024).await.unwrap();
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
 
         // Insert an article
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
@@ -766,13 +864,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "foyer HybridCache hangs in test context - run manually with --ignored"]
     async fn test_hybrid_cache_availability_tracking() {
-        let cache = HybridArticleCache::new_memory_only(1024 * 1024).await.unwrap();
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
 
         // Record a 430 response
         let msg_id = MessageId::from_borrowed("<missing@example.com>").unwrap();
-        cache
-            .record_missing(msg_id, BackendId::from_index(0))
-            .await;
+        cache.record_missing(msg_id, BackendId::from_index(0)).await;
 
         // Check availability
         let msg_id = MessageId::from_borrowed("<missing@example.com>").unwrap();
@@ -845,21 +943,21 @@ mod tests {
         assert!(!head.matches_command_type_verb("BODY"));
         assert!(head.matches_command_type_verb("HEAD"));
     }
-    
+
     #[test]
     fn test_hybrid_entry_rejects_invalid() {
         // Invalid status code
         assert!(HybridArticleEntry::new(b"999 invalid\r\n".to_vec()).is_none());
-        
+
         // Empty buffer
         assert!(HybridArticleEntry::new(vec![]).is_none());
-        
+
         // Too short
         assert!(HybridArticleEntry::new(b"20".to_vec()).is_none());
-        
+
         // Not starting with digits
         assert!(HybridArticleEntry::new(b"abc\r\n".to_vec()).is_none());
-        
+
         // Valid codes we allow
         assert!(HybridArticleEntry::new(b"220 article\r\n".to_vec()).is_some());
         assert!(HybridArticleEntry::new(b"221 head\r\n".to_vec()).is_some());

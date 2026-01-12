@@ -80,7 +80,6 @@ pub enum BackendStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArticleAvailability {
-
     /// Bitset of backends we've checked (tried to fetch from)
     checked: u8,
     /// Bitset of backends that DON'T have this article (returned 430)
@@ -459,12 +458,10 @@ impl ArticleEntry {
     /// the cached buffer fails validation.
     pub fn response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
         let code = self.status_code()?.as_u16();
-        
+
         match (code, cmd_verb) {
             // STAT just needs existence confirmation - synthesize response
-            (220 | 221 | 222, "STAT") => {
-                Some(format!("223 0 {}\r\n", message_id).into_bytes())
-            }
+            (220 | 221 | 222, "STAT") => Some(format!("223 0 {}\r\n", message_id).into_bytes()),
             // Direct match - return cached buffer if valid
             (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
                 if self.is_valid_response() {
@@ -507,7 +504,7 @@ impl ArticleEntry {
         if self.buffer.len() < 9 {
             return false;
         }
-        
+
         // First 3 bytes must be ASCII digits
         if !self.buffer[0].is_ascii_digit()
             || !self.buffer[1].is_ascii_digit()
@@ -515,12 +512,12 @@ impl ArticleEntry {
         {
             return false;
         }
-        
+
         // Must end with .\r\n for multiline responses
         if !self.buffer.ends_with(b".\r\n") {
             return false;
         }
-        
+
         // Must have CRLF in first line (status line)
         memchr::memmem::find(&self.buffer[..self.buffer.len().min(256)], b"\r\n").is_some()
     }

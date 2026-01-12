@@ -246,7 +246,9 @@ fn test_body_article_command_type_mismatch() {
 
     // BODY response should NOT match ARTICLE request (no headers)
     assert!(
-        body_response.response_for_command("ARTICLE", msg_id).is_none(),
+        body_response
+            .response_for_command("ARTICLE", msg_id)
+            .is_none(),
         "ARTICLE command should not match BODY (222) response"
     );
 
@@ -261,7 +263,7 @@ fn test_body_article_command_type_mismatch() {
         body_response.response_for_command("HEAD", msg_id).is_none(),
         "HEAD command should not match BODY (222) response"
     );
-    
+
     // STAT should work - we know the article exists
     assert!(
         body_response.response_for_command("STAT", msg_id).is_some(),
@@ -272,19 +274,27 @@ fn test_body_article_command_type_mismatch() {
     let article_response =
         ArticleEntry::new(b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec());
     assert!(
-        article_response.response_for_command("ARTICLE", msg_id).is_some(),
+        article_response
+            .response_for_command("ARTICLE", msg_id)
+            .is_some(),
         "ARTICLE command should match ARTICLE (220) response"
     );
     assert!(
-        article_response.response_for_command("BODY", msg_id).is_some(),
+        article_response
+            .response_for_command("BODY", msg_id)
+            .is_some(),
         "BODY command should match ARTICLE (220) response"
     );
     assert!(
-        article_response.response_for_command("HEAD", msg_id).is_some(),
+        article_response
+            .response_for_command("HEAD", msg_id)
+            .is_some(),
         "HEAD command should match ARTICLE (220) response"
     );
     assert!(
-        article_response.response_for_command("STAT", msg_id).is_some(),
+        article_response
+            .response_for_command("STAT", msg_id)
+            .is_some(),
         "STAT should match ARTICLE (220) response"
     );
 }

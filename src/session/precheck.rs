@@ -27,7 +27,7 @@ pub struct PrecheckDeps<'a> {
     pub router: &'a Arc<BackendSelector>,
     pub cache: &'a Arc<UnifiedCache>,
     pub buffer_pool: &'a BufferPool,
-    pub metrics: Option<&'a MetricsCollector>,
+    pub metrics: &'a MetricsCollector,
     pub cache_articles: bool,
 }
 
@@ -36,7 +36,7 @@ struct OwnedDeps {
     router: Arc<BackendSelector>,
     cache: Arc<UnifiedCache>,
     buffer_pool: BufferPool,
-    metrics: Option<MetricsCollector>,
+    metrics: MetricsCollector,
     cache_articles: bool,
 }
 
@@ -46,7 +46,7 @@ impl<'a> PrecheckDeps<'a> {
             router: Arc::clone(self.router),
             cache: Arc::clone(self.cache),
             buffer_pool: self.buffer_pool.clone(),
-            metrics: self.metrics.cloned(),
+            metrics: self.metrics.clone(),
             cache_articles: self.cache_articles,
         }
     }
@@ -121,12 +121,11 @@ async fn execute_backend_query(
             Ok(match status_code {
                 220..=223 => {
                     // Record successful command
-                    if let Some(m) = &deps.metrics {
-                        tracing::debug!(backend = backend_id.as_index(), "precheck recording command to metrics");
-                        m.record_command(backend_id);
-                    } else {
-                        tracing::warn!(backend = backend_id.as_index(), "precheck: metrics is None, cannot record command");
-                    }
+                    tracing::debug!(
+                        backend = backend_id.as_index(),
+                        "precheck recording command to metrics"
+                    );
+                    deps.metrics.record_command(backend_id);
                     let data = if deps.cache_articles || !multiline {
                         response
                     } else {
@@ -135,10 +134,8 @@ async fn execute_backend_query(
                     QueryResult::Found(backend_id, data)
                 }
                 430 => {
-                    if let Some(m) = &deps.metrics {
-                        m.record_command(backend_id);
-                        m.record_error_4xx(backend_id);
-                    }
+                    deps.metrics.record_command(backend_id);
+                    deps.metrics.record_error_4xx(backend_id);
                     QueryResult::Missing(backend_id)
                 }
                 _ => QueryResult::Error(backend_id),

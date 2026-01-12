@@ -362,11 +362,7 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
         ]
     };
 
-    let title = if is_hybrid {
-        "Cache (Hybrid)"
-    } else {
-        "Cache"
-    };
+    let title = if is_hybrid { "Cache (Hybrid)" } else { "Cache" };
 
     Paragraph::new(lines)
         .block(bordered_block(title, styles::BORDER_NORMAL))

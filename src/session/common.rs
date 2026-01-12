@@ -98,7 +98,7 @@ pub(crate) fn on_authentication_success(
     client_addr: impl std::fmt::Display,
     username: Option<String>,
     routing_mode: &crate::config::RoutingMode,
-    metrics: &Option<crate::metrics::MetricsCollector>,
+    metrics: &crate::metrics::MetricsCollector,
     connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
     set_username_fn: impl FnOnce(Option<String>),
 ) {
@@ -115,13 +115,11 @@ pub(crate) fn on_authentication_success(
     }
 
     // Track user connection in metrics
-    if let Some(m) = metrics {
-        m.user_connection_opened(username.as_deref());
-        debug!(
-            "Client {} opened connection for user: {:?}",
-            client_addr, username
-        );
-    }
+    metrics.user_connection_opened(username.as_deref());
+    debug!(
+        "Client {} opened connection for user: {:?}",
+        client_addr, username
+    );
 }
 
 #[cfg(test)]
@@ -323,7 +321,7 @@ pub async fn handle_stateful_auth_check<W>(
     auth_handler: &std::sync::Arc<crate::auth::AuthHandler>,
     auth_state: &crate::session::AuthState,
     routing_mode: &crate::config::RoutingMode,
-    metrics: &Option<crate::metrics::MetricsCollector>,
+    metrics: &crate::metrics::MetricsCollector,
     connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
     client_addr: impl std::fmt::Display + Clone,
     set_username_fn: impl FnOnce(Option<String>),

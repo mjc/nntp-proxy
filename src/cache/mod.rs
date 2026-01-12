@@ -74,7 +74,7 @@ impl CacheStatsProvider for HybridArticleCache {
     fn display_stats(&self) -> CacheDisplayStats {
         let stats = self.stats();
         CacheDisplayStats {
-            entry_count: 0, // foyer doesn't expose entry count easily
+            entry_count: 0,                    // foyer doesn't expose entry count easily
             size_bytes: stats.memory_capacity, // Use configured capacity
             hit_rate: stats.hit_rate(),
             disk: Some(DiskDisplayStats {

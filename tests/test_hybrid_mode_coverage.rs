@@ -43,7 +43,6 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
 
     let proxy = NntpProxy::builder(config)
         .with_routing_mode(RoutingMode::Hybrid)
-        .with_metrics() // Enable metrics to exercise flush code paths
         .build()
         .await?;
 

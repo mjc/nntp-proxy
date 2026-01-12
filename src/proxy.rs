@@ -59,7 +59,6 @@ pub struct NntpProxyBuilder {
     routing_mode: RoutingMode,
     buffer_size: Option<usize>,
     buffer_count: Option<usize>,
-    enable_metrics: bool,
 }
 
 impl NntpProxyBuilder {
@@ -73,7 +72,6 @@ impl NntpProxyBuilder {
             routing_mode: RoutingMode::Stateful,
             buffer_size: None,
             buffer_count: None,
-            enable_metrics: false, // Default to disabled for performance
         }
     }
 
@@ -106,17 +104,6 @@ impl NntpProxyBuilder {
     #[must_use]
     pub fn with_buffer_pool_count(mut self, count: usize) -> Self {
         self.buffer_count = Some(count);
-        self
-    }
-
-    /// Enable metrics collection for TUI and monitoring
-    ///
-    /// **Warning:** Metrics collection causes ~45% performance regression
-    /// (110MB/s -> 60MB/s) due to atomic operations in the hot path.
-    /// Only enable this when you need the TUI or monitoring.
-    #[must_use]
-    pub fn with_metrics(mut self) -> Self {
-        self.enable_metrics = true;
         self
     }
 
@@ -233,7 +220,11 @@ impl NntpProxyBuilder {
                 )
             } else {
                 // Memory-only cache
-                Arc::new(UnifiedCache::memory(capacity, cache_config.ttl, cache_articles))
+                Arc::new(UnifiedCache::memory(
+                    capacity,
+                    cache_config.ttl,
+                    cache_articles,
+                ))
             };
 
             if capacity > 0 {
@@ -280,7 +271,6 @@ impl NntpProxyBuilder {
             routing_mode: self.routing_mode,
             auth_handler,
             metrics,
-            enable_metrics: self.enable_metrics,
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
             cache_articles,
@@ -381,11 +371,17 @@ impl NntpProxyBuilder {
 
             // Warn if disk cache is configured but we're using sync build
             if cache_config.disk.is_some() {
-                warn!("Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support.");
+                warn!(
+                    "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
+                );
             }
 
             // Memory-only cache
-            let cache = Arc::new(UnifiedCache::memory(capacity, cache_config.ttl, cache_articles));
+            let cache = Arc::new(UnifiedCache::memory(
+                capacity,
+                cache_config.ttl,
+                cache_articles,
+            ));
 
             if capacity > 0 {
                 if cache_articles {
@@ -431,7 +427,6 @@ impl NntpProxyBuilder {
             routing_mode: self.routing_mode,
             auth_handler,
             metrics,
-            enable_metrics: self.enable_metrics,
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
             cache_articles,
@@ -456,10 +451,8 @@ pub struct NntpProxy {
     routing_mode: RoutingMode,
     /// Authentication handler for client auth interception
     auth_handler: Arc<AuthHandler>,
-    /// Metrics collector for TUI and monitoring
+    /// Metrics collector for TUI and monitoring (always enabled)
     metrics: MetricsCollector,
-    /// Whether metrics collection is enabled (causes ~45% perf penalty)
-    enable_metrics: bool,
     /// Connection statistics aggregator (reduces log spam)
     connection_stats: ConnectionStatsAggregator,
     /// Article cache (always present - tracks backend availability even with capacity=0)
@@ -508,16 +501,12 @@ impl NntpProxy {
 
     #[inline]
     fn record_connection_opened(&self) {
-        if self.enable_metrics {
-            self.metrics.connection_opened();
-        }
+        self.metrics.connection_opened();
     }
 
     #[inline]
     fn record_connection_closed(&self) {
-        if self.enable_metrics {
-            self.metrics.connection_closed();
-        }
+        self.metrics.connection_closed();
     }
 
     /// Increment active client count
@@ -597,6 +586,7 @@ impl NntpProxy {
             client_addr,
             self.buffer_pool.clone(),
             self.auth_handler.clone(),
+            self.metrics.clone(),
         )
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
@@ -608,13 +598,6 @@ impl NntpProxy {
         let builder = match router {
             Some(r) => builder.with_router(r),
             None => builder,
-        };
-
-        // Apply optional metrics
-        let builder = if self.enable_metrics {
-            builder.with_metrics(self.metrics.clone())
-        } else {
-            builder
         };
 
         builder.build()
@@ -936,9 +919,7 @@ impl NntpProxy {
                     &m,
                 );
 
-                if self.enable_metrics
-                    && let Some(bid) = backend_id
-                {
+                if let Some(bid) = backend_id {
                     self.metrics
                         .record_client_to_backend_bytes_for(bid, m.client_to_backend.as_u64());
                     self.metrics
@@ -947,9 +928,7 @@ impl NntpProxy {
                 Ok(())
             }
             Err(e) => {
-                if self.enable_metrics
-                    && let Some(bid) = backend_id
-                {
+                if let Some(bid) = backend_id {
                     self.metrics.record_error(bid);
                 }
 
@@ -1476,7 +1455,11 @@ mod tests {
         #[tokio::test]
         async fn test_prepare_per_command_connection() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).await.unwrap());
+            let proxy = Arc::new(
+                NntpProxy::new(config, RoutingMode::PerCommand)
+                    .await
+                    .unwrap(),
+            );
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

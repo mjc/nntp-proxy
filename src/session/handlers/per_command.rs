@@ -5,7 +5,6 @@
 //! logic used by all routing modes.
 
 use crate::session::common;
-use crate::session::metrics_ext::MetricsRecorder;
 use crate::session::routing::{
     CacheAction, CommandRoutingDecision, MetricsAction, decide_command_routing,
     determine_cache_action, determine_metrics_action, is_430_status_code,
@@ -122,7 +121,7 @@ impl ClientSession {
             .next()
             .unwrap_or("")
             .to_ascii_uppercase();
-        
+
         if cmd_verb != "STAT" && !cached.is_complete_article() {
             debug!(
                 "Client {} cache entry for {} is a stub (len={}), fetching full article",
@@ -386,9 +385,8 @@ impl ClientSession {
         }
 
         // Log session summary and close user connection
-        if let Some(ref m) = self.metrics {
-            m.user_connection_closed(self.username().as_deref());
-        }
+        self.metrics
+            .user_connection_closed(self.username().as_deref());
 
         Ok(TransferMetrics {
             client_to_backend: client_to_backend_bytes,
@@ -836,18 +834,14 @@ impl ClientSession {
         send: u64,
         recv: u64,
     ) {
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_ttfb_micros(backend_id, ttfb);
-            metrics.record_send_recv_micros(backend_id, send, recv);
-        }
+        self.metrics.record_ttfb_micros(backend_id, ttfb);
+        self.metrics.record_send_recv_micros(backend_id, send, recv);
     }
 
     /// Handle backend error (metrics and cleanup)
     fn handle_backend_error(&self, backend_id: crate::types::BackendId, router: &BackendSelector) {
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_error(backend_id);
-            metrics.user_error(self.username().as_deref());
-        }
+        self.metrics.record_error(backend_id);
+        self.metrics.user_error(self.username().as_deref());
         router.complete_command(backend_id);
     }
 
@@ -906,13 +900,11 @@ impl ClientSession {
         // An invalid response (code 0) should never reach here.
         let Some(status_code) = response_code.status_code() else {
             // This should never happen - caller should reject Invalid responses
-            tracing::error!(
-                "BUG: stream_response_to_client called with Invalid response"
-            );
+            tracing::error!("BUG: stream_response_to_client called with Invalid response");
             anyhow::bail!("Cannot stream invalid response");
         };
         let code = status_code.as_u16();
-        
+
         let cache_action = determine_cache_action(
             command,
             code,
@@ -923,7 +915,11 @@ impl ClientSession {
 
         debug!(
             "stream_response_to_client: code={}, is_multiline={}, cache_articles={}, has_msg_id={}, action={:?}",
-            code, is_multiline, self.cache_articles, msg_id.is_some(), cache_action
+            code,
+            is_multiline,
+            self.cache_articles,
+            msg_id.is_some(),
+            cache_action
         );
 
         match (is_multiline, cache_action) {
@@ -1008,22 +1004,20 @@ impl ClientSession {
     ) {
         use crate::types::MetricsBytes;
 
-        let Some(ref metrics) = self.metrics else {
-            return;
-        };
-
         if let Some(code) = response_code.status_code() {
             match determine_metrics_action(code.as_u16(), is_multiline) {
-                MetricsAction::Error4xx => metrics.record_error_4xx(backend_id),
-                MetricsAction::Error5xx => metrics.record_error_5xx(backend_id),
-                MetricsAction::Article => metrics.record_article(backend_id, resp_bytes),
+                MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+                MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+                MetricsAction::Article => self.metrics.record_article(backend_id, resp_bytes),
                 MetricsAction::None => {}
             }
         }
 
         let cmd_bytes_metric = MetricsBytes::new(cmd_bytes);
         let resp_bytes_metric = MetricsBytes::new(resp_bytes);
-        let _ = metrics.record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
+        let _ =
+            self.metrics
+                .record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
         self.metrics
             .user_bytes_sent(self.username().as_deref(), cmd_bytes);
         self.metrics
@@ -1036,7 +1030,7 @@ impl ClientSession {
             router,
             cache: &self.cache,
             buffer_pool: &self.buffer_pool,
-            metrics: self.metrics.as_ref(),
+            metrics: &self.metrics,
             cache_articles: self.cache_articles,
         }
     }
