@@ -163,6 +163,8 @@ async fn execute_backend_query(
 }
 
 async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) -> Vec<QueryResult> {
+    use futures::StreamExt;
+    
     let tasks: Vec<_> = (0..deps.router.backend_count().get())
         .map(BackendId::from_index)
         .map(|id| {
@@ -172,11 +174,13 @@ async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) ->
         })
         .collect();
 
-    futures::future::join_all(tasks)
-        .await
-        .into_iter()
-        .filter_map(Result::ok)
+    // Race all backends - collect results as they complete (fastest first)
+    let task_count = tasks.len();
+    futures::stream::iter(tasks)
+        .buffer_unordered(task_count)
+        .filter_map(|result| async move { result.ok() })
         .collect()
+        .await
 }
 
 /// Extract first found response and build availability from results.
