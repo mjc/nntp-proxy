@@ -162,9 +162,10 @@ async fn execute_backend_query(
     }
 }
 
+/// Query all backends, collecting results as they arrive
 async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) -> Vec<QueryResult> {
     use futures::StreamExt;
-    
+
     let tasks: Vec<_> = (0..deps.router.backend_count().get())
         .map(BackendId::from_index)
         .map(|id| {
@@ -181,6 +182,67 @@ async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) ->
         .filter_map(|result| async move { result.ok() })
         .collect()
         .await
+}
+
+/// Query all backends racing, return first success immediately.
+/// Background task updates cache with full availability once all backends complete.
+async fn query_all_backends_racing(
+    deps: &OwnedDeps,
+    command: &str,
+    msg_id: &MessageId<'_>,
+    multiline: bool,
+) -> Option<(BackendId, Vec<u8>)> {
+    use futures::StreamExt;
+
+    let tasks: Vec<_> = (0..deps.router.backend_count().get())
+        .map(BackendId::from_index)
+        .map(|id| {
+            let deps = deps.clone();
+            let cmd = command.to_string();
+            tokio::spawn(async move { query_backend(&deps, id, &cmd, multiline).await })
+        })
+        .collect();
+
+    let backend_count = deps.router.backend_count();
+
+    // Process results as they complete, return first success immediately
+    let mut pending = futures::stream::iter(tasks)
+        .buffer_unordered(backend_count.get())
+        .filter_map(|result| async move { result.ok() })
+        .boxed();
+
+    let mut results = Vec::with_capacity(backend_count.get());
+    let mut first_found = None;
+
+    // Collect results until we find a success
+    while let Some(result) = pending.next().await {
+        match &result {
+            QueryResult::Found(id, response) if first_found.is_none() => {
+                first_found = Some((*id, response.clone()));
+                results.push(result);
+
+                // Spawn background task to complete remaining backends and update cache
+                let cache = deps.cache.clone();
+                let msg_id_owned = msg_id.to_owned();
+                tokio::spawn(async move {
+                    // Collect remaining results
+                    while let Some(result) = pending.next().await {
+                        results.push(result);
+                    }
+                    // Build availability from all results and sync to cache
+                    let (_, availability) = summarize(results);
+                    cache.sync_availability(msg_id_owned, &availability).await;
+                });
+                return first_found;
+            }
+            _ => {
+                results.push(result);
+            }
+        }
+    }
+
+    // No success found - all backends returned 430
+    None
 }
 
 /// Extract first found response and build availability from results.
@@ -214,33 +276,10 @@ fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, Vec<u8>)>, Articl
 ///
 /// If found, upserts with data. Then syncs full availability state.
 /// Returns the cache entry if article was found.
-async fn cache_results(
-    cache: &UnifiedCache,
-    msg_id: &MessageId<'_>,
-    found: Option<(BackendId, Vec<u8>)>,
-    availability: ArticleAvailability,
-) -> Option<ArticleEntry> {
-    let has_article = found.is_some();
-
-    if let Some((backend_id, data)) = found {
-        cache.upsert(msg_id.to_owned(), data, backend_id).await;
-    }
-    cache
-        .sync_availability(msg_id.to_owned(), &availability)
-        .await;
-
-    // Return cached entry if we found something
-    if has_article {
-        cache.get(msg_id).await
-    } else {
-        None
-    }
-}
-
 /// Precheck all backends for an article.
 ///
-/// Queries concurrently, stores results in cache.
-/// Returns Some(entry) if any backend had it, None if all 430'd.
+/// Queries concurrently, returns first successful response immediately.
+/// Remaining backends complete in background to update full availability.
 ///
 /// Skips backend queries entirely if we already have a complete article cached.
 pub async fn precheck(
@@ -250,16 +289,26 @@ pub async fn precheck(
     multiline: bool,
 ) -> Option<ArticleEntry> {
     // Check cache first - if we have a complete article, return it immediately
-    if let Some(cached) = deps.cache.get(msg_id).await {
-        if cached.is_complete_article() {
-            return Some(cached);
-        }
+    if let Some(cached) = deps.cache.get(msg_id).await
+        && cached.is_complete_article()
+    {
+        return Some(cached);
     }
 
     let owned = deps.to_owned();
-    let results = query_all_backends(&owned, command, multiline).await;
-    let (found, availability) = summarize(results);
-    cache_results(&owned.cache, msg_id, found, availability).await
+    let found = query_all_backends_racing(&owned, command, msg_id, multiline).await;
+
+    // Cache the found result and return it
+    if let Some((backend_id, data)) = found {
+        owned
+            .cache
+            .upsert(msg_id.to_owned(), data, backend_id)
+            .await;
+        owned.cache.get(msg_id).await
+    } else {
+        // No article found - availability is synced by background task
+        None
+    }
 }
 
 /// Spawn background precheck. Results go to cache only.
@@ -273,11 +322,11 @@ pub fn spawn_background_precheck(
     let owned = deps.to_owned();
     tokio::spawn(async move {
         // Check cache first - if we have a complete article, no need to query backends
-        if let Some(cached) = owned.cache.get(&msg_id).await {
-            if cached.is_complete_article() {
-                // Already have full article cached - nothing to do
-                return;
-            }
+        if let Some(cached) = owned.cache.get(&msg_id).await
+            && cached.is_complete_article()
+        {
+            // Already have full article cached - nothing to do
+            return;
         }
 
         let results = query_all_backends(&owned, &command, false).await;

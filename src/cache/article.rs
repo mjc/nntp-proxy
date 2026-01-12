@@ -66,7 +66,7 @@ pub const MAX_BACKENDS: usize = 8;
 /// 1. Query all backends concurrently
 /// 2. Wait for all to complete
 /// 3. Update cache serially with all results
-
+///
 /// Status of a backend for a specific article
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
@@ -461,7 +461,7 @@ impl ArticleEntry {
 
         match (code, cmd_verb) {
             // STAT just needs existence confirmation - synthesize response
-            (220 | 221 | 222, "STAT") => Some(format!("223 0 {}\r\n", message_id).into_bytes()),
+            (220..=222, "STAT") => Some(format!("223 0 {}\r\n", message_id).into_bytes()),
             // Direct match - return cached buffer if valid
             (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
                 if self.is_valid_response() {
