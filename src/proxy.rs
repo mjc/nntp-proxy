@@ -698,8 +698,14 @@ impl NntpProxy {
 
     /// Gracefully shutdown all connection pools
     pub async fn graceful_shutdown(&self) {
-        info!("Initiating graceful shutdown of all connection pools...");
+        info!("Initiating graceful shutdown...");
 
+        // Give foyer time to flush pending writes to disk
+        // With WriteOnInsertion, writes are enqueued but processed async
+        info!("Waiting for disk cache writes to flush...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        info!("Shutting down connection pools...");
         for provider in &self.connection_providers {
             provider.graceful_shutdown().await;
         }

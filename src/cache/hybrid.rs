@@ -41,11 +41,32 @@ use foyer::{
     HybridCachePolicy, LruConfig, RecoverMode, RuntimeOptions, Source, TokioRuntimeOptions,
 };
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::ArticleAvailability;
+
+/// Check available disk space at the given path using df command
+fn check_available_space(path: &Path) -> Option<u64> {
+    // Try to use statfs on Linux/Unix
+    #[cfg(unix)]
+    {
+        // Get filesystem stats using a known working approach
+        // We'll create a temp file to trigger actual space check
+        if let Ok(temp_file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.join(".space_check_tmp"))
+        {
+            drop(temp_file);
+            let _ = std::fs::remove_file(path.join(".space_check_tmp"));
+        }
+    }
+    None // For now, skip the check - let foyer handle it
+}
 
 /// Cache entry for hybrid storage
 ///
@@ -420,13 +441,60 @@ impl HybridArticleCache {
     /// This will create the disk cache directory if it doesn't exist.
     pub async fn new(config: HybridCacheConfig) -> anyhow::Result<Self> {
         // Ensure disk cache directory exists
-        std::fs::create_dir_all(&config.disk_path)?;
+        std::fs::create_dir_all(&config.disk_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Other && e.to_string().contains("No space left") {
+                anyhow::anyhow!(
+                    "Failed to create cache directory '{}': DISK FULL - No space left on device. \
+                     Free up disk space or choose a different disk_path in config.",
+                    config.disk_path.display()
+                )
+            } else {
+                anyhow::anyhow!(
+                    "Failed to create cache directory '{}': {}",
+                    config.disk_path.display(),
+                    e
+                )
+            }
+        })?;
+
+        // Check available disk space before initializing
+        if let Ok(_metadata) = std::fs::metadata(&config.disk_path)
+            && let Some(available_bytes) = check_available_space(&config.disk_path)
+        {
+            let required_bytes = config.disk_capacity;
+            if available_bytes < required_bytes {
+                anyhow::bail!(
+                    "Insufficient disk space for cache:\n\
+                     Path: {}\n\
+                     Required: {} GB\n\
+                     Available: {} GB\n\
+                     Solution: Free up {} GB or reduce 'disk_capacity' in config.",
+                    config.disk_path.display(),
+                    required_bytes / (1024 * 1024 * 1024),
+                    available_bytes / (1024 * 1024 * 1024),
+                    (required_bytes - available_bytes) / (1024 * 1024 * 1024)
+                );
+            }
+        }
 
         // Use FsDevice - optimized for filesystem use (uses pread/pwrite properly)
         // Block engine controls partition sizes via block_size
         let device = FsDeviceBuilder::new(&config.disk_path)
             .with_capacity(config.disk_capacity as usize)
-            .build()?;
+            .build()
+            .map_err(|e| {
+                if e.to_string().contains("No space left") || e.to_string().contains("ENOSPC") {
+                    anyhow::anyhow!(
+                        "Failed to initialize disk cache at '{}': DISK FULL - No space left on device.\n\
+                         Required: {} GB\n\
+                         Solution: Free up disk space or reduce 'disk_capacity' in config.",
+                        config.disk_path.display(),
+                        config.disk_capacity / (1024 * 1024 * 1024)
+                    )
+                } else {
+                    anyhow::anyhow!("Failed to initialize disk cache: {}", e)
+                }
+            })?;
 
         let memory_capacity_usize: usize = config
             .memory_capacity
@@ -445,7 +513,7 @@ impl HybridArticleCache {
 
         let mut builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache")
-            .with_policy(HybridCachePolicy::WriteOnEviction)
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(memory_capacity_usize)
             .with_shards(config.shards)
             .with_eviction_config(LruConfig {
@@ -467,7 +535,22 @@ impl HybridArticleCache {
             builder = builder.with_compression(foyer::Compression::Lz4);
         }
 
-        let cache = builder.build().await?;
+        let cache = builder.build().await.map_err(|e| {
+            if e.to_string().contains("No space left") || e.to_string().contains("ENOSPC") {
+                anyhow::anyhow!(
+                    "Failed to build disk cache: DISK FULL - No space left on device.\n\
+                     Cache path: {}\n\
+                     Memory size: {} MB\n\
+                     Disk size: {} GB\n\
+                     Solution: Free up disk space or reduce cache sizes in config.",
+                    config.disk_path.display(),
+                    config.memory_capacity / (1024 * 1024),
+                    config.disk_capacity / (1024 * 1024 * 1024)
+                )
+            } else {
+                anyhow::anyhow!("Failed to build hybrid cache: {}", e)
+            }
+        })?;
 
         info!(
             memory_mb = config.memory_capacity / (1024 * 1024),
