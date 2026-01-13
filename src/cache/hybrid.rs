@@ -797,7 +797,8 @@ impl HybridArticleCache {
     /// Close the cache gracefully
     ///
     /// Flushes pending writes to disk before returning.
-    pub async fn close(self) -> anyhow::Result<()> {
+    /// This waits for all enqueued disk writes to complete.
+    pub async fn close(&self) -> anyhow::Result<()> {
         self.cache
             .close()
             .await

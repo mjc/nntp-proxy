@@ -700,10 +700,12 @@ impl NntpProxy {
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown...");
 
-        // Give foyer time to flush pending writes to disk
-        // With WriteOnInsertion, writes are enqueued but processed async
-        info!("Waiting for disk cache writes to flush...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Flush cache writes to disk before shutting down
+        // With WriteOnInsertion, writes are enqueued async - close() waits for completion
+        info!("Flushing disk cache writes...");
+        if let Err(e) = self.cache.close().await {
+            warn!("Error closing cache: {}", e);
+        }
 
         info!("Shutting down connection pools...");
         for provider in &self.connection_providers {

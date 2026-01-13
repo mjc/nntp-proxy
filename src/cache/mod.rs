@@ -214,6 +214,17 @@ impl UnifiedCache {
             Self::Hybrid(_) => {} // foyer handles this differently
         }
     }
+
+    /// Close the cache and flush all pending writes
+    ///
+    /// For hybrid cache, this ensures all enqueued disk writes complete before returning.
+    /// For memory cache, this is a no-op (no persistent state).
+    pub async fn close(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Memory(_) => Ok(()), // No persistent state
+            Self::Hybrid(cache) => cache.close().await,
+        }
+    }
 }
 
 impl CacheStatsProvider for UnifiedCache {
