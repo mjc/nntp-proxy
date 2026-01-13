@@ -709,11 +709,19 @@ impl ClientSession {
         {
             Ok(bytes) => bytes,
             Err(e) => {
-                // Only mark as backend error if it's NOT a client disconnect
-                // Client disconnects should not penalize the backend
+                // CRITICAL: Always decrement pending count when streaming fails,
+                // regardless of error type (client disconnect, network error, etc.)
+                // Failure to do this causes TUI in-flight count drift over time.
+                // The pending count was incremented by route_command_with_availability()
+                // at the start of try_backend_for_article().
+                router.complete_command(backend_id);
+
+                // Only mark as backend error metrics if it's NOT a client disconnect.
+                // Client disconnects are normal behavior and shouldn't penalize backends.
                 if !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&e)
                 {
-                    self.handle_backend_error(backend_id, &router);
+                    self.metrics.record_error(backend_id);
+                    self.metrics.user_error(self.username().as_deref());
                 }
                 crate::pool::remove_from_pool(conn);
                 return Err(e);
@@ -839,12 +847,6 @@ impl ClientSession {
     }
 
     /// Handle backend error (metrics and cleanup)
-    fn handle_backend_error(&self, backend_id: crate::types::BackendId, router: &BackendSelector) {
-        self.metrics.record_error(backend_id);
-        self.metrics.user_error(self.username().as_deref());
-        router.complete_command(backend_id);
-    }
-
     /// Send standardized 430 response to client
     async fn send_430_to_client(
         &self,

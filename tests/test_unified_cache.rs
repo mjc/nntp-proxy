@@ -845,6 +845,7 @@ fn test_hybrid_entry_serialization_estimated_size() {
     let entry = HybridArticleEntry::new(buffer.clone()).unwrap();
 
     // estimated_size = 2 (status) + 2 (checked+missing) + 8 (timestamp) + 4 (len) + buffer.len()
+    // Format: [status:u16][checked:u8][missing:u8][timestamp:u64][len:u32][buffer:bytes]
     let expected_size = 2 + 2 + 8 + 4 + buffer.len();
     assert_eq!(entry.estimated_size(), expected_size);
 }
@@ -927,13 +928,15 @@ fn test_hybrid_entry_decode_truncated_buffer() {
 
     // Encode header that claims more data than available
     let mut buf = Vec::new();
-    buf.extend_from_slice(&220u16.to_le_bytes()); // status
-    buf.extend_from_slice(&0u8.to_le_bytes()); // checked
-    buf.extend_from_slice(&0u8.to_le_bytes()); // missing
-    buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    buf.extend_from_slice(&220u16.to_le_bytes()); // status (2 bytes)
+    buf.extend_from_slice(&0u8.to_le_bytes()); // checked (1 byte)
+    buf.extend_from_slice(&0u8.to_le_bytes()); // missing (1 byte)
     buf.extend_from_slice(&1000u32.to_le_bytes()); // claims 1000 bytes
-    buf.extend_from_slice(b"short"); // only 5 bytes
+    buf.extend_from_slice(b"short"); // only 5 bytes (not 1000)
 
     let result = HybridArticleEntry::decode(&mut Cursor::new(&buf));
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "Should fail when buffer length doesn't match claimed size"
+    );
 }

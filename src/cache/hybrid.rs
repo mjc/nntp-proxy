@@ -75,7 +75,7 @@ fn check_available_space(path: &Path) -> Option<u64> {
 ///
 /// Implements foyer's Code trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
-/// - Simple binary format: [status:u16][checked:u8][missing:u8][len:u32][buffer:bytes]
+/// - Simple binary format: [status:u16][checked:u8][missing:u8][timestamp:u64][len:u32][buffer:bytes]
 #[derive(Clone, Debug)]
 pub struct HybridArticleEntry {
     /// Validated NNTP status code (220, 221, 222, 223, 430)
@@ -85,6 +85,10 @@ pub struct HybridArticleEntry {
     checked: u8,
     /// Backend availability bitset - missing bits
     missing: u8,
+    /// Unix timestamp when availability info was last updated (seconds since epoch)
+    /// Used to expire stale availability-only entries (430 stubs, STAT responses)
+    /// Full articles (220 with body) ignore this field
+    timestamp: u64,
     /// Complete response buffer
     /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
     buffer: Vec<u8>,
@@ -93,12 +97,15 @@ pub struct HybridArticleEntry {
 /// Manual Code implementation to avoid bincode's vec resizing overhead
 impl Code for HybridArticleEntry {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
-        // Format: status (2) + checked (1) + missing (1) + len (4) + buffer
+        // Format: status (2) + checked (1) + missing (1) + timestamp (8) + len (4) + buffer
         writer
             .write_all(&self.status_code.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&[self.checked, self.missing])
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&self.timestamp.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         let len = self.buffer.len() as u32;
         writer
@@ -132,6 +139,13 @@ impl Code for HybridArticleEntry {
             .read_exact(&mut header)
             .map_err(foyer::Error::io_error)?;
 
+        // Read timestamp
+        let mut timestamp_bytes = [0u8; 8];
+        reader
+            .read_exact(&mut timestamp_bytes)
+            .map_err(foyer::Error::io_error)?;
+        let timestamp = u64::from_le_bytes(timestamp_bytes);
+
         // Read length and pre-allocate buffer (no resizing!)
         let mut len_bytes = [0u8; 4];
         reader
@@ -149,12 +163,13 @@ impl Code for HybridArticleEntry {
             status_code,
             checked: header[0],
             missing: header[1],
+            timestamp,
             buffer,
         })
     }
 
     fn estimated_size(&self) -> usize {
-        2 + 2 + 4 + self.buffer.len() // status + header + len + buffer
+        2 + 2 + 8 + 4 + self.buffer.len() // status + header + timestamp + len + buffer
     }
 }
 
@@ -182,6 +197,10 @@ impl HybridArticleEntry {
             status_code,
             checked: 0,
             missing: 0,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             buffer,
         })
     }
