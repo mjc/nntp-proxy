@@ -931,6 +931,7 @@ fn test_hybrid_entry_decode_truncated_buffer() {
     buf.extend_from_slice(&220u16.to_le_bytes()); // status (2 bytes)
     buf.extend_from_slice(&0u8.to_le_bytes()); // checked (1 byte)
     buf.extend_from_slice(&0u8.to_le_bytes()); // missing (1 byte)
+    buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp (8 bytes)
     buf.extend_from_slice(&1000u32.to_le_bytes()); // claims 1000 bytes
     buf.extend_from_slice(b"short"); // only 5 bytes (not 1000)
 

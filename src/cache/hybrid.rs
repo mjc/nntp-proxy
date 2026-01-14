@@ -153,6 +153,18 @@ impl Code for HybridArticleEntry {
             .map_err(foyer::Error::io_error)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
+        // Reject unreasonably large cached entries to avoid OOM on corrupted data.
+        const MAX_BUFFER_SIZE: usize = 100 * 1024 * 1024; // 100 MiB hard limit
+        if len > MAX_BUFFER_SIZE {
+            return Err(foyer::Error::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Cached article too large: {} bytes (max {} bytes)",
+                    len, MAX_BUFFER_SIZE
+                ),
+            )));
+        }
+
         // Pre-allocate exact size - this is the key optimization
         let mut buffer = vec![0u8; len];
         reader
@@ -498,8 +510,16 @@ impl HybridArticleCache {
 
         // Use FsDevice - optimized for filesystem use (uses pread/pwrite properly)
         // Block engine controls partition sizes via block_size
+        let disk_capacity_usize: usize = config.disk_capacity.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "Disk capacity {} bytes too large for platform (max {} bytes)",
+                config.disk_capacity,
+                usize::MAX
+            )
+        })?;
+
         let device = FsDeviceBuilder::new(&config.disk_path)
-            .with_capacity(config.disk_capacity as usize)
+            .with_capacity(disk_capacity_usize)
             .build()
             .map_err(|e| {
                 if e.to_string().contains("No space left") || e.to_string().contains("ENOSPC") {
@@ -933,6 +953,17 @@ impl HybridArticleCache {
 //   cargo test --features hybrid-cache cache::hybrid -- --ignored
 #[cfg(test)]
 mod tests {
+    //! Unit tests for HybridArticleCache
+    //!
+    //! NOTE: These tests are marked as #[ignore] due to foyer runtime issues in test context.
+    //! The actual Foyer integration is tested through:
+    //! - MockHybridCache in tests/test_hybrid_cache_integration.rs
+    //! - UnifiedCache wrapper in tests/test_unified_cache.rs
+    //! - Full integration tests with real cache instances
+    //!
+    //! To run these ignored tests manually:
+    //!   cargo test --package nntp-proxy --lib cache::hybrid::tests -- --ignored --nocapture
+
     use super::*;
 
     #[tokio::test]

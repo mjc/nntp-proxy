@@ -224,7 +224,8 @@ async fn query_all_backends_racing(
                 // Spawn background task to complete remaining backends and update cache
                 let cache = deps.cache.clone();
                 let msg_id_owned = msg_id.to_owned();
-                tokio::spawn(async move {
+                let msg_id_log = msg_id.to_string();
+                let handle = tokio::spawn(async move {
                     // Collect remaining results
                     while let Some(result) = pending.next().await {
                         results.push(result);
@@ -232,6 +233,17 @@ async fn query_all_backends_racing(
                     // Build availability from all results and sync to cache
                     let (_, availability) = summarize(results);
                     cache.sync_availability(msg_id_owned, &availability).await;
+                });
+
+                // Log task failures in the background
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await {
+                        tracing::error!(
+                            "Background precheck sync task panicked for {}: {}",
+                            msg_id_log,
+                            e
+                        );
+                    }
                 });
                 return first_found;
             }
