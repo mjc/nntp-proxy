@@ -37,7 +37,7 @@ async fn setup_proxy_with_config(config: Config, routing_mode: RoutingMode) -> R
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
 
-    let proxy = NntpProxy::new(config, routing_mode)?;
+    let proxy = NntpProxy::new(config, routing_mode).await?;
 
     tokio::spawn(async move {
         loop {

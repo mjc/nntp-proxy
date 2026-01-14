@@ -82,9 +82,9 @@ pub enum BackendSelectionStrategy {
 }
 
 impl Default for BackendSelectionStrategy {
-    /// Default is weighted round-robin for predictable distribution
+    /// Default is least-loaded for optimal dynamic load distribution
     fn default() -> Self {
-        Self::WeightedRoundRobin
+        Self::LeastLoaded
     }
 }
 
@@ -161,7 +161,7 @@ impl Default for Proxy {
 /// Cache configuration for article caching
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Cache {
-    /// Maximum cache size in bytes
+    /// Maximum cache size in bytes (memory tier for hybrid cache)
     ///
     /// Supports human-readable formats:
     /// - \"1gb\" = 1 GB
@@ -200,6 +200,63 @@ pub struct Cache {
     /// Trade-off: Uses more backend connections but builds accurate availability data
     #[serde(default = "super::defaults::adaptive_precheck")]
     pub adaptive_precheck: bool,
+
+    /// Disk cache configuration (requires `hybrid-cache` feature)
+    ///
+    /// When enabled, articles evicted from memory are written to disk,
+    /// creating a two-tier cache (memory → disk → backend).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskCache>,
+}
+
+/// Disk cache configuration for hybrid caching
+///
+/// When enabled, creates a two-tier cache:
+/// - Hot articles in memory (fast, limited capacity)
+/// - Cold articles on disk (slower, larger capacity)
+///
+/// Requires the `hybrid-cache` feature to be enabled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiskCache {
+    /// Path to disk cache directory
+    ///
+    /// Directory will be created if it doesn't exist.
+    /// Recommended: Use a fast SSD or NVMe drive.
+    #[serde(default = "super::defaults::disk_cache_path")]
+    pub path: std::path::PathBuf,
+
+    /// Maximum disk cache size in bytes
+    ///
+    /// Supports human-readable formats:
+    /// - \"100gb\" = 100 GB
+    /// - \"10gb\" = 10 GB (default)
+    /// - \"1tb\" = 1 TB
+    #[serde(default = "super::defaults::disk_cache_capacity")]
+    pub capacity: CacheCapacity,
+
+    /// Enable LZ4 compression for disk storage (default: true)
+    ///
+    /// Reduces disk usage by ~60% for typical NNTP articles.
+    /// Slight CPU overhead for compression/decompression.
+    #[serde(default = "super::defaults::disk_cache_compression")]
+    pub compression: bool,
+
+    /// Number of shards for concurrent disk access (default: 4)
+    ///
+    /// Higher values improve concurrency but use more file handles.
+    #[serde(default = "super::defaults::disk_cache_shards")]
+    pub shards: usize,
+}
+
+impl Default for DiskCache {
+    fn default() -> Self {
+        Self {
+            path: defaults::disk_cache_path(),
+            capacity: defaults::disk_cache_capacity(),
+            compression: defaults::disk_cache_compression(),
+            shards: defaults::disk_cache_shards(),
+        }
+    }
 }
 
 impl Default for Cache {
@@ -209,6 +266,7 @@ impl Default for Cache {
             ttl: defaults::cache_ttl(),
             cache_articles: defaults::cache_articles(),
             adaptive_precheck: defaults::adaptive_precheck(),
+            disk: None,
         }
     }
 }

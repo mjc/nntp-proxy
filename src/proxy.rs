@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthHandler;
-use crate::cache::ArticleCache;
+use crate::cache::{HybridCacheConfig, UnifiedCache};
 use crate::config::{Config, RoutingMode, Server};
 use crate::constants::buffer::{POOL, POOL_COUNT};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
@@ -59,7 +59,6 @@ pub struct NntpProxyBuilder {
     routing_mode: RoutingMode,
     buffer_size: Option<usize>,
     buffer_count: Option<usize>,
-    enable_metrics: bool,
 }
 
 impl NntpProxyBuilder {
@@ -73,7 +72,6 @@ impl NntpProxyBuilder {
             routing_mode: RoutingMode::Stateful,
             buffer_size: None,
             buffer_count: None,
-            enable_metrics: false, // Default to disabled for performance
         }
     }
 
@@ -109,17 +107,6 @@ impl NntpProxyBuilder {
         self
     }
 
-    /// Enable metrics collection for TUI and monitoring
-    ///
-    /// **Warning:** Metrics collection causes ~45% performance regression
-    /// (110MB/s -> 60MB/s) due to atomic operations in the hot path.
-    /// Only enable this when you need the TUI or monitoring.
-    #[must_use]
-    pub fn with_metrics(mut self) -> Self {
-        self.enable_metrics = true;
-        self
-    }
-
     /// Build the `NntpProxy` instance
     ///
     /// # Errors
@@ -128,7 +115,8 @@ impl NntpProxyBuilder {
     /// - No servers are configured
     /// - Connection providers cannot be created
     /// - Buffer size is zero
-    pub fn build(self) -> Result<NntpProxy> {
+    /// - Hybrid cache initialization fails (if disk cache configured)
+    pub async fn build(self) -> Result<NntpProxy> {
         if self.config.servers.is_empty() {
             anyhow::bail!("No servers configured in configuration");
         }
@@ -203,8 +191,41 @@ impl NntpProxyBuilder {
         // If max_capacity=0, only tracks which backends have articles (no content caching)
         let (cache, cache_articles) = if let Some(cache_config) = &self.config.cache {
             let capacity = cache_config.max_capacity.as_u64();
-            let cache = ArticleCache::new(capacity, cache_config.ttl, cache_config.cache_articles);
             let cache_articles = cache_config.cache_articles;
+
+            // Check if disk cache is configured
+            let cache = if let Some(disk_config) = &cache_config.disk {
+                // Create hybrid cache with disk tier
+                let hybrid_config = HybridCacheConfig {
+                    memory_capacity: capacity,
+                    disk_path: disk_config.path.clone(),
+                    disk_capacity: disk_config.capacity.as_u64(),
+                    shards: disk_config.shards,
+                    compression: disk_config.compression,
+                    ttl: cache_config.ttl,
+                    cache_articles,
+                };
+
+                info!(
+                    "Initializing hybrid cache: memory={}MB, disk={}GB at {:?}",
+                    capacity / (1024 * 1024),
+                    disk_config.capacity.as_u64() / (1024 * 1024 * 1024),
+                    disk_config.path
+                );
+
+                Arc::new(
+                    UnifiedCache::hybrid(hybrid_config)
+                        .await
+                        .context("Failed to initialize hybrid disk cache")?,
+                )
+            } else {
+                // Memory-only cache
+                Arc::new(UnifiedCache::memory(
+                    capacity,
+                    cache_config.ttl,
+                    cache_articles,
+                ))
+            };
 
             if capacity > 0 {
                 if cache_articles {
@@ -223,11 +244,11 @@ impl NntpProxyBuilder {
             } else {
                 info!("Backend availability tracking enabled (cache disabled, capacity=0)");
             }
-            (Arc::new(cache), cache_articles)
+            (cache, cache_articles)
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
             (
-                Arc::new(ArticleCache::new(0, Duration::from_secs(3600), false)),
+                Arc::new(UnifiedCache::memory(0, Duration::from_secs(3600), false)),
                 true,
             )
         };
@@ -250,7 +271,162 @@ impl NntpProxyBuilder {
             routing_mode: self.routing_mode,
             auth_handler,
             metrics,
-            enable_metrics: self.enable_metrics,
+            connection_stats: ConnectionStatsAggregator::new(),
+            cache,
+            cache_articles,
+            adaptive_precheck,
+            last_activity_nanos: Arc::new(AtomicU64::new(0)),
+            active_clients: Arc::new(AtomicUsize::new(0)),
+            start_instant,
+        })
+    }
+
+    /// Build the `NntpProxy` instance (synchronous version)
+    ///
+    /// This version only supports memory-only cache. If disk cache is configured
+    /// in the config, it will be ignored and a warning will be logged.
+    /// Use `build()` for full disk cache support.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No servers are configured
+    /// - Connection providers cannot be created
+    /// - Buffer size is zero
+    pub fn build_sync(self) -> Result<NntpProxy> {
+        if self.config.servers.is_empty() {
+            anyhow::bail!("No servers configured in configuration");
+        }
+
+        // Use provided values or defaults
+        let buffer_size = self.buffer_size.unwrap_or(POOL);
+        let buffer_count = self.buffer_count.unwrap_or(POOL_COUNT);
+
+        // Create deadpool connection providers for each server
+        let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = self
+            .config
+            .servers
+            .iter()
+            .map(|server| {
+                info!(
+                    "Configuring deadpool connection provider for '{}'",
+                    server.name
+                );
+                DeadpoolConnectionProvider::from_server_config(server)
+            })
+            .collect();
+
+        let connection_providers = connection_providers?;
+
+        let buffer_pool = BufferPool::new(
+            BufferSize::try_new(buffer_size)
+                .map_err(|_| anyhow::anyhow!("Buffer size must be non-zero"))?,
+            buffer_count,
+        );
+
+        // Create metrics collector (before moving servers)
+        let metrics = MetricsCollector::new(self.config.servers.len());
+
+        let servers = Arc::new(self.config.servers);
+
+        // Create backend selector and add all backends
+        let router = Arc::new({
+            use types::BackendId;
+            let backend_strategy = self.config.proxy.backend_selection;
+            connection_providers.iter().enumerate().fold(
+                router::BackendSelector::with_strategy(backend_strategy),
+                |mut r, (idx, provider)| {
+                    let backend_id = BackendId::from_index(idx);
+                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
+                    r
+                },
+            )
+        });
+
+        // Create auth handler from config
+        let auth_handler = {
+            let all_users: Vec<(String, String)> = self
+                .config
+                .client_auth
+                .all_users()
+                .into_iter()
+                .map(|(u, p)| (u.to_string(), p.to_string()))
+                .collect();
+
+            if all_users.is_empty() {
+                Arc::new(AuthHandler::default())
+            } else {
+                Arc::new(AuthHandler::with_users(all_users).with_context(|| {
+                    "Invalid authentication configuration. \
+                             If you set username/password in config, they cannot be empty. \
+                             Remove them entirely to disable authentication."
+                })?)
+            }
+        };
+
+        // Create article cache (memory-only in sync version)
+        let (cache, cache_articles) = if let Some(cache_config) = &self.config.cache {
+            let capacity = cache_config.max_capacity.as_u64();
+            let cache_articles = cache_config.cache_articles;
+
+            // Warn if disk cache is configured but we're using sync build
+            if cache_config.disk.is_some() {
+                warn!(
+                    "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
+                );
+            }
+
+            // Memory-only cache
+            let cache = Arc::new(UnifiedCache::memory(
+                capacity,
+                cache_config.ttl,
+                cache_articles,
+            ));
+
+            if capacity > 0 {
+                if cache_articles {
+                    info!(
+                        "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
+                        cache_config.max_capacity,
+                        cache_config.ttl.as_secs()
+                    );
+                } else {
+                    info!(
+                        "Article cache enabled: max_capacity={}, ttl={}s (availability-only, bodies not cached)",
+                        cache_config.max_capacity,
+                        cache_config.ttl.as_secs()
+                    );
+                }
+            } else {
+                info!("Backend availability tracking enabled (cache disabled, capacity=0)");
+            }
+            (cache, cache_articles)
+        } else {
+            debug!("Cache not configured, using availability-only mode (capacity=0)");
+            (
+                Arc::new(UnifiedCache::memory(0, Duration::from_secs(3600), false)),
+                true,
+            )
+        };
+
+        // Extract adaptive_precheck from cache config (default: false)
+        let adaptive_precheck = self
+            .config
+            .cache
+            .as_ref()
+            .map(|c| c.adaptive_precheck)
+            .unwrap_or(false);
+
+        let start_instant = Instant::now();
+
+        Ok(NntpProxy {
+            servers,
+            router,
+            connection_providers,
+            buffer_pool,
+            routing_mode: self.routing_mode,
+            auth_handler,
+            metrics,
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
             cache_articles,
@@ -275,14 +451,12 @@ pub struct NntpProxy {
     routing_mode: RoutingMode,
     /// Authentication handler for client auth interception
     auth_handler: Arc<AuthHandler>,
-    /// Metrics collector for TUI and monitoring
+    /// Metrics collector for TUI and monitoring (always enabled)
     metrics: MetricsCollector,
-    /// Whether metrics collection is enabled (causes ~45% perf penalty)
-    enable_metrics: bool,
     /// Connection statistics aggregator (reduces log spam)
     connection_stats: ConnectionStatsAggregator,
     /// Article cache (always present - tracks backend availability even with capacity=0)
-    cache: Arc<ArticleCache>,
+    cache: Arc<UnifiedCache>,
     /// Whether to cache article bodies (config-driven)
     cache_articles: bool,
     /// Whether to use adaptive availability prechecking for STAT/HEAD
@@ -327,16 +501,12 @@ impl NntpProxy {
 
     #[inline]
     fn record_connection_opened(&self) {
-        if self.enable_metrics {
-            self.metrics.connection_opened();
-        }
+        self.metrics.connection_opened();
     }
 
     #[inline]
     fn record_connection_closed(&self) {
-        if self.enable_metrics {
-            self.metrics.connection_closed();
-        }
+        self.metrics.connection_closed();
     }
 
     /// Increment active client count
@@ -409,13 +579,14 @@ impl NntpProxy {
         client_addr: ClientAddress,
         router: Option<Arc<router::BackendSelector>>,
         routing_mode: RoutingMode,
-        cache: Arc<crate::cache::ArticleCache>,
+        cache: Arc<UnifiedCache>,
     ) -> ClientSession {
         // Start with base builder
         let builder = ClientSession::builder(
             client_addr,
             self.buffer_pool.clone(),
             self.auth_handler.clone(),
+            self.metrics.clone(),
         )
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
@@ -427,13 +598,6 @@ impl NntpProxy {
         let builder = match router {
             Some(r) => builder.with_router(r),
             None => builder,
-        };
-
-        // Apply optional metrics
-        let builder = if self.enable_metrics {
-            builder.with_metrics(self.metrics.clone())
-        } else {
-            builder
         };
 
         builder.build()
@@ -472,14 +636,37 @@ impl NntpProxy {
     /// # use nntp_proxy::config::load_config;
     /// # fn main() -> anyhow::Result<()> {
     /// let config = load_config("config.toml")?;
-    /// let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    /// let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(config: Config, routing_mode: RoutingMode) -> Result<Self> {
+    pub async fn new(config: Config, routing_mode: RoutingMode) -> Result<Self> {
         NntpProxyBuilder::new(config)
             .with_routing_mode(routing_mode)
             .build()
+            .await
+    }
+
+    /// Create a new `NntpProxy` synchronously (memory-only cache)
+    ///
+    /// This version only supports memory-only cache. If disk cache is configured,
+    /// it will be ignored. Use [`NntpProxy::new`] for full disk cache support.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use nntp_proxy::{NntpProxy, Config, RoutingMode};
+    /// # use nntp_proxy::config::load_config;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let config = load_config("config.toml")?;
+    /// let proxy = NntpProxy::new_sync(config, RoutingMode::Hybrid)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_sync(config: Config, routing_mode: RoutingMode) -> Result<Self> {
+        NntpProxyBuilder::new(config)
+            .with_routing_mode(routing_mode)
+            .build_sync()
     }
 
     /// Create a builder for more fine-grained control over proxy configuration
@@ -511,8 +698,16 @@ impl NntpProxy {
 
     /// Gracefully shutdown all connection pools
     pub async fn graceful_shutdown(&self) {
-        info!("Initiating graceful shutdown of all connection pools...");
+        info!("Initiating graceful shutdown...");
 
+        // Flush cache writes to disk before shutting down
+        // With WriteOnInsertion, writes are enqueued async - close() waits for completion
+        info!("Flushing disk cache writes...");
+        if let Err(e) = self.cache.close().await {
+            warn!("Error closing cache: {}", e);
+        }
+
+        info!("Shutting down connection pools...");
         for provider in &self.connection_providers {
             provider.graceful_shutdown().await;
         }
@@ -551,7 +746,7 @@ impl NntpProxy {
     /// Get the article cache (always present - capacity 0 if not configured)
     #[must_use]
     #[inline]
-    pub fn cache(&self) -> &Arc<crate::cache::ArticleCache> {
+    pub fn cache(&self) -> &Arc<UnifiedCache> {
         &self.cache
     }
 
@@ -732,9 +927,7 @@ impl NntpProxy {
                     &m,
                 );
 
-                if self.enable_metrics
-                    && let Some(bid) = backend_id
-                {
+                if let Some(bid) = backend_id {
                     self.metrics
                         .record_client_to_backend_bytes_for(bid, m.client_to_backend.as_u64());
                     self.metrics
@@ -743,9 +936,7 @@ impl NntpProxy {
                 Ok(())
             }
             Err(e) => {
-                if self.enable_metrics
-                    && let Some(bid) = backend_id
-                {
+                if let Some(bid) = backend_id {
                     self.metrics.record_error(bid);
                 }
 
@@ -923,7 +1114,7 @@ mod tests {
     fn test_proxy_creation_with_servers() {
         let config = create_test_config();
         let proxy = Arc::new(
-            NntpProxy::new(config, RoutingMode::Stateful).expect("Failed to create proxy"),
+            NntpProxy::new_sync(config, RoutingMode::Stateful).expect("Failed to create proxy"),
         );
 
         assert_eq!(proxy.servers().len(), 3);
@@ -936,7 +1127,7 @@ mod tests {
             servers: vec![],
             ..Default::default()
         };
-        let result = NntpProxy::new(config, RoutingMode::Stateful);
+        let result = NntpProxy::new_sync(config, RoutingMode::Stateful);
 
         assert!(result.is_err());
         assert!(
@@ -951,7 +1142,7 @@ mod tests {
     fn test_proxy_has_router() {
         let config = create_test_config();
         let proxy = Arc::new(
-            NntpProxy::new(config, RoutingMode::Stateful).expect("Failed to create proxy"),
+            NntpProxy::new_sync(config, RoutingMode::Stateful).expect("Failed to create proxy"),
         );
 
         // Proxy should have a router with backends
@@ -962,7 +1153,7 @@ mod tests {
     fn test_builder_basic_usage() {
         let config = create_test_config();
         let proxy = NntpProxy::builder(config)
-            .build()
+            .build_sync()
             .expect("Failed to build proxy");
 
         assert_eq!(proxy.servers().len(), 3);
@@ -974,7 +1165,7 @@ mod tests {
         let config = create_test_config();
         let proxy = NntpProxy::builder(config)
             .with_routing_mode(RoutingMode::PerCommand)
-            .build()
+            .build_sync()
             .expect("Failed to build proxy");
 
         assert_eq!(proxy.servers().len(), 3);
@@ -986,7 +1177,7 @@ mod tests {
         let proxy = NntpProxy::builder(config)
             .with_buffer_pool_size(512 * 1024)
             .with_buffer_pool_count(64)
-            .build()
+            .build_sync()
             .expect("Failed to build proxy");
 
         assert_eq!(proxy.servers().len(), 3);
@@ -1000,7 +1191,7 @@ mod tests {
             .with_routing_mode(RoutingMode::Hybrid)
             .with_buffer_pool_size(1024 * 1024)
             .with_buffer_pool_count(16)
-            .build()
+            .build_sync()
             .expect("Failed to build proxy");
 
         assert_eq!(proxy.servers().len(), 3);
@@ -1013,7 +1204,7 @@ mod tests {
             servers: vec![],
             ..Default::default()
         };
-        let result = NntpProxy::builder(config).build();
+        let result = NntpProxy::builder(config).build_sync();
 
         assert!(result.is_err());
         assert!(
@@ -1026,10 +1217,10 @@ mod tests {
 
     #[test]
     fn test_backward_compatibility_new() {
-        // Ensure NntpProxy::new() still works (it uses builder internally)
+        // Ensure NntpProxy::new_sync() still works (it uses builder internally)
         let config = create_test_config();
-        let proxy = NntpProxy::new(config, RoutingMode::Stateful)
-            .expect("Failed to create proxy with new()");
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful)
+            .expect("Failed to create proxy with new_sync()");
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.router.backend_count(), 3);
@@ -1125,7 +1316,7 @@ mod tests {
         #[test]
         fn test_session_mode_label_per_command() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::PerCommand).unwrap();
 
             let label = proxy.session_mode_label(SessionMode::PerCommand);
             assert_eq!(label, "per-command");
@@ -1134,7 +1325,7 @@ mod tests {
         #[test]
         fn test_session_mode_label_stateful_standard() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             let label = proxy.session_mode_label(SessionMode::Stateful);
             assert_eq!(label, "standard");
@@ -1143,7 +1334,7 @@ mod tests {
         #[test]
         fn test_session_mode_label_stateful_hybrid() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Hybrid).unwrap();
 
             let label = proxy.session_mode_label(SessionMode::Stateful);
             assert_eq!(label, "hybrid");
@@ -1152,7 +1343,7 @@ mod tests {
         #[test]
         fn test_routing_mode_display_name_caching() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::PerCommand).unwrap();
 
             // Empty cache (default 0 capacity) should return "per-command"
             assert_eq!(proxy.routing_mode_display_name(), "per-command");
@@ -1161,7 +1352,7 @@ mod tests {
         #[test]
         fn test_generate_session_id_format() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             let session = proxy.create_session(
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
@@ -1177,7 +1368,7 @@ mod tests {
         #[test]
         fn test_create_session_without_router() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             let session = proxy.create_session(
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
@@ -1191,7 +1382,7 @@ mod tests {
         #[test]
         fn test_create_session_with_router() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::PerCommand).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::PerCommand).unwrap();
 
             let session = proxy.create_session(
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
@@ -1206,7 +1397,7 @@ mod tests {
         #[test]
         fn test_record_connection_if_unauthenticated_no_auth() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap());
 
             let session = proxy.create_session(
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
@@ -1222,7 +1413,7 @@ mod tests {
         #[test]
         fn test_record_session_metrics_success() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap());
 
             let session = proxy.create_session(
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
@@ -1249,7 +1440,7 @@ mod tests {
         #[test]
         fn test_record_session_metrics_error() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap());
 
             let session = proxy.create_session(
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
@@ -1272,7 +1463,11 @@ mod tests {
         #[tokio::test]
         async fn test_prepare_per_command_connection() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+            let proxy = Arc::new(
+                NntpProxy::new(config, RoutingMode::PerCommand)
+                    .await
+                    .unwrap(),
+            );
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1296,9 +1491,9 @@ mod tests {
         #[test]
         fn test_routing_mode_display_name_empty_cache() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Hybrid).unwrap();
 
-            let _empty_cache = Arc::new(crate::cache::ArticleCache::new(
+            let _empty_cache = Arc::new(crate::cache::UnifiedCache::memory(
                 100,
                 std::time::Duration::from_secs(3600),
                 false,
@@ -1309,7 +1504,7 @@ mod tests {
         #[test]
         fn test_log_routing_selection() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap());
 
             let backend_id = crate::types::BackendId::from_index(0);
             let client_addr =
@@ -1322,7 +1517,7 @@ mod tests {
         #[test]
         fn test_log_pool_status() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap());
 
             // Should not panic
             proxy.log_pool_status(0);
@@ -1331,7 +1526,7 @@ mod tests {
         #[tokio::test]
         async fn test_apply_tcp_optimizations() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).await.unwrap());
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1352,25 +1547,25 @@ mod tests {
 
             // PerCommand mode
             let config = create_test_config();
-            let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand).unwrap();
+            let proxy = NntpProxy::new_sync(config.clone(), RoutingMode::PerCommand).unwrap();
             assert_eq!(
                 proxy.session_mode_label(SessionMode::PerCommand),
                 "per-command"
             );
 
             // Stateful mode
-            let proxy = NntpProxy::new(config.clone(), RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config.clone(), RoutingMode::Stateful).unwrap();
             assert_eq!(proxy.session_mode_label(SessionMode::Stateful), "standard");
 
             // Hybrid mode
-            let proxy = NntpProxy::new(config, RoutingMode::Hybrid).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Hybrid).unwrap();
             assert_eq!(proxy.session_mode_label(SessionMode::Stateful), "hybrid");
         }
 
         #[test]
         fn test_finalize_stateful_session_success() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap());
 
             let client_addr =
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
@@ -1397,7 +1592,7 @@ mod tests {
         #[test]
         fn test_finalize_stateful_session_error() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap());
 
             let client_addr =
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
@@ -1419,7 +1614,7 @@ mod tests {
         #[test]
         fn test_finalize_per_command_session_success() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::PerCommand).unwrap());
 
             let client_addr =
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
@@ -1440,7 +1635,7 @@ mod tests {
         #[test]
         fn test_finalize_per_command_session_error() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::PerCommand).unwrap());
 
             let client_addr =
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
@@ -1460,7 +1655,7 @@ mod tests {
         #[test]
         fn test_record_session_metrics_without_backend() {
             let config = create_test_config();
-            let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).unwrap());
+            let proxy = Arc::new(NntpProxy::new_sync(config, RoutingMode::PerCommand).unwrap());
 
             let client_addr =
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
@@ -1482,7 +1677,7 @@ mod tests {
         #[test]
         fn test_generate_session_id_uniqueness() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             let client_addr =
                 ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
@@ -1511,7 +1706,7 @@ mod tests {
         #[test]
         fn test_active_clients_increment_decrement() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             assert_eq!(proxy.active_clients.load(Ordering::Relaxed), 0);
 
@@ -1531,7 +1726,7 @@ mod tests {
         #[test]
         fn test_last_activity_updated_on_last_client_disconnect() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             // Initially no activity
             assert_eq!(proxy.last_activity_nanos.load(Ordering::Relaxed), 0);
@@ -1552,7 +1747,7 @@ mod tests {
         #[test]
         fn test_check_and_clear_skips_when_clients_active() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             // Simulate a past activity
             proxy.last_activity_nanos.store(1, Ordering::Relaxed);
@@ -1566,7 +1761,7 @@ mod tests {
         #[test]
         fn test_check_and_clear_skips_when_never_active() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             // No prior activity (last_activity_nanos = 0)
             let cleared = proxy.check_and_clear_stale_pools();
@@ -1576,7 +1771,7 @@ mod tests {
         #[test]
         fn test_check_and_clear_skips_when_recently_active() {
             let config = create_test_config();
-            let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+            let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
             // Connect and disconnect to set timestamp
             proxy.increment_active_clients();

@@ -5,7 +5,6 @@
 //! logic used by all routing modes.
 
 use crate::session::common;
-use crate::session::metrics_ext::MetricsRecorder;
 use crate::session::routing::{
     CacheAction, CommandRoutingDecision, MetricsAction, decide_command_routing,
     determine_cache_action, determine_metrics_action, is_430_status_code,
@@ -96,28 +95,34 @@ impl ClientSession {
             self.client_addr, msg_id_ref, self.cache_articles
         );
 
-        // Spawn background precheck for STAT to update availability
-        if self.adaptive_precheck {
-            let bytes = command.as_bytes();
-            let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-            if cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES) {
-                precheck::spawn_background_precheck(
-                    self.precheck_deps(router),
-                    command.to_string(),
-                    msg_id_ref.to_owned(),
-                );
-            }
-        }
-
         // If full article caching enabled, try to serve from cache
         if !self.cache_articles {
-            // Availability-only mode - fall through to use availability info for routing
+            // Availability-only mode - spawn background precheck to update availability
+            // then fall through to use availability info for routing
+            if self.adaptive_precheck {
+                let bytes = command.as_bytes();
+                let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+                if cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES) {
+                    precheck::spawn_background_precheck(
+                        self.precheck_deps(router),
+                        command.to_string(),
+                        msg_id_ref.to_owned(),
+                    );
+                }
+            }
             return Ok(None);
         }
 
         // Check if this is a complete article we can serve
         // Stubs from STAT/HEAD precheck or availability tracking should not be served
-        if !cached.is_complete_article() {
+        // Exception: STAT can be answered from any cache entry (we just need to know it exists)
+        let cmd_verb = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+
+        if cmd_verb != "STAT" && !cached.is_complete_article() {
             debug!(
                 "Client {} cache entry for {} is a stub (len={}), fetching full article",
                 self.client_addr,
@@ -127,26 +132,19 @@ impl ClientSession {
             return Ok(None);
         }
 
-        // Check if cached response type matches the requested command
-        // E.g., if we have BODY (222) cached but client requests ARTICLE (220),
-        // we need to fetch HEAD and combine them
-        let cmd_verb = command
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        if !cached.matches_command_type_verb(&cmd_verb) {
+        // Get the appropriate response for this command type
+        let Some(response) = cached.response_for_command(&cmd_verb, msg_id_ref.as_str()) else {
             debug!(
-                "Client {} cached response type (code={:?}) doesn't match command '{}', need to fetch",
+                "Client {} cached response (code={:?}) can't serve '{}' command",
                 self.client_addr,
                 cached.status_code().map(|c| c.as_u16()),
                 cmd_verb
             );
             return Ok(None);
-        }
+        };
 
-        client_write.write_all(cached.response()).await?;
-        *backend_to_client_bytes = backend_to_client_bytes.add(cached.response().len());
+        client_write.write_all(&response).await?;
+        *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
 
         let backend_id = router.route_command(self.client_id, command)?;
         router.complete_command(backend_id);
@@ -387,9 +385,8 @@ impl ClientSession {
         }
 
         // Log session summary and close user connection
-        if let Some(ref m) = self.metrics {
-            m.user_connection_closed(self.username().as_deref());
-        }
+        self.metrics
+            .user_connection_closed(self.username().as_deref());
 
         Ok(TransferMetrics {
             client_to_backend: client_to_backend_bytes,
@@ -673,6 +670,20 @@ impl ClientSession {
         self.record_timing_metrics(backend_id, ttfb, send, recv);
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
+        // Reject invalid responses - never forward garbage to client
+        if response_code == crate::protocol::NntpResponse::Invalid {
+            tracing::error!(
+                backend_id = backend_id.as_index(),
+                first_bytes = ?&buffer[..n.min(64)],
+                "Backend returned invalid/unparseable response, rejecting"
+            );
+            // Mark backend as unavailable for this article so we try next one
+            availability.record_missing(backend_id);
+            router.complete_command(backend_id);
+            crate::pool::remove_from_pool(conn);
+            return Ok(BackendAttemptResult::BackendUnavailable);
+        }
+
         // Handle 430 - article not found
         // Note: response is already read into buffer, keeping connection clean
         if self.is_430_response(&response_code) {
@@ -698,11 +709,19 @@ impl ClientSession {
         {
             Ok(bytes) => bytes,
             Err(e) => {
-                // Only mark as backend error if it's NOT a client disconnect
-                // Client disconnects should not penalize the backend
+                // CRITICAL: Always decrement pending count when streaming fails,
+                // regardless of error type (client disconnect, network error, etc.)
+                // Failure to do this causes TUI in-flight count drift over time.
+                // The pending count was incremented by route_command_with_availability()
+                // at the start of try_backend_for_article().
+                router.complete_command(backend_id);
+
+                // Only mark as backend error metrics if it's NOT a client disconnect.
+                // Client disconnects are normal behavior and shouldn't penalize backends.
                 if !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&e)
                 {
-                    self.handle_backend_error(backend_id, &router);
+                    self.metrics.record_error(backend_id);
+                    self.metrics.user_error(self.username().as_deref());
                 }
                 crate::pool::remove_from_pool(conn);
                 return Err(e);
@@ -823,21 +842,11 @@ impl ClientSession {
         send: u64,
         recv: u64,
     ) {
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_ttfb_micros(backend_id, ttfb);
-            metrics.record_send_recv_micros(backend_id, send, recv);
-        }
+        self.metrics.record_ttfb_micros(backend_id, ttfb);
+        self.metrics.record_send_recv_micros(backend_id, send, recv);
     }
 
     /// Handle backend error (metrics and cleanup)
-    fn handle_backend_error(&self, backend_id: crate::types::BackendId, router: &BackendSelector) {
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_error(backend_id);
-            metrics.user_error(self.username().as_deref());
-        }
-        router.complete_command(backend_id);
-    }
-
     /// Send standardized 430 response to client
     async fn send_430_to_client(
         &self,
@@ -889,13 +898,30 @@ impl ClientSession {
         first_chunk: &[u8],
         first_chunk_size: usize,
     ) -> Result<u64> {
-        let code = response_code.status_code().map(|c| c.as_u16()).unwrap_or(0);
+        // SAFETY: Caller must validate response before calling this function.
+        // An invalid response (code 0) should never reach here.
+        let Some(status_code) = response_code.status_code() else {
+            // This should never happen - caller should reject Invalid responses
+            tracing::error!("BUG: stream_response_to_client called with Invalid response");
+            anyhow::bail!("Cannot stream invalid response");
+        };
+        let code = status_code.as_u16();
+
         let cache_action = determine_cache_action(
             command,
             code,
             is_multiline,
             self.cache_articles,
             msg_id.is_some(),
+        );
+
+        debug!(
+            "stream_response_to_client: code={}, is_multiline={}, cache_articles={}, has_msg_id={}, action={:?}",
+            code,
+            is_multiline,
+            self.cache_articles,
+            msg_id.is_some(),
+            cache_action
         );
 
         match (is_multiline, cache_action) {
@@ -980,22 +1006,20 @@ impl ClientSession {
     ) {
         use crate::types::MetricsBytes;
 
-        let Some(ref metrics) = self.metrics else {
-            return;
-        };
-
         if let Some(code) = response_code.status_code() {
             match determine_metrics_action(code.as_u16(), is_multiline) {
-                MetricsAction::Error4xx => metrics.record_error_4xx(backend_id),
-                MetricsAction::Error5xx => metrics.record_error_5xx(backend_id),
-                MetricsAction::Article => metrics.record_article(backend_id, resp_bytes),
+                MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+                MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+                MetricsAction::Article => self.metrics.record_article(backend_id, resp_bytes),
                 MetricsAction::None => {}
             }
         }
 
         let cmd_bytes_metric = MetricsBytes::new(cmd_bytes);
         let resp_bytes_metric = MetricsBytes::new(resp_bytes);
-        let _ = metrics.record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
+        let _ =
+            self.metrics
+                .record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
         self.metrics
             .user_bytes_sent(self.username().as_deref(), cmd_bytes);
         self.metrics
@@ -1008,7 +1032,7 @@ impl ClientSession {
             router,
             cache: &self.cache,
             buffer_pool: &self.buffer_pool,
-            metrics: self.metrics.as_ref(),
+            metrics: &self.metrics,
             cache_articles: self.cache_articles,
         }
     }

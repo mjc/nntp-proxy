@@ -203,7 +203,9 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     };
 
     // Start proxy
-    let proxy = nntp_proxy::NntpProxy::new(config.clone(), RoutingMode::PerCommand).unwrap();
+    let proxy = nntp_proxy::NntpProxy::new(config.clone(), RoutingMode::PerCommand)
+        .await
+        .unwrap();
     let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
         .await
         .unwrap();
@@ -306,7 +308,9 @@ async fn test_head_cache_hit_zero_backend_queries() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand).unwrap();
+    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
+        .await
+        .unwrap();
     let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
         .await
         .unwrap();
@@ -411,7 +415,9 @@ async fn test_article_cache_hit_zero_backend_queries() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand).unwrap();
+    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
+        .await
+        .unwrap();
     let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
         .await
         .unwrap();
@@ -516,7 +522,9 @@ async fn test_cached_430_zero_backend_queries() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand).unwrap();
+    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
+        .await
+        .unwrap();
     let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
         .await
         .unwrap();

@@ -244,7 +244,7 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let listener = TcpListener::bind(&proxy_addr).await?;
 
@@ -341,7 +341,7 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let listener = TcpListener::bind(&proxy_addr).await?;
 
@@ -414,7 +414,7 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let listener = TcpListener::bind(&proxy_addr).await?;
 
@@ -661,7 +661,7 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand)?);
+    let proxy = Arc::new(NntpProxy::new(config, RoutingMode::PerCommand).await?);
 
     // Phase 1: Learn availability by making a request
     // The proxy will try backend 0 first, get 430, then try backend 1, get success

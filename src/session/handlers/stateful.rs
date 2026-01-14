@@ -2,7 +2,6 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
-use crate::session::metrics_ext::MetricsRecorder;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;

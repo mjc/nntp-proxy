@@ -18,7 +18,6 @@
 //! ```
 
 use crate::session::ClientSession;
-use crate::session::metrics_ext::MetricsRecorder;
 use crate::types::TransferMetrics;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWriteExt, BufReader};

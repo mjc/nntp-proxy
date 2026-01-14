@@ -32,7 +32,7 @@ async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()>
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
-    let proxy = build_proxy_with_metrics(config, routing_mode)?;
+    let proxy = build_proxy(config, routing_mode).await?;
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -59,15 +59,15 @@ async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()>
     Ok(())
 }
 
-fn build_proxy_with_metrics(
+async fn build_proxy(
     config: nntp_proxy::config::Config,
     routing_mode: nntp_proxy::RoutingMode,
 ) -> Result<Arc<NntpProxy>> {
     Ok(Arc::new(
         NntpProxy::builder(config)
             .with_routing_mode(routing_mode)
-            .with_metrics()
-            .build()?,
+            .build()
+            .await?,
     ))
 }
 

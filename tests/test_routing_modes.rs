@@ -47,7 +47,7 @@ async fn setup_proxy_with_mode(
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, routing_mode)?;
+    let proxy = NntpProxy::new(config, routing_mode).await?;
 
     tokio::spawn(async move {
         loop {

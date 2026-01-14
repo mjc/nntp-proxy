@@ -55,7 +55,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -148,7 +148,7 @@ async fn test_round_robin_distribution() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -238,7 +238,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
@@ -292,7 +292,7 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
 
     // Create proxy config
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start proxy in per-command routing mode
     spawn_test_proxy(proxy, proxy_port, true).await;
@@ -368,7 +368,7 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -454,7 +454,7 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
-    let proxy = NntpProxy::new(config, RoutingMode::Stateful)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
     spawn_test_proxy(proxy, proxy_port, true).await;
 
     // Give proxy more time to initialize connection pool
@@ -540,7 +540,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let listener = TcpListener::bind(&proxy_addr).await?;
 
@@ -627,7 +627,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let listener = TcpListener::bind(&proxy_addr).await?;
 
@@ -725,7 +725,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let listener = TcpListener::bind(&proxy_addr).await?;
 
@@ -858,7 +858,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
     };
 
     // Start proxy in per-command mode (where this issue was observed)
-    let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     let proxy_clone = proxy.clone();
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let proxy_addr_clone = proxy_addr.clone();

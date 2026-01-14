@@ -90,7 +90,7 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid)?;
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     tokio::spawn(async move {
         loop {

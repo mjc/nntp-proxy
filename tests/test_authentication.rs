@@ -248,21 +248,24 @@ async fn test_command_classification_for_stateless() {
 
 #[tokio::test]
 async fn test_session_with_auth_handler() {
+    use nntp_proxy::metrics::MetricsCollector;
     use test_helpers::{create_test_addr, create_test_auth_handler_with, create_test_buffer_pool};
 
     let backend_port = get_available_port().await.unwrap();
     let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_with("testuser", "testpass");
+    let metrics = MetricsCollector::new(1);
 
     let addr = create_test_addr();
-    let _session = ClientSession::new(addr.into(), buffer_pool, auth_handler);
+    let _session = ClientSession::new(addr.into(), buffer_pool, auth_handler, metrics);
 
     // Session should be created successfully with auth handler
 }
 
 #[tokio::test]
 async fn test_session_with_disabled_auth() {
+    use nntp_proxy::metrics::MetricsCollector;
     use test_helpers::{
         create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
     };
@@ -271,9 +274,10 @@ async fn test_session_with_disabled_auth() {
     let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_disabled();
+    let metrics = MetricsCollector::new(1);
 
     let addr = create_test_addr();
-    let _session = ClientSession::new(addr.into(), buffer_pool, auth_handler.clone());
+    let _session = ClientSession::new(addr.into(), buffer_pool, auth_handler.clone(), metrics);
 
     assert!(!auth_handler.is_enabled());
 }
@@ -375,20 +379,28 @@ async fn test_auth_handler_clone_via_arc() {
 
 #[tokio::test]
 async fn test_session_builder_with_auth_handler() {
+    use nntp_proxy::metrics::MetricsCollector;
     use test_helpers::{create_test_addr, create_test_auth_handler, create_test_buffer_pool};
 
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler();
     let addr = create_test_addr();
+    let metrics = MetricsCollector::new(1);
 
-    let session =
-        ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler.clone()).build();
+    let session = ClientSession::builder(
+        addr.into(),
+        buffer_pool.clone(),
+        auth_handler.clone(),
+        metrics,
+    )
+    .build();
 
     assert!(!session.is_per_command_routing());
 }
 
 #[tokio::test]
 async fn test_session_builder_with_router_and_auth() {
+    use nntp_proxy::metrics::MetricsCollector;
     use test_helpers::{
         create_test_addr, create_test_auth_handler, create_test_buffer_pool, create_test_router,
     };
@@ -397,8 +409,9 @@ async fn test_session_builder_with_router_and_auth() {
     let auth_handler = create_test_auth_handler();
     let router = create_test_router();
     let addr = create_test_addr();
+    let metrics = MetricsCollector::new(1);
 
-    let session = ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler)
+    let session = ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler, metrics)
         .with_router(router)
         .with_routing_mode(RoutingMode::PerCommand)
         .build();
@@ -413,7 +426,7 @@ async fn test_proxy_creates_auth_handler_from_config() {
 
     let config = create_test_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
 
-    let proxy = NntpProxy::new(config, RoutingMode::Stateful).unwrap();
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await.unwrap();
 
     // Proxy should be created successfully with auth config
     assert!(!proxy.servers().is_empty());

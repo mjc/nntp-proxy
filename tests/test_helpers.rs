@@ -215,7 +215,7 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 ///
 /// # Example
 /// ```ignore
-/// let proxy = NntpProxy::new(config, RoutingMode::PerCommand)?;
+/// let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
 /// spawn_test_proxy(proxy, 8119, true).await;
 /// ```
 #[allow(dead_code)]
@@ -432,7 +432,7 @@ pub async fn setup_proxy_with_backends(
             .collect(),
     );
 
-    let proxy = NntpProxy::new(config, routing_mode)?;
+    let proxy = NntpProxy::new(config, routing_mode).await?;
 
     // Start proxy accept loop
     let proxy_for_spawn = proxy.clone();

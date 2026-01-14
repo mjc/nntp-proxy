@@ -33,7 +33,7 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
-    let proxy = Arc::new(NntpProxy::new(config, routing_mode)?);
+    let proxy = Arc::new(NntpProxy::new(config, routing_mode).await?);
     let listener = runtime::bind_listener(&host, port, routing_mode).await?;
 
     runtime::spawn_connection_prewarming(&proxy);
