@@ -82,7 +82,7 @@ build_linux_target() {
 build_windows_target() {
     local target=$1
     local arch=$2
-    
+
     log_info "Building for $target..."
     $BUILD_CMD build --release --target "$target"
     (cd "target/$target/release" && \

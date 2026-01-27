@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows Cross-Compilation with TUI** - Fixed build failures when cross-compiling for Windows from non-Windows hosts. The TUI binary's dependencies (ratatui, crossterm, sysinfo) pull windows-sys 0.61+ which requires Windows library stubs during cross-compilation. Now properly links against mingw-w64 libraries from nixpkgs in the flake-based build environment.
 - **Stale Connection Handling** ([#46](https://github.com/mjc/nntp-proxy/pull/46)) - Fixed "overnight 430" bug where pooled connections become stale after idle periods, causing false article-not-found errors
 - **Critical Pending Count Leak** - Fixed pending request count not being properly decremented in precheck path
 - **Precheck Performance** - Fixed precheck stalling at 53k cache entries by using atomic moka APIs
