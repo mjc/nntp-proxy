@@ -66,6 +66,7 @@
           # Code quality & linting
           cargo-deny
           cargo-audit
+          shellcheck
 
           # Testing & coverage
           cargo-tarpaulin
@@ -136,6 +137,7 @@
           echo "🔍 Code quality:"
           echo "   cargo deny check  - Check dependencies for security/licenses"
           echo "   cargo audit       - Check for security vulnerabilities"
+          echo "   shellcheck scripts/*.sh - Lint shell scripts"
           echo ""
           echo "🧪 Testing & coverage:"
           echo "   cargo nextest run - Fast test runner"
