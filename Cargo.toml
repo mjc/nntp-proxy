@@ -92,7 +92,7 @@ harness = false
 
 
 [profile.release]
-debug = false          # Strip debug symbols for smaller binaries
+debug = false          # No debug symbols for smaller binaries
 strip = true           # Strip symbols for even smaller size
 lto = true             # Link-time optimization for better performance
 codegen-units = 1      # Single codegen unit for better optimization
