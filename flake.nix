@@ -191,13 +191,13 @@
 
           # Windows cross-compilation: provide mingw-w64 libraries for windows-link crate
           # windows-sys 0.61+ with windows-link needs actual Windows lib files to link against
-          MINGW_LIBS="$(find /nix/store -maxdepth 1 -name '*mingw-w64-x86_64-w64-mingw32*' -type d | head -1)/lib"
-          if [ -n "''${MINGW_LIBS}" ] && [ "''${MINGW_LIBS}" != "/lib" ] && [ -d "''${MINGW_LIBS}" ] && ls "''${MINGW_LIBS}"/libkernel32.* >/dev/null 2>&1; then
+          MINGW_LIBS="${pkgs.pkgsCross.mingwW64.windows.mingw_w64}/lib"
+          if [ -d "''${MINGW_LIBS}" ] && ls "''${MINGW_LIBS}"/libkernel32.* >/dev/null 2>&1; then
             export LIBRARY_PATH="''${MINGW_LIBS}:''${LIBRARY_PATH:-}"
             # Pass mingw libs to rustflags so cargo-zigbuild's zig linker can find them
-            export RUSTFLAGS="''${RUSTFLAGS:-} -C link-arg=-L -C link-arg=''${MINGW_LIBS}"
+            export RUSTFLAGS="''${RUSTFLAGS:-} -C link-arg=-L''${MINGW_LIBS}"
           else
-            echo "warning: mingw-w64 libraries not found in nixpkgs store; Windows cross-linking may fail" >&2
+            echo "warning: mingw-w64 libraries not found in nixpkgs (expected at ''${MINGW_LIBS}); Windows cross-linking may fail" >&2
           fi
 
           echo "🦀 Cross-compilation environment loaded!"

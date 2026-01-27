@@ -94,6 +94,6 @@ harness = false
 [profile.release]
 debug = false          # No debug symbols for smaller binaries
 strip = true           # Strip symbols for even smaller size
-lto = true             # Link-time optimization for better performance
+lto = true             # Full LTO for better optimization and much smaller binaries (note: increases build time ~10x)
 codegen-units = 1      # Single codegen unit for better optimization
 overflow-checks = true # Keep overflow checks for safety with untrusted network data
