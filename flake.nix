@@ -66,6 +66,7 @@
           # Code quality & linting
           cargo-deny
           cargo-audit
+          shellcheck
 
           # Testing & coverage
           cargo-tarpaulin
@@ -89,6 +90,7 @@
           cargo-llvm-cov
         ];
 
+
       # Cross-compilation tools (separate to avoid environment pollution)
       crossCompilationTools = with pkgs; [
         rustNightlyToolchain # For cross-compilation builds
@@ -100,7 +102,7 @@
         jq # JSON parsing for version detection
         zip # Windows release archives
         # tar is already available in most shells
-        # Windows cross-compilation - we need binutils (dlltool) but not the full mingw CC/CXX
+        # Windows cross-compilation
         pkgsCross.mingwW64.buildPackages.binutils
       ];
 
@@ -135,6 +137,7 @@
           echo "🔍 Code quality:"
           echo "   cargo deny check  - Check dependencies for security/licenses"
           echo "   cargo audit       - Check for security vulnerabilities"
+          echo "   shellcheck scripts/*.sh - Lint shell scripts"
           echo ""
           echo "🧪 Testing & coverage:"
           echo "   cargo nextest run - Fast test runner"
@@ -186,9 +189,21 @@
           unset AR
           unset RANLIB
 
+          # Windows cross-compilation: provide mingw-w64 libraries for windows-link crate
+          # windows-sys 0.61+ with windows-link needs actual Windows lib files to link against
+          MINGW_LIBS="${pkgs.pkgsCross.mingwW64.windows.mingw_w64}/lib"
+          if [ -d "''${MINGW_LIBS}" ] && ls "''${MINGW_LIBS}"/libkernel32.* >/dev/null 2>&1; then
+            export LIBRARY_PATH="''${MINGW_LIBS}:''${LIBRARY_PATH:-}"
+            # Pass mingw libs to rustflags so cargo-zigbuild's zig linker can find them
+            export RUSTFLAGS="''${RUSTFLAGS:-} -C link-arg=-L''${MINGW_LIBS}"
+          else
+            echo "warning: mingw-w64 libraries not found in nixpkgs (expected at ''${MINGW_LIBS}); Windows cross-linking may fail" >&2
+          fi
+
           echo "🦀 Cross-compilation environment loaded!"
           echo "   Nightly toolchain: ${rustNightlyToolchain}/bin/rustc"
           echo "   Using cargo-zigbuild with Zig as linker (no mingw pollution)"
+          echo "   Windows libraries: ''${MINGW_LIBS}"
           echo ""
         '';
 

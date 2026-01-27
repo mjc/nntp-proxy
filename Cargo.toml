@@ -68,7 +68,6 @@ bytesize = { version = "2.3.1", features = ["serde"] }
 serde_bytes = "0.11.19"
 twox-hash = "2.1.2"
 
-
 [dev-dependencies]
 tempfile = "3.23"
 serde_json = "1.0"  # For testing serde implementations
@@ -93,8 +92,8 @@ harness = false
 
 
 [profile.release]
-debug = true          # No debug symbols for smaller binaries
-# strip = false          # Strip symbols for even smaller size
-# lto = false            # Link-time optimization for better performance
-# codegen-units = 1     # Single codegen unit for better optimization
-# overflow-checks = true  # Keep overflow checks for safety with untrusted network data
+debug = false          # No debug symbols for smaller binaries
+strip = true           # Strip symbols for even smaller size
+lto = true             # Full LTO for better optimization and much smaller binaries (note: increases build time ~10x)
+codegen-units = 1      # Single codegen unit for better optimization
+overflow-checks = true # Keep overflow checks for safety with untrusted network data

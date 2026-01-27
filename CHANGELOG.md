@@ -50,8 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **⚠️ Breaking: Disk Cache Format** ([#48](https://github.com/mjc/nntp-proxy/pull/48)) - Existing disk cache will be discarded on upgrade due to format changes for tier-aware TTL
 
+- **Release Binary Optimization** - Enabled aggressive binary size optimizations (strip, LTO, single codegen-unit) reducing release artifacts by ~90% (4.5-4.9M vs 41-43M). Release builds now take ~10x longer due to full LTO, but significantly faster downloads and lower disk usage for deployments.
+
 ### Fixed
 
+- **Windows Cross-Compilation with TUI** - Fixed build failures when cross-compiling for Windows from non-Windows hosts. The TUI binary's dependencies (ratatui, crossterm, sysinfo) pull windows-sys 0.61+ which requires Windows library stubs during cross-compilation. Now properly links against mingw-w64 libraries from nixpkgs in the flake-based build environment.
 - **Stale Connection Handling** ([#46](https://github.com/mjc/nntp-proxy/pull/46)) - Fixed "overnight 430" bug where pooled connections become stale after idle periods, causing false article-not-found errors
 - **Critical Pending Count Leak** - Fixed pending request count not being properly decremented in precheck path
 - **Precheck Performance** - Fixed precheck stalling at 53k cache entries by using atomic moka APIs

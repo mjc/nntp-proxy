@@ -82,7 +82,7 @@ build_linux_target() {
 build_windows_target() {
     local target=$1
     local arch=$2
-    
+
     log_info "Building for $target..."
     $BUILD_CMD build --release --target "$target"
     (cd "target/$target/release" && \
@@ -184,7 +184,7 @@ echo "  Version: $VERSION"
 echo "  Output directory: release/v$VERSION/"
 echo ""
 echo "Built artifacts:"
-ls -lh "release/v$VERSION/" | tail -n +2 | awk '{printf "  • %s (%s)\n", $9, $5}'
+find "release/v$VERSION/" -maxdepth 1 -type f -exec ls -lh {} \; | awk '{printf "  • %s (%s)\n", $NF, $5}'
 echo "════════════════════════════════════════════════════════════════════════"
 
 # Clean up the cross-env marker
