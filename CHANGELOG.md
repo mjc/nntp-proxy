@@ -7,67 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-01-27
+
 ### Added
 
-- **Standalone NNTP Client Module** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
-  - New `NntpClient` for standalone article fetching without proxy overhead
-  - Methods: `fetch_article()`, `fetch_body()`, `fetch_head()`, `stat()`
-  - Zero-copy streaming with buffer pooling for memory efficiency
-  - Supports TLS/SSL and backend authentication
+- **Backend Server Tiering** ([#48](https://github.com/mjc/nntp-proxy/pull/48))
+  - Servers can be assigned tier levels (0=primary, higher=backup/archive)
+  - Tier-aware selection ensures lower-tier backends are prioritized for article requests
+  - Configuration via file-based `tier = N` or environment `NNTP_SERVER_N_TIER=N`
+  - Backwards compatible: servers without tier assignment default to tier 0
 
-- **Connection Pool Convenience Constructors** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
-  - `DeadpoolConnectionProvider::simple()` for unencrypted connections
-  - `with_auth()` for credential-based authentication
-  - `with_tls()` for encrypted connections
-  - `with_tls_auth()` for TLS + authentication (most common use case)
-  - Enables quick setup of Usenet provider connections in ~2 lines
+- **Tier-Aware Cache TTL** ([#48](https://github.com/mjc/nntp-proxy/pull/48))
+  - Exponential TTL scaling: `effective_ttl = base_ttl * 2^tier`
+  - Higher-tier backends (backups/archives) get exponentially longer cache retention
+  - Dramatically reduces expensive queries to slow backup servers
+  - Examples with 1-hour base TTL:
+    - Tier 0 (primary): 1 hour
+    - Tier 5 (backup): 32 hours (~1.3 days)
+    - Tier 10 (archive): 1024 hours (~42.7 days)
+    - Tier 15: ~1365 days (~3.7 years)
 
-- **Test Convenience Methods** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
-  - `BufferPool::for_tests()` - Creates test-sized buffer pools with sane defaults
-  - Consolidates test configuration helpers across test suites
+- **Hybrid Disk Cache** ([#47](https://github.com/mjc/nntp-proxy/pull/47))
+  - New two-tier cache: memory + disk backing using foyer
+  - Memory tier for hot articles, disk tier for larger capacity
+  - Automatic LRU promotion for frequently accessed disk entries
+  - LZ4 compression reduces disk usage by ~60%
+  - Configuration via `[cache.disk]` section with path and capacity
 
-- **Backend Availability Tracking** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
-  - Automatic 430 retry across all backends when article not found
-  - Compact bitset tracking (u8) for up to 8 backends per article
-  - Progressive learning from cache hits, misses, and backend responses
-  - Zero-cost abstractions with O(1) bitwise operations (~2ns lookup)
-
-- **Availability-Only Cache Mode** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
-  - New `cache_articles` config option (default: true)
-  - `cache_articles = false` tracks backend availability without caching article bodies
-  - Memory footprint: ~68 bytes/article (availability-only) vs ~1MB/article (full cache)
-  - Ideal for tracking which backends have articles with minimal memory usage
-
-- **Multi-User Authentication** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
-  - Support for multiple client credentials via `[[client_auth.users]]` array
-  - Each user can have different username/password combinations
-  - Backwards compatible with existing single-user configs
+- **Adaptive Precheck for STAT/HEAD** ([#46](https://github.com/mjc/nntp-proxy/pull/46))
+  - Concurrent backend queries for STAT/HEAD commands
+  - Returns first successful response immediately
+  - Background task updates full backend availability
+  - Reduces latency for article metadata lookups
 
 ### Changed
 
-- **Public API Enhancements** ([#44](https://github.com/mjc/nntp-proxy/pull/44))
-  - Exported `streaming` and `backend` modules for external use
-  - Added `pub use` re-exports in `lib.rs` for convenient access
-  - Enables library usage patterns for third-party integrations
-  - Better ergonomics for connection provider initialization
+- **⚠️ Breaking: Default Backend Selection Strategy** ([#47](https://github.com/mjc/nntp-proxy/pull/47))
+  - Default changed from `WeightedRoundRobin` to `LeastLoaded`
+  - Existing deployments relying on previous default should explicitly set `backend_selection = "WeightedRoundRobin"` in config
 
-- **Session Architecture Improvements** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
-  - Unified per-command handler with cache-aware execution
-  - Extracted stateful mode logic to dedicated `session/handlers/stateful.rs` module
-  - Refactored proxy lifecycle with 11 DRY helper methods
-  - Consistent TCP optimizations applied across all routing modes
+- **Metrics Always Enabled** ([#47](https://github.com/mjc/nntp-proxy/pull/47)) - Metrics collection is no longer optional for better observability
 
-- **Error Handling & Logging** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
-  - Client disconnect detection suppresses spurious error logs
-  - Eliminated duplicate logging (WARN + ERROR for same event)
-  - Only logs actionable errors requiring attention
+- **⚠️ Breaking: Disk Cache Format** ([#48](https://github.com/mjc/nntp-proxy/pull/48)) - Existing disk cache will be discarded on upgrade due to format changes for tier-aware TTL
 
 ### Fixed
 
-- **Proxy Greeting Timing** ([#43](https://github.com/mjc/nntp-proxy/pull/43))
-  - Greeting now sent immediately on connection in all modes
-  - Fixes client disconnect errors caused by delayed greeting
-  - Session handlers no longer responsible for greeting (proxy owns it)
+- **Stale Connection Handling** ([#46](https://github.com/mjc/nntp-proxy/pull/46)) - Fixed "overnight 430" bug where pooled connections become stale after idle periods, causing false article-not-found errors
+- **Critical Pending Count Leak** - Fixed pending request count not being properly decremented in precheck path
+- **Precheck Performance** - Fixed precheck stalling at 53k cache entries by using atomic moka APIs
+- **Disk Cache Errors** - Improved error messages and handling for disk full scenarios
 
 ## [0.3.0] - 2025-11-21
 
