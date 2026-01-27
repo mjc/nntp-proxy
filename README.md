@@ -320,6 +320,7 @@ unhealthy_threshold = 3    # Failures before marking unhealthy (default: 3)
 | `username` | string | No | - | Authentication username |
 | `password` | string | No | - | Authentication password |
 | `max_connections` | integer | No | 10 | Max concurrent connections to this backend |
+| `tier` | integer | No | 0 | Server tier (lower = higher priority); also controls cache TTL |
 | `use_tls` | boolean | No | false | Enable TLS/SSL encryption |
 | `tls_verify_cert` | boolean | No | true | Verify server certificates (uses system CA store) |
 | `tls_cert_path` | string | No | - | Path to additional CA certificate (PEM format) |
@@ -392,6 +393,72 @@ max_connections = 10
 ✅ **Monitor TLS handshake failures** in logs  
 
 ⚠️ **Never set `tls_verify_cert = false` in production** - this disables all certificate verification and is extremely insecure!
+
+### Server Tiering & Tier-Aware Cache TTL
+
+The proxy supports **server tiering** for intelligent backend selection and cache retention:
+
+#### How Server Tiering Works
+
+1. **Selection Priority**: Lower tier numbers are tried first
+   - Tier 0 servers: tried first (primary/preferred)
+   - Tier 1 servers: tried if tier 0 servers return 430 (not found)
+   - Tier N servers: tried if all lower tiers exhausted
+
+2. **Exponential Cache TTL**: Articles from higher tier servers get much longer cache retention
+   - Formula: `effective_ttl = base_ttl * 2^tier`
+   - This prevents expensive repeated queries to slow backup servers
+
+#### Example Configuration
+
+```toml
+# Primary servers - tier 0 (short cache TTL)
+[[servers]]
+host = "primary1.example.com"
+port = 119
+tier = 0          # Tried first, articles cached with base TTL (e.g., 1 hour)
+
+# Backup servers - tier 5 (32x longer cache)
+[[servers]]
+host = "backup1.example.com"
+port = 119
+tier = 5          # Tried only if primaries return 430
+                  # Articles cached for 32x base TTL (e.g., 32 hours)
+
+# Archive servers - tier 10 (1024x longer cache, ~43 days)
+[[servers]]
+host = "archive.example.com"
+port = 119
+tier = 10         # Tried only if tiers 0-9 exhausted
+                  # Articles cached for 1024x base TTL (~43 days)
+```
+
+#### Cache TTL by Tier (with 1 hour base TTL)
+
+| Tier | Multiplier | Cache Duration |
+|------|------------|-----------------|
+| 0    | 1x         | 1 hour          |
+| 1    | 2x         | 2 hours         |
+| 2    | 4x         | 4 hours         |
+| 5    | 32x        | 32 hours (~1.3 days) |
+| 7    | 128x       | 128 hours (~5.3 days) |
+| 10   | 1024x      | 1024 hours (~42.7 days) |
+| 13   | 8192x      | ~341 days (~0.9 years)  |
+| 15   | 32768x     | ~1365 days (~3.7 years) |
+| 20   | ~1Mx (2^20)| ~100 years (approx. moka limit) |
+| 63   | 2^63       | Capped by cache engine (~100 years) |
+
+> **Note:** The underlying cache engine (moka for in-memory, foyer for hybrid) has a practical
+> TTL ceiling of ~100 years. Tiers with computed TTL exceeding this are automatically clamped
+> to the engine's maximum, so tier 20 and tier 63 behave identically in practice.
+
+#### Why Exponential TTL?
+
+- **Primary servers (tier 0)**: Short TTL ensures content stays fresh and exploits locality
+- **Backup servers (tiers 1-5)**: Medium TTL balances freshness with reducing backup server load
+- **Archive servers (tiers 10+)**: Very long TTL prevents repeated expensive queries for rare articles
+
+This strategy dramatically reduces load on slow, expensive backup servers while keeping frequently-accessed content fresh from primary servers.
 
 #### Environment Variable Overrides for Servers
 

@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use super::ArticleAvailability;
+use super::{ArticleAvailability, ttl};
 
 /// Check available disk space at the given path using df command
 fn check_available_space(path: &Path) -> Option<u64> {
@@ -75,7 +75,7 @@ fn check_available_space(path: &Path) -> Option<u64> {
 ///
 /// Implements foyer's Code trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
-/// - Simple binary format: [status:u16][checked:u8][missing:u8][timestamp:u64][len:u32][buffer:bytes]
+/// - Simple binary format: [status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][len:u32][buffer:bytes]
 #[derive(Clone, Debug)]
 pub struct HybridArticleEntry {
     /// Validated NNTP status code (220, 221, 222, 223, 430)
@@ -85,10 +85,13 @@ pub struct HybridArticleEntry {
     checked: u8,
     /// Backend availability bitset - missing bits
     missing: u8,
-    /// Unix timestamp when availability info was last updated (seconds since epoch)
+    /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (430 stubs, STAT responses)
-    /// Full articles (220 with body) ignore this field
+    /// and for tier-aware TTL calculation
     timestamp: u64,
+    /// Server tier (lower = higher priority)
+    /// Used for tier-aware TTL: higher tier = longer TTL
+    tier: u8,
     /// Complete response buffer
     /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
     buffer: Vec<u8>,
@@ -97,7 +100,7 @@ pub struct HybridArticleEntry {
 /// Manual Code implementation to avoid bincode's vec resizing overhead
 impl Code for HybridArticleEntry {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
-        // Format: status (2) + checked (1) + missing (1) + timestamp (8) + len (4) + buffer
+        // Format: status (2) + checked (1) + missing (1) + timestamp (8) + tier (1) + len (4) + buffer
         writer
             .write_all(&self.status_code.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
@@ -106,6 +109,9 @@ impl Code for HybridArticleEntry {
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.timestamp.to_le_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&[self.tier])
             .map_err(foyer::Error::io_error)?;
         let len = self.buffer.len() as u32;
         writer
@@ -146,6 +152,13 @@ impl Code for HybridArticleEntry {
             .map_err(foyer::Error::io_error)?;
         let timestamp = u64::from_le_bytes(timestamp_bytes);
 
+        // Read tier
+        let mut tier_byte = [0u8; 1];
+        reader
+            .read_exact(&mut tier_byte)
+            .map_err(foyer::Error::io_error)?;
+        let tier = tier_byte[0];
+
         // Read length and pre-allocate buffer (no resizing!)
         let mut len_bytes = [0u8; 4];
         reader
@@ -176,12 +189,13 @@ impl Code for HybridArticleEntry {
             checked: header[0],
             missing: header[1],
             timestamp,
+            tier,
             buffer,
         })
     }
 
     fn estimated_size(&self) -> usize {
-        2 + 2 + 8 + 4 + self.buffer.len() // status + header + timestamp + len + buffer
+        2 + 2 + 8 + 1 + 4 + self.buffer.len() // status + header + timestamp + tier + len + buffer
     }
 }
 
@@ -198,7 +212,15 @@ impl HybridArticleEntry {
     /// Create from response buffer - returns None if buffer has invalid status code
     ///
     /// This is the ONLY way to create an entry. Invalid buffers are rejected.
+    /// Tier defaults to 0.
     pub fn new(buffer: Vec<u8>) -> Option<Self> {
+        Self::with_tier(buffer, 0)
+    }
+
+    /// Create from response buffer with specified tier
+    ///
+    /// Returns None if buffer has invalid status code.
+    pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Option<Self> {
         let status_code = StatusCode::parse(&buffer)?.as_u16();
 
         if !Self::is_valid_status_code(status_code) {
@@ -209,10 +231,8 @@ impl HybridArticleEntry {
             status_code,
             checked: 0,
             missing: 0,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: ttl::now_millis(),
+            tier,
             buffer,
         })
     }
@@ -388,22 +408,38 @@ impl HybridArticleEntry {
         self.checked != 0
     }
 
-    /// Check if availability information is stale (older than ttl_secs)
+    /// Check if availability information is stale (older than ttl_millis)
     ///
-    /// Since HybridArticleEntry doesn't track timestamps, this always returns false.
-    /// The foyer cache handles eviction separately.
+    /// HybridArticleEntry stores timestamps for tier-aware TTL, but foyer's cache
+    /// handles eviction based on insertion time. This method is kept for compatibility
+    /// and always returns false since the cache layer manages staleness.
     #[inline]
-    pub fn is_availability_stale(&self, _ttl_secs: u64) -> bool {
-        // HybridArticleEntry doesn't track timestamps - foyer handles TTL
+    pub fn is_availability_stale(&self, _ttl_millis: u64) -> bool {
+        // Foyer cache handles TTL-based eviction separately
         false
     }
 
     /// Clear stale availability information
     ///
-    /// Since HybridArticleEntry doesn't track timestamps, this is a no-op.
+    /// HybridArticleEntry now tracks timestamps via `timestamp` field for tier-aware TTL,
+    /// but foyer handles eviction separately. This method is a no-op for compatibility.
     #[inline]
-    pub fn clear_stale_availability(&mut self, _ttl_secs: u64) {
-        // No-op: HybridArticleEntry doesn't track timestamps
+    pub fn clear_stale_availability(&mut self, _ttl_millis: u64) {
+        // Foyer cache handles TTL-based eviction, no need to clear here
+    }
+
+    /// Check if this entry has expired based on tier-aware TTL
+    ///
+    /// See [`super::ttl`] for the TTL formula.
+    #[inline]
+    pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
+        ttl::is_expired(self.timestamp, base_ttl_millis, self.tier)
+    }
+
+    /// Get the tier of the backend that provided this article
+    #[inline]
+    pub fn tier(&self) -> u8 {
+        self.tier
     }
 }
 
@@ -445,6 +481,9 @@ impl Default for HybridCacheConfig {
 /// Uses foyer's `HybridCache` for automatic memory→disk spillover.
 /// Hot articles stay in memory, cold articles spill to disk.
 ///
+/// Supports tier-aware TTL: entries from higher tier backends get longer TTLs.
+/// Formula: `effective_ttl = base_ttl * (2 ^ tier)`
+///
 /// Note: Keys are stored as `String` (message ID without brackets) because
 /// foyer requires keys to implement the `Code` trait for disk serialization.
 pub struct HybridArticleCache {
@@ -453,6 +492,8 @@ pub struct HybridArticleCache {
     misses: AtomicU64,
     disk_hits: AtomicU64,
     config: HybridCacheConfig,
+    /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
+    ttl_millis: u64,
 }
 
 impl std::fmt::Debug for HybridArticleCache {
@@ -551,7 +592,7 @@ impl HybridArticleCache {
         });
 
         let mut builder = HybridCacheBuilder::new()
-            .with_name("nntp-article-cache")
+            .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
             .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(memory_capacity_usize)
             .with_shards(config.shards)
@@ -599,18 +640,21 @@ impl HybridArticleCache {
             "Hybrid article cache initialized"
         );
 
+        let ttl_millis = config.ttl.as_millis() as u64;
         Ok(Self {
             cache,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             config,
+            ttl_millis,
         })
     }
 
     /// Get an article from the cache
     ///
     /// Checks memory first, then disk. Returns None if not found in either tier.
+    /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<HybridArticleEntry> {
         let start = std::time::Instant::now();
         let key = message_id.without_brackets().to_string();
@@ -623,13 +667,24 @@ impl HybridArticleCache {
         let clone_start = std::time::Instant::now();
         match result {
             Ok(Some(entry)) => {
+                let cloned = entry.value().clone();
+
+                // Check tier-aware TTL expiration
+                if cloned.is_expired(self.ttl_millis) {
+                    // Expired by tier-aware TTL - treat as cache miss
+                    // We intentionally do NOT remove from foyer. Eviction decisions are delegated
+                    // to foyer's capacity-based and LRU policies. Expired entries may linger on
+                    // disk until capacity pressure forces eviction, avoiding explicit removal overhead.
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 let source = entry.source();
                 // Track disk hits for monitoring
                 if source == Source::Disk {
                     self.disk_hits.fetch_add(1, Ordering::Relaxed);
                 }
-                let cloned = entry.value().clone();
                 let clone_time = clone_start.elapsed();
                 let total = start.elapsed();
 
@@ -665,11 +720,14 @@ impl HybridArticleCache {
     ///
     /// **UPSERT SEMANTICS**: Never overwrites a larger buffer with a smaller one.
     /// A cached full article (220/222 response) must not be replaced by a STAT stub.
+    ///
+    /// The tier is stored with the entry for tier-aware TTL calculation.
     pub async fn upsert<'a>(
         &self,
         message_id: MessageId<'a>,
         buffer: Vec<u8>,
         backend_id: BackendId,
+        tier: u8,
     ) {
         let key = message_id.without_brackets().to_string();
         let buffer_len = buffer.len();
@@ -678,9 +736,11 @@ impl HybridArticleCache {
         if let Ok(Some(existing)) = self.cache.get(&key).await {
             let existing_len = existing.value().buffer.len();
             if existing_len > buffer_len {
-                // Existing entry is larger - just update availability info
+                // Existing entry is larger - just update availability info and refresh TTL
                 let mut updated = existing.value().clone();
                 updated.record_backend_has(backend_id);
+                // Refresh timestamp on successful upsert to extend tier-aware TTL
+                updated.timestamp = ttl::now_millis();
                 self.cache.insert(key.clone(), updated);
                 debug!(
                     msg_id = %key,
@@ -693,11 +753,11 @@ impl HybridArticleCache {
         }
 
         let Some(mut entry) = (if self.config.cache_articles {
-            HybridArticleEntry::new(buffer.clone())
+            HybridArticleEntry::with_tier(buffer.clone(), tier)
         } else {
             // Availability-only mode: store minimal stub
             let stub = Self::create_stub(&buffer);
-            HybridArticleEntry::new(stub)
+            HybridArticleEntry::with_tier(stub, tier)
         }) else {
             // Invalid buffer - cannot cache
             warn!(
@@ -718,6 +778,7 @@ impl HybridArticleCache {
             msg_id = %key,
             original_bytes = buffer_len,
             stored_bytes = entry_len,
+            tier = tier,
             cache_articles = self.config.cache_articles,
             "Hybrid cache upsert"
         );
@@ -938,6 +999,7 @@ impl HybridArticleCache {
             misses: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             config,
+            ttl_millis: 3600 * 1000, // 1 hour in milliseconds
         })
     }
 }
@@ -977,7 +1039,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert(msg_id, buffer.clone(), BackendId::from_index(0))
+            .upsert(msg_id, buffer.clone(), BackendId::from_index(0), 0)
             .await;
 
         // Retrieve it

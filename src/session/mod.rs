@@ -441,6 +441,7 @@ impl ClientSession {
     /// use nntp_proxy::pool::BufferPool;
     /// use nntp_proxy::types::BufferSize;
     /// use nntp_proxy::auth::AuthHandler;
+    /// use nntp_proxy::metrics::MetricsCollector;
     ///
     /// let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     /// let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);

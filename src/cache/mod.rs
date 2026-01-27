@@ -15,6 +15,7 @@
 
 mod article;
 mod hybrid;
+pub mod ttl;
 
 pub mod mock_hybrid;
 
@@ -122,9 +123,10 @@ impl UnifiedCache {
             Self::Hybrid(cache) => {
                 // Convert HybridArticleEntry to ArticleEntry
                 cache.get(message_id).await.map(|entry| {
-                    // Get availability before consuming buffer
+                    // Get availability and tier before consuming buffer
                     let availability = entry.availability();
-                    let mut article_entry = ArticleEntry::new(entry.into_buffer());
+                    let tier = entry.tier();
+                    let mut article_entry = ArticleEntry::with_tier(entry.into_buffer(), tier);
                     // Copy availability from hybrid entry
                     article_entry.set_availability(availability);
                     article_entry
@@ -134,15 +136,18 @@ impl UnifiedCache {
     }
 
     /// Upsert (insert or update) an article in the cache
+    ///
+    /// The tier is used for tier-aware TTL calculation (higher tier = longer TTL).
     pub async fn upsert<'a>(
         &self,
         message_id: MessageId<'a>,
         buffer: Vec<u8>,
         backend_id: BackendId,
+        tier: u8,
     ) {
         match self {
-            Self::Memory(cache) => cache.upsert(message_id, buffer, backend_id).await,
-            Self::Hybrid(cache) => cache.upsert(message_id, buffer, backend_id).await,
+            Self::Memory(cache) => cache.upsert(message_id, buffer, backend_id, tier).await,
+            Self::Hybrid(cache) => cache.upsert(message_id, buffer, backend_id, tier).await,
         }
     }
 

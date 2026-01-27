@@ -22,7 +22,7 @@ async fn test_cache_hit() -> Result<()> {
 
     // Insert
     cache
-        .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0))
+        .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0), 0)
         .await;
 
     // Retrieve - should hit
@@ -54,7 +54,9 @@ async fn test_multiple_cache_entries() -> Result<()> {
         let msg_str = format!("<test{}@example.com>", i);
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
         let buffer = format!("220 Body {}\r\n.\r\n", i).into_bytes();
-        cache.upsert(msgid, buffer, BackendId::from_index(0)).await;
+        cache
+            .upsert(msgid, buffer, BackendId::from_index(0), 0)
+            .await;
     }
 
     // Sync cache to ensure all inserts are processed
@@ -83,7 +85,7 @@ async fn test_cache_ttl_expiration() -> Result<()> {
 
     // Insert article
     cache
-        .upsert(msgid.clone(), buffer, BackendId::from_index(0))
+        .upsert(msgid.clone(), buffer, BackendId::from_index(0), 0)
         .await;
 
     // Should be in cache immediately
@@ -108,7 +110,9 @@ async fn test_cache_capacity_limit() -> Result<()> {
         let msg_str = format!("<test{}@example.com>", i);
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
         let buffer = format!("220 Body {}\r\n.\r\n", i).into_bytes();
-        cache.upsert(msgid, buffer, BackendId::from_index(0)).await;
+        cache
+            .upsert(msgid, buffer, BackendId::from_index(0), 0)
+            .await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -139,7 +143,7 @@ async fn test_cache_different_message_id_formats() -> Result<()> {
         let msgid = MessageId::from_borrowed(msg_str).unwrap();
         let buffer = format!("220 {}\r\n.\r\n", msg_str).into_bytes();
         cache
-            .upsert(msgid.clone(), buffer, BackendId::from_index(0))
+            .upsert(msgid.clone(), buffer, BackendId::from_index(0), 0)
             .await;
 
         // Verify retrievable
@@ -168,7 +172,9 @@ async fn test_cache_stats() -> Result<()> {
         let mut buffer = vec![0u8; 1024];
         // Put valid status code at start
         buffer[0..3].copy_from_slice(b"220");
-        cache.upsert(msgid, buffer, BackendId::from_index(0)).await;
+        cache
+            .upsert(msgid, buffer, BackendId::from_index(0), 0)
+            .await;
     }
 
     // Run pending background tasks to ensure cache is fully updated
@@ -189,7 +195,9 @@ async fn test_zero_allocation_lookup() -> Result<()> {
     let msgid1 = MessageId::from_borrowed("<test@example.com>").unwrap();
     let buffer = b"220 Body\r\n.\r\n".to_vec();
 
-    cache.upsert(msgid1, buffer, BackendId::from_index(0)).await;
+    cache
+        .upsert(msgid1, buffer, BackendId::from_index(0), 0)
+        .await;
 
     // Create different MessageId instance with same content
     let msgid2 = MessageId::from_borrowed("<test@example.com>").unwrap();

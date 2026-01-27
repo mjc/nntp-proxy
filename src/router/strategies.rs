@@ -35,18 +35,22 @@ impl WeightedRoundRobin {
         self.total_weight = total_weight;
     }
 
-    /// Select backend index using weighted round-robin
+    /// Select backend index using a specific weight
     ///
-    /// Returns the weighted position that should be mapped to a backend.
-    /// The caller must convert this to an actual backend by summing weights.
+    /// This method allows tier-aware selection by using a tier's total weight
+    /// instead of the global total weight. This avoids modulo bias when selecting
+    /// within a tier that has a different total weight than the global weight.
+    ///
+    /// The atomic counter is still shared across all calls, ensuring fair
+    /// distribution even when tier weights change.
     #[must_use]
-    pub fn select(&self) -> Option<usize> {
-        if self.total_weight == 0 {
+    pub fn select_with_weight(&self, weight: usize) -> Option<usize> {
+        if weight == 0 {
             return None;
         }
 
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-        Some(counter % self.total_weight)
+        Some(counter % weight)
     }
 
     /// Get total weight
@@ -92,14 +96,17 @@ mod tests {
 
         // Should cycle through 0-9
         for i in 0..20 {
-            assert_eq!(strategy.select(), Some(i % 10));
+            assert_eq!(
+                strategy.select_with_weight(strategy.total_weight()),
+                Some(i % 10)
+            );
         }
     }
 
     #[test]
     fn test_weighted_round_robin_zero_weight() {
         let strategy = WeightedRoundRobin::new(0);
-        assert_eq!(strategy.select(), None);
+        assert_eq!(strategy.select_with_weight(strategy.total_weight()), None);
     }
 
     #[test]
@@ -108,7 +115,10 @@ mod tests {
 
         // All selections should return 0
         for _ in 0..100 {
-            assert_eq!(strategy.select(), Some(0));
+            assert_eq!(
+                strategy.select_with_weight(strategy.total_weight()),
+                Some(0)
+            );
         }
     }
 
@@ -126,12 +136,16 @@ mod tests {
         let mut strategy = WeightedRoundRobin::new(10);
 
         // First should work
-        assert!(strategy.select().is_some());
+        assert!(
+            strategy
+                .select_with_weight(strategy.total_weight())
+                .is_some()
+        );
 
         // Change to zero
         strategy.set_total_weight(0);
         assert_eq!(strategy.total_weight(), 0);
-        assert_eq!(strategy.select(), None);
+        assert_eq!(strategy.select_with_weight(strategy.total_weight()), None);
     }
 
     #[test]
@@ -140,7 +154,10 @@ mod tests {
 
         // Should cycle through 0-999
         for i in 0..2000 {
-            assert_eq!(strategy.select(), Some(i % 1000));
+            assert_eq!(
+                strategy.select_with_weight(strategy.total_weight()),
+                Some(i % 1000)
+            );
         }
     }
 
@@ -150,7 +167,10 @@ mod tests {
 
         // Should cycle through 0-6
         for i in 0..21 {
-            assert_eq!(strategy.select(), Some(i % 7));
+            assert_eq!(
+                strategy.select_with_weight(strategy.total_weight()),
+                Some(i % 7)
+            );
         }
     }
 
@@ -160,7 +180,10 @@ mod tests {
 
         // Test with prime number to ensure no modulo bias
         for i in 0..26 {
-            assert_eq!(strategy.select(), Some(i % 13));
+            assert_eq!(
+                strategy.select_with_weight(strategy.total_weight()),
+                Some(i % 13)
+            );
         }
     }
 
@@ -174,7 +197,7 @@ mod tests {
         // Next few selections should still work correctly
         // Even when counter wraps around, modulo should still produce valid results
         for _ in 0..10 {
-            let result = strategy.select();
+            let result = strategy.select_with_weight(strategy.total_weight());
             assert!(result.is_some());
             assert!(result.unwrap() < 10);
         }
@@ -187,7 +210,9 @@ mod tests {
 
         // Make 1000 selections
         for _ in 0..1000 {
-            let pos = strategy.select().unwrap();
+            let pos = strategy
+                .select_with_weight(strategy.total_weight())
+                .unwrap();
             counts[pos] += 1;
         }
 
@@ -208,7 +233,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let mut results = vec![];
                 for _ in 0..100 {
-                    results.push(strategy_clone.select().unwrap());
+                    results.push(strategy_clone.select_with_weight(100).unwrap());
                 }
                 results
             }));
@@ -240,7 +265,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let mut counts = [0usize; 50];
                 for _ in 0..1000 {
-                    let pos = strategy_clone.select().unwrap();
+                    let pos = strategy_clone.select_with_weight(50).unwrap();
                     counts[pos] += 1;
                 }
                 counts
@@ -267,8 +292,14 @@ mod tests {
         let strategy = WeightedRoundRobin::new(42);
 
         // First selection should be 0 (counter starts at 0)
-        assert_eq!(strategy.select(), Some(0));
-        assert_eq!(strategy.select(), Some(1));
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(0)
+        );
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -284,17 +315,26 @@ mod tests {
         let mut strategy = WeightedRoundRobin::new(10);
 
         assert_eq!(strategy.total_weight(), 10);
-        assert_eq!(strategy.select(), Some(0));
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(0)
+        );
 
         strategy.set_total_weight(5);
         assert_eq!(strategy.total_weight(), 5);
         // Counter continues from 1, so 1 % 5 = 1
-        assert_eq!(strategy.select(), Some(1));
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(1)
+        );
 
         strategy.set_total_weight(20);
         assert_eq!(strategy.total_weight(), 20);
         // Counter at 2, so 2 % 20 = 2
-        assert_eq!(strategy.select(), Some(2));
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -303,7 +343,10 @@ mod tests {
 
         // Powers of 2 should work efficiently with modulo
         for i in 0..128 {
-            assert_eq!(strategy.select(), Some(i % 64));
+            assert_eq!(
+                strategy.select_with_weight(strategy.total_weight()),
+                Some(i % 64)
+            );
         }
     }
 
@@ -313,8 +356,17 @@ mod tests {
         let strategy = WeightedRoundRobin::new(usize::MAX);
 
         // First few selections should work normally
-        assert_eq!(strategy.select(), Some(0));
-        assert_eq!(strategy.select(), Some(1));
-        assert_eq!(strategy.select(), Some(2));
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(0)
+        );
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(1)
+        );
+        assert_eq!(
+            strategy.select_with_weight(strategy.total_weight()),
+            Some(2)
+        );
     }
 }

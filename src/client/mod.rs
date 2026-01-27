@@ -23,8 +23,9 @@
 //! )?;
 //! let client = NntpClient::new(conn_pool, buffer_pool.clone());
 //!
+//! # let message_ids: Vec<&str> = vec![];
 //! for msg_id in message_ids {
-//!     let buffer = client.fetch_body(&msg_id).await?;
+//!     let buffer = client.fetch_body(msg_id).await?;
 //!     let article = Article::parse(&buffer, true)?;
 //!     if let Some(decoded) = article.decode() {
 //!         process(&decoded);
@@ -34,7 +35,6 @@
 //! # Ok(())
 //! # }
 //! # fn process(_: &[u8]) {}
-//! # let message_ids: Vec<String> = vec![];
 //! ```
 
 use anyhow::{Context, Result};

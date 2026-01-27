@@ -312,9 +312,15 @@ pub async fn precheck(
 
     // Cache the found result and return it
     if let Some((backend_id, data)) = found {
+        // NOTE: We intentionally use tier 0 for articles found via racing queries.
+        // Racing all backends can cause higher-tier backends to respond slightly faster,
+        // incorrectly caching an article as "higher tier" (longer TTL) even if a lower-tier
+        // backend also has it but responded slower. Using tier 0 conservatively ensures
+        // we don't overestimate TTL. Regular routing will discover higher-tier availability.
+        let tier = 0;
         owned
             .cache
-            .upsert(msg_id.to_owned(), data, backend_id)
+            .upsert(msg_id.to_owned(), data, backend_id, tier)
             .await;
         owned.cache.get(msg_id).await
     } else {
@@ -345,9 +351,13 @@ pub fn spawn_background_precheck(
         let (found, availability) = summarize(results);
 
         if let Some((backend_id, data)) = found {
+            // NOTE: We intentionally use tier 0 for articles found via background precheck.
+            // When racing backends, we don't have visibility into which tier actually has
+            // the article. Using tier 0 conservatively avoids overestimating TTL.
+            let tier = 0;
             owned
                 .cache
-                .upsert(msg_id.to_owned(), data, backend_id)
+                .upsert(msg_id.to_owned(), data, backend_id, tier)
                 .await;
         }
         owned.cache.sync_availability(msg_id, &availability).await;

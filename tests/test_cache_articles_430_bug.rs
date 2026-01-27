@@ -75,6 +75,7 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
             msg_id.clone(),
             article_data.clone(),
             BackendId::from_index(0),
+            0,
         )
         .await;
 
@@ -105,6 +106,7 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
             msg_id.clone(),
             article_data.clone(),
             BackendId::from_index(0),
+            0,
         )
         .await;
 
@@ -332,7 +334,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
         let article_data =
             b"220 0 <concurrent@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache1
-            .upsert(msg_id1, article_data, BackendId::from_index(0))
+            .upsert(msg_id1, article_data, BackendId::from_index(0), 0)
             .await;
     });
 
@@ -482,6 +484,7 @@ async fn test_stub_not_served_as_article() -> Result<()> {
             msg_id.clone(),
             b"223\r\n".to_vec(),
             BackendId::from_index(0),
+            0,
         )
         .await;
 
@@ -512,6 +515,7 @@ async fn test_precheck_stub_then_article_request() -> Result<()> {
             msg_id.clone(),
             b"223\r\n".to_vec(),
             BackendId::from_index(0),
+            0,
         )
         .await;
 
@@ -532,6 +536,7 @@ async fn test_precheck_stub_then_article_request() -> Result<()> {
             msg_id.clone(),
             real_article.clone(),
             BackendId::from_index(0),
+            0,
         )
         .await;
 
