@@ -32,6 +32,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use super::ttl;
+
 /// Maximum number of backends supported by ArticleAvailability bitset
 pub const MAX_BACKENDS: usize = 8;
 
@@ -323,6 +325,14 @@ pub struct ArticleEntry {
     /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
     /// Status code is always at bytes [0..3]
     buffer: Arc<Vec<u8>>,
+
+    /// Tier of the backend that provided this article
+    /// Used for tier-aware TTL: higher tier = longer TTL
+    tier: u8,
+
+    /// Unix timestamp when this entry was inserted (milliseconds since epoch)
+    /// Populated via `ttl::now_millis()` and used with `tier` for TTL expiration
+    inserted_at: u64,
 }
 
 impl ArticleEntry {
@@ -332,10 +342,25 @@ impl ArticleEntry {
     /// No validation is performed here - caller must ensure buffer is valid.
     ///
     /// Backend availability starts with assumption all backends have the article.
+    /// Tier defaults to 0, timestamp is set to now.
     pub fn new(buffer: Vec<u8>) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
             buffer: Arc::new(buffer),
+            tier: 0,
+            inserted_at: ttl::now_millis(),
+        }
+    }
+
+    /// Create from response buffer with a specific tier
+    ///
+    /// Used when caching articles from backends with known tier.
+    pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Self {
+        Self {
+            backend_availability: ArticleAvailability::new(),
+            buffer: Arc::new(buffer),
+            tier,
+            inserted_at: ttl::now_millis(),
         }
     }
 
@@ -346,7 +371,29 @@ impl ArticleEntry {
         Self {
             backend_availability: ArticleAvailability::new(),
             buffer,
+            tier: 0,
+            inserted_at: ttl::now_millis(),
         }
+    }
+
+    /// Check if this entry has expired based on tier-aware TTL
+    ///
+    /// See [`super::ttl`] for the TTL formula.
+    #[inline]
+    pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
+        ttl::is_expired(self.inserted_at, base_ttl_millis, self.tier)
+    }
+
+    /// Get the tier of the backend that provided this article
+    #[inline]
+    pub fn tier(&self) -> u8 {
+        self.tier
+    }
+
+    /// Set the tier (used when updating entry)
+    #[inline]
+    pub fn set_tier(&mut self, tier: u8) {
+        self.tier = tier;
     }
 
     /// Get raw buffer for serving to client
@@ -561,6 +608,9 @@ impl ArticleEntry {
 ///
 /// Uses `Arc<str>` (message ID content without brackets) as key for zero-allocation lookups.
 /// `Arc<str>` implements `Borrow<str>`, allowing `cache.get(&str)` without allocation.
+///
+/// Supports tier-aware TTL: entries from higher tier backends get longer TTLs.
+/// Formula: `effective_ttl = base_ttl * (2 ^ tier)`
 #[derive(Clone, Debug)]
 pub struct ArticleCache {
     cache: Arc<Cache<Arc<str>, ArticleEntry>>,
@@ -568,6 +618,8 @@ pub struct ArticleCache {
     misses: Arc<AtomicU64>,
     capacity: u64,
     cache_articles: bool,
+    /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
+    ttl_millis: u64,
 }
 
 impl ArticleCache {
@@ -580,9 +632,27 @@ impl ArticleCache {
     pub fn new(max_capacity: u64, ttl: Duration, cache_articles: bool) -> Self {
         // Build cache with byte-based capacity using weigher
         // max_capacity is total bytes allowed
+        //
+        // IMPORTANT: Moka's time_to_live must be set to the MAXIMUM tier-aware TTL
+        // so that high-tier entries aren't evicted prematurely by Moka.
+        // Our is_expired() method handles per-entry expiration based on tier.
+        //
+        // Moka has a hard limit of ~1000 years for TTL. For very high tier multipliers
+        // (e.g., tier 63 = 2^63), we cap at 100 years which is more than enough.
+        // We handle per-entry expiration ourselves in get() based on actual tier.
+        const MAX_MOKA_TTL: Duration = Duration::from_secs(100 * 365 * 24 * 3600); // 100 years
+
+        // For zero TTL, use Duration::ZERO so entries expire immediately in Moka too
+        let max_tier_ttl = if ttl.is_zero() {
+            Duration::ZERO
+        } else {
+            // Non-zero TTL: multiply by max tier multiplier (2^63) and cap at MAX_MOKA_TTL
+            // Since 2^63 > u32::MAX, the multiplier will overflow u32, so just use MAX_MOKA_TTL
+            MAX_MOKA_TTL
+        };
         let cache = Cache::builder()
             .max_capacity(max_capacity)
-            .time_to_live(ttl)
+            .time_to_live(max_tier_ttl)
             .weigher(move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
                 // Calculate actual memory footprint for accurate capacity tracking.
                 //
@@ -644,6 +714,7 @@ impl ArticleCache {
             misses: Arc::new(AtomicU64::new(0)),
             capacity: max_capacity,
             cache_articles,
+            ttl_millis: ttl.as_millis() as u64,
         }
     }
 
@@ -654,19 +725,32 @@ impl ArticleCache {
     /// **Zero-allocation**: `without_brackets()` returns `&str`, which moka accepts directly
     /// for `Arc<str>` keys via the `Borrow<str>` trait. This avoids allocating a new `Arc<str>`
     /// for every cache lookup. See `test_arc_str_borrow_lookup` test for verification.
+    ///
+    /// **Tier-aware TTL**: Even if moka hasn't expired the entry yet, we check if the entry
+    /// is expired based on tier-aware TTL. Higher tier entries get longer TTLs.
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<ArticleEntry> {
         // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
         // This is zero-allocation: no Arc<str> is created for the lookup
         let result = self.cache.get(message_id.without_brackets()).await;
 
-        if result.is_some() {
-            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.misses
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match result {
+            Some(entry) if !entry.is_expired(self.ttl_millis) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry)
+            }
+            Some(_) => {
+                // Entry exists but expired by tier-aware TTL - invalidate and treat as cache miss
+                // Invalidating immediately frees capacity rather than waiting for LRU eviction,
+                // preventing repeated cache misses on the same stale key
+                self.cache.invalidate(message_id.without_brackets()).await;
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
-
-        result
     }
 
     /// Upsert cache entry (insert or update) - ATOMIC OPERATION
@@ -681,12 +765,15 @@ impl ArticleCache {
     /// When `cache_articles=false`, extracts status code from buffer and stores minimal stub.
     /// When `cache_articles=true`, stores full buffer.
     ///
+    /// The tier is stored with the entry for tier-aware TTL calculation.
+    ///
     /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
     pub async fn upsert<'a>(
         &self,
         message_id: MessageId<'a>,
         buffer: Vec<u8>,
         backend_id: BackendId,
+        tier: u8,
     ) {
         let key: Arc<str> = message_id.without_brackets().into();
         let cache_articles = self.cache_articles;
@@ -724,14 +811,24 @@ impl ArticleCache {
                     if should_replace {
                         // Already wrapped in Arc, just clone the Arc (cheap)
                         entry.buffer = Arc::clone(&new_buffer);
+                        // Update tier when replacing buffer
+                        entry.tier = tier;
                     }
+
+                    // Refresh TTL on every successful upsert, independent of buffer replacement
+                    entry.inserted_at = ttl::now_millis();
 
                     // Mark backend as having the article
                     entry.record_backend_has(backend_id);
                     entry
                 } else {
-                    // New entry - clone Arc (cheap, just reference count bump)
-                    let mut entry = ArticleEntry::from_arc(Arc::clone(&new_buffer));
+                    // New entry with tier
+                    let mut entry = ArticleEntry {
+                        backend_availability: ArticleAvailability::new(),
+                        buffer: Arc::clone(&new_buffer),
+                        tier,
+                        inserted_at: ttl::now_millis(),
+                    };
                     entry.record_backend_has(backend_id);
                     entry
                 };
@@ -1262,7 +1359,7 @@ mod tests {
         let buffer = b"220 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
 
         cache
-            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0))
+            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0), 0)
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
@@ -1281,12 +1378,12 @@ mod tests {
 
         // Insert with backend 0
         cache
-            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0))
+            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0), 0)
             .await;
 
         // Update with backend 1 - does nothing (entry already exists)
         cache
-            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(1))
+            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(1), 0)
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
@@ -1433,7 +1530,7 @@ mod tests {
         let full_size = buffer.len();
 
         cache_stub
-            .upsert(msgid.clone(), buffer, BackendId::from_index(0))
+            .upsert(msgid.clone(), buffer, BackendId::from_index(0), 0)
             .await;
         cache_stub.sync().await;
 
@@ -1461,7 +1558,7 @@ mod tests {
         let original_size = buffer2.len();
 
         cache_full
-            .upsert(msgid2.clone(), buffer2, BackendId::from_index(0))
+            .upsert(msgid2.clone(), buffer2, BackendId::from_index(0), 0)
             .await;
         cache_full.sync().await;
 

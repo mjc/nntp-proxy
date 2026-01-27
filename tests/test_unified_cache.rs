@@ -43,7 +43,7 @@ async fn test_unified_cache_memory_upsert_and_get() {
     let backend_id = BackendId::from_index(0);
 
     cache
-        .upsert(msg_id.clone(), buffer.clone(), backend_id)
+        .upsert(msg_id.clone(), buffer.clone(), backend_id, 0)
         .await;
 
     let result = cache.get(&msg_id).await;
@@ -77,7 +77,7 @@ async fn test_unified_cache_sync_availability() {
 
     // First insert an article
     cache
-        .upsert(msg_id.clone(), buffer.clone(), backend_id)
+        .upsert(msg_id.clone(), buffer.clone(), backend_id, 0)
         .await;
 
     // Create availability with backend 1 marked as missing
@@ -115,7 +115,7 @@ async fn test_unified_cache_weighted_size() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(0))
+        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 0)
         .await;
 
     // Run pending tasks to ensure moka updates its internal state
@@ -844,9 +844,9 @@ fn test_hybrid_entry_serialization_estimated_size() {
     let buffer = make_valid_article_buffer();
     let entry = HybridArticleEntry::new(buffer.clone()).unwrap();
 
-    // estimated_size = 2 (status) + 2 (checked+missing) + 8 (timestamp) + 4 (len) + buffer.len()
-    // Format: [status:u16][checked:u8][missing:u8][timestamp:u64][len:u32][buffer:bytes]
-    let expected_size = 2 + 2 + 8 + 4 + buffer.len();
+    // estimated_size = 2 (status) + 2 (checked+missing) + 8 (timestamp) + 1 (tier) + 4 (len) + buffer.len()
+    // Format: [status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][len:u32][buffer:bytes]
+    let expected_size = 2 + 2 + 8 + 1 + 4 + buffer.len();
     assert_eq!(entry.estimated_size(), expected_size);
 }
 

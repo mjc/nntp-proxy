@@ -184,6 +184,7 @@ mod tests {
             connection_keepalive: None,
             health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
             health_check_pool_timeout: crate::config::health_check_pool_timeout(),
+            tier: 0,
         }];
 
         let providers = servers
@@ -232,6 +233,7 @@ mod tests {
                 connection_keepalive: None,
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
+                tier: 0,
             },
             Server {
                 name: crate::types::ServerName::try_new("Server2".to_string()).unwrap(),
@@ -246,6 +248,7 @@ mod tests {
                 connection_keepalive: None,
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
+                tier: 0,
             },
         ];
 
@@ -285,6 +288,7 @@ mod tests {
             connection_keepalive: None,
             health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
             health_check_pool_timeout: crate::config::health_check_pool_timeout(),
+            tier: 0,
         }];
 
         let providers = servers
@@ -403,6 +407,7 @@ mod tests {
                 connection_keepalive: None,
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
+                tier: 0,
             },
             Server {
                 name: crate::types::ServerName::try_new("BadServer".to_string()).unwrap(),
@@ -417,6 +422,7 @@ mod tests {
                 connection_keepalive: None,
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
+                tier: 0,
             },
         ];
 

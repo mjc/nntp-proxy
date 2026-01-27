@@ -271,6 +271,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 connection_keepalive: None,
                 health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
+                tier: 0,
             })
             .collect(),
         proxy: Default::default(),

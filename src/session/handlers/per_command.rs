@@ -821,16 +821,21 @@ impl ClientSession {
     ///
     /// This is fire-and-forget - we don't wait for the cache to update.
     /// Used after successfully streaming a response to update availability tracking.
+    ///
+    /// The tier is used for tier-aware TTL (higher tier = longer TTL).
     fn spawn_cache_upsert(
         &self,
         msg_id: &crate::types::MessageId<'_>,
         buffer: Vec<u8>,
         backend_id: crate::types::BackendId,
+        tier: u8,
     ) {
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
-            cache_clone.upsert(msg_id_owned, buffer, backend_id).await;
+            cache_clone
+                .upsert(msg_id_owned, buffer, backend_id, tier)
+                .await;
         });
     }
 
@@ -946,7 +951,12 @@ impl ClientSession {
                         msg_id_ref,
                         captured.len()
                     );
-                    self.spawn_cache_upsert(msg_id_ref, captured, backend_id);
+                    let tier = self
+                        .router
+                        .as_ref()
+                        .and_then(|r| r.get_tier(backend_id))
+                        .unwrap_or(0);
+                    self.spawn_cache_upsert(msg_id_ref, captured, backend_id, tier);
                 }
                 Ok(bytes)
             }
@@ -963,7 +973,12 @@ impl ClientSession {
                 .await?;
 
                 if let Some(msg_id_ref) = msg_id {
-                    self.spawn_cache_upsert(msg_id_ref, first_chunk.to_vec(), backend_id);
+                    let tier = self
+                        .router
+                        .as_ref()
+                        .and_then(|r| r.get_tier(backend_id))
+                        .unwrap_or(0);
+                    self.spawn_cache_upsert(msg_id_ref, first_chunk.to_vec(), backend_id, tier);
                 }
                 Ok(bytes)
             }
@@ -983,7 +998,12 @@ impl ClientSession {
             (false, CacheAction::TrackStat) => {
                 client_write.write_all(first_chunk).await?;
                 if let Some(msg_id_ref) = msg_id {
-                    self.spawn_cache_upsert(msg_id_ref, b"223\r\n".to_vec(), backend_id);
+                    let tier = self
+                        .router
+                        .as_ref()
+                        .and_then(|r| r.get_tier(backend_id))
+                        .unwrap_or(0);
+                    self.spawn_cache_upsert(msg_id_ref, b"223\r\n".to_vec(), backend_id, tier);
                 }
                 Ok(first_chunk_size as u64)
             }

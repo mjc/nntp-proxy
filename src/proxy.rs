@@ -28,28 +28,34 @@ use crate::types::{self, BufferSize, TransferMetrics};
 ///
 /// Basic usage with defaults:
 /// ```no_run
-/// # use nntp_proxy::{NntpProxyBuilder, Config, RoutingMode};
-/// # use nntp_proxy::config::load_config;
-/// # fn main() -> anyhow::Result<()> {
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// use nntp_proxy::{NntpProxyBuilder, Config, RoutingMode};
+/// use nntp_proxy::config::load_config;
+///
 /// let config = load_config("config.toml")?;
 /// let proxy = NntpProxyBuilder::new(config)
 ///     .with_routing_mode(RoutingMode::Hybrid)
-///     .build()?;
+///     .build()
+///     .await?;
 /// # Ok(())
 /// # }
 /// ```
 ///
 /// With custom buffer pool size:
 /// ```no_run
-/// # use nntp_proxy::{NntpProxyBuilder, Config, RoutingMode};
-/// # use nntp_proxy::config::load_config;
-/// # fn main() -> anyhow::Result<()> {
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// use nntp_proxy::{NntpProxyBuilder, Config, RoutingMode};
+/// use nntp_proxy::config::load_config;
+///
 /// let config = load_config("config.toml")?;
 /// let proxy = NntpProxyBuilder::new(config)
 ///     .with_routing_mode(RoutingMode::PerCommand)
 ///     .with_buffer_pool_size(512 * 1024)  // 512KB buffers
 ///     .with_buffer_pool_count(64)         // 64 buffers
-///     .build()?;
+///     .build()
+///     .await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -160,7 +166,12 @@ impl NntpProxyBuilder {
                 router::BackendSelector::with_strategy(backend_strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
+                    r.add_backend(
+                        backend_id,
+                        servers[idx].name.clone(),
+                        provider.clone(),
+                        servers[idx].tier,
+                    );
                     r
                 },
             )
@@ -337,7 +348,12 @@ impl NntpProxyBuilder {
                 router::BackendSelector::with_strategy(backend_strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    r.add_backend(backend_id, servers[idx].name.clone(), provider.clone());
+                    r.add_backend(
+                        backend_id,
+                        servers[idx].name.clone(),
+                        provider.clone(),
+                        servers[idx].tier,
+                    );
                     r
                 },
             )
@@ -634,7 +650,8 @@ impl NntpProxy {
     /// ```no_run
     /// # use nntp_proxy::{NntpProxy, Config, RoutingMode};
     /// # use nntp_proxy::config::load_config;
-    /// # fn main() -> anyhow::Result<()> {
+    /// # #[tokio::main]
+    /// # async fn main() -> anyhow::Result<()> {
     /// let config = load_config("config.toml")?;
     /// let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     /// # Ok(())
@@ -676,12 +693,14 @@ impl NntpProxy {
     /// ```no_run
     /// # use nntp_proxy::{NntpProxy, Config, RoutingMode};
     /// # use nntp_proxy::config::load_config;
-    /// # fn main() -> anyhow::Result<()> {
+    /// # #[tokio::main]
+    /// # async fn main() -> anyhow::Result<()> {
     /// let config = load_config("config.toml")?;
     /// let proxy = NntpProxy::builder(config)
     ///     .with_routing_mode(RoutingMode::Hybrid)
     ///     .with_buffer_pool_size(512 * 1024)
-    ///     .build()?;
+    ///     .build()
+    ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1076,6 +1095,7 @@ mod tests {
                     connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
+                    tier: 0,
                 },
                 Server {
                     host: HostName::try_new("server2.example.com".to_string()).unwrap(),
@@ -1090,6 +1110,7 @@ mod tests {
                     connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
+                    tier: 0,
                 },
                 Server {
                     host: HostName::try_new("server3.example.com".to_string()).unwrap(),
@@ -1104,6 +1125,7 @@ mod tests {
                     connection_keepalive: None,
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
+                    tier: 0,
                 },
             ],
             ..Default::default()

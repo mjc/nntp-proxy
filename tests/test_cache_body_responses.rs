@@ -26,7 +26,12 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
         "X".repeat(750_000)
     );
     cache
-        .upsert(msg_id.clone(), full_article.as_bytes().to_vec(), backend_id)
+        .upsert(
+            msg_id.clone(),
+            full_article.as_bytes().to_vec(),
+            backend_id,
+            0,
+        )
         .await;
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");
@@ -38,7 +43,9 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
 
     // Second upsert: Try to overwrite with stub (53 bytes)
     let stub = b"222 0 <test@example.com>\r\n".to_vec();
-    cache.upsert(msg_id.clone(), stub.clone(), backend_id).await;
+    cache
+        .upsert(msg_id.clone(), stub.clone(), backend_id, 0)
+        .await;
 
     let cached = cache
         .get(&msg_id)
@@ -66,7 +73,9 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
 
     // First upsert: Store stub
     let stub = b"222 0 <test@example.com>\r\n".to_vec();
-    cache.upsert(msg_id.clone(), stub.clone(), backend_id).await;
+    cache
+        .upsert(msg_id.clone(), stub.clone(), backend_id, 0)
+        .await;
 
     let cached = cache.get(&msg_id).await.expect("Stub should be cached");
     assert_eq!(cached.buffer().len(), stub.len(), "Stub should be cached");
@@ -77,7 +86,12 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
         "X".repeat(750_000)
     );
     cache
-        .upsert(msg_id.clone(), full_article.as_bytes().to_vec(), backend_id)
+        .upsert(
+            msg_id.clone(),
+            full_article.as_bytes().to_vec(),
+            backend_id,
+            0,
+        )
         .await;
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");

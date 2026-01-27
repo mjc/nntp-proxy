@@ -24,6 +24,7 @@
 //!     BackendId::from_index(0),
 //!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
+//!     0, // tier (lower = higher priority)
 //! );
 //!
 //! // Route a command
@@ -323,6 +324,8 @@ struct BackendInfo {
     pending_count: PendingCount,
     /// Number of connections in stateful mode (for hybrid routing reservation)
     stateful_count: StatefulCount,
+    /// Server tier for prioritization (lower = higher priority)
+    tier: u8,
 }
 
 impl BackendInfo {
@@ -371,6 +374,7 @@ impl BackendInfo {
 ///     BackendId::from_index(0),
 ///     ServerName::try_new("backend-1".to_string()).unwrap(),
 ///     provider,
+///     0, // tier (lower = higher priority)
 /// );
 ///
 /// // Route commands
@@ -400,6 +404,16 @@ impl BackendSelector {
         self.backends.iter().find(|b| b.id == backend_id)
     }
 
+    /// Get the tier for a backend
+    ///
+    /// Returns the tier value for the specified backend, or None if the backend doesn't exist.
+    /// Used by cache to implement tier-aware TTL (higher tier = longer TTL).
+    #[inline]
+    #[must_use]
+    pub fn get_tier(&self, backend_id: BackendId) -> Option<u8> {
+        self.find_backend(backend_id).map(|b| b.tier)
+    }
+
     /// Create a new backend selector with weighted round-robin strategy (default)
     #[must_use]
     pub fn new() -> Self {
@@ -426,11 +440,18 @@ impl BackendSelector {
     }
 
     /// Add a backend server to the router
+    ///
+    /// # Arguments
+    /// * `backend_id` - Unique identifier for this backend
+    /// * `name` - Human-readable name for logging
+    /// * `provider` - Connection pool provider
+    /// * `tier` - Server tier (lower = higher priority, 0 is highest)
     pub fn add_backend(
         &mut self,
         backend_id: BackendId,
         name: ServerName,
         provider: DeadpoolConnectionProvider,
+        tier: u8,
     ) {
         let max_connections = provider.max_size();
 
@@ -445,9 +466,10 @@ impl BackendSelector {
                 let traffic_share = TrafficShare::from_weight(max_connections, new_weight);
 
                 info!(
-                    "Added backend {:?} ({}) with {} connections - will receive {:.1}% of traffic (total weight: {} -> {}) [weighted round-robin]",
+                    "Added backend {:?} ({}) tier {} with {} connections - will receive {:.1}% of traffic (total weight: {} -> {}) [weighted round-robin]",
                     backend_id,
                     name,
+                    tier,
                     max_connections,
                     traffic_share.get(),
                     old_weight,
@@ -456,8 +478,8 @@ impl BackendSelector {
             }
             SelectionStrategy::LeastLoaded(_) => {
                 info!(
-                    "Added backend {:?} ({}) with {} connections [least-loaded strategy]",
-                    backend_id, name, max_connections
+                    "Added backend {:?} ({}) tier {} with {} connections [least-loaded strategy]",
+                    backend_id, name, tier, max_connections
                 );
             }
         }
@@ -468,11 +490,14 @@ impl BackendSelector {
             provider,
             pending_count: PendingCount::new(),
             stateful_count: StatefulCount::new(),
+            tier,
         });
     }
 
-    /// Select the next backend using the configured strategy
+    /// Select the next backend using the configured strategy with tier-aware prioritization
     ///
+    /// Selection is tier-aware: backends with lower tier numbers are tried first.
+    /// Within each tier, the configured strategy applies:
     /// - **Weighted round-robin**: Distributes proportionally to max_connections
     /// - **Least-loaded**: Routes to backend with fewest pending requests
     ///
@@ -487,31 +512,70 @@ impl BackendSelector {
         }
 
         // Filter backends by availability if provided
-        let filter_fn =
+        let is_available =
             |backend: &&BackendInfo| availability.is_none_or(|avail| avail.should_try(backend.id));
+
+        // Tier filtering only applies to article requests (when availability is provided).
+        // For non-article commands (LIST, CAPABILITIES, etc), use all backends regardless of tier.
+        let should_apply_tier_filtering = availability.is_some();
+
+        // If tiering applies, find the lowest available tier; otherwise this value is unused
+        let lowest_available_tier = if should_apply_tier_filtering {
+            self.backends
+                .iter()
+                .filter(|b| is_available(b))
+                .map(|b| b.tier)
+                .min()?
+        } else {
+            0 // Unused when should_apply_tier_filtering is false; see tier_filter closure
+        };
+
+        // Filter: if tiering applies, only backends in lowest tier; otherwise all available backends
+        let tier_filter = |backend: &&BackendInfo| {
+            if should_apply_tier_filtering {
+                backend.tier == lowest_available_tier && is_available(backend)
+            } else {
+                is_available(backend)
+            }
+        };
 
         match &self.strategy {
             SelectionStrategy::WeightedRoundRobin(wrr) => {
-                let weighted_position = wrr.select()?;
+                // Calculate total weight for this tier only
+                let tier_total_weight: usize = self
+                    .backends
+                    .iter()
+                    .filter(tier_filter)
+                    .map(|b| b.provider.max_size())
+                    .sum();
+
+                if tier_total_weight == 0 {
+                    // No backends with positive weight - cannot route
+                    return None;
+                }
+
+                // Use tier-specific weight for selection to avoid modulo bias
+                // (directly select within tier's weight range instead of global % tier)
+                let tier_position = wrr.select_with_weight(tier_total_weight)?;
 
                 // Find backend owning this weighted position using cumulative weights
                 self.backends
                     .iter()
-                    .filter(filter_fn)
+                    .filter(tier_filter)
                     .scan(0, |cumulative, backend| {
                         *cumulative += backend.provider.max_size();
                         Some((*cumulative, backend))
                     })
-                    .find(|(cumulative_weight, _)| weighted_position < *cumulative_weight)
+                    .find(|(cumulative_weight, _)| tier_position < *cumulative_weight)
                     .map(|(_, backend)| backend)
                     .or_else(|| {
-                        // Fallback to first available backend
-                        self.backends.iter().find(filter_fn)
+                        // Fallback to first available backend in tier
+                        self.backends.iter().find(tier_filter)
                     })
             }
             SelectionStrategy::LeastLoaded(_) => {
-                // Find backend with lowest load ratio using functional approach
-                self.backends.iter().filter(filter_fn).min_by(|a, b| {
+                // Find backend with lowest load ratio in the lowest available tier
+                self.backends.iter().filter(tier_filter).min_by(|a, b| {
                     a.load_ratio()
                         .partial_cmp(&b.load_ratio())
                         .unwrap_or(std::cmp::Ordering::Equal)
