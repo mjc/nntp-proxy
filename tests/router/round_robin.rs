@@ -15,6 +15,7 @@ fn test_round_robin_selection() {
             backend_id,
             ServerName::try_new(format!("backend-{}", i)).unwrap(),
             provider,
+            0, // tier
         );
     }
 
@@ -52,6 +53,7 @@ fn test_load_balancing_fairness() {
             BackendId::from_index(i),
             ServerName::try_new(format!("backend-{}", i)).unwrap(),
             create_test_provider(), // 2 connections each
+            0,                      // tier
         );
     }
 

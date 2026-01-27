@@ -30,6 +30,7 @@ fn test_metrics_with_pool_status_standard_mode() {
         BackendId::from_index(0),
         ServerName::try_new("standard-backend".to_string()).unwrap(),
         provider.clone(),
+        0, // tier
     );
 
     // Simulate standard mode behavior: record bytes only
@@ -94,12 +95,14 @@ fn test_metrics_with_pool_status_per_command_mode() {
         BackendId::from_index(0),
         ServerName::try_new("backend1".to_string()).unwrap(),
         provider1.clone(),
+        0, // tier
     );
 
     router.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("backend2".to_string()).unwrap(),
         provider2.clone(),
+        0, // tier
     );
 
     // Simulate per-command mode: round-robin distribution
@@ -177,6 +180,7 @@ fn test_metrics_with_pool_status_hybrid_mode() {
         BackendId::from_index(0),
         ServerName::try_new("hybrid-backend".to_string()).unwrap(),
         provider.clone(),
+        0, // tier
     );
 
     // Simulate hybrid mode: start with per-command
@@ -246,6 +250,7 @@ fn test_all_modes_show_meaningful_metrics() {
             BackendId::from_index(0),
             ServerName::try_new("test-backend".to_string()).unwrap(),
             provider.clone(),
+            0, // tier
         );
 
         // Record some activity

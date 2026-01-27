@@ -100,6 +100,17 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(defaults::health_check_pool_timeout);
 
+    let tier_key = format!("NNTP_SERVER_{}_TIER", index);
+    let tier = match env.get(&tier_key) {
+        Some(tier_str) => tier_str.parse::<u8>().unwrap_or_else(|_| {
+            panic!(
+                "Invalid tier in {}: '{}' (must be 0-255)",
+                tier_key, tier_str
+            )
+        }),
+        None => 0,
+    };
+
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {}: '{}'", host_key, host)),
@@ -116,6 +127,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         connection_keepalive,
         health_check_max_per_cycle,
         health_check_pool_timeout,
+        tier,
     })
 }
 
@@ -331,6 +343,7 @@ pub fn create_default_config() -> Config {
             connection_keepalive: None,
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
+            tier: 0,
         }],
         ..Default::default()
     }

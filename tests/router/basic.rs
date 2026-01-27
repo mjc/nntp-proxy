@@ -18,6 +18,7 @@ fn test_add_backend() {
         backend_id,
         ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
+        0, // tier
     );
 
     assert_eq!(router.backend_count(), 1);
@@ -34,6 +35,7 @@ fn test_add_multiple_backends() {
             backend_id,
             ServerName::try_new(format!("backend-{}", i)).unwrap(),
             provider,
+            0, // tier
         );
     }
 
@@ -59,6 +61,7 @@ fn test_get_backend_provider() {
         backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         provider,
+        0, // tier
     );
 
     let retrieved = router.backend_provider(backend_id);

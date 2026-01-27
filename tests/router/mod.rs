@@ -9,6 +9,7 @@ mod least_loaded;
 mod load_tracking;
 mod round_robin;
 mod stateful;
+mod tiered;
 mod weighted;
 
 /// Helper function to create a test provider for use in tests

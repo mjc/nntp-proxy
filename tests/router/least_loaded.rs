@@ -15,11 +15,13 @@ fn test_least_loaded_basic() {
         BackendId::from_index(0),
         ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
+        0, // tier
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
+        0, // tier
     );
 
     // First request should go to backend 0 (both empty, picks first)
@@ -52,11 +54,13 @@ fn test_least_loaded_unequal_capacity() {
         BackendId::from_index(0),
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 10),
+        0, // tier
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 50),
+        0, // tier
     );
 
     // Route 15 requests
@@ -89,11 +93,13 @@ fn test_least_loaded_respects_pending_counts() {
         BackendId::from_index(0),
         ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
+        0, // tier
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
+        0, // tier
     );
 
     // Route 10 requests - they should distribute evenly (both start at 0)
@@ -138,6 +144,7 @@ fn test_least_loaded_single_backend() {
         BackendId::from_index(0),
         ServerName::try_new("only".to_string()).unwrap(),
         create_backend("only", 10),
+        0, // tier
     );
 
     // All requests should go to the only backend
@@ -157,6 +164,7 @@ fn test_least_loaded_load_balancing_fairness() {
             BackendId::from_index(i),
             ServerName::try_new(format!("backend-{}", i)).unwrap(),
             create_backend(&format!("backend-{}", i), 10),
+            0, // tier
         );
     }
 

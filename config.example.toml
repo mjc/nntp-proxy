@@ -54,6 +54,22 @@ name = "Example News Server 1"
 # password = "your_password"
 # High-capacity server allows many connections
 max_connections = 20
+# Server tier for prioritization (lower = higher priority, default: 0)
+#
+# Tier determines:
+# 1. Selection priority: tier 0 tried first, tier 1 only if tier 0 exhausted, etc.
+# 2. Cache TTL: effective_ttl = base_ttl * (2 ^ tier)
+#    - Tier 0: 1x TTL (fresh articles from primary)
+#    - Tier 1: 2x TTL (backup servers)
+#    - Tier 5: 32x TTL (~32 hours with 1h base)
+#    - Tier 10: 1024x TTL (~43 days with 1h base)
+#    - Tier 63: 2^63x TTL (effectively infinite for rare articles)
+#
+# Example strategy:
+#   tier 0: primary/fast servers (1h cache)
+#   tier 5: backup/medium servers (32h cache)
+#   tier 10: archive/slow servers (43 days cache)
+tier = 0
 # Connection health check interval (omit or comment out to disable, recommended: 60-120 seconds)
 # Sends DATE command to detect stale connections before reuse
 # connection_keepalive = 60
@@ -70,6 +86,8 @@ username = "testuser"
 password = "testpass"
 # Standard connection limit
 max_connections = 10
+# Tier 1 = backup server, only used when tier 0 servers don't have the article
+tier = 1
 # Enable health checks every 60 seconds for this server
 connection_keepalive = 60
 # Plain TCP connection (default)
@@ -85,6 +103,9 @@ username = "premium_user"
 password = "secure_password"
 # Premium server allows more connections
 max_connections = 15
+# Tier 5 = backup server (32x longer cache)
+# With 1h base TTL, articles cached for 32 hours
+tier = 5
 # Health checks recommended for production servers
 connection_keepalive = 120
 # Enable TLS for secure connection (NNTPS)
@@ -93,6 +114,21 @@ use_tls = true
 tls_verify_cert = true
 # Optional: custom CA certificate
 # tls_cert_path = "/path/to/ca-cert.pem"
+
+[[servers]]
+host = "archive.example.com"
+port = 563
+name = "Archive Server (Tier 10)"
+# Example: Archive server for rare/hard-to-find articles
+# Tier 10 = 1024x longer cache (with 1h base: ~43 days)
+# Articles found here are cached much longer to avoid repeated lookups
+username = "archive_user"
+password = "archive_pass"
+max_connections = 2
+tier = 10
+connection_keepalive = 120
+use_tls = true
+tls_verify_cert = true
 
 [[servers]]
 host = "localhost"

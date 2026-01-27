@@ -13,6 +13,7 @@ fn test_backend_load_tracking() {
         backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         provider,
+        0, // tier
     );
 
     // Initially no load

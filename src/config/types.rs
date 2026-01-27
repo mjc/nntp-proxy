@@ -376,6 +376,10 @@ pub struct Server {
         default = "super::defaults::health_check_pool_timeout"
     )]
     pub health_check_pool_timeout: Duration,
+    /// Server tier for prioritization (lower = higher priority, default: 0)
+    /// Servers with lower tier numbers are tried first; higher tiers only when lower exhausted
+    #[serde(default)]
+    pub tier: u8,
 }
 
 /// Builder for constructing `Server` instances
@@ -417,6 +421,7 @@ pub struct ServerBuilder {
     connection_keepalive: Option<Duration>,
     health_check_max_per_cycle: Option<usize>,
     health_check_pool_timeout: Option<Duration>,
+    tier: u8,
 }
 
 impl ServerBuilder {
@@ -440,6 +445,7 @@ impl ServerBuilder {
             connection_keepalive: None,
             health_check_max_per_cycle: None,
             health_check_pool_timeout: None,
+            tier: 0,
         }
     }
 
@@ -513,6 +519,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Set server tier for prioritization (lower = higher priority)
+    #[must_use]
+    pub fn tier(mut self, tier: u8) -> Self {
+        self.tier = tier;
+        self
+    }
+
     /// Build the Server
     ///
     /// # Errors
@@ -557,6 +570,7 @@ impl ServerBuilder {
             connection_keepalive: self.connection_keepalive,
             health_check_max_per_cycle,
             health_check_pool_timeout,
+            tier: self.tier,
         })
     }
 }
