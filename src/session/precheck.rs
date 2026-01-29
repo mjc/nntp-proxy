@@ -318,11 +318,14 @@ pub async fn precheck(
         // backend also has it but responded slower. Using tier 0 conservatively ensures
         // we don't overestimate TTL. Regular routing will discover higher-tier availability.
         let tier = 0;
+        // Construct the entry directly from the data we have, avoiding a redundant
+        // cache.get() round-trip after upsert.
+        let entry = ArticleEntry::with_tier(data.clone(), tier);
         owned
             .cache
             .upsert(msg_id.to_owned(), data, backend_id, tier)
             .await;
-        owned.cache.get(msg_id).await
+        Some(entry)
     } else {
         // No article found - availability is synced by background task
         None
