@@ -323,93 +323,25 @@ impl HybridArticleEntry {
     /// Check if this cache entry contains a complete article (220) or body (222)
     #[inline]
     pub fn is_complete_article(&self) -> bool {
-        if !matches!(
-            self.status_code,
-            CacheableStatusCode::Article | CacheableStatusCode::Body
-        ) {
-            return false;
-        }
-        const MIN_ARTICLE_SIZE: usize = 30;
-        self.buffer.len() >= MIN_ARTICLE_SIZE && self.buffer.ends_with(b".\r\n")
+        super::entry_helpers::is_complete_article(&self.buffer, self.status_code.as_u16())
     }
 
     /// Get the appropriate response for a command, if this cache entry can serve it
     ///
     /// Returns `Some(response_bytes)` if cache can satisfy the command:
     /// - ARTICLE (220 cached) → returns full cached response
-    /// - BODY (222 cached or 220 cached) → returns cached response  
+    /// - BODY (222 cached or 220 cached) → returns cached response
     /// - HEAD (221 cached or 220 cached) → returns cached response
     /// - STAT → synthesizes "223 0 <msg-id>\r\n" (we know article exists)
     ///
     /// Returns `None` if cached response can't serve this command type.
     pub fn response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
-        use CacheableStatusCode::*;
-
-        match (self.status_code, cmd_verb) {
-            // STAT just needs existence confirmation - synthesize response
-            (Article | Head | Body, "STAT") => {
-                Some(format!("223 0 {}\r\n", message_id).into_bytes())
-            }
-            // Direct match - return cached buffer if valid
-            (Article, "ARTICLE") | (Body, "BODY") | (Head, "HEAD") => {
-                if self.is_valid_response() {
-                    Some(self.buffer.clone())
-                } else {
-                    tracing::warn!(
-                        code = self.status_code.as_u16(),
-                        len = self.buffer.len(),
-                        "Cached buffer failed validation, discarding"
-                    );
-                    None
-                }
-            }
-            // ARTICLE (220) contains everything, can serve BODY or HEAD requests
-            // Note: For HEAD we'd ideally extract just headers, but returning full
-            // article still works (client gets bonus body data)
-            (Article, "BODY" | "HEAD") => {
-                if self.is_valid_response() {
-                    Some(self.buffer.clone())
-                } else {
-                    tracing::warn!(
-                        code = self.status_code.as_u16(),
-                        len = self.buffer.len(),
-                        "Cached buffer failed validation, discarding"
-                    );
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Check if buffer contains a valid NNTP multiline response
-    ///
-    /// A valid response must:
-    /// 1. Start with 3 ASCII digits (status code)
-    /// 2. Have CRLF somewhere (line terminator)
-    /// 3. End with .\r\n for multiline responses (220/221/222)
-    #[inline]
-    fn is_valid_response(&self) -> bool {
-        // Must have at least "NNN \r\n.\r\n" = 9 bytes
-        if self.buffer.len() < 9 {
-            return false;
-        }
-
-        // First 3 bytes must be ASCII digits
-        if !self.buffer[0].is_ascii_digit()
-            || !self.buffer[1].is_ascii_digit()
-            || !self.buffer[2].is_ascii_digit()
-        {
-            return false;
-        }
-
-        // Must end with .\r\n for multiline responses
-        if !self.buffer.ends_with(b".\r\n") {
-            return false;
-        }
-
-        // Must have CRLF in first line (status line)
-        memchr::memmem::find(&self.buffer[..self.buffer.len().min(256)], b"\r\n").is_some()
+        super::entry_helpers::response_for_command(
+            &self.buffer,
+            self.status_code.as_u16(),
+            cmd_verb,
+            message_id,
+        )
     }
 
     /// Check if this entry can serve a given command type
@@ -417,13 +349,7 @@ impl HybridArticleEntry {
     /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
     pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
-        use CacheableStatusCode::*;
-        match self.status_code {
-            Article => matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD" | "STAT"),
-            Body => matches!(cmd_verb, "BODY" | "STAT"),
-            Head => matches!(cmd_verb, "HEAD" | "STAT"),
-            _ => false,
-        }
+        super::entry_helpers::matches_command_type_verb(self.status_code.as_u16(), cmd_verb)
     }
 
     /// Get backend availability as ArticleAvailability struct
