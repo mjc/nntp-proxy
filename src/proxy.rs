@@ -113,21 +113,15 @@ impl NntpProxyBuilder {
         self
     }
 
-    /// Build the `NntpProxy` instance
+    /// Shared initialization logic for both `build()` and `build_sync()`.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - No servers are configured
-    /// - Connection providers cannot be created
-    /// - Buffer size is zero
-    /// - Hybrid cache initialization fails (if disk cache configured)
-    pub async fn build(self) -> Result<NntpProxy> {
+    /// Creates connection providers, buffer pool, metrics, router, and auth handler.
+    /// Returns the intermediate `BuildContext` and the cache config (for cache init).
+    fn build_infrastructure(self) -> Result<(BuildContext, Option<crate::config::Cache>)> {
         if self.config.servers.is_empty() {
             anyhow::bail!("No servers configured in configuration");
         }
 
-        // Use provided values or defaults
         let buffer_size = self.buffer_size.unwrap_or(POOL);
         let buffer_count = self.buffer_count.unwrap_or(POOL_COUNT);
 
@@ -153,15 +147,21 @@ impl NntpProxyBuilder {
             buffer_count,
         );
 
-        // Create metrics collector (before moving servers)
         let metrics = MetricsCollector::new(self.config.servers.len());
 
+        let adaptive_precheck = self
+            .config
+            .cache
+            .as_ref()
+            .map(|c| c.adaptive_precheck)
+            .unwrap_or(false);
+
+        let backend_strategy = self.config.proxy.backend_selection;
+        let cache_config = self.config.cache;
         let servers = Arc::new(self.config.servers);
 
-        // Create backend selector and add all backends
         let router = Arc::new({
             use types::BackendId;
-            let backend_strategy = self.config.proxy.backend_selection;
             connection_providers.iter().enumerate().fold(
                 router::BackendSelector::with_strategy(backend_strategy),
                 |mut r, (idx, provider)| {
@@ -177,7 +177,6 @@ impl NntpProxyBuilder {
             )
         });
 
-        // Create auth handler from config
         let auth_handler = {
             let all_users: Vec<(String, String)> = self
                 .config
@@ -198,15 +197,61 @@ impl NntpProxyBuilder {
             }
         };
 
+        let ctx = BuildContext {
+            connection_providers,
+            buffer_pool,
+            metrics,
+            servers,
+            router,
+            auth_handler,
+            adaptive_precheck,
+            routing_mode: self.routing_mode,
+        };
+
+        Ok((ctx, cache_config))
+    }
+
+    /// Log cache configuration details
+    fn log_cache_config(cache_config: &crate::config::Cache, cache_articles: bool) {
+        let capacity = cache_config.max_capacity.as_u64();
+        if capacity > 0 {
+            if cache_articles {
+                info!(
+                    "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
+                    cache_config.max_capacity,
+                    cache_config.ttl.as_secs()
+                );
+            } else {
+                info!(
+                    "Article cache enabled: max_capacity={}, ttl={}s (availability-only, bodies not cached)",
+                    cache_config.max_capacity,
+                    cache_config.ttl.as_secs()
+                );
+            }
+        } else {
+            info!("Backend availability tracking enabled (cache disabled, capacity=0)");
+        }
+    }
+
+    /// Build the `NntpProxy` instance
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No servers are configured
+    /// - Connection providers cannot be created
+    /// - Buffer size is zero
+    /// - Hybrid cache initialization fails (if disk cache configured)
+    pub async fn build(self) -> Result<NntpProxy> {
+        let (ctx, cache_config) = self.build_infrastructure()?;
+
         // Create article cache (always enabled for availability tracking)
-        // If max_capacity=0, only tracks which backends have articles (no content caching)
-        let (cache, cache_articles) = if let Some(cache_config) = &self.config.cache {
+        let (cache, cache_articles) = if let Some(cache_config) = &cache_config {
             let capacity = cache_config.max_capacity.as_u64();
             let cache_articles = cache_config.cache_articles;
 
             // Check if disk cache is configured
             let cache = if let Some(disk_config) = &cache_config.disk {
-                // Create hybrid cache with disk tier
                 let hybrid_config = HybridCacheConfig {
                     memory_capacity: capacity,
                     disk_path: disk_config.path.clone(),
@@ -230,7 +275,6 @@ impl NntpProxyBuilder {
                         .context("Failed to initialize hybrid disk cache")?,
                 )
             } else {
-                // Memory-only cache
                 Arc::new(UnifiedCache::memory(
                     capacity,
                     cache_config.ttl,
@@ -238,23 +282,7 @@ impl NntpProxyBuilder {
                 ))
             };
 
-            if capacity > 0 {
-                if cache_articles {
-                    info!(
-                        "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
-                        cache_config.max_capacity,
-                        cache_config.ttl.as_secs()
-                    );
-                } else {
-                    info!(
-                        "Article cache enabled: max_capacity={}, ttl={}s (availability-only, bodies not cached)",
-                        cache_config.max_capacity,
-                        cache_config.ttl.as_secs()
-                    );
-                }
-            } else {
-                info!("Backend availability tracking enabled (cache disabled, capacity=0)");
-            }
+            Self::log_cache_config(cache_config, cache_articles);
             (cache, cache_articles)
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
@@ -264,32 +292,7 @@ impl NntpProxyBuilder {
             )
         };
 
-        // Extract adaptive_precheck from cache config (default: false)
-        let adaptive_precheck = self
-            .config
-            .cache
-            .as_ref()
-            .map(|c| c.adaptive_precheck)
-            .unwrap_or(false);
-
-        let start_instant = Instant::now();
-
-        Ok(NntpProxy {
-            servers,
-            router,
-            connection_providers,
-            buffer_pool,
-            routing_mode: self.routing_mode,
-            auth_handler,
-            metrics,
-            connection_stats: ConnectionStatsAggregator::new(),
-            cache,
-            cache_articles,
-            adaptive_precheck,
-            last_activity_nanos: Arc::new(AtomicU64::new(0)),
-            active_clients: Arc::new(AtomicUsize::new(0)),
-            start_instant,
-        })
+        Ok(ctx.into_proxy(cache, cache_articles))
     }
 
     /// Build the `NntpProxy` instance (synchronous version)
@@ -305,117 +308,26 @@ impl NntpProxyBuilder {
     /// - Connection providers cannot be created
     /// - Buffer size is zero
     pub fn build_sync(self) -> Result<NntpProxy> {
-        if self.config.servers.is_empty() {
-            anyhow::bail!("No servers configured in configuration");
-        }
-
-        // Use provided values or defaults
-        let buffer_size = self.buffer_size.unwrap_or(POOL);
-        let buffer_count = self.buffer_count.unwrap_or(POOL_COUNT);
-
-        // Create deadpool connection providers for each server
-        let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = self
-            .config
-            .servers
-            .iter()
-            .map(|server| {
-                info!(
-                    "Configuring deadpool connection provider for '{}'",
-                    server.name
-                );
-                DeadpoolConnectionProvider::from_server_config(server)
-            })
-            .collect();
-
-        let connection_providers = connection_providers?;
-
-        let buffer_pool = BufferPool::new(
-            BufferSize::try_new(buffer_size)
-                .map_err(|_| anyhow::anyhow!("Buffer size must be non-zero"))?,
-            buffer_count,
-        );
-
-        // Create metrics collector (before moving servers)
-        let metrics = MetricsCollector::new(self.config.servers.len());
-
-        let servers = Arc::new(self.config.servers);
-
-        // Create backend selector and add all backends
-        let router = Arc::new({
-            use types::BackendId;
-            let backend_strategy = self.config.proxy.backend_selection;
-            connection_providers.iter().enumerate().fold(
-                router::BackendSelector::with_strategy(backend_strategy),
-                |mut r, (idx, provider)| {
-                    let backend_id = BackendId::from_index(idx);
-                    r.add_backend(
-                        backend_id,
-                        servers[idx].name.clone(),
-                        provider.clone(),
-                        servers[idx].tier,
-                    );
-                    r
-                },
-            )
-        });
-
-        // Create auth handler from config
-        let auth_handler = {
-            let all_users: Vec<(String, String)> = self
-                .config
-                .client_auth
-                .all_users()
-                .into_iter()
-                .map(|(u, p)| (u.to_string(), p.to_string()))
-                .collect();
-
-            if all_users.is_empty() {
-                Arc::new(AuthHandler::default())
-            } else {
-                Arc::new(AuthHandler::with_users(all_users).with_context(|| {
-                    "Invalid authentication configuration. \
-                             If you set username/password in config, they cannot be empty. \
-                             Remove them entirely to disable authentication."
-                })?)
-            }
-        };
+        let (ctx, cache_config) = self.build_infrastructure()?;
 
         // Create article cache (memory-only in sync version)
-        let (cache, cache_articles) = if let Some(cache_config) = &self.config.cache {
+        let (cache, cache_articles) = if let Some(cache_config) = &cache_config {
             let capacity = cache_config.max_capacity.as_u64();
             let cache_articles = cache_config.cache_articles;
 
-            // Warn if disk cache is configured but we're using sync build
             if cache_config.disk.is_some() {
                 warn!(
                     "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
                 );
             }
 
-            // Memory-only cache
             let cache = Arc::new(UnifiedCache::memory(
                 capacity,
                 cache_config.ttl,
                 cache_articles,
             ));
 
-            if capacity > 0 {
-                if cache_articles {
-                    info!(
-                        "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
-                        cache_config.max_capacity,
-                        cache_config.ttl.as_secs()
-                    );
-                } else {
-                    info!(
-                        "Article cache enabled: max_capacity={}, ttl={}s (availability-only, bodies not cached)",
-                        cache_config.max_capacity,
-                        cache_config.ttl.as_secs()
-                    );
-                }
-            } else {
-                info!("Backend availability tracking enabled (cache disabled, capacity=0)");
-            }
+            Self::log_cache_config(cache_config, cache_articles);
             (cache, cache_articles)
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
@@ -425,32 +337,44 @@ impl NntpProxyBuilder {
             )
         };
 
-        // Extract adaptive_precheck from cache config (default: false)
-        let adaptive_precheck = self
-            .config
-            .cache
-            .as_ref()
-            .map(|c| c.adaptive_precheck)
-            .unwrap_or(false);
+        Ok(ctx.into_proxy(cache, cache_articles))
+    }
+}
 
-        let start_instant = Instant::now();
+/// Intermediate state from shared builder initialization
+///
+/// Contains everything needed to construct an `NntpProxy` except the cache,
+/// which differs between `build()` (supports disk) and `build_sync()` (memory-only).
+struct BuildContext {
+    connection_providers: Vec<DeadpoolConnectionProvider>,
+    buffer_pool: BufferPool,
+    metrics: MetricsCollector,
+    servers: Arc<Vec<Server>>,
+    router: Arc<router::BackendSelector>,
+    auth_handler: Arc<AuthHandler>,
+    adaptive_precheck: bool,
+    routing_mode: RoutingMode,
+}
 
-        Ok(NntpProxy {
-            servers,
-            router,
-            connection_providers,
-            buffer_pool,
+impl BuildContext {
+    /// Construct the final `NntpProxy` from this context and a cache
+    fn into_proxy(self, cache: Arc<UnifiedCache>, cache_articles: bool) -> NntpProxy {
+        NntpProxy {
+            servers: self.servers,
+            router: self.router,
+            connection_providers: self.connection_providers,
+            buffer_pool: self.buffer_pool,
             routing_mode: self.routing_mode,
-            auth_handler,
-            metrics,
+            auth_handler: self.auth_handler,
+            metrics: self.metrics,
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
             cache_articles,
-            adaptive_precheck,
+            adaptive_precheck: self.adaptive_precheck,
             last_activity_nanos: Arc::new(AtomicU64::new(0)),
             active_clients: Arc::new(AtomicUsize::new(0)),
-            start_instant,
-        })
+            start_instant: Instant::now(),
+        }
     }
 }
 
