@@ -146,17 +146,12 @@ impl Builder {
             self.password,
             self.tls_config,
         )?;
-        let pool = Pool::builder(manager)
-            .max_size(self.max_size)
-            .build()
-            .expect("Failed to create connection pool");
 
-        Ok(DeadpoolConnectionProvider {
-            pool,
+        Ok(DeadpoolConnectionProvider::from_manager(
+            manager,
             name,
-            shutdown_tx: None,
-            health_check_metrics: Arc::new(HealthCheckMetrics::new()),
-        })
+            self.max_size,
+        ))
     }
 }
 
@@ -286,19 +281,12 @@ impl DeadpoolConnectionProvider {
         password: Option<String>,
     ) -> Self {
         // Plain TCP (no TLS) cannot fail during TcpManager construction
-        let manager = TcpManager::new(host, port, name.clone(), username, password, None)
-            .expect("Plain TCP TcpManager creation cannot fail");
-        let pool = Pool::builder(manager)
-            .max_size(max_size)
-            .build()
-            .expect("Failed to create connection pool");
-
-        Self {
-            pool,
+        Self::from_manager(
+            TcpManager::new(host, port, name.clone(), username, password, None)
+                .expect("Plain TCP TcpManager creation cannot fail"),
             name,
-            shutdown_tx: None,
-            health_check_metrics: Arc::new(HealthCheckMetrics::new()),
-        }
+            max_size,
+        )
     }
 
     /// Create a new connection provider with TLS support
@@ -319,17 +307,22 @@ impl DeadpoolConnectionProvider {
             password,
             Some(tls_config),
         )?;
+        Ok(Self::from_manager(manager, name, max_size))
+    }
+
+    /// Construct a provider from a pre-built TcpManager
+    fn from_manager(manager: TcpManager, name: String, max_size: usize) -> Self {
         let pool = Pool::builder(manager)
             .max_size(max_size)
             .build()
             .expect("Failed to create connection pool");
 
-        Ok(Self {
+        Self {
             pool,
             name,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
-        })
+        }
     }
 
     /// Create a connection provider from a server configuration
