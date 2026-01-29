@@ -106,6 +106,38 @@ impl SessionLoopState {
         self.backend_to_client = self.backend_to_client.add_u64(bytes);
     }
 
+    /// Flush accumulated byte deltas to the metrics collector.
+    ///
+    /// Reports the difference since the last flush and updates the last-reported watermarks.
+    /// Used by both the periodic in-loop flush and the final flush on disconnect.
+    pub fn flush_byte_deltas(
+        &mut self,
+        metrics: &crate::metrics::MetricsCollector,
+        backend_id: crate::types::BackendId,
+        username: Option<&str>,
+    ) {
+        let delta_c2b = self
+            .client_to_backend
+            .as_u64()
+            .saturating_sub(self.last_reported_c2b.as_u64());
+        let delta_b2c = self
+            .backend_to_client
+            .as_u64()
+            .saturating_sub(self.last_reported_b2c.as_u64());
+
+        if delta_c2b > 0 {
+            metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b);
+            metrics.user_bytes_sent(username, delta_c2b);
+        }
+        if delta_b2c > 0 {
+            metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c);
+            metrics.user_bytes_received(username, delta_b2c);
+        }
+
+        self.last_reported_c2b = self.client_to_backend;
+        self.last_reported_b2c = self.backend_to_client;
+    }
+
     /// Convert to final transfer metrics
     #[must_use]
     pub fn into_metrics(self) -> TransferMetrics {

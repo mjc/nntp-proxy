@@ -82,31 +82,7 @@ impl ClientSession {
 
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
-                // Report byte deltas since last flush
-                let delta_c2b = state
-                    .client_to_backend
-                    .as_u64()
-                    .saturating_sub(state.last_reported_c2b.as_u64());
-                let delta_b2c = state
-                    .backend_to_client
-                    .as_u64()
-                    .saturating_sub(state.last_reported_b2c.as_u64());
-
-                if delta_c2b > 0 {
-                    self.metrics
-                        .record_client_to_backend_bytes_for(backend_id, delta_c2b);
-                    self.metrics
-                        .user_bytes_sent(self.username().as_deref(), delta_c2b);
-                }
-                if delta_b2c > 0 {
-                    self.metrics
-                        .record_backend_to_client_bytes_for(backend_id, delta_b2c);
-                    self.metrics
-                        .user_bytes_received(self.username().as_deref(), delta_b2c);
-                }
-
-                state.last_reported_c2b = state.client_to_backend;
-                state.last_reported_b2c = state.backend_to_client;
+                state.flush_byte_deltas(&self.metrics, backend_id, self.username().as_deref());
             }
 
             tokio::select! {
@@ -163,31 +139,249 @@ impl ClientSession {
         }
 
         // Final metrics - report any remaining byte deltas
-        let delta_c2b = state
-            .client_to_backend
-            .as_u64()
-            .saturating_sub(state.last_reported_c2b.as_u64());
-        let delta_b2c = state
-            .backend_to_client
-            .as_u64()
-            .saturating_sub(state.last_reported_b2c.as_u64());
-
-        if delta_c2b > 0 {
-            self.metrics
-                .record_client_to_backend_bytes_for(backend_id, delta_c2b);
-            self.metrics
-                .user_bytes_sent(self.username().as_deref(), delta_c2b);
-        }
-        if delta_b2c > 0 {
-            self.metrics
-                .record_backend_to_client_bytes_for(backend_id, delta_b2c);
-            self.metrics
-                .user_bytes_received(self.username().as_deref(), delta_b2c);
-        }
+        state.flush_byte_deltas(&self.metrics, backend_id, self.username().as_deref());
 
         self.metrics
             .user_connection_closed(self.username().as_deref());
 
         Ok(state.into_metrics())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    use crate::auth::AuthHandler;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::BufferPool;
+    use crate::session::ClientSession;
+    use crate::session::state::SessionLoopState;
+    use crate::types::{BackendId, BufferSize, ClientAddress};
+
+    fn test_session() -> ClientSession {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let metrics = MetricsCollector::new(1);
+        ClientSession::builder(
+            ClientAddress::from(addr),
+            buffer_pool,
+            auth_handler,
+            metrics,
+        )
+        .build()
+    }
+
+    #[tokio::test]
+    async fn test_client_disconnect_returns_metrics() {
+        let session = test_session();
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false); // auth disabled → skip_auth_check = true
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+
+        // Backend echo: read and respond
+        let echo = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = backend_end.write_all(b"200 ok\r\n").await;
+                    }
+                }
+            }
+        });
+
+        // Client sends a command then closes
+        client_end.write_all(b"LIST\r\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(client_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.run_stateful_proxy_loop(
+                client_reader,
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                state,
+                backend_id,
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        echo.abort();
+
+        assert!(
+            result.client_to_backend.as_u64() > 0,
+            "Should have forwarded client bytes: {}",
+            result.client_to_backend.as_u64()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backend_disconnect_returns_metrics() {
+        let session = test_session();
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false);
+
+        let (client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+
+        // Drop backend immediately → EOF
+        drop(backend_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.run_stateful_proxy_loop(
+                client_reader,
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                state,
+                backend_id,
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        // No data was exchanged
+        assert_eq!(result.client_to_backend.as_u64(), 0);
+        assert_eq!(result.backend_to_client.as_u64(), 0);
+
+        drop(client_end);
+    }
+
+    #[tokio::test]
+    async fn test_auth_disabled_skips_auth_check() {
+        let session = test_session(); // auth disabled by default (None, None)
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false); // auth disabled
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+
+        // Backend: just read and discard
+        let echo = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {} // Just consume, don't respond
+                }
+            }
+        });
+
+        // Client sends AUTHINFO command (should be forwarded directly since auth is disabled)
+        client_end
+            .write_all(b"AUTHINFO USER test\r\n")
+            .await
+            .unwrap();
+        drop(client_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.run_stateful_proxy_loop(
+                client_reader,
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                state,
+                backend_id,
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        echo.abort();
+
+        // When auth is disabled, the AUTHINFO command is forwarded directly to backend
+        assert_eq!(
+            result.client_to_backend.as_u64(),
+            b"AUTHINFO USER test\r\n".len() as u64,
+            "AUTHINFO should be forwarded when auth is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_byte_accumulation() {
+        let session = test_session();
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false).with_initial_bytes(100, 200);
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+
+        let echo = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = backend_end.write_all(b"200 ok\r\n").await;
+                    }
+                }
+            }
+        });
+
+        client_end.write_all(b"LIST\r\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(client_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.run_stateful_proxy_loop(
+                client_reader,
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                state,
+                backend_id,
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        echo.abort();
+
+        // Initial bytes + forwarded bytes
+        assert!(
+            result.client_to_backend.as_u64() >= 100 + b"LIST\r\n".len() as u64,
+            "c2b should include initial + forwarded: {}",
+            result.client_to_backend.as_u64()
+        );
+        assert!(
+            result.backend_to_client.as_u64() >= 200,
+            "b2c should include at least initial bytes: {}",
+            result.backend_to_client.as_u64()
+        );
     }
 }
