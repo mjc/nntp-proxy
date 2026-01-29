@@ -179,6 +179,7 @@ impl UnifiedCache {
     }
 
     /// Get cache capacity
+    #[must_use]
     pub fn capacity(&self) -> u64 {
         match self {
             Self::Memory(cache) => cache.capacity(),
@@ -187,6 +188,7 @@ impl UnifiedCache {
     }
 
     /// Get number of cached entries
+    #[must_use]
     pub fn entry_count(&self) -> u64 {
         match self {
             Self::Memory(cache) => cache.entry_count(),
@@ -195,6 +197,7 @@ impl UnifiedCache {
     }
 
     /// Get weighted size in bytes
+    #[must_use]
     pub fn weighted_size(&self) -> u64 {
         match self {
             Self::Memory(cache) => cache.weighted_size(),
@@ -203,6 +206,7 @@ impl UnifiedCache {
     }
 
     /// Get cache hit rate
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
         match self {
             Self::Memory(cache) => cache.hit_rate(),
@@ -211,6 +215,7 @@ impl UnifiedCache {
     }
 
     /// Check if this is a hybrid cache (has disk tier)
+    #[must_use]
     pub fn is_hybrid(&self) -> bool {
         matches!(self, Self::Hybrid(_))
     }

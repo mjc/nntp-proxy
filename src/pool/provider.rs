@@ -411,11 +411,17 @@ impl DeadpoolConnectionProvider {
     }
 
     /// Get a connection from the pool (automatically returned when dropped)
-    pub async fn get_pooled_connection(&self) -> Result<managed::Object<TcpManager>> {
-        self.pool
-            .get()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get connection from {}: {}", self.name, e))
+    pub async fn get_pooled_connection(
+        &self,
+    ) -> Result<managed::Object<TcpManager>, crate::connection_error::ConnectionError> {
+        use crate::connection_error::ConnectionError;
+        self.pool.get().await.map_err(|e| match e {
+            deadpool::managed::PoolError::Backend(conn_err) => conn_err,
+            _other => ConnectionError::PoolExhausted {
+                backend: self.name.clone(),
+                max_size: self.pool.status().max_size,
+            },
+        })
     }
 
     /// Clear all idle connections from the pool

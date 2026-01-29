@@ -3,11 +3,11 @@
 //! This module provides the `TcpManager` struct which handles the low-level
 //! creation of optimized TCP/TLS connections to NNTP servers.
 
-use anyhow::Result;
 use deadpool::managed;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
+use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::protocol::{authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
@@ -56,10 +56,15 @@ impl TcpManager {
         username: Option<String>,
         password: Option<String>,
         tls_config: TlsConfig,
-    ) -> Result<Self> {
+    ) -> Result<Self, ConnectionError> {
         // Pre-initialize TLS manager if TLS is enabled
         let tls_manager = if tls_config.use_tls {
-            Some(Arc::new(TlsManager::new(tls_config.clone())?))
+            Some(Arc::new(TlsManager::new(tls_config.clone()).map_err(
+                |e| ConnectionError::TlsHandshake {
+                    backend: name.clone(),
+                    source: e.into(),
+                },
+            )?))
         } else {
             None
         };
@@ -76,13 +81,15 @@ impl TcpManager {
     }
 
     /// Create an optimized connection (TCP or TLS)
-    pub(crate) async fn create_optimized_stream(&self) -> Result<ConnectionStream, anyhow::Error> {
+    pub(crate) async fn create_optimized_stream(
+        &self,
+    ) -> Result<ConnectionStream, ConnectionError> {
         use socket2::{Domain, Protocol, Socket, Type};
 
         // Resolve hostname
         let addr = format!("{}:{}", self.host, self.port);
         let Some(socket_addr) = tokio::net::lookup_host(&addr).await?.next() else {
-            anyhow::bail!("No addresses found for {}", addr);
+            return Err(ConnectionError::DnsNoAddresses { address: addr });
         };
 
         // Create and configure socket
@@ -118,12 +125,19 @@ impl TcpManager {
         if self.tls_config.use_tls {
             // Use cached TLS manager to avoid re-parsing certificates
             let Some(tls_manager) = self.tls_manager.as_ref() else {
-                anyhow::bail!("TLS enabled but TLS manager not initialized");
+                return Err(ConnectionError::TlsHandshake {
+                    backend: self.name.clone(),
+                    source: "TLS enabled but TLS manager not initialized".into(),
+                });
             };
 
             let tls_stream = tls_manager
                 .handshake(tcp_stream, &self.host, &self.name)
-                .await?;
+                .await
+                .map_err(|e| ConnectionError::TlsHandshake {
+                    backend: self.name.clone(),
+                    source: e.into(),
+                })?;
             Ok(ConnectionStream::Tls(Box::new(tls_stream)))
         } else {
             Ok(ConnectionStream::Plain(tcp_stream))
@@ -137,9 +151,9 @@ impl TcpManager {
 
 impl managed::Manager for TcpManager {
     type Type = ConnectionStream;
-    type Error = anyhow::Error;
+    type Error = ConnectionError;
 
-    async fn create(&self) -> Result<ConnectionStream, anyhow::Error> {
+    async fn create(&self) -> Result<ConnectionStream, ConnectionError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut stream = self.create_optimized_stream().await?;
@@ -154,7 +168,10 @@ impl managed::Manager for TcpManager {
             crate::protocol::NntpResponse::parse(greeting),
             crate::protocol::NntpResponse::Greeting(_)
         ) {
-            return Err(anyhow::anyhow!("Invalid greeting: {}", greeting_str.trim()));
+            return Err(ConnectionError::InvalidGreeting {
+                backend: self.name.clone(),
+                greeting: greeting_str.trim().to_string(),
+            });
         }
 
         // Authenticate if needed
@@ -170,7 +187,9 @@ impl managed::Manager for TcpManager {
             ) {
                 // Password required
                 let Some(password) = self.password.as_ref() else {
-                    anyhow::bail!("Password required but not provided");
+                    return Err(ConnectionError::PasswordRequired {
+                        backend: self.name.clone(),
+                    });
                 };
 
                 stream.write_all(authinfo_pass(password).as_bytes()).await?;
@@ -190,11 +209,10 @@ impl managed::Manager for TcpManager {
                         response_str.trim(),
                         username
                     );
-                    return Err(anyhow::anyhow!(
-                        "Auth failed for {} - Server said: {}",
-                        self.name,
-                        response_str.trim()
-                    ));
+                    return Err(ConnectionError::AuthenticationFailed {
+                        backend: self.name.clone(),
+                        response: response_str.trim().to_string(),
+                    });
                 } else {
                     tracing::debug!(
                         "Successfully authenticated to {} ({}:{}) as {}",
@@ -208,10 +226,10 @@ impl managed::Manager for TcpManager {
                 crate::protocol::NntpResponse::parse(response),
                 crate::protocol::NntpResponse::AuthSuccess
             ) {
-                return Err(anyhow::anyhow!(
-                    "Unexpected auth response: {}",
-                    response_str.trim()
-                ));
+                return Err(ConnectionError::UnexpectedAuthResponse {
+                    backend: self.name.clone(),
+                    response: response_str.trim().to_string(),
+                });
             }
         }
 
@@ -222,7 +240,7 @@ impl managed::Manager for TcpManager {
         &self,
         conn: &mut ConnectionStream,
         _metrics: &managed::Metrics,
-    ) -> managed::RecycleResult<anyhow::Error> {
+    ) -> managed::RecycleResult<ConnectionError> {
         use super::health_check::check_tcp_alive;
         // Only do fast TCP-level check on recycle
         // Full health checks happen periodically via the periodic health checks

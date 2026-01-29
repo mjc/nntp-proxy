@@ -53,7 +53,7 @@ pub enum HealthCheckError {
     ConnectionClosedDuringCheck,
 }
 
-impl From<HealthCheckError> for managed::RecycleError<anyhow::Error> {
+impl From<HealthCheckError> for managed::RecycleError<crate::connection_error::ConnectionError> {
     fn from(err: HealthCheckError) -> Self {
         managed::RecycleError::Message(err.to_string().into())
     }
@@ -123,7 +123,9 @@ impl HealthCheckMetrics {
 /// - `Err(WouldBlock)` means no data available - this is **expected** for an idle,
 ///   healthy connection, as there should be no data to read between commands
 /// - Other errors indicate TCP-level problems
-pub fn check_tcp_alive(conn: &mut ConnectionStream) -> managed::RecycleResult<anyhow::Error> {
+pub fn check_tcp_alive(
+    conn: &mut ConnectionStream,
+) -> managed::RecycleResult<crate::connection_error::ConnectionError> {
     let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
 
     match conn {

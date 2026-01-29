@@ -1,53 +1,32 @@
 //! Article parsing errors
 
-use std::fmt;
-
 /// Errors that can occur when parsing article responses
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
-    /// Invalid or unexpected status code
+    #[error("Invalid status code: {0}")]
     InvalidStatusCode(u16),
 
-    /// Missing blank line separator between headers and body
+    #[error("Missing blank line separator between headers and body")]
     MissingSeparator,
 
-    /// Missing multiline terminator (.\r\n)
+    #[error("Missing multiline terminator (CRLF.CRLF)")]
     MissingTerminator,
 
-    /// Invalid header format
+    #[error("Invalid header: {0}")]
     InvalidHeader(String),
 
-    /// HEAD response contains body (invalid)
+    #[error("HEAD response should not contain body")]
     UnexpectedBody,
 
-    /// Invalid yenc structure
+    #[error("Invalid yenc: {0}")]
     InvalidYenc(String),
 
-    /// Buffer too short
+    #[error("Buffer too short to contain valid response")]
     BufferTooShort,
 
-    /// Invalid message-ID format
+    #[error("Invalid message-ID: {0}")]
     InvalidMessageId(String),
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidStatusCode(code) => write!(f, "Invalid status code: {}", code),
-            Self::MissingSeparator => {
-                write!(f, "Missing blank line separator between headers and body")
-            }
-            Self::MissingTerminator => write!(f, "Missing multiline terminator (CRLF.CRLF)"),
-            Self::InvalidHeader(msg) => write!(f, "Invalid header: {}", msg),
-            Self::UnexpectedBody => write!(f, "HEAD response should not contain body"),
-            Self::InvalidYenc(msg) => write!(f, "Invalid yenc: {}", msg),
-            Self::BufferTooShort => write!(f, "Buffer too short to contain valid response"),
-            Self::InvalidMessageId(msg) => write!(f, "Invalid message-ID: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 // Allow conversion from ValidationError to ParseError
 impl From<crate::types::validated::ValidationError> for ParseError {

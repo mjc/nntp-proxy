@@ -7,24 +7,25 @@
 use super::{ArticleAvailability, HybridArticleEntry, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Mock hybrid cache for testing
 #[derive(Clone)]
 pub struct MockHybridCache {
     storage: Arc<Mutex<HashMap<String, HybridArticleEntry>>>,
-    hits: Arc<Mutex<u64>>,
-    misses: Arc<Mutex<u64>>,
-    disk_hits: Arc<Mutex<u64>>,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
+    disk_hits: Arc<AtomicU64>,
 }
 
 impl MockHybridCache {
     pub fn new(_memory_capacity: u64) -> Self {
         Self {
             storage: Arc::new(Mutex::new(HashMap::new())),
-            hits: Arc::new(Mutex::new(0)),
-            misses: Arc::new(Mutex::new(0)),
-            disk_hits: Arc::new(Mutex::new(0)),
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
+            disk_hits: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -33,10 +34,10 @@ impl MockHybridCache {
         let storage = self.storage.lock().unwrap();
 
         if let Some(entry) = storage.get(&key) {
-            *self.hits.lock().unwrap() += 1;
+            self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.clone())
         } else {
-            *self.misses.lock().unwrap() += 1;
+            self.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
@@ -139,9 +140,9 @@ impl MockHybridCache {
 
     pub fn stats(&self) -> HybridCacheStats {
         HybridCacheStats {
-            hits: *self.hits.lock().unwrap(),
-            misses: *self.misses.lock().unwrap(),
-            disk_hits: *self.disk_hits.lock().unwrap(),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            disk_hits: self.disk_hits.load(Ordering::Relaxed),
             memory_capacity: 0,
             disk_capacity: 0,
             disk_write_bytes: 0,
