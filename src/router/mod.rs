@@ -344,6 +344,48 @@ impl BackendInfo {
     }
 }
 
+/// RAII guard that decrements the backend's pending command count on drop.
+///
+/// Prevents TUI in-flight count drift when error paths forget to call `complete_command()`.
+/// On success paths, call [`CommandGuard::complete`] to explicitly finalize.
+/// On error/early-return paths, `Drop` handles cleanup automatically.
+pub struct CommandGuard {
+    router: Arc<BackendSelector>,
+    backend_id: BackendId,
+    completed: bool,
+}
+
+impl CommandGuard {
+    /// Create a new guard that will call `complete_command` on drop.
+    pub fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
+        Self {
+            router,
+            backend_id,
+            completed: false,
+        }
+    }
+
+    /// Explicitly complete (consumes the obligation, Drop becomes no-op).
+    pub fn complete(mut self) {
+        self.router.complete_command(self.backend_id);
+        self.completed = true;
+    }
+
+    /// Get the backend ID this guard is protecting.
+    #[must_use]
+    pub fn backend_id(&self) -> BackendId {
+        self.backend_id
+    }
+}
+
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.router.complete_command(self.backend_id);
+        }
+    }
+}
+
 /// Selects backend servers using weighted round-robin with load tracking
 ///
 /// # Thread Safety
@@ -760,5 +802,81 @@ impl BackendSelector {
             let total = self.total_weight();
             TrafficShare::from_weight(b.provider.max_size(), total)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_router_with_backend() -> (Arc<BackendSelector>, BackendId) {
+        let mut selector = BackendSelector::new();
+        let backend_id = BackendId::from_index(0);
+        let provider = crate::pool::DeadpoolConnectionProvider::new(
+            "localhost".to_string(),
+            119,
+            "test".to_string(),
+            10,
+            None,
+            None,
+        );
+        selector.add_backend(
+            backend_id,
+            ServerName::try_new("test-server".to_string()).unwrap(),
+            provider,
+            0,
+        );
+        (Arc::new(selector), backend_id)
+    }
+
+    #[test]
+    fn command_guard_decrements_on_drop() {
+        let (router, backend_id) = make_router_with_backend();
+
+        // Simulate route_command incrementing the pending count
+        router.mark_backend_pending(backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
+
+        // Guard should decrement on drop
+        {
+            let _guard = CommandGuard::new(router.clone(), backend_id);
+        }
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
+    }
+
+    #[test]
+    fn command_guard_explicit_complete() {
+        let (router, backend_id) = make_router_with_backend();
+
+        router.mark_backend_pending(backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
+
+        let guard = CommandGuard::new(router.clone(), backend_id);
+        guard.complete();
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
+    }
+
+    #[test]
+    fn command_guard_no_double_decrement() {
+        let (router, backend_id) = make_router_with_backend();
+
+        // Start with pending count of 1
+        router.mark_backend_pending(backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
+
+        // Explicit complete + drop should only decrement once
+        let guard = CommandGuard::new(router.clone(), backend_id);
+        guard.complete();
+        // After complete(), count should be 0; drop should be a no-op
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
+        // If double-decrement happened, we'd see wrapping (very large number)
+        // Since we're at 0 already and drop is a no-op, this confirms correctness
+    }
+
+    #[test]
+    fn command_guard_backend_id_accessor() {
+        let (router, backend_id) = make_router_with_backend();
+        let guard = CommandGuard::new(router, backend_id);
+        assert_eq!(guard.backend_id(), backend_id);
     }
 }
