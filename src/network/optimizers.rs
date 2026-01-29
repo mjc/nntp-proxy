@@ -47,6 +47,10 @@ fn apply_core_optimizations(
         .set_linger(Some(LINGER_TIMEOUT))
         .context("Failed to set SO_LINGER timeout")?;
 
+    sock_ref
+        .set_tcp_nodelay(true)
+        .context("Failed to set TCP_NODELAY")?;
+
     Ok(())
 }
 
@@ -123,7 +127,7 @@ impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
         apply_linux_optimizations(&sock_ref, "TCP stream");
 
         debug!(
-            "Applied TCP optimizations: recv_buffer={}, send_buffer={}, linger={}s{}",
+            "Applied TCP optimizations: recv_buffer={}, send_buffer={}, linger={}s, nodelay=true{}",
             self.recv_buffer_size,
             self.send_buffer_size,
             LINGER_TIMEOUT.as_secs(),
@@ -184,7 +188,7 @@ impl<'a> NetworkOptimizer for TlsOptimizer<'a> {
         apply_linux_optimizations(&sock_ref, "TLS stream");
 
         debug!(
-            "Applied TLS optimizations to underlying TCP stream: recv_buffer={}, send_buffer={}, linger={}s{}",
+            "Applied TLS optimizations to underlying TCP stream: recv_buffer={}, send_buffer={}, linger={}s, nodelay=true{}",
             self.recv_buffer_size,
             self.send_buffer_size,
             LINGER_TIMEOUT.as_secs(),
