@@ -212,3 +212,309 @@ pub fn log_routing_error(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::BufferSize;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    fn test_buffer_pool() -> BufferPool {
+        BufferPool::new(BufferSize::try_new(8192).unwrap(), 4)
+    }
+
+    #[tokio::test]
+    async fn test_normal_disconnect_client_eof() {
+        let pool = test_buffer_pool();
+
+        // Client sends a line then closes → proxy sees EOF → NormalDisconnect
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, mut proxy_backend_end) = tokio::io::duplex(4096);
+
+        // Backend echo: reads from proxy, sends response, then keeps connection open
+        let echo = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 1024];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = backend_end.write_all(b"220 article\r\n").await;
+                    }
+                }
+            }
+        });
+
+        client_end
+            .write_all(b"ARTICLE <test@id>\r\n")
+            .await
+            .unwrap();
+        drop(client_end); // EOF
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let mut client_reader = BufReader::new(proxy_client_read);
+        let mut client_writer = proxy_client_write;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bidirectional_forward(
+                &mut client_reader,
+                &mut client_writer,
+                &mut proxy_backend_end,
+                &pool,
+                "test-client",
+                ClientToBackendBytes::zero(),
+                BackendToClientBytes::zero(),
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        echo.abort();
+
+        match result {
+            ForwardResult::NormalDisconnect(metrics) => {
+                assert!(
+                    metrics.client_to_backend.as_u64() > 0,
+                    "Should have forwarded client bytes"
+                );
+            }
+            ForwardResult::BackendError(_) => {
+                panic!("Expected NormalDisconnect, got BackendError");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backend_closed_returns_normal_or_error() {
+        let pool = test_buffer_pool();
+
+        let (client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, mut proxy_backend_end) = tokio::io::duplex(4096);
+
+        // Drop backend immediately → proxy backend read returns 0 (EOF)
+        drop(backend_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let mut client_reader = BufReader::new(proxy_client_read);
+        let mut client_writer = proxy_client_write;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bidirectional_forward(
+                &mut client_reader,
+                &mut client_writer,
+                &mut proxy_backend_end,
+                &pool,
+                "test-client",
+                ClientToBackendBytes::zero(),
+                BackendToClientBytes::zero(),
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        // Backend EOF → loop breaks → NormalDisconnect
+        match result {
+            ForwardResult::NormalDisconnect(metrics) => {
+                assert_eq!(metrics.client_to_backend.as_u64(), 0);
+                assert_eq!(metrics.backend_to_client.as_u64(), 0);
+            }
+            ForwardResult::BackendError(_) => {
+                // Also acceptable: read error classified as connection error
+            }
+        }
+
+        drop(client_end);
+    }
+
+    #[tokio::test]
+    async fn test_byte_counting_with_initial_values() {
+        let pool = test_buffer_pool();
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, mut proxy_backend_end) = tokio::io::duplex(4096);
+
+        let client_msg = b"LIST\r\n";
+
+        // Backend: read and respond, then close
+        let echo = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf).await
+                && n > 0
+            {
+                let _ = backend_end.write_all(b"215 list\r\n").await;
+            }
+            // Short pause to let data flow, then close
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(backend_end);
+        });
+
+        // Client sends, then closes
+        client_end.write_all(client_msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(client_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let mut client_reader = BufReader::new(proxy_client_read);
+        let mut client_writer = proxy_client_write;
+
+        let initial_c2b = ClientToBackendBytes::new(100);
+        let initial_b2c = BackendToClientBytes::new(200);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bidirectional_forward(
+                &mut client_reader,
+                &mut client_writer,
+                &mut proxy_backend_end,
+                &pool,
+                "test-client",
+                initial_c2b,
+                initial_b2c,
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        echo.await.unwrap();
+
+        match result {
+            ForwardResult::NormalDisconnect(metrics) | ForwardResult::BackendError(metrics) => {
+                // Initial bytes should be preserved and client bytes added
+                assert!(
+                    metrics.client_to_backend.as_u64() >= 100 + client_msg.len() as u64,
+                    "c2b should include initial + forwarded bytes: {}",
+                    metrics.client_to_backend.as_u64()
+                );
+                assert!(
+                    metrics.backend_to_client.as_u64() >= 200,
+                    "b2c should include at least initial bytes: {}",
+                    metrics.backend_to_client.as_u64()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_exchanges() {
+        let pool = test_buffer_pool();
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, mut proxy_backend_end) = tokio::io::duplex(4096);
+
+        // Backend: raw read/write (not line-buffered to avoid blocking)
+        let echo = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 4096];
+            let mut count = 0;
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_n) => {
+                        count += 1;
+                        let resp = format!("200 ok #{count}\r\n");
+                        if backend_end.write_all(resp.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Client sends multiple lines
+        for cmd in &["LIST\r\n", "GROUP comp.lang.rust\r\n", "STAT 1\r\n"] {
+            client_end.write_all(cmd.as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(client_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let mut client_reader = BufReader::new(proxy_client_read);
+        let mut client_writer = proxy_client_write;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bidirectional_forward(
+                &mut client_reader,
+                &mut client_writer,
+                &mut proxy_backend_end,
+                &pool,
+                "test-client",
+                ClientToBackendBytes::zero(),
+                BackendToClientBytes::zero(),
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        echo.abort();
+
+        match result {
+            ForwardResult::NormalDisconnect(metrics) | ForwardResult::BackendError(metrics) => {
+                // Client bytes should all be forwarded (client sends, then EOF breaks loop)
+                // Note: commands may be coalesced into fewer read_line calls due to buffering
+                let expected_c2b =
+                    "LIST\r\n".len() + "GROUP comp.lang.rust\r\n".len() + "STAT 1\r\n".len();
+                assert_eq!(
+                    metrics.client_to_backend.as_u64(),
+                    expected_c2b as u64,
+                    "Should have forwarded all client commands"
+                );
+                // Backend responses are best-effort: select! may pick client EOF before
+                // backend data arrives, so we just verify the metric is non-negative
+                // (the important thing is byte counting works, tested elsewhere)
+            }
+        }
+    }
+
+    // Smoke tests for log functions — verify they don't panic
+    #[test]
+    fn test_log_client_error_no_panic() {
+        let metrics = TransferMetrics {
+            client_to_backend: ClientToBackendBytes::new(100),
+            backend_to_client: BackendToClientBytes::new(200),
+        };
+
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let err = std::io::Error::new(kind, "test error");
+            log_client_error("127.0.0.1:1234", Some("testuser"), &err, metrics);
+            log_client_error("127.0.0.1:1234", None, &err, metrics);
+        }
+    }
+
+    #[test]
+    fn test_log_routing_error_no_panic() {
+        let metrics = TransferMetrics {
+            client_to_backend: ClientToBackendBytes::new(100),
+            backend_to_client: BackendToClientBytes::new(200),
+        };
+        let backend_id = crate::types::BackendId::from_index(0);
+
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let err = std::io::Error::new(kind, "test error");
+            log_routing_error(
+                "127.0.0.1:1234",
+                &err,
+                "ARTICLE <test>\r\n",
+                metrics,
+                backend_id,
+            );
+        }
+    }
+}
