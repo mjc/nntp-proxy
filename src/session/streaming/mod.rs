@@ -192,25 +192,18 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut total_bytes = 0u64;
-    // Prepare double buffering for pipelined streaming using buffer pool
-    let mut buffer1 = buffer_pool.acquire().await;
-    let mut buffer2 = buffer_pool.acquire().await;
+    let mut buffer = buffer_pool.acquire().await;
 
-    // Copy first chunk into buffer1 and mark it initialized
-    buffer1.copy_from_slice(&first_chunk[..first_n]);
+    // Copy first chunk into buffer
+    buffer.copy_from_slice(&first_chunk[..first_n]);
 
     let mut current_n = first_n;
-    let mut use_buffer1 = true; // Track which buffer is current
 
     // Track tail for spanning terminator detection
     let mut tail = TailBuffer::default();
     // Main streaming loop - processes first chunk and all subsequent chunks uniformly
     loop {
-        let data = if use_buffer1 {
-            &buffer1[..current_n]
-        } else {
-            &buffer2[..current_n]
-        };
+        let data = &buffer[..current_n];
 
         // Detect terminator location: within chunk or spanning boundary
         let status = tail.detect_terminator(data);
@@ -252,19 +245,11 @@ where
         // Update tail for next iteration
         tail.update(&data[..write_len]);
 
-        // Read next chunk into alternate buffer
-        use_buffer1 = !use_buffer1;
-        let next_n = if use_buffer1 {
-            buffer1
-                .read_from(backend_read)
-                .await
-                .context("Failed to read next chunk from backend")?
-        } else {
-            buffer2
-                .read_from(backend_read)
-                .await
-                .context("Failed to read next chunk from backend")?
-        };
+        // Read next chunk into same buffer (previous write completed)
+        let next_n = buffer
+            .read_from(backend_read)
+            .await
+            .context("Failed to read next chunk from backend")?;
 
         if next_n == 0 {
             debug!(
@@ -274,7 +259,6 @@ where
             );
             break; // EOF
         }
-        // Swap to current buffer for next iteration
         current_n = next_n;
     }
 
