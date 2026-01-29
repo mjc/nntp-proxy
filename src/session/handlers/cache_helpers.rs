@@ -3,6 +3,7 @@
 //! Handles serving responses from cache, spawning cache upserts,
 //! and tier-aware cache operations.
 
+use crate::cache::ArticleAvailability;
 use crate::command::classifier::{STAT_CASES, matches_any};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
@@ -12,10 +13,26 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
+/// Result of a cache lookup attempt in `try_serve_from_cache`.
+///
+/// Distinguishes between a full cache hit (response served), a partial hit
+/// (entry existed but wasn't servable — availability info is available),
+/// and a complete miss (no entry in cache at all).
+pub(super) enum CacheLookupResult {
+    /// Response was served directly from cache.
+    Hit(BackendId),
+    /// Entry existed but wasn't servable. Carries the availability info
+    /// so callers can skip a redundant `cache.get()`.
+    PartialHit(ArticleAvailability),
+    /// No entry in cache at all.
+    Miss,
+}
+
 impl ClientSession {
     /// Try to serve from cache
     ///
-    /// Returns Some(backend_id) if served from cache, None if cache miss or availability-only mode
+    /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but
+    /// wasn't servable (carries availability to avoid a redundant lookup), or `Miss`.
     pub(super) async fn try_serve_from_cache(
         &self,
         msg_id: &Option<crate::types::MessageId<'_>>,
@@ -23,9 +40,9 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<Option<crate::types::BackendId>> {
+    ) -> Result<CacheLookupResult> {
         let Some(msg_id_ref) = msg_id.as_ref() else {
-            return Ok(None);
+            return Ok(CacheLookupResult::Miss);
         };
 
         debug!(
@@ -35,15 +52,18 @@ impl ClientSession {
 
         let Some(cached) = self.cache.get(msg_id_ref).await else {
             debug!("Cache MISS for message-ID: {}", msg_id_ref);
-            return Ok(None);
+            return Ok(CacheLookupResult::Miss);
         };
+
+        // Extract availability before any early returns so we can pass it back
+        let availability = cached.to_availability(router.backend_count());
 
         if !cached.has_availability_info() {
             debug!(
                 "Cache entry exists for {} but no availability info (missing=0) - running precheck",
                 msg_id_ref
             );
-            return Ok(None);
+            return Ok(CacheLookupResult::PartialHit(availability));
         }
 
         debug!(
@@ -66,7 +86,7 @@ impl ClientSession {
                     );
                 }
             }
-            return Ok(None);
+            return Ok(CacheLookupResult::PartialHit(availability));
         }
 
         // Check if this is a complete article we can serve
@@ -85,7 +105,7 @@ impl ClientSession {
                 msg_id_ref,
                 cached.buffer().len()
             );
-            return Ok(None);
+            return Ok(CacheLookupResult::PartialHit(availability));
         }
 
         // Serve from cache, avoiding buffer copies for the common path.
@@ -96,7 +116,7 @@ impl ClientSession {
                 "Client {} cached response has no valid status code",
                 self.client_addr,
             );
-            return Ok(None);
+            return Ok(CacheLookupResult::PartialHit(availability));
         };
 
         if !crate::cache::entry_helpers::matches_command_type_verb(status_code, &cmd_verb) {
@@ -104,7 +124,7 @@ impl ClientSession {
                 "Client {} cached response (code={}) can't serve '{}' command",
                 self.client_addr, status_code, cmd_verb
             );
-            return Ok(None);
+            return Ok(CacheLookupResult::PartialHit(availability));
         }
 
         // STAT: synthesize a small response (no buffer copy needed)
@@ -121,7 +141,7 @@ impl ClientSession {
                     len = cached.buffer().len(),
                     "Cached buffer failed validation, discarding"
                 );
-                return Ok(None);
+                return Ok(CacheLookupResult::PartialHit(availability));
             }
             let buf = cached.buffer();
             client_write.write_all(buf).await?;
@@ -132,7 +152,7 @@ impl ClientSession {
         let backend_id = router.route_command(self.client_id, command)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
-        Ok(Some(backend_id))
+        Ok(CacheLookupResult::Hit(backend_id))
     }
 
     /// Spawn async cache upsert task

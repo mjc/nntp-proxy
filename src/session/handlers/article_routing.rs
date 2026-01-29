@@ -5,6 +5,7 @@
 
 use crate::router::BackendSelector;
 use crate::session::handlers::backend_execution::BackendAttemptResult;
+use crate::session::handlers::cache_helpers::CacheLookupResult;
 use crate::session::{ClientSession, common};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -41,8 +42,9 @@ impl ClientSession {
             self.client_addr, msg_id, self.cache_articles
         );
 
-        // Try cache first - may return early if cache hit
-        if let Some(backend_id) = self
+        // Try cache first - may return early if cache hit.
+        // On partial hit, we get availability info to avoid a redundant cache.get() later.
+        let cached_availability = match self
             .try_serve_from_cache(
                 &msg_id,
                 command,
@@ -52,8 +54,10 @@ impl ClientSession {
             )
             .await?
         {
-            return Ok(backend_id);
-        }
+            CacheLookupResult::Hit(backend_id) => return Ok(backend_id),
+            CacheLookupResult::PartialHit(availability) => Some(availability),
+            CacheLookupResult::Miss => None,
+        };
 
         // Adaptive prechecking for STAT/HEAD commands (if enabled and cache missed)
         if self.adaptive_precheck
@@ -78,42 +82,26 @@ impl ClientSession {
             }
         }
 
-        // Execute command with availability-aware backend selection
+        // Execute command with availability-aware backend selection.
+        // Reuse availability from cache lookup to avoid a redundant cache.get().
         debug!(
-            "Client {} calling execute_with_availability_routing for command: {}",
+            "Client {} starting availability routing for command: {}",
             self.client_addr,
             command.trim()
         );
-        self.execute_with_availability_routing(
-            router,
-            command,
-            msg_id.as_ref(),
-            client_write,
-            client_to_backend_bytes,
-            backend_to_client_bytes,
-        )
-        .await
-    }
 
-    /// Execute command with availability-aware backend selection
-    ///
-    /// Uses ArticleAvailability to intelligently select backends, automatically retrying
-    /// on 430 responses across backends that haven't returned 430 for this article yet.
-    pub(super) async fn execute_with_availability_routing(
-        &self,
-        router: Arc<BackendSelector>,
-        command: &str,
-        msg_id: Option<&crate::types::MessageId<'_>>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        client_to_backend_bytes: &mut ClientToBackendBytes,
-        backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<crate::types::BackendId> {
         let mut buffer = self.buffer_pool.acquire().await;
 
-        // Initialize availability tracker from cache
-        let mut availability = self.load_article_availability(msg_id, router.clone()).await;
+        // Use pre-loaded availability if available, otherwise load from cache
+        let mut availability = match cached_availability {
+            Some(avail) => avail,
+            None => {
+                self.load_article_availability(msg_id.as_ref(), router.clone())
+                    .await
+            }
+        };
         debug!(
-            "Client {} starting availability routing, missing_bits={:08b}, backend_count={}",
+            "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
             availability.missing_bits(),
             router.backend_count().get()
@@ -152,7 +140,7 @@ impl ClientSession {
                 .try_backend_for_article(
                     router.clone(),
                     command,
-                    msg_id,
+                    msg_id.as_ref(),
                     client_write,
                     &mut availability,
                     &mut buffer,
@@ -168,7 +156,7 @@ impl ClientSession {
                     // complete_command already called by CommandGuard inside try_backend_for_article
                     // Sync availability to cache before returning (got a success, but we may have
                     // recorded some 430s from other backends along the way)
-                    self.sync_availability_if_needed(msg_id, &availability)
+                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                         .await;
                     return Ok(backend_id);
                 }
@@ -206,7 +194,7 @@ impl ClientSession {
             "Client {} all backends exhausted for {:?}, sending 430",
             self.client_addr, msg_id
         );
-        self.sync_availability_if_needed(msg_id, &availability)
+        self.sync_availability_if_needed(msg_id.as_ref(), &availability)
             .await;
         self.send_430_to_client(client_write, backend_to_client_bytes)
             .await?;
