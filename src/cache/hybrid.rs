@@ -122,10 +122,8 @@ fn check_available_space(path: &Path) -> Option<u64> {
 pub struct HybridArticleEntry {
     /// Validated NNTP status code — only cacheable codes are representable
     status_code: CacheableStatusCode,
-    /// Backend availability bitset - checked bits
-    checked: u8,
-    /// Backend availability bitset - missing bits
-    missing: u8,
+    /// Backend availability tracking (checked/missing bitsets)
+    availability: ArticleAvailability,
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (430 stubs, STAT responses)
     /// and for tier-aware TTL calculation
@@ -146,7 +144,10 @@ impl Code for HybridArticleEntry {
             .write_all(&self.status_code.as_u16().to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
-            .write_all(&[self.checked, self.missing])
+            .write_all(&[
+                self.availability.checked_bits(),
+                self.availability.missing_bits(),
+            ])
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.timestamp.to_le_bytes())
@@ -227,8 +228,7 @@ impl Code for HybridArticleEntry {
 
         Ok(Self {
             status_code,
-            checked: header[0],
-            missing: header[1],
+            availability: ArticleAvailability::from_bits(header[0], header[1]),
             timestamp,
             tier,
             buffer,
@@ -258,8 +258,7 @@ impl HybridArticleEntry {
 
         Some(Self {
             status_code,
-            checked: 0,
-            missing: 0,
+            availability: ArticleAvailability::new(),
             timestamp: ttl::now_millis(),
             tier,
             buffer,
@@ -291,33 +290,22 @@ impl HybridArticleEntry {
     /// Check if we should try fetching from this backend
     #[inline]
     pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
-        let idx = backend_id.as_index();
-        // Backend is "should try" if not marked as missing
-        self.missing & (1u8 << idx) == 0
+        self.availability.should_try(backend_id)
     }
 
     /// Record that a backend returned 430 (doesn't have this article)
     pub fn record_backend_missing(&mut self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        self.checked |= 1u8 << idx;
-        self.missing |= 1u8 << idx;
+        self.availability.record_missing(backend_id);
     }
 
     /// Record that a backend successfully provided this article
     pub fn record_backend_has(&mut self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        self.checked |= 1u8 << idx;
-        self.missing &= !(1u8 << idx);
+        self.availability.record_has(backend_id);
     }
 
     /// Check if all backends have been tried and none have the article
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
-        let count = total_backends.get();
-        match count {
-            0 => true,
-            8 => self.missing == 0xFF,
-            n => self.missing & ((1u8 << n) - 1) == (1u8 << n) - 1,
-        }
+        self.availability.all_exhausted(total_backends)
     }
 
     /// Check if this cache entry contains a complete article (220) or body (222)
@@ -355,7 +343,7 @@ impl HybridArticleEntry {
     /// Get backend availability as ArticleAvailability struct
     #[inline]
     pub fn availability(&self) -> ArticleAvailability {
-        ArticleAvailability::from_bits(self.checked, self.missing)
+        self.availability
     }
 
     /// Check if we have any backend availability information
@@ -364,7 +352,7 @@ impl HybridArticleEntry {
     /// Wrapper around `ArticleAvailability::has_availability_info()` for convenience.
     #[inline]
     pub fn has_availability_info(&self) -> bool {
-        self.checked != 0
+        self.availability.has_availability_info()
     }
 
     /// Check if availability information is stale (older than ttl_millis)
@@ -793,9 +781,7 @@ impl HybridArticleCache {
             Ok(Some(existing)) => {
                 // Merge availability into existing entry
                 let mut entry = existing.value().clone();
-                // Merge: union of checked bits, union of missing bits
-                entry.checked |= availability.checked_bits();
-                entry.missing |= availability.missing_bits();
+                entry.availability.merge_from(availability);
                 Some(entry)
             }
             _ => {
@@ -809,8 +795,7 @@ impl HybridArticleCache {
                     // SAFETY: "430\r\n" is a valid NNTP response
                     let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec())
                         .expect("430 is a valid status code");
-                    entry.checked = availability.checked_bits();
-                    entry.missing = availability.missing_bits();
+                    entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     Some(entry)
                 }
