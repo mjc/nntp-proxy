@@ -22,8 +22,12 @@ config.toml
 *.log
 .direnv
 
+# Profiling artifacts
 flamegraph.svg
+flamegraph-*.svg
 perf.data*
+perf-offcpu.data*
+strace.log
 cache-config.toml
 
 # Release binaries
