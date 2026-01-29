@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1d6aa414d1eb8563e81241369ac05896b2e33a2ee2b332d01243fa27a527e445 # shrinks to commands = ["HELP", "HELP", "HEAD <.Qd2I-@j1bn>", "STAT <L3@-d.dD->", "LIST"]
+cc b5d091fa6081c5b4c1c44088a332346f7966550c0c043c509c9bbb6508a8e0a1 # shrinks to command = "LIST"
+cc 282996c1fb613dbfae036af6503951b5c374c6c3c983a0eca0273cf90063047d # shrinks to command = "HELP"
