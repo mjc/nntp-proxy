@@ -25,9 +25,9 @@ pub mod buffer {
     pub const POOL: usize = 724 * 1024;
 
     /// Number of buffers in the buffer pool
-    /// Sized for ~25 concurrent connections with one buffer each
-    /// Total memory: 25 × 724KB ≈ 18MB
-    pub const POOL_COUNT: usize = 25;
+    /// Sized for ~25 concurrent connections with double-buffering (2 buffers each)
+    /// Total memory: 50 × 724KB ≈ 36MB
+    pub const POOL_COUNT: usize = 50;
 
     /// BufReader capacity for client command parsing (64KB)
     /// Large enough to handle any NNTP command line without multiple reads
@@ -253,8 +253,8 @@ mod tests {
         // Calculate total pool memory
         let total_memory = buffer::POOL * buffer::POOL_COUNT;
 
-        // Should be approximately 18MB
-        let expected_mb = 18;
+        // Should be approximately 36MB (50 buffers × 724KB)
+        let expected_mb = 35;
         let actual_mb = total_memory / (1024 * 1024);
 
         assert!(
