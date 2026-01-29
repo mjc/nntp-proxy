@@ -138,48 +138,25 @@ impl Builder {
             .name
             .unwrap_or_else(|| format!("{}:{}", self.host, self.port));
 
-        if let Some(tls_config) = self.tls_config {
-            // Build with TLS
-            let manager = TcpManager::new_with_tls(
-                self.host,
-                self.port,
-                name.clone(),
-                self.username,
-                self.password,
-                tls_config,
-            )?;
-            let pool = Pool::builder(manager)
-                .max_size(self.max_size)
-                .build()
-                .expect("Failed to create connection pool");
+        let manager = TcpManager::new(
+            self.host,
+            self.port,
+            name.clone(),
+            self.username,
+            self.password,
+            self.tls_config,
+        )?;
+        let pool = Pool::builder(manager)
+            .max_size(self.max_size)
+            .build()
+            .expect("Failed to create connection pool");
 
-            Ok(DeadpoolConnectionProvider {
-                pool,
-                name,
-                shutdown_tx: None,
-                health_check_metrics: Arc::new(HealthCheckMetrics::new()),
-            })
-        } else {
-            // Build without TLS
-            let manager = TcpManager::new(
-                self.host,
-                self.port,
-                name.clone(),
-                self.username,
-                self.password,
-            );
-            let pool = Pool::builder(manager)
-                .max_size(self.max_size)
-                .build()
-                .expect("Failed to create connection pool");
-
-            Ok(DeadpoolConnectionProvider {
-                pool,
-                name,
-                shutdown_tx: None,
-                health_check_metrics: Arc::new(HealthCheckMetrics::new()),
-            })
-        }
+        Ok(DeadpoolConnectionProvider {
+            pool,
+            name,
+            shutdown_tx: None,
+            health_check_metrics: Arc::new(HealthCheckMetrics::new()),
+        })
     }
 }
 
@@ -297,7 +274,9 @@ impl DeadpoolConnectionProvider {
             .build()
     }
 
-    /// Create a new connection provider
+    /// Create a new connection provider (plain TCP, no TLS)
+    ///
+    /// For TLS support, use `new_with_tls()` or the builder API.
     pub fn new(
         host: String,
         port: u16,
@@ -306,7 +285,9 @@ impl DeadpoolConnectionProvider {
         username: Option<String>,
         password: Option<String>,
     ) -> Self {
-        let manager = TcpManager::new(host, port, name.clone(), username, password);
+        // Plain TCP (no TLS) cannot fail during TcpManager construction
+        let manager = TcpManager::new(host, port, name.clone(), username, password, None)
+            .expect("Plain TCP TcpManager creation cannot fail");
         let pool = Pool::builder(manager)
             .max_size(max_size)
             .build()
@@ -330,8 +311,14 @@ impl DeadpoolConnectionProvider {
         password: Option<String>,
         tls_config: TlsConfig,
     ) -> Result<Self> {
-        let manager =
-            TcpManager::new_with_tls(host, port, name.clone(), username, password, tls_config)?;
+        let manager = TcpManager::new(
+            host,
+            port,
+            name.clone(),
+            username,
+            password,
+            Some(tls_config),
+        )?;
         let pool = Pool::builder(manager)
             .max_size(max_size)
             .build()
@@ -362,13 +349,13 @@ impl DeadpoolConnectionProvider {
 
         let tls_config = tls_builder.build();
 
-        let manager = TcpManager::new_with_tls(
+        let manager = TcpManager::new(
             server.host.to_string(),
             server.port.get(),
             server.name.to_string(),
             server.username.clone(),
             server.password.clone(),
-            tls_config,
+            Some(tls_config),
         )?;
         let pool = Pool::builder(manager)
             .max_size(server.max_connections.get())

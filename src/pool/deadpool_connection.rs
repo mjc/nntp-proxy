@@ -30,43 +30,31 @@ pub struct TcpManager {
 }
 
 impl TcpManager {
+    /// Create a new TcpManager with optional TLS configuration
+    ///
+    /// If `tls_config` is `Some` with `use_tls = true`, the TLS manager is
+    /// pre-initialized (certificates loaded). If `None` or `use_tls = false`,
+    /// plain TCP connections are used.
     pub fn new(
         host: String,
         port: u16,
         name: String,
         username: Option<String>,
         password: Option<String>,
-    ) -> Self {
-        Self {
-            host,
-            port,
-            name,
-            username,
-            password,
-            tls_config: TlsConfig::default(),
-            tls_manager: None,
-        }
-    }
-
-    /// Create a new TcpManager with TLS configuration
-    pub fn new_with_tls(
-        host: String,
-        port: u16,
-        name: String,
-        username: Option<String>,
-        password: Option<String>,
-        tls_config: TlsConfig,
+        tls_config: Option<TlsConfig>,
     ) -> Result<Self, ConnectionError> {
-        // Pre-initialize TLS manager if TLS is enabled
-        let tls_manager = if tls_config.use_tls {
-            Some(Arc::new(TlsManager::new(tls_config.clone()).map_err(
-                |e| ConnectionError::TlsHandshake {
-                    backend: name.clone(),
-                    source: e.into(),
-                },
-            )?))
-        } else {
-            None
+        let (tls_config, tls_manager) = match tls_config {
+            Some(cfg) if cfg.use_tls => {
+                let mgr = Arc::new(TlsManager::new(cfg.clone()).map_err(|e| {
+                    ConnectionError::TlsHandshake {
+                        backend: name.clone(),
+                        source: e.into(),
+                    }
+                })?);
+                (cfg, Some(mgr))
+            }
+            Some(cfg) => (cfg, None),
+            None => (TlsConfig::default(), None),
         };
 
         Ok(Self {
@@ -256,14 +244,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tcp_manager_new() {
+    fn test_tcp_manager_new_plain() {
         let manager = TcpManager::new(
             "news.example.com".to_string(),
             119,
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(manager.host, "news.example.com");
         assert_eq!(manager.port, 119);
@@ -282,7 +272,9 @@ mod tests {
             "SecureServer".to_string(),
             None,
             None,
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(manager.host, "news.example.com");
         assert_eq!(manager.port, 563);
@@ -294,17 +286,16 @@ mod tests {
     #[test]
     fn test_tcp_manager_new_with_tls_disabled() {
         let tls_config = TlsConfig::default(); // use_tls = false
-        let result = TcpManager::new_with_tls(
+        let manager = TcpManager::new(
             "news.example.com".to_string(),
             119,
             "PlainServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-            tls_config,
-        );
+            Some(tls_config),
+        )
+        .unwrap();
 
-        assert!(result.is_ok());
-        let manager = result.unwrap();
         assert_eq!(manager.host, "news.example.com");
         assert_eq!(manager.port, 119);
         assert!(!manager.tls_config.use_tls);
@@ -318,17 +309,16 @@ mod tests {
             tls_verify_cert: true,
             tls_cert_path: None,
         };
-        let result = TcpManager::new_with_tls(
+        let manager = TcpManager::new(
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-            tls_config,
-        );
+            Some(tls_config),
+        )
+        .unwrap();
 
-        assert!(result.is_ok());
-        let manager = result.unwrap();
         assert_eq!(manager.host, "secure.example.com");
         assert_eq!(manager.port, 563);
         assert!(manager.tls_config.use_tls);
@@ -343,7 +333,9 @@ mod tests {
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-        );
+            None,
+        )
+        .unwrap();
 
         let cloned = manager.clone();
         assert_eq!(cloned.host, manager.host);
@@ -361,7 +353,9 @@ mod tests {
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-        );
+            None,
+        )
+        .unwrap();
 
         let debug_str = format!("{:?}", manager);
         assert!(debug_str.contains("TcpManager"));
@@ -376,13 +370,13 @@ mod tests {
             tls_verify_cert: false,
             tls_cert_path: None,
         };
-        let manager = TcpManager::new_with_tls(
+        let manager = TcpManager::new(
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
             None,
             None,
-            tls_config,
+            Some(tls_config),
         )
         .unwrap();
 
@@ -405,13 +399,13 @@ mod tests {
         };
 
         // This will fail due to missing file, but tests the construction path
-        let result = TcpManager::new_with_tls(
+        let result = TcpManager::new(
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
             None,
             None,
-            tls_config,
+            Some(tls_config),
         );
 
         // Should fail because cert file doesn't exist
