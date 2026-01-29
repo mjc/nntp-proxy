@@ -603,15 +603,9 @@ impl HybridArticleCache {
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<HybridArticleEntry> {
-        let start = std::time::Instant::now();
         let key = message_id.without_brackets().to_string();
-        let key_time = start.elapsed();
-
-        let get_start = std::time::Instant::now();
         let result = self.cache.get(&key).await;
-        let get_time = get_start.elapsed();
 
-        let clone_start = std::time::Instant::now();
         match result {
             Ok(Some(entry)) => {
                 let cloned = entry.value().clone();
@@ -631,20 +625,6 @@ impl HybridArticleCache {
                 // Track disk hits for monitoring
                 if source == Source::Disk {
                     self.disk_hits.fetch_add(1, Ordering::Relaxed);
-                }
-                let clone_time = clone_start.elapsed();
-                let total = start.elapsed();
-
-                // Log slow disk reads
-                if source == Source::Disk && total.as_millis() > 5 {
-                    warn!(
-                        key_us = key_time.as_micros(),
-                        get_us = get_time.as_micros(),
-                        clone_us = clone_time.as_micros(),
-                        total_ms = total.as_millis(),
-                        size = cloned.buffer.len(),
-                        "SLOW disk cache read"
-                    );
                 }
                 Some(cloned)
             }
