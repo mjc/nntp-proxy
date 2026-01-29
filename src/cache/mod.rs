@@ -130,7 +130,8 @@ impl UnifiedCache {
                     // Get availability and tier before consuming buffer
                     let availability = entry.availability();
                     let tier = entry.tier();
-                    let mut article_entry = ArticleEntry::with_tier(entry.into_buffer(), tier);
+                    let mut article_entry =
+                        ArticleEntry::from_arc_with_tier(entry.into_buffer(), tier);
                     // Copy availability from hybrid entry
                     article_entry.set_availability(availability);
                     article_entry

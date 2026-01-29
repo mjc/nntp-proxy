@@ -376,6 +376,16 @@ impl ArticleEntry {
         }
     }
 
+    /// Create from pre-wrapped Arc buffer with a specific tier
+    pub fn from_arc_with_tier(buffer: Arc<Vec<u8>>, tier: u8) -> Self {
+        Self {
+            backend_availability: ArticleAvailability::new(),
+            buffer,
+            tier,
+            inserted_at: ttl::now_millis(),
+        }
+    }
+
     /// Check if this entry has expired based on tier-aware TTL
     ///
     /// See [`super::ttl`] for the TTL formula.

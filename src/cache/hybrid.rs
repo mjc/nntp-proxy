@@ -42,6 +42,7 @@ use foyer::{
 };
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -131,9 +132,9 @@ pub struct HybridArticleEntry {
     /// Server tier (lower = higher priority)
     /// Used for tier-aware TTL: higher tier = longer TTL
     tier: u8,
-    /// Complete response buffer
+    /// Complete response buffer (Arc for O(1) clone on cache hits)
     /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
-    buffer: Vec<u8>,
+    buffer: Arc<Vec<u8>>,
 }
 
 /// Manual Code implementation to avoid bincode's vec resizing overhead
@@ -231,7 +232,7 @@ impl Code for HybridArticleEntry {
             availability: ArticleAvailability::from_bits(header[0], header[1]),
             timestamp,
             tier,
-            buffer,
+            buffer: Arc::new(buffer),
         })
     }
 
@@ -261,7 +262,7 @@ impl HybridArticleEntry {
             availability: ArticleAvailability::new(),
             timestamp: ttl::now_millis(),
             tier,
-            buffer,
+            buffer: Arc::new(buffer),
         })
     }
 
@@ -271,9 +272,9 @@ impl HybridArticleEntry {
         &self.buffer
     }
 
-    /// Get buffer as owned Vec (for sending to client)
+    /// Get buffer as shared Arc (O(1) clone for sending to client)
     #[inline]
-    pub fn into_buffer(self) -> Vec<u8> {
+    pub fn into_buffer(self) -> Arc<Vec<u8>> {
         self.buffer
     }
 
