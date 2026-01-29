@@ -90,6 +90,14 @@ harness = false
 name = "yenc_decoding"
 harness = false
 
+[[bench]]
+name = "cache_lookup"
+harness = false
+
+[[bench]]
+name = "router_selection"
+harness = false
+
 
 [profile.release]
 debug = false          # No debug symbols for smaller binaries
