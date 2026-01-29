@@ -14,7 +14,7 @@
 //! - [`UnifiedCache`] - Enum that wraps either cache type with a common interface
 
 mod article;
-mod entry_helpers;
+pub(crate) mod entry_helpers;
 mod hybrid;
 pub mod ttl;
 

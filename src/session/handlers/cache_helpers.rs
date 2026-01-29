@@ -88,19 +88,46 @@ impl ClientSession {
             return Ok(None);
         }
 
-        // Get the appropriate response for this command type
-        let Some(response) = cached.response_for_command(&cmd_verb, msg_id_ref.as_str()) else {
+        // Serve from cache, avoiding buffer copies for the common path.
+        // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
+        let code = cached.status_code().map(|c| c.as_u16());
+        let Some(status_code) = code else {
             debug!(
-                "Client {} cached response (code={:?}) can't serve '{}' command",
+                "Client {} cached response has no valid status code",
                 self.client_addr,
-                cached.status_code().map(|c| c.as_u16()),
-                cmd_verb
             );
             return Ok(None);
         };
 
-        client_write.write_all(&response).await?;
-        *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
+        if !crate::cache::entry_helpers::matches_command_type_verb(status_code, &cmd_verb) {
+            debug!(
+                "Client {} cached response (code={}) can't serve '{}' command",
+                self.client_addr, status_code, cmd_verb
+            );
+            return Ok(None);
+        }
+
+        // STAT: synthesize a small response (no buffer copy needed)
+        // Direct serve: write directly from the Arc-backed buffer (zero-copy)
+        let bytes_written = if cmd_verb == "STAT" {
+            let stat_response = format!("223 0 {}\r\n", msg_id_ref.as_str());
+            client_write.write_all(stat_response.as_bytes()).await?;
+            stat_response.len()
+        } else {
+            // Validate before serving
+            if !crate::cache::entry_helpers::is_valid_response(cached.buffer()) {
+                tracing::warn!(
+                    code = status_code,
+                    len = cached.buffer().len(),
+                    "Cached buffer failed validation, discarding"
+                );
+                return Ok(None);
+            }
+            let buf = cached.buffer();
+            client_write.write_all(buf).await?;
+            buf.len()
+        };
+        *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
 
         let backend_id = router.route_command(self.client_id, command)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
