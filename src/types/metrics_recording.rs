@@ -5,8 +5,14 @@
 
 use std::marker::PhantomData;
 
-/// Marker trait for recording states
-pub trait RecordingState {}
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Unrecorded {}
+    impl Sealed for super::Recorded {}
+}
+
+/// Marker trait for recording states (sealed — cannot be implemented externally)
+pub trait RecordingState: sealed::Sealed {}
 
 /// Bytes that have NOT been recorded to metrics yet
 #[derive(Debug, Clone, Copy)]
@@ -361,5 +367,59 @@ mod tests {
 
         assert_eq!(direction, TransferDirection::ClientToBackend);
         assert_eq!(recorded.as_u64(), 512);
+    }
+
+    // =========================================================================
+    // Sealed trait tests
+    // =========================================================================
+
+    /// Verify the sealed module exists and its Sealed trait is implemented for
+    /// both state types. We can't test "external impls are rejected" at runtime,
+    /// but we can verify the sealed impls are structurally correct by exercising
+    /// the trait bound through generic code.
+    #[test]
+    fn test_sealed_trait_bound_satisfied_for_unrecorded() {
+        fn assert_recording_state<S: RecordingState>() {}
+        assert_recording_state::<Unrecorded>();
+    }
+
+    #[test]
+    fn test_sealed_trait_bound_satisfied_for_recorded() {
+        fn assert_recording_state<S: RecordingState>() {}
+        assert_recording_state::<Recorded>();
+    }
+
+    #[test]
+    fn test_sealed_does_not_affect_generic_usage() {
+        // Generic functions constrained on RecordingState still work
+        fn peek_bytes<S: RecordingState>(b: &MetricsBytes<S>) -> u64 {
+            b.peek()
+        }
+
+        let unrecorded = MetricsBytes::<Unrecorded>::new(42);
+        assert_eq!(peek_bytes(&unrecorded), 42);
+
+        let recorded = unrecorded.mark_recorded();
+        assert_eq!(peek_bytes(&recorded), 42);
+    }
+
+    #[test]
+    fn test_sealed_states_in_directional_bytes() {
+        // DirectionalBytes uses RecordingState — verify it still works with sealed trait
+        let dir = DirectionalBytes::client_to_backend(100);
+        let unrecorded: MetricsBytes<Unrecorded> = dir.into_bytes();
+        let recorded = unrecorded.mark_recorded();
+        assert_eq!(recorded.as_u64(), 100);
+    }
+
+    #[test]
+    fn test_mark_recorded_preserves_value_through_sealed_bound() {
+        // Exercise the full typestate transition which requires both states
+        // to satisfy the sealed RecordingState bound
+        for val in [0u64, 1, 100, u64::MAX] {
+            let unrecorded = MetricsBytes::<Unrecorded>::new(val);
+            let recorded = unrecorded.mark_recorded();
+            assert_eq!(recorded.as_u64(), val);
+        }
     }
 }

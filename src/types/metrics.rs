@@ -301,6 +301,118 @@ mod tests {
             prop_assert_eq!(diff.backend_to_client.as_u64(), a2.saturating_sub(b2));
         }
     }
+
+    // ========================================================================
+    // define_counter! macro tests — Display with unit and empty unit
+    // ========================================================================
+
+    #[test]
+    fn test_counter_display_with_unit() {
+        let c = TotalConnections::new(42);
+        assert_eq!(format!("{}", c), "42 connections");
+    }
+
+    #[test]
+    fn test_counter_display_with_unit_zero() {
+        let c = TotalConnections::new(0);
+        assert_eq!(format!("{}", c), "0 connections");
+    }
+
+    #[test]
+    fn test_counter_display_bytes_per_second() {
+        let c = BytesPerSecondRate::new(1500);
+        assert_eq!(format!("{}", c), "1500 B/s");
+    }
+
+    #[test]
+    fn test_counter_display_article_bytes() {
+        let c = ArticleBytesTotal::new(999999);
+        assert_eq!(format!("{}", c), "999999 bytes");
+    }
+
+    #[test]
+    fn test_counter_display_empty_unit() {
+        // TimingMeasurementCount uses empty unit — should NOT have trailing space
+        let c = TimingMeasurementCount::new(7);
+        assert_eq!(format!("{}", c), "7");
+    }
+
+    #[test]
+    fn test_counter_display_empty_unit_zero() {
+        let c = TimingMeasurementCount::new(0);
+        assert_eq!(format!("{}", c), "0");
+    }
+
+    #[test]
+    fn test_counter_display_empty_unit_large() {
+        let c = TimingMeasurementCount::new(u64::MAX);
+        assert_eq!(format!("{}", c), format!("{}", u64::MAX));
+    }
+
+    #[test]
+    fn test_timing_measurement_count_new_and_get() {
+        let c = TimingMeasurementCount::new(123);
+        assert_eq!(c.get(), 123);
+    }
+
+    #[test]
+    fn test_timing_measurement_count_zero_constant() {
+        assert_eq!(TimingMeasurementCount::ZERO.get(), 0);
+    }
+
+    #[test]
+    fn test_timing_measurement_count_from_u64() {
+        let c = TimingMeasurementCount::from(55u64);
+        assert_eq!(c.get(), 55);
+    }
+
+    #[test]
+    fn test_timing_measurement_count_default() {
+        let c = TimingMeasurementCount::default();
+        assert_eq!(c.get(), 0);
+    }
+
+    #[test]
+    fn test_timing_measurement_count_eq() {
+        assert_eq!(
+            TimingMeasurementCount::new(10),
+            TimingMeasurementCount::new(10)
+        );
+        assert_ne!(
+            TimingMeasurementCount::new(10),
+            TimingMeasurementCount::new(11)
+        );
+    }
+
+    #[test]
+    fn test_timing_measurement_count_ord() {
+        assert!(TimingMeasurementCount::new(5) < TimingMeasurementCount::new(10));
+        assert!(TimingMeasurementCount::new(10) > TimingMeasurementCount::new(5));
+    }
+
+    #[test]
+    fn test_timing_measurement_count_clone_copy() {
+        let a = TimingMeasurementCount::new(42);
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_timing_measurement_count_debug() {
+        let c = TimingMeasurementCount::new(99);
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("99"));
+    }
+
+    #[test]
+    fn test_counter_repr_transparent() {
+        use std::mem::size_of;
+        // All counter types should be exactly u64-sized due to #[repr(transparent)]
+        assert_eq!(size_of::<TotalConnections>(), size_of::<u64>());
+        assert_eq!(size_of::<BytesPerSecondRate>(), size_of::<u64>());
+        assert_eq!(size_of::<ArticleBytesTotal>(), size_of::<u64>());
+        assert_eq!(size_of::<TimingMeasurementCount>(), size_of::<u64>());
+    }
 }
 
 // ============================================================================
@@ -341,7 +453,12 @@ macro_rules! define_counter {
 
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{} {}", self.0, $unit)
+                let unit: &str = $unit;
+                if unit.is_empty() {
+                    write!(f, "{}", self.0)
+                } else {
+                    write!(f, "{} {}", self.0, unit)
+                }
             }
         }
     };
@@ -355,34 +472,4 @@ define_counter!(TotalConnections, "connections");
 define_counter!(BytesPerSecondRate, "B/s");
 define_counter!(ArticleBytesTotal, "bytes");
 
-/// Timing measurement count (for averaging TTFB/send/recv times)
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct TimingMeasurementCount(u64);
-
-impl TimingMeasurementCount {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(&self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for TimingMeasurementCount {
-    #[inline]
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl fmt::Display for TimingMeasurementCount {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+define_counter!(TimingMeasurementCount, "");

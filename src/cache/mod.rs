@@ -20,7 +20,10 @@ pub mod ttl;
 pub mod mock_hybrid;
 
 pub use article::{ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, MAX_BACKENDS};
-pub use hybrid::{HybridArticleCache, HybridArticleEntry, HybridCacheConfig, HybridCacheStats};
+pub use hybrid::{
+    CacheableStatusCode, HybridArticleCache, HybridArticleEntry, HybridCacheConfig,
+    HybridCacheStats,
+};
 
 use crate::types::{BackendId, MessageId};
 

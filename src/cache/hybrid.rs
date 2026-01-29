@@ -48,6 +48,48 @@ use tracing::{debug, info, warn};
 
 use super::{ArticleAvailability, ttl};
 
+/// Valid NNTP status codes for cached articles
+///
+/// Using an enum instead of raw `u16` makes invalid states unrepresentable.
+/// The `repr(u16)` allows efficient serialization as a 2-byte wire format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum CacheableStatusCode {
+    /// 220 — Full article (headers + body)
+    Article = 220,
+    /// 221 — Headers only
+    Head = 221,
+    /// 222 — Body only
+    Body = 222,
+    /// 223 — Article exists (STAT response)
+    Stat = 223,
+    /// 430 — Article not found
+    Missing = 430,
+}
+
+impl CacheableStatusCode {
+    /// Get the raw u16 value
+    #[inline]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+impl TryFrom<u16> for CacheableStatusCode {
+    type Error = u16;
+
+    fn try_from(code: u16) -> Result<Self, Self::Error> {
+        match code {
+            220 => Ok(Self::Article),
+            221 => Ok(Self::Head),
+            222 => Ok(Self::Body),
+            223 => Ok(Self::Stat),
+            430 => Ok(Self::Missing),
+            other => Err(other),
+        }
+    }
+}
+
 /// Check available disk space at the given path using df command
 fn check_available_space(path: &Path) -> Option<u64> {
     // Try to use statfs on Linux/Unix
@@ -78,9 +120,8 @@ fn check_available_space(path: &Path) -> Option<u64> {
 /// - Simple binary format: [status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][len:u32][buffer:bytes]
 #[derive(Clone, Debug)]
 pub struct HybridArticleEntry {
-    /// Validated NNTP status code (220, 221, 222, 223, 430)
-    /// Stored explicitly so we never have to re-parse from buffer
-    status_code: u16,
+    /// Validated NNTP status code — only cacheable codes are representable
+    status_code: CacheableStatusCode,
     /// Backend availability bitset - checked bits
     checked: u8,
     /// Backend availability bitset - missing bits
@@ -102,7 +143,7 @@ impl Code for HybridArticleEntry {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         // Format: status (2) + checked (1) + missing (1) + timestamp (8) + tier (1) + len (4) + buffer
         writer
-            .write_all(&self.status_code.to_le_bytes())
+            .write_all(&self.status_code.as_u16().to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&[self.checked, self.missing])
@@ -129,15 +170,15 @@ impl Code for HybridArticleEntry {
         reader
             .read_exact(&mut status_bytes)
             .map_err(foyer::Error::io_error)?;
-        let status_code = u16::from_le_bytes(status_bytes);
+        let raw_code = u16::from_le_bytes(status_bytes);
 
         // Validate status code on decode - reject corrupted entries
-        if !Self::is_valid_status_code(status_code) {
-            return Err(foyer::Error::io_error(std::io::Error::new(
+        let status_code = CacheableStatusCode::try_from(raw_code).map_err(|code| {
+            foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid cached status code: {}", status_code),
-            )));
-        }
+                format!("Invalid cached status code: {}", code),
+            ))
+        })?;
 
         // Read header: checked + missing
         let mut header = [0u8; 2];
@@ -200,15 +241,6 @@ impl Code for HybridArticleEntry {
 }
 
 impl HybridArticleEntry {
-    /// Valid NNTP status codes for cached articles
-    const VALID_CODES: [u16; 5] = [220, 221, 222, 223, 430];
-
-    /// Check if a status code is valid for caching
-    #[inline]
-    fn is_valid_status_code(code: u16) -> bool {
-        Self::VALID_CODES.contains(&code)
-    }
-
     /// Create from response buffer - returns None if buffer has invalid status code
     ///
     /// This is the ONLY way to create an entry. Invalid buffers are rejected.
@@ -219,13 +251,10 @@ impl HybridArticleEntry {
 
     /// Create from response buffer with specified tier
     ///
-    /// Returns None if buffer has invalid status code.
+    /// Returns None if buffer has invalid or non-cacheable status code.
     pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Option<Self> {
-        let status_code = StatusCode::parse(&buffer)?.as_u16();
-
-        if !Self::is_valid_status_code(status_code) {
-            return None;
-        }
+        let raw_code = StatusCode::parse(&buffer)?.as_u16();
+        let status_code = CacheableStatusCode::try_from(raw_code).ok()?;
 
         Some(Self {
             status_code,
@@ -256,7 +285,7 @@ impl HybridArticleEntry {
     #[inline]
     pub fn status_code(&self) -> Option<StatusCode> {
         // SAFETY: Invariant enforced by new() and decode()
-        Some(StatusCode::new(self.status_code))
+        Some(StatusCode::new(self.status_code.as_u16()))
     }
 
     /// Check if we should try fetching from this backend
@@ -294,8 +323,10 @@ impl HybridArticleEntry {
     /// Check if this cache entry contains a complete article (220) or body (222)
     #[inline]
     pub fn is_complete_article(&self) -> bool {
-        let code = self.status_code;
-        if code != 220 && code != 222 {
+        if !matches!(
+            self.status_code,
+            CacheableStatusCode::Article | CacheableStatusCode::Body
+        ) {
             return false;
         }
         const MIN_ARTICLE_SIZE: usize = 30;
@@ -312,19 +343,20 @@ impl HybridArticleEntry {
     ///
     /// Returns `None` if cached response can't serve this command type.
     pub fn response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
-        let code = self.status_code;
+        use CacheableStatusCode::*;
 
-        match (code, cmd_verb) {
+        match (self.status_code, cmd_verb) {
             // STAT just needs existence confirmation - synthesize response
-            (220..=222, "STAT") => Some(format!("223 0 {}\r\n", message_id).into_bytes()),
+            (Article | Head | Body, "STAT") => {
+                Some(format!("223 0 {}\r\n", message_id).into_bytes())
+            }
             // Direct match - return cached buffer if valid
-            (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
-                // Validate buffer is a well-formed NNTP response
+            (Article, "ARTICLE") | (Body, "BODY") | (Head, "HEAD") => {
                 if self.is_valid_response() {
                     Some(self.buffer.clone())
                 } else {
                     tracing::warn!(
-                        code = code,
+                        code = self.status_code.as_u16(),
                         len = self.buffer.len(),
                         "Cached buffer failed validation, discarding"
                     );
@@ -334,12 +366,12 @@ impl HybridArticleEntry {
             // ARTICLE (220) contains everything, can serve BODY or HEAD requests
             // Note: For HEAD we'd ideally extract just headers, but returning full
             // article still works (client gets bonus body data)
-            (220, "BODY" | "HEAD") => {
+            (Article, "BODY" | "HEAD") => {
                 if self.is_valid_response() {
                     Some(self.buffer.clone())
                 } else {
                     tracing::warn!(
-                        code = code,
+                        code = self.status_code.as_u16(),
                         len = self.buffer.len(),
                         "Cached buffer failed validation, discarding"
                     );
@@ -385,10 +417,11 @@ impl HybridArticleEntry {
     /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
     pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
+        use CacheableStatusCode::*;
         match self.status_code {
-            220 => matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD" | "STAT"),
-            222 => matches!(cmd_verb, "BODY" | "STAT"),
-            221 => matches!(cmd_verb, "HEAD" | "STAT"),
+            Article => matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD" | "STAT"),
+            Body => matches!(cmd_verb, "BODY" | "STAT"),
+            Head => matches!(cmd_verb, "HEAD" | "STAT"),
             _ => false,
         }
     }
@@ -1159,5 +1192,438 @@ mod tests {
         assert!(HybridArticleEntry::new(b"222 body\r\n".to_vec()).is_some());
         assert!(HybridArticleEntry::new(b"223 stat\r\n".to_vec()).is_some());
         assert!(HybridArticleEntry::new(b"430 not found\r\n".to_vec()).is_some());
+    }
+
+    // =========================================================================
+    // CacheableStatusCode enum tests
+    // =========================================================================
+
+    #[test]
+    fn test_cacheable_status_code_as_u16() {
+        assert_eq!(CacheableStatusCode::Article.as_u16(), 220);
+        assert_eq!(CacheableStatusCode::Head.as_u16(), 221);
+        assert_eq!(CacheableStatusCode::Body.as_u16(), 222);
+        assert_eq!(CacheableStatusCode::Stat.as_u16(), 223);
+        assert_eq!(CacheableStatusCode::Missing.as_u16(), 430);
+    }
+
+    #[test]
+    fn test_cacheable_status_code_try_from_valid() {
+        assert_eq!(
+            CacheableStatusCode::try_from(220),
+            Ok(CacheableStatusCode::Article)
+        );
+        assert_eq!(
+            CacheableStatusCode::try_from(221),
+            Ok(CacheableStatusCode::Head)
+        );
+        assert_eq!(
+            CacheableStatusCode::try_from(222),
+            Ok(CacheableStatusCode::Body)
+        );
+        assert_eq!(
+            CacheableStatusCode::try_from(223),
+            Ok(CacheableStatusCode::Stat)
+        );
+        assert_eq!(
+            CacheableStatusCode::try_from(430),
+            Ok(CacheableStatusCode::Missing)
+        );
+    }
+
+    #[test]
+    fn test_cacheable_status_code_try_from_invalid() {
+        // Adjacent codes that are NOT cacheable
+        assert_eq!(CacheableStatusCode::try_from(219), Err(219));
+        assert_eq!(CacheableStatusCode::try_from(224), Err(224));
+        assert_eq!(CacheableStatusCode::try_from(429), Err(429));
+        assert_eq!(CacheableStatusCode::try_from(431), Err(431));
+
+        // Common NNTP codes that aren't cacheable
+        assert_eq!(CacheableStatusCode::try_from(200), Err(200));
+        assert_eq!(CacheableStatusCode::try_from(201), Err(201));
+        assert_eq!(CacheableStatusCode::try_from(211), Err(211));
+        assert_eq!(CacheableStatusCode::try_from(411), Err(411));
+        assert_eq!(CacheableStatusCode::try_from(480), Err(480));
+        assert_eq!(CacheableStatusCode::try_from(500), Err(500));
+
+        // Edge cases
+        assert_eq!(CacheableStatusCode::try_from(0), Err(0));
+        assert_eq!(CacheableStatusCode::try_from(u16::MAX), Err(u16::MAX));
+    }
+
+    #[test]
+    fn test_cacheable_status_code_roundtrip() {
+        // Every variant round-trips through u16
+        for code in [
+            CacheableStatusCode::Article,
+            CacheableStatusCode::Head,
+            CacheableStatusCode::Body,
+            CacheableStatusCode::Stat,
+            CacheableStatusCode::Missing,
+        ] {
+            let raw = code.as_u16();
+            let back = CacheableStatusCode::try_from(raw).unwrap();
+            assert_eq!(code, back);
+        }
+    }
+
+    #[test]
+    fn test_cacheable_status_code_clone_copy() {
+        let a = CacheableStatusCode::Article;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_cacheable_status_code_debug() {
+        let dbg = format!("{:?}", CacheableStatusCode::Article);
+        assert!(dbg.contains("Article"));
+        let dbg = format!("{:?}", CacheableStatusCode::Missing);
+        assert!(dbg.contains("Missing"));
+    }
+
+    #[test]
+    fn test_cacheable_status_code_eq() {
+        assert_eq!(CacheableStatusCode::Article, CacheableStatusCode::Article);
+        assert_ne!(CacheableStatusCode::Article, CacheableStatusCode::Body);
+        assert_ne!(CacheableStatusCode::Head, CacheableStatusCode::Missing);
+    }
+
+    #[test]
+    fn test_cacheable_status_code_repr_u16_size() {
+        use std::mem::size_of;
+        // repr(u16) means the enum is 2 bytes
+        assert_eq!(size_of::<CacheableStatusCode>(), size_of::<u16>());
+    }
+
+    // =========================================================================
+    // Entry status_code field uses enum
+    // =========================================================================
+
+    #[test]
+    fn test_entry_status_code_returns_protocol_status_code() {
+        let entry = HybridArticleEntry::new(b"220 0 <id>\r\n".to_vec()).unwrap();
+        let sc = entry.status_code().unwrap();
+        assert_eq!(sc.as_u16(), 220);
+
+        let entry = HybridArticleEntry::new(b"430 not found\r\n".to_vec()).unwrap();
+        let sc = entry.status_code().unwrap();
+        assert_eq!(sc.as_u16(), 430);
+    }
+
+    #[test]
+    fn test_entry_each_cacheable_code() {
+        let cases: &[(&[u8], u16)] = &[
+            (b"220 article\r\n", 220),
+            (b"221 head\r\n", 221),
+            (b"222 body\r\n", 222),
+            (b"223 stat\r\n", 223),
+            (b"430 missing\r\n", 430),
+        ];
+        for (buf, expected) in cases {
+            let entry = HybridArticleEntry::new(buf.to_vec())
+                .unwrap_or_else(|| panic!("should accept code {}", expected));
+            assert_eq!(entry.status_code().unwrap().as_u16(), *expected);
+        }
+    }
+
+    #[test]
+    fn test_entry_rejects_non_cacheable_nntp_codes() {
+        // These are valid NNTP status codes but not cacheable
+        for code in [200, 201, 211, 411, 480, 500, 502] {
+            let buf = format!("{} response\r\n", code).into_bytes();
+            assert!(
+                HybridArticleEntry::new(buf).is_none(),
+                "code {} should be rejected",
+                code
+            );
+        }
+    }
+
+    // =========================================================================
+    // Code encode/decode roundtrip with enum
+    // =========================================================================
+
+    #[test]
+    fn test_code_encode_decode_roundtrip_article() {
+        let entry =
+            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
+                .unwrap();
+        let mut buf = Vec::new();
+        entry.encode(&mut buf).unwrap();
+        let decoded = HybridArticleEntry::decode(&mut buf.as_slice()).unwrap();
+
+        assert_eq!(decoded.status_code().unwrap().as_u16(), 220);
+        assert_eq!(decoded.buffer(), entry.buffer());
+    }
+
+    #[test]
+    fn test_code_encode_decode_roundtrip_all_codes() {
+        let buffers: &[&[u8]] = &[
+            b"220 article\r\n",
+            b"221 head\r\n",
+            b"222 body\r\n",
+            b"223 stat\r\n",
+            b"430 missing\r\n",
+        ];
+        for raw in buffers {
+            let entry = HybridArticleEntry::new(raw.to_vec()).unwrap();
+            let mut encoded = Vec::new();
+            entry.encode(&mut encoded).unwrap();
+            let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
+            assert_eq!(
+                decoded.status_code().unwrap().as_u16(),
+                entry.status_code().unwrap().as_u16()
+            );
+            assert_eq!(decoded.buffer(), entry.buffer());
+        }
+    }
+
+    #[test]
+    fn test_code_decode_rejects_invalid_status() {
+        // Hand-craft encoded bytes with an invalid status code (999)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&999u16.to_le_bytes()); // invalid code
+        buf.extend_from_slice(&[0u8; 2]); // checked + missing
+        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        buf.push(0); // tier
+        buf.extend_from_slice(&5u32.to_le_bytes()); // len
+        buf.extend_from_slice(b"hello"); // buffer
+
+        let result = HybridArticleEntry::decode(&mut buf.as_slice());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_code_encode_decode_preserves_tier() {
+        let entry = HybridArticleEntry::with_tier(b"220 article\r\n".to_vec(), 3).unwrap();
+        assert_eq!(entry.tier(), 3);
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
+        assert_eq!(decoded.tier(), 3);
+    }
+
+    #[test]
+    fn test_code_encode_decode_preserves_availability() {
+        let mut entry = HybridArticleEntry::new(b"220 ok\r\n".to_vec()).unwrap();
+        entry.record_backend_has(BackendId::from_index(0));
+        entry.record_backend_missing(BackendId::from_index(2));
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
+
+        assert!(decoded.should_try_backend(BackendId::from_index(0)));
+        assert!(decoded.should_try_backend(BackendId::from_index(1)));
+        assert!(!decoded.should_try_backend(BackendId::from_index(2)));
+    }
+
+    #[test]
+    fn test_code_estimated_size() {
+        let entry = HybridArticleEntry::new(b"220 article\r\n".to_vec()).unwrap();
+        let expected = 2 + 2 + 8 + 1 + 4 + entry.buffer().len();
+        assert_eq!(entry.estimated_size(), expected);
+    }
+
+    // =========================================================================
+    // is_complete_article with enum
+    // =========================================================================
+
+    #[test]
+    fn test_is_complete_article_220() {
+        let entry =
+            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
+                .unwrap();
+        assert!(entry.is_complete_article());
+    }
+
+    #[test]
+    fn test_is_complete_article_222() {
+        let entry =
+            HybridArticleEntry::new(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec()).unwrap();
+        assert!(entry.is_complete_article());
+    }
+
+    #[test]
+    fn test_is_complete_article_false_for_head() {
+        let entry =
+            HybridArticleEntry::new(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec()).unwrap();
+        assert!(!entry.is_complete_article());
+    }
+
+    #[test]
+    fn test_is_complete_article_false_for_stat() {
+        let entry = HybridArticleEntry::new(b"223 0 <t@x>\r\n".to_vec()).unwrap();
+        assert!(!entry.is_complete_article());
+    }
+
+    #[test]
+    fn test_is_complete_article_false_for_430() {
+        let entry = HybridArticleEntry::new(b"430 not found\r\n".to_vec()).unwrap();
+        assert!(!entry.is_complete_article());
+    }
+
+    #[test]
+    fn test_is_complete_article_false_for_too_small_buffer() {
+        // 220 with buffer too small (< 30 bytes)
+        let entry = HybridArticleEntry::new(b"220 ok\r\n.\r\n".to_vec()).unwrap();
+        assert!(!entry.is_complete_article());
+    }
+
+    // =========================================================================
+    // response_for_command with enum
+    // =========================================================================
+
+    #[test]
+    fn test_response_for_command_stat_from_220() {
+        let entry =
+            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
+                .unwrap();
+        let resp = entry
+            .response_for_command("STAT", "<t@x>")
+            .expect("should serve STAT");
+        assert_eq!(resp, b"223 0 <t@x>\r\n");
+    }
+
+    #[test]
+    fn test_response_for_command_stat_from_221() {
+        let entry =
+            HybridArticleEntry::new(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec()).unwrap();
+        let resp = entry
+            .response_for_command("STAT", "<t@x>")
+            .expect("should serve STAT from head");
+        assert_eq!(resp, b"223 0 <t@x>\r\n");
+    }
+
+    #[test]
+    fn test_response_for_command_stat_from_222() {
+        let entry =
+            HybridArticleEntry::new(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec()).unwrap();
+        let resp = entry
+            .response_for_command("STAT", "<t@x>")
+            .expect("should serve STAT from body");
+        assert_eq!(resp, b"223 0 <t@x>\r\n");
+    }
+
+    #[test]
+    fn test_response_for_command_stat_not_from_430() {
+        let entry = HybridArticleEntry::new(b"430 not found\r\n".to_vec()).unwrap();
+        assert!(entry.response_for_command("STAT", "<t@x>").is_none());
+    }
+
+    #[test]
+    fn test_response_for_command_article_direct() {
+        let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
+        let entry = HybridArticleEntry::new(buf.clone()).unwrap();
+        let resp = entry
+            .response_for_command("ARTICLE", "<t@x>")
+            .expect("should serve ARTICLE");
+        assert_eq!(resp, buf);
+    }
+
+    #[test]
+    fn test_response_for_command_body_from_220() {
+        let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
+        let entry = HybridArticleEntry::new(buf.clone()).unwrap();
+        let resp = entry
+            .response_for_command("BODY", "<t@x>")
+            .expect("220 can serve BODY");
+        assert_eq!(resp, buf);
+    }
+
+    #[test]
+    fn test_response_for_command_head_from_220() {
+        let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
+        let entry = HybridArticleEntry::new(buf.clone()).unwrap();
+        let resp = entry
+            .response_for_command("HEAD", "<t@x>")
+            .expect("220 can serve HEAD");
+        assert_eq!(resp, buf);
+    }
+
+    #[test]
+    fn test_response_for_command_body_cannot_serve_article() {
+        let entry =
+            HybridArticleEntry::new(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec()).unwrap();
+        assert!(entry.response_for_command("ARTICLE", "<t@x>").is_none());
+    }
+
+    #[test]
+    fn test_response_for_command_head_cannot_serve_body() {
+        let entry =
+            HybridArticleEntry::new(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec()).unwrap();
+        assert!(entry.response_for_command("BODY", "<t@x>").is_none());
+    }
+
+    #[test]
+    fn test_response_for_command_unknown_verb() {
+        let entry =
+            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
+                .unwrap();
+        assert!(entry.response_for_command("LIST", "<t@x>").is_none());
+        assert!(entry.response_for_command("GROUP", "<t@x>").is_none());
+        assert!(entry.response_for_command("QUIT", "<t@x>").is_none());
+    }
+
+    // =========================================================================
+    // matches_command_type_verb with enum
+    // =========================================================================
+
+    #[test]
+    fn test_matches_command_type_verb_stat_for_all_content_codes() {
+        // STAT works for 220, 221, 222 but NOT 223 or 430
+        for buf in [&b"220 ok\r\n"[..], b"221 ok\r\n", b"222 ok\r\n"] {
+            let entry = HybridArticleEntry::new(buf.to_vec()).unwrap();
+            assert!(
+                entry.matches_command_type_verb("STAT"),
+                "STAT should match for {}xx entry",
+                buf[0] - b'0'
+            );
+        }
+
+        // 223 and 430 do NOT match STAT (or anything else)
+        let stat_entry = HybridArticleEntry::new(b"223 stat\r\n".to_vec()).unwrap();
+        assert!(!stat_entry.matches_command_type_verb("STAT"));
+
+        let missing_entry = HybridArticleEntry::new(b"430 missing\r\n".to_vec()).unwrap();
+        assert!(!missing_entry.matches_command_type_verb("STAT"));
+    }
+
+    #[test]
+    fn test_matches_command_type_verb_430_matches_nothing() {
+        let entry = HybridArticleEntry::new(b"430 missing\r\n".to_vec()).unwrap();
+        assert!(!entry.matches_command_type_verb("ARTICLE"));
+        assert!(!entry.matches_command_type_verb("HEAD"));
+        assert!(!entry.matches_command_type_verb("BODY"));
+        assert!(!entry.matches_command_type_verb("STAT"));
+    }
+
+    #[test]
+    fn test_matches_command_type_verb_223_matches_nothing() {
+        let entry = HybridArticleEntry::new(b"223 stat\r\n".to_vec()).unwrap();
+        assert!(!entry.matches_command_type_verb("ARTICLE"));
+        assert!(!entry.matches_command_type_verb("HEAD"));
+        assert!(!entry.matches_command_type_verb("BODY"));
+        assert!(!entry.matches_command_type_verb("STAT"));
+    }
+
+    #[test]
+    fn test_with_tier_sets_tier() {
+        let entry = HybridArticleEntry::with_tier(b"220 ok\r\n".to_vec(), 5).unwrap();
+        assert_eq!(entry.tier(), 5);
+    }
+
+    #[test]
+    fn test_with_tier_zero_default() {
+        let entry = HybridArticleEntry::new(b"220 ok\r\n".to_vec()).unwrap();
+        assert_eq!(entry.tier(), 0);
+    }
+
+    #[test]
+    fn test_with_tier_rejects_invalid_code() {
+        assert!(HybridArticleEntry::with_tier(b"999 bad\r\n".to_vec(), 0).is_none());
     }
 }
