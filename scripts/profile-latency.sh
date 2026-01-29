@@ -42,8 +42,8 @@ fi
 
 # Resolve binary name
 case "$BIN" in
-    tui) BINARY="$PROJECT_DIR/target/release/nntp-proxy-tui" ;;
-    cli) BINARY="$PROJECT_DIR/target/release/nntp-proxy" ;;
+    tui) BINARY="$PROJECT_DIR/target/profiling/nntp-proxy-tui" ;;
+    cli) BINARY="$PROJECT_DIR/target/profiling/nntp-proxy" ;;
     *)   BINARY="$BIN" ;;
 esac
 
@@ -54,7 +54,7 @@ sudo chmod -R a+rx /sys/kernel/tracing 2>/dev/null || true
 sudo chmod -R a+rx /sys/kernel/debug/tracing 2>/dev/null || true
 
 # Build with profiling flags
-RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --release
+RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling
 
 echo "=== Latency Profile Mode: $MODE ==="
 echo ""
@@ -108,10 +108,7 @@ case "$MODE" in
 
     OFFCPU_METHOD=""
 
-    if command -v bpftrace &> /dev/null; then
-      echo "Using bpftrace for off-CPU profiling..."
-      OFFCPU_METHOD="bpftrace"
-    elif perf record -e sched:sched_switch -a -- sleep 0.01 2>/dev/null; then
+    if perf record -e sched:sched_switch -a -- sleep 0.01 2>/dev/null; then
       rm -f perf.data
       echo "Using perf sched:sched_switch..."
       OFFCPU_METHOD="perf-sched"
@@ -122,7 +119,7 @@ case "$MODE" in
     else
       echo "Error: No off-CPU profiling method available"
       echo ""
-      echo "Try installing bpftrace, or fix perf permissions:"
+      echo "Try fixing perf permissions:"
       echo "  sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'"
       echo "  sudo chmod -R a+rx /sys/kernel/tracing"
       exit 1
@@ -130,11 +127,6 @@ case "$MODE" in
 
     set +e
     case "$OFFCPU_METHOD" in
-      bpftrace)
-        perf record -e sched:sched_switch -g --call-graph fp -F 997 -o perf-offcpu.data \
-          "$BINARY" "${EXTRA_ARGS[@]}" || true
-        ;;
-
       perf-sched)
         "$BINARY" "${EXTRA_ARGS[@]}" &
         APP_PID=$!

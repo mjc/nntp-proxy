@@ -105,3 +105,12 @@ strip = true           # Strip symbols for even smaller size
 lto = true             # Full LTO for better optimization and much smaller binaries (note: increases build time ~10x)
 codegen-units = 1      # Single codegen unit for better optimization
 overflow-checks = true # Keep overflow checks for safety with untrusted network data
+
+[profile.profiling]
+inherits = "release"
+debug = 2              # Full DWARF debuginfo for accurate flamegraphs
+strip = false
+
+[profile.bench]
+inherits = "release"
+debug = 2              # Full debuginfo so benchmark flamegraphs resolve symbols

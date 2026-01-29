@@ -30,6 +30,10 @@ perf-offcpu.data*
 strace.log
 cache-config.toml
 
+# Heap profiling artifacts
+heaptrack.*
+massif.out.*
+
 # Release binaries
 /release/
 .env

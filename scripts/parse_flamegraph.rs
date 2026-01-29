@@ -3,7 +3,6 @@ use std::env;
 use std::fs;
 use std::io;
 
-#[allow(dead_code)]
 struct Entry {
     name: String,
     samples: u64,
@@ -21,12 +20,14 @@ fn main() -> io::Result<()> {
         eprintln!("  search <pattern>   Search for functions matching pattern");
         eprintln!("  syscalls           Show syscall breakdown");
         eprintln!("  summary            Show categorized summary");
+        eprintln!("  diff <other.svg>   Compare two flamegraphs (show gained/lost CPU)");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} flamegraph.svg top 20", args[0]);
         eprintln!("  {} flamegraph.svg search foyer", args[0]);
         eprintln!("  {} flamegraph.svg syscalls", args[0]);
         eprintln!("  {} flamegraph.svg summary", args[0]);
+        eprintln!("  {} before.svg diff after.svg", args[0]);
         std::process::exit(1);
     }
 
@@ -51,6 +52,18 @@ fn main() -> io::Result<()> {
         }
         "summary" => {
             cmd_summary(&entries);
+        }
+        "diff" => {
+            let other_path = match args.get(3) {
+                Some(p) => p,
+                None => {
+                    eprintln!("Usage: {} <before.svg> diff <after.svg>", args[0]);
+                    std::process::exit(1);
+                }
+            };
+            let other_content = fs::read_to_string(other_path)?;
+            let other_entries = parse_entries(&other_content);
+            cmd_diff(&entries, &other_entries);
         }
         _ => {
             eprintln!("Unknown command: {}", command);
@@ -100,8 +113,8 @@ fn parse_title(title: &str) -> Option<(String, u64, f64)> {
 
 fn cmd_top(entries: &[Entry], n: usize, min_pct: f64) {
     println!("Top {} functions (>= {:.1}%):\n", n, min_pct);
-    println!("{:>7}  {}", "%", "Function");
-    println!("{}", "-".repeat(80));
+    println!("{:>7} {:>10}  {}", "%", "samples", "Function");
+    println!("{}", "-".repeat(90));
 
     let mut shown = 0;
     let mut total = 0.0;
@@ -114,36 +127,36 @@ fn cmd_top(entries: &[Entry], n: usize, min_pct: f64) {
             break;
         }
 
-        let display_name = truncate_name(&e.name, 70);
-        println!("{:>6.2}%  {}", e.percent, display_name);
+        let display_name = truncate_name(&e.name, 65);
+        println!("{:>6.2}% {:>10}  {}", e.percent, e.samples, display_name);
         total += e.percent;
         shown += 1;
     }
 
-    println!("{}", "-".repeat(80));
-    println!("{:>6.2}%  Total ({} functions shown)", total, shown);
+    println!("{}", "-".repeat(90));
+    println!("{:>6.2}%             Total ({} functions shown)", total, shown);
 }
 
 fn cmd_search(entries: &[Entry], pattern: &str) {
     let pattern_lower = pattern.to_lowercase();
     println!("Functions matching '{}':\n", pattern);
-    println!("{:>7}  {}", "%", "Function");
-    println!("{}", "-".repeat(80));
+    println!("{:>7} {:>10}  {}", "%", "samples", "Function");
+    println!("{}", "-".repeat(90));
 
     let mut total = 0.0;
     let mut count = 0;
 
     for e in entries {
         if e.name.to_lowercase().contains(&pattern_lower) {
-            let display_name = truncate_name(&e.name, 70);
-            println!("{:>6.2}%  {}", e.percent, display_name);
+            let display_name = truncate_name(&e.name, 65);
+            println!("{:>6.2}% {:>10}  {}", e.percent, e.samples, display_name);
             total += e.percent;
             count += 1;
         }
     }
 
-    println!("{}", "-".repeat(80));
-    println!("{:>6.2}%  Total ({} matches)", total, count);
+    println!("{}", "-".repeat(90));
+    println!("{:>6.2}%             Total ({} matches)", total, count);
 }
 
 fn cmd_syscalls(entries: &[Entry]) {
@@ -214,6 +227,117 @@ fn cmd_summary(entries: &[Entry]) {
             }
             println!();
         }
+    }
+}
+
+fn cmd_diff(before: &[Entry], after: &[Entry]) {
+    // Build maps: function name -> (samples, percent)
+    let before_map: HashMap<&str, (u64, f64)> = before
+        .iter()
+        .map(|e| (e.name.as_str(), (e.samples, e.percent)))
+        .collect();
+    let after_map: HashMap<&str, (u64, f64)> = after
+        .iter()
+        .map(|e| (e.name.as_str(), (e.samples, e.percent)))
+        .collect();
+
+    // Collect all function names
+    let mut all_names: Vec<&str> = Vec::new();
+    for e in before {
+        all_names.push(&e.name);
+    }
+    for e in after {
+        if !before_map.contains_key(e.name.as_str()) {
+            all_names.push(&e.name);
+        }
+    }
+
+    // Compute deltas
+    struct Delta<'a> {
+        name: &'a str,
+        before_pct: f64,
+        after_pct: f64,
+        diff_pct: f64,
+        before_samples: u64,
+        after_samples: u64,
+    }
+
+    let mut deltas: Vec<Delta> = Vec::new();
+    for name in &all_names {
+        let (bs, bp) = before_map.get(name).copied().unwrap_or((0, 0.0));
+        let (a_s, ap) = after_map.get(name).copied().unwrap_or((0, 0.0));
+        let diff = ap - bp;
+        if diff.abs() >= 0.01 {
+            deltas.push(Delta {
+                name,
+                before_pct: bp,
+                after_pct: ap,
+                diff_pct: diff,
+                before_samples: bs,
+                after_samples: a_s,
+            });
+        }
+    }
+
+    // Sort by absolute delta descending
+    deltas.sort_by(|a, b| {
+        b.diff_pct
+            .abs()
+            .partial_cmp(&a.diff_pct.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Print regressions (gained CPU)
+    let regressions: Vec<_> = deltas.iter().filter(|d| d.diff_pct > 0.0).collect();
+    let improvements: Vec<_> = deltas.iter().filter(|d| d.diff_pct < 0.0).collect();
+
+    println!("Flamegraph diff: before vs after\n");
+
+    if !regressions.is_empty() {
+        println!("REGRESSIONS (gained CPU):\n");
+        println!(
+            "{:>8} {:>8} {:>8}  {:>10} {:>10}  {}",
+            "before%", "after%", "delta%", "before_n", "after_n", "Function"
+        );
+        println!("{}", "-".repeat(100));
+        for d in regressions.iter().take(30) {
+            let display_name = truncate_name(d.name, 42);
+            println!(
+                "{:>7.2}% {:>7.2}% {:>+7.2}%  {:>10} {:>10}  {}",
+                d.before_pct, d.after_pct, d.diff_pct, d.before_samples, d.after_samples, display_name
+            );
+        }
+        println!();
+    }
+
+    if !improvements.is_empty() {
+        println!("IMPROVEMENTS (lost CPU):\n");
+        println!(
+            "{:>8} {:>8} {:>8}  {:>10} {:>10}  {}",
+            "before%", "after%", "delta%", "before_n", "after_n", "Function"
+        );
+        println!("{}", "-".repeat(100));
+        for d in improvements.iter().take(30) {
+            let display_name = truncate_name(d.name, 42);
+            println!(
+                "{:>7.2}% {:>7.2}% {:>+7.2}%  {:>10} {:>10}  {}",
+                d.before_pct, d.after_pct, d.diff_pct, d.before_samples, d.after_samples, display_name
+            );
+        }
+        println!();
+    }
+
+    if regressions.is_empty() && improvements.is_empty() {
+        println!("No significant differences found (threshold: 0.01%).");
+    } else {
+        let total_regression: f64 = regressions.iter().map(|d| d.diff_pct).sum();
+        let total_improvement: f64 = improvements.iter().map(|d| d.diff_pct).sum();
+        println!(
+            "Summary: {:>+.2}% regressions, {:>+.2}% improvements ({} functions changed)",
+            total_regression,
+            total_improvement,
+            deltas.len()
+        );
     }
 }
 

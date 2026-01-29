@@ -10,32 +10,55 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-BIN="${1:-tui}"
-shift 2>/dev/null || true
-EXTRA_ARGS=("$@")
+ATTACH_PID=""
+BIN="tui"
+EXTRA_ARGS=()
 
-if [ "$BIN" = "-h" ] || [ "$BIN" = "--help" ]; then
-    echo "Usage: $0 [BIN] [ARGS...]"
-    echo ""
-    echo "Profile nntp-proxy CPU usage"
-    echo ""
-    echo "Arguments:"
-    echo "  BIN       Which binary to profile: tui, cli, or a path (default: tui)"
-    echo "  ARGS...   Extra arguments passed to the binary"
-    echo ""
-    echo "Examples:"
-    echo "  ./scripts/profile.sh tui"
-    echo "  ./scripts/profile.sh tui -c config.toml"
-    echo "  ./scripts/profile.sh cli -c config.toml"
-    echo ""
-    echo "Press 'q' in the TUI (or Ctrl-C for CLI) to stop and generate flamegraph.svg"
-    exit 0
-fi
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            echo "Usage: $0 [--pid PID] [BIN] [ARGS...]"
+            echo ""
+            echo "Profile nntp-proxy CPU usage"
+            echo ""
+            echo "Options:"
+            echo "  --pid PID   Attach to an already-running process instead of launching one"
+            echo ""
+            echo "Arguments:"
+            echo "  BIN       Which binary to profile: tui, cli, or a path (default: tui)"
+            echo "  ARGS...   Extra arguments passed to the binary"
+            echo ""
+            echo "Examples:"
+            echo "  ./scripts/profile.sh tui"
+            echo "  ./scripts/profile.sh tui -c config.toml"
+            echo "  ./scripts/profile.sh cli -c config.toml"
+            echo "  ./scripts/profile.sh --pid 12345"
+            echo ""
+            echo "Press 'q' in the TUI (or Ctrl-C for CLI) to stop and generate flamegraph.svg"
+            exit 0
+            ;;
+        --pid)
+            ATTACH_PID="$2"
+            shift 2
+            ;;
+        *)
+            if [ -z "${BIN_SET:-}" ]; then
+                BIN="$1"
+                BIN_SET=1
+                shift
+            else
+                EXTRA_ARGS+=("$1")
+                shift
+            fi
+            ;;
+    esac
+done
 
 # Resolve binary name
 case "$BIN" in
-    tui) BINARY="$PROJECT_DIR/target/release/nntp-proxy-tui" ;;
-    cli) BINARY="$PROJECT_DIR/target/release/nntp-proxy" ;;
+    tui) BINARY="$PROJECT_DIR/target/profiling/nntp-proxy-tui" ;;
+    cli) BINARY="$PROJECT_DIR/target/profiling/nntp-proxy" ;;
     *)   BINARY="$BIN" ;;
 esac
 
@@ -49,16 +72,27 @@ fi
 echo 0 | sudo tee /proc/sys/kernel/kptr_restrict > /dev/null
 echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid > /dev/null
 
-# Build with native CPU + frame pointers
-RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --release
+# Set terminal title for tmux/terminal identification
+printf '\033]0;perf: nntp-proxy CPU\007'
 
-echo "Profiling: $BINARY ${EXTRA_ARGS[*]}"
-echo "Stop the proxy (q in TUI, Ctrl-C for CLI) to generate flamegraph."
-echo ""
+# Build with native CPU + frame pointers
+if [ -z "$ATTACH_PID" ]; then
+    RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling
+fi
 
 # Record using frame pointers
 set +e
-perf record -g --call-graph fp -F 997 "$BINARY" "${EXTRA_ARGS[@]}"
+if [ -n "$ATTACH_PID" ]; then
+    echo "Attaching to PID $ATTACH_PID..."
+    echo "Press Ctrl-C to stop recording and generate flamegraph."
+    echo ""
+    perf record -g --call-graph fp -F 997 -p "$ATTACH_PID"
+else
+    echo "Profiling: $BINARY ${EXTRA_ARGS[*]}"
+    echo "Stop the proxy (q in TUI, Ctrl-C for CLI) to generate flamegraph."
+    echo ""
+    perf record -g --call-graph fp -F 997 "$BINARY" "${EXTRA_ARGS[@]}"
+fi
 set -e
 
 echo ""
