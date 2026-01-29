@@ -532,12 +532,19 @@ impl HybridArticleCache {
         // Block size of 768KB matches average article size (~750KB)
         // This minimizes read amplification when reading individual articles
 
-        // Configure dedicated runtime for foyer disk I/O to avoid blocking the main runtime
-        // This is critical for performance - foyer warns about latency spikes without it
-        let runtime_options = RuntimeOptions::Unified(TokioRuntimeOptions {
-            worker_threads: 4,
-            max_blocking_threads: 8,
-        });
+        // Configure separate read/write runtimes for foyer disk I/O.
+        // With WriteOnInsertion, every cache insert triggers a background disk write.
+        // Separating runtimes prevents write flushes from starving read I/O under load.
+        let runtime_options = RuntimeOptions::Separated {
+            read_runtime_options: TokioRuntimeOptions {
+                worker_threads: 4,
+                max_blocking_threads: 8,
+            },
+            write_runtime_options: TokioRuntimeOptions {
+                worker_threads: 2,
+                max_blocking_threads: 4,
+            },
+        };
 
         let mut builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
