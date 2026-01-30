@@ -2,10 +2,11 @@
 //!
 //! Provides a shared pattern for retrying operations that may fail due to stale
 //! pooled connections. Both command execution and precheck use this pattern:
-//! call once → on error → log → retry once → return original error if retry fails.
+//! call once → on error → log → jittered sleep → retry once → return original error if retry fails.
 //!
-//! The optional sleep hook between attempts is a no-op today but provides a clean
-//! insertion point for jittered backoff (see `feature/retry-backoff-jitter`).
+//! The jittered delay (10–59ms) prevents thundering-herd retries when multiple
+//! connections go stale simultaneously (e.g. backend restart). Fail fast after
+//! one retry — let the router try a different backend.
 //!
 //! Uses a macro rather than a generic async function because callsites capture
 //! `&mut` references that cannot escape `FnMut` closure bodies.
@@ -36,8 +37,11 @@ macro_rules! retry_once_on_stale {
                     $label
                 );
 
-                // Future: insert jittered sleep here
-                // tokio::time::sleep(Duration::from_millis(10 + rand::random::<u64>() % 50)).await;
+                // Jittered backoff: 10–59ms prevents thundering-herd retries
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    10 + rand::random::<u64>() % 50,
+                ))
+                .await;
 
                 match $expr {
                     Ok(val) => Ok(val),

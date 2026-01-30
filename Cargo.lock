@@ -1394,6 +1394,7 @@ dependencies = [
  "nix",
  "nutype",
  "proptest",
+ "rand 0.8.5",
  "ratatui",
  "rustls",
  "rustls-native-certs",
