@@ -26,7 +26,7 @@ pub mod buffer {
 
     /// Number of buffers in the buffer pool
     /// Sized for ~50 concurrent connections with a single buffer per connection
-    /// Total memory: 50 × 724KB ≈ 36MB
+    /// Total memory: 50 × 724KB ≈ 35MB
     pub const POOL_COUNT: usize = 50;
 
     /// BufReader capacity for client command parsing (64KB)
