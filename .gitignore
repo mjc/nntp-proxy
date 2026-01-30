@@ -37,3 +37,4 @@ massif.out.*
 # Release binaries
 /release/
 .env
+DEEP_DIVE_ANALYSIS.md
