@@ -7,12 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-mod test_helpers;
-
+use crate::test_helpers::{MockNntpServer, create_test_server_config};
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::config::{ClientAuth, Config, RoutingMode, UserCredentials};
-use test_helpers::{MockNntpServer, create_test_server_config};
 
 #[tokio::test]
 async fn test_quit_command_integration() -> Result<()> {

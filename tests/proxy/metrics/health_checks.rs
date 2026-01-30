@@ -15,8 +15,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-mod test_helpers;
-
 /// Test that a healthy connection passes TCP alive check
 #[tokio::test]
 async fn test_tcp_alive_check_healthy_connection() -> Result<()> {

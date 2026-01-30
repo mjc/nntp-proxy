@@ -7,14 +7,12 @@
 //!
 //! This prevents the "overnight 430" bug where all articles fail after idle periods.
 
-mod test_helpers;
-
+use crate::test_helpers::{create_test_server_config, get_available_port, wait_for_server};
 use anyhow::Result;
 use nntp_proxy::{Cache, Config, NntpProxy, RoutingMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use test_helpers::{create_test_server_config, get_available_port, wait_for_server};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;

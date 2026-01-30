@@ -3,8 +3,6 @@
 //! These tests verify that authentication cannot be bypassed and that
 //! invalid credentials never result in authenticated state.
 
-mod test_helpers;
-
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::AuthAction;
 use std::sync::Arc;
@@ -12,7 +10,7 @@ use std::sync::Arc;
 /// Test that invalid credentials are NEVER accepted
 #[tokio::test]
 async fn test_invalid_credentials_rejected() {
-    use test_helpers::create_test_auth_handler_with;
+    use crate::test_helpers::create_test_auth_handler_with;
 
     let handler = create_test_auth_handler_with("correctuser", "correctpass");
 
@@ -87,7 +85,7 @@ async fn test_valid_credentials_accepted() {
 /// Test that AUTHINFO PASS without prior AUTHINFO USER is rejected
 #[tokio::test]
 async fn test_password_without_username_rejected() {
-    use test_helpers::create_test_auth_handler;
+    use crate::test_helpers::create_test_auth_handler;
 
     let handler = create_test_auth_handler();
 
@@ -109,7 +107,7 @@ async fn test_password_without_username_rejected() {
 /// Test that authentication is case-sensitive
 #[tokio::test]
 async fn test_credentials_case_sensitive() {
-    use test_helpers::create_test_auth_handler_with;
+    use crate::test_helpers::create_test_auth_handler_with;
 
     let handler = create_test_auth_handler_with("User", "Pass");
 
@@ -153,7 +151,7 @@ async fn test_credentials_case_sensitive() {
 /// Test that empty credentials don't bypass authentication
 #[tokio::test]
 async fn test_empty_credentials_rejected() {
-    use test_helpers::create_test_auth_handler;
+    use crate::test_helpers::create_test_auth_handler;
 
     let handler = create_test_auth_handler();
 
@@ -230,7 +228,7 @@ async fn test_auth_success_flag_reliability() {
 /// Test that RequestPassword never returns auth_success=true
 #[tokio::test]
 async fn test_request_password_never_authenticates() {
-    use test_helpers::create_test_auth_handler;
+    use crate::test_helpers::create_test_auth_handler;
 
     let handler = create_test_auth_handler();
 
@@ -249,7 +247,7 @@ async fn test_request_password_never_authenticates() {
 /// Test disabled auth accepts anything
 #[tokio::test]
 async fn test_disabled_auth_accepts_all() {
-    use test_helpers::create_test_auth_handler_disabled;
+    use crate::test_helpers::create_test_auth_handler_disabled;
 
     let handler = create_test_auth_handler_disabled();
 
@@ -271,7 +269,7 @@ async fn test_disabled_auth_accepts_all() {
 /// Test that validate() method matches handle_auth_command behavior
 #[tokio::test]
 async fn test_validate_matches_handle_auth_command() {
-    use test_helpers::create_test_auth_handler;
+    use crate::test_helpers::create_test_auth_handler;
 
     let handler = create_test_auth_handler();
 

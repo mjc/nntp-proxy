@@ -10,12 +10,11 @@
 
 use std::sync::Arc;
 
-mod test_helpers;
+use crate::test_helpers::{create_test_config_with_auth, get_available_port, spawn_mock_server};
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::config::RoutingMode;
 use nntp_proxy::session::ClientSession;
-use test_helpers::{create_test_config_with_auth, get_available_port, spawn_mock_server};
 
 #[tokio::test]
 async fn test_auth_handler_disabled_by_default() {
@@ -248,8 +247,10 @@ async fn test_command_classification_for_stateless() {
 
 #[tokio::test]
 async fn test_session_with_auth_handler() {
+    use crate::test_helpers::{
+        create_test_addr, create_test_auth_handler_with, create_test_buffer_pool,
+    };
     use nntp_proxy::metrics::MetricsCollector;
-    use test_helpers::{create_test_addr, create_test_auth_handler_with, create_test_buffer_pool};
 
     let backend_port = get_available_port().await.unwrap();
     let _handle = spawn_mock_server(backend_port, "Mock Backend");
@@ -265,10 +266,10 @@ async fn test_session_with_auth_handler() {
 
 #[tokio::test]
 async fn test_session_with_disabled_auth() {
-    use nntp_proxy::metrics::MetricsCollector;
-    use test_helpers::{
+    use crate::test_helpers::{
         create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
     };
+    use nntp_proxy::metrics::MetricsCollector;
 
     let backend_port = get_available_port().await.unwrap();
     let _handle = spawn_mock_server(backend_port, "Mock Backend");
@@ -367,7 +368,7 @@ async fn test_multiple_auth_handlers_independent() {
 
 #[tokio::test]
 async fn test_auth_handler_clone_via_arc() {
-    use test_helpers::create_test_auth_handler;
+    use crate::test_helpers::create_test_auth_handler;
 
     let handler = create_test_auth_handler();
     let handler_clone = handler.clone();
@@ -379,8 +380,10 @@ async fn test_auth_handler_clone_via_arc() {
 
 #[tokio::test]
 async fn test_session_builder_with_auth_handler() {
+    use crate::test_helpers::{
+        create_test_addr, create_test_auth_handler, create_test_buffer_pool,
+    };
     use nntp_proxy::metrics::MetricsCollector;
-    use test_helpers::{create_test_addr, create_test_auth_handler, create_test_buffer_pool};
 
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler();
@@ -400,10 +403,10 @@ async fn test_session_builder_with_auth_handler() {
 
 #[tokio::test]
 async fn test_session_builder_with_router_and_auth() {
-    use nntp_proxy::metrics::MetricsCollector;
-    use test_helpers::{
+    use crate::test_helpers::{
         create_test_addr, create_test_auth_handler, create_test_buffer_pool, create_test_router,
     };
+    use nntp_proxy::metrics::MetricsCollector;
 
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler();
@@ -498,7 +501,7 @@ async fn test_auth_case_variations() {
 
 #[tokio::test]
 async fn test_concurrent_auth_handlers() {
-    use test_helpers::create_test_auth_handler_with;
+    use crate::test_helpers::create_test_auth_handler_with;
     use tokio::task::JoinSet;
 
     let handler = create_test_auth_handler_with("shared", "password");
@@ -569,8 +572,8 @@ async fn test_auth_with_null_bytes_in_credentials() {
 
 #[tokio::test]
 async fn test_auth_handler_with_concurrent_requests() {
+    use crate::test_helpers::create_test_auth_handler;
     use nntp_proxy::command::AuthAction;
-    use test_helpers::create_test_auth_handler;
     use tokio::task::JoinSet;
 
     let handler = create_test_auth_handler();

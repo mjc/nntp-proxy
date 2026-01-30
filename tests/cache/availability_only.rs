@@ -7,8 +7,7 @@
 use anyhow::Result;
 use nntp_proxy::RoutingMode;
 
-mod test_helpers;
-use test_helpers::{
+use crate::test_helpers::{
     connect_and_read_greeting, send_article_read_full_response, setup_proxy_with_backends,
 };
 

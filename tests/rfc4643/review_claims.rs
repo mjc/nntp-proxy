@@ -5,8 +5,6 @@
 //! 2. There's no race condition in auth_username (each session has its own)
 //! 3. Uninit buffers with set_len are safe when used with AsyncRead/AsyncWrite
 
-mod test_helpers;
-
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 use std::sync::Arc;
@@ -22,7 +20,7 @@ use tokio::io::AsyncReadExt;
 /// command is still subject to the same authentication check. No bypass occurs.
 #[tokio::test]
 async fn test_reject_commands_dont_bypass_authentication() {
-    use test_helpers::create_test_auth_handler;
+    use crate::test_helpers::create_test_auth_handler;
 
     let auth_handler = create_test_auth_handler();
 
@@ -128,7 +126,7 @@ async fn test_no_auth_username_race_condition() {
         }
     }
 
-    use test_helpers::create_test_auth_handler_with;
+    use crate::test_helpers::create_test_auth_handler_with;
 
     let auth_handler = create_test_auth_handler_with("alice", "secret");
 
@@ -166,7 +164,7 @@ async fn test_no_auth_username_race_condition() {
 /// the username from the most recent AUTHINFO USER command, which is correct behavior.
 #[tokio::test]
 async fn test_auth_attempts_are_serialized_per_connection() {
-    use test_helpers::create_test_auth_handler;
+    use crate::test_helpers::create_test_auth_handler;
 
     let auth_handler = create_test_auth_handler();
 
@@ -286,7 +284,7 @@ async fn test_uninit_buffer_pattern_is_safe() {
 /// Test that the buffer pool pattern is sound even with multiple get/return cycles.
 #[tokio::test]
 async fn test_buffer_pool_safety_across_cycles() {
-    use test_helpers::create_test_buffer_pool;
+    use crate::test_helpers::create_test_buffer_pool;
 
     let pool = create_test_buffer_pool();
 

@@ -10,8 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-mod test_helpers;
-use test_helpers::*;
+use crate::test_helpers::*;
 
 /// Test that per-command routing mode sends exactly one greeting
 #[test]

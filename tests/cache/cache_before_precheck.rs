@@ -23,8 +23,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-mod test_helpers;
-use test_helpers::get_available_port;
+use crate::test_helpers::get_available_port;
 
 /// Count how many times backends are queried
 #[derive(Clone)]

@@ -8,10 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-mod test_helpers;
-
+use crate::test_helpers::{MockNntpServer, create_test_server_config};
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
-use test_helpers::{MockNntpServer, create_test_server_config};
 
 /// Helper to setup proxy with specific routing mode
 async fn setup_proxy_with_mode(
