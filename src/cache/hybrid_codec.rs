@@ -851,4 +851,174 @@ mod tests {
     fn test_with_tier_rejects_invalid_code() {
         assert!(HybridArticleEntry::with_tier(b"999 bad\r\n".to_vec(), 0).is_none());
     }
+
+    // =========================================================================
+    // Property tests for HybridArticleEntry codec
+    // =========================================================================
+
+    #[test]
+    fn prop_hybrid_article_encode_decode_roundtrip_220() {
+        let original = HybridArticleEntry::new(
+            b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
+
+        let mut buffer = Vec::new();
+        original.encode(&mut buffer).unwrap();
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+
+        assert_eq!(original.buffer(), decoded.buffer());
+        assert_eq!(original.tier(), decoded.tier());
+    }
+
+    #[test]
+    fn prop_hybrid_article_encode_decode_roundtrip_221() {
+        let original = HybridArticleEntry::new(
+            b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
+
+        let mut buffer = Vec::new();
+        original.encode(&mut buffer).unwrap();
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+
+        assert_eq!(original.buffer(), decoded.buffer());
+    }
+
+    #[test]
+    fn prop_hybrid_article_encode_decode_roundtrip_222() {
+        let original =
+            HybridArticleEntry::new(b"222 body\r\n\r\nbody content\r\n.\r\n".to_vec()).unwrap();
+
+        let mut buffer = Vec::new();
+        original.encode(&mut buffer).unwrap();
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+
+        assert_eq!(original.buffer(), decoded.buffer());
+    }
+
+    #[test]
+    fn prop_hybrid_article_encode_decode_roundtrip_223() {
+        let original = HybridArticleEntry::new(b"223 stat\r\n.\r\n".to_vec()).unwrap();
+
+        let mut buffer = Vec::new();
+        original.encode(&mut buffer).unwrap();
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+
+        assert_eq!(original.buffer(), decoded.buffer());
+    }
+
+    #[test]
+    fn prop_hybrid_article_encode_decode_roundtrip_430() {
+        let original = HybridArticleEntry::new(b"430 missing\r\n.\r\n".to_vec()).unwrap();
+
+        let mut buffer = Vec::new();
+        original.encode(&mut buffer).unwrap();
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+
+        assert_eq!(original.buffer(), decoded.buffer());
+    }
+
+    #[test]
+    fn prop_hybrid_article_estimated_size_matches_encoded() {
+        let codes: Vec<&[u8]> = vec![
+            b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
+            b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n",
+            b"222 body\r\nbody content\r\n.\r\n",
+            b"223 stat\r\n.\r\n",
+            b"430 missing\r\n.\r\n",
+        ];
+
+        for code in &codes {
+            let entry = HybridArticleEntry::new(code.to_vec()).unwrap();
+            let estimated = entry.estimated_size();
+
+            let mut buffer = Vec::new();
+            entry.encode(&mut buffer).unwrap();
+
+            assert_eq!(
+                estimated,
+                buffer.len(),
+                "estimated_size mismatch for {:?}",
+                std::str::from_utf8(code)
+            );
+        }
+    }
+
+    #[test]
+    fn prop_hybrid_article_decode_rejects_invalid_status_code() {
+        // Create a valid encoding but with an invalid status code
+        let mut buffer = Vec::new();
+
+        // Write invalid status code (500)
+        buffer.extend_from_slice(&500u16.to_le_bytes());
+        // Write dummy header bytes
+        buffer.extend_from_slice(&[0u8, 0u8]);
+        // Write dummy timestamp
+        buffer.extend_from_slice(&0u64.to_le_bytes());
+        // Write dummy tier
+        buffer.push(0u8);
+        // Write dummy length
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let result = HybridArticleEntry::decode(&mut reader);
+
+        assert!(result.is_err(), "Should reject invalid status code 500");
+    }
+
+    #[test]
+    fn prop_hybrid_article_preserves_tier() {
+        for tier in [0u8, 1, 5, 10, 255] {
+            let entry = HybridArticleEntry::with_tier(
+                b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n".to_vec(),
+                tier,
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            entry.encode(&mut buffer).unwrap();
+
+            let mut reader = std::io::Cursor::new(buffer);
+            let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+
+            assert_eq!(tier, decoded.tier(), "Tier mismatch");
+        }
+    }
+
+    #[test]
+    fn prop_hybrid_article_preserves_availability() {
+        let entry = HybridArticleEntry::new(
+            b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
+
+        let mut buffer = Vec::new();
+        entry.encode(&mut buffer).unwrap();
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+
+        // Compare the bitset representation
+        assert_eq!(
+            entry.availability.checked_bits(),
+            decoded.availability.checked_bits(),
+            "Checked bits mismatch"
+        );
+        assert_eq!(
+            entry.availability.missing_bits(),
+            decoded.availability.missing_bits(),
+            "Missing bits mismatch"
+        );
+    }
 }
