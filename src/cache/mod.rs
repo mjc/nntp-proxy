@@ -14,17 +14,18 @@
 //! - [`UnifiedCache`] - Enum that wraps either cache type with a common interface
 
 mod article;
+mod availability;
 pub(crate) mod entry_helpers;
 mod hybrid;
+mod hybrid_codec;
 pub mod ttl;
 
 pub mod mock_hybrid;
 
-pub use article::{ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, MAX_BACKENDS};
-pub use hybrid::{
-    CacheableStatusCode, HybridArticleCache, HybridArticleEntry, HybridCacheConfig,
-    HybridCacheStats,
-};
+pub use article::{ArticleCache, ArticleEntry};
+pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
+pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
+pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 
 use crate::types::{BackendId, MessageId};
 
