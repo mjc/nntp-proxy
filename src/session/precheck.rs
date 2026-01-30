@@ -310,7 +310,7 @@ pub async fn precheck(
         let tier = 0;
         // Construct the entry directly from the data we have, avoiding a redundant
         // cache.get() round-trip after upsert.
-        let entry = ArticleEntry::with_tier(data.clone(), tier);
+        let entry = ArticleEntry::from_arc_with_tier(std::sync::Arc::new(data.clone()), tier);
         owned
             .cache
             .upsert(msg_id.to_owned(), data, backend_id, tier)
