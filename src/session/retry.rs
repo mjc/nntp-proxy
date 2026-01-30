@@ -38,10 +38,8 @@ macro_rules! retry_once_on_stale {
                 );
 
                 // Jittered backoff: 10–59ms prevents thundering-herd retries
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    10 + rand::random::<u64>() % 50,
-                ))
-                .await;
+                let jitter_ms = rand::Rng::gen_range(&mut rand::thread_rng(), 10..60);
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 
                 match $expr {
                     Ok(val) => Ok(val),
@@ -78,7 +76,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_succeeds_on_retry() {
         let counter = AtomicU32::new(0);
         let result = retry_once_on_stale!("test", fallible_op(&counter, 1).await);
@@ -86,7 +84,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_returns_first_error_on_double_failure() {
         let counter = AtomicU32::new(0);
 

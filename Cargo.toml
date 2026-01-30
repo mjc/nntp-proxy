@@ -70,6 +70,7 @@ twox-hash = "2.1.2"
 rand = "0.8"  # Jittered backoff for stale-connection retries
 
 [dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }  # Paused time for deterministic async tests
 tempfile = "3.23"
 serde_json = "1.0"  # For testing serde implementations
 divan = "0.1"  # Modern benchmarking framework
