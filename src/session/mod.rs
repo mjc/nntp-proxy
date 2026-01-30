@@ -174,6 +174,7 @@ pub mod handlers;
 pub mod metrics_ext;
 pub mod mode_state;
 pub mod precheck;
+pub(crate) mod retry;
 pub(crate) mod routing;
 pub mod state;
 pub mod streaming;

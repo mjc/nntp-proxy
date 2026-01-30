@@ -35,6 +35,7 @@
 pub mod args;
 pub mod auth;
 pub mod client;
+pub mod compression;
 pub mod connection_error;
 pub mod formatting;
 pub mod logging;

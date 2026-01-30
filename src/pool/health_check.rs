@@ -128,46 +128,21 @@ pub fn check_tcp_alive(
 ) -> managed::RecycleResult<crate::connection_error::ConnectionError> {
     let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
 
-    match conn {
-        ConnectionStream::Plain(tcp) => {
-            match tcp.try_read(&mut peek_buf) {
-                Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
-                Ok(_) => return Err(HealthCheckError::UnexpectedData.into()),
-                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                    // Clone to preserve original error details and message
-                    return Err(HealthCheckError::TcpError(std::io::Error::new(
-                        e.kind(),
-                        e.to_string(),
-                    ))
-                    .into());
-                }
-                // WouldBlock is the expected case - no data available on idle connection
-                Err(_) => {}
-            }
+    // Check the underlying TCP stream regardless of TLS/compression layers
+    let tcp_stream = conn.underlying_tcp_stream();
+    match tcp_stream.try_read(&mut peek_buf) {
+        Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
+        Ok(_) => {
+            // Data available on TCP socket that we haven't consumed — reject it
+            return Err(HealthCheckError::UnexpectedData.into());
         }
-        ConnectionStream::Tls(tls) => {
-            // For TLS connections, check the underlying TCP socket for readable data
-            // We can't use try_read on TlsStream directly, so we check the inner TCP stream
-            // Only the underlying TCP stream is needed for the health check; TLS state is ignored.
-            let (tcp_stream, _) = tls.get_ref();
-            match tcp_stream.try_read(&mut peek_buf) {
-                Ok(0) => return Err(HealthCheckError::TcpClosed.into()),
-                Ok(_) => {
-                    // Data available on TCP socket - could be TLS records or buffered application data
-                    // Either way, this connection has data we haven't consumed, so reject it
-                    return Err(HealthCheckError::UnexpectedData.into());
-                }
-                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                    return Err(HealthCheckError::TcpError(std::io::Error::new(
-                        e.kind(),
-                        e.to_string(),
-                    ))
-                    .into());
-                }
-                // WouldBlock is the expected case - no data available on idle connection
-                Err(_) => {}
-            }
+        Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+            return Err(
+                HealthCheckError::TcpError(std::io::Error::new(e.kind(), e.to_string())).into(),
+            );
         }
+        // WouldBlock is the expected case - no data available on idle connection
+        Err(_) => {}
     }
 
     Ok(())

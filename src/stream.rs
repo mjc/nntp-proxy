@@ -3,6 +3,7 @@
 //! This module provides abstractions for handling different stream types (TCP, TLS, etc.)
 //! in a unified way. This is preparation for adding SSL/TLS support to backend connections.
 
+use crate::compression::DecompressStream;
 use crate::tls::TlsStream;
 use std::io;
 use std::pin::Pin;
@@ -31,6 +32,10 @@ pub enum ConnectionStream {
     Plain(TcpStream),
     /// TLS-encrypted connection
     Tls(Box<TlsStream<TcpStream>>),
+    /// Compressed plain TCP connection (RFC 8054 / XFEATURE COMPRESS GZIP)
+    CompressedPlain(Box<DecompressStream<TcpStream>>),
+    /// Compressed TLS connection (RFC 8054 / XFEATURE COMPRESS GZIP)
+    CompressedTls(Box<DecompressStream<TlsStream<TcpStream>>>),
 }
 
 impl ConnectionStream {
@@ -50,6 +55,8 @@ impl ConnectionStream {
         match self {
             Self::Plain(_) => "TCP",
             Self::Tls(_) => "TLS",
+            Self::CompressedPlain(_) => "TCP+COMPRESS",
+            Self::CompressedTls(_) => "TLS+COMPRESS",
         }
     }
 
@@ -57,50 +64,57 @@ impl ConnectionStream {
     #[inline]
     #[must_use]
     pub const fn is_encrypted(&self) -> bool {
-        matches!(self, Self::Tls(_))
+        matches!(self, Self::Tls(_) | Self::CompressedTls(_))
     }
 
     /// Returns true if this connection is unencrypted (plain TCP)
     #[inline]
     #[must_use]
     pub const fn is_unencrypted(&self) -> bool {
-        matches!(self, Self::Plain(_))
+        matches!(self, Self::Plain(_) | Self::CompressedPlain(_))
     }
 
-    /// Get a reference to the underlying TCP stream (if plain TCP)
+    /// Returns true if this connection uses wire compression
+    #[inline]
+    #[must_use]
+    pub const fn is_compressed(&self) -> bool {
+        matches!(self, Self::CompressedPlain(_) | Self::CompressedTls(_))
+    }
+
+    /// Get a reference to the underlying TCP stream (if plain, uncompressed TCP)
     ///
-    /// Returns None for TLS streams, as the TCP stream is wrapped.
+    /// Returns None for TLS or compressed streams.
     /// Useful for socket optimization that requires direct TCP access.
     #[must_use]
     pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match self {
             Self::Plain(tcp) => Some(tcp),
-            Self::Tls(_) => None,
+            _ => None,
         }
     }
 
-    /// Get a mutable reference to the underlying TCP stream (if plain TCP)
+    /// Get a mutable reference to the underlying TCP stream (if plain, uncompressed TCP)
     pub fn as_tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
         match self {
             Self::Plain(tcp) => Some(tcp),
-            Self::Tls(_) => None,
+            _ => None,
         }
     }
 
-    /// Get a reference to the TLS stream (if TLS connection)
+    /// Get a reference to the TLS stream (if uncompressed TLS connection)
     #[must_use]
     pub fn as_tls_stream(&self) -> Option<&TlsStream<TcpStream>> {
         match self {
             Self::Tls(tls) => Some(tls.as_ref()),
-            Self::Plain(_) => None,
+            _ => None,
         }
     }
 
-    /// Get a mutable reference to the TLS stream (if TLS connection)
+    /// Get a mutable reference to the TLS stream (if uncompressed TLS connection)
     pub fn as_tls_stream_mut(&mut self) -> Option<&mut TlsStream<TcpStream>> {
         match self {
             Self::Tls(tls) => Some(tls.as_mut()),
-            Self::Plain(_) => None,
+            _ => None,
         }
     }
 
@@ -108,11 +122,14 @@ impl ConnectionStream {
     ///
     /// For plain TCP, returns the stream directly.
     /// For TLS, returns the underlying TCP stream within the TLS wrapper.
+    /// For compressed streams, returns the TCP stream from within the wrapper.
     #[must_use]
     pub fn underlying_tcp_stream(&self) -> &TcpStream {
         match self {
             Self::Plain(tcp) => tcp,
             Self::Tls(tls) => tls.get_ref().0,
+            Self::CompressedPlain(cs) => cs.get_ref(),
+            Self::CompressedTls(cs) => cs.get_ref().get_ref().0,
         }
     }
 }
@@ -126,6 +143,8 @@ impl AsyncRead for ConnectionStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+            Self::CompressedPlain(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+            Self::CompressedTls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -139,6 +158,8 @@ impl AsyncWrite for ConnectionStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+            Self::CompressedPlain(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+            Self::CompressedTls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -146,6 +167,8 @@ impl AsyncWrite for ConnectionStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            Self::CompressedPlain(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            Self::CompressedTls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
         }
     }
 
@@ -153,6 +176,8 @@ impl AsyncWrite for ConnectionStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+            Self::CompressedPlain(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+            Self::CompressedTls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -305,14 +330,10 @@ mod tests {
         let plain_conn = ConnectionStream::plain(stream);
 
         // Match on the enum to ensure Plain variant exists
-        match plain_conn {
-            ConnectionStream::Plain(_) => {
-                // Plain variant works
-            }
-            ConnectionStream::Tls(_) => {
-                panic!("Should be Plain, not Tls");
-            }
-        }
+        assert!(
+            matches!(plain_conn, ConnectionStream::Plain(_)),
+            "Should be Plain variant"
+        );
     }
 
     #[tokio::test]

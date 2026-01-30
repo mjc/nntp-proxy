@@ -4,6 +4,7 @@
 //! response validation, and streaming multiline responses to clients.
 
 use crate::router::{BackendSelector, CommandGuard};
+use crate::session::retry::retry_once_on_stale;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
     is_430_status_code,
@@ -59,26 +60,25 @@ impl ClientSession {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        // Functional retry: try first attempt, on connection error retry once with fresh connection
-        let attempt_result = self
-            .execute_backend_attempt(provider, backend_id, command, buffer)
-            .await;
-
-        let (conn, n, response_code, is_multiline, ttfb, send, recv) = match attempt_result {
-            Ok(result) => result,
-            Err(first_error) => {
-                // First attempt failed - retry once with fresh connection
-                debug!(
-                    "Client {} stale connection to backend {}, retrying with fresh connection",
-                    self.client_addr,
-                    backend_id.as_index()
-                );
-
-                self.execute_backend_attempt(provider, backend_id, command, buffer)
-                    .await
-                    .map_err(|_| first_error)? // On retry failure, guard drops → complete_command
-            }
-        };
+        // Retry once on stale connection (fresh connection on second attempt)
+        let label = format!(
+            "client {} backend {}",
+            self.client_addr,
+            backend_id.as_index()
+        );
+        let (conn, n, response_code, is_multiline, ttfb, send, recv): (
+            _,
+            usize,
+            _,
+            bool,
+            u64,
+            u64,
+            u64,
+        ) = retry_once_on_stale!(
+            label,
+            self.execute_backend_attempt(provider, backend_id, command, buffer)
+                .await
+        )?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
@@ -190,10 +190,13 @@ impl ClientSession {
         }
     }
 
-    /// Execute command on backend and read first chunk
+    /// Execute command on a connection and read first chunk.
+    ///
+    /// Takes `&mut ConnectionStream` (not a pool object) so it can be called
+    /// by both the pool-checkout path and future pipeline workers.
     async fn execute_and_get_first_chunk(
         &self,
-        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        conn: &mut crate::stream::ConnectionStream,
         backend_id: crate::types::BackendId,
         command: &str,
         buffer: &mut crate::pool::PooledBuffer,
@@ -202,7 +205,7 @@ impl ClientSession {
         self.metrics.user_command(self.username().as_deref());
 
         let (response, ttfb, send, recv) =
-            backend::send_command_timed(&mut **pooled_conn, command, buffer).await?;
+            backend::send_command_timed(conn, command, buffer).await?;
 
         // Log any validation warnings
         backend::log_warnings(

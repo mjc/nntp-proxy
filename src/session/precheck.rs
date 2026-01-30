@@ -65,23 +65,13 @@ async fn query_backend(
     // Track pending count for load balancing
     deps.router.mark_backend_pending(backend_id);
 
-    // Functional retry: try once, on error retry with fresh connection
-    let result = execute_backend_query(deps, provider, backend_id, command, multiline).await;
-
-    let query_result = match result {
-        Ok(query_result) => query_result,
-        Err(_first_error) => {
-            tracing::debug!(
-                backend = backend_id.as_index(),
-                "Stale connection detected, retrying with fresh connection"
-            );
-
-            // Retry once with fresh connection
-            execute_backend_query(deps, provider, backend_id, command, multiline)
-                .await
-                .unwrap_or(QueryResult::Error(backend_id))
-        }
-    };
+    // Retry once on stale connection (fresh connection on second attempt)
+    let label = format!("backend {}", backend_id.as_index());
+    let query_result: QueryResult = crate::session::retry::retry_once_on_stale!(
+        label,
+        execute_backend_query(deps, provider, backend_id, command, multiline).await
+    )
+    .unwrap_or(QueryResult::Error(backend_id));
 
     // Always decrement pending count when done
     deps.router.complete_command(backend_id);

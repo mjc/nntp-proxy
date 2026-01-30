@@ -7,7 +7,6 @@
 //! (plain TCP, TLS) with configurable buffer sizes.
 
 use crate::stream::ConnectionStream;
-use crate::tls::TlsStream;
 use anyhow::{Context, Result};
 use socket2::SockRef;
 use std::time::Duration;
@@ -145,67 +144,6 @@ impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
     }
 }
 
-/// TLS-specific optimizations that work on the underlying TCP stream
-pub struct TlsOptimizer<'a> {
-    stream: &'a TlsStream<TcpStream>,
-    recv_buffer_size: usize,
-    send_buffer_size: usize,
-}
-
-impl<'a> TlsOptimizer<'a> {
-    /// Create a new TLS optimizer with default settings
-    pub fn new(stream: &'a TlsStream<TcpStream>) -> Self {
-        Self {
-            stream,
-            recv_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER,
-            send_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER,
-        }
-    }
-
-    /// Create optimizer with custom buffer sizes using builder pattern
-    pub const fn with_buffer_sizes(
-        stream: &'a TlsStream<TcpStream>,
-        recv_size: usize,
-        send_size: usize,
-    ) -> Self {
-        Self {
-            stream,
-            recv_buffer_size: recv_size,
-            send_buffer_size: send_size,
-        }
-    }
-}
-
-impl<'a> NetworkOptimizer for TlsOptimizer<'a> {
-    fn optimize(&self) -> Result<()> {
-        // Get the underlying TCP stream for optimization
-        let tcp_stream = self.stream.get_ref().0;
-        let sock_ref = SockRef::from(tcp_stream);
-
-        // Core optimizations (required)
-        apply_core_optimizations(&sock_ref, self.recv_buffer_size, self.send_buffer_size)
-            .context("Failed to apply core TCP optimizations to TLS stream")?;
-
-        // Platform-specific optimizations (best-effort)
-        #[cfg(target_os = "linux")]
-        apply_linux_optimizations(&sock_ref, "TLS stream");
-
-        debug!(
-            "Applied TLS optimizations to underlying TCP stream: recv_buffer={}, send_buffer={}, linger={}s, nodelay=true{}",
-            self.recv_buffer_size,
-            self.send_buffer_size,
-            LINGER_TIMEOUT.as_secs(),
-            platform_optimization_desc()
-        );
-
-        Ok(())
-    }
-
-    fn description(&self) -> &'static str {
-        "TLS optimization via underlying TCP stream"
-    }
-}
-
 /// High-level optimizer that works with ConnectionStream
 pub struct ConnectionOptimizer<'a> {
     stream: &'a ConnectionStream,
@@ -245,32 +183,36 @@ impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
             result
         };
 
-        match (self.recv_buffer_size, self.send_buffer_size, self.stream) {
-            // Custom buffer sizes
-            (Some(recv), Some(send), ConnectionStream::Plain(tcp)) => optimize_fn(
-                "TCP high-throughput optimization with custom buffers",
-                TcpOptimizer::with_buffer_sizes(tcp, recv, send).optimize(),
-            ),
-            (Some(recv), Some(send), ConnectionStream::Tls(tls)) => optimize_fn(
-                "TLS optimization via underlying TCP stream with custom buffers",
-                TlsOptimizer::with_buffer_sizes(tls.as_ref(), recv, send).optimize(),
-            ),
-            // Default buffer sizes
-            (_, _, ConnectionStream::Plain(tcp)) => optimize_fn(
-                "TCP high-throughput optimization",
-                TcpOptimizer::new(tcp).optimize(),
-            ),
-            (_, _, ConnectionStream::Tls(tls)) => optimize_fn(
-                "TLS optimization via underlying TCP stream",
-                TlsOptimizer::new(tls.as_ref()).optimize(),
-            ),
+        // Get the underlying TCP stream for optimization regardless of compression layer
+        let tcp = self.stream.underlying_tcp_stream();
+        match (self.recv_buffer_size, self.send_buffer_size) {
+            (Some(recv), Some(send)) => {
+                let desc = if self.stream.is_encrypted() {
+                    "TLS optimization via underlying TCP stream with custom buffers"
+                } else {
+                    "TCP high-throughput optimization with custom buffers"
+                };
+                optimize_fn(
+                    desc,
+                    TcpOptimizer::with_buffer_sizes(tcp, recv, send).optimize(),
+                )
+            }
+            _ => {
+                let desc = if self.stream.is_encrypted() {
+                    "TLS optimization via underlying TCP stream"
+                } else {
+                    "TCP high-throughput optimization"
+                };
+                optimize_fn(desc, TcpOptimizer::new(tcp).optimize())
+            }
         }
     }
 
     fn description(&self) -> &'static str {
-        match self.stream {
-            ConnectionStream::Plain(_) => "Connection-level TCP optimization",
-            ConnectionStream::Tls(_) => "Connection-level TLS optimization",
+        if self.stream.is_encrypted() {
+            "Connection-level TLS optimization"
+        } else {
+            "Connection-level TCP optimization"
         }
     }
 }

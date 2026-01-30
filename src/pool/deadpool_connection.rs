@@ -134,21 +134,19 @@ impl TcpManager {
 }
 
 // ============================================================================
-// Manager trait implementation
+// Connection setup: greeting, auth, and future negotiation hooks
 // ============================================================================
 
-impl managed::Manager for TcpManager {
-    type Type = ConnectionStream;
-    type Error = ConnectionError;
+impl TcpManager {
+    /// Read and validate the NNTP server greeting.
+    async fn consume_greeting(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<(), ConnectionError> {
+        use tokio::io::AsyncReadExt;
 
-    async fn create(&self) -> Result<ConnectionStream, ConnectionError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut stream = self.create_optimized_stream().await?;
-
-        // Consume greeting
-        let mut buffer = [0u8; 4096];
-        let n = stream.read(&mut buffer).await?;
+        let n = stream.read(buffer).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
 
@@ -162,64 +160,96 @@ impl managed::Manager for TcpManager {
             });
         }
 
-        // Authenticate if needed
-        if let Some(username) = &self.username {
-            stream.write_all(authinfo_user(username).as_bytes()).await?;
-            let n = stream.read(&mut buffer).await?;
+        Ok(())
+    }
+
+    /// Perform AUTHINFO USER/PASS handshake if credentials are configured.
+    async fn negotiate_auth(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<(), ConnectionError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Some(username) = &self.username else {
+            return Ok(());
+        };
+
+        stream.write_all(authinfo_user(username).as_bytes()).await?;
+        let n = stream.read(buffer).await?;
+        let response = &buffer[..n];
+        let response_str = String::from_utf8_lossy(response);
+
+        if matches!(
+            crate::protocol::NntpResponse::parse(response),
+            crate::protocol::NntpResponse::AuthRequired(_)
+        ) {
+            // Password required
+            let Some(password) = self.password.as_ref() else {
+                return Err(ConnectionError::PasswordRequired {
+                    backend: self.name.clone(),
+                });
+            };
+
+            stream.write_all(authinfo_pass(password).as_bytes()).await?;
+            let n = stream.read(buffer).await?;
             let response = &buffer[..n];
             let response_str = String::from_utf8_lossy(response);
 
-            if matches!(
-                crate::protocol::NntpResponse::parse(response),
-                crate::protocol::NntpResponse::AuthRequired(_)
-            ) {
-                // Password required
-                let Some(password) = self.password.as_ref() else {
-                    return Err(ConnectionError::PasswordRequired {
-                        backend: self.name.clone(),
-                    });
-                };
-
-                stream.write_all(authinfo_pass(password).as_bytes()).await?;
-                let n = stream.read(&mut buffer).await?;
-                let response = &buffer[..n];
-                let response_str = String::from_utf8_lossy(response);
-
-                if !matches!(
-                    crate::protocol::NntpResponse::parse(response),
-                    crate::protocol::NntpResponse::AuthSuccess
-                ) {
-                    tracing::error!(
-                        "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
-                        self.name,
-                        self.host,
-                        self.port,
-                        response_str.trim(),
-                        username
-                    );
-                    return Err(ConnectionError::AuthenticationFailed {
-                        backend: self.name.clone(),
-                        response: response_str.trim().to_string(),
-                    });
-                } else {
-                    tracing::debug!(
-                        "Successfully authenticated to {} ({}:{}) as {}",
-                        self.name,
-                        self.host,
-                        self.port,
-                        username
-                    );
-                }
-            } else if !matches!(
+            if !matches!(
                 crate::protocol::NntpResponse::parse(response),
                 crate::protocol::NntpResponse::AuthSuccess
             ) {
-                return Err(ConnectionError::UnexpectedAuthResponse {
+                tracing::error!(
+                    "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
+                    self.name,
+                    self.host,
+                    self.port,
+                    response_str.trim(),
+                    username
+                );
+                return Err(ConnectionError::AuthenticationFailed {
                     backend: self.name.clone(),
                     response: response_str.trim().to_string(),
                 });
+            } else {
+                tracing::debug!(
+                    "Successfully authenticated to {} ({}:{}) as {}",
+                    self.name,
+                    self.host,
+                    self.port,
+                    username
+                );
             }
+        } else if !matches!(
+            crate::protocol::NntpResponse::parse(response),
+            crate::protocol::NntpResponse::AuthSuccess
+        ) {
+            return Err(ConnectionError::UnexpectedAuthResponse {
+                backend: self.name.clone(),
+                response: response_str.trim().to_string(),
+            });
         }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Manager trait implementation
+// ============================================================================
+
+impl managed::Manager for TcpManager {
+    type Type = ConnectionStream;
+    type Error = ConnectionError;
+
+    async fn create(&self) -> Result<ConnectionStream, ConnectionError> {
+        let mut stream = self.create_optimized_stream().await?;
+        let mut buffer = [0u8; 4096];
+
+        self.consume_greeting(&mut stream, &mut buffer).await?;
+        self.negotiate_auth(&mut stream, &mut buffer).await?;
+        // Future: self.negotiate_compression(&mut stream, &mut buffer).await?;
 
         Ok(stream)
     }
