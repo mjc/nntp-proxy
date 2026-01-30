@@ -70,6 +70,17 @@ impl StatusCode {
         (400..600).contains(&code)
     }
 
+    /// Check if this is a continuation code (3xx)
+    ///
+    /// Per [RFC 3977 §3.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2.1):
+    /// - 3xx: Success so far, send more input
+    #[inline]
+    #[must_use]
+    pub fn is_continuation(&self) -> bool {
+        let code = self.into_inner();
+        (300..400).contains(&code)
+    }
+
     /// Check if this is an informational code (1xx)
     #[inline]
     #[must_use]

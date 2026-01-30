@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 mod article;
+pub mod codes;
 mod commands;
 mod response;
 mod responses;
