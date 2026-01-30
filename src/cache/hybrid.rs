@@ -221,11 +221,20 @@ impl Code for HybridArticleEntry {
             )));
         }
 
-        // Pre-allocate exact size - this is the key optimization
-        let mut buffer = vec![0u8; len];
+        // Read exactly len bytes without pre-zeroing (idiomatic, safe).
+        // Use take() to limit reads to len bytes, then collect into Vec.
+        use std::io::Read;
+        let mut buffer = Vec::new();
         reader
-            .read_exact(&mut buffer)
+            .take(len as u64)
+            .read_to_end(&mut buffer)
             .map_err(foyer::Error::io_error)?;
+        if buffer.len() != len {
+            return Err(foyer::Error::io_error(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Expected {} bytes, got {}", len, buffer.len()),
+            )));
+        }
 
         Ok(Self {
             status_code,
@@ -529,8 +538,8 @@ impl HybridArticleCache {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Memory capacity too large for platform"))?;
 
-        // Block size of 768KB matches average article size (~750KB)
-        // This minimizes read amplification when reading individual articles
+        // Block size controls the disk partition file size used by foyer's block engine.
+        // Smaller blocks = faster reclaim cycles but more FDs (~160 for 10GB at 64MB).
 
         // Configure separate read/write runtimes for foyer disk I/O.
         // With WriteOnInsertion, every cache insert triggers a background disk write.
@@ -558,7 +567,7 @@ impl HybridArticleCache {
             .storage()
             .with_engine_config(
                 BlockEngineBuilder::new(device)
-                    .with_block_size(512 * 1024 * 1024) // 512MB blocks - fewer files/FDs
+                    .with_block_size(64 * 1024 * 1024) // 64MB blocks - faster reclaim, ~160 FDs for 10GB
                     .with_indexer_shards(16)
                     .with_flushers(1)
                     .with_reclaimers(1),
