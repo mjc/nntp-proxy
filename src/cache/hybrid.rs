@@ -428,7 +428,7 @@ impl Default for HybridCacheConfig {
             ttl: Duration::from_secs(3600), // 1 hour
             cache_articles: true,
             compression: true,
-            shards: 4,
+            shards: 16, // Match indexer shards for consistent lock contention
         }
     }
 }
@@ -546,12 +546,12 @@ impl HybridArticleCache {
         // Separating runtimes prevents write flushes from starving read I/O under load.
         let runtime_options = RuntimeOptions::Separated {
             read_runtime_options: TokioRuntimeOptions {
-                worker_threads: 4,
-                max_blocking_threads: 8,
+                worker_threads: 8,
+                max_blocking_threads: 16,
             },
             write_runtime_options: TokioRuntimeOptions {
-                worker_threads: 2,
-                max_blocking_threads: 4,
+                worker_threads: 8,
+                max_blocking_threads: 16,
             },
         };
 
@@ -569,8 +569,8 @@ impl HybridArticleCache {
                 BlockEngineBuilder::new(device)
                     .with_block_size(64 * 1024 * 1024) // 64MB blocks - faster reclaim, ~160 FDs for 10GB
                     .with_indexer_shards(16)
-                    .with_flushers(1)
-                    .with_reclaimers(1),
+                    .with_flushers(4)
+                    .with_reclaimers(2),
             )
             .with_recover_mode(RecoverMode::Quiet)
             .with_runtime_options(runtime_options);
