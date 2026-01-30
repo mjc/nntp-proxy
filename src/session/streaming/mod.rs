@@ -1,7 +1,7 @@
 //! Client streaming module
 //!
-//! Handles streaming response data from backend to client with pipelined I/O.
-//! Uses double-buffering for optimal performance on large transfers.
+//! Handles streaming response data from backend to client.
+//! Uses a single pooled buffer for sequential read-write I/O on large transfers.
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -28,7 +28,7 @@ pub(crate) fn is_valid_response(buffer: &[u8]) -> bool {
     }
 
     // Must have CRLF in first line (status line)
-    memchr::memmem::find(&buffer[..buffer.len().min(256)], b"\r\n").is_some()
+    memchr::memmem::find(&buffer[..256.min(buffer.len())], b"\r\n").is_some()
 }
 
 /// Check if a buffer is a complete article (220/222) with actual content

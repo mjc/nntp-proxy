@@ -249,7 +249,8 @@ impl managed::Manager for TcpManager {
 
         self.consume_greeting(&mut stream, &mut buffer).await?;
         self.negotiate_auth(&mut stream, &mut buffer).await?;
-        // Future: self.negotiate_compression(&mut stream, &mut buffer).await?;
+        // Future: self.negotiate_compression(&mut stream, &mut buffer).await?
+        // See feature/wire-compression-rfc8054
 
         Ok(stream)
     }

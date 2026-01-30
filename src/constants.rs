@@ -25,7 +25,7 @@ pub mod buffer {
     pub const POOL: usize = 724 * 1024;
 
     /// Number of buffers in the buffer pool
-    /// Sized for ~25 concurrent connections with double-buffering (2 buffers each)
+    /// Sized for ~50 concurrent connections with a single buffer per connection
     /// Total memory: 50 × 724KB ≈ 36MB
     pub const POOL_COUNT: usize = 50;
 
