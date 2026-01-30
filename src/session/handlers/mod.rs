@@ -10,9 +10,9 @@
 //! All handler functions are implemented as methods on `ClientSession` in their
 //! respective modules. No need to re-export since they're all impl blocks.
 
-mod article_routing;
-mod backend_execution;
-mod cache_helpers;
+mod article_retry;
+mod cache_operations;
+mod command_execution;
 mod hybrid;
 mod per_command;
 mod stateful;

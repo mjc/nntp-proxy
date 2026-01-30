@@ -4,8 +4,8 @@
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::router::BackendSelector;
-use crate::session::handlers::backend_execution::BackendAttemptResult;
-use crate::session::handlers::cache_helpers::CacheLookupResult;
+use crate::session::handlers::cache_operations::CacheLookupResult;
+use crate::session::handlers::command_execution::BackendAttemptResult;
 use crate::session::{ClientSession, common};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;

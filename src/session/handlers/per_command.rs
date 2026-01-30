@@ -4,9 +4,9 @@
 //! command can be routed to a different backend. The actual routing, backend
 //! execution, and cache logic are split into sub-modules:
 //!
-//! - [`article_routing`]: Availability-aware backend selection and retry logic
-//! - [`backend_execution`]: Single-backend command execution and response streaming
-//! - [`cache_helpers`]: Cache lookups, upserts, and tier helpers
+//! - [`article_retry`]: Availability-aware backend selection and retry logic
+//! - [`command_execution`]: Single-backend command execution and response streaming
+//! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
 use crate::session::common;
 use crate::session::routing::{CommandRoutingDecision, decide_command_routing};
