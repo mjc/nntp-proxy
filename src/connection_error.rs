@@ -55,6 +55,15 @@ pub enum ConnectionError {
 
     #[error("Certificate verification failed for backend '{backend}': {reason}")]
     CertificateVerification { backend: String, reason: String },
+
+    #[error("No DNS addresses found for {address}")]
+    DnsNoAddresses { address: String },
+
+    #[error("Password required but not configured for backend '{backend}'")]
+    PasswordRequired { backend: String },
+
+    #[error("Unexpected auth response from backend '{backend}': {response}")]
+    UnexpectedAuthResponse { backend: String, response: String },
 }
 
 impl ConnectionError {

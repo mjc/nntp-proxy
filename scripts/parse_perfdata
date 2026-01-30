@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY="$SCRIPT_DIR/../target/release/parse_perfdata"
+SOURCE="$SCRIPT_DIR/parse_perfdata.rs"
+
+# Rebuild if source is newer than binary or binary doesn't exist
+if [ ! -f "$BINARY" ] || [ "$SOURCE" -nt "$BINARY" ]; then
+    echo "Compiling parse_perfdata..." >&2
+    rustc -O -o "$BINARY" "$SOURCE"
+fi
+
+exec "$BINARY" "$@"

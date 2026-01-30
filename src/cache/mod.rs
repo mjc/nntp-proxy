@@ -14,13 +14,18 @@
 //! - [`UnifiedCache`] - Enum that wraps either cache type with a common interface
 
 mod article;
+mod availability;
+pub(crate) mod entry_helpers;
 mod hybrid;
+mod hybrid_codec;
 pub mod ttl;
 
 pub mod mock_hybrid;
 
-pub use article::{ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, MAX_BACKENDS};
-pub use hybrid::{HybridArticleCache, HybridArticleEntry, HybridCacheConfig, HybridCacheStats};
+pub use article::{ArticleCache, ArticleEntry};
+pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
+pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
+pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 
 use crate::types::{BackendId, MessageId};
 
@@ -126,7 +131,8 @@ impl UnifiedCache {
                     // Get availability and tier before consuming buffer
                     let availability = entry.availability();
                     let tier = entry.tier();
-                    let mut article_entry = ArticleEntry::with_tier(entry.into_buffer(), tier);
+                    let mut article_entry =
+                        ArticleEntry::from_arc_with_tier(entry.into_buffer(), tier);
                     // Copy availability from hybrid entry
                     article_entry.set_availability(availability);
                     article_entry
@@ -176,6 +182,7 @@ impl UnifiedCache {
     }
 
     /// Get cache capacity
+    #[must_use]
     pub fn capacity(&self) -> u64 {
         match self {
             Self::Memory(cache) => cache.capacity(),
@@ -184,6 +191,7 @@ impl UnifiedCache {
     }
 
     /// Get number of cached entries
+    #[must_use]
     pub fn entry_count(&self) -> u64 {
         match self {
             Self::Memory(cache) => cache.entry_count(),
@@ -192,6 +200,7 @@ impl UnifiedCache {
     }
 
     /// Get weighted size in bytes
+    #[must_use]
     pub fn weighted_size(&self) -> u64 {
         match self {
             Self::Memory(cache) => cache.weighted_size(),
@@ -200,6 +209,7 @@ impl UnifiedCache {
     }
 
     /// Get cache hit rate
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
         match self {
             Self::Memory(cache) => cache.hit_rate(),
@@ -208,6 +218,7 @@ impl UnifiedCache {
     }
 
     /// Check if this is a hybrid cache (has disk tier)
+    #[must_use]
     pub fn is_hybrid(&self) -> bool {
         matches!(self, Self::Hybrid(_))
     }

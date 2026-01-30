@@ -6,22 +6,40 @@
 use deadpool::managed::Object;
 use std::io::ErrorKind;
 
+use crate::connection_error::ConnectionError;
 use crate::pool::deadpool_connection::TcpManager;
 
 /// Check if an error should cause the connection to be removed from the pool
 #[inline]
 pub fn is_connection_error(e: &anyhow::Error) -> bool {
+    // Check for typed ConnectionError first
+    if let Some(conn_err) = e.downcast_ref::<ConnectionError>() {
+        return matches!(
+            conn_err,
+            ConnectionError::IoError(io_err)
+                if matches!(
+                    io_err.kind(),
+                    ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::UnexpectedEof
+                )
+        ) || matches!(
+            conn_err,
+            ConnectionError::StaleConnection { .. } | ConnectionError::BackendTimeout { .. }
+        );
+    }
+    // Fallback for raw io::Error from non-pool paths
     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-        matches!(
+        return matches!(
             io_err.kind(),
             ErrorKind::BrokenPipe
                 | ErrorKind::ConnectionReset
                 | ErrorKind::ConnectionAborted
                 | ErrorKind::UnexpectedEof
-        )
-    } else {
-        false
+        );
     }
+    false
 }
 
 /// Take a connection out of the pool, preventing it from being recycled

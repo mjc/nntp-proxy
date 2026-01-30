@@ -3,11 +3,11 @@
 //! This module provides the `TcpManager` struct which handles the low-level
 //! creation of optimized TCP/TLS connections to NNTP servers.
 
-use anyhow::Result;
 use deadpool::managed;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
+use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::protocol::{authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
@@ -30,38 +30,31 @@ pub struct TcpManager {
 }
 
 impl TcpManager {
+    /// Create a new TcpManager with optional TLS configuration
+    ///
+    /// If `tls_config` is `Some` with `use_tls = true`, the TLS manager is
+    /// pre-initialized (certificates loaded). If `None` or `use_tls = false`,
+    /// plain TCP connections are used.
     pub fn new(
         host: String,
         port: u16,
         name: String,
         username: Option<String>,
         password: Option<String>,
-    ) -> Self {
-        Self {
-            host,
-            port,
-            name,
-            username,
-            password,
-            tls_config: TlsConfig::default(),
-            tls_manager: None,
-        }
-    }
-
-    /// Create a new TcpManager with TLS configuration
-    pub fn new_with_tls(
-        host: String,
-        port: u16,
-        name: String,
-        username: Option<String>,
-        password: Option<String>,
-        tls_config: TlsConfig,
-    ) -> Result<Self> {
-        // Pre-initialize TLS manager if TLS is enabled
-        let tls_manager = if tls_config.use_tls {
-            Some(Arc::new(TlsManager::new(tls_config.clone())?))
-        } else {
-            None
+        tls_config: Option<TlsConfig>,
+    ) -> Result<Self, ConnectionError> {
+        let (tls_config, tls_manager) = match tls_config {
+            Some(cfg) if cfg.use_tls => {
+                let mgr = Arc::new(TlsManager::new(cfg.clone()).map_err(|e| {
+                    ConnectionError::TlsHandshake {
+                        backend: name.clone(),
+                        source: e.into(),
+                    }
+                })?);
+                (cfg, Some(mgr))
+            }
+            Some(cfg) => (cfg, None),
+            None => (TlsConfig::default(), None),
         };
 
         Ok(Self {
@@ -76,13 +69,15 @@ impl TcpManager {
     }
 
     /// Create an optimized connection (TCP or TLS)
-    pub(crate) async fn create_optimized_stream(&self) -> Result<ConnectionStream, anyhow::Error> {
+    pub(crate) async fn create_optimized_stream(
+        &self,
+    ) -> Result<ConnectionStream, ConnectionError> {
         use socket2::{Domain, Protocol, Socket, Type};
 
         // Resolve hostname
         let addr = format!("{}:{}", self.host, self.port);
         let Some(socket_addr) = tokio::net::lookup_host(&addr).await?.next() else {
-            anyhow::bail!("No addresses found for {}", addr);
+            return Err(ConnectionError::DnsNoAddresses { address: addr });
         };
 
         // Create and configure socket
@@ -118,16 +113,125 @@ impl TcpManager {
         if self.tls_config.use_tls {
             // Use cached TLS manager to avoid re-parsing certificates
             let Some(tls_manager) = self.tls_manager.as_ref() else {
-                anyhow::bail!("TLS enabled but TLS manager not initialized");
+                return Err(ConnectionError::TlsHandshake {
+                    backend: self.name.clone(),
+                    source: "TLS enabled but TLS manager not initialized".into(),
+                });
             };
 
             let tls_stream = tls_manager
                 .handshake(tcp_stream, &self.host, &self.name)
-                .await?;
+                .await
+                .map_err(|e| ConnectionError::TlsHandshake {
+                    backend: self.name.clone(),
+                    source: e.into(),
+                })?;
             Ok(ConnectionStream::Tls(Box::new(tls_stream)))
         } else {
             Ok(ConnectionStream::Plain(tcp_stream))
         }
+    }
+}
+
+// ============================================================================
+// Connection setup: greeting, auth, and future negotiation hooks
+// ============================================================================
+
+impl TcpManager {
+    /// Read and validate the NNTP server greeting.
+    async fn consume_greeting(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<(), ConnectionError> {
+        use tokio::io::AsyncReadExt;
+
+        let n = stream.read(buffer).await?;
+        let greeting = &buffer[..n];
+        let greeting_str = String::from_utf8_lossy(greeting);
+
+        if !matches!(
+            crate::protocol::NntpResponse::parse(greeting),
+            crate::protocol::NntpResponse::Greeting(_)
+        ) {
+            return Err(ConnectionError::InvalidGreeting {
+                backend: self.name.clone(),
+                greeting: greeting_str.trim().to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Perform AUTHINFO USER/PASS handshake if credentials are configured.
+    async fn negotiate_auth(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<(), ConnectionError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Some(username) = &self.username else {
+            return Ok(());
+        };
+
+        stream.write_all(authinfo_user(username).as_bytes()).await?;
+        let n = stream.read(buffer).await?;
+        let response = &buffer[..n];
+        let response_str = String::from_utf8_lossy(response);
+
+        if matches!(
+            crate::protocol::NntpResponse::parse(response),
+            crate::protocol::NntpResponse::AuthRequired(_)
+        ) {
+            // Password required
+            let Some(password) = self.password.as_ref() else {
+                return Err(ConnectionError::PasswordRequired {
+                    backend: self.name.clone(),
+                });
+            };
+
+            stream.write_all(authinfo_pass(password).as_bytes()).await?;
+            let n = stream.read(buffer).await?;
+            let response = &buffer[..n];
+            let response_str = String::from_utf8_lossy(response);
+
+            if !matches!(
+                crate::protocol::NntpResponse::parse(response),
+                crate::protocol::NntpResponse::AuthSuccess
+            ) {
+                tracing::error!(
+                    "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
+                    self.name,
+                    self.host,
+                    self.port,
+                    response_str.trim(),
+                    username
+                );
+                return Err(ConnectionError::AuthenticationFailed {
+                    backend: self.name.clone(),
+                    response: response_str.trim().to_string(),
+                });
+            } else {
+                tracing::debug!(
+                    "Successfully authenticated to {} ({}:{}) as {}",
+                    self.name,
+                    self.host,
+                    self.port,
+                    username
+                );
+            }
+        } else if !matches!(
+            crate::protocol::NntpResponse::parse(response),
+            crate::protocol::NntpResponse::AuthSuccess
+        ) {
+            return Err(ConnectionError::UnexpectedAuthResponse {
+                backend: self.name.clone(),
+                response: response_str.trim().to_string(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -137,83 +241,16 @@ impl TcpManager {
 
 impl managed::Manager for TcpManager {
     type Type = ConnectionStream;
-    type Error = anyhow::Error;
+    type Error = ConnectionError;
 
-    async fn create(&self) -> Result<ConnectionStream, anyhow::Error> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    async fn create(&self) -> Result<ConnectionStream, ConnectionError> {
         let mut stream = self.create_optimized_stream().await?;
-
-        // Consume greeting
         let mut buffer = [0u8; 4096];
-        let n = stream.read(&mut buffer).await?;
-        let greeting = &buffer[..n];
-        let greeting_str = String::from_utf8_lossy(greeting);
 
-        if !matches!(
-            crate::protocol::NntpResponse::parse(greeting),
-            crate::protocol::NntpResponse::Greeting(_)
-        ) {
-            return Err(anyhow::anyhow!("Invalid greeting: {}", greeting_str.trim()));
-        }
-
-        // Authenticate if needed
-        if let Some(username) = &self.username {
-            stream.write_all(authinfo_user(username).as_bytes()).await?;
-            let n = stream.read(&mut buffer).await?;
-            let response = &buffer[..n];
-            let response_str = String::from_utf8_lossy(response);
-
-            if matches!(
-                crate::protocol::NntpResponse::parse(response),
-                crate::protocol::NntpResponse::AuthRequired(_)
-            ) {
-                // Password required
-                let Some(password) = self.password.as_ref() else {
-                    anyhow::bail!("Password required but not provided");
-                };
-
-                stream.write_all(authinfo_pass(password).as_bytes()).await?;
-                let n = stream.read(&mut buffer).await?;
-                let response = &buffer[..n];
-                let response_str = String::from_utf8_lossy(response);
-
-                if !matches!(
-                    crate::protocol::NntpResponse::parse(response),
-                    crate::protocol::NntpResponse::AuthSuccess
-                ) {
-                    tracing::error!(
-                        "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
-                        self.name,
-                        self.host,
-                        self.port,
-                        response_str.trim(),
-                        username
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Auth failed for {} - Server said: {}",
-                        self.name,
-                        response_str.trim()
-                    ));
-                } else {
-                    tracing::debug!(
-                        "Successfully authenticated to {} ({}:{}) as {}",
-                        self.name,
-                        self.host,
-                        self.port,
-                        username
-                    );
-                }
-            } else if !matches!(
-                crate::protocol::NntpResponse::parse(response),
-                crate::protocol::NntpResponse::AuthSuccess
-            ) {
-                return Err(anyhow::anyhow!(
-                    "Unexpected auth response: {}",
-                    response_str.trim()
-                ));
-            }
-        }
+        self.consume_greeting(&mut stream, &mut buffer).await?;
+        self.negotiate_auth(&mut stream, &mut buffer).await?;
+        // Future: self.negotiate_compression(&mut stream, &mut buffer).await?
+        // See feature/wire-compression-rfc8054
 
         Ok(stream)
     }
@@ -222,7 +259,7 @@ impl managed::Manager for TcpManager {
         &self,
         conn: &mut ConnectionStream,
         _metrics: &managed::Metrics,
-    ) -> managed::RecycleResult<anyhow::Error> {
+    ) -> managed::RecycleResult<ConnectionError> {
         use super::health_check::check_tcp_alive;
         // Only do fast TCP-level check on recycle
         // Full health checks happen periodically via the periodic health checks
@@ -238,14 +275,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tcp_manager_new() {
+    fn test_tcp_manager_new_plain() {
         let manager = TcpManager::new(
             "news.example.com".to_string(),
             119,
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(manager.host, "news.example.com");
         assert_eq!(manager.port, 119);
@@ -264,7 +303,9 @@ mod tests {
             "SecureServer".to_string(),
             None,
             None,
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(manager.host, "news.example.com");
         assert_eq!(manager.port, 563);
@@ -276,17 +317,16 @@ mod tests {
     #[test]
     fn test_tcp_manager_new_with_tls_disabled() {
         let tls_config = TlsConfig::default(); // use_tls = false
-        let result = TcpManager::new_with_tls(
+        let manager = TcpManager::new(
             "news.example.com".to_string(),
             119,
             "PlainServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-            tls_config,
-        );
+            Some(tls_config),
+        )
+        .unwrap();
 
-        assert!(result.is_ok());
-        let manager = result.unwrap();
         assert_eq!(manager.host, "news.example.com");
         assert_eq!(manager.port, 119);
         assert!(!manager.tls_config.use_tls);
@@ -300,17 +340,16 @@ mod tests {
             tls_verify_cert: true,
             tls_cert_path: None,
         };
-        let result = TcpManager::new_with_tls(
+        let manager = TcpManager::new(
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-            tls_config,
-        );
+            Some(tls_config),
+        )
+        .unwrap();
 
-        assert!(result.is_ok());
-        let manager = result.unwrap();
         assert_eq!(manager.host, "secure.example.com");
         assert_eq!(manager.port, 563);
         assert!(manager.tls_config.use_tls);
@@ -325,7 +364,9 @@ mod tests {
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-        );
+            None,
+        )
+        .unwrap();
 
         let cloned = manager.clone();
         assert_eq!(cloned.host, manager.host);
@@ -343,7 +384,9 @@ mod tests {
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
-        );
+            None,
+        )
+        .unwrap();
 
         let debug_str = format!("{:?}", manager);
         assert!(debug_str.contains("TcpManager"));
@@ -358,13 +401,13 @@ mod tests {
             tls_verify_cert: false,
             tls_cert_path: None,
         };
-        let manager = TcpManager::new_with_tls(
+        let manager = TcpManager::new(
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
             None,
             None,
-            tls_config,
+            Some(tls_config),
         )
         .unwrap();
 
@@ -387,13 +430,13 @@ mod tests {
         };
 
         // This will fail due to missing file, but tests the construction path
-        let result = TcpManager::new_with_tls(
+        let result = TcpManager::new(
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
             None,
             None,
-            tls_config,
+            Some(tls_config),
         );
 
         // Should fail because cert file doesn't exist

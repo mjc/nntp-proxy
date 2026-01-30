@@ -1,8 +1,8 @@
 //! Hybrid memory+disk article cache using foyer
 //!
 //! This module provides a two-tier cache that stores hot articles in memory
-//! and spills to disk when memory capacity is exceeded. This is ideal for
-//! large-scale article caching where memory alone isn't sufficient.
+//! and spills to disk when memory capacity is exceeded. The entry type and
+//! its foyer codec are in [`super::hybrid_codec`].
 //!
 //! # Architecture
 //!
@@ -33,20 +33,19 @@
 //! - Automatic promotion: Frequently accessed disk entries promoted to memory
 //! - LZ4 compression: Reduces disk usage by ~60% for typical NNTP articles
 
-use crate::protocol::StatusCode;
-use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use foyer::{
-    BlockEngineBuilder, Code, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
+    BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     HybridCachePolicy, LruConfig, RecoverMode, RuntimeOptions, Source, TokioRuntimeOptions,
 };
-use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use super::{ArticleAvailability, ttl};
+use super::availability::ArticleAvailability;
+use super::hybrid_codec::HybridArticleEntry;
+use super::ttl;
 
 /// Check available disk space at the given path using df command
 fn check_available_space(path: &Path) -> Option<u64> {
@@ -66,381 +65,6 @@ fn check_available_space(path: &Path) -> Option<u64> {
         }
     }
     None // For now, skip the check - let foyer handle it
-}
-
-/// Cache entry for hybrid storage
-///
-/// INVARIANT: Every entry has a valid NNTP status code (220, 221, 222, 223, 430).
-/// This is enforced at construction - `new()` returns `Option<Self>`.
-///
-/// Implements foyer's Code trait manually for efficient serialization:
-/// - Pre-allocates buffer on decode (no vec resizing)
-/// - Simple binary format: [status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][len:u32][buffer:bytes]
-#[derive(Clone, Debug)]
-pub struct HybridArticleEntry {
-    /// Validated NNTP status code (220, 221, 222, 223, 430)
-    /// Stored explicitly so we never have to re-parse from buffer
-    status_code: u16,
-    /// Backend availability bitset - checked bits
-    checked: u8,
-    /// Backend availability bitset - missing bits
-    missing: u8,
-    /// Unix timestamp when availability info was last updated (milliseconds since epoch)
-    /// Used to expire stale availability-only entries (430 stubs, STAT responses)
-    /// and for tier-aware TTL calculation
-    timestamp: u64,
-    /// Server tier (lower = higher priority)
-    /// Used for tier-aware TTL: higher tier = longer TTL
-    tier: u8,
-    /// Complete response buffer
-    /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
-    buffer: Vec<u8>,
-}
-
-/// Manual Code implementation to avoid bincode's vec resizing overhead
-impl Code for HybridArticleEntry {
-    fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
-        // Format: status (2) + checked (1) + missing (1) + timestamp (8) + tier (1) + len (4) + buffer
-        writer
-            .write_all(&self.status_code.to_le_bytes())
-            .map_err(foyer::Error::io_error)?;
-        writer
-            .write_all(&[self.checked, self.missing])
-            .map_err(foyer::Error::io_error)?;
-        writer
-            .write_all(&self.timestamp.to_le_bytes())
-            .map_err(foyer::Error::io_error)?;
-        writer
-            .write_all(&[self.tier])
-            .map_err(foyer::Error::io_error)?;
-        let len = self.buffer.len() as u32;
-        writer
-            .write_all(&len.to_le_bytes())
-            .map_err(foyer::Error::io_error)?;
-        writer
-            .write_all(&self.buffer)
-            .map_err(foyer::Error::io_error)?;
-        Ok(())
-    }
-
-    fn decode(reader: &mut impl Read) -> foyer::Result<Self> {
-        // Read status code
-        let mut status_bytes = [0u8; 2];
-        reader
-            .read_exact(&mut status_bytes)
-            .map_err(foyer::Error::io_error)?;
-        let status_code = u16::from_le_bytes(status_bytes);
-
-        // Validate status code on decode - reject corrupted entries
-        if !Self::is_valid_status_code(status_code) {
-            return Err(foyer::Error::io_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Invalid cached status code: {}", status_code),
-            )));
-        }
-
-        // Read header: checked + missing
-        let mut header = [0u8; 2];
-        reader
-            .read_exact(&mut header)
-            .map_err(foyer::Error::io_error)?;
-
-        // Read timestamp
-        let mut timestamp_bytes = [0u8; 8];
-        reader
-            .read_exact(&mut timestamp_bytes)
-            .map_err(foyer::Error::io_error)?;
-        let timestamp = u64::from_le_bytes(timestamp_bytes);
-
-        // Read tier
-        let mut tier_byte = [0u8; 1];
-        reader
-            .read_exact(&mut tier_byte)
-            .map_err(foyer::Error::io_error)?;
-        let tier = tier_byte[0];
-
-        // Read length and pre-allocate buffer (no resizing!)
-        let mut len_bytes = [0u8; 4];
-        reader
-            .read_exact(&mut len_bytes)
-            .map_err(foyer::Error::io_error)?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-
-        // Reject unreasonably large cached entries to avoid OOM on corrupted data.
-        const MAX_BUFFER_SIZE: usize = 100 * 1024 * 1024; // 100 MiB hard limit
-        if len > MAX_BUFFER_SIZE {
-            return Err(foyer::Error::io_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Cached article too large: {} bytes (max {} bytes)",
-                    len, MAX_BUFFER_SIZE
-                ),
-            )));
-        }
-
-        // Pre-allocate exact size - this is the key optimization
-        let mut buffer = vec![0u8; len];
-        reader
-            .read_exact(&mut buffer)
-            .map_err(foyer::Error::io_error)?;
-
-        Ok(Self {
-            status_code,
-            checked: header[0],
-            missing: header[1],
-            timestamp,
-            tier,
-            buffer,
-        })
-    }
-
-    fn estimated_size(&self) -> usize {
-        2 + 2 + 8 + 1 + 4 + self.buffer.len() // status + header + timestamp + tier + len + buffer
-    }
-}
-
-impl HybridArticleEntry {
-    /// Valid NNTP status codes for cached articles
-    const VALID_CODES: [u16; 5] = [220, 221, 222, 223, 430];
-
-    /// Check if a status code is valid for caching
-    #[inline]
-    fn is_valid_status_code(code: u16) -> bool {
-        Self::VALID_CODES.contains(&code)
-    }
-
-    /// Create from response buffer - returns None if buffer has invalid status code
-    ///
-    /// This is the ONLY way to create an entry. Invalid buffers are rejected.
-    /// Tier defaults to 0.
-    pub fn new(buffer: Vec<u8>) -> Option<Self> {
-        Self::with_tier(buffer, 0)
-    }
-
-    /// Create from response buffer with specified tier
-    ///
-    /// Returns None if buffer has invalid status code.
-    pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Option<Self> {
-        let status_code = StatusCode::parse(&buffer)?.as_u16();
-
-        if !Self::is_valid_status_code(status_code) {
-            return None;
-        }
-
-        Some(Self {
-            status_code,
-            checked: 0,
-            missing: 0,
-            timestamp: ttl::now_millis(),
-            tier,
-            buffer,
-        })
-    }
-
-    /// Get raw buffer for serving to client
-    #[inline]
-    pub fn buffer(&self) -> &[u8] {
-        &self.buffer
-    }
-
-    /// Get buffer as owned Vec (for sending to client)
-    #[inline]
-    pub fn into_buffer(self) -> Vec<u8> {
-        self.buffer
-    }
-
-    /// Get the validated status code
-    ///
-    /// This always returns a valid code because entries cannot be created
-    /// with invalid status codes. Returns Option for API consistency with ArticleEntry.
-    #[inline]
-    pub fn status_code(&self) -> Option<StatusCode> {
-        // SAFETY: Invariant enforced by new() and decode()
-        Some(StatusCode::new(self.status_code))
-    }
-
-    /// Check if we should try fetching from this backend
-    #[inline]
-    pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
-        let idx = backend_id.as_index();
-        // Backend is "should try" if not marked as missing
-        self.missing & (1u8 << idx) == 0
-    }
-
-    /// Record that a backend returned 430 (doesn't have this article)
-    pub fn record_backend_missing(&mut self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        self.checked |= 1u8 << idx;
-        self.missing |= 1u8 << idx;
-    }
-
-    /// Record that a backend successfully provided this article
-    pub fn record_backend_has(&mut self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        self.checked |= 1u8 << idx;
-        self.missing &= !(1u8 << idx);
-    }
-
-    /// Check if all backends have been tried and none have the article
-    pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
-        let count = total_backends.get();
-        match count {
-            0 => true,
-            8 => self.missing == 0xFF,
-            n => self.missing & ((1u8 << n) - 1) == (1u8 << n) - 1,
-        }
-    }
-
-    /// Check if this cache entry contains a complete article (220) or body (222)
-    #[inline]
-    pub fn is_complete_article(&self) -> bool {
-        let code = self.status_code;
-        if code != 220 && code != 222 {
-            return false;
-        }
-        const MIN_ARTICLE_SIZE: usize = 30;
-        self.buffer.len() >= MIN_ARTICLE_SIZE && self.buffer.ends_with(b".\r\n")
-    }
-
-    /// Get the appropriate response for a command, if this cache entry can serve it
-    ///
-    /// Returns `Some(response_bytes)` if cache can satisfy the command:
-    /// - ARTICLE (220 cached) → returns full cached response
-    /// - BODY (222 cached or 220 cached) → returns cached response  
-    /// - HEAD (221 cached or 220 cached) → returns cached response
-    /// - STAT → synthesizes "223 0 <msg-id>\r\n" (we know article exists)
-    ///
-    /// Returns `None` if cached response can't serve this command type.
-    pub fn response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
-        let code = self.status_code;
-
-        match (code, cmd_verb) {
-            // STAT just needs existence confirmation - synthesize response
-            (220..=222, "STAT") => Some(format!("223 0 {}\r\n", message_id).into_bytes()),
-            // Direct match - return cached buffer if valid
-            (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
-                // Validate buffer is a well-formed NNTP response
-                if self.is_valid_response() {
-                    Some(self.buffer.clone())
-                } else {
-                    tracing::warn!(
-                        code = code,
-                        len = self.buffer.len(),
-                        "Cached buffer failed validation, discarding"
-                    );
-                    None
-                }
-            }
-            // ARTICLE (220) contains everything, can serve BODY or HEAD requests
-            // Note: For HEAD we'd ideally extract just headers, but returning full
-            // article still works (client gets bonus body data)
-            (220, "BODY" | "HEAD") => {
-                if self.is_valid_response() {
-                    Some(self.buffer.clone())
-                } else {
-                    tracing::warn!(
-                        code = code,
-                        len = self.buffer.len(),
-                        "Cached buffer failed validation, discarding"
-                    );
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Check if buffer contains a valid NNTP multiline response
-    ///
-    /// A valid response must:
-    /// 1. Start with 3 ASCII digits (status code)
-    /// 2. Have CRLF somewhere (line terminator)
-    /// 3. End with .\r\n for multiline responses (220/221/222)
-    #[inline]
-    fn is_valid_response(&self) -> bool {
-        // Must have at least "NNN \r\n.\r\n" = 9 bytes
-        if self.buffer.len() < 9 {
-            return false;
-        }
-
-        // First 3 bytes must be ASCII digits
-        if !self.buffer[0].is_ascii_digit()
-            || !self.buffer[1].is_ascii_digit()
-            || !self.buffer[2].is_ascii_digit()
-        {
-            return false;
-        }
-
-        // Must end with .\r\n for multiline responses
-        if !self.buffer.ends_with(b".\r\n") {
-            return false;
-        }
-
-        // Must have CRLF in first line (status line)
-        memchr::memmem::find(&self.buffer[..self.buffer.len().min(256)], b"\r\n").is_some()
-    }
-
-    /// Check if this entry can serve a given command type
-    ///
-    /// Simpler version of `response_for_command` for boolean checks.
-    #[inline]
-    pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
-        match self.status_code {
-            220 => matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD" | "STAT"),
-            222 => matches!(cmd_verb, "BODY" | "STAT"),
-            221 => matches!(cmd_verb, "HEAD" | "STAT"),
-            _ => false,
-        }
-    }
-
-    /// Get backend availability as ArticleAvailability struct
-    #[inline]
-    pub fn availability(&self) -> ArticleAvailability {
-        ArticleAvailability::from_bits(self.checked, self.missing)
-    }
-
-    /// Check if we have any backend availability information
-    ///
-    /// Returns true if at least one backend has been checked.
-    /// Wrapper around `ArticleAvailability::has_availability_info()` for convenience.
-    #[inline]
-    pub fn has_availability_info(&self) -> bool {
-        self.checked != 0
-    }
-
-    /// Check if availability information is stale (older than ttl_millis)
-    ///
-    /// HybridArticleEntry stores timestamps for tier-aware TTL, but foyer's cache
-    /// handles eviction based on insertion time. This method is kept for compatibility
-    /// and always returns false since the cache layer manages staleness.
-    #[inline]
-    pub fn is_availability_stale(&self, _ttl_millis: u64) -> bool {
-        // Foyer cache handles TTL-based eviction separately
-        false
-    }
-
-    /// Clear stale availability information
-    ///
-    /// HybridArticleEntry now tracks timestamps via `timestamp` field for tier-aware TTL,
-    /// but foyer handles eviction separately. This method is a no-op for compatibility.
-    #[inline]
-    pub fn clear_stale_availability(&mut self, _ttl_millis: u64) {
-        // Foyer cache handles TTL-based eviction, no need to clear here
-    }
-
-    /// Check if this entry has expired based on tier-aware TTL
-    ///
-    /// See [`super::ttl`] for the TTL formula.
-    #[inline]
-    pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.timestamp, base_ttl_millis, self.tier)
-    }
-
-    /// Get the tier of the backend that provided this article
-    #[inline]
-    pub fn tier(&self) -> u8 {
-        self.tier
-    }
 }
 
 /// Configuration for hybrid cache
@@ -471,7 +95,7 @@ impl Default for HybridCacheConfig {
             ttl: Duration::from_secs(3600), // 1 hour
             cache_articles: true,
             compression: true,
-            shards: 4,
+            shards: 16, // Match indexer shards for consistent lock contention
         }
     }
 }
@@ -581,15 +205,22 @@ impl HybridArticleCache {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Memory capacity too large for platform"))?;
 
-        // Block size of 768KB matches average article size (~750KB)
-        // This minimizes read amplification when reading individual articles
+        // Block size controls the disk partition file size used by foyer's block engine.
+        // Smaller blocks = faster reclaim cycles but more FDs (~160 for 10GB at 64MB).
 
-        // Configure dedicated runtime for foyer disk I/O to avoid blocking the main runtime
-        // This is critical for performance - foyer warns about latency spikes without it
-        let runtime_options = RuntimeOptions::Unified(TokioRuntimeOptions {
-            worker_threads: 4,
-            max_blocking_threads: 8,
-        });
+        // Configure separate read/write runtimes for foyer disk I/O.
+        // With WriteOnInsertion, every cache insert triggers a background disk write.
+        // Separating runtimes prevents write flushes from starving read I/O under load.
+        let runtime_options = RuntimeOptions::Separated {
+            read_runtime_options: TokioRuntimeOptions {
+                worker_threads: 8,
+                max_blocking_threads: 16,
+            },
+            write_runtime_options: TokioRuntimeOptions {
+                worker_threads: 8,
+                max_blocking_threads: 16,
+            },
+        };
 
         let mut builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
@@ -603,10 +234,10 @@ impl HybridArticleCache {
             .storage()
             .with_engine_config(
                 BlockEngineBuilder::new(device)
-                    .with_block_size(512 * 1024 * 1024) // 512MB blocks - fewer files/FDs
+                    .with_block_size(64 * 1024 * 1024) // 64MB blocks - faster reclaim, ~160 FDs for 10GB
                     .with_indexer_shards(16)
-                    .with_flushers(1)
-                    .with_reclaimers(1),
+                    .with_flushers(4)
+                    .with_reclaimers(2),
             )
             .with_recover_mode(RecoverMode::Quiet)
             .with_runtime_options(runtime_options);
@@ -656,15 +287,9 @@ impl HybridArticleCache {
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
     pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<HybridArticleEntry> {
-        let start = std::time::Instant::now();
         let key = message_id.without_brackets().to_string();
-        let key_time = start.elapsed();
-
-        let get_start = std::time::Instant::now();
         let result = self.cache.get(&key).await;
-        let get_time = get_start.elapsed();
 
-        let clone_start = std::time::Instant::now();
         match result {
             Ok(Some(entry)) => {
                 let cloned = entry.value().clone();
@@ -684,20 +309,6 @@ impl HybridArticleCache {
                 // Track disk hits for monitoring
                 if source == Source::Disk {
                     self.disk_hits.fetch_add(1, Ordering::Relaxed);
-                }
-                let clone_time = clone_start.elapsed();
-                let total = start.elapsed();
-
-                // Log slow disk reads
-                if source == Source::Disk && total.as_millis() > 5 {
-                    warn!(
-                        key_us = key_time.as_micros(),
-                        get_us = get_time.as_micros(),
-                        clone_us = clone_time.as_micros(),
-                        total_ms = total.as_millis(),
-                        size = cloned.buffer.len(),
-                        "SLOW disk cache read"
-                    );
                 }
                 Some(cloned)
             }
@@ -834,9 +445,7 @@ impl HybridArticleCache {
             Ok(Some(existing)) => {
                 // Merge availability into existing entry
                 let mut entry = existing.value().clone();
-                // Merge: union of checked bits, union of missing bits
-                entry.checked |= availability.checked_bits();
-                entry.missing |= availability.missing_bits();
+                entry.availability.merge_from(availability);
                 Some(entry)
             }
             _ => {
@@ -850,8 +459,7 @@ impl HybridArticleCache {
                     // SAFETY: "430\r\n" is a valid NNTP response
                     let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec())
                         .expect("430 is a valid status code");
-                    entry.checked = availability.checked_bits();
-                    entry.missing = availability.missing_bits();
+                    entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     Some(entry)
                 }
@@ -1015,13 +623,11 @@ impl HybridArticleCache {
 //   cargo test --features hybrid-cache cache::hybrid -- --ignored
 #[cfg(test)]
 mod tests {
-    //! Unit tests for HybridArticleCache
+    //! Cache-level integration tests for HybridArticleCache
     //!
     //! NOTE: These tests are marked as #[ignore] due to foyer runtime issues in test context.
-    //! The actual Foyer integration is tested through:
-    //! - MockHybridCache in tests/test_hybrid_cache_integration.rs
-    //! - UnifiedCache wrapper in tests/test_unified_cache.rs
-    //! - Full integration tests with real cache instances
+    //! Entry-level tests (HybridArticleEntry, CacheableStatusCode, Code encode/decode)
+    //! are in the `hybrid_codec` module.
     //!
     //! To run these ignored tests manually:
     //!   cargo test --package nntp-proxy --lib cache::hybrid::tests -- --ignored --nocapture
@@ -1074,90 +680,5 @@ mod tests {
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 
         cache.close().await.unwrap();
-    }
-
-    // Test the HybridArticleEntry directly without foyer
-    #[test]
-    fn test_hybrid_entry_basic() {
-        let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let mut entry = HybridArticleEntry::new(buffer.clone()).expect("valid status code");
-
-        assert_eq!(entry.buffer(), buffer.as_slice());
-        assert_eq!(entry.status_code().map(|c| c.as_u16()), Some(220));
-
-        // Test backend tracking
-        entry.record_backend_has(BackendId::from_index(0));
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
-
-        entry.record_backend_missing(BackendId::from_index(1));
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
-        assert!(!entry.should_try_backend(BackendId::from_index(1)));
-    }
-
-    #[test]
-    fn test_hybrid_entry_availability() {
-        let mut entry = HybridArticleEntry::new(b"220 ok\r\n".to_vec()).expect("valid");
-
-        // Initially all backends are "should try" (not marked missing)
-        for i in 0..8 {
-            assert!(entry.should_try_backend(BackendId::from_index(i)));
-        }
-
-        // Mark some backends as missing
-        entry.record_backend_missing(BackendId::from_index(0));
-        entry.record_backend_missing(BackendId::from_index(2));
-        entry.record_backend_missing(BackendId::from_index(4));
-
-        assert!(!entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
-        assert!(!entry.should_try_backend(BackendId::from_index(2)));
-        assert!(entry.should_try_backend(BackendId::from_index(3)));
-        assert!(!entry.should_try_backend(BackendId::from_index(4)));
-
-        // Check availability struct
-        let avail = entry.availability();
-        assert!(avail.is_missing(BackendId::from_index(0)));
-        assert!(!avail.is_missing(BackendId::from_index(1))); // Not checked = not missing
-    }
-
-    #[test]
-    fn test_hybrid_entry_command_matching() {
-        let article = HybridArticleEntry::new(b"220 0 <id>\r\n".to_vec()).expect("valid");
-        assert!(article.matches_command_type_verb("ARTICLE"));
-        assert!(article.matches_command_type_verb("BODY"));
-        assert!(article.matches_command_type_verb("HEAD"));
-
-        let body = HybridArticleEntry::new(b"222 0 <id>\r\n".to_vec()).expect("valid");
-        assert!(!body.matches_command_type_verb("ARTICLE"));
-        assert!(body.matches_command_type_verb("BODY"));
-        assert!(!body.matches_command_type_verb("HEAD"));
-
-        let head = HybridArticleEntry::new(b"221 0 <id>\r\n".to_vec()).expect("valid");
-        assert!(!head.matches_command_type_verb("ARTICLE"));
-        assert!(!head.matches_command_type_verb("BODY"));
-        assert!(head.matches_command_type_verb("HEAD"));
-    }
-
-    #[test]
-    fn test_hybrid_entry_rejects_invalid() {
-        // Invalid status code
-        assert!(HybridArticleEntry::new(b"999 invalid\r\n".to_vec()).is_none());
-
-        // Empty buffer
-        assert!(HybridArticleEntry::new(vec![]).is_none());
-
-        // Too short
-        assert!(HybridArticleEntry::new(b"20".to_vec()).is_none());
-
-        // Not starting with digits
-        assert!(HybridArticleEntry::new(b"abc\r\n".to_vec()).is_none());
-
-        // Valid codes we allow
-        assert!(HybridArticleEntry::new(b"220 article\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"221 head\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"222 body\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"223 stat\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"430 not found\r\n".to_vec()).is_some());
     }
 }

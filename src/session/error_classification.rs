@@ -33,14 +33,10 @@ impl ErrorClassifier {
 
     /// Check if error is an authentication failure
     pub fn is_authentication_error(error: &anyhow::Error) -> bool {
-        // Check for ConnectionError::AuthenticationFailed
         if let Some(conn_err) = error.downcast_ref::<ConnectionError>() {
             return conn_err.is_authentication_error();
         }
-
-        // Check error message as fallback
-        let error_str = error.to_string();
-        error_str.contains("Auth failed") || error_str.contains("Authentication Failed")
+        false
     }
 
     /// Check if error is a network/connectivity issue
@@ -87,9 +83,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_authentication_error_with_message() {
+    fn test_is_authentication_error_with_plain_message() {
+        // Plain anyhow errors without ConnectionError are no longer detected as auth errors
         let err = anyhow::anyhow!("Auth failed: invalid credentials");
-        assert!(ErrorClassifier::is_authentication_error(&err));
+        assert!(!ErrorClassifier::is_authentication_error(&err));
     }
 
     #[test]
