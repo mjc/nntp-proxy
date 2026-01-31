@@ -77,7 +77,7 @@ printf '\033]0;perf: nntp-proxy CPU\007'
 
 # Build with native CPU + frame pointers
 if [ -z "$ATTACH_PID" ]; then
-    RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling
+    RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --features zlib-ng
 fi
 
 # Record using frame pointers

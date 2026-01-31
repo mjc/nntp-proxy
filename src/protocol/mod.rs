@@ -21,8 +21,8 @@ pub use response::{NntpResponse, StatusCode};
 
 // Re-export command construction helpers
 pub use commands::{
-    DATE, QUIT, article_by_msgid, authinfo_pass, authinfo_user, body_by_msgid, head_by_msgid,
-    stat_by_msgid,
+    COMPRESS_DEFLATE, DATE, QUIT, article_by_msgid, authinfo_pass, authinfo_user, body_by_msgid,
+    head_by_msgid, stat_by_msgid,
 };
 
 // Re-export response constants and helpers

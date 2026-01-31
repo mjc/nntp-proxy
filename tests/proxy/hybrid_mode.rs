@@ -4,6 +4,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
+use nntp_proxy::config::Server;
+use nntp_proxy::types::{MaxConnections, Port};
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
 
 use crate::test_helpers::*;
@@ -155,12 +157,15 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    let server = Server::builder("127.0.0.1", Port::try_new(mock_port).unwrap())
+        .name("Mock Server")
+        .max_connections(MaxConnections::try_new(5).unwrap())
+        .compress(Some(false))
+        .build()
+        .expect("Valid server config");
+
     let config = Config {
-        servers: vec![create_test_server_config(
-            "127.0.0.1",
-            mock_port,
-            "Mock Server",
-        )],
+        servers: vec![server],
         ..Default::default()
     };
 

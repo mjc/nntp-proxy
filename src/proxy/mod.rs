@@ -250,6 +250,8 @@ pub(super) mod tests {
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
                     tier: 0,
+                    compress: None,
+                    compress_level: None,
                 },
                 Server {
                     host: HostName::try_new("server2.example.com".to_string()).unwrap(),
@@ -265,6 +267,8 @@ pub(super) mod tests {
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
                     tier: 0,
+                    compress: None,
+                    compress_level: None,
                 },
                 Server {
                     host: HostName::try_new("server3.example.com".to_string()).unwrap(),
@@ -280,6 +284,8 @@ pub(super) mod tests {
                     health_check_max_per_cycle: health_check_max_per_cycle(),
                     health_check_pool_timeout: health_check_pool_timeout(),
                     tier: 0,
+                    compress: None,
+                    compress_level: None,
                 },
             ],
             ..Default::default()

@@ -145,6 +145,8 @@ impl Builder {
             self.username,
             self.password,
             self.tls_config,
+            None,
+            None,
         )?;
 
         Ok(DeadpoolConnectionProvider::from_manager(
@@ -282,8 +284,17 @@ impl DeadpoolConnectionProvider {
     ) -> Self {
         // Plain TCP (no TLS) cannot fail during TcpManager construction
         Self::from_manager(
-            TcpManager::new(host, port, name.clone(), username, password, None)
-                .expect("Plain TCP TcpManager creation cannot fail"),
+            TcpManager::new(
+                host,
+                port,
+                name.clone(),
+                username,
+                password,
+                None,
+                None,
+                None,
+            )
+            .expect("Plain TCP TcpManager creation cannot fail"),
             name,
             max_size,
         )
@@ -306,6 +317,8 @@ impl DeadpoolConnectionProvider {
             username,
             password,
             Some(tls_config),
+            None,
+            None,
         )?;
         Ok(Self::from_manager(manager, name, max_size))
     }
@@ -349,6 +362,8 @@ impl DeadpoolConnectionProvider {
             server.username.clone(),
             server.password.clone(),
             Some(tls_config),
+            server.compress,
+            server.compress_level,
         )?;
         let pool = Pool::builder(manager)
             .max_size(server.max_connections.get())

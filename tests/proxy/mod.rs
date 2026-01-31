@@ -4,6 +4,7 @@
 //! NNTP protocol, including routing strategies, load balancing, caching integration,
 //! and hybrid mode operations.
 
+pub mod compression;
 pub mod config;
 pub mod hybrid_mode;
 pub mod metrics;

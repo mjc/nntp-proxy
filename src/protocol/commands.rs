@@ -6,6 +6,9 @@
 /// QUIT command (RFC 3977 Section 5.4)
 pub const QUIT: &[u8] = b"QUIT\r\n";
 
+/// COMPRESS DEFLATE command (RFC 8054 §2.2)
+pub const COMPRESS_DEFLATE: &[u8] = b"COMPRESS DEFLATE\r\n";
+
 /// DATE command (RFC 3977 Section 7.1)
 ///
 /// The DATE command returns the server's current date and time in UTC.

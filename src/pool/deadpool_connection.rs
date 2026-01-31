@@ -27,10 +27,15 @@ pub struct TcpManager {
     pub(crate) tls_config: TlsConfig,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
+    /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
+    pub(crate) compress: Option<bool>,
+    /// Compression level (0-9). None = fast (level 1).
+    pub(crate) compress_level: Option<u32>,
 }
 
 impl TcpManager {
     /// Create a new TcpManager with optional TLS configuration
+    #[allow(clippy::too_many_arguments)]
     ///
     /// If `tls_config` is `Some` with `use_tls = true`, the TLS manager is
     /// pre-initialized (certificates loaded). If `None` or `use_tls = false`,
@@ -42,6 +47,8 @@ impl TcpManager {
         username: Option<String>,
         password: Option<String>,
         tls_config: Option<TlsConfig>,
+        compress: Option<bool>,
+        compress_level: Option<u32>,
     ) -> Result<Self, ConnectionError> {
         let (tls_config, tls_manager) = match tls_config {
             Some(cfg) if cfg.use_tls => {
@@ -65,6 +72,8 @@ impl TcpManager {
             password,
             tls_config,
             tls_manager,
+            compress,
+            compress_level,
         })
     }
 
@@ -163,6 +172,53 @@ impl TcpManager {
         Ok(())
     }
 
+    /// Negotiate COMPRESS DEFLATE (RFC 8054) with the backend server.
+    ///
+    /// Returns `Ok(true)` if compression was successfully negotiated,
+    /// `Ok(false)` if compression was skipped or not supported.
+    async fn negotiate_compression(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<bool, ConnectionError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if self.compress == Some(false) {
+            return Ok(false);
+        }
+
+        stream.write_all(crate::protocol::COMPRESS_DEFLATE).await?;
+        stream.flush().await?;
+
+        let n = stream.read(buffer).await?;
+        let response = &buffer[..n];
+        let response_str = String::from_utf8_lossy(response);
+
+        // 206 = Compression active
+        if response.len() >= 3 && &response[..3] == b"206" {
+            tracing::debug!(
+                backend = %self.name,
+                "COMPRESS DEFLATE negotiated successfully"
+            );
+            return Ok(true);
+        }
+
+        if self.compress == Some(true) {
+            return Err(ConnectionError::CompressionRequired {
+                backend: self.name.clone(),
+                response: response_str.trim().to_string(),
+            });
+        }
+
+        // Auto mode: compression not supported, continue without it
+        tracing::debug!(
+            backend = %self.name,
+            response = %response_str.trim(),
+            "COMPRESS DEFLATE not supported, continuing without compression"
+        );
+        Ok(false)
+    }
+
     /// Perform AUTHINFO USER/PASS handshake if credentials are configured.
     async fn negotiate_auth(
         &self,
@@ -244,13 +300,29 @@ impl managed::Manager for TcpManager {
     type Error = ConnectionError;
 
     async fn create(&self) -> Result<ConnectionStream, ConnectionError> {
+        use crate::compression::DecompressStream;
+
         let mut stream = self.create_optimized_stream().await?;
         let mut buffer = [0u8; 4096];
 
         self.consume_greeting(&mut stream, &mut buffer).await?;
         self.negotiate_auth(&mut stream, &mut buffer).await?;
-        // Future: self.negotiate_compression(&mut stream, &mut buffer).await?
-        // See feature/wire-compression-rfc8054
+
+        if self.negotiate_compression(&mut stream, &mut buffer).await? {
+            let level = self.compress_level.unwrap_or(1);
+            stream = match stream {
+                ConnectionStream::Plain(tcp) => ConnectionStream::CompressedPlain(Box::new(
+                    DecompressStream::with_level(tcp, level),
+                )),
+                ConnectionStream::Tls(tls) => ConnectionStream::CompressedTls(Box::new(
+                    DecompressStream::with_level(*tls, level),
+                )),
+                // create_optimized_stream() only returns Plain or Tls
+                ConnectionStream::CompressedPlain(_) | ConnectionStream::CompressedTls(_) => {
+                    unreachable!("fresh connections are never already compressed")
+                }
+            };
+        }
 
         Ok(stream)
     }
@@ -283,6 +355,8 @@ mod tests {
             Some("user".to_string()),
             Some("pass".to_string()),
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -301,6 +375,8 @@ mod tests {
             "news.example.com".to_string(),
             563,
             "SecureServer".to_string(),
+            None,
+            None,
             None,
             None,
             None,
@@ -324,6 +400,8 @@ mod tests {
             Some("user".to_string()),
             Some("pass".to_string()),
             Some(tls_config),
+            None,
+            None,
         )
         .unwrap();
 
@@ -347,6 +425,8 @@ mod tests {
             Some("user".to_string()),
             Some("pass".to_string()),
             Some(tls_config),
+            None,
+            None,
         )
         .unwrap();
 
@@ -364,6 +444,8 @@ mod tests {
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -384,6 +466,8 @@ mod tests {
             "TestServer".to_string(),
             Some("user".to_string()),
             Some("pass".to_string()),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -408,6 +492,8 @@ mod tests {
             None,
             None,
             Some(tls_config),
+            None,
+            None,
         )
         .unwrap();
 
@@ -437,6 +523,8 @@ mod tests {
             None,
             None,
             Some(tls_config),
+            None,
+            None,
         );
 
         // Should fail because cert file doesn't exist

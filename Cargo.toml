@@ -68,6 +68,8 @@ bytesize = { version = "2.3.1", features = ["serde"] }
 serde_bytes = "0.11.19"
 twox-hash = "2.1.2"
 rand = "0.8"  # Jittered backoff for stale-connection retries
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }  # RFC 8054 COMPRESS DEFLATE
+pin-project-lite = "0.2"  # Safe pin projection (already in dep tree via tokio)
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["test-util"] }  # Paused time for deterministic async tests
@@ -79,6 +81,7 @@ yenc = "0.2.2"  # For benchmark comparison only
 
 [features]
 default = []
+zlib-ng = ["flate2/zlib-ng"]  # SIMD-optimized compression (requires cmake; ~2-3x faster)
 
 [[bench]]
 name = "command_parsing"

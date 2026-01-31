@@ -54,7 +54,7 @@ sudo chmod -R a+rx /sys/kernel/tracing 2>/dev/null || true
 sudo chmod -R a+rx /sys/kernel/debug/tracing 2>/dev/null || true
 
 # Build with profiling flags
-RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling
+RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --features zlib-ng
 
 echo "=== Latency Profile Mode: $MODE ==="
 echo ""

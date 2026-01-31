@@ -85,8 +85,13 @@ impl StaleConnectionServer {
                         let cmd = String::from_utf8_lossy(&buffer[..n]);
                         let cmd_upper = cmd.trim().to_uppercase();
 
+                        // Handle COMPRESS DEFLATE (connection setup, don't count)
+                        if cmd_upper.starts_with("COMPRESS") {
+                            let _ = stream.write_all(b"500 Not supported\r\n").await;
+                            continue;
+                        }
                         // Handle DATE (health check)
-                        if cmd_upper.starts_with("DATE") {
+                        else if cmd_upper.starts_with("DATE") {
                             let _ = stream.write_all(b"111 20251219120000\r\n").await;
                             command_count += 1;
                         }

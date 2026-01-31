@@ -128,6 +128,8 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         health_check_max_per_cycle,
         health_check_pool_timeout,
         tier,
+        compress: None,
+        compress_level: None,
     })
 }
 
@@ -344,6 +346,8 @@ pub fn create_default_config() -> Config {
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
             tier: 0,
+            compress: None,
+            compress_level: None,
         }],
         ..Default::default()
     }
