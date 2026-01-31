@@ -38,7 +38,7 @@ macro_rules! retry_once_on_stale {
                 );
 
                 // Jittered backoff: 10–59ms prevents thundering-herd retries
-                let jitter_ms = rand::Rng::gen_range(&mut rand::thread_rng(), 10..60);
+                let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 10..60);
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 
                 match $expr {

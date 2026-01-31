@@ -49,6 +49,16 @@ impl ConnectionStream {
         Self::Tls(Box::new(stream))
     }
 
+    /// Create a compressed plain TCP connection stream
+    pub fn compressed_plain(stream: TcpStream) -> Self {
+        Self::CompressedPlain(Box::new(DecompressStream::new(stream)))
+    }
+
+    /// Create a compressed TLS connection stream
+    pub fn compressed_tls(stream: TlsStream<TcpStream>) -> Self {
+        Self::CompressedTls(Box::new(DecompressStream::new(stream)))
+    }
+
     /// Returns the connection type as a string for logging/debugging
     #[must_use]
     pub fn connection_type(&self) -> &'static str {

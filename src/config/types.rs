@@ -380,6 +380,13 @@ pub struct Server {
     /// Servers with lower tier numbers are tried first; higher tiers only when lower exhausted
     #[serde(default)]
     pub tier: u8,
+    /// Wire compression for backend connections (RFC 8054 COMPRESS DEFLATE)
+    /// None (default) = auto-detect, Some(true) = require, Some(false) = disable
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress: Option<bool>,
+    /// Compression level (0-9). None = fast (level 1). Higher = better ratio, more CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_level: Option<u32>,
 }
 
 /// Builder for constructing `Server` instances
@@ -422,6 +429,8 @@ pub struct ServerBuilder {
     health_check_max_per_cycle: Option<usize>,
     health_check_pool_timeout: Option<Duration>,
     tier: u8,
+    compress: Option<bool>,
+    compress_level: Option<u32>,
 }
 
 impl ServerBuilder {
@@ -446,6 +455,8 @@ impl ServerBuilder {
             health_check_max_per_cycle: None,
             health_check_pool_timeout: None,
             tier: 0,
+            compress: None,
+            compress_level: None,
         }
     }
 
@@ -526,6 +537,25 @@ impl ServerBuilder {
         self
     }
 
+    /// Set wire compression mode (RFC 8054 COMPRESS DEFLATE)
+    #[must_use]
+    pub fn compress(mut self, compress: Option<bool>) -> Self {
+        self.compress = compress;
+        self
+    }
+
+    /// Set compression level (0-9, default: 1 = fast)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `level` is greater than 9.
+    #[must_use]
+    pub fn compress_level(mut self, level: u32) -> Self {
+        assert!(level <= 9, "compress_level must be 0-9, got {level}");
+        self.compress_level = Some(level);
+        self
+    }
+
     /// Build the Server
     ///
     /// # Errors
@@ -571,6 +601,8 @@ impl ServerBuilder {
             health_check_max_per_cycle,
             health_check_pool_timeout,
             tier: self.tier,
+            compress: self.compress,
+            compress_level: self.compress_level,
         })
     }
 }

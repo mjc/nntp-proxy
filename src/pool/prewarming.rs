@@ -185,6 +185,8 @@ mod tests {
             health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
             health_check_pool_timeout: crate::config::health_check_pool_timeout(),
             tier: 0,
+            compress: None,
+            compress_level: None,
         }];
 
         let providers = servers
@@ -234,6 +236,8 @@ mod tests {
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
                 tier: 0,
+                compress: None,
+                compress_level: None,
             },
             Server {
                 name: crate::types::ServerName::try_new("Server2".to_string()).unwrap(),
@@ -249,6 +253,8 @@ mod tests {
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
                 tier: 0,
+                compress: None,
+                compress_level: None,
             },
         ];
 
@@ -289,6 +295,8 @@ mod tests {
             health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
             health_check_pool_timeout: crate::config::health_check_pool_timeout(),
             tier: 0,
+            compress: None,
+            compress_level: None,
         }];
 
         let providers = servers
@@ -408,6 +416,8 @@ mod tests {
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
                 tier: 0,
+                compress: None,
+                compress_level: None,
             },
             Server {
                 name: crate::types::ServerName::try_new("BadServer".to_string()).unwrap(),
@@ -423,6 +433,8 @@ mod tests {
                 health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
                 health_check_pool_timeout: crate::config::health_check_pool_timeout(),
                 tier: 0,
+                compress: None,
+                compress_level: None,
             },
         ];
 

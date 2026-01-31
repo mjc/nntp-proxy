@@ -45,7 +45,7 @@ case "$BIN" in
 esac
 
 # Build with profiling flags
-RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling
+RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --features zlib-ng
 
 echo "=== Heap Profiling ==="
 echo ""

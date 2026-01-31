@@ -97,7 +97,10 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut TuiApp,
     shutdown_rx: &mut mpsc::Receiver<()>,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     // Create update interval (4 times per second for responsive UI)
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
 

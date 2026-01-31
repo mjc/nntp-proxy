@@ -62,6 +62,7 @@
         [
           rustToolchain
           pkg-config
+          cmake  # Required for zlib-ng feature in flate2
 
           # Code quality & linting
           cargo-deny

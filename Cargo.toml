@@ -37,19 +37,19 @@ anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
 crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data structures with minimal features
-nix = { version = "0.30", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
+nix = { version = "0.31", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.12.3"
 async-trait = "0.1.89"
 memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
 moka = { version = "0.12", features = ["future"], default-features = false }  # Async LRU cache, minimal features
-foyer = { version = "0.21", features = ["serde"] }  # Hybrid memory+disk cache for large article caching
+foyer = { version = "0.22", features = ["serde"] }  # Hybrid memory+disk cache for large article caching
 bytes = "1.0"  # Efficient byte buffer for zero-copy operations
-ratatui = "0.29"  # Terminal UI framework
+ratatui = "0.30"  # Terminal UI framework
 crossterm = "0.29"  # Cross-platform terminal manipulation
 smallvec = "1.13"  # Stack-allocated vectors for small collections
 dashmap = "6.1"  # Lock-free concurrent HashMap for metrics
-sysinfo = "0.37"  # System metrics (CPU, memory) for monitoring
+sysinfo = "0.38"  # System metrics (CPU, memory) for monitoring
 
 # Derive helpers to reduce newtype boilerplate
 nutype = { version = "0.6", features = ["serde"] }  # Validated newtypes with automatic derives
@@ -67,7 +67,9 @@ yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom i
 bytesize = { version = "2.3.1", features = ["serde"] }
 serde_bytes = "0.11.19"
 twox-hash = "2.1.2"
-rand = "0.8"  # Jittered backoff for stale-connection retries
+rand = "0.9"  # Jittered backoff for stale-connection retries
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }  # RFC 8054 COMPRESS DEFLATE
+pin-project-lite = "0.2"  # Safe pin projection (already in dep tree via tokio)
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["test-util"] }  # Paused time for deterministic async tests
@@ -79,6 +81,7 @@ yenc = "0.2.2"  # For benchmark comparison only
 
 [features]
 default = []
+zlib-ng = ["flate2/zlib-ng"]  # SIMD-optimized compression (requires cmake; ~2-3x faster)
 
 [[bench]]
 name = "command_parsing"

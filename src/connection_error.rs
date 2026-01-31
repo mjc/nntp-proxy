@@ -64,6 +64,9 @@ pub enum ConnectionError {
 
     #[error("Unexpected auth response from backend '{backend}': {response}")]
     UnexpectedAuthResponse { backend: String, response: String },
+
+    #[error("Compression required but not supported by backend '{backend}': {response}")]
+    CompressionRequired { backend: String, response: String },
 }
 
 impl ConnectionError {

@@ -35,8 +35,8 @@
 
 use crate::types::{BackendId, MessageId};
 use foyer::{
-    BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    HybridCachePolicy, LruConfig, RecoverMode, RuntimeOptions, Source, TokioRuntimeOptions,
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
+    HybridCachePolicy, LruConfig, RecoverMode, Source, Spawner,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -208,19 +208,16 @@ impl HybridArticleCache {
         // Block size controls the disk partition file size used by foyer's block engine.
         // Smaller blocks = faster reclaim cycles but more FDs (~160 for 10GB at 64MB).
 
-        // Configure separate read/write runtimes for foyer disk I/O.
+        // Create a dedicated tokio runtime for foyer disk I/O.
         // With WriteOnInsertion, every cache insert triggers a background disk write.
-        // Separating runtimes prevents write flushes from starving read I/O under load.
-        let runtime_options = RuntimeOptions::Separated {
-            read_runtime_options: TokioRuntimeOptions {
-                worker_threads: 8,
-                max_blocking_threads: 16,
-            },
-            write_runtime_options: TokioRuntimeOptions {
-                worker_threads: 8,
-                max_blocking_threads: 16,
-            },
-        };
+        // A separate runtime prevents disk I/O from starving the main proxy event loop.
+        let foyer_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .max_blocking_threads(16)
+            .thread_name("foyer-disk-io")
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create foyer runtime: {}", e))?;
 
         let mut builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
@@ -233,14 +230,14 @@ impl HybridArticleCache {
             .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
             .storage()
             .with_engine_config(
-                BlockEngineBuilder::new(device)
+                BlockEngineConfig::new(device)
                     .with_block_size(64 * 1024 * 1024) // 64MB blocks - faster reclaim, ~160 FDs for 10GB
                     .with_indexer_shards(16)
                     .with_flushers(4)
                     .with_reclaimers(2),
             )
             .with_recover_mode(RecoverMode::Quiet)
-            .with_runtime_options(runtime_options);
+            .with_spawner(Spawner::from(foyer_runtime));
 
         if config.compression {
             builder = builder.with_compression(foyer::Compression::Lz4);
@@ -563,7 +560,7 @@ impl HybridArticleCache {
     ///
     /// Uses a very small noop device to minimize initialization time.
     pub async fn new_memory_only(memory_capacity: u64) -> anyhow::Result<Self> {
-        use foyer::{IoEngineBuilder, NoopDeviceBuilder, NoopIoEngineBuilder};
+        use foyer::{NoopDeviceBuilder, NoopIoEngineConfig};
 
         let memory_capacity_usize: usize = memory_capacity
             .try_into()
@@ -571,9 +568,6 @@ impl HybridArticleCache {
 
         // Create minimal noop device - 64KB is minimum for block engine
         let device = NoopDeviceBuilder::new(64 * 1024).build()?;
-
-        // Use noop I/O engine to avoid any actual I/O
-        let io_engine = NoopIoEngineBuilder.build().await?;
 
         let builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-test")
@@ -585,8 +579,8 @@ impl HybridArticleCache {
             })
             .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
             .storage()
-            .with_io_engine(io_engine)
-            .with_engine_config(BlockEngineBuilder::new(device))
+            .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>)
+            .with_engine_config(BlockEngineConfig::new(device))
             .with_recover_mode(RecoverMode::Quiet);
 
         let cache = builder.build().await?;
