@@ -102,6 +102,10 @@ fn test_metrics_snapshot_total_bytes() {
         cache_hit_rate: 0.0,
         cache_size_bytes: 0,
         disk_cache: None,
+        pipeline_batches: 0,
+        pipeline_commands: 0,
+        pipeline_requests_queued: 0,
+        pipeline_requests_completed: 0,
     };
 
     assert_eq!(snapshot.total_bytes(), 6000);
@@ -122,6 +126,10 @@ fn test_metrics_snapshot_throughput() {
         cache_hit_rate: 0.0,
         cache_size_bytes: 0,
         disk_cache: None,
+        pipeline_batches: 0,
+        pipeline_commands: 0,
+        pipeline_requests_queued: 0,
+        pipeline_requests_completed: 0,
     };
 
     // 10000 bytes / 10 seconds = 1000 bytes/sec
@@ -150,6 +158,10 @@ fn test_metrics_snapshot_format_uptime() {
         cache_hit_rate: 0.0,
         cache_size_bytes: 0,
         disk_cache: None,
+        pipeline_batches: 0,
+        pipeline_commands: 0,
+        pipeline_requests_queued: 0,
+        pipeline_requests_completed: 0,
     };
     assert_eq!(snapshot_secs.format_uptime(), "45s");
 
@@ -166,6 +178,10 @@ fn test_metrics_snapshot_format_uptime() {
         cache_hit_rate: 0.0,
         cache_size_bytes: 0,
         disk_cache: None,
+        pipeline_batches: 0,
+        pipeline_commands: 0,
+        pipeline_requests_queued: 0,
+        pipeline_requests_completed: 0,
     };
     assert_eq!(snapshot_mins.format_uptime(), "3m 5s");
 
@@ -182,6 +198,10 @@ fn test_metrics_snapshot_format_uptime() {
         cache_hit_rate: 0.0,
         cache_size_bytes: 0,
         disk_cache: None,
+        pipeline_batches: 0,
+        pipeline_commands: 0,
+        pipeline_requests_queued: 0,
+        pipeline_requests_completed: 0,
     };
     assert_eq!(snapshot_hours.format_uptime(), "2h 1m 5s");
 }
@@ -279,6 +299,10 @@ fn test_metrics_snapshot_with_multiple_backends() {
         cache_hit_rate: 0.0,
         cache_size_bytes: 0,
         disk_cache: None,
+        pipeline_batches: 0,
+        pipeline_commands: 0,
+        pipeline_requests_queued: 0,
+        pipeline_requests_completed: 0,
     };
 
     assert_eq!(snapshot.backend_stats.len(), 2);

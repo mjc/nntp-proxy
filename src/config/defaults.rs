@@ -100,3 +100,21 @@ pub fn disk_cache_compression() -> bool {
 pub fn disk_cache_shards() -> usize {
     4
 }
+
+/// Default for backend pipelining (enabled)
+#[inline]
+pub fn enable_pipelining() -> bool {
+    true
+}
+
+/// Default pipeline queue depth
+#[inline]
+pub fn pipeline_queue_depth() -> usize {
+    1000
+}
+
+/// Default pipeline batch size
+#[inline]
+pub fn pipeline_batch_size() -> usize {
+    4
+}

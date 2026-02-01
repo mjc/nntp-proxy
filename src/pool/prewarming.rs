@@ -187,6 +187,9 @@ mod tests {
             tier: 0,
             compress: None,
             compress_level: None,
+            enable_pipelining: true,
+            pipeline_queue_depth: 1000,
+            pipeline_batch_size: 16,
         }];
 
         let providers = servers
@@ -238,6 +241,9 @@ mod tests {
                 tier: 0,
                 compress: None,
                 compress_level: None,
+                enable_pipelining: true,
+                pipeline_queue_depth: 1000,
+                pipeline_batch_size: 16,
             },
             Server {
                 name: crate::types::ServerName::try_new("Server2".to_string()).unwrap(),
@@ -255,6 +261,9 @@ mod tests {
                 tier: 0,
                 compress: None,
                 compress_level: None,
+                enable_pipelining: true,
+                pipeline_queue_depth: 1000,
+                pipeline_batch_size: 16,
             },
         ];
 
@@ -297,6 +306,9 @@ mod tests {
             tier: 0,
             compress: None,
             compress_level: None,
+            enable_pipelining: true,
+            pipeline_queue_depth: 1000,
+            pipeline_batch_size: 16,
         }];
 
         let providers = servers
@@ -418,6 +430,9 @@ mod tests {
                 tier: 0,
                 compress: None,
                 compress_level: None,
+                enable_pipelining: true,
+                pipeline_queue_depth: 1000,
+                pipeline_batch_size: 16,
             },
             Server {
                 name: crate::types::ServerName::try_new("BadServer".to_string()).unwrap(),
@@ -435,6 +450,9 @@ mod tests {
                 tier: 0,
                 compress: None,
                 compress_level: None,
+                enable_pipelining: true,
+                pipeline_queue_depth: 1000,
+                pipeline_batch_size: 16,
             },
         ];
 

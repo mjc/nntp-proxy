@@ -166,6 +166,10 @@
         OPENSSL_DIR = "${pkgs.openssl.dev}";
         OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
+
+        # tikv-jemalloc-sys builds jemalloc from source; its configure script
+        # fails strerror_r detection when _FORTIFY_SOURCE is set at -O0 (NixOS default).
+        hardeningDisable = [ "fortify" ];
       };
 
       # Cross-compilation shell with all the tooling

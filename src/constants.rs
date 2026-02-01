@@ -253,8 +253,8 @@ mod tests {
         // Calculate total pool memory
         let total_memory = buffer::POOL * buffer::POOL_COUNT;
 
-        // Should be approximately 36MB (50 buffers × 724KB)
-        let expected_mb = 35;
+        // Should be approximately 353MB (500 buffers × 724KB)
+        let expected_mb = 353;
         let actual_mb = total_memory / (1024 * 1024);
 
         assert!(

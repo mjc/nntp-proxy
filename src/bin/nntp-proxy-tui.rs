@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
@@ -99,6 +102,9 @@ fn launch_tui(
                 cache.weighted_size()
             );
             builder = builder.with_cache(cache.clone());
+
+            // Add buffer pool for monitoring
+            builder = builder.with_buffer_pool(proxy.buffer_pool().clone());
 
             let tui_app = builder.build();
 

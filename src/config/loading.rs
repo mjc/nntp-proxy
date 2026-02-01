@@ -130,6 +130,9 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         tier,
         compress: None,
         compress_level: None,
+        enable_pipelining: crate::config::defaults::enable_pipelining(),
+        pipeline_queue_depth: crate::config::defaults::pipeline_queue_depth(),
+        pipeline_batch_size: crate::config::defaults::pipeline_batch_size(),
     })
 }
 
@@ -348,6 +351,9 @@ pub fn create_default_config() -> Config {
             tier: 0,
             compress: None,
             compress_level: None,
+            enable_pipelining: defaults::enable_pipelining(),
+            pipeline_queue_depth: defaults::pipeline_queue_depth(),
+            pipeline_batch_size: defaults::pipeline_batch_size(),
         }],
         ..Default::default()
     }

@@ -124,6 +124,13 @@ struct MetricsInner {
     backend_metrics: Vec<BackendMetrics>,
     user_metrics: DashMap<String, UserMetrics>,
     start_time: Instant,
+    // Pipeline metrics
+    pipeline_batches: AtomicU64,
+    pipeline_commands: AtomicU64,
+    /// Total requests enqueued to pipeline queues
+    pipeline_requests_queued: AtomicU64,
+    /// Total requests completed via pipeline
+    pipeline_requests_completed: AtomicU64,
     // Note: client_to_backend_bytes and backend_to_client_bytes are calculated
     // from backend_metrics sums, not stored separately
 }
@@ -190,6 +197,10 @@ impl MetricsCollector {
                 backend_metrics,
                 user_metrics: DashMap::new(),
                 start_time: Instant::now(),
+                pipeline_batches: AtomicU64::new(0),
+                pipeline_commands: AtomicU64::new(0),
+                pipeline_requests_queued: AtomicU64::new(0),
+                pipeline_requests_completed: AtomicU64::new(0),
             }),
         }
     }
@@ -408,6 +419,37 @@ impl MetricsCollector {
         self.update_user_metrics(username, |m| m.errors += 1);
     }
 
+    // Pipeline metrics
+
+    /// Record a pipelined batch execution.
+    ///
+    /// `batch_size` is the number of commands in the batch. Only called for
+    /// batches with more than 1 command (single-command batches use the
+    /// existing sequential path and are not counted).
+    #[inline]
+    pub fn record_pipeline_batch(&self, batch_size: u64) {
+        self.inner.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pipeline_commands
+            .fetch_add(batch_size, Ordering::Relaxed);
+    }
+
+    /// Record a request being enqueued to a pipeline queue
+    #[inline]
+    pub fn record_pipeline_enqueue(&self) {
+        self.inner
+            .pipeline_requests_queued
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a request being completed via pipeline
+    #[inline]
+    pub fn record_pipeline_complete(&self) {
+        self.inner
+            .pipeline_requests_completed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     // Snapshot creation (pure functional transformations)
 
     /// Create a snapshot of current metrics (functional pipeline)
@@ -477,6 +519,13 @@ impl MetricsCollector {
             cache_size_bytes,
             cache_hit_rate,
             disk_cache,
+            pipeline_batches: self.inner.pipeline_batches.load(Ordering::Relaxed),
+            pipeline_commands: self.inner.pipeline_commands.load(Ordering::Relaxed),
+            pipeline_requests_queued: self.inner.pipeline_requests_queued.load(Ordering::Relaxed),
+            pipeline_requests_completed: self
+                .inner
+                .pipeline_requests_completed
+                .load(Ordering::Relaxed),
         }
     }
 

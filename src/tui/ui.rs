@@ -184,8 +184,13 @@ fn render_summary(f: &mut Frame, area: Rect, app: &TuiApp) {
         ])
         .split(area);
 
-    // Left: App summary (uptime, sessions)
-    let left_summary = create_app_summary(snapshot, system_stats);
+    // Left: App summary (uptime, sessions, buffer stats in details mode)
+    let left_summary = create_app_summary(
+        snapshot,
+        system_stats,
+        app.buffer_pool(),
+        app.show_details(),
+    );
 
     // Middle: Cache summary
     let middle_summary = create_cache_summary(snapshot);
@@ -222,10 +227,12 @@ fn render_backends(
 // Summary Panel Builders (Pure Functions)
 // ============================================================================
 
-/// Create app summary panel (uptime, CPU, memory)
+/// Create app summary panel (uptime, CPU, memory, buffer stats in details mode)
 fn create_app_summary(
     snapshot: &crate::metrics::MetricsSnapshot,
     system_stats: &crate::tui::SystemStats,
+    buffer_pool: Option<&crate::pool::BufferPool>,
+    show_details: bool,
 ) -> Paragraph<'static> {
     /// Color for CPU usage based on threshold
     const fn cpu_color(usage: f32) -> Color {
@@ -247,7 +254,19 @@ fn create_app_summary(
         }
     }
 
-    Paragraph::new(vec![
+    /// Color for buffer pool utilization
+    fn buffer_color(in_use: usize, total: usize) -> Color {
+        let percent = if total > 0 { (in_use * 100) / total } else { 0 };
+        if percent > 80 {
+            Color::Red
+        } else if percent > 60 {
+            Color::Yellow
+        } else {
+            styles::VALUE_INFO
+        }
+    }
+
+    let mut lines = vec![
         Line::from(label_value_spans(
             "Uptime: ",
             snapshot.format_uptime(),
@@ -268,9 +287,39 @@ fn create_app_summary(
             format_bytes(system_stats.memory_bytes),
             styles::VALUE_INFO,
         )),
-    ])
-    .block(bordered_block("App", styles::BORDER_NORMAL))
-    .alignment(Alignment::Left)
+    ];
+
+    // Show pipeline stats if any batches have been processed
+    if snapshot.pipeline_batches > 0 {
+        let avg_batch = snapshot.pipeline_commands as f64 / snapshot.pipeline_batches as f64;
+        lines.push(Line::from(label_value_spans(
+            "Pipeline: ",
+            format!(
+                "{} batches (avg {:.1} cmds)",
+                snapshot.pipeline_batches, avg_batch
+            ),
+            styles::VALUE_INFO,
+        )));
+    }
+
+    // Add buffer stats in details mode if available
+    if show_details && let Some(pool) = buffer_pool {
+        let (_available, in_use, total) = pool.stats();
+        lines.push(Line::from(label_value_spans(
+            "Buffers: ",
+            format!(
+                "{}/{} ({:.0}%)",
+                in_use,
+                total,
+                (in_use * 100) as f64 / total as f64
+            ),
+            buffer_color(in_use, total),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .block(bordered_block("App", styles::BORDER_NORMAL))
+        .alignment(Alignment::Left)
 }
 
 /// Create cache summary panel
@@ -799,8 +848,10 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     /// Truncate username to fit display width
     fn format_username(username: &str) -> String {
         const MAX_LEN: usize = 12;
+        const TRUNCATE_AT: usize = 9;
         if username.len() > MAX_LEN {
-            format!("{}...", &username[..9])
+            let truncated: String = username.chars().take(TRUNCATE_AT).collect();
+            format!("{truncated}...")
         } else {
             format!("{:<MAX_LEN$}", username)
         }

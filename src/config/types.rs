@@ -387,6 +387,20 @@ pub struct Server {
     /// Compression level (0-9). None = fast (level 1). Higher = better ratio, more CPU.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compress_level: Option<u32>,
+
+    /// Enable backend pipelining (request multiplexing) for this server
+    /// When enabled, client requests are queued and batched onto shared connections
+    /// Default: true
+    #[serde(default = "super::defaults::enable_pipelining")]
+    pub enable_pipelining: bool,
+    /// Maximum queue depth for pipelined requests (backpressure threshold)
+    /// Default: 1000
+    #[serde(default = "super::defaults::pipeline_queue_depth")]
+    pub pipeline_queue_depth: usize,
+    /// Maximum number of commands per pipeline batch
+    /// Default: 16
+    #[serde(default = "super::defaults::pipeline_batch_size")]
+    pub pipeline_batch_size: usize,
 }
 
 /// Builder for constructing `Server` instances
@@ -431,6 +445,9 @@ pub struct ServerBuilder {
     tier: u8,
     compress: Option<bool>,
     compress_level: Option<u32>,
+    enable_pipelining: bool,
+    pipeline_queue_depth: Option<usize>,
+    pipeline_batch_size: Option<usize>,
 }
 
 impl ServerBuilder {
@@ -457,6 +474,9 @@ impl ServerBuilder {
             tier: 0,
             compress: None,
             compress_level: None,
+            enable_pipelining: true,
+            pipeline_queue_depth: None,
+            pipeline_batch_size: None,
         }
     }
 
@@ -556,6 +576,27 @@ impl ServerBuilder {
         self
     }
 
+    /// Enable or disable backend pipelining (request multiplexing)
+    #[must_use]
+    pub fn enable_pipelining(mut self, enabled: bool) -> Self {
+        self.enable_pipelining = enabled;
+        self
+    }
+
+    /// Set pipeline queue depth
+    #[must_use]
+    pub fn pipeline_queue_depth(mut self, depth: usize) -> Self {
+        self.pipeline_queue_depth = Some(depth);
+        self
+    }
+
+    /// Set pipeline batch size
+    #[must_use]
+    pub fn pipeline_batch_size(mut self, size: usize) -> Self {
+        self.pipeline_batch_size = Some(size);
+        self
+    }
+
     /// Build the Server
     ///
     /// # Errors
@@ -587,6 +628,14 @@ impl ServerBuilder {
             .health_check_pool_timeout
             .unwrap_or_else(super::defaults::health_check_pool_timeout);
 
+        let pipeline_queue_depth = self
+            .pipeline_queue_depth
+            .unwrap_or_else(super::defaults::pipeline_queue_depth);
+
+        let pipeline_batch_size = self
+            .pipeline_batch_size
+            .unwrap_or_else(super::defaults::pipeline_batch_size);
+
         Ok(Server {
             host,
             port,
@@ -603,6 +652,9 @@ impl ServerBuilder {
             tier: self.tier,
             compress: self.compress,
             compress_level: self.compress_level,
+            enable_pipelining: self.enable_pipelining,
+            pipeline_queue_depth,
+            pipeline_batch_size,
         })
     }
 }

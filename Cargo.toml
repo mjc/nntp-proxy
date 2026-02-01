@@ -37,6 +37,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
 crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data structures with minimal features
+tikv-jemallocator = "0.6"  # jemalloc allocator for reduced page allocation overhead
 nix = { version = "0.31", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.12.3"
 async-trait = "0.1.89"

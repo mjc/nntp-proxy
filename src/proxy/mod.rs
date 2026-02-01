@@ -252,6 +252,9 @@ pub(super) mod tests {
                     tier: 0,
                     compress: None,
                     compress_level: None,
+                    enable_pipelining: true,
+                    pipeline_queue_depth: 1000,
+                    pipeline_batch_size: 16,
                 },
                 Server {
                     host: HostName::try_new("server2.example.com".to_string()).unwrap(),
@@ -269,6 +272,9 @@ pub(super) mod tests {
                     tier: 0,
                     compress: None,
                     compress_level: None,
+                    enable_pipelining: true,
+                    pipeline_queue_depth: 1000,
+                    pipeline_batch_size: 16,
                 },
                 Server {
                     host: HostName::try_new("server3.example.com".to_string()).unwrap(),
@@ -286,6 +292,9 @@ pub(super) mod tests {
                     tier: 0,
                     compress: None,
                     compress_level: None,
+                    enable_pipelining: true,
+                    pipeline_queue_depth: 1000,
+                    pipeline_batch_size: 16,
                 },
             ],
             ..Default::default()

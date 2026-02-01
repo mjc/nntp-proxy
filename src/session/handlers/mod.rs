@@ -15,4 +15,6 @@ mod cache_operations;
 mod command_execution;
 mod hybrid;
 mod per_command;
+mod pipeline;
+pub(crate) mod pipeline_worker;
 mod stateful;

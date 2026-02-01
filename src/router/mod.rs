@@ -25,6 +25,7 @@
 //!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
 //!     0, // tier (lower = higher priority)
+//!     None, // pipeline_queue
 //! );
 //!
 //! // Route a command
@@ -36,6 +37,7 @@
 //! ```
 
 mod backend_info;
+pub mod backend_queue;
 mod strategies;
 
 use anyhow::Result;
@@ -43,6 +45,8 @@ use nutype::nutype;
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+pub use backend_queue::BackendQueue;
 
 use crate::config::BackendSelectionStrategy;
 use crate::pool::DeadpoolConnectionProvider;
@@ -220,6 +224,7 @@ impl Drop for CommandGuard {
 ///     ServerName::try_new("backend-1".to_string()).unwrap(),
 ///     provider,
 ///     0, // tier (lower = higher priority)
+///     None, // pipeline_queue
 /// );
 ///
 /// // Route commands
@@ -291,12 +296,14 @@ impl BackendSelector {
     /// * `name` - Human-readable name for logging
     /// * `provider` - Connection pool provider
     /// * `tier` - Server tier (lower = higher priority, 0 is highest)
+    /// * `pipeline_queue` - Optional pipeline queue for request multiplexing
     pub fn add_backend(
         &mut self,
         backend_id: BackendId,
         name: ServerName,
         provider: DeadpoolConnectionProvider,
         tier: u8,
+        pipeline_queue: Option<Arc<BackendQueue>>,
     ) {
         let max_connections = provider.max_size();
 
@@ -329,6 +336,10 @@ impl BackendSelector {
             }
         }
 
+        if pipeline_queue.is_some() {
+            info!("Backend {:?} ({}) pipeline queue enabled", backend_id, name);
+        }
+
         self.backends.push(BackendInfo {
             id: backend_id,
             name,
@@ -336,6 +347,7 @@ impl BackendSelector {
             pending_count: PendingCount::new(),
             stateful_count: StatefulCount::new(),
             tier,
+            pipeline_queue,
         });
     }
 
@@ -479,6 +491,13 @@ impl BackendSelector {
     #[must_use]
     pub fn backend_provider(&self, backend_id: BackendId) -> Option<&DeadpoolConnectionProvider> {
         self.find_backend(backend_id).map(|b| &b.provider)
+    }
+
+    /// Get the pipeline queue for a backend (if pipelining is enabled)
+    #[must_use]
+    pub fn get_backend_queue(&self, backend_id: BackendId) -> Option<&Arc<BackendQueue>> {
+        self.find_backend(backend_id)
+            .and_then(|b| b.pipeline_queue.as_ref())
     }
 
     /// Get the number of backends
@@ -628,6 +647,7 @@ mod tests {
             ServerName::try_new("test-server".to_string()).unwrap(),
             provider,
             0,
+            None,
         );
         (Arc::new(selector), backend_id)
     }

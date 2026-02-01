@@ -274,6 +274,9 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                 tier: 0,
                 compress: None,
                 compress_level: None,
+                enable_pipelining: true,
+                pipeline_queue_depth: 1000,
+                pipeline_batch_size: 16,
             })
             .collect(),
         proxy: Default::default(),

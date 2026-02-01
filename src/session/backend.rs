@@ -46,6 +46,13 @@ pub struct ValidatedResponse {
     pub warnings: Vec<ResponseWarning>,
 }
 
+impl ValidatedResponse {
+    /// Get the status code as a u16, or 0 if invalid
+    pub fn status_code_u16(&self) -> u16 {
+        self.response.status_code().map(|c| c.as_u16()).unwrap_or(0)
+    }
+}
+
 /// Validate backend response data (pure function - easily testable)
 ///
 /// Checks response for:

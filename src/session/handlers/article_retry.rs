@@ -4,18 +4,210 @@
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::router::BackendSelector;
+use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
 use crate::session::handlers::cache_operations::CacheLookupResult;
 use crate::session::handlers::command_execution::BackendAttemptResult;
 use crate::session::{ClientSession, common};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
-use crate::command::classifier::{HEAD_CASES, STAT_CASES, matches_any};
+use crate::command::classifier::{ARTICLE_CASES, BODY_CASES, HEAD_CASES, STAT_CASES, matches_any};
 use crate::session::precheck;
 
 impl ClientSession {
+    /// Batch-execute ARTICLE/BODY commands using TCP pipelining.
+    ///
+    /// Sends all commands to one backend connection upfront, then reads/streams
+    /// responses in order. This exploits TCP pipelining: the backend starts
+    /// responding immediately, and responses queue in our receive buffer while
+    /// we stream earlier ones to the client.
+    pub(super) async fn batch_execute_articles(
+        &self,
+        router: Arc<BackendSelector>,
+        commands: &[String],
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+    ) -> Result<()> {
+        use crate::router::CommandGuard;
+        use crate::session::routing::{
+            MetricsAction, determine_metrics_action, is_430_status_code,
+        };
+        use crate::session::{backend, streaming};
+
+        // Route to a single backend for the whole batch.
+        // One pending count for one connection — don't inflate pending by N,
+        // as that skews load_ratio and can cause other sessions to over-allocate
+        // connections on other backends, hitting provider connection limits.
+        let backend_id = router.route_command(self.client_id, &commands[0])?;
+        let guard = CommandGuard::new(router.clone(), backend_id);
+
+        let Some(provider) = router.backend_provider(backend_id) else {
+            return Err(anyhow::anyhow!(
+                "Backend {:?} has no connection provider",
+                backend_id
+            ));
+        };
+
+        let mut conn = match provider.get_pooled_connection().await {
+            Ok(c) => c,
+            Err(e) => return Err(e.into()),
+        };
+
+        // Phase 1: Write all commands, then flush
+        for command in commands {
+            if let Err(e) = conn.write_all(command.as_bytes()).await {
+                debug!(
+                    "Client {} batch write failed to backend {:?}: {}",
+                    self.client_addr, backend_id, e
+                );
+                crate::pool::remove_from_pool(conn);
+                return Err(e.into());
+            }
+        }
+        if let Err(e) = conn.flush().await {
+            debug!(
+                "Client {} batch flush failed to backend {:?}: {}",
+                self.client_addr, backend_id, e
+            );
+            crate::pool::remove_from_pool(conn);
+            return Err(e.into());
+        }
+
+        // Phase 2: Read and stream responses in order
+        let mut connection_healthy = true;
+        for (i, command) in commands.iter().enumerate() {
+            let msg_id = crate::session::common::extract_message_id(command)
+                .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
+
+            // Read first chunk of this response
+            let mut buffer = self.buffer_pool.acquire().await;
+            let n = match buffer.read_from(&mut *conn).await {
+                Ok(n) if n > 0 => n,
+                Ok(_) => {
+                    debug!(
+                        "Client {} batch: backend {:?} EOF at response {}/{}",
+                        self.client_addr,
+                        backend_id,
+                        i + 1,
+                        commands.len()
+                    );
+                    connection_healthy = false;
+                    break;
+                }
+                Err(e) => {
+                    debug!(
+                        "Client {} batch: read error at response {}/{}: {}",
+                        self.client_addr,
+                        i + 1,
+                        commands.len(),
+                        e
+                    );
+                    connection_healthy = false;
+                    break;
+                }
+            };
+
+            // Validate response
+            let validated = backend::validate_backend_response(
+                &buffer[..n],
+                n,
+                crate::protocol::MIN_RESPONSE_LENGTH,
+            );
+            let response_code = validated.response;
+            let is_multiline = validated.is_multiline;
+
+            // Handle 430 — article not found on this backend
+            if response_code
+                .status_code()
+                .is_some_and(|code| is_430_status_code(code.as_u16()))
+            {
+                // Send 430 to client for this command
+                self.send_430_to_client(client_write, backend_to_client_bytes)
+                    .await?;
+                *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+
+                // Record availability
+                if let Some(ref msg_id_val) = msg_id {
+                    let mut avail = self
+                        .load_article_availability(Some(msg_id_val), router.clone())
+                        .await;
+                    avail.record_missing(backend_id);
+                    self.sync_availability_if_needed(Some(msg_id_val), &avail)
+                        .await;
+                }
+
+                self.metrics.record_command(backend_id);
+                self.metrics.user_command(self.username().as_deref());
+                continue;
+            }
+
+            // Handle invalid response
+            if response_code == crate::protocol::NntpResponse::Invalid {
+                // Send 430 to client as a safe fallback
+                self.send_430_to_client(client_write, backend_to_client_bytes)
+                    .await?;
+                *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+                continue;
+            }
+
+            // Success — stream response to client
+            *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+
+            let bytes_written = if is_multiline {
+                match streaming::stream_multiline_response(
+                    &mut *conn,
+                    client_write,
+                    &buffer[..n],
+                    n,
+                    self.client_addr,
+                    backend_id,
+                    &self.buffer_pool,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        // Connection has pipelined responses we can't cleanly drain.
+                        crate::pool::remove_from_pool(conn);
+                        return Err(e);
+                    }
+                }
+            } else {
+                // Single-line response
+                client_write.write_all(&buffer[..n]).await?;
+                n as u64
+            };
+
+            *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
+
+            // Record metrics
+            self.metrics.record_command(backend_id);
+            self.metrics.user_command(self.username().as_deref());
+            if let Some(status_code) = response_code.status_code() {
+                match determine_metrics_action(status_code.as_u16(), is_multiline) {
+                    MetricsAction::Article => {
+                        self.metrics.record_article(backend_id, bytes_written);
+                    }
+                    MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+                    MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+                    MetricsAction::None => {}
+                }
+            }
+        }
+
+        if !connection_healthy {
+            crate::pool::remove_from_pool(conn);
+        }
+        // else: conn drops here, returning to pool automatically
+
+        guard.complete();
+        Ok(())
+    }
+
     /// Route a single command to a backend and execute it
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
@@ -79,6 +271,103 @@ impl ClientSession {
                 client_write.write_all(&response).await?;
                 *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                 return Ok(BackendId::from_index(0));
+            }
+        }
+
+        // Detect large-transfer commands that should skip the pipeline.
+        // ARTICLE and BODY responses can be many megabytes; the pipeline worker
+        // serializes all clients through one connection per backend, killing
+        // throughput. These commands fall through to the direct streaming path
+        // which gives each client its own pooled connection (~120 MB/s).
+        let cmd_bytes = command.as_bytes();
+        let cmd_end = memchr::memchr(b' ', cmd_bytes).unwrap_or(cmd_bytes.len());
+        let is_large_transfer = cmd_end >= 4
+            && (matches_any(&cmd_bytes[..cmd_end], ARTICLE_CASES)
+                || matches_any(&cmd_bytes[..cmd_end], BODY_CASES));
+
+        // Try pipeline path: if the routed backend has a pipeline queue, enqueue
+        // the command and await the response instead of acquiring a direct connection.
+        // This allows N client sessions to share M backend connections (N >> M).
+        if !is_large_transfer
+            && let Ok(backend_id) = router.route_command(self.client_id, command)
+            && let Some(queue) = router.get_backend_queue(backend_id)
+        {
+            debug!(
+                "Client {} using pipeline path for backend {:?}: {}",
+                self.client_addr,
+                backend_id,
+                command.trim()
+            );
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let request = QueuedRequest {
+                command: command.to_string(),
+                response_tx: tx,
+            };
+
+            // Enqueue with backpressure - fail fast if queue is full
+            match queue.try_enqueue(request) {
+                Ok(()) => {
+                    self.metrics.record_pipeline_enqueue();
+
+                    // Await response from the pipeline worker
+                    match rx.await {
+                        Ok(PipelineResponse::Success {
+                            data,
+                            status_code,
+                            backend_id,
+                        }) => {
+                            // Check if the response is a 430 (article not found).
+                            // If so, fall through to the availability-aware retry loop
+                            // which will try other backends.
+                            if status_code == 430 {
+                                debug!(
+                                    "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
+                                    self.client_addr, backend_id
+                                );
+                                // Record this backend as missing so retry loop skips it
+                                if let Some(ref msg_id_val) = msg_id {
+                                    let mut avail = self
+                                        .load_article_availability(Some(msg_id_val), router.clone())
+                                        .await;
+                                    avail.record_missing(backend_id);
+                                    self.sync_availability_if_needed(Some(msg_id_val), &avail)
+                                        .await;
+                                }
+                                self.metrics.record_pipeline_complete();
+                                // Fall through to direct execution path for retry
+                            } else {
+                                client_write.write_all(&data).await?;
+                                *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
+                                *client_to_backend_bytes =
+                                    client_to_backend_bytes.add(command.len());
+                                self.metrics.record_pipeline_complete();
+                                return Ok(backend_id);
+                            }
+                        }
+                        Ok(PipelineResponse::Error(e)) => {
+                            debug!(
+                                "Client {} pipeline error for backend {:?}: {}",
+                                self.client_addr, backend_id, e
+                            );
+                            // Fall through to direct execution path
+                        }
+                        Err(_) => {
+                            debug!(
+                                "Client {} pipeline worker dropped response channel",
+                                self.client_addr
+                            );
+                            // Fall through to direct execution path
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Client {} pipeline queue full for backend {:?}: {}",
+                        self.client_addr, backend_id, e
+                    );
+                    // Fall through to direct execution path
+                }
             }
         }
 
