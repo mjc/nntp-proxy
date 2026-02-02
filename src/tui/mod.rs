@@ -118,7 +118,6 @@ where
             // Update timer - check for events only on ticks to reduce overhead
             _ = update_interval.tick() => {
                 app.update();
-                terminal.draw(|f| ui::render_ui(f, app))?;
 
                 // Check events on blocking thread pool to not block async runtime
                 let has_events = tokio::task::spawn_blocking(|| {
@@ -134,20 +133,12 @@ where
                         && key.kind == KeyEventKind::Press
                     {
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                should_quit = true;
-                            }
+                            KeyCode::Char('q') | KeyCode::Esc => should_quit = true,
                             KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                                 should_quit = true;
                             }
-                            KeyCode::Char('l') => {
-                                app.toggle_log_fullscreen();
-                                terminal.draw(|f| ui::render_ui(f, app))?;
-                            }
-                            KeyCode::Char('d') => {
-                                app.toggle_details();
-                                terminal.draw(|f| ui::render_ui(f, app))?;
-                            }
+                            KeyCode::Char('l') => app.toggle_log_fullscreen(),
+                            KeyCode::Char('d') => app.toggle_details(),
                             _ => {}
                         }
                     }
@@ -156,6 +147,8 @@ where
                 if should_quit {
                     break;
                 }
+
+                terminal.draw(|f| ui::render_ui(f, app))?;
             }
         }
     }
