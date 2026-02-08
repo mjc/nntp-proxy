@@ -48,7 +48,11 @@ async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()>
     )?;
     let listener = runtime::bind_listener(&host, port, routing_mode).await?;
 
-    runtime::spawn_connection_prewarming(&proxy);
+    // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
+    info!("Prewarming connection pools...");
+    proxy.prewarm_connections().await?;
+    info!("Connection pools ready, accepting clients");
+
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
     spawn_tui_shutdown_handler(&proxy, &shutdown_tx, tui_shutdown_tx);

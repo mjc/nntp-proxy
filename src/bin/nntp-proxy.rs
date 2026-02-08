@@ -39,7 +39,11 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     let proxy = Arc::new(NntpProxy::new(config, routing_mode).await?);
     let listener = runtime::bind_listener(&host, port, routing_mode).await?;
 
-    runtime::spawn_connection_prewarming(&proxy);
+    // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
+    tracing::info!("Prewarming connection pools...");
+    proxy.prewarm_connections().await?;
+    tracing::info!("Connection pools ready, accepting clients");
+
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
 
