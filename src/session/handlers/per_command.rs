@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
-use crate::command::classifier::{ARTICLE_CASES, BODY_CASES, matches_any};
+use crate::command::classifier::is_large_transfer_command;
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::is_client_disconnect_error;
@@ -32,16 +32,37 @@ enum CommandResult {
     SwitchToStateful,
 }
 
+/// Result of processing a single command
+enum SingleCommandResult {
+    /// Continue processing commands
+    Continue { auth_succeeded: bool },
+    /// Client sent QUIT command (bytes already added to backend_to_client_bytes)
+    Quit,
+    /// Switch to stateful mode (early return from loop)
+    SwitchToStateful,
+}
+
 /// Parameters for executing a command decision
 struct CommandExecutionParams<'a, 'b> {
     command: &'a str,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
-    client_reader: &'a mut tokio::io::BufReader<tokio::net::tcp::ReadHalf<'b>>,
     client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
     auth_username: &'a mut Option<String>,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
+}
+
+/// Parameters for processing a single command (full flow including QUIT handling)
+struct ProcessCommandParams<'a, 'b> {
+    command: &'a str,
+    skip_auth_check: bool,
+    router: &'a Arc<BackendSelector>,
+    client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
+    auth_username: &'a mut Option<String>,
+    client_to_backend_bytes: ClientToBackendBytes,
+    backend_to_client_bytes: &'a mut BackendToClientBytes,
+    last_command: &'a mut String,
 }
 
 impl ClientSession {
@@ -56,7 +77,6 @@ impl ClientSession {
             command,
             skip_auth_check,
             router,
-            client_reader: _client_reader,
             client_write,
             auth_username,
             client_to_backend_bytes,
@@ -168,6 +188,56 @@ impl ClientSession {
         }
     }
 
+    /// Process a single command (handles QUIT, auth, routing decision)
+    ///
+    /// Returns SingleCommandResult indicating whether to continue, quit, or switch to stateful mode.
+    async fn process_single_command(
+        &self,
+        params: ProcessCommandParams<'_, '_>,
+    ) -> Result<SingleCommandResult> {
+        let ProcessCommandParams {
+            command,
+            skip_auth_check,
+            router,
+            client_write,
+            auth_username,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+            last_command,
+        } = params;
+
+        // Handle QUIT locally
+        if let common::QuitStatus::Quit(bytes) =
+            common::handle_quit_command(command, client_write).await?
+        {
+            *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
+            return Ok(SingleCommandResult::Quit);
+        }
+
+        // Update last_command buffer (used for switch-to-stateful)
+        last_command.clear();
+        last_command.push_str(command);
+
+        // Execute command decision
+        match self
+            .execute_command_decision(CommandExecutionParams {
+                command: last_command,
+                skip_auth_check,
+                router,
+                client_write,
+                auth_username,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+            })
+            .await?
+        {
+            CommandResult::Continue { auth_succeeded } => {
+                Ok(SingleCommandResult::Continue { auth_succeeded })
+            }
+            CommandResult::SwitchToStateful => Ok(SingleCommandResult::SwitchToStateful),
+        }
+    }
+
     /// Handle a client connection with per-command routing
     /// Each command is routed independently to potentially different backends
     pub async fn handle_per_command_routing(
@@ -249,13 +319,10 @@ impl ClientSession {
                 // Detect if entire batch is large-transfer commands (ARTICLE/BODY by message-ID)
                 // that benefit from TCP pipelining on a single backend connection.
                 let all_large_transfer = batch.commands.len() > 1
-                    && batch.commands.iter().all(|cmd| {
-                        let bytes = cmd.as_bytes();
-                        let end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-                        end >= 4
-                            && (matches_any(&bytes[..end], ARTICLE_CASES)
-                                || matches_any(&bytes[..end], BODY_CASES))
-                    });
+                    && batch
+                        .commands
+                        .iter()
+                        .all(|cmd| is_large_transfer_command(cmd.as_bytes()));
 
                 // Try batch pipelining for all-ARTICLE/BODY batches;
                 // fall through to individual processing on failure.
@@ -298,40 +365,31 @@ impl ClientSession {
                         );
 
                         client_to_backend_bytes = client_to_backend_bytes.add(command.len());
-
-                        // Handle QUIT locally
-                        if let common::QuitStatus::Quit(bytes) =
-                            common::handle_quit_command(command, &mut client_write).await?
-                        {
-                            backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
-                            should_break = true;
-                            break;
-                        }
-
                         skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
-                        last_command.clear();
-                        last_command.push_str(command);
-
                         match self
-                            .execute_command_decision(CommandExecutionParams {
-                                command: &last_command,
+                            .process_single_command(ProcessCommandParams {
+                                command,
                                 skip_auth_check,
                                 router,
-                                client_reader: &mut client_reader,
                                 client_write: &mut client_write,
                                 auth_username: &mut auth_username,
                                 client_to_backend_bytes,
                                 backend_to_client_bytes: &mut backend_to_client_bytes,
+                                last_command: &mut last_command,
                             })
                             .await?
                         {
-                            CommandResult::Continue { auth_succeeded } => {
+                            SingleCommandResult::Continue { auth_succeeded } => {
                                 if auth_succeeded {
                                     skip_auth_check = true;
                                 }
                             }
-                            CommandResult::SwitchToStateful => {
+                            SingleCommandResult::Quit => {
+                                should_break = true;
+                                break;
+                            }
+                            SingleCommandResult::SwitchToStateful => {
                                 return self
                                     .switch_to_stateful_mode(
                                         client_reader,
@@ -365,39 +423,30 @@ impl ClientSession {
                 );
 
                 client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.len());
-
-                // Handle QUIT locally
-                if let common::QuitStatus::Quit(bytes) =
-                    common::handle_quit_command(trailing_cmd, &mut client_write).await?
-                {
-                    backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
-                    break;
-                }
-
                 skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
-                last_command.clear();
-                last_command.push_str(trailing_cmd);
-
                 match self
-                    .execute_command_decision(CommandExecutionParams {
-                        command: &last_command,
+                    .process_single_command(ProcessCommandParams {
+                        command: trailing_cmd,
                         skip_auth_check,
                         router,
-                        client_reader: &mut client_reader,
                         client_write: &mut client_write,
                         auth_username: &mut auth_username,
                         client_to_backend_bytes,
                         backend_to_client_bytes: &mut backend_to_client_bytes,
+                        last_command: &mut last_command,
                     })
                     .await?
                 {
-                    CommandResult::Continue { auth_succeeded } => {
+                    SingleCommandResult::Continue { auth_succeeded } => {
                         if auth_succeeded {
                             skip_auth_check = true;
                         }
                     }
-                    CommandResult::SwitchToStateful => {
+                    SingleCommandResult::Quit => {
+                        break;
+                    }
+                    SingleCommandResult::SwitchToStateful => {
                         return self
                             .switch_to_stateful_mode(
                                 client_reader,

@@ -6,7 +6,7 @@ use crate::protocol::TERMINATOR_TAIL_SIZE;
 
 /// Status of terminator detection in a chunk
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum TerminatorStatus {
+pub enum TerminatorStatus {
     /// Complete terminator found at this position (position is after terminator)
     FoundAt(usize),
     /// Terminator spans the boundary between tail and current chunk
@@ -17,11 +17,11 @@ pub(crate) enum TerminatorStatus {
 
 impl TerminatorStatus {
     /// Returns true if a terminator was found (either complete or spanning)
-    pub(crate) fn is_found(self) -> bool {
+    pub fn is_found(self) -> bool {
         !matches!(self, Self::NotFound)
     }
     /// Get the number of bytes to write from the chunk
-    pub(crate) fn write_len(self, chunk_size: usize) -> usize {
+    pub fn write_len(self, chunk_size: usize) -> usize {
         match self {
             Self::FoundAt(pos) => pos,
             Self::Spanning | Self::NotFound => chunk_size,
@@ -33,14 +33,14 @@ impl TerminatorStatus {
 ///
 /// Used to detect terminators that span across chunk boundaries.
 #[derive(Default)]
-pub(crate) struct TailBuffer {
+pub struct TailBuffer {
     data: [u8; TERMINATOR_TAIL_SIZE],
     len: usize,
 }
 
 impl TailBuffer {
     /// Update tail with the last bytes from a chunk
-    pub(crate) fn update(&mut self, chunk: &[u8]) {
+    pub fn update(&mut self, chunk: &[u8]) {
         if chunk.len() >= TERMINATOR_TAIL_SIZE {
             self.data
                 .copy_from_slice(&chunk[chunk.len() - TERMINATOR_TAIL_SIZE..]);
@@ -51,19 +51,19 @@ impl TailBuffer {
         }
     }
     /// Get the tail data as a slice
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.data[..self.len]
     }
     /// Get the current length of valid tail data
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
     /// Returns true if the buffer is empty
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len == 0
     }
     /// Check if terminator spans the boundary between this tail and the given chunk
-    pub(crate) fn has_spanning_terminator(&self, chunk: &[u8]) -> bool {
+    pub fn has_spanning_terminator(&self, chunk: &[u8]) -> bool {
         // Early return if buffer is empty - no boundary to span
         if self.is_empty() {
             return false;
@@ -75,7 +75,7 @@ impl TailBuffer {
     /// **Performance**: find_terminator_end() checks end first (O(1)),
     /// only scans with memchr if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
-    pub(crate) fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
+    pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
         if let Some(pos) = find_terminator_end(chunk) {
             TerminatorStatus::FoundAt(pos)
         } else if self.has_spanning_terminator(chunk) {

@@ -105,10 +105,11 @@ async fn execute_backend_query(
                 return Err(());
             };
 
-            // For multiline responses, read remaining data
+            // For multiline responses, read remaining data until we have the full terminator
             let mut response = buffer[..cmd_response.bytes_read].to_vec();
             if multiline && cmd_response.is_multiline {
-                while !response.ends_with(b".\r\n") {
+                // Read until we have the complete NNTP terminator \r\n.\r\n
+                while !crate::protocol::has_multiline_terminator(&response) {
                     match conn.as_mut().read(buffer.as_mut_slice()).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => response.extend_from_slice(&buffer[..n]),

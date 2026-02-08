@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
-use crate::command::classifier::{ARTICLE_CASES, BODY_CASES, HEAD_CASES, STAT_CASES, matches_any};
+use crate::command::classifier::{is_head_command, is_large_transfer_command, is_stat_command};
 use crate::session::precheck;
 
 impl ClientSession {
@@ -127,14 +127,8 @@ impl ClientSession {
                 *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
                 // Record availability
-                if let Some(ref msg_id_val) = msg_id {
-                    let mut avail = self
-                        .load_article_availability(Some(msg_id_val), router.clone())
-                        .await;
-                    avail.record_missing(backend_id);
-                    self.sync_availability_if_needed(Some(msg_id_val), &avail)
-                        .await;
-                }
+                self.record_article_missing(msg_id.as_ref(), backend_id, router.clone())
+                    .await;
 
                 self.metrics.record_command(backend_id);
                 self.metrics.user_command(self.username().as_deref());
@@ -253,11 +247,8 @@ impl ClientSession {
         {
             // Use optimized command matching from classifier (direct byte comparison)
             let bytes = command.as_bytes();
-            let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-            let is_stat = cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES);
-            let is_head = cmd_end >= 4 && matches_any(&bytes[..cmd_end], HEAD_CASES);
-
-            if is_stat || is_head {
+            let is_head = is_head_command(bytes);
+            if is_stat_command(bytes) || is_head {
                 let deps = self.precheck_deps(&router);
                 let response = match precheck::precheck(&deps, command, msg_id_ref, is_head).await {
                     Some(entry) => entry.buffer().to_vec(),
@@ -276,10 +267,7 @@ impl ClientSession {
         // throughput. These commands fall through to the direct streaming path
         // which gives each client its own pooled connection (~120 MB/s).
         let cmd_bytes = command.as_bytes();
-        let cmd_end = memchr::memchr(b' ', cmd_bytes).unwrap_or(cmd_bytes.len());
-        let is_large_transfer = cmd_end >= 4
-            && (matches_any(&cmd_bytes[..cmd_end], ARTICLE_CASES)
-                || matches_any(&cmd_bytes[..cmd_end], BODY_CASES));
+        let is_large_transfer = is_large_transfer_command(cmd_bytes);
 
         // Try pipeline path: if the routed backend has a pipeline queue, enqueue
         // the command and await the response instead of acquiring a direct connection.
@@ -322,14 +310,12 @@ impl ClientSession {
                                     self.client_addr, backend_id
                                 );
                                 // Record this backend as missing so retry loop skips it
-                                if let Some(ref msg_id_val) = msg_id {
-                                    let mut avail = self
-                                        .load_article_availability(Some(msg_id_val), router.clone())
-                                        .await;
-                                    avail.record_missing(backend_id);
-                                    self.sync_availability_if_needed(Some(msg_id_val), &avail)
-                                        .await;
-                                }
+                                self.record_article_missing(
+                                    msg_id.as_ref(),
+                                    backend_id,
+                                    router.clone(),
+                                )
+                                .await;
                                 self.metrics.record_pipeline_complete();
                                 // Fall through to direct execution path for retry
                             } else {
@@ -531,6 +517,25 @@ impl ClientSession {
         if let Some(msg_id_ref) = msg_id {
             self.cache
                 .sync_availability(msg_id_ref.clone(), availability)
+                .await;
+        }
+    }
+
+    /// Record that an article is missing on a specific backend and sync to cache.
+    ///
+    /// Loads the current availability, marks the backend as missing, and syncs back to cache.
+    pub(super) async fn record_article_missing(
+        &self,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        backend_id: crate::types::BackendId,
+        router: std::sync::Arc<crate::router::BackendSelector>,
+    ) {
+        if let Some(msg_id_val) = msg_id {
+            let mut avail = self
+                .load_article_availability(Some(msg_id_val), router)
+                .await;
+            avail.record_missing(backend_id);
+            self.sync_availability_if_needed(Some(msg_id_val), &avail)
                 .await;
         }
     }

@@ -4,6 +4,8 @@
 //! providing common logic used by both `ArticleEntry` (moka) and
 //! `HybridArticleEntry` (foyer) cache implementations.
 
+use crate::protocol::has_multiline_terminator;
+
 /// Check if a buffer contains a valid NNTP multiline response
 ///
 /// A valid response must:
@@ -22,8 +24,8 @@ pub(crate) fn is_valid_response(buffer: &[u8]) -> bool {
         return false;
     }
 
-    // Must end with .\r\n for multiline responses
-    if !buffer.ends_with(b".\r\n") {
+    // Must end with \r\n.\r\n for multiline responses
+    if !has_multiline_terminator(buffer) {
         return false;
     }
 
@@ -37,14 +39,14 @@ pub(crate) fn is_valid_response(buffer: &[u8]) -> bool {
 /// 1. Status code is 220 (ARTICLE) or 222 (BODY)
 /// 2. Buffer contains actual content (not just a stub)
 ///
-/// A complete response ends with `.\r\n` and is at least 30 bytes.
+/// A complete response ends with `\r\n.\r\n` and is at least 30 bytes.
 #[inline]
 pub(crate) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
     if status_code != 220 && status_code != 222 {
         return false;
     }
     const MIN_ARTICLE_SIZE: usize = 30;
-    buffer.len() >= MIN_ARTICLE_SIZE && buffer.ends_with(b".\r\n")
+    buffer.len() >= MIN_ARTICLE_SIZE && has_multiline_terminator(buffer)
 }
 
 /// Get the appropriate response bytes for a command verb

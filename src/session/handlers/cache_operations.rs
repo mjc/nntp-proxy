@@ -4,7 +4,7 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
-use crate::command::classifier::{STAT_CASES, matches_any};
+use crate::command::classifier::is_stat_command;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes};
@@ -77,8 +77,7 @@ impl ClientSession {
             // then fall through to use availability info for routing
             if self.adaptive_precheck {
                 let bytes = command.as_bytes();
-                let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-                if cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES) {
+                if is_stat_command(bytes) {
                     precheck::spawn_background_precheck(
                         self.precheck_deps(router),
                         command.to_string(),

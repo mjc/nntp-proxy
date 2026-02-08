@@ -28,7 +28,9 @@ mod status_code_parsing {
 
 mod terminator_finding {
     use super::*;
+    use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
 
+    /// Naive baseline: linear scan for terminator
     #[inline]
     fn find_terminator_old(data: &[u8]) -> Option<usize> {
         let n = data.len();
@@ -45,29 +47,23 @@ mod terminator_finding {
         None
     }
 
+    /// Production: TailBuffer with SIMD-accelerated detection
+    ///
+    /// Note: TailBuffer is stateful (tracks cross-boundary terminators),
+    /// but for these complete-response benchmarks, we use empty state.
     #[inline]
-    fn find_terminator_new(data: &[u8]) -> Option<usize> {
-        let n = data.len();
-        if n < 5 {
-            return None;
-        }
+    fn find_terminator_production(data: &[u8]) -> Option<usize> {
+        use nntp_proxy::session::streaming::tail_buffer::TerminatorStatus;
 
-        let mut pos = 0;
-        while let Some(r_pos) = memchr::memchr(b'\r', &data[pos..]) {
-            let abs_pos = pos + r_pos;
-
-            if abs_pos + 5 > n {
-                return None;
+        let tail = TailBuffer::default(); // Empty state - no previous chunks
+        match tail.detect_terminator(data) {
+            TerminatorStatus::FoundAt(pos) => Some(pos),
+            TerminatorStatus::Spanning => {
+                // Can't happen with empty tail + complete response, but handle it
+                Some(data.len())
             }
-
-            if &data[abs_pos..abs_pos + 5] == b"\r\n.\r\n" {
-                return Some(abs_pos + 5);
-            }
-
-            pos = abs_pos + 1;
+            TerminatorStatus::NotFound => None,
         }
-
-        None
     }
 
     const SMALL_RESPONSE: &[u8] =
@@ -85,22 +81,22 @@ mod terminator_finding {
         .\r\n";
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn old_small(bencher: Bencher) {
+    fn baseline_small(bencher: Bencher) {
         bencher.bench(|| black_box(find_terminator_old(black_box(SMALL_RESPONSE))));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn new_small(bencher: Bencher) {
-        bencher.bench(|| black_box(find_terminator_new(black_box(SMALL_RESPONSE))));
+    fn production_small(bencher: Bencher) {
+        bencher.bench(|| black_box(find_terminator_production(black_box(SMALL_RESPONSE))));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn old_medium(bencher: Bencher) {
+    fn baseline_medium(bencher: Bencher) {
         bencher.bench(|| black_box(find_terminator_old(black_box(MEDIUM_RESPONSE))));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn new_medium(bencher: Bencher) {
-        bencher.bench(|| black_box(find_terminator_new(black_box(MEDIUM_RESPONSE))));
+    fn production_medium(bencher: Bencher) {
+        bencher.bench(|| black_box(find_terminator_production(black_box(MEDIUM_RESPONSE))));
     }
 }

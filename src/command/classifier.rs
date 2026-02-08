@@ -316,6 +316,39 @@ pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
     cases.contains(&cmd)
 }
 
+/// Check if a command is a large transfer command (ARTICLE or BODY)
+///
+/// These commands typically return multi-line responses with article content
+/// and are candidates for pipelining optimization.
+#[inline(always)]
+#[must_use]
+pub fn is_large_transfer_command(cmd: &[u8]) -> bool {
+    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    end >= 4 && (matches_any(&cmd[..end], ARTICLE_CASES) || matches_any(&cmd[..end], BODY_CASES))
+}
+
+/// Check if a command is a STAT command
+///
+/// STAT returns only the status line without article content, making it
+/// suitable for background prechecking.
+#[inline(always)]
+#[must_use]
+pub fn is_stat_command(cmd: &[u8]) -> bool {
+    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    end >= 4 && matches_any(&cmd[..end], STAT_CASES)
+}
+
+/// Check if a command is a HEAD command
+///
+/// HEAD returns article headers without the body, also suitable for
+/// background prechecking.
+#[inline(always)]
+#[must_use]
+pub fn is_head_command(cmd: &[u8]) -> bool {
+    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    end >= 4 && matches_any(&cmd[..end], HEAD_CASES)
+}
+
 /// Ultra-fast detection of article retrieval commands with message-ID
 ///
 /// **THE CRITICAL HOT PATH** for NZB downloads and binary retrieval (70%+ of traffic).
