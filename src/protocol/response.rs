@@ -209,6 +209,16 @@ impl NntpResponse {
     pub fn is_success(&self) -> bool {
         self.status_code().is_some_and(|code| code.is_success())
     }
+
+    /// Check if this is a 430 response (article not found)
+    ///
+    /// Per [RFC 3977 §6.2.1.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.1.1):
+    /// - 430: No such article number
+    #[inline]
+    #[must_use]
+    pub fn is_430(&self) -> bool {
+        self.status_code().is_some_and(|code| code.as_u16() == 430)
+    }
 }
 
 impl StatusCode {

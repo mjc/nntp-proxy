@@ -3,6 +3,7 @@
 //! Handles routing article commands across backends, using ArticleAvailability
 //! to skip backends that have already returned 430 for a given article.
 
+use crate::is_client_disconnect_error;
 use crate::router::BackendSelector;
 use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
 use crate::session::handlers::cache_operations::CacheLookupResult;
@@ -33,9 +34,7 @@ impl ClientSession {
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<()> {
         use crate::router::CommandGuard;
-        use crate::session::routing::{
-            MetricsAction, determine_metrics_action, is_430_status_code,
-        };
+        use crate::session::routing::{MetricsAction, determine_metrics_action};
         use crate::session::{backend, streaming};
 
         // Route to a single backend for the whole batch.
@@ -121,10 +120,7 @@ impl ClientSession {
             let is_multiline = validated.is_multiline;
 
             // Handle 430 — article not found on this backend
-            if response_code
-                .status_code()
-                .is_some_and(|code| is_430_status_code(code.as_u16()))
-            {
+            if response_code.is_430() {
                 // Send 430 to client for this command
                 self.send_430_to_client(client_write, backend_to_client_bytes)
                     .await?;
@@ -457,9 +453,7 @@ impl ClientSession {
                 }
                 Err(e) => {
                     // Check if client disconnected - if so, stop trying backends
-                    if crate::session::error_classification::ErrorClassifier::is_client_disconnect(
-                        &e,
-                    ) {
+                    if is_client_disconnect_error(&e) {
                         debug!(
                             "Client {} disconnected, stopping retry loop",
                             self.client_addr

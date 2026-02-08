@@ -3,11 +3,11 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and streaming multiline responses to clients.
 
+use crate::is_client_disconnect_error;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::retry::retry_once_on_stale;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
-    is_430_status_code,
 };
 use crate::session::{ClientSession, backend, streaming};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
@@ -66,15 +66,7 @@ impl ClientSession {
             self.client_addr,
             backend_id.as_index()
         );
-        let (conn, n, response_code, is_multiline, ttfb, send, recv): (
-            _,
-            usize,
-            _,
-            bool,
-            u64,
-            u64,
-            u64,
-        ) = retry_once_on_stale!(
+        let (conn, cmd_response, ttfb, send, recv) = retry_once_on_stale!(
             label,
             self.execute_backend_attempt(provider, backend_id, command, buffer)
                 .await
@@ -84,10 +76,10 @@ impl ClientSession {
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
         // Reject invalid responses - never forward garbage to client
-        if response_code == crate::protocol::NntpResponse::Invalid {
+        if cmd_response.response == crate::protocol::NntpResponse::Invalid {
             tracing::error!(
                 backend_id = backend_id.as_index(),
-                first_bytes = ?&buffer[..n.min(64)],
+                first_bytes = ?&buffer[..cmd_response.bytes_read.min(64)],
                 "Backend returned invalid/unparseable response, rejecting"
             );
             // Mark backend as unavailable for this article so we try next one
@@ -99,7 +91,7 @@ impl ClientSession {
 
         // Handle 430 - article not found
         // Note: response is already read into buffer, keeping connection clean
-        if self.is_430_response(&response_code) {
+        if cmd_response.is_430() {
             self.handle_430_availability(backend_id, availability);
             // guard drops here → complete_command called automatically
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
@@ -114,10 +106,10 @@ impl ClientSession {
                 backend_id,
                 command,
                 msg_id,
-                &response_code,
-                is_multiline,
-                &buffer[..n],
-                n,
+                &cmd_response.response,
+                cmd_response.is_multiline,
+                &buffer[..cmd_response.bytes_read],
+                cmd_response.bytes_read,
             )
             .await
         {
@@ -128,8 +120,7 @@ impl ClientSession {
 
                 // Only mark as backend error metrics if it's NOT a client disconnect.
                 // Client disconnects are normal behavior and shouldn't penalize backends.
-                if !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&e)
-                {
+                if !is_client_disconnect_error(&e) {
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username().as_deref());
                 }
@@ -140,8 +131,8 @@ impl ClientSession {
 
         self.record_response_metrics(
             backend_id,
-            &response_code,
-            is_multiline,
+            &cmd_response.response,
+            cmd_response.is_multiline,
             command.len() as u64,
             bytes_written,
         );
@@ -167,9 +158,7 @@ impl ClientSession {
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(
         deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        usize,
-        crate::protocol::NntpResponse,
-        bool,
+        backend::CommandResponse,
         u64,
         u64,
         u64,
@@ -180,9 +169,7 @@ impl ClientSession {
             .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
             .await
         {
-            Ok((n, response_code, is_multiline, ttfb, send, recv)) => {
-                Ok((conn, n, response_code, is_multiline, ttfb, send, recv))
-            }
+            Ok((cmd_response, ttfb, send, recv)) => Ok((conn, cmd_response, ttfb, send, recv)),
             Err(e) => {
                 crate::pool::remove_from_pool(conn);
                 Err(e)
@@ -200,7 +187,7 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         command: &str,
         buffer: &mut crate::pool::PooledBuffer,
-    ) -> Result<(usize, crate::protocol::NntpResponse, bool, u64, u64, u64)> {
+    ) -> Result<(backend::CommandResponse, u64, u64, u64)> {
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username().as_deref());
 
@@ -208,29 +195,9 @@ impl ClientSession {
             backend::send_command_timed(conn, command, buffer).await?;
 
         // Log any validation warnings
-        backend::log_warnings(
-            &response.warnings,
-            &buffer[..response.bytes_read],
-            response.bytes_read,
-            self.client_addr,
-            backend_id,
-        );
+        response.log_warnings(&buffer[..response.bytes_read], self.client_addr, backend_id);
 
-        Ok((
-            response.bytes_read,
-            response.response,
-            response.is_multiline,
-            ttfb,
-            send,
-            recv,
-        ))
-    }
-
-    /// Check if response is 430 (article not found)
-    pub(super) fn is_430_response(&self, response_code: &crate::protocol::NntpResponse) -> bool {
-        response_code
-            .status_code()
-            .is_some_and(|code| is_430_status_code(code.as_u16()))
+        Ok((response, ttfb, send, recv))
     }
 
     /// Stream response from backend to client and handle caching

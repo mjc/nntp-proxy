@@ -20,6 +20,7 @@ use tracing::{debug, info};
 use crate::command::classifier::{ARTICLE_CASES, BODY_CASES, matches_any};
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
+use crate::is_client_disconnect_error;
 use crate::router::BackendSelector;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
@@ -273,9 +274,7 @@ impl ClientSession {
                         Ok(()) => {
                             batch_handled = true;
                         }
-                        Err(e)
-                            if crate::session::error_classification::ErrorClassifier::is_client_disconnect(&e) =>
-                        {
+                        Err(e) if is_client_disconnect_error(&e) => {
                             return Err(e);
                         }
                         Err(e) => {

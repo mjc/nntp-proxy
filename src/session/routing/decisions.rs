@@ -69,12 +69,6 @@ pub(crate) fn decide_command_routing(
     }
 }
 
-/// Check if a status code represents a 430 (article not found) response
-#[inline]
-pub(crate) const fn is_430_status_code(code: u16) -> bool {
-    code == 430
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,14 +216,5 @@ mod tests {
             decide_command_routing("LIST", true, true, RoutingMode::PerCommand),
             CommandRoutingDecision::Forward
         );
-    }
-
-    #[test]
-    fn test_is_430_status_code() {
-        assert!(is_430_status_code(430));
-        assert!(!is_430_status_code(429));
-        assert!(!is_430_status_code(431));
-        assert!(!is_430_status_code(200));
-        assert!(!is_430_status_code(500));
     }
 }

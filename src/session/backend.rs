@@ -134,6 +134,49 @@ impl CommandResponse {
     pub fn status_code(&self) -> Option<u16> {
         self.response.status_code().map(|c| c.as_u16())
     }
+
+    /// Log validation warnings with context
+    pub fn log_warnings(
+        &self,
+        buffer: &[u8],
+        client_addr: impl std::fmt::Display,
+        backend_id: crate::types::BackendId,
+    ) {
+        use tracing::warn;
+
+        for warning in &self.warnings {
+            match warning {
+                ResponseWarning::ShortResponse { bytes, min } => {
+                    warn!(
+                        "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
+                        client_addr,
+                        backend_id,
+                        bytes,
+                        min,
+                        &buffer[..self.bytes_read]
+                    );
+                }
+                ResponseWarning::InvalidResponse => {
+                    warn!(
+                        "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
+                        client_addr,
+                        backend_id,
+                        self.bytes_read,
+                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                    );
+                }
+                ResponseWarning::UnusualStatusCode(code) => {
+                    warn!(
+                        "Client {} got unusual status code {} from backend {:?}: {:?}",
+                        client_addr,
+                        code,
+                        backend_id,
+                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Send command to backend and read first response chunk
@@ -213,50 +256,6 @@ where
         send_elapsed.as_micros() as u64,
         recv_elapsed.as_micros() as u64,
     ))
-}
-
-/// Log validation warnings with context
-pub fn log_warnings(
-    warnings: &[ResponseWarning],
-    buffer: &[u8],
-    bytes_read: usize,
-    client_addr: impl std::fmt::Display,
-    backend_id: crate::types::BackendId,
-) {
-    use tracing::warn;
-
-    for warning in warnings {
-        match warning {
-            ResponseWarning::ShortResponse { bytes, min } => {
-                warn!(
-                    "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
-                    client_addr,
-                    backend_id,
-                    bytes,
-                    min,
-                    &buffer[..bytes_read]
-                );
-            }
-            ResponseWarning::InvalidResponse => {
-                warn!(
-                    "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
-                    client_addr,
-                    backend_id,
-                    bytes_read,
-                    String::from_utf8_lossy(&buffer[..bytes_read.min(50)])
-                );
-            }
-            ResponseWarning::UnusualStatusCode(code) => {
-                warn!(
-                    "Client {} got unusual status code {} from backend {:?}: {:?}",
-                    client_addr,
-                    code,
-                    backend_id,
-                    String::from_utf8_lossy(&buffer[..bytes_read.min(50)])
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
