@@ -135,6 +135,8 @@ pub struct Proxy {
     pub port: Port,
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     pub threads: ThreadCount,
+    /// Routing mode for the proxy
+    pub routing_mode: RoutingMode,
     /// Backend selection strategy for load balancing
     pub backend_selection: BackendSelectionStrategy,
     /// Validate yEnc structure and checksums (default: true)
@@ -152,6 +154,7 @@ impl Default for Proxy {
             host: Self::DEFAULT_HOST.to_string(),
             port: Port::default(),
             threads: ThreadCount::default(),
+            routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),
             validate_yenc: true,
         }

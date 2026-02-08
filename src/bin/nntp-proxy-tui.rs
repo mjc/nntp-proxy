@@ -23,15 +23,28 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let log_buffer = nntp_proxy::logging::init_tui_logging(args.no_tui);
+    let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
 
-    RuntimeConfig::from_args(args.common.threads)
+    // Apply CLI argument overrides to config
+    args.common.apply_overrides(&mut config);
+
+    // Fix thread config fallback: merge args with config before building runtime
+    let threads = args.common.threads.or(Some(config.proxy.threads));
+
+    RuntimeConfig::from_args(threads)
         .build_runtime()?
-        .block_on(run_proxy(args, log_buffer))
+        .block_on(run_proxy(args, config, log_buffer))
 }
 
-async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()> {
-    let (config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
-    let routing_mode = args.common.routing_mode;
+async fn run_proxy(
+    args: Args,
+    config: nntp_proxy::config::Config,
+    log_buffer: Option<tui::LogBuffer>,
+) -> Result<()> {
+    let routing_mode = args
+        .common
+        .routing_mode
+        .unwrap_or(config.proxy.routing_mode);
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 

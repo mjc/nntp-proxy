@@ -18,7 +18,10 @@ fn main() -> Result<()> {
     nntp_proxy::logging::init_dual_logging();
 
     let args = Args::parse();
-    let (config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
+    let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
+
+    // Apply CLI argument overrides to config
+    args.common.apply_overrides(&mut config);
 
     build_runtime(&args, &config)?.block_on(run_proxy(args, config))
 }
@@ -32,7 +35,10 @@ fn build_runtime(
 }
 
 async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()> {
-    let routing_mode = args.common.routing_mode;
+    let routing_mode = args
+        .common
+        .routing_mode
+        .unwrap_or(config.proxy.routing_mode);
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
