@@ -85,10 +85,14 @@
 
           # Performance profiling
           cargo-flamegraph
+
+          # Build acceleration
+          sccache  # Build cache
         ]
         ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           perf
           cargo-llvm-cov
+          mold  # Fast linker (Linux only)
         ];
 
 
@@ -111,6 +115,14 @@
         openssl
         zlib
       ];
+
+      # Map system to Rust target triple env var prefix
+      cargoTargetEnvPrefix =
+        if system == "x86_64-linux" then "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU"
+        else if system == "aarch64-linux" then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU"
+        else if system == "x86_64-darwin" then "CARGO_TARGET_X86_64_APPLE_DARWIN"
+        else if system == "aarch64-darwin" then "CARGO_TARGET_AARCH64_APPLE_DARWIN"
+        else throw "Unsupported system: ${system}";
     in {
       devShells.default = pkgs.mkShell {
         nativeBuildInputs = basicNativeBuildInputs;
@@ -119,6 +131,20 @@
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
           export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
+
+          # Build acceleration
+          export RUSTC_WRAPPER="sccache"
+
+          ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            # Linux: mold linker + native CPU optimizations
+            export ${cargoTargetEnvPrefix}_LINKER="clang"
+            export ${cargoTargetEnvPrefix}_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=native"
+          ''}
+
+          ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+            # macOS: native CPU optimizations (no mold on macOS)
+            export ${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native"
+          ''}
 
           echo "🦀 Rust development environment loaded (NIGHTLY)!"
           echo "   Rust version: $(rustc --version)"

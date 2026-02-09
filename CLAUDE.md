@@ -635,6 +635,115 @@ fn bench_terminator_detection() {
 
 ---
 
+### Profiling Analysis
+
+**Custom profiling scripts** in `scripts/` directory provide structured analysis of `perf.data`:
+
+#### parse_perfdata
+
+Analyzes `perf script` output to show hotspots, thread distribution, and timeline analysis.
+
+**Usage:**
+```bash
+# Generate perf.data first
+perf record -g ./target/release/nntp-proxy-tui
+
+# Analyze with parse_perfdata
+perf script 2>/dev/null | ./scripts/parse_perfdata
+```
+
+**Output sections:**
+- **Thread Breakdown**: Shows CPU distribution across threads (tokio workers, foyer-disk-io, etc.)
+- **Top Functions (self time)**: Functions consuming most CPU (excludes child functions)
+- **Top Functions Per Thread**: Per-thread hotspot analysis
+- **Caller → Callee Edges**: Call graph showing where time flows
+- **Timeline**: Sample distribution over time (cold vs hot phase)
+- **Category Summary**: Time grouped by category (Network I/O, TLS/Crypto, Cache, etc.)
+
+**Key insights:**
+- **Self time** shows actual work in function (not including callees)
+- **Timeline** shows if performance degrades over time (hot phase worse = overhead)
+- **Category summary** identifies system-level bottlenecks
+
+**Example output interpretation:**
+```
+Top Functions (self time):
+  8.07%  __memmove_avx_unaligned_erms  ← Memory copy hotspot
+  4.80%  aes_gcm_dec_update            ← TLS decryption
+  2.24%  Checksummer::checksum64       ← Cache overhead
+```
+
+Timeline showing hot phase worse:
+```
+First half:  7.44% memmove  (cold/startup)
+Second half: 8.88% memmove  (hot/cached) ← Cache adds overhead!
+```
+
+#### parse_flamegraph
+
+Generates SVG flamegraph from `perf script` output.
+
+**Usage:**
+```bash
+# Generate flamegraph
+perf script 2>/dev/null | ./scripts/parse_flamegraph > flamegraph.svg
+
+# View in browser
+firefox flamegraph.svg
+```
+
+**Flamegraph interpretation:**
+- **Width**: Time spent in function (wider = more CPU)
+- **Height**: Stack depth (nesting level)
+- **Click function**: Zoom to subtree
+- **Search (Ctrl+F)**: Highlight specific functions
+
+**Tips:**
+- Look for wide blocks at any height (not just top)
+- Repetitive patterns indicate functions called many times
+- Compare flamegraphs before/after changes
+
+#### Profiling Workflow
+
+**1. Baseline profile:**
+```bash
+# Start proxy
+./target/release/nntp-proxy-tui &
+
+# Run workload (e.g., sabnzbd download)
+# ...
+
+# Capture profile
+perf record -g -p $(pgrep nntp-proxy-tui)
+# Let run for 30-60 seconds, then Ctrl+C
+
+# Analyze
+perf script 2>/dev/null | ./scripts/parse_perfdata > baseline.txt
+```
+
+**2. After optimization:**
+```bash
+# Repeat profiling with same workload
+perf script 2>/dev/null | ./scripts/parse_perfdata > optimized.txt
+
+# Compare
+diff baseline.txt optimized.txt
+```
+
+**3. Identify next target:**
+- Look for functions with high self time (>2%)
+- Check timeline for degradation (hot phase worse than cold)
+- Category summary shows system-level bottlenecks
+- Caller→Callee edges show where time flows
+
+**Common optimization targets:**
+- High memmove % → Look for unnecessary allocations or copies
+- Cache category high → Cache overhead may exceed benefit
+- Locks/Futex high → Contention, consider lock-free structures
+- TLS/Crypto high → Expected, but verify hardware acceleration enabled
+
+---
+
 ### Special Test Cases
 
 **Cache tests with foyer HybridCache:**

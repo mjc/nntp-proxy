@@ -1,0 +1,9 @@
+# Isolate RA's build artifacts from cargo build/test to prevent
+# lock contention and invalidation churn (6.6GB shared target/ currently)
+[cargo]
+targetDir = true
+
+# Don't check 63 test files + 5 bench files on every keystroke
+# RA still analyzes lib + 2 binaries
+[check]
+allTargets = false

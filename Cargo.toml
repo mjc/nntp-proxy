@@ -105,6 +105,14 @@ name = "router_selection"
 harness = false
 
 
+[profile.dev]
+split-debuginfo = "unpacked"  # Faster linking — don't bundle debuginfo into binary
+
+[profile.dev.package."*"]
+opt-level = 1  # Compile dependencies with optimizations in dev mode
+               # Huge runtime speedup for rustls/ring/foyer/moka
+               # Minimal compile-time cost (deps cached after first build)
+
 [profile.release]
 debug = false          # No debug symbols for smaller binaries
 strip = true           # Strip symbols for even smaller size
