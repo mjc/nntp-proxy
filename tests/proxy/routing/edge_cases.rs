@@ -5,18 +5,6 @@ use nntp_proxy::router::BackendSelector;
 use nntp_proxy::types::{BackendId, ClientId, ServerName};
 use std::sync::Arc;
 
-/// Helper function to create a test provider
-fn create_test_provider() -> DeadpoolConnectionProvider {
-    DeadpoolConnectionProvider::new(
-        "localhost".to_string(),
-        9999,
-        "test".to_string(),
-        2,
-        None,
-        None,
-    )
-}
-
 #[test]
 fn test_complete_command_on_empty_router() {
     let router = BackendSelector::new();
@@ -34,7 +22,7 @@ fn test_complete_command_on_wrong_backend() {
     router.add_backend(
         backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
-        create_test_provider(),
+        super::create_test_provider(),
         0, // tier
         None,
     );
@@ -71,7 +59,7 @@ fn test_release_stateful_when_count_is_zero() {
     router.add_backend(
         backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
-        create_test_provider(),
+        super::create_test_provider(),
         0, // tier
         None,
     );
@@ -104,7 +92,7 @@ fn test_excessive_complete_command_calls() {
     router.add_backend(
         backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
-        create_test_provider(),
+        super::create_test_provider(),
         0, // tier
         None,
     );
@@ -138,7 +126,7 @@ fn test_large_number_of_backends() {
         router.add_backend(
             BackendId::from_index(i),
             ServerName::try_new(format!("backend-{}", i)).unwrap(),
-            create_test_provider(),
+            super::create_test_provider(),
             0, // tier
             None,
         );
@@ -161,7 +149,7 @@ fn test_backend_provider_retrieval() {
     router.add_backend(
         backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
-        create_test_provider(),
+        super::create_test_provider(),
         0, // tier
         None,
     );
@@ -171,7 +159,7 @@ fn test_backend_provider_retrieval() {
 
     // Verify we can call methods on the provider
     let provider = provider.unwrap();
-    assert_eq!(provider.max_size(), 2); // From create_test_provider()
+    assert_eq!(provider.max_size(), 2); // From super::create_test_provider()
 }
 
 #[test]
@@ -183,7 +171,7 @@ fn test_single_backend_round_robin() {
     router.add_backend(
         backend_id,
         ServerName::try_new("solo".to_string()).unwrap(),
-        create_test_provider(),
+        super::create_test_provider(),
         0, // tier
         None,
     );
@@ -232,7 +220,7 @@ fn test_concurrent_route_command_calls() {
         router.add_backend(
             BackendId::from_index(i),
             ServerName::try_new(format!("backend-{}", i)).unwrap(),
-            create_test_provider(),
+            super::create_test_provider(),
             0, // tier
             None,
         );
@@ -331,7 +319,7 @@ fn test_wrap_around_with_large_counter() {
         router.add_backend(
             BackendId::from_index(i),
             ServerName::try_new(format!("backend-{}", i)).unwrap(),
-            create_test_provider(),
+            super::create_test_provider(),
             0, // tier
             None,
         );

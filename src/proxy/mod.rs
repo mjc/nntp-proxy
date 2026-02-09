@@ -230,72 +230,27 @@ impl NntpProxy {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::config::{Config, Server, health_check_max_per_cycle, health_check_pool_timeout};
-    use crate::types::{HostName, MaxConnections, Port, ServerName};
+    use crate::config::{Config, Server};
+    use crate::types::{MaxConnections, Port};
 
     pub(in crate::proxy) fn create_test_config() -> Config {
         Config {
             servers: vec![
-                Server {
-                    host: HostName::try_new("server1.example.com".to_string()).unwrap(),
-                    port: Port::try_new(119).unwrap(),
-                    name: ServerName::try_new("Test Server 1".to_string()).unwrap(),
-                    username: None,
-                    password: None,
-                    max_connections: MaxConnections::try_new(5).unwrap(),
-                    use_tls: false,
-                    tls_verify_cert: true,
-                    tls_cert_path: None,
-                    connection_keepalive: None,
-                    health_check_max_per_cycle: health_check_max_per_cycle(),
-                    health_check_pool_timeout: health_check_pool_timeout(),
-                    tier: 0,
-                    compress: None,
-                    compress_level: None,
-                    enable_pipelining: true,
-                    pipeline_queue_depth: 1000,
-                    pipeline_batch_size: 16,
-                },
-                Server {
-                    host: HostName::try_new("server2.example.com".to_string()).unwrap(),
-                    port: Port::try_new(119).unwrap(),
-                    name: ServerName::try_new("Test Server 2".to_string()).unwrap(),
-                    username: None,
-                    password: None,
-                    max_connections: MaxConnections::try_new(8).unwrap(),
-                    use_tls: false,
-                    tls_verify_cert: true,
-                    tls_cert_path: None,
-                    connection_keepalive: None,
-                    health_check_max_per_cycle: health_check_max_per_cycle(),
-                    health_check_pool_timeout: health_check_pool_timeout(),
-                    tier: 0,
-                    compress: None,
-                    compress_level: None,
-                    enable_pipelining: true,
-                    pipeline_queue_depth: 1000,
-                    pipeline_batch_size: 16,
-                },
-                Server {
-                    host: HostName::try_new("server3.example.com".to_string()).unwrap(),
-                    port: Port::try_new(119).unwrap(),
-                    name: ServerName::try_new("Test Server 3".to_string()).unwrap(),
-                    username: None,
-                    password: None,
-                    max_connections: MaxConnections::try_new(12).unwrap(),
-                    use_tls: false,
-                    tls_verify_cert: true,
-                    tls_cert_path: None,
-                    connection_keepalive: None,
-                    health_check_max_per_cycle: health_check_max_per_cycle(),
-                    health_check_pool_timeout: health_check_pool_timeout(),
-                    tier: 0,
-                    compress: None,
-                    compress_level: None,
-                    enable_pipelining: true,
-                    pipeline_queue_depth: 1000,
-                    pipeline_batch_size: 16,
-                },
+                Server::builder("server1.example.com", Port::try_new(119).unwrap())
+                    .name("Test Server 1")
+                    .max_connections(MaxConnections::try_new(5).unwrap())
+                    .build()
+                    .unwrap(),
+                Server::builder("server2.example.com", Port::try_new(119).unwrap())
+                    .name("Test Server 2")
+                    .max_connections(MaxConnections::try_new(8).unwrap())
+                    .build()
+                    .unwrap(),
+                Server::builder("server3.example.com", Port::try_new(119).unwrap())
+                    .name("Test Server 3")
+                    .max_connections(MaxConnections::try_new(12).unwrap())
+                    .build()
+                    .unwrap(),
             ],
             ..Default::default()
         }

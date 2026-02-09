@@ -96,16 +96,7 @@ fn test_metrics_snapshot_total_bytes() {
         client_to_backend_bytes: ClientToBackendBytes::new(1000),
         backend_to_client_bytes: BackendToClientBytes::new(5000),
         uptime: Duration::from_secs(60),
-        backend_stats: Arc::new(vec![]),
-        user_stats: vec![],
-        cache_entries: 0,
-        cache_hit_rate: 0.0,
-        cache_size_bytes: 0,
-        disk_cache: None,
-        pipeline_batches: 0,
-        pipeline_commands: 0,
-        pipeline_requests_queued: 0,
-        pipeline_requests_completed: 0,
+        ..Default::default()
     };
 
     assert_eq!(snapshot.total_bytes(), 6000);
@@ -120,16 +111,7 @@ fn test_metrics_snapshot_throughput() {
         client_to_backend_bytes: ClientToBackendBytes::new(2000),
         backend_to_client_bytes: BackendToClientBytes::new(8000),
         uptime: Duration::from_secs(10),
-        backend_stats: Arc::new(vec![]),
-        user_stats: vec![],
-        cache_entries: 0,
-        cache_hit_rate: 0.0,
-        cache_size_bytes: 0,
-        disk_cache: None,
-        pipeline_batches: 0,
-        pipeline_commands: 0,
-        pipeline_requests_queued: 0,
-        pipeline_requests_completed: 0,
+        ..Default::default()
     };
 
     // 10000 bytes / 10 seconds = 1000 bytes/sec
@@ -146,62 +128,20 @@ fn test_metrics_snapshot_throughput() {
 #[test]
 fn test_metrics_snapshot_format_uptime() {
     let snapshot_secs = MetricsSnapshot {
-        total_connections: 0,
-        active_connections: 0,
-        stateful_sessions: 0,
-        client_to_backend_bytes: ClientToBackendBytes::new(0),
-        backend_to_client_bytes: BackendToClientBytes::new(0),
         uptime: Duration::from_secs(45),
-        backend_stats: Arc::new(vec![]),
-        user_stats: vec![],
-        cache_entries: 0,
-        cache_hit_rate: 0.0,
-        cache_size_bytes: 0,
-        disk_cache: None,
-        pipeline_batches: 0,
-        pipeline_commands: 0,
-        pipeline_requests_queued: 0,
-        pipeline_requests_completed: 0,
+        ..Default::default()
     };
     assert_eq!(snapshot_secs.format_uptime(), "45s");
 
     let snapshot_mins = MetricsSnapshot {
-        total_connections: 0,
-        active_connections: 0,
-        stateful_sessions: 0,
-        client_to_backend_bytes: ClientToBackendBytes::new(0),
-        backend_to_client_bytes: BackendToClientBytes::new(0),
         uptime: Duration::from_secs(185),
-        backend_stats: Arc::new(vec![]),
-        user_stats: vec![],
-        cache_entries: 0,
-        cache_hit_rate: 0.0,
-        cache_size_bytes: 0,
-        disk_cache: None,
-        pipeline_batches: 0,
-        pipeline_commands: 0,
-        pipeline_requests_queued: 0,
-        pipeline_requests_completed: 0,
+        ..Default::default()
     };
     assert_eq!(snapshot_mins.format_uptime(), "3m 5s");
 
     let snapshot_hours = MetricsSnapshot {
-        total_connections: 0,
-        active_connections: 0,
-        stateful_sessions: 0,
-        client_to_backend_bytes: ClientToBackendBytes::new(0),
-        backend_to_client_bytes: BackendToClientBytes::new(0),
         uptime: Duration::from_secs(7265),
-        backend_stats: Arc::new(vec![]),
-        user_stats: vec![],
-        cache_entries: 0,
-        cache_hit_rate: 0.0,
-        cache_size_bytes: 0,
-        disk_cache: None,
-        pipeline_batches: 0,
-        pipeline_commands: 0,
-        pipeline_requests_queued: 0,
-        pipeline_requests_completed: 0,
+        ..Default::default()
     };
     assert_eq!(snapshot_hours.format_uptime(), "2h 1m 5s");
 }
@@ -294,15 +234,7 @@ fn test_metrics_snapshot_with_multiple_backends() {
         backend_to_client_bytes: BackendToClientBytes::new(15000),
         uptime: Duration::from_secs(100),
         backend_stats: Arc::new(vec![stats1, stats2]),
-        user_stats: vec![],
-        cache_entries: 0,
-        cache_hit_rate: 0.0,
-        cache_size_bytes: 0,
-        disk_cache: None,
-        pipeline_batches: 0,
-        pipeline_commands: 0,
-        pipeline_requests_queued: 0,
-        pipeline_requests_completed: 0,
+        ..Default::default()
     };
 
     assert_eq!(snapshot.backend_stats.len(), 2);

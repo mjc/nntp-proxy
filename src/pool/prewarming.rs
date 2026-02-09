@@ -171,26 +171,13 @@ mod tests {
         // Give server time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let servers = vec![Server {
-            name: crate::types::ServerName::try_new("TestServer1".to_string()).unwrap(),
-            host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
-            port: crate::types::Port::try_new(port).unwrap(),
-            max_connections: crate::types::MaxConnections::try_new(2).unwrap(),
-            username: None,
-            password: None,
-            use_tls: false,
-            tls_verify_cert: true,
-            tls_cert_path: None,
-            connection_keepalive: None,
-            health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
-            health_check_pool_timeout: crate::config::health_check_pool_timeout(),
-            tier: 0,
-            compress: None,
-            compress_level: None,
-            enable_pipelining: true,
-            pipeline_queue_depth: 1000,
-            pipeline_batch_size: 16,
-        }];
+        let servers = vec![
+            Server::builder("127.0.0.1", crate::types::Port::try_new(port).unwrap())
+                .name("TestServer1")
+                .max_connections(crate::types::MaxConnections::try_new(2).unwrap())
+                .build()
+                .unwrap(),
+        ];
 
         let providers = servers
             .iter()
@@ -225,46 +212,16 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let servers = vec![
-            Server {
-                name: crate::types::ServerName::try_new("Server1".to_string()).unwrap(),
-                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::try_new(port1).unwrap(),
-                max_connections: crate::types::MaxConnections::try_new(2).unwrap(),
-                username: None,
-                password: None,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive: None,
-                health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
-                health_check_pool_timeout: crate::config::health_check_pool_timeout(),
-                tier: 0,
-                compress: None,
-                compress_level: None,
-                enable_pipelining: true,
-                pipeline_queue_depth: 1000,
-                pipeline_batch_size: 16,
-            },
-            Server {
-                name: crate::types::ServerName::try_new("Server2".to_string()).unwrap(),
-                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::try_new(port2).unwrap(),
-                max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
-                username: None,
-                password: None,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive: None,
-                health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
-                health_check_pool_timeout: crate::config::health_check_pool_timeout(),
-                tier: 0,
-                compress: None,
-                compress_level: None,
-                enable_pipelining: true,
-                pipeline_queue_depth: 1000,
-                pipeline_batch_size: 16,
-            },
+            Server::builder("127.0.0.1", crate::types::Port::try_new(port1).unwrap())
+                .name("Server1")
+                .max_connections(crate::types::MaxConnections::try_new(2).unwrap())
+                .build()
+                .unwrap(),
+            Server::builder("127.0.0.1", crate::types::Port::try_new(port2).unwrap())
+                .name("Server2")
+                .max_connections(crate::types::MaxConnections::try_new(1).unwrap())
+                .build()
+                .unwrap(),
         ];
 
         let providers = servers
@@ -290,26 +247,13 @@ mod tests {
         // Use a port that won't have a server (99999 is invalid)
         let bad_port = 65500; // High port unlikely to be in use
 
-        let servers = vec![Server {
-            name: crate::types::ServerName::try_new("UnreachableServer".to_string()).unwrap(),
-            host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
-            port: crate::types::Port::try_new(bad_port).unwrap(),
-            max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
-            username: None,
-            password: None,
-            use_tls: false,
-            tls_verify_cert: true,
-            tls_cert_path: None,
-            connection_keepalive: None,
-            health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
-            health_check_pool_timeout: crate::config::health_check_pool_timeout(),
-            tier: 0,
-            compress: None,
-            compress_level: None,
-            enable_pipelining: true,
-            pipeline_queue_depth: 1000,
-            pipeline_batch_size: 16,
-        }];
+        let servers = vec![
+            Server::builder("127.0.0.1", crate::types::Port::try_new(bad_port).unwrap())
+                .name("UnreachableServer")
+                .max_connections(crate::types::MaxConnections::try_new(1).unwrap())
+                .build()
+                .unwrap(),
+        ];
 
         let providers = servers
             .iter()
@@ -414,46 +358,16 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let servers = vec![
-            Server {
-                name: crate::types::ServerName::try_new("GoodServer".to_string()).unwrap(),
-                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::try_new(good_port).unwrap(),
-                max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
-                username: None,
-                password: None,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive: None,
-                health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
-                health_check_pool_timeout: crate::config::health_check_pool_timeout(),
-                tier: 0,
-                compress: None,
-                compress_level: None,
-                enable_pipelining: true,
-                pipeline_queue_depth: 1000,
-                pipeline_batch_size: 16,
-            },
-            Server {
-                name: crate::types::ServerName::try_new("BadServer".to_string()).unwrap(),
-                host: crate::types::HostName::try_new("127.0.0.1".to_string()).unwrap(),
-                port: crate::types::Port::try_new(bad_port).unwrap(),
-                max_connections: crate::types::MaxConnections::try_new(1).unwrap(),
-                username: None,
-                password: None,
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive: None,
-                health_check_max_per_cycle: crate::config::health_check_max_per_cycle(),
-                health_check_pool_timeout: crate::config::health_check_pool_timeout(),
-                tier: 0,
-                compress: None,
-                compress_level: None,
-                enable_pipelining: true,
-                pipeline_queue_depth: 1000,
-                pipeline_batch_size: 16,
-            },
+            Server::builder("127.0.0.1", crate::types::Port::try_new(good_port).unwrap())
+                .name("GoodServer")
+                .max_connections(crate::types::MaxConnections::try_new(1).unwrap())
+                .build()
+                .unwrap(),
+            Server::builder("127.0.0.1", crate::types::Port::try_new(bad_port).unwrap())
+                .name("BadServer")
+                .max_connections(crate::types::MaxConnections::try_new(1).unwrap())
+                .build()
+                .unwrap(),
         ];
 
         let providers = servers
