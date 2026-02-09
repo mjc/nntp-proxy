@@ -293,7 +293,7 @@ impl ClientSession {
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             let request = QueuedRequest {
-                command: command.to_string(),
+                command: std::sync::Arc::from(command),
                 response_tx: tx,
             };
 

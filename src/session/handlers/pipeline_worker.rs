@@ -142,11 +142,12 @@ async fn execute_pipeline_batch(
     let mut connection_healthy = true;
     let mut buffer = buffer_pool.acquire().await;
     let mut leftover: Vec<u8> = Vec::new(); // Typically empty, small when non-empty
+    let mut result_buf = bytes::BytesMut::with_capacity(4096); // Reused across responses
 
     let mut batch_iter = batch.into_iter().enumerate();
     while let Some((i, req)) = batch_iter.next() {
         // Read the response for this command
-        match read_full_response(&mut buffer, conn, &mut leftover).await {
+        match read_full_response(&mut buffer, conn, &mut leftover, &mut result_buf).await {
             Ok((data, status_code)) => {
                 metrics.record_command(backend_id);
                 let data_len = data.len();
@@ -193,54 +194,61 @@ async fn execute_pipeline_batch(
 
 /// Read a complete NNTP response (status line + multiline body if applicable).
 ///
-/// Returns the full response as a byte vector and the parsed status code.
+/// Returns the full response as `Bytes` and the parsed status code.
 /// If leftover bytes from a previous response are provided, they are processed first.
+///
+/// `result_buf` is cleared and reused for each response to avoid per-response allocations.
 async fn read_full_response(
     buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
     leftover: &mut Vec<u8>,
-) -> Result<(Vec<u8>, u16)> {
+    result_buf: &mut bytes::BytesMut,
+) -> Result<(bytes::Bytes, crate::protocol::StatusCode)> {
     use crate::session::streaming::tail_buffer::TailBuffer;
 
     let mut tail = TailBuffer::default();
-    let mut result = Vec::with_capacity(4096);
+    result_buf.clear(); // Reuse buffer from previous response
 
-    // Process leftovers from previous response first
-    let first_chunk = if !leftover.is_empty() {
-        std::mem::take(leftover)
+    // Get first data directly into result_buf (no intermediate Vec)
+    if !leftover.is_empty() {
+        result_buf.extend_from_slice(leftover);
+        leftover.clear();
     } else {
         let n = buffer.read_from(conn).await?;
         if n == 0 {
             anyhow::bail!("Backend connection closed unexpectedly");
         }
-        buffer[..n].to_vec()
-    };
+        result_buf.extend_from_slice(&buffer[..n]);
+    }
 
     // Validate the response to determine if it's multiline and get status code
     let validated = validate_backend_response(
-        &first_chunk,
-        first_chunk.len(),
+        result_buf,
+        result_buf.len(),
         crate::protocol::MIN_RESPONSE_LENGTH,
     );
-    let status_code = validated.status_code_u16();
+    let status_code = validated
+        .response
+        .status_code()
+        .ok_or_else(|| anyhow::anyhow!("Invalid status code in pipeline response"))?;
 
     if !validated.is_multiline {
-        // Single-line response: return immediately
-        return Ok((first_chunk, status_code));
+        // Single-line response: return immediately (split to leave rest in buffer for reuse)
+        return Ok((result_buf.split().freeze(), status_code));
     }
 
     // Multiline response: use TailBuffer to detect terminator
-    let status = tail.detect_terminator(&first_chunk);
-    let write_len = status.write_len(first_chunk.len());
-    result.extend_from_slice(&first_chunk[..write_len]);
+    let status = tail.detect_terminator(result_buf);
+    let write_len = status.write_len(result_buf.len());
 
     // Save any leftover bytes for next response
-    if write_len < first_chunk.len() {
-        leftover.extend_from_slice(&first_chunk[write_len..]);
+    if write_len < result_buf.len() {
+        leftover.extend_from_slice(&result_buf[write_len..]);
+        result_buf.truncate(write_len);
     }
 
     if !status.is_found() {
-        tail.update(&first_chunk[..write_len]);
+        tail.update(result_buf);
 
         loop {
             let n = buffer.read_from(conn).await?;
@@ -251,7 +259,7 @@ async fn read_full_response(
             let chunk = &buffer[..n];
             let status = tail.detect_terminator(chunk);
             let write_len = status.write_len(n);
-            result.extend_from_slice(&chunk[..write_len]);
+            result_buf.extend_from_slice(&chunk[..write_len]);
 
             if status.is_found() {
                 // Save leftover bytes for next response
@@ -264,7 +272,7 @@ async fn read_full_response(
         }
     }
 
-    Ok((result, status_code))
+    Ok((result_buf.split().freeze(), status_code))
 }
 
 /// Send error responses to all requests in a batch

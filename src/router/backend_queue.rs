@@ -21,7 +21,7 @@ pub enum PipelineResponse {
     /// Command executed successfully; `data` is the complete response bytes
     Success {
         /// Complete response data (status line + multiline body if applicable)
-        data: Vec<u8>,
+        data: bytes::Bytes,
         /// Parsed status code from the response
         status_code: u16,
         /// Which backend handled this request
@@ -34,7 +34,7 @@ pub enum PipelineResponse {
 /// A request queued for pipeline execution on a backend
 pub struct QueuedRequest {
     /// The full NNTP command string (including \r\n)
-    pub command: String,
+    pub command: std::sync::Arc<str>,
     /// Channel to send the response back to the waiting client session
     pub response_tx: oneshot::Sender<PipelineResponse>,
 }
@@ -165,7 +165,7 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         queue
             .try_enqueue(QueuedRequest {
-                command: "ARTICLE <test@example.com>\r\n".to_string(),
+                command: "ARTICLE <test@example.com>\r\n".into(),
                 response_tx: tx,
             })
             .unwrap();
@@ -179,14 +179,14 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             queue
                 .try_enqueue(QueuedRequest {
-                    command: format!("ARTICLE <test{}@example.com>\r\n", i),
+                    command: format!("ARTICLE <test{}@example.com>\r\n", i).into(),
                     response_tx: tx,
                 })
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
         let result = queue.try_enqueue(QueuedRequest {
-            command: "ARTICLE <overflow@example.com>\r\n".to_string(),
+            command: "ARTICLE <overflow@example.com>\r\n".into(),
             response_tx: tx,
         });
         assert!(result.is_err());
@@ -206,7 +206,7 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             queue
                 .try_enqueue(QueuedRequest {
-                    command: format!("CMD {}\r\n", i),
+                    command: format!("CMD {}\r\n", i).into(),
                     response_tx: tx,
                 })
                 .unwrap();
@@ -236,7 +236,7 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         queue
             .try_enqueue(QueuedRequest {
-                command: "HELLO\r\n".to_string(),
+                command: "HELLO\r\n".into(),
                 response_tx: tx,
             })
             .unwrap();
