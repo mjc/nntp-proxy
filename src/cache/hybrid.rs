@@ -36,7 +36,7 @@
 use crate::types::{BackendId, MessageId};
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    HybridCachePolicy, LruConfig, RecoverMode, Source, Spawner,
+    HybridCachePolicy, LruConfig, PsyncIoEngineConfig, RecoverMode, Source, Spawner,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -229,6 +229,7 @@ impl HybridArticleCache {
             })
             .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
             .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
                 BlockEngineConfig::new(device)
                     .with_block_size(64 * 1024 * 1024) // 64MB blocks - faster reclaim, ~160 FDs for 10GB
@@ -360,36 +361,33 @@ impl HybridArticleCache {
             }
         }
 
-        let Some(mut entry) = (if self.config.cache_articles {
-            HybridArticleEntry::with_tier(buffer.clone(), tier)
+        // Split into two paths to avoid clone: one moves buffer, one borrows it
+        if self.config.cache_articles {
+            let Some(mut entry) = HybridArticleEntry::with_tier(buffer, tier) else {
+                warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
+                return;
+            };
+            entry.record_backend_has(backend_id);
+            let entry_len = entry.buffer.len();
+            self.cache.insert(key.clone(), entry);
+            debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert");
         } else {
             // Availability-only mode: store minimal stub
             let stub = Self::create_stub(&buffer);
-            HybridArticleEntry::with_tier(stub, tier)
-        }) else {
-            // Invalid buffer - cannot cache
-            warn!(
-                msg_id = %key,
-                buffer_len = buffer_len,
-                first_bytes = ?&buffer[..buffer_len.min(32)],
-                "Cannot cache: buffer has invalid status code"
-            );
-            return;
-        };
-
-        entry.record_backend_has(backend_id);
-
-        let entry_len = entry.buffer.len();
-        self.cache.insert(key.clone(), entry);
-
-        debug!(
-            msg_id = %key,
-            original_bytes = buffer_len,
-            stored_bytes = entry_len,
-            tier = tier,
-            cache_articles = self.config.cache_articles,
-            "Hybrid cache upsert"
-        );
+            let Some(mut entry) = HybridArticleEntry::with_tier(stub, tier) else {
+                warn!(
+                    msg_id = %key,
+                    buffer_len,
+                    first_bytes = ?&buffer[..buffer_len.min(32)],
+                    "Cannot cache: invalid status code"
+                );
+                return;
+            };
+            entry.record_backend_has(backend_id);
+            let entry_len = entry.buffer.len();
+            self.cache.insert(key.clone(), entry);
+            debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert (stub)");
+        }
     }
 
     /// Record that a backend doesn't have an article (430 response)
