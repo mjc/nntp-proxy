@@ -15,7 +15,7 @@
 
 mod article;
 mod availability;
-pub(crate) mod entry_helpers;
+pub(super) mod entry_helpers;
 mod hybrid;
 mod hybrid_codec;
 pub mod ttl;
@@ -26,6 +26,9 @@ pub use article::{ArticleCache, ArticleEntry};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
+
+// Internal helper re-exported for session handlers
+pub(crate) use entry_helpers::extract_status_line;
 
 use crate::types::{BackendId, MessageId};
 

@@ -5,6 +5,7 @@
 //! `HybridArticleEntry` (foyer) cache implementations.
 
 use crate::protocol::has_multiline_terminator;
+use smallvec::SmallVec;
 
 /// Check if a buffer contains a valid NNTP multiline response
 ///
@@ -13,7 +14,7 @@ use crate::protocol::has_multiline_terminator;
 /// 2. Have CRLF somewhere (line terminator)
 /// 3. End with `.\r\n` for multiline responses (220/221/222)
 #[inline]
-pub(crate) fn is_valid_response(buffer: &[u8]) -> bool {
+pub(super) fn is_valid_response(buffer: &[u8]) -> bool {
     // Must have at least "NNN \r\n.\r\n" = 9 bytes
     if buffer.len() < 9 {
         return false;
@@ -41,7 +42,7 @@ pub(crate) fn is_valid_response(buffer: &[u8]) -> bool {
 ///
 /// A complete response ends with `\r\n.\r\n` and is at least 30 bytes.
 #[inline]
-pub(crate) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
+pub(super) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
     if status_code != 220 && status_code != 222 {
         return false;
     }
@@ -58,7 +59,7 @@ pub(crate) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
 /// - STAT -> synthesizes "223 0 <msg-id>\r\n" (we know article exists)
 ///
 /// Returns `None` if cached response can't serve this command type.
-pub(crate) fn response_for_command(
+pub(super) fn response_for_command(
     buffer: &[u8],
     status_code: u16,
     cmd_verb: &str,
@@ -100,13 +101,48 @@ pub(crate) fn response_for_command(
 /// Check if a status code can serve a given command verb
 ///
 /// Simpler version of `response_for_command` for boolean checks.
+/// Case-insensitive per RFC 3977 (commands are case-insensitive).
 #[inline]
-pub(crate) fn matches_command_type_verb(status_code: u16, cmd_verb: &str) -> bool {
+pub(super) fn matches_command_type_verb(status_code: u16, cmd_verb: &str) -> bool {
     match status_code {
-        220 => matches!(cmd_verb, "ARTICLE" | "BODY" | "HEAD" | "STAT"),
-        222 => matches!(cmd_verb, "BODY" | "STAT"),
-        221 => matches!(cmd_verb, "HEAD" | "STAT"),
+        220 => {
+            cmd_verb.eq_ignore_ascii_case("ARTICLE")
+                || cmd_verb.eq_ignore_ascii_case("BODY")
+                || cmd_verb.eq_ignore_ascii_case("HEAD")
+                || cmd_verb.eq_ignore_ascii_case("STAT")
+        }
+        222 => cmd_verb.eq_ignore_ascii_case("BODY") || cmd_verb.eq_ignore_ascii_case("STAT"),
+        221 => cmd_verb.eq_ignore_ascii_case("HEAD") || cmd_verb.eq_ignore_ascii_case("STAT"),
         _ => false,
+    }
+}
+
+/// Extract the first status line from an NNTP response buffer.
+///
+/// Returns bytes up to and including the first `\r\n`, or the first 3 bytes
+/// plus `\r\n` as fallback. Used to create minimal cache stubs without
+/// copying the full response buffer.
+///
+/// This is used when `cache_articles=false` to reduce memory copies —
+/// the cache only needs the status code to build an availability stub,
+/// not the full article content (which can be 8-64KB in first_chunk).
+///
+/// Uses SmallVec to keep typical status lines (~30-80 bytes) on the stack,
+/// avoiding heap allocation in the common case.
+#[inline]
+pub fn extract_status_line(buffer: &[u8]) -> SmallVec<[u8; 128]> {
+    // Find first \r for end of status line
+    if let Some(cr_pos) = memchr::memchr(b'\r', buffer) {
+        let end = (cr_pos + 2).min(buffer.len());
+        SmallVec::from_slice(&buffer[..end])
+    } else if buffer.len() >= 3 {
+        // Fallback: just the status code digits + CRLF
+        let mut stub = SmallVec::new();
+        stub.extend_from_slice(&buffer[..3]);
+        stub.extend_from_slice(b"\r\n");
+        stub
+    } else {
+        SmallVec::from_slice(buffer)
     }
 }
 
@@ -307,5 +343,48 @@ mod tests {
         assert!(!matches_command_type_verb(223, "STAT"));
         assert!(!matches_command_type_verb(430, "ARTICLE"));
         assert!(!matches_command_type_verb(200, "ARTICLE"));
+    }
+
+    // =========================================================================
+    // extract_status_line tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_status_line_full() {
+        let buf = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content\r\n.\r\n";
+        let stub = extract_status_line(buf);
+        assert_eq!(stub.as_slice(), b"220 0 <test@example.com>\r\n");
+    }
+
+    #[test]
+    fn test_extract_status_line_minimal() {
+        let buf = b"430 not found\r\n";
+        let stub = extract_status_line(buf);
+        assert_eq!(stub.as_slice(), b"430 not found\r\n");
+    }
+
+    #[test]
+    fn test_extract_status_line_no_crlf() {
+        // Fallback: just status code + CRLF
+        let buf = b"220 something without crlf";
+        let stub = extract_status_line(buf);
+        assert_eq!(stub.as_slice(), b"220\r\n");
+    }
+
+    #[test]
+    fn test_extract_status_line_too_short() {
+        // Buffer shorter than 3 bytes - just return it
+        let buf = b"22";
+        let stub = extract_status_line(buf);
+        assert_eq!(stub.as_slice(), b"22");
+    }
+
+    #[test]
+    fn test_extract_status_line_exact_crlf_boundary() {
+        // \r at the end, but buffer doesn't have \n
+        let buf = b"220 test\r";
+        let stub = extract_status_line(buf);
+        // cr_pos = 8, end = min(10, 9) = 9
+        assert_eq!(stub.as_slice(), b"220 test\r");
     }
 }

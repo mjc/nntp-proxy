@@ -206,10 +206,10 @@ async fn query_all_backends_racing(
     let mut first_found = None;
 
     // Collect results until we find a success
-    while let Some(result) = pending.next().await {
-        match &result {
+    while let Some(mut result) = pending.next().await {
+        match &mut result {
             QueryResult::Found(id, response) if first_found.is_none() => {
-                first_found = Some((*id, response.clone()));
+                first_found = Some((*id, std::mem::take(response)));
                 results.push(result);
 
                 // Spawn background task to complete remaining backends and update cache
@@ -309,14 +309,13 @@ pub async fn precheck(
         // backend also has it but responded slower. Using tier 0 conservatively ensures
         // we don't overestimate TTL. Regular routing will discover higher-tier availability.
         let tier = 0;
-        // Construct the entry directly from the data we have, avoiding a redundant
-        // cache.get() round-trip after upsert.
-        let entry = ArticleEntry::from_arc_with_tier(std::sync::Arc::new(data.clone()), tier);
+        // Move data into upsert, then retrieve the entry via cache.get().
+        // The lookup is sub-microsecond vs 750KB memcpy from cloning.
         owned
             .cache
             .upsert(msg_id.to_owned(), data, backend_id, tier)
             .await;
-        Some(entry)
+        owned.cache.get(msg_id).await
     } else {
         // No article found - availability is synced by background task
         None

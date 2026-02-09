@@ -198,6 +198,17 @@ impl ArticleEntry {
         super::entry_helpers::is_complete_article(&self.buffer, code.as_u16())
     }
 
+    /// Check if buffer contains a valid NNTP multiline response
+    ///
+    /// A valid response must:
+    /// 1. Start with 3 ASCII digits (status code)
+    /// 2. Have CRLF somewhere (line terminator)
+    /// 3. End with `.\r\n` for multiline responses (220/221/222)
+    #[inline]
+    pub fn is_valid_response(&self) -> bool {
+        super::entry_helpers::is_valid_response(&self.buffer)
+    }
+
     /// Get the appropriate response for a command, if this cache entry can serve it
     ///
     /// Returns `Some(response_bytes)` if cache can satisfy the command:

@@ -16,6 +16,9 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
+/// Typical yEnc articles are ~750KB - size capture buffer to avoid reallocations during streaming
+const ARTICLE_CAPTURE_CAPACITY: usize = 768 * 1024;
+
 /// Result of attempting to execute a command on a backend
 pub(super) enum BackendAttemptResult {
     /// Article found - response streamed successfully
@@ -242,7 +245,8 @@ impl ClientSession {
 
         match (is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let mut captured = Vec::with_capacity(first_chunk.len() * 2);
+                let mut captured =
+                    Vec::with_capacity(ARTICLE_CAPTURE_CAPACITY.max(first_chunk.len()));
                 let bytes = streaming::stream_and_capture_multiline_response(
                     &mut **pooled_conn,
                     client_write,
@@ -263,7 +267,7 @@ impl ClientSession {
                         captured.len()
                     );
                     let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, captured, backend_id, tier);
+                    self.spawn_cache_upsert(msg_id_ref, &captured, backend_id, tier);
                 }
                 Ok(bytes)
             }
@@ -281,7 +285,13 @@ impl ClientSession {
 
                 if let Some(msg_id_ref) = msg_id {
                     let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, first_chunk.to_vec(), backend_id, tier);
+                    // Extract first status line (~30-80 bytes) instead of copying
+                    // full first_chunk (8-64KB). The cache only needs the status
+                    // code to build an availability stub.
+                    // SmallVec keeps small status lines on stack, avoiding heap allocation
+                    // until the spawn boundary where .to_vec() happens inside spawn_cache_upsert.
+                    let stub = crate::cache::extract_status_line(first_chunk);
+                    self.spawn_cache_upsert(msg_id_ref, &stub, backend_id, tier);
                 }
                 Ok(bytes)
             }
@@ -302,7 +312,7 @@ impl ClientSession {
                 client_write.write_all(first_chunk).await?;
                 if let Some(msg_id_ref) = msg_id {
                     let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, b"223\r\n".to_vec(), backend_id, tier);
+                    self.spawn_cache_upsert(msg_id_ref, b"223\r\n", backend_id, tier);
                 }
                 Ok(first_chunk_size as u64)
             }
