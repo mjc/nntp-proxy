@@ -141,6 +141,16 @@ pub struct Proxy {
     pub backend_selection: BackendSelectionStrategy,
     /// Validate yEnc structure and checksums (default: true)
     pub validate_yenc: bool,
+    /// Number of buffers in the main buffer pool (default: 50)
+    /// Controls memory usage for I/O operations: count × 724KB
+    /// Higher values support more concurrent connections but use more memory
+    #[serde(default = "super::defaults::buffer_pool_count")]
+    pub buffer_pool_count: usize,
+    /// Number of buffers in the capture pool for caching (default: 16)
+    /// Controls memory usage for cache operations: count × 768KB
+    /// Only used when caching is enabled
+    #[serde(default = "super::defaults::capture_pool_count")]
+    pub capture_pool_count: usize,
 }
 
 impl Proxy {
@@ -157,6 +167,8 @@ impl Default for Proxy {
             routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),
             validate_yenc: true,
+            buffer_pool_count: defaults::buffer_pool_count(),
+            capture_pool_count: defaults::capture_pool_count(),
         }
     }
 }

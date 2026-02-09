@@ -118,3 +118,19 @@ pub fn pipeline_queue_depth() -> usize {
 pub fn pipeline_batch_size() -> usize {
     4
 }
+
+/// Default number of buffers in the main buffer pool
+/// Sized for ~50 concurrent connections with single buffer per connection
+/// Total memory: 50 × 724KB ≈ 35MB
+#[inline]
+pub fn buffer_pool_count() -> usize {
+    50
+}
+
+/// Default number of buffers in the capture pool for caching
+/// Sized for 16 concurrent caching operations
+/// Total memory: 16 × 768KB ≈ 12MB
+#[inline]
+pub fn capture_pool_count() -> usize {
+    16
+}

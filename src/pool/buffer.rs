@@ -87,6 +87,33 @@ impl PooledBuffer {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buffer[..]
     }
+
+    /// Append data to the buffer (accumulator mode)
+    ///
+    /// Used when PooledBuffer is acquired from capture pool for accumulating
+    /// streaming data. Unlike copy_from_slice which overwrites, this extends.
+    ///
+    /// # Performance
+    ///
+    /// Capture buffers are pre-allocated with sufficient capacity (768KB) and
+    /// pages are pre-faulted. As long as total accumulated data fits within
+    /// capacity, this operation performs NO allocations or page faults.
+    ///
+    /// # Note on length
+    ///
+    /// After calling this, `.len()` (via Deref) returns the total accumulated length.
+    #[inline]
+    pub fn extend_from_slice(&mut self, data: &[u8]) {
+        debug_assert!(
+            self.buffer.len() + data.len() <= self.buffer.capacity(),
+            "Capture buffer overflow: {} + {} > {} capacity",
+            self.buffer.len(),
+            data.len(),
+            self.buffer.capacity()
+        );
+        self.buffer.extend_from_slice(data);
+        self.initialized = self.buffer.len();
+    }
 }
 
 impl Deref for PooledBuffer {
@@ -142,6 +169,11 @@ pub struct BufferPool {
     buffer_size: BufferSize,
     max_pool_size: usize,
     pool_size: Arc<AtomicUsize>,
+    // Capture buffer pool (for accumulating streaming data)
+    capture_pool: Arc<SegQueue<Vec<u8>>>,
+    capture_capacity: usize,
+    max_capture_pool_size: usize,
+    capture_pool_size: Arc<AtomicUsize>,
 }
 
 impl BufferPool {
@@ -181,6 +213,21 @@ impl BufferPool {
             buffer.set_len(size);
         }
         buffer
+    }
+
+    /// Pre-fault pages by writing to each 4KB stride to map physical memory
+    ///
+    /// This eliminates page faults during streaming by ensuring all pages are
+    /// resident in physical memory. Without this, the first write to each page
+    /// triggers a soft page fault (96.75% of memmove time in profiling).
+    fn prefault_pages(buf: &mut Vec<u8>) {
+        let cap = buf.capacity();
+        unsafe {
+            let ptr = buf.as_mut_ptr();
+            for offset in (0..cap).step_by(4096) {
+                std::ptr::write_volatile(ptr.add(offset), 1);
+            }
+        }
     }
 
     /// Create a new buffer pool with pre-allocated buffers
@@ -230,7 +277,45 @@ impl BufferPool {
             buffer_size,
             max_pool_size,
             pool_size,
+            // Initialize capture pool as empty (will be configured via with_capture_pool)
+            capture_pool: Arc::new(SegQueue::new()),
+            capture_capacity: 0,
+            max_capture_pool_size: 0,
+            capture_pool_size: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Configure the capture buffer pool for pre-faulted accumulator buffers
+    ///
+    /// Capture buffers are used for accumulating streaming data (e.g., caching).
+    /// Pages are pre-faulted to eliminate soft page faults during streaming.
+    ///
+    /// # Arguments
+    /// * `capacity` - Size of each capture buffer in bytes (e.g., 768KB)
+    /// * `count` - Number of capture buffers to pre-allocate
+    #[must_use]
+    pub fn with_capture_pool(mut self, capacity: usize, count: usize) -> Self {
+        info!(
+            "Pre-allocating {} capture buffers of {}KB each ({}MB total)",
+            count,
+            capacity / 1024,
+            (count * capacity) / (1024 * 1024)
+        );
+
+        for _ in 0..count {
+            let mut buffer = Vec::with_capacity(capacity);
+            // Pre-fault all pages to map physical memory
+            Self::prefault_pages(&mut buffer);
+            self.capture_pool.push(buffer);
+            self.capture_pool_size.fetch_add(1, Ordering::Relaxed);
+        }
+
+        self.capture_capacity = capacity;
+        self.max_capture_pool_size = count;
+
+        info!("Capture buffer pool pre-allocation complete");
+
+        self
     }
 
     /// Create a buffer pool suitable for testing
@@ -240,7 +325,27 @@ impl BufferPool {
     #[cfg(test)]
     #[must_use]
     pub fn for_tests() -> Self {
-        Self::new(BufferSize::try_new(8192).expect("valid size"), 4)
+        Self::new(BufferSize::try_new(8192).expect("valid size"), 4).with_capture_pool(8192, 2)
+    }
+
+    /// Get the current number of available buffers in the pool
+    #[must_use]
+    pub fn available_buffers(&self) -> usize {
+        self.pool_size.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of buffers currently in use
+    #[must_use]
+    pub fn buffers_in_use(&self) -> usize {
+        self.max_pool_size.saturating_sub(self.available_buffers())
+    }
+
+    /// Get buffer pool statistics (available, in-use, total)
+    #[must_use]
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let available = self.available_buffers();
+        let in_use = self.buffers_in_use();
+        (available, in_use, self.max_pool_size)
     }
 
     /// Get a buffer from the pool or create a new one (lock-free)
@@ -270,6 +375,11 @@ impl BufferPool {
             buffer
         } else {
             // Create new page-aligned buffer for better DMA performance
+            let in_use = self.buffers_in_use();
+            debug!(
+                "Buffer pool exhausted (allocating beyond pool size). In use: {}/{}",
+                in_use, self.max_pool_size
+            );
             Self::create_aligned_buffer(self.buffer_size.get())
         };
 
@@ -279,6 +389,42 @@ impl BufferPool {
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
+        }
+    }
+
+    /// Get a capture buffer from the capture pool
+    ///
+    /// Returns a PooledBuffer backed by a pre-faulted capture buffer.
+    /// Used for accumulating streaming data (e.g., caching articles).
+    ///
+    /// Pages are pre-faulted to eliminate soft page faults during streaming,
+    /// which profiling showed accounted for 96.75% of memmove time.
+    pub async fn acquire_capture(&self) -> PooledBuffer {
+        let buffer = if let Some(mut buffer) = self.capture_pool.pop() {
+            self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
+            // Clear but keep capacity (pages stay mapped)
+            buffer.clear();
+            buffer
+        } else {
+            // Pool exhausted - allocate and pre-fault new buffer
+            let in_use = self
+                .max_capture_pool_size
+                .saturating_sub(self.capture_pool_size.load(Ordering::Relaxed));
+            debug!(
+                "Capture pool exhausted (allocating beyond pool size). In use: {}/{}",
+                in_use, self.max_capture_pool_size
+            );
+            let mut buffer = Vec::with_capacity(self.capture_capacity);
+            Self::prefault_pages(&mut buffer);
+            buffer
+        };
+
+        PooledBuffer {
+            buffer,
+            initialized: 0,
+            pool: Arc::clone(&self.capture_pool),
+            pool_size: Arc::clone(&self.capture_pool_size),
+            max_pool_size: self.max_capture_pool_size,
         }
     }
 }

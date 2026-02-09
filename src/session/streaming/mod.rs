@@ -157,7 +157,7 @@ pub async fn stream_and_capture_multiline_response<R, W>(
     client_addr: impl std::fmt::Display,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
-    capture: &mut Vec<u8>,
+    capture: &mut crate::pool::PooledBuffer,
 ) -> Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -186,7 +186,7 @@ async fn stream_multiline_response_impl<R, W>(
     client_addr: impl std::fmt::Display,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
-    mut capture: Option<&mut Vec<u8>>,
+    mut capture: Option<&mut crate::pool::PooledBuffer>,
 ) -> Result<u64>
 where
     R: AsyncReadExt + Unpin,

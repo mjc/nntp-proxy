@@ -284,6 +284,18 @@ fn create_app_summary(
         ]));
     }
 
+    /// Color for buffer pool utilization
+    fn buffer_color(in_use: usize, total: usize) -> Color {
+        let percent = if total > 0 { (in_use * 100) / total } else { 0 };
+        if percent > 80 {
+            Color::Red
+        } else if percent > 60 {
+            Color::Yellow
+        } else {
+            styles::VALUE_INFO
+        }
+    }
+
     Paragraph::new(lines)
         .block(bordered_block("App", styles::BORDER_NORMAL))
         .alignment(Alignment::Left)

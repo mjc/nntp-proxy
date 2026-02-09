@@ -16,9 +16,6 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
-/// Typical yEnc articles are ~750KB - size capture buffer to avoid reallocations during streaming
-const ARTICLE_CAPTURE_CAPACITY: usize = 768 * 1024;
-
 /// Result of attempting to execute a command on a backend
 pub(super) enum BackendAttemptResult {
     /// Article found - response streamed successfully
@@ -245,8 +242,7 @@ impl ClientSession {
 
         match (is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let mut captured =
-                    Vec::with_capacity(ARTICLE_CAPTURE_CAPACITY.max(first_chunk.len()));
+                let mut captured = self.buffer_pool.acquire_capture().await;
                 let bytes = streaming::stream_and_capture_multiline_response(
                     &mut **pooled_conn,
                     client_write,

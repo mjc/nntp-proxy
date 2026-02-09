@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::auth::AuthHandler;
 use crate::cache::{HybridCacheConfig, UnifiedCache};
 use crate::config::{Config, RoutingMode, Server};
-use crate::constants::buffer::{POOL, POOL_COUNT};
+use crate::constants::buffer::{CAPTURE, POOL};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::router;
@@ -121,7 +121,9 @@ impl NntpProxyBuilder {
         }
 
         let buffer_size = self.buffer_size.unwrap_or(POOL);
-        let buffer_count = self.buffer_count.unwrap_or(POOL_COUNT);
+        let buffer_count = self
+            .buffer_count
+            .unwrap_or(self.config.proxy.buffer_pool_count);
 
         // Create deadpool connection providers for each server
         let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = self
@@ -143,7 +145,8 @@ impl NntpProxyBuilder {
             BufferSize::try_new(buffer_size)
                 .map_err(|_| anyhow::anyhow!("Buffer size must be non-zero"))?,
             buffer_count,
-        );
+        )
+        .with_capture_pool(CAPTURE, self.config.proxy.capture_pool_count);
 
         let metrics = MetricsCollector::new(self.config.servers.len());
 
