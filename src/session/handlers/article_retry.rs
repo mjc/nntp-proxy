@@ -310,7 +310,7 @@ impl ClientSession {
                             // Check if the response is a 430 (article not found).
                             // If so, fall through to the availability-aware retry loop
                             // which will try other backends.
-                            if status_code == 430 {
+                            if status_code.as_u16() == 430 {
                                 debug!(
                                     "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
                                     self.client_addr, backend_id

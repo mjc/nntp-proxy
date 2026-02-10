@@ -47,12 +47,7 @@ pub struct ValidatedResponse {
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-impl ValidatedResponse {
-    /// Get the status code as a u16, or 0 if invalid
-    pub fn status_code_u16(&self) -> u16 {
-        self.response.status_code().map(|c| c.as_u16()).unwrap_or(0)
-    }
-}
+impl ValidatedResponse {}
 
 /// Validate backend response data (pure function - easily testable)
 ///
@@ -132,8 +127,8 @@ impl CommandResponse {
 
     /// Get status code if valid
     #[inline]
-    pub fn status_code(&self) -> Option<u16> {
-        self.response.status_code().map(|c| c.as_u16())
+    pub fn status_code(&self) -> Option<crate::protocol::StatusCode> {
+        self.response.status_code()
     }
 
     /// Log validation warnings with context
@@ -294,7 +289,7 @@ mod tests {
             is_multiline: false,
             warnings: SmallVec::new(),
         };
-        assert_eq!(response.status_code(), Some(211));
+        assert_eq!(response.status_code().map(|c| c.as_u16()), Some(211));
     }
 
     // ─── Validation tests ───────────────────────────────────────────────────

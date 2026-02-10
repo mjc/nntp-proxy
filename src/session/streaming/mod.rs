@@ -265,22 +265,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut total_bytes = 0u64;
-<<<<<<< HEAD
-    let mut buffer = buffer_pool.acquire().await;
-
-    // Copy first chunk into buffer
-    buffer.copy_from_slice(&first_chunk[..first_n]);
-
-    let mut current_n = first_n;
-
-    // Track tail for spanning terminator detection
     let mut tail = TailBuffer::default();
-    // Main streaming loop - processes first chunk and all subsequent chunks uniformly
-    loop {
-        let data = &buffer[..current_n];
-=======
-    let mut tail = TailBuffer::default();
->>>>>>> 4df5e30 (perf: eliminate 8-10 heap allocations + 14 atomics per article request)
 
     // Phase 1: Process first chunk directly — no copy into pooled buffer
     let data = &first_chunk[..first_n];
@@ -309,17 +294,9 @@ where
         ChunkResult::Continue => {}
     }
 
-<<<<<<< HEAD
-        // Read next chunk into same buffer (previous write completed)
-        let next_n = buffer
-            .read_from(backend_read)
-            .await
-            .context("Failed to read next chunk from backend")?;
-=======
     // Phase 2: Multi-chunk response — acquire pooled buffers for double-buffering
     let mut buffers = [buffer_pool.acquire().await, buffer_pool.acquire().await];
     let mut idx: usize = 0;
->>>>>>> 4df5e30 (perf: eliminate 8-10 heap allocations + 14 atomics per article request)
 
     loop {
         let n = buffers[idx]

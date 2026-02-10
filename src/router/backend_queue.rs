@@ -23,7 +23,7 @@ pub enum PipelineResponse {
         /// Complete response data (status line + multiline body if applicable)
         data: bytes::Bytes,
         /// Parsed status code from the response
-        status_code: u16,
+        status_code: crate::protocol::StatusCode,
         /// Which backend handled this request
         backend_id: BackendId,
     },

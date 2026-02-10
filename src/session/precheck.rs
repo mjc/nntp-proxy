@@ -116,7 +116,7 @@ async fn execute_backend_query(
                 }
             }
 
-            Ok(match status_code {
+            Ok(match status_code.as_u16() {
                 220..=223 => {
                     // Record successful command and timing
                     tracing::debug!(
