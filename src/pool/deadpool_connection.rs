@@ -5,7 +5,6 @@
 
 use deadpool::managed;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 
 use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
@@ -81,42 +80,35 @@ impl TcpManager {
     pub(crate) async fn create_optimized_stream(
         &self,
     ) -> Result<ConnectionStream, ConnectionError> {
-        use socket2::{Domain, Protocol, Socket, Type};
-
         // Resolve hostname
         let addr = format!("{}:{}", self.host, self.port);
         let Some(socket_addr) = tokio::net::lookup_host(&addr).await?.next() else {
             return Err(ConnectionError::DnsNoAddresses { address: addr });
         };
 
-        // Create and configure socket
-        let domain = if socket_addr.is_ipv4() {
-            Domain::IPV4
+        // Create tokio TcpSocket (non-blocking from the start)
+        let socket = if socket_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
         } else {
-            Domain::IPV6
+            tokio::net::TcpSocket::new_v6()?
         };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
-        // Socket buffers (4MB for pooled connections)
-        socket.set_recv_buffer_size(POOL_RECV_BUFFER)?;
-        socket.set_send_buffer_size(POOL_SEND_BUFFER)?;
+        // Pre-connect options (buffer sizes, reuse)
+        socket.set_recv_buffer_size(POOL_RECV_BUFFER as u32)?;
+        socket.set_send_buffer_size(POOL_SEND_BUFFER as u32)?;
+        socket.set_reuseaddr(true)?;
 
-        // TCP keepalive: probe after 60s idle, retry every 10s
-        socket.set_keepalive(true)?;
+        // Async connect — does NOT block the tokio worker thread
+        let tcp_stream = socket.connect(socket_addr).await?;
+
+        // Post-connect options via socket2::SockRef (keepalive with params, nodelay)
+        let sock_ref = socket2::SockRef::from(&tcp_stream);
+        sock_ref.set_keepalive(true)?;
         let keepalive = socket2::TcpKeepalive::new()
             .with_time(std::time::Duration::from_secs(60))
             .with_interval(std::time::Duration::from_secs(10));
-        socket.set_tcp_keepalive(&keepalive)?;
-
-        // Low latency settings
-        socket.set_tcp_nodelay(true)?;
-        socket.set_reuse_address(true)?;
-
-        // Connect and convert to tokio TcpStream
-        socket.connect(&socket_addr.into())?;
-        let std_stream: std::net::TcpStream = socket.into();
-        std_stream.set_nonblocking(true)?;
-        let tcp_stream = TcpStream::from_std(std_stream)?;
+        sock_ref.set_tcp_keepalive(&keepalive)?;
+        sock_ref.set_tcp_nodelay(true)?;
 
         // Perform TLS handshake if enabled
         if self.tls_config.use_tls {
@@ -333,10 +325,16 @@ impl managed::Manager for TcpManager {
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<ConnectionError> {
         use super::health_check::check_tcp_alive;
-        // Only do fast TCP-level check on recycle
-        // Full health checks happen periodically via the periodic health checks
-        check_tcp_alive(conn)?;
-        Ok(())
+        match check_tcp_alive(conn) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Shut down TCP immediately so backend releases the slot
+                // before deadpool drops this and creates a replacement.
+                let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
+                    .shutdown(std::net::Shutdown::Both);
+                Err(e)
+            }
+        }
     }
 
     fn detach(&self, _conn: &mut ConnectionStream) {}

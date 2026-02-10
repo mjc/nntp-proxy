@@ -104,13 +104,21 @@ impl PooledBuffer {
     /// After calling this, `.len()` (via Deref) returns the total accumulated length.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
-        debug_assert!(
-            self.buffer.len() + data.len() <= self.buffer.capacity(),
-            "Capture buffer overflow: {} + {} > {} capacity",
-            self.buffer.len(),
-            data.len(),
-            self.buffer.capacity()
-        );
+        // M3: Runtime check instead of debug_assert to prevent realloc in release builds
+        if self.buffer.len() + data.len() > self.buffer.capacity() {
+            tracing::warn!(
+                "Capture buffer overflow: {} + {} > {} capacity, truncating",
+                self.buffer.len(),
+                data.len(),
+                self.buffer.capacity()
+            );
+            let available = self.buffer.capacity().saturating_sub(self.buffer.len());
+            if available > 0 {
+                self.buffer.extend_from_slice(&data[..available]);
+                self.initialized = self.buffer.len();
+            }
+            return;
+        }
         self.buffer.extend_from_slice(data);
         self.initialized = self.buffer.len();
     }
@@ -221,8 +229,18 @@ impl BufferPool {
     /// This eliminates page faults during streaming by ensuring all pages are
     /// resident in physical memory. Without this, the first write to each page
     /// triggers a soft page fault (96.75% of memmove time in profiling).
+    ///
+    /// # Safety
+    ///
+    /// M2: We write within the buffer's allocated capacity (not beyond it).
+    /// `write_volatile` touches one byte per 4KB page to trigger the OS page fault
+    /// at init time rather than during streaming I/O. Values are overwritten by
+    /// actual I/O before being read.
     fn prefault_pages(buf: &mut Vec<u8>) {
         let cap = buf.capacity();
+        // SAFETY: We write within the buffer's allocated capacity.
+        // Each write_volatile touches one byte per 4KB page to trigger page faults.
+        // These sentinel values (1) are overwritten by real I/O data before being read.
         unsafe {
             let ptr = buf.as_mut_ptr();
             for offset in (0..cap).step_by(4096) {

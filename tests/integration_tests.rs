@@ -258,14 +258,27 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     // Give proxy time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Test client connection - should receive error message
+    // Test client connection - should receive greeting first, then error when backend connection fails
     let mut client = TcpStream::connect(&proxy_addr).await?;
     let mut buffer = [0; 1024];
 
+    // Read greeting (sent by prepare_stateful_connection)
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-    let response = String::from_utf8_lossy(&buffer[..n]);
+    let greeting = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        greeting.contains("200"),
+        "Expected greeting, got: {:?}",
+        greeting
+    );
 
-    assert!(response.contains("400 Backend server unavailable"));
+    // Read error (sent by handle_stateful_session when backend connection fails)
+    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+    let error_response = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        error_response.contains("400 Backend server unavailable"),
+        "Expected backend unavailable error, got: {:?}",
+        error_response
+    );
 
     Ok(())
 }

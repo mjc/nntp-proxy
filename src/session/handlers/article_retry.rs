@@ -4,8 +4,8 @@
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::is_client_disconnect_error;
-use crate::router::BackendSelector;
 use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
+use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::handlers::cache_operations::CacheLookupResult;
 use crate::session::handlers::command_execution::BackendAttemptResult;
@@ -271,13 +271,28 @@ impl ClientSession {
         let cmd_bytes = command.as_bytes();
         let is_large_transfer = is_large_transfer_command(cmd_bytes);
 
+        // Load availability BEFORE attempting pipeline path to avoid routing
+        // to backends we know don't have the article
+        let mut availability = match cached_availability {
+            Some(avail) => avail,
+            None => {
+                self.load_article_availability(msg_id.as_ref(), router.backend_count())
+                    .await
+            }
+        };
+
         // Try pipeline path: if the routed backend has a pipeline queue, enqueue
         // the command and await the response instead of acquiring a direct connection.
         // This allows N client sessions to share M backend connections (N >> M).
+        // IMPORTANT: Check availability to avoid routing to backends that returned 430
         if !is_large_transfer
             && let Ok(backend_id) = router.route_command(self.client_id, command)
+            && availability.should_try(backend_id)  // Skip if we know it returned 430
             && let Some(queue) = router.get_backend_queue(backend_id)
         {
+            // Wrap in guard - decrements pending_count on all exit paths
+            let guard = CommandGuard::new(router.clone(), backend_id);
+
             debug!(
                 "Client {} using pipeline path for backend {:?}: {}",
                 self.client_addr,
@@ -308,6 +323,7 @@ impl ClientSession {
                             *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
                             *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
                             self.metrics.record_pipeline_complete();
+                            guard.complete();
                             return Ok(backend_id);
                         }
                         Ok(PipelineResponse::Success { backend_id, .. }) => {
@@ -320,21 +336,21 @@ impl ClientSession {
                             self.record_article_missing(msg_id.as_ref(), backend_id, &router)
                                 .await;
                             self.metrics.record_pipeline_complete();
-                            // Fall through to direct execution path for retry
+                            // Fall through - guard drops, decrementing pending_count
                         }
                         Ok(PipelineResponse::Error(e)) => {
                             debug!(
                                 "Client {} pipeline error for backend {:?}: {}",
                                 self.client_addr, backend_id, e
                             );
-                            // Fall through to direct execution path
+                            // Fall through - guard drops, decrementing pending_count
                         }
                         Err(_) => {
                             debug!(
                                 "Client {} pipeline worker dropped response channel",
                                 self.client_addr
                             );
-                            // Fall through to direct execution path
+                            // Fall through - guard drops, decrementing pending_count
                         }
                     }
                 }
@@ -343,13 +359,14 @@ impl ClientSession {
                         "Client {} pipeline queue full for backend {:?}: {}",
                         self.client_addr, backend_id, e
                     );
-                    // Fall through to direct execution path
+                    // Fall through - guard drops, decrementing pending_count
                 }
             }
+            // Guard drops here if we fell through from any path
         }
 
         // Execute command with availability-aware backend selection.
-        // Reuse availability from cache lookup to avoid a redundant cache.get().
+        // Availability was already loaded before the pipeline check above.
         debug!(
             "Client {} starting availability routing for command: {}",
             self.client_addr,
@@ -357,15 +374,6 @@ impl ClientSession {
         );
 
         let mut buffer = self.buffer_pool.acquire().await;
-
-        // Use pre-loaded availability if available, otherwise load from cache
-        let mut availability = match cached_availability {
-            Some(avail) => avail,
-            None => {
-                self.load_article_availability(msg_id.as_ref(), router.backend_count())
-                    .await
-            }
-        };
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,

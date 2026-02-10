@@ -554,8 +554,11 @@ impl DeadpoolConnectionProvider {
                             error = %e,
                             "Health check failed, discarding connection"
                         );
-                        // Drop the connection without returning it to pool
-                        drop(managed::Object::take(conn_obj));
+                        // Shut down the raw TCP socket so recycle reliably detects it as dead
+                        let _ = socket2::SockRef::from(conn_obj.underlying_tcp_stream())
+                            .shutdown(std::net::Shutdown::Both);
+                        // Return to pool normally — deadpool drops it before creating a replacement
+                        drop(conn_obj);
                     } else {
                         // Connection is healthy, return to pool automatically via Drop
                         drop(conn_obj);
