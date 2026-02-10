@@ -60,7 +60,7 @@ impl ClientSession {
                     "Client {} batch write failed to backend {:?}: {}",
                     self.client_addr, backend_id, e
                 );
-                crate::pool::remove_from_pool(conn);
+                provider.remove_with_cooldown(conn);
                 return Err(e.into());
             }
         }
@@ -69,57 +69,88 @@ impl ClientSession {
                 "Client {} batch flush failed to backend {:?}: {}",
                 self.client_addr, backend_id, e
             );
-            crate::pool::remove_from_pool(conn);
+            provider.remove_with_cooldown(conn);
             return Err(e.into());
         }
 
         // Phase 2: Read and stream responses in order
+        // Acquire buffer once before loop (reused across responses)
+        let mut buffer = self.buffer_pool.acquire().await;
+        let mut leftover: Vec<u8> = Vec::new(); // Tracks data from previous response
+        let mut chunk_data: Vec<u8> = Vec::new(); // Holds leftover + new read combined
+
         for (i, command) in commands.iter().enumerate() {
             let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
 
-            // Read first chunk of this response
-            let mut buffer = self.buffer_pool.acquire().await;
-            let n = match buffer.read_from(&mut *conn).await {
-                Ok(n) if n > 0 => n,
-                Ok(_) => {
-                    debug!(
-                        "Client {} batch: backend {:?} EOF at response {}/{}",
-                        self.client_addr,
-                        backend_id,
-                        i + 1,
-                        commands.len()
-                    );
-                    // Connection broken — remove from pool and exit early
-                    crate::pool::remove_from_pool(conn);
-                    guard.complete();
-                    return Ok(());
-                }
-                Err(e) => {
-                    debug!(
-                        "Client {} batch: read error at response {}/{}: {}",
-                        self.client_addr,
-                        i + 1,
-                        commands.len(),
-                        e
-                    );
-                    // Connection broken — remove from pool and exit early
-                    crate::pool::remove_from_pool(conn);
-                    guard.complete();
-                    return Ok(());
+            // Get first chunk of this response
+            chunk_data.clear();
+            let n = if !leftover.is_empty() {
+                // Use leftover data from previous response
+                chunk_data.extend_from_slice(&leftover);
+                leftover.clear();
+                chunk_data.len()
+            } else {
+                match buffer.read_from(&mut *conn).await {
+                    Ok(bytes_read) if bytes_read > 0 => {
+                        chunk_data.extend_from_slice(&buffer[..bytes_read]);
+                        bytes_read
+                    }
+                    Ok(_) => {
+                        debug!(
+                            "Client {} batch: backend {:?} EOF at response {}/{}",
+                            self.client_addr,
+                            backend_id,
+                            i + 1,
+                            commands.len()
+                        );
+                        // Send 430 for remaining commands to maintain protocol sync
+                        for remaining in &commands[i..] {
+                            self.send_430_to_client(client_write, backend_to_client_bytes)
+                                .await?;
+                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                        }
+                        provider.remove_with_cooldown(conn);
+                        guard.complete();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Client {} batch: read error at response {}/{}: {}",
+                            self.client_addr,
+                            i + 1,
+                            commands.len(),
+                            e
+                        );
+                        // Send 430 for remaining commands to maintain protocol sync
+                        for remaining in &commands[i..] {
+                            self.send_430_to_client(client_write, backend_to_client_bytes)
+                                .await?;
+                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                        }
+                        provider.remove_with_cooldown(conn);
+                        guard.complete();
+                        return Ok(());
+                    }
                 }
             };
+            let chunk = chunk_data.as_slice();
 
             // Validate response
-            let validated = backend::validate_backend_response(
-                &buffer[..n],
-                n,
-                crate::protocol::MIN_RESPONSE_LENGTH,
-            );
+            let validated =
+                backend::validate_backend_response(chunk, n, crate::protocol::MIN_RESPONSE_LENGTH);
             let response_code = validated.response;
             let is_multiline = validated.is_multiline;
 
             // Handle 430 — article not found on this backend
             if response_code.is_430() {
+                // For single-line 430, find boundary and save leftover
+                if !is_multiline && let Some(pos) = memchr::memchr(b'\n', chunk) {
+                    let end = pos + 1;
+                    if end < n {
+                        leftover.extend_from_slice(&chunk[end..]);
+                    }
+                }
+
                 // Send 430 to client for this command
                 self.send_430_to_client(client_write, backend_to_client_bytes)
                     .await?;
@@ -130,6 +161,7 @@ impl ClientSession {
                     .await;
 
                 self.metrics.record_command(backend_id);
+                self.metrics.record_error_4xx(backend_id);
                 self.metrics.user_command(self.username());
                 continue;
             }
@@ -150,7 +182,7 @@ impl ClientSession {
                 match streaming::stream_multiline_response(
                     &mut *conn,
                     client_write,
-                    &buffer[..n],
+                    chunk,
                     n,
                     self.client_addr,
                     backend_id,
@@ -161,14 +193,23 @@ impl ClientSession {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         // Connection has pipelined responses we can't cleanly drain.
-                        crate::pool::remove_from_pool(conn);
+                        provider.remove_with_cooldown(conn);
                         return Err(e);
                     }
                 }
             } else {
-                // Single-line response
-                client_write.write_all(&buffer[..n]).await?;
-                n as u64
+                // Single-line response - find boundary and save leftover
+                let write_len = if let Some(pos) = memchr::memchr(b'\n', chunk) {
+                    let end = pos + 1;
+                    if end < n {
+                        leftover.extend_from_slice(&chunk[end..]);
+                    }
+                    end
+                } else {
+                    n
+                };
+                client_write.write_all(&chunk[..write_len]).await?;
+                write_len as u64
             };
 
             *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
@@ -271,102 +312,107 @@ impl ClientSession {
         let cmd_bytes = command.as_bytes();
         let is_large_transfer = is_large_transfer_command(cmd_bytes);
 
-        // Load availability BEFORE attempting pipeline path to avoid routing
-        // to backends we know don't have the article
-        let mut availability = match cached_availability {
-            Some(avail) => avail,
-            None => {
-                self.load_article_availability(msg_id.as_ref(), router.backend_count())
-                    .await
-            }
-        };
-
         // Try pipeline path: if the routed backend has a pipeline queue, enqueue
         // the command and await the response instead of acquiring a direct connection.
         // This allows N client sessions to share M backend connections (N >> M).
-        // IMPORTANT: Check availability to avoid routing to backends that returned 430
-        if !is_large_transfer
-            && let Ok(backend_id) = router.route_command(self.client_id, command)
-            && availability.should_try(backend_id)  // Skip if we know it returned 430
-            && let Some(queue) = router.get_backend_queue(backend_id)
-        {
-            // Wrap in guard - decrements pending_count on all exit paths
-            let guard = CommandGuard::new(router.clone(), backend_id);
-
-            debug!(
-                "Client {} using pipeline path for backend {:?}: {}",
-                self.client_addr,
-                backend_id,
-                command.trim()
-            );
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let request = QueuedRequest {
-                command: std::sync::Arc::from(command),
-                response_tx: tx,
+        // NOTE: Pipeline path uses route_command_with_availability to respect 430s
+        if !is_large_transfer {
+            // Load availability for message-ID based commands
+            let availability = match &msg_id {
+                Some(msg_id_ref) => self
+                    .cache
+                    .get(msg_id_ref)
+                    .await
+                    .map(|entry| entry.to_availability(router.backend_count())),
+                None => None,
             };
 
-            // Enqueue with backpressure - fail fast if queue is full
-            match queue.try_enqueue(request) {
-                Ok(()) => {
-                    self.metrics.record_pipeline_enqueue();
+            // Route with availability awareness (avoids backends that returned 430)
+            if let Ok(backend_id) = router.route_command_with_availability(
+                self.client_id,
+                command,
+                availability.as_ref(),
+            ) && let Some(queue) = router.get_backend_queue(backend_id)
+            {
+                // Wrap in guard - decrements pending_count on all exit paths
+                let guard = CommandGuard::new(router.clone(), backend_id);
 
-                    // Await response from the pipeline worker
-                    match rx.await {
-                        Ok(PipelineResponse::Success {
-                            data,
-                            status_code,
-                            backend_id,
-                        }) if status_code.as_u16() != 430 => {
-                            // Success - article found, return immediately
-                            client_write.write_all(&data).await?;
-                            *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
-                            *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
-                            self.metrics.record_pipeline_complete();
-                            guard.complete();
-                            return Ok(backend_id);
-                        }
-                        Ok(PipelineResponse::Success { backend_id, .. }) => {
-                            // 430 (article not found) - fall through to retry loop
-                            debug!(
-                                "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
-                                self.client_addr, backend_id
-                            );
-                            // Record this backend as missing so retry loop skips it
-                            self.record_article_missing(msg_id.as_ref(), backend_id, &router)
-                                .await;
-                            self.metrics.record_pipeline_complete();
-                            // Fall through - guard drops, decrementing pending_count
-                        }
-                        Ok(PipelineResponse::Error(e)) => {
-                            debug!(
-                                "Client {} pipeline error for backend {:?}: {}",
-                                self.client_addr, backend_id, e
-                            );
-                            // Fall through - guard drops, decrementing pending_count
-                        }
-                        Err(_) => {
-                            debug!(
-                                "Client {} pipeline worker dropped response channel",
-                                self.client_addr
-                            );
-                            // Fall through - guard drops, decrementing pending_count
+                debug!(
+                    "Client {} using pipeline path for backend {:?}: {}",
+                    self.client_addr,
+                    backend_id,
+                    command.trim()
+                );
+
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let request = QueuedRequest {
+                    command: std::sync::Arc::from(command),
+                    response_tx: tx,
+                };
+
+                // Enqueue with backpressure - fail fast if queue is full
+                match queue.try_enqueue(request) {
+                    Ok(()) => {
+                        self.metrics.record_pipeline_enqueue();
+
+                        // Await response from the pipeline worker
+                        match rx.await {
+                            Ok(PipelineResponse::Success {
+                                data,
+                                status_code,
+                                backend_id,
+                            }) if status_code.as_u16() != 430 => {
+                                // Success - article found, return immediately
+                                client_write.write_all(&data).await?;
+                                *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
+                                *client_to_backend_bytes =
+                                    client_to_backend_bytes.add(command.len());
+                                self.metrics.record_pipeline_complete();
+                                guard.complete();
+                                return Ok(backend_id);
+                            }
+                            Ok(PipelineResponse::Success { backend_id, .. }) => {
+                                // 430 (article not found) - fall through to retry loop
+                                debug!(
+                                    "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
+                                    self.client_addr, backend_id
+                                );
+                                // Record this backend as missing so retry loop skips it
+                                self.record_article_missing(msg_id.as_ref(), backend_id, &router)
+                                    .await;
+                                self.metrics.record_pipeline_complete();
+                                // Fall through - guard drops, decrementing pending_count
+                            }
+                            Ok(PipelineResponse::Error(e)) => {
+                                debug!(
+                                    "Client {} pipeline error for backend {:?}: {}",
+                                    self.client_addr, backend_id, e
+                                );
+                                // Fall through - guard drops, decrementing pending_count
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "Client {} pipeline worker dropped response channel",
+                                    self.client_addr
+                                );
+                                // Fall through - guard drops, decrementing pending_count
+                            }
                         }
                     }
+                    Err(e) => {
+                        debug!(
+                            "Client {} pipeline queue full for backend {:?}: {}",
+                            self.client_addr, backend_id, e
+                        );
+                        // Fall through - guard drops, decrementing pending_count
+                    }
                 }
-                Err(e) => {
-                    debug!(
-                        "Client {} pipeline queue full for backend {:?}: {}",
-                        self.client_addr, backend_id, e
-                    );
-                    // Fall through - guard drops, decrementing pending_count
-                }
+                // Guard drops here if we fell through from any path
             }
-            // Guard drops here if we fell through from any path
         }
 
         // Execute command with availability-aware backend selection.
-        // Availability was already loaded before the pipeline check above.
+        // Load availability from cache if not already checked
         debug!(
             "Client {} starting availability routing for command: {}",
             self.client_addr,
@@ -374,6 +420,15 @@ impl ClientSession {
         );
 
         let mut buffer = self.buffer_pool.acquire().await;
+
+        // Use pre-loaded availability if available, otherwise load from cache
+        let mut availability = match cached_availability {
+            Some(avail) => avail,
+            None => {
+                self.load_article_availability(msg_id.as_ref(), router.backend_count())
+                    .await
+            }
+        };
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
@@ -505,9 +560,10 @@ impl ClientSession {
     ) {
         availability.record_missing(backend_id);
 
-        // NOTE: 430 is NOT an error - it's normal retry behavior.
-        // The backend is correctly reporting it doesn't have the article.
-        // Error metrics should only track actual errors (connection failures, protocol violations, etc.)
+        // Track 430 responses in 4xx metrics for visibility in TUI
+        // While 430 is normal retry behavior (not a failure), users want to see
+        // these counted to understand backend article distribution
+        self.metrics.record_error_4xx(backend_id);
     }
 
     /// Sync availability to cache if a message ID is present.

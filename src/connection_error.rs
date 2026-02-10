@@ -63,6 +63,9 @@ pub enum ConnectionError {
     #[error("Authentication failed for backend '{backend}': {response}")]
     AuthenticationFailed { backend: String, response: String },
 
+    #[error("Connection limit exceeded for backend '{backend}': {response}")]
+    ConnectionLimitExceeded { backend: String, response: String },
+
     #[error("Invalid greeting from backend '{backend}': {greeting}")]
     InvalidGreeting { backend: String, greeting: String },
 
@@ -318,5 +321,18 @@ mod tests {
         assert!(msg.contains("invalid.example.com"));
         assert!(msg.contains("name not resolved"));
         assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn test_connection_limit_exceeded_error() {
+        let err = ConnectionError::ConnectionLimitExceeded {
+            backend: "news.example.com".to_string(),
+            response: "482 Connection limit exceeded".to_string(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("Connection limit exceeded"));
+        assert!(msg.contains("news.example.com"));
+        assert!(msg.contains("482"));
     }
 }

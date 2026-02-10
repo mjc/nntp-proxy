@@ -42,6 +42,7 @@ pub async fn backend_pipeline_worker(
     config: PipelineWorkerConfig,
     queue: Arc<BackendQueue>,
     provider: Arc<DeadpoolConnectionProvider>,
+    _router: Arc<crate::router::BackendSelector>,
     metrics: MetricsCollector,
     buffer_pool: BufferPool,
 ) {
@@ -81,7 +82,7 @@ pub async fn backend_pipeline_worker(
 
         if !success {
             // Connection is likely broken; remove from pool so it's not reused
-            crate::pool::remove_from_pool(conn);
+            provider.remove_with_cooldown(conn);
         }
 
         // Record pipeline batch metrics
@@ -215,6 +216,18 @@ async fn read_full_response(
         result_buf.extend_from_slice(&buffer[..n]);
     }
 
+    // H5: If leftover was too short to validate, read more data
+    if result_buf.len() < crate::protocol::MIN_RESPONSE_LENGTH {
+        let n = buffer.read_from(conn).await?;
+        if n == 0 {
+            anyhow::bail!(
+                "Backend EOF with partial status line ({} bytes)",
+                result_buf.len()
+            );
+        }
+        result_buf.extend_from_slice(&buffer[..n]);
+    }
+
     // Validate the response to determine if it's multiline and get status code
     let validated = validate_backend_response(
         result_buf,
@@ -227,7 +240,14 @@ async fn read_full_response(
         .ok_or_else(|| anyhow::anyhow!("Invalid status code in pipeline response"))?;
 
     if !validated.is_multiline {
-        // Single-line response: return immediately (split to leave rest in buffer for reuse)
+        // Single-line response: split at \r\n boundary to save leftover
+        if let Some(pos) = memchr::memchr(b'\n', &result_buf[..]) {
+            let end = pos + 1;
+            if end < result_buf.len() {
+                leftover.extend_from_slice(&result_buf[end..]);
+                result_buf.truncate(end);
+            }
+        }
         return Ok((result_buf.split().freeze(), status_code));
     }
 
@@ -247,8 +267,11 @@ async fn read_full_response(
         loop {
             let n = buffer.read_from(conn).await?;
             if n == 0 {
-                // EOF before terminator - return what we have
-                break;
+                // C4: EOF before terminator is an error, not success
+                anyhow::bail!(
+                    "Backend EOF before multiline terminator (received {} bytes)",
+                    result_buf.len()
+                );
             }
             let chunk = &buffer[..n];
             let status = tail.detect_terminator(chunk);

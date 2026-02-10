@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
+use nntp_proxy::config::Server;
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
 mod test_helpers;
@@ -949,6 +950,340 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
         response.ends_with(".\r\n"),
         "Should have multiline terminator"
     );
+
+    // Clean up
+    client.write_all(b"QUIT\r\n").await?;
+
+    Ok(())
+}
+
+/// Test that tier 0 backends are exhausted before escalating to tier 1
+///
+/// This test verifies the critical tier-based routing behavior:
+/// When backend 0 (tier 0) returns 430, the proxy MUST try backend 1 (tier 0)
+/// before escalating to tier 1. This ensures all tier 0 backends are exhausted.
+#[tokio::test]
+async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
+    use nntp_proxy::RoutingMode;
+
+    // Find available ports
+    let backend_0_port = get_available_port().await?;
+    let backend_1_port = get_available_port().await?;
+    let backend_2_port = get_available_port().await?;
+    let proxy_port = get_available_port().await?;
+
+    // Start mock backends:
+    // Backend 0 (tier 0): Returns 430 for the article
+    // Backend 1 (tier 0): Has the article (returns 220)
+    // Backend 2 (tier 1): Has the article but should NOT be tried if tier 0 works
+    let _backend_0 = MockNntpServer::new(backend_0_port)
+        .with_name("Backend-0-Tier-0")
+        .on_command(
+            "ARTICLE",
+            "430 No such article\r\n", // Backend 0 doesn't have it
+        )
+        .spawn();
+
+    let _backend_1 = MockNntpServer::new(backend_1_port)
+        .with_name("Backend-1-Tier-0")
+        .on_command(
+            "ARTICLE",
+            "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from backend 1\r\n.\r\n", // Backend 1 has it
+        )
+        .spawn();
+
+    let _backend_2 = MockNntpServer::new(backend_2_port)
+        .with_name("Backend-2-Tier-1")
+        .on_command(
+            "ARTICLE",
+            "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from backend 2\r\n.\r\n",
+        )
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create proxy config with tier settings
+    let config = Config {
+        servers: vec![
+            Server::builder(
+                "127.0.0.1",
+                nntp_proxy::types::Port::try_new(backend_0_port)?,
+            )
+            .name("Backend-0-Tier-0")
+            .tier(0) // Tier 0 (highest priority)
+            .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
+            .build()?,
+            Server::builder(
+                "127.0.0.1",
+                nntp_proxy::types::Port::try_new(backend_1_port)?,
+            )
+            .name("Backend-1-Tier-0")
+            .tier(0) // Tier 0 (highest priority)
+            .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
+            .build()?,
+            Server::builder(
+                "127.0.0.1",
+                nntp_proxy::types::Port::try_new(backend_2_port)?,
+            )
+            .name("Backend-2-Tier-1")
+            .tier(1) // Tier 1 (lower priority)
+            .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
+            .build()?,
+        ],
+        proxy: Default::default(),
+        health_check: Default::default(),
+        cache: Default::default(),
+        client_auth: Default::default(),
+    };
+
+    // Start proxy
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port)).await?;
+
+    let proxy_clone = proxy.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = proxy_listener.accept().await {
+                let p = proxy_clone.clone();
+                tokio::spawn(async move {
+                    let _ = p
+                        .handle_client_per_command_routing(stream, addr.into())
+                        .await;
+                });
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect to proxy
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut buffer = [0u8; 4096];
+
+    // Read greeting
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let greeting = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        greeting.starts_with("200"),
+        "Expected greeting, got: {}",
+        greeting
+    );
+
+    // Request article - should try backend 0 (430), then backend 1 (220)
+    // Backend 2 (tier 1) should NOT be tried at all
+    client.write_all(b"ARTICLE <test@example.com>\r\n").await?;
+    client.flush().await?;
+
+    // Read response
+    buffer = [0u8; 4096];
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+
+    // CRITICAL ASSERTION: We should get 220 (success) from backend 1
+    // NOT 430 (which would mean we didn't try backend 1)
+    assert!(
+        response.starts_with("220"),
+        "Expected 220 from backend 1 (tier 0), got: {}",
+        response
+    );
+
+    // CRITICAL ASSERTION: Response should contain "Body from backend 1"
+    // This proves backend 1 was tried (not backend 2 from tier 1)
+    assert!(
+        response.contains("Body from backend 1"),
+        "Expected article from backend 1 (tier 0), got: {}",
+        response
+    );
+
+    // Test multiple requests to ensure consistent behavior
+    for i in 1..=5 {
+        client
+            .write_all(format!("ARTICLE <test{}@example.com>\r\n", i).as_bytes())
+            .await?;
+        client.flush().await?;
+
+        buffer = [0u8; 4096];
+        let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+        let response = String::from_utf8_lossy(&buffer[..n]);
+
+        assert!(
+            response.starts_with("220"),
+            "Request {}: Expected 220 from backend 1, got: {}",
+            i,
+            response
+        );
+        assert!(
+            response.contains("Body from backend 1"),
+            "Request {}: Expected backend 1 response, got: {}",
+            i,
+            response
+        );
+    }
+
+    // Clean up
+    client.write_all(b"QUIT\r\n").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tier_exhaustion_multi_tier() -> Result<()> {
+    use nntp_proxy::RoutingMode;
+
+    // Find available ports
+    let backend_0_port = get_available_port().await?;
+    let backend_1_port = get_available_port().await?;
+    let backend_2_port = get_available_port().await?;
+    let proxy_port = get_available_port().await?;
+
+    // Start mock backends:
+    // Backend 0 (tier 0): Returns 430 for the article (doesn't have it)
+    // Backend 1 (tier 0): Also returns 430 (doesn't have it either)
+    // Backend 2 (tier 1): Has the article (returns 220)
+    // CRITICAL: Backend 2 should ONLY be tried after BOTH tier 0 backends are exhausted
+    let _backend_0 = MockNntpServer::new(backend_0_port)
+        .with_name("Backend-0-Tier-0")
+        .on_command(
+            "ARTICLE",
+            "430 No such article\r\n", // Backend 0 doesn't have it
+        )
+        .spawn();
+
+    let _backend_1 = MockNntpServer::new(backend_1_port)
+        .with_name("Backend-1-Tier-0")
+        .on_command(
+            "ARTICLE",
+            "430 No such article\r\n", // Backend 1 doesn't have it either
+        )
+        .spawn();
+
+    let _backend_2 = MockNntpServer::new(backend_2_port)
+        .with_name("Backend-2-Tier-1")
+        .on_command(
+            "ARTICLE",
+            "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from tier 1\r\n.\r\n", // Backend 2 has it
+        )
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create proxy config with tier settings
+    let config = Config {
+        servers: vec![
+            Server::builder(
+                "127.0.0.1",
+                nntp_proxy::types::Port::try_new(backend_0_port)?,
+            )
+            .name("Backend-0-Tier-0")
+            .tier(0) // Tier 0 (highest priority)
+            .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
+            .build()?,
+            Server::builder(
+                "127.0.0.1",
+                nntp_proxy::types::Port::try_new(backend_1_port)?,
+            )
+            .name("Backend-1-Tier-0")
+            .tier(0) // Tier 0 (highest priority)
+            .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
+            .build()?,
+            Server::builder(
+                "127.0.0.1",
+                nntp_proxy::types::Port::try_new(backend_2_port)?,
+            )
+            .name("Backend-2-Tier-1")
+            .tier(1) // Tier 1 (lower priority)
+            .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
+            .build()?,
+        ],
+        proxy: Default::default(),
+        health_check: Default::default(),
+        cache: Default::default(),
+        client_auth: Default::default(),
+    };
+
+    // Start proxy
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port)).await?;
+
+    let proxy_clone = proxy.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = proxy_listener.accept().await {
+                let p = proxy_clone.clone();
+                tokio::spawn(async move {
+                    let _ = p
+                        .handle_client_per_command_routing(stream, addr.into())
+                        .await;
+                });
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect to proxy
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut buffer = [0u8; 4096];
+
+    // Read greeting
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let greeting = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        greeting.starts_with("200"),
+        "Expected greeting, got: {}",
+        greeting
+    );
+
+    // Request article - should try backend 0 (430), backend 1 (430), then backend 2 (220)
+    // This tests that tier 0 is fully exhausted before escalating to tier 1
+    client.write_all(b"ARTICLE <test@example.com>\r\n").await?;
+    client.flush().await?;
+
+    // Read response
+    buffer = [0u8; 4096];
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+
+    // CRITICAL ASSERTION: We should get 220 (success) from backend 2 (tier 1)
+    // This proves that tier 0 was fully exhausted before trying tier 1
+    assert!(
+        response.starts_with("220"),
+        "Expected 220 from backend 2 (tier 1), got: {}",
+        response
+    );
+
+    // CRITICAL ASSERTION: Response should contain "Body from tier 1"
+    // This proves that backend 2 (tier 1) was tried after exhausting tier 0
+    assert!(
+        response.contains("Body from tier 1"),
+        "Expected article from tier 1, got: {}",
+        response
+    );
+
+    // Test multiple requests to ensure consistent behavior
+    for i in 1..=5 {
+        client
+            .write_all(format!("ARTICLE <test{}@example.com>\r\n", i).as_bytes())
+            .await?;
+        client.flush().await?;
+
+        buffer = [0u8; 4096];
+        let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+        let response = String::from_utf8_lossy(&buffer[..n]);
+
+        assert!(
+            response.starts_with("220"),
+            "Request {}: Expected 220 from tier 1, got: {}",
+            i,
+            response
+        );
+        assert!(
+            response.contains("Body from tier 1"),
+            "Request {}: Expected tier 1 response, got: {}",
+            i,
+            response
+        );
+    }
 
     // Clean up
     client.write_all(b"QUIT\r\n").await?;

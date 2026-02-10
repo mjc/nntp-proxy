@@ -248,6 +248,21 @@ impl TcpManager {
                 crate::protocol::NntpResponse::parse(response),
                 crate::protocol::NntpResponse::AuthSuccess
             ) {
+                // Check for 482 (connection limit exceeded) before generic auth failure
+                if crate::protocol::StatusCode::parse(response).is_some_and(|c| c.as_u16() == 482) {
+                    tracing::error!(
+                        backend = %self.name,
+                        host = %self.host,
+                        port = self.port,
+                        response = %response_str.trim(),
+                        "Backend connection limit exceeded"
+                    );
+                    return Err(ConnectionError::ConnectionLimitExceeded {
+                        backend: self.name.clone(),
+                        response: response_str.trim().to_string(),
+                    });
+                }
+
                 tracing::error!(
                     "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
                     self.name,

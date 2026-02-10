@@ -380,6 +380,15 @@ pub struct Server {
         skip_serializing_if = "Option::is_none"
     )]
     pub connection_keepalive: Option<Duration>,
+    /// How long to wait before replacing an actively-removed connection.
+    /// Prevents backend connection limit exceeded (482) errors from connection churn.
+    /// Default: 30 seconds. Set to 0 to disable.
+    #[serde(
+        with = "option_duration_serde",
+        default = "super::defaults::replacement_cooldown_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub replacement_cooldown: Option<Duration>,
     /// Maximum number of connections to check per health check cycle
     /// Lower values reduce pool contention but may take longer to detect all stale connections
     #[serde(default = "super::defaults::health_check_max_per_cycle")]
@@ -413,7 +422,7 @@ pub struct Server {
     #[serde(default = "super::defaults::pipeline_queue_depth")]
     pub pipeline_queue_depth: usize,
     /// Maximum number of commands per pipeline batch
-    /// Default: 16
+    /// Default: 4
     #[serde(default = "super::defaults::pipeline_batch_size")]
     pub pipeline_batch_size: usize,
 }
@@ -455,6 +464,7 @@ pub struct ServerBuilder {
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
     connection_keepalive: Option<Duration>,
+    replacement_cooldown: Option<Duration>,
     health_check_max_per_cycle: Option<usize>,
     health_check_pool_timeout: Option<Duration>,
     tier: u8,
@@ -484,6 +494,7 @@ impl ServerBuilder {
             tls_verify_cert: true, // Secure by default
             tls_cert_path: None,
             connection_keepalive: None,
+            replacement_cooldown: None,
             health_check_max_per_cycle: None,
             health_check_pool_timeout: None,
             tier: 0,
@@ -548,6 +559,13 @@ impl ServerBuilder {
     #[must_use]
     pub fn connection_keepalive(mut self, interval: Duration) -> Self {
         self.connection_keepalive = Some(interval);
+        self
+    }
+
+    /// Set connection replacement cooldown duration
+    #[must_use]
+    pub fn replacement_cooldown(mut self, cooldown: Duration) -> Self {
+        self.replacement_cooldown = Some(cooldown);
         self
     }
 
@@ -662,6 +680,9 @@ impl ServerBuilder {
             tls_verify_cert: self.tls_verify_cert,
             tls_cert_path: self.tls_cert_path,
             connection_keepalive: self.connection_keepalive,
+            replacement_cooldown: self
+                .replacement_cooldown
+                .or_else(super::defaults::replacement_cooldown_option),
             health_check_max_per_cycle,
             health_check_pool_timeout,
             tier: self.tier,

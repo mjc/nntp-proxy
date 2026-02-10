@@ -16,6 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -30,6 +31,12 @@ pub struct DeadpoolConnectionProvider {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Metrics for health check operations (lock-free)
     pub health_check_metrics: Arc<HealthCheckMetrics>,
+    /// Original max pool size (before any cooldown reductions)
+    original_max_size: usize,
+    /// Number of active cooldown timers reducing pool size
+    active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
+    /// Connection replacement cooldown duration (None = disabled)
+    replacement_cooldown: Option<std::time::Duration>,
 }
 
 /// Builder for constructing `DeadpoolConnectionProvider` instances
@@ -335,6 +342,9 @@ impl DeadpoolConnectionProvider {
             name,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
+            original_max_size: max_size,
+            active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            replacement_cooldown: None, // Default: no cooldown
         }
     }
 
@@ -365,8 +375,9 @@ impl DeadpoolConnectionProvider {
             server.compress,
             server.compress_level,
         )?;
+        let max_size = server.max_connections.get();
         let pool = Pool::builder(manager)
-            .max_size(server.max_connections.get())
+            .max_size(max_size)
             .build()
             .expect("Failed to create connection pool");
 
@@ -402,6 +413,9 @@ impl DeadpoolConnectionProvider {
             name: server.name.to_string(),
             shutdown_tx,
             health_check_metrics: metrics,
+            original_max_size: max_size,
+            active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            replacement_cooldown: server.replacement_cooldown,
         })
     }
 
@@ -410,12 +424,25 @@ impl DeadpoolConnectionProvider {
         &self,
     ) -> Result<managed::Object<TcpManager>, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
-        self.pool.get().await.map_err(|e| match e {
-            deadpool::managed::PoolError::Backend(conn_err) => conn_err,
-            _other => ConnectionError::PoolExhausted {
-                backend: self.name.clone(),
-                max_size: self.pool.status().max_size,
-            },
+        self.pool.get().await.map_err(|e| {
+            let status = self.pool.status();
+            let err = match e {
+                deadpool::managed::PoolError::Backend(conn_err) => conn_err,
+                _other => ConnectionError::PoolExhausted {
+                    backend: self.name.clone(),
+                    max_size: status.max_size,
+                },
+            };
+            warn!(
+                pool = %self.name,
+                max_size = status.max_size,
+                available = status.available,
+                current_size = status.size,
+                waiting = status.waiting,
+                error = %err,
+                "Connection acquisition failed"
+            );
+            err
         })
     }
 
@@ -427,7 +454,6 @@ impl DeadpoolConnectionProvider {
     ///
     /// Use this to clear potentially stale connections after an idle period.
     pub fn clear_idle_connections(&self) {
-        let max_size = self.pool.status().max_size;
         let available = self.pool.status().available;
 
         if available > 0 {
@@ -437,11 +463,93 @@ impl DeadpoolConnectionProvider {
                 "Clearing idle connections from pool"
             );
 
+            // Calculate target max based on original size minus active cooldowns
+            let cooldowns = self.active_cooldowns.load(Ordering::Acquire);
+            let target_max = self.original_max_size.saturating_sub(cooldowns).max(1);
+
             // Resize to 0 drops all idle connections
             self.pool.resize(0);
-            // Resize back to original allows new connections
-            self.pool.resize(max_size);
+            // Resize back to target allows new connections
+            self.pool.resize(target_max);
         }
+    }
+
+    /// Remove a broken connection and temporarily reduce pool size.
+    ///
+    /// Gives the backend time to release the old connection's slot before
+    /// deadpool creates a replacement. Prevents connection count from
+    /// exceeding the backend's limit during high churn.
+    ///
+    /// If replacement_cooldown is None or Duration::ZERO (disabled), immediately drops
+    /// the connection without cooldown (behaves like normal pool removal).
+    pub fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
+        // Shut down TCP immediately
+        let _ =
+            socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
+        drop(conn);
+
+        // If cooldown is disabled (None or zero duration), just return
+        let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
+            return;
+        };
+
+        // Cap cooldowns to prevent pool collapse: never reduce below half original size
+        let max_reduction = self.original_max_size / 2;
+        let current = self.active_cooldowns.load(Ordering::Acquire);
+        if current >= max_reduction {
+            // Already at max reduction — skip further cooldown
+            return;
+        }
+
+        // Temporarily reduce pool size
+        let cooldowns = self.active_cooldowns.fetch_add(1, Ordering::AcqRel) + 1;
+        let new_max = self.original_max_size.saturating_sub(cooldowns).max(1);
+        self.pool.resize(new_max);
+
+        info!(
+            pool = %self.name,
+            new_max_size = new_max,
+            original_max_size = self.original_max_size,
+            active_cooldowns = cooldowns,
+            cooldown_secs = cooldown.as_secs(),
+            "Connection removed, pool size temporarily reduced"
+        );
+
+        // Schedule restoration with Drop guard to ensure fetch_sub runs
+        let active_cooldowns = self.active_cooldowns.clone();
+        let pool = self.pool.clone();
+        let original_max = self.original_max_size;
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            // Drop guard ensures fetch_sub runs even if task is cancelled
+            struct CooldownGuard {
+                active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
+                pool: Pool,
+                original_max: usize,
+                name: String,
+            }
+            impl Drop for CooldownGuard {
+                fn drop(&mut self) {
+                    let remaining = self.active_cooldowns.fetch_sub(1, Ordering::AcqRel) - 1;
+                    let restored_max = self.original_max.saturating_sub(remaining);
+                    self.pool.resize(restored_max);
+                    debug!(
+                        pool = %self.name,
+                        restored_max_size = restored_max,
+                        remaining_cooldowns = remaining,
+                        "Connection cooldown expired, pool size restored"
+                    );
+                }
+            }
+            let _guard = CooldownGuard {
+                active_cooldowns,
+                pool,
+                original_max,
+                name,
+            };
+            tokio::time::sleep(cooldown).await;
+            // _guard drops here, running fetch_sub + resize
+        });
     }
 
     /// Get the maximum pool size

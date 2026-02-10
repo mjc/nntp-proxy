@@ -102,6 +102,9 @@ impl BackendQueue {
     pub async fn dequeue_batch(&self, max_batch: usize) -> Vec<QueuedRequest> {
         // Wait for at least one item
         loop {
+            // Register interest before the final check to prevent missed notifications
+            let notified = self.notify.notified();
+
             if let Some(first) = self.queue.pop() {
                 self.depth.fetch_sub(1, Ordering::AcqRel);
                 let mut batch = Vec::with_capacity(max_batch);
@@ -121,8 +124,8 @@ impl BackendQueue {
                 return batch;
             }
 
-            // Queue is empty, wait for notification
-            self.notify.notified().await;
+            // Queue is empty, await the notification we registered
+            notified.await;
         }
     }
 
