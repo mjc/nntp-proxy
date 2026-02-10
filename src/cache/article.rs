@@ -219,7 +219,11 @@ impl ArticleEntry {
     ///
     /// Returns `None` if cached response can't serve this command type or if
     /// the cached buffer fails validation.
-    pub fn response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
+    pub fn response_for_command(
+        &self,
+        cmd_verb: &str,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Option<Vec<u8>> {
         let code = self.status_code()?.as_u16();
         super::entry_helpers::response_for_command(&self.buffer, code, cmd_verb, message_id)
     }

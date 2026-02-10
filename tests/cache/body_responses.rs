@@ -113,20 +113,21 @@ fn test_matches_command_type_article_response() {
     let msg_id = "<test@example.com>";
 
     // ARTICLE response can serve ARTICLE, BODY, HEAD, or STAT requests
+    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
-        entry.response_for_command("ARTICLE", msg_id).is_some(),
+        entry.response_for_command("ARTICLE", msg_id_ref).is_some(),
         "ARTICLE (220) should match ARTICLE command"
     );
     assert!(
-        entry.response_for_command("BODY", msg_id).is_some(),
+        entry.response_for_command("BODY", msg_id_ref).is_some(),
         "ARTICLE (220) should match BODY command"
     );
     assert!(
-        entry.response_for_command("HEAD", msg_id).is_some(),
+        entry.response_for_command("HEAD", msg_id_ref).is_some(),
         "ARTICLE (220) should match HEAD command"
     );
     assert!(
-        entry.response_for_command("STAT", msg_id).is_some(),
+        entry.response_for_command("STAT", msg_id_ref).is_some(),
         "ARTICLE (220) should match STAT command"
     );
 }
@@ -139,20 +140,21 @@ fn test_matches_command_type_body_response() {
     let msg_id = "<test@example.com>";
 
     // BODY response can serve BODY and STAT requests
+    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
-        entry.response_for_command("BODY", msg_id).is_some(),
+        entry.response_for_command("BODY", msg_id_ref).is_some(),
         "BODY (222) should match BODY command"
     );
     assert!(
-        entry.response_for_command("ARTICLE", msg_id).is_none(),
+        entry.response_for_command("ARTICLE", msg_id_ref).is_none(),
         "BODY (222) should NOT match ARTICLE command"
     );
     assert!(
-        entry.response_for_command("HEAD", msg_id).is_none(),
+        entry.response_for_command("HEAD", msg_id_ref).is_none(),
         "BODY (222) should NOT match HEAD command"
     );
     assert!(
-        entry.response_for_command("STAT", msg_id).is_some(),
+        entry.response_for_command("STAT", msg_id_ref).is_some(),
         "BODY (222) should match STAT command (article exists)"
     );
 }
@@ -165,20 +167,21 @@ fn test_matches_command_type_head_response() {
     let msg_id = "<test@example.com>";
 
     // HEAD response can serve HEAD and STAT requests
+    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
-        entry.response_for_command("HEAD", msg_id).is_some(),
+        entry.response_for_command("HEAD", msg_id_ref).is_some(),
         "HEAD (221) should match HEAD command"
     );
     assert!(
-        entry.response_for_command("ARTICLE", msg_id).is_none(),
+        entry.response_for_command("ARTICLE", msg_id_ref).is_none(),
         "HEAD (221) should NOT match ARTICLE command"
     );
     assert!(
-        entry.response_for_command("BODY", msg_id).is_none(),
+        entry.response_for_command("BODY", msg_id_ref).is_none(),
         "HEAD (221) should NOT match BODY command"
     );
     assert!(
-        entry.response_for_command("STAT", msg_id).is_some(),
+        entry.response_for_command("STAT", msg_id_ref).is_some(),
         "HEAD (221) should match STAT command (article exists)"
     );
 }
@@ -190,7 +193,8 @@ fn test_response_for_command_verbs_uppercase() {
     let msg_id = "<test@example.com>";
 
     // Only uppercase verbs are expected (caller is responsible for uppercasing)
-    assert!(entry.response_for_command("BODY", msg_id).is_some());
+    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
+    assert!(entry.response_for_command("BODY", msg_id_ref).is_some());
 }
 
 #[test]
@@ -259,28 +263,35 @@ fn test_body_article_command_type_mismatch() {
     let msg_id = "<test@example.com>";
 
     // BODY response should NOT match ARTICLE request (no headers)
+    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
         body_response
-            .response_for_command("ARTICLE", msg_id)
+            .response_for_command("ARTICLE", msg_id_ref)
             .is_none(),
         "ARTICLE command should not match BODY (222) response"
     );
 
     // But BODY response should match BODY request
     assert!(
-        body_response.response_for_command("BODY", msg_id).is_some(),
+        body_response
+            .response_for_command("BODY", msg_id_ref)
+            .is_some(),
         "BODY command should match BODY (222) response"
     );
 
     // And should not match HEAD request (no body)
     assert!(
-        body_response.response_for_command("HEAD", msg_id).is_none(),
+        body_response
+            .response_for_command("HEAD", msg_id_ref)
+            .is_none(),
         "HEAD command should not match BODY (222) response"
     );
 
     // STAT should work - we know the article exists
     assert!(
-        body_response.response_for_command("STAT", msg_id).is_some(),
+        body_response
+            .response_for_command("STAT", msg_id_ref)
+            .is_some(),
         "STAT should match BODY (222) response (article exists)"
     );
 
@@ -289,25 +300,25 @@ fn test_body_article_command_type_mismatch() {
         ArticleEntry::new(b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec());
     assert!(
         article_response
-            .response_for_command("ARTICLE", msg_id)
+            .response_for_command("ARTICLE", msg_id_ref)
             .is_some(),
         "ARTICLE command should match ARTICLE (220) response"
     );
     assert!(
         article_response
-            .response_for_command("BODY", msg_id)
+            .response_for_command("BODY", msg_id_ref)
             .is_some(),
         "BODY command should match ARTICLE (220) response"
     );
     assert!(
         article_response
-            .response_for_command("HEAD", msg_id)
+            .response_for_command("HEAD", msg_id_ref)
             .is_some(),
         "HEAD command should match ARTICLE (220) response"
     );
     assert!(
         article_response
-            .response_for_command("STAT", msg_id)
+            .response_for_command("STAT", msg_id_ref)
             .is_some(),
         "STAT should match ARTICLE (220) response"
     );

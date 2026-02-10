@@ -165,7 +165,10 @@ fn test_response_for_command_stat_synthesizes_223() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    let response = entry.response_for_command("STAT", "<test@example.com>");
+    let response = entry.response_for_command(
+        "STAT",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
 
     let response_bytes = response.unwrap();
@@ -179,7 +182,10 @@ fn test_response_for_command_stat_from_body() {
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    let response = entry.response_for_command("STAT", "<test@example.com>");
+    let response = entry.response_for_command(
+        "STAT",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
 
     let response_bytes = response.unwrap();
@@ -193,7 +199,10 @@ fn test_response_for_command_stat_from_head() {
     let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    let response = entry.response_for_command("STAT", "<test@example.com>");
+    let response = entry.response_for_command(
+        "STAT",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
 
     let response_bytes = response.unwrap();
@@ -207,7 +216,10 @@ fn test_response_for_command_430_returns_none_for_stat() {
     let buffer = b"430 No Such Article\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    let response = entry.response_for_command("STAT", "<test@example.com>");
+    let response = entry.response_for_command(
+        "STAT",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_none());
 }
 
@@ -216,7 +228,10 @@ fn test_response_for_command_article_direct_match() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer.clone());
 
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
     assert_eq!(response.unwrap(), buffer);
 }
@@ -227,7 +242,10 @@ fn test_response_for_command_body_from_article() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer.clone());
 
-    let response = entry.response_for_command("BODY", "<test@example.com>");
+    let response = entry.response_for_command(
+        "BODY",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
     assert_eq!(response.unwrap(), buffer);
 }
@@ -238,7 +256,10 @@ fn test_response_for_command_head_from_article() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer.clone());
 
-    let response = entry.response_for_command("HEAD", "<test@example.com>");
+    let response = entry.response_for_command(
+        "HEAD",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
     assert_eq!(response.unwrap(), buffer);
 }
@@ -249,7 +270,10 @@ fn test_response_for_command_body_cannot_serve_article() {
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_none());
 }
 
@@ -259,7 +283,10 @@ fn test_response_for_command_head_cannot_serve_body() {
     let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    let response = entry.response_for_command("BODY", "<test@example.com>");
+    let response = entry.response_for_command(
+        "BODY",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_none());
 }
 
@@ -270,7 +297,10 @@ fn test_response_for_command_validates_buffer() {
     let entry = ArticleEntry::new(buffer);
 
     // Should return None because buffer fails validation
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_none());
 }
 
@@ -279,12 +309,12 @@ fn test_response_for_command_empty_message_id() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    // STAT with empty message ID should still work (just returns empty ID in response)
-    let response = entry.response_for_command("STAT", "");
+    // STAT with minimal message ID <x> should still work
+    let response = entry.response_for_command("STAT", &MessageId::from_borrowed("<x>").unwrap());
     assert!(response.is_some());
     let response_bytes = response.unwrap();
     let response_str = String::from_utf8_lossy(&response_bytes);
-    assert!(response_str.starts_with("223 0 \r\n"));
+    assert!(response_str.starts_with("223 0 <x>")); // Returns the message ID we passed
 }
 
 // ============================================================================
@@ -511,7 +541,10 @@ fn test_response_validation_rejects_short_buffer() {
     let entry = ArticleEntry::new(buffer);
 
     // Should fail validation and return None
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_none());
 }
 
@@ -521,7 +554,10 @@ fn test_response_validation_rejects_missing_terminator() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec();
     let entry = ArticleEntry::new(buffer);
 
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_none());
 }
 
@@ -533,7 +569,10 @@ fn test_response_validation_rejects_non_digit_start() {
     let entry = ArticleEntry::new(buffer);
 
     // status_code() will return None, so response_for_command returns None
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_none());
 }
 
@@ -544,7 +583,10 @@ fn test_response_validation_accepts_valid_buffer() {
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content here\r\n.\r\n".to_vec();
     let entry = ArticleEntry::new(buffer.clone());
 
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
     assert_eq!(response.unwrap(), buffer);
 }
@@ -719,7 +761,10 @@ fn test_hybrid_entry_response_for_command_article() {
     let buffer = make_valid_article_buffer();
     let entry = HybridArticleEntry::new(buffer.clone()).unwrap();
 
-    let response = entry.response_for_command("ARTICLE", "<test@example.com>");
+    let response = entry.response_for_command(
+        "ARTICLE",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
     assert_eq!(response.unwrap(), buffer);
 }
@@ -728,7 +773,10 @@ fn test_hybrid_entry_response_for_command_article() {
 fn test_hybrid_entry_response_for_command_stat_synthesized() {
     let entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
 
-    let response = entry.response_for_command("STAT", "<test@example.com>");
+    let response = entry.response_for_command(
+        "STAT",
+        &MessageId::from_borrowed("<test@example.com>").unwrap(),
+    );
     assert!(response.is_some());
 
     let response_str = String::from_utf8(response.unwrap()).unwrap();
@@ -742,14 +790,20 @@ fn test_hybrid_entry_response_for_command_430_returns_none() {
     // 430 stubs should not serve ARTICLE requests
     assert!(
         entry
-            .response_for_command("ARTICLE", "<test@example.com>")
+            .response_for_command(
+                "ARTICLE",
+                &MessageId::from_borrowed("<test@example.com>").unwrap()
+            )
             .is_none()
     );
 
     // 430 stubs should not serve STAT either (article doesn't exist)
     assert!(
         entry
-            .response_for_command("STAT", "<test@example.com>")
+            .response_for_command(
+                "STAT",
+                &MessageId::from_borrowed("<test@example.com>").unwrap()
+            )
             .is_none()
     );
 }

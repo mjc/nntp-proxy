@@ -77,7 +77,10 @@ impl NntpClient {
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
     #[inline]
-    pub async fn fetch_body(&self, message_id: &str) -> Result<PooledBuffer> {
+    pub async fn fetch_body(
+        &self,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Result<PooledBuffer> {
         let command = body_by_msgid(message_id);
         self.fetch_response(&command).await
     }
@@ -90,7 +93,10 @@ impl NntpClient {
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
     #[inline]
-    pub async fn fetch_head(&self, message_id: &str) -> Result<PooledBuffer> {
+    pub async fn fetch_head(
+        &self,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Result<PooledBuffer> {
         let command = head_by_msgid(message_id);
         self.fetch_response(&command).await
     }
@@ -103,7 +109,10 @@ impl NntpClient {
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
     #[inline]
-    pub async fn fetch_article(&self, message_id: &str) -> Result<PooledBuffer> {
+    pub async fn fetch_article(
+        &self,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Result<PooledBuffer> {
         let command = article_by_msgid(message_id);
         self.fetch_response(&command).await
     }
@@ -115,7 +124,7 @@ impl NntpClient {
     ///
     /// # Returns
     /// `true` if article exists, `false` if 430 (not found)
-    pub async fn stat(&self, message_id: &str) -> Result<bool> {
+    pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let command = stat_by_msgid(message_id);
         let mut conn = self.get_connection().await?;
         let mut buffer = self.buffer_pool.acquire().await;

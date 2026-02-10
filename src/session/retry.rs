@@ -13,29 +13,32 @@
 
 /// Retry an async expression once on failure (stale connection recovery).
 ///
-/// Evaluates `$expr` once. On `Err`, logs at debug level using `$label`,
+/// Evaluates `$expr` once. On `Err`, logs at debug level with optional context,
 /// then evaluates `$expr` a second time. If the retry also fails, returns
 /// the **original** error from the first attempt.
 ///
 /// # Usage
 ///
 /// ```ignore
-/// let result = retry_once_on_stale!("backend 3", {
-///     self.execute_backend_attempt(provider, id, cmd, buf).await
-/// });
+/// // With context fields (lazy evaluation, zero allocation on success path)
+/// let result = retry_once_on_stale!(
+///     self.execute_backend_attempt(provider, id, cmd, buf).await,
+///     client = self.client_addr,
+///     backend = backend_id.as_index()
+/// );
+///
+/// // Without context (tests)
+/// let result = retry_once_on_stale!(fallible_op(&counter).await);
 /// ```
 ///
 /// The expression is evaluated twice at most, sequentially, so mutable borrows
 /// that span the `.await` work correctly — unlike an `FnMut` closure.
 macro_rules! retry_once_on_stale {
-    ($label:expr, $expr:expr) => {{
+    ($expr:expr $(, $key:ident = $val:expr)* $(,)?) => {{
         match $expr {
             Ok(val) => Ok(val),
             Err(first_error) => {
-                tracing::debug!(
-                    "Stale connection to {}, retrying with fresh connection",
-                    $label
-                );
+                tracing::debug!($($key = %$val,)* "Stale connection, retrying");
 
                 // Jittered backoff: 10–59ms prevents thundering-herd retries
                 let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 10..60);
@@ -71,7 +74,7 @@ mod tests {
     #[tokio::test]
     async fn test_succeeds_on_first_try() {
         let counter = AtomicU32::new(0);
-        let result = retry_once_on_stale!("test", fallible_op(&counter, 0).await);
+        let result = retry_once_on_stale!(fallible_op(&counter, 0).await);
         assert_eq!(result, Ok("success"));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -79,7 +82,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_succeeds_on_retry() {
         let counter = AtomicU32::new(0);
-        let result = retry_once_on_stale!("test", fallible_op(&counter, 1).await);
+        let result = retry_once_on_stale!(fallible_op(&counter, 1).await);
         assert_eq!(result, Ok("success"));
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
@@ -95,7 +98,7 @@ mod tests {
             Err(format!("error {}", n))
         }
 
-        let result = retry_once_on_stale!("test", numbered_fail(&counter).await);
+        let result = retry_once_on_stale!(numbered_fail(&counter).await);
         assert_eq!(result, Err("error 0".to_string()));
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }

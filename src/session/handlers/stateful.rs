@@ -82,7 +82,7 @@ impl ClientSession {
 
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
-                state.flush_byte_deltas(&self.metrics, backend_id, self.username().as_deref());
+                state.flush_byte_deltas(&self.metrics, backend_id, self.username());
             }
 
             tokio::select! {
@@ -139,10 +139,9 @@ impl ClientSession {
         }
 
         // Final metrics - report any remaining byte deltas
-        state.flush_byte_deltas(&self.metrics, backend_id, self.username().as_deref());
+        state.flush_byte_deltas(&self.metrics, backend_id, self.username());
 
-        self.metrics
-            .user_connection_closed(self.username().as_deref());
+        self.metrics.user_connection_closed(self.username());
 
         Ok(state.into_metrics())
     }

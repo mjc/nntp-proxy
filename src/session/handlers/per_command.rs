@@ -274,10 +274,19 @@ impl ClientSession {
         // Track last command for switch-to-stateful (needs to be outside loop for borrow checker)
         let mut last_command = String::new();
 
+        // Accumulator buffers for zero-alloc batching (hoisted to session scope, reused across batches)
+        let mut batch_buf = String::with_capacity(512 * 4); // ~2KB for typical 4-command batch
+        let mut batch_offsets: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
+
         // Process commands in batches (single commands fall through with zero overhead)
         loop {
             let batch = match self
-                .read_command_batch(&mut client_reader, &mut command_buf)
+                .read_command_batch(
+                    &mut client_reader,
+                    &mut command_buf,
+                    &mut batch_buf,
+                    &mut batch_offsets,
+                )
                 .await
             {
                 Ok(batch) => batch,
@@ -286,7 +295,7 @@ impl ClientSession {
                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                         connection::log_client_error(
                             self.client_addr,
-                            self.username().as_deref(),
+                            self.username(),
                             io_err,
                             TransferMetrics {
                                 client_to_backend: client_to_backend_bytes,
@@ -305,10 +314,10 @@ impl ClientSession {
                 break;
             }
 
-            let batch_size = batch.commands.len();
+            let batch_size = batch.len();
 
             // --- Process pipelineable commands ---
-            if !batch.commands.is_empty() {
+            if batch_size > 0 {
                 if batch_size > 1 {
                     debug!(
                         "Client {} pipeline batch: {} pipelineable commands",
@@ -318,20 +327,22 @@ impl ClientSession {
 
                 // Detect if entire batch is large-transfer commands (ARTICLE/BODY by message-ID)
                 // that benefit from TCP pipelining on a single backend connection.
-                let all_large_transfer = batch.commands.len() > 1
-                    && batch
-                        .commands
-                        .iter()
-                        .all(|cmd| is_large_transfer_command(cmd.as_bytes()));
+                let all_large_transfer = batch_size > 1
+                    && (0..batch_size)
+                        .all(|i| is_large_transfer_command(batch.command(i).as_bytes()));
 
                 // Try batch pipelining for all-ARTICLE/BODY batches;
                 // fall through to individual processing on failure.
                 let mut batch_handled = false;
                 if all_large_transfer {
+                    // Create temporary slice vector for batch_execute_articles
+                    // (TODO: refactor batch_execute_articles to take CommandBatch directly)
+                    let commands_vec: Vec<&str> =
+                        (0..batch_size).map(|i| batch.command(i)).collect();
                     match self
                         .batch_execute_articles(
-                            router.clone(),
-                            &batch.commands,
+                            router,
+                            &commands_vec,
                             &mut client_write,
                             &mut client_to_backend_bytes,
                             &mut backend_to_client_bytes,
@@ -356,7 +367,8 @@ impl ClientSession {
                 if !batch_handled {
                     // Sequential processing for mixed, single-command, or failed-batch commands
                     let mut should_break = false;
-                    for command in &batch.commands {
+                    for i in 0..batch_size {
+                        let command = batch.command(i);
                         debug!(
                             "Client {} received {} bytes: {:?}",
                             self.client_addr,
@@ -415,7 +427,7 @@ impl ClientSession {
             }
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
-            if let Some(ref trailing_cmd) = batch.trailing_non_pipelineable {
+            if let Some(trailing_cmd) = batch.trailing() {
                 debug!(
                     "Client {} trailing non-pipelineable: {:?}",
                     self.client_addr,
@@ -459,11 +471,13 @@ impl ClientSession {
                     }
                 }
             }
+
+            // Extract buffers for reuse in next batch (avoids allocating new buffers each iteration)
+            (batch_buf, batch_offsets) = batch.into_buffers();
         }
 
         // Log session summary and close user connection
-        self.metrics
-            .user_connection_closed(self.username().as_deref());
+        self.metrics.user_connection_closed(self.username());
 
         Ok(TransferMetrics {
             client_to_backend: client_to_backend_bytes,

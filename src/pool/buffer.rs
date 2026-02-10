@@ -212,6 +212,7 @@ impl BufferPool {
         unsafe {
             buffer.set_len(size);
         }
+        Self::prefault_pages(&mut buffer);
         buffer
     }
 

@@ -20,6 +20,7 @@
 //! ```
 
 use anyhow::Result;
+use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
@@ -43,7 +44,7 @@ pub enum ResponseWarning {
 pub struct ValidatedResponse {
     pub response: NntpResponse,
     pub is_multiline: bool,
-    pub warnings: Vec<ResponseWarning>,
+    pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
 impl ValidatedResponse {
@@ -73,7 +74,7 @@ pub fn validate_backend_response(
     bytes_read: usize,
     min_length: usize,
 ) -> ValidatedResponse {
-    let mut warnings = Vec::new();
+    let mut warnings = SmallVec::new();
 
     // Check minimum length
     if bytes_read < min_length {
@@ -117,7 +118,7 @@ pub struct CommandResponse {
     /// Whether this is a multiline response
     pub is_multiline: bool,
     /// Any validation warnings
-    pub warnings: Vec<ResponseWarning>,
+    pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
 impl CommandResponse {
@@ -271,7 +272,7 @@ mod tests {
             bytes_read: 20,
             response: NntpResponse::parse(b"430 No such article\r\n"),
             is_multiline: false,
-            warnings: vec![],
+            warnings: SmallVec::new(),
         };
         assert!(response.is_430());
 
@@ -280,7 +281,7 @@ mod tests {
             bytes_read: 30,
             response: NntpResponse::parse(b"220 0 <msg@example.com>\r\n"),
             is_multiline: true,
-            warnings: vec![],
+            warnings: SmallVec::new(),
         };
         assert!(!response.is_430());
     }
@@ -291,7 +292,7 @@ mod tests {
             bytes_read: 10,
             response: NntpResponse::parse(b"211 Group\r\n"),
             is_multiline: false,
-            warnings: vec![],
+            warnings: SmallVec::new(),
         };
         assert_eq!(response.status_code(), Some(211));
     }

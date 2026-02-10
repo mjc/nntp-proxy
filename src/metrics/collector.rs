@@ -142,13 +142,6 @@ impl MetricsCollector {
     }
 
     #[inline]
-    fn normalize_username(username: Option<&str>) -> String {
-        username
-            .unwrap_or(crate::constants::user::ANONYMOUS)
-            .to_string()
-    }
-
-    #[inline]
     fn with_backend<F>(&self, backend_id: BackendId, action: F)
     where
         F: FnOnce(&BackendMetrics),
@@ -164,18 +157,21 @@ impl MetricsCollector {
     where
         F: Fn(&mut UserMetrics),
     {
-        let key = Self::normalize_username(username);
+        let key = username.unwrap_or(crate::constants::user::ANONYMOUS);
 
-        // Fast path: try lock-free update if entry exists
-        if let Some(mut entry) = self.inner.user_metrics.get_mut(&key) {
+        // Fast path: zero-alloc &str lookup (DashMap String key supports Borrow<str>)
+        if let Some(mut entry) = self.inner.user_metrics.get_mut(key) {
             update(&mut entry);
             return;
         }
 
-        // Slow path: insert new entry (only happens once per user)
-        let new_metrics = UserMetrics::new(key.clone());
-        self.inner.user_metrics.insert(key.clone(), new_metrics);
-        if let Some(mut entry) = self.inner.user_metrics.get_mut(&key) {
+        // Slow path: insert once per user, then update
+        let owned = key.to_string();
+        self.inner
+            .user_metrics
+            .entry(owned)
+            .or_insert_with(|| UserMetrics::new(key.to_string()));
+        if let Some(mut entry) = self.inner.user_metrics.get_mut(key) {
             update(&mut entry);
         }
     }
@@ -397,8 +393,8 @@ impl MetricsCollector {
     }
 
     pub fn user_connection_closed(&self, username: Option<&str>) {
-        let key = Self::normalize_username(username);
-        if let Some(mut m) = self.inner.user_metrics.get_mut(&key) {
+        let key = username.unwrap_or(crate::constants::user::ANONYMOUS);
+        if let Some(mut m) = self.inner.user_metrics.get_mut(key) {
             m.active_connections = m.active_connections.saturating_sub(1);
         }
     }

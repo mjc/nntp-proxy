@@ -233,81 +233,161 @@ mod tests {
     #[test]
     fn test_stat_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n";
-        let resp = response_for_command(buf, 220, "STAT", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            220,
+            "STAT",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
 
     #[test]
     fn test_stat_from_221() {
         let buf = b"221 0 <t@x>\r\nSubject: T\r\n.\r\n";
-        let resp = response_for_command(buf, 221, "STAT", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            221,
+            "STAT",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
 
     #[test]
     fn test_stat_from_222() {
         let buf = b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n";
-        let resp = response_for_command(buf, 222, "STAT", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            222,
+            "STAT",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
 
     #[test]
     fn test_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n";
-        let resp = response_for_command(buf, 220, "ARTICLE", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            220,
+            "ARTICLE",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, buf.to_vec());
     }
 
     #[test]
     fn test_body_from_222() {
         let buf = b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n";
-        let resp = response_for_command(buf, 222, "BODY", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            222,
+            "BODY",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, buf.to_vec());
     }
 
     #[test]
     fn test_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n";
-        let resp = response_for_command(buf, 220, "BODY", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            220,
+            "BODY",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, buf.to_vec());
     }
 
     #[test]
     fn test_head_from_221() {
         let buf = b"221 0 <t@x>\r\nSubject: T\r\n.\r\n";
-        let resp = response_for_command(buf, 221, "HEAD", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            221,
+            "HEAD",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, buf.to_vec());
     }
 
     #[test]
     fn test_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n";
-        let resp = response_for_command(buf, 220, "HEAD", "<t@x>").unwrap();
+        let resp = response_for_command(
+            buf,
+            220,
+            "HEAD",
+            &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
+        )
+        .unwrap();
         assert_eq!(resp, buf.to_vec());
     }
 
     #[test]
     fn test_body_cannot_serve_article() {
         let buf = b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n";
-        assert!(response_for_command(buf, 222, "ARTICLE", "<t@x>").is_none());
+        assert!(
+            response_for_command(
+                buf,
+                222,
+                "ARTICLE",
+                &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn test_head_cannot_serve_body() {
         let buf = b"221 0 <t@x>\r\nSubject: T\r\n.\r\n";
-        assert!(response_for_command(buf, 221, "BODY", "<t@x>").is_none());
+        assert!(
+            response_for_command(
+                buf,
+                221,
+                "BODY",
+                &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn test_unknown_verb() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n";
-        assert!(response_for_command(buf, 220, "LIST", "<t@x>").is_none());
+        assert!(
+            response_for_command(
+                buf,
+                220,
+                "LIST",
+                &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn test_stat_not_from_430() {
         let buf = b"430 not found\r\n";
-        assert!(response_for_command(buf, 430, "STAT", "<t@x>").is_none());
+        assert!(
+            response_for_command(
+                buf,
+                430,
+                "STAT",
+                &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
+            )
+            .is_none()
+        );
     }
 
     // =========================================================================

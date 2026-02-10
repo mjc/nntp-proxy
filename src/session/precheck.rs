@@ -66,10 +66,9 @@ async fn query_backend(
     deps.router.mark_backend_pending(backend_id);
 
     // Retry once on stale connection (fresh connection on second attempt)
-    let label = format!("backend {}", backend_id.as_index());
     let query_result: QueryResult = crate::session::retry::retry_once_on_stale!(
-        label,
-        execute_backend_query(deps, provider, backend_id, command, multiline).await
+        execute_backend_query(deps, provider, backend_id, command, multiline).await,
+        backend = backend_id.as_index()
     )
     .unwrap_or(QueryResult::Error(backend_id));
 

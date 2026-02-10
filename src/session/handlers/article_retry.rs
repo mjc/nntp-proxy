@@ -6,9 +6,9 @@
 use crate::is_client_disconnect_error;
 use crate::router::BackendSelector;
 use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
+use crate::session::ClientSession;
 use crate::session::handlers::cache_operations::CacheLookupResult;
 use crate::session::handlers::command_execution::BackendAttemptResult;
-use crate::session::{ClientSession, common};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
@@ -27,8 +27,8 @@ impl ClientSession {
     /// we stream earlier ones to the client.
     pub(super) async fn batch_execute_articles(
         &self,
-        router: Arc<BackendSelector>,
-        commands: &[String],
+        router: &Arc<BackendSelector>,
+        commands: &[&str],
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
@@ -41,7 +41,7 @@ impl ClientSession {
         // One pending count for one connection — don't inflate pending by N,
         // as that skews load_ratio and can cause other sessions to over-allocate
         // connections on other backends, hitting provider connection limits.
-        let backend_id = router.route_command(self.client_id, &commands[0])?;
+        let backend_id = router.route_command(self.client_id, commands[0])?;
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         let Some(provider) = router.backend_provider(backend_id) else {
@@ -79,8 +79,7 @@ impl ClientSession {
         // Phase 2: Read and stream responses in order
         let mut connection_healthy = true;
         for (i, command) in commands.iter().enumerate() {
-            let msg_id = crate::session::common::extract_message_id(command)
-                .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
+            let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
 
             // Read first chunk of this response
             let mut buffer = self.buffer_pool.acquire().await;
@@ -127,11 +126,11 @@ impl ClientSession {
                 *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
                 // Record availability
-                self.record_article_missing(msg_id.as_ref(), backend_id, router.clone())
+                self.record_article_missing(msg_id.as_ref(), backend_id, router)
                     .await;
 
                 self.metrics.record_command(backend_id);
-                self.metrics.user_command(self.username().as_deref());
+                self.metrics.user_command(self.username());
                 continue;
             }
 
@@ -176,7 +175,7 @@ impl ClientSession {
 
             // Record metrics
             self.metrics.record_command(backend_id);
-            self.metrics.user_command(self.username().as_deref());
+            self.metrics.user_command(self.username());
             if let Some(status_code) = response_code.status_code() {
                 match determine_metrics_action(status_code.as_u16(), is_multiline) {
                     MetricsAction::Article => {
@@ -216,8 +215,7 @@ impl ClientSession {
             command.trim()
         );
         // Extract message-ID early for cache/availability tracking
-        let msg_id = common::extract_message_id(command)
-            .and_then(|s| crate::types::MessageId::from_borrowed(s).ok());
+        let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
 
         debug!(
             "Client {} msg_id={:?}, cache_articles={}",
@@ -318,12 +316,8 @@ impl ClientSession {
                                     self.client_addr, backend_id
                                 );
                                 // Record this backend as missing so retry loop skips it
-                                self.record_article_missing(
-                                    msg_id.as_ref(),
-                                    backend_id,
-                                    router.clone(),
-                                )
-                                .await;
+                                self.record_article_missing(msg_id.as_ref(), backend_id, &router)
+                                    .await;
                                 self.metrics.record_pipeline_complete();
                                 // Fall through to direct execution path for retry
                             } else {
@@ -375,7 +369,7 @@ impl ClientSession {
         let mut availability = match cached_availability {
             Some(avail) => avail,
             None => {
-                self.load_article_availability(msg_id.as_ref(), router.clone())
+                self.load_article_availability(msg_id.as_ref(), router.backend_count())
                     .await
             }
         };
@@ -417,7 +411,7 @@ impl ClientSession {
         while !availability.all_exhausted(router.backend_count()) {
             match self
                 .try_backend_for_article(
-                    router.clone(),
+                    &router,
                     command,
                     msg_id.as_ref(),
                     client_write,
@@ -483,7 +477,7 @@ impl ClientSession {
     pub(super) async fn load_article_availability(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        router: Arc<BackendSelector>,
+        backend_count: crate::router::BackendCount,
     ) -> crate::cache::ArticleAvailability {
         match msg_id {
             Some(msg_id_ref) => self
@@ -491,7 +485,7 @@ impl ClientSession {
                 .get(msg_id_ref)
                 .await
                 .map(|entry| {
-                    let avail = entry.to_availability(router.backend_count());
+                    let avail = entry.to_availability(backend_count);
                     debug!("Client {} loaded availability for {}: checked_bits={:08b}, missing_bits={:08b}",
                         self.client_addr, msg_id_ref, avail.checked_bits(), avail.missing_bits());
                     avail
@@ -536,11 +530,11 @@ impl ClientSession {
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
         backend_id: crate::types::BackendId,
-        router: std::sync::Arc<crate::router::BackendSelector>,
+        router: &std::sync::Arc<crate::router::BackendSelector>,
     ) {
         if let Some(msg_id_val) = msg_id {
             let mut avail = self
-                .load_article_availability(Some(msg_id_val), router)
+                .load_article_availability(Some(msg_id_val), router.backend_count())
                 .await;
             avail.record_missing(backend_id);
             self.sync_availability_if_needed(Some(msg_id_val), &avail)

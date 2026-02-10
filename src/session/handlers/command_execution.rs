@@ -38,7 +38,7 @@ impl ClientSession {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn try_backend_for_article(
         &self,
-        router: Arc<BackendSelector>,
+        router: &Arc<BackendSelector>,
         command: &str,
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
@@ -50,7 +50,7 @@ impl ClientSession {
         let backend_id =
             router.route_command_with_availability(self.client_id, command, Some(availability))?;
 
-        // RAII guard ensures complete_command is called on all exit paths
+        // RAII guard ensures complete_command is called on all exit paths (clone Arc here)
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         // Get connection provider
@@ -61,15 +61,11 @@ impl ClientSession {
         };
 
         // Retry once on stale connection (fresh connection on second attempt)
-        let label = format!(
-            "client {} backend {}",
-            self.client_addr,
-            backend_id.as_index()
-        );
         let (conn, cmd_response, ttfb, send, recv) = retry_once_on_stale!(
-            label,
             self.execute_backend_attempt(provider, backend_id, command, buffer)
-                .await
+                .await,
+            client = self.client_addr,
+            backend = backend_id.as_index()
         )?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
@@ -122,7 +118,7 @@ impl ClientSession {
                 // Client disconnects are normal behavior and shouldn't penalize backends.
                 if !is_client_disconnect_error(&e) {
                     self.metrics.record_error(backend_id);
-                    self.metrics.user_error(self.username().as_deref());
+                    self.metrics.user_error(self.username());
                 }
                 crate::pool::remove_from_pool(conn);
                 return Err(e);
@@ -189,7 +185,7 @@ impl ClientSession {
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(backend::CommandResponse, u64, u64, u64)> {
         self.metrics.record_command(backend_id);
-        self.metrics.user_command(self.username().as_deref());
+        self.metrics.user_command(self.username());
 
         let (response, ttfb, send, recv) =
             backend::send_command_timed(conn, command, buffer).await?;
@@ -372,9 +368,8 @@ impl ClientSession {
         let _ =
             self.metrics
                 .record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
+        self.metrics.user_bytes_sent(self.username(), cmd_bytes);
         self.metrics
-            .user_bytes_sent(self.username().as_deref(), cmd_bytes);
-        self.metrics
-            .user_bytes_received(self.username().as_deref(), resp_bytes);
+            .user_bytes_received(self.username(), resp_bytes);
     }
 }
