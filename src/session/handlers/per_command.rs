@@ -279,7 +279,7 @@ impl ClientSession {
         let mut batch_offsets: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
 
         // Process commands in batches (single commands fall through with zero overhead)
-        loop {
+        'command_batch_loop: loop {
             let batch = match self
                 .read_command_batch(
                     &mut client_reader,
@@ -333,8 +333,7 @@ impl ClientSession {
 
                 // Try batch pipelining for all-ARTICLE/BODY batches;
                 // fall through to individual processing on failure.
-                let mut batch_handled = false;
-                if all_large_transfer {
+                let batch_handled = if all_large_transfer {
                     // Create temporary slice vector for batch_execute_articles
                     // (TODO: refactor batch_execute_articles to take CommandBatch directly)
                     let commands_vec: Vec<&str> =
@@ -349,9 +348,7 @@ impl ClientSession {
                         )
                         .await
                     {
-                        Ok(()) => {
-                            batch_handled = true;
-                        }
+                        Ok(()) => true,
                         Err(e) if is_client_disconnect_error(&e) => {
                             return Err(e);
                         }
@@ -360,13 +357,15 @@ impl ClientSession {
                                 "Client {} batch execution failed, falling through to individual: {}",
                                 self.client_addr, e
                             );
+                            false
                         }
                     }
-                }
+                } else {
+                    false
+                };
 
                 if !batch_handled {
                     // Sequential processing for mixed, single-command, or failed-batch commands
-                    let mut should_break = false;
                     for i in 0..batch_size {
                         let command = batch.command(i);
                         debug!(
@@ -393,13 +392,10 @@ impl ClientSession {
                             .await?
                         {
                             SingleCommandResult::Continue { auth_succeeded } => {
-                                if auth_succeeded {
-                                    skip_auth_check = true;
-                                }
+                                skip_auth_check |= auth_succeeded;
                             }
                             SingleCommandResult::Quit => {
-                                should_break = true;
-                                break;
+                                break 'command_batch_loop;
                             }
                             SingleCommandResult::SwitchToStateful => {
                                 return self
@@ -413,10 +409,6 @@ impl ClientSession {
                                     .await;
                             }
                         }
-                    }
-
-                    if should_break {
-                        break;
                     }
                 }
 

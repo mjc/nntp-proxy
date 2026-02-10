@@ -104,7 +104,6 @@ async fn execute_pipeline_batch(
     let batch_len = batch.len();
 
     // Phase 1: Write all commands
-    let mut write_failed_at: Option<usize> = None;
     for (i, req) in batch.iter().enumerate() {
         if let Err(e) = conn.write_all(req.command.as_bytes()).await {
             warn!(
@@ -114,19 +113,14 @@ async fn execute_pipeline_batch(
                 batch_len,
                 e
             );
-            write_failed_at = Some(i);
-            break;
+            // We wrote commands 0..i successfully but can't read responses
+            // because the connection is broken. Fail everything and return early.
+            let err_msg = format!("write failed at command {}/{}", i + 1, batch_len);
+            fail_batch(batch, &err_msg);
+            return false;
         }
     }
-
-    // If write failed, fail all requests from the failure point onward
-    if let Some(failed_idx) = write_failed_at {
-        // We wrote commands 0..failed_idx successfully but can't read responses
-        // because the connection is broken. Fail everything.
-        let err_msg = format!("write failed at command {}/{}", failed_idx + 1, batch_len);
-        fail_batch(batch, &err_msg);
-        return false;
-    }
+    // All writes succeeded, continue to flush
 
     // Flush after writing all commands
     if let Err(e) = conn.flush().await {
@@ -139,7 +133,6 @@ async fn execute_pipeline_batch(
     }
 
     // Phase 2: Read responses in order (with shared buffer + leftover tracking)
-    let mut connection_healthy = true;
     let mut buffer = buffer_pool.acquire().await;
     let mut leftover: Vec<u8> = Vec::new(); // Typically empty, small when non-empty
     let mut result_buf = bytes::BytesMut::with_capacity(4096); // Reused across responses
@@ -183,13 +176,14 @@ async fn execute_pipeline_batch(
                         .send(PipelineResponse::Error(error_msg.clone()));
                 }
 
-                connection_healthy = false;
-                break;
+                // Connection broken — return false immediately
+                return false;
             }
         }
     }
 
-    connection_healthy
+    // All responses processed successfully — connection healthy
+    true
 }
 
 /// Read a complete NNTP response (status line + multiline body if applicable).

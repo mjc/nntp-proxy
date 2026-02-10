@@ -95,7 +95,7 @@ impl ClientSession {
 
         // Success - stream response
         let mut conn = conn;
-        let bytes_written = match self
+        let bytes_written = self
             .stream_response_to_client(
                 &mut conn,
                 client_write,
@@ -108,22 +108,18 @@ impl ClientSession {
                 cmd_response.bytes_read,
             )
             .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
+            .inspect_err(|e| {
                 // guard drops here → complete_command called automatically
                 // (prevents TUI in-flight count drift on streaming errors)
 
                 // Only mark as backend error metrics if it's NOT a client disconnect.
                 // Client disconnects are normal behavior and shouldn't penalize backends.
-                if !is_client_disconnect_error(&e) {
+                if !is_client_disconnect_error(e) {
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username());
                 }
                 crate::pool::remove_from_pool(conn);
-                return Err(e);
-            }
-        };
+            })?;
 
         self.record_response_metrics(
             backend_id,
@@ -161,10 +157,11 @@ impl ClientSession {
     )> {
         let mut conn = provider.get_pooled_connection().await?;
 
-        match self
+        let result = self
             .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
-            .await
-        {
+            .await;
+
+        match result {
             Ok((cmd_response, ttfb, send, recv)) => Ok((conn, cmd_response, ttfb, send, recv)),
             Err(e) => {
                 crate::pool::remove_from_pool(conn);
@@ -212,11 +209,11 @@ impl ClientSession {
     ) -> Result<u64> {
         // SAFETY: Caller must validate response before calling this function.
         // An invalid response (code 0) should never reach here.
-        let Some(status_code) = response_code.status_code() else {
+        let status_code = response_code.status_code().ok_or_else(|| {
             // This should never happen - caller should reject Invalid responses
             tracing::error!("BUG: stream_response_to_client called with Invalid response");
-            anyhow::bail!("Cannot stream invalid response");
-        };
+            anyhow::anyhow!("Cannot stream invalid response")
+        })?;
         let code = status_code.as_u16();
 
         let cache_action = determine_cache_action(
@@ -258,9 +255,8 @@ impl ClientSession {
                         msg_id_ref,
                         captured.len()
                     );
-                    let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, &captured, backend_id, tier);
                 }
+                self.maybe_cache_upsert(msg_id, &captured, backend_id);
                 Ok(bytes)
             }
             (true, CacheAction::TrackAvailability) => {
@@ -275,16 +271,13 @@ impl ClientSession {
                 )
                 .await?;
 
-                if let Some(msg_id_ref) = msg_id {
-                    let tier = self.tier_for_backend(backend_id);
-                    // Extract first status line (~30-80 bytes) instead of copying
-                    // full first_chunk (8-64KB). The cache only needs the status
-                    // code to build an availability stub.
-                    // SmallVec keeps small status lines on stack, avoiding heap allocation
-                    // until the spawn boundary where .to_vec() happens inside spawn_cache_upsert.
-                    let stub = crate::cache::extract_status_line(first_chunk);
-                    self.spawn_cache_upsert(msg_id_ref, &stub, backend_id, tier);
-                }
+                // Extract first status line (~30-80 bytes) instead of copying
+                // full first_chunk (8-64KB). The cache only needs the status
+                // code to build an availability stub.
+                // SmallVec keeps small status lines on stack, avoiding heap allocation
+                // until the spawn boundary where .to_vec() happens inside spawn_cache_upsert.
+                let stub = crate::cache::extract_status_line(first_chunk);
+                self.maybe_cache_upsert(msg_id, &stub, backend_id);
                 Ok(bytes)
             }
             (true, _) => {
@@ -302,10 +295,7 @@ impl ClientSession {
             }
             (false, CacheAction::TrackStat) => {
                 client_write.write_all(first_chunk).await?;
-                if let Some(msg_id_ref) = msg_id {
-                    let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, b"223\r\n", backend_id, tier);
-                }
+                self.maybe_cache_upsert(msg_id, b"223\r\n", backend_id);
                 Ok(first_chunk_size as u64)
             }
             (false, _) => {
@@ -341,6 +331,20 @@ impl ClientSession {
     ) {
         self.metrics.record_ttfb_micros(backend_id, ttfb);
         self.metrics.record_send_recv_micros(backend_id, send, recv);
+    }
+
+    /// Cache article data if message ID is present
+    #[inline]
+    fn maybe_cache_upsert(
+        &self,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        data: &[u8],
+        backend_id: BackendId,
+    ) {
+        if let Some(msg_id_ref) = msg_id {
+            let tier = self.tier_for_backend(backend_id);
+            self.spawn_cache_upsert(msg_id_ref, data, backend_id, tier);
+        }
     }
 
     /// Record response metrics (errors, article sizes, command execution)

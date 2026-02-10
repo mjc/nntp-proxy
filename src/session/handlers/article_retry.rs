@@ -51,10 +51,7 @@ impl ClientSession {
             ));
         };
 
-        let mut conn = match provider.get_pooled_connection().await {
-            Ok(c) => c,
-            Err(e) => return Err(e.into()),
-        };
+        let mut conn = provider.get_pooled_connection().await?;
 
         // Phase 1: Write all commands, then flush
         for command in commands {
@@ -77,7 +74,6 @@ impl ClientSession {
         }
 
         // Phase 2: Read and stream responses in order
-        let mut connection_healthy = true;
         for (i, command) in commands.iter().enumerate() {
             let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
 
@@ -93,8 +89,10 @@ impl ClientSession {
                         i + 1,
                         commands.len()
                     );
-                    connection_healthy = false;
-                    break;
+                    // Connection broken — remove from pool and exit early
+                    crate::pool::remove_from_pool(conn);
+                    guard.complete();
+                    return Ok(());
                 }
                 Err(e) => {
                     debug!(
@@ -104,8 +102,10 @@ impl ClientSession {
                         commands.len(),
                         e
                     );
-                    connection_healthy = false;
-                    break;
+                    // Connection broken — remove from pool and exit early
+                    crate::pool::remove_from_pool(conn);
+                    guard.complete();
+                    return Ok(());
                 }
             };
 
@@ -188,11 +188,7 @@ impl ClientSession {
             }
         }
 
-        if !connection_healthy {
-            crate::pool::remove_from_pool(conn);
-        }
-        // else: conn drops here, returning to pool automatically
-
+        // Connection healthy — conn drops here, returning to pool automatically
         guard.complete();
         Ok(())
     }
@@ -306,28 +302,25 @@ impl ClientSession {
                             data,
                             status_code,
                             backend_id,
-                        }) => {
-                            // Check if the response is a 430 (article not found).
-                            // If so, fall through to the availability-aware retry loop
-                            // which will try other backends.
-                            if status_code.as_u16() == 430 {
-                                debug!(
-                                    "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
-                                    self.client_addr, backend_id
-                                );
-                                // Record this backend as missing so retry loop skips it
-                                self.record_article_missing(msg_id.as_ref(), backend_id, &router)
-                                    .await;
-                                self.metrics.record_pipeline_complete();
-                                // Fall through to direct execution path for retry
-                            } else {
-                                client_write.write_all(&data).await?;
-                                *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
-                                *client_to_backend_bytes =
-                                    client_to_backend_bytes.add(command.len());
-                                self.metrics.record_pipeline_complete();
-                                return Ok(backend_id);
-                            }
+                        }) if status_code.as_u16() != 430 => {
+                            // Success - article found, return immediately
+                            client_write.write_all(&data).await?;
+                            *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
+                            *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+                            self.metrics.record_pipeline_complete();
+                            return Ok(backend_id);
+                        }
+                        Ok(PipelineResponse::Success { backend_id, .. }) => {
+                            // 430 (article not found) - fall through to retry loop
+                            debug!(
+                                "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
+                                self.client_addr, backend_id
+                            );
+                            // Record this backend as missing so retry loop skips it
+                            self.record_article_missing(msg_id.as_ref(), backend_id, &router)
+                                .await;
+                            self.metrics.record_pipeline_complete();
+                            // Fall through to direct execution path for retry
                         }
                         Ok(PipelineResponse::Error(e)) => {
                             debug!(
@@ -439,16 +432,15 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     // Continue to next backend
                 }
+                Err(e) if is_client_disconnect_error(&e) => {
+                    // Client disconnected - stop trying backends
+                    debug!(
+                        "Client {} disconnected, stopping retry loop",
+                        self.client_addr
+                    );
+                    return Err(e);
+                }
                 Err(e) => {
-                    // Check if client disconnected - if so, stop trying backends
-                    if is_client_disconnect_error(&e) {
-                        debug!(
-                            "Client {} disconnected, stopping retry loop",
-                            self.client_addr
-                        );
-                        return Err(e);
-                    }
-
                     // Backend error (timeout, connection error, etc.)
                     // Log it but continue trying other backends
                     debug!(
