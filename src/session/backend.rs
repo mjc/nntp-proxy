@@ -47,8 +47,6 @@ pub struct ValidatedResponse {
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-impl ValidatedResponse {}
-
 /// Validate backend response data (pure function - easily testable)
 ///
 /// Checks response for:

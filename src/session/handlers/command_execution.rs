@@ -81,7 +81,7 @@ impl ClientSession {
             // Mark backend as unavailable for this article so we try next one
             availability.record_missing(backend_id);
             // guard drops here → complete_command called automatically
-            crate::pool::remove_from_pool(conn);
+            provider.remove_with_cooldown(conn);
             return Ok(BackendAttemptResult::BackendUnavailable);
         }
 
@@ -118,7 +118,7 @@ impl ClientSession {
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username());
                 }
-                crate::pool::remove_from_pool(conn);
+                provider.remove_with_cooldown(conn);
             })?;
 
         self.record_response_metrics(
@@ -164,7 +164,7 @@ impl ClientSession {
         match result {
             Ok((cmd_response, ttfb, send, recv)) => Ok((conn, cmd_response, ttfb, send, recv)),
             Err(e) => {
-                crate::pool::remove_from_pool(conn);
+                provider.remove_with_cooldown(conn);
                 Err(e)
             }
         }

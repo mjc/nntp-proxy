@@ -143,6 +143,7 @@ where
         backend_id,
         buffer_pool,
         None,
+        None,
     )
     .await
 }
@@ -172,14 +173,49 @@ where
         backend_id,
         buffer_pool,
         Some(capture),
+        None,
+    )
+    .await
+}
+
+/// Stream multiline response from backend to client during pipelined batch execution.
+///
+/// Like `stream_multiline_response`, but captures leftover bytes after the terminator
+/// into `leftover` for use as the start of the next response in the pipeline.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_multiline_response_pipelined<R, W>(
+    backend_read: &mut R,
+    client_write: &mut W,
+    first_chunk: &[u8],
+    first_n: usize,
+    client_addr: crate::types::ClientAddress,
+    backend_id: crate::types::BackendId,
+    buffer_pool: &crate::pool::BufferPool,
+    leftover: &mut Vec<u8>,
+) -> Result<u64>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    stream_multiline_response_impl(
+        backend_read,
+        client_write,
+        first_chunk,
+        first_n,
+        client_addr,
+        backend_id,
+        buffer_pool,
+        None,
+        Some(leftover),
     )
     .await
 }
 
 /// Result of processing a single chunk in the streaming pipeline
 enum ChunkResult {
-    /// Terminator found — streaming is complete
-    Done,
+    /// Terminator found — streaming is complete.
+    /// `write_len` is bytes written from this chunk (up to and including terminator).
+    Done { write_len: usize },
     /// Chunk processed, continue reading
     Continue,
 }
@@ -237,7 +273,7 @@ where
     *total_bytes += write_len as u64;
 
     if status.is_found() {
-        return Ok(ChunkResult::Done);
+        return Ok(ChunkResult::Done { write_len });
     }
 
     // Update tail for next iteration
@@ -259,6 +295,7 @@ async fn stream_multiline_response_impl<R, W>(
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
     mut capture: Option<&mut crate::pool::PooledBuffer>,
+    mut leftover_out: Option<&mut Vec<u8>>,
 ) -> Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -283,7 +320,12 @@ where
     )
     .await?
     {
-        ChunkResult::Done => {
+        ChunkResult::Done { write_len } => {
+            if let Some(leftover) = leftover_out.as_mut()
+                && write_len < first_n
+            {
+                leftover.extend_from_slice(&first_chunk[write_len..first_n]);
+            }
             debug!(
                 "Client {} multiline response complete ({})",
                 client_addr,
@@ -328,7 +370,12 @@ where
         )
         .await?
         {
-            ChunkResult::Done => {
+            ChunkResult::Done { write_len } => {
+                if let Some(leftover) = leftover_out.as_mut()
+                    && write_len < n
+                {
+                    leftover.extend_from_slice(&buffers[idx][write_len..n]);
+                }
                 debug!(
                     "Client {} multiline response complete ({})",
                     client_addr,
@@ -608,5 +655,123 @@ mod tests {
         // Verify backend was drained (cursor should be at or near end)
         let pos = backend.position();
         assert!(pos >= remaining_data.len() as u64 - 5); // Near end after draining
+    }
+
+    // =========================================================================
+    // Pipelined streaming leftover tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_stream_pipelined_leftover_in_first_chunk() {
+        use crate::types::BufferSize;
+        // Two pipelined multiline responses in one buffer.
+        // First response ends at terminator, second response starts right after.
+        let response1 = b"220 Article follows\r\nBody1\r\n.\r\n";
+        let response2_start = b"220 Article follows\r\nBody2";
+        let mut combined = Vec::new();
+        combined.extend_from_slice(response1);
+        combined.extend_from_slice(response2_start);
+
+        // No backend reads needed — everything is in first chunk
+        let mut reader = Cursor::new(b"" as &[u8]);
+        let mut writer = Vec::new();
+        let mut leftover = Vec::new();
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+
+        let result = stream_multiline_response_pipelined(
+            &mut reader,
+            &mut writer,
+            &combined,
+            combined.len(),
+            client_addr,
+            backend_id,
+            &buffer_pool,
+            &mut leftover,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Should only write first response (up to and including terminator)
+        assert_eq!(result.unwrap(), response1.len() as u64);
+        assert_eq!(&writer[..], response1.as_slice());
+        // Leftover should contain the start of the second response
+        assert_eq!(&leftover[..], response2_start.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_stream_pipelined_leftover_in_later_chunk() {
+        use crate::types::BufferSize;
+        // First chunk is just the header (no terminator).
+        // Backend read returns terminator + start of next response.
+        let first_chunk = b"220 Article follows\r\nLong body content here";
+        let second_read = b" more body\r\n.\r\n430 No such article\r\n";
+
+        let mut reader = Cursor::new(second_read.as_slice());
+        let mut writer = Vec::new();
+        let mut leftover = Vec::new();
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+
+        let result = stream_multiline_response_pipelined(
+            &mut reader,
+            &mut writer,
+            first_chunk,
+            first_chunk.len(),
+            client_addr,
+            backend_id,
+            &buffer_pool,
+            &mut leftover,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Total bytes = first_chunk + " more body\r\n.\r\n" (15 bytes)
+        let expected_body = b" more body\r\n.\r\n";
+        let expected_total = first_chunk.len() as u64 + expected_body.len() as u64;
+        assert_eq!(result.unwrap(), expected_total);
+        // Writer should have first_chunk + body up to terminator
+        let mut expected_written = Vec::new();
+        expected_written.extend_from_slice(first_chunk);
+        expected_written.extend_from_slice(expected_body);
+        assert_eq!(&writer[..], &expected_written[..]);
+        // Leftover should contain "430 No such article\r\n"
+        assert_eq!(&leftover[..], b"430 No such article\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_stream_pipelined_no_leftover() {
+        use crate::types::BufferSize;
+        // Terminator at exact end of chunk — no leftover bytes
+        let response = b"220 Article follows\r\nBody\r\n.\r\n";
+        let mut reader = Cursor::new(b"" as &[u8]);
+        let mut writer = Vec::new();
+        let mut leftover = Vec::new();
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+
+        let result = stream_multiline_response_pipelined(
+            &mut reader,
+            &mut writer,
+            response,
+            response.len(),
+            client_addr,
+            backend_id,
+            &buffer_pool,
+            &mut leftover,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), response.len() as u64);
+        assert_eq!(&writer[..], response.as_slice());
+        // No leftover — terminator was at exact end
+        assert!(leftover.is_empty());
     }
 }

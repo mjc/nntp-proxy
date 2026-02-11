@@ -91,7 +91,15 @@ impl ClientSession {
                     trailing_range: None,
                 });
             }
-            Ok(_) => {}
+            Ok(_) => {
+                // M4: Reject oversized commands (RFC 3977: 512 byte limit)
+                if command_buf.len() > 512 {
+                    return Err(anyhow::anyhow!(
+                        "Command too long ({} bytes)",
+                        command_buf.len()
+                    ));
+                }
+            }
             Err(e) => return Err(e.into()),
         }
 
@@ -124,6 +132,10 @@ impl ClientSession {
             match reader.read_line(command_buf).await {
                 Ok(0) => break,
                 Ok(_) => {
+                    // M4: Reject oversized commands (end batch on invalid command)
+                    if command_buf.len() > 512 {
+                        break;
+                    }
                     let parsed = NntpCommand::parse(command_buf);
                     if !parsed.is_pipelineable() {
                         // Non-pipelineable command ends the batch

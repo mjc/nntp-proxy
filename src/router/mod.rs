@@ -237,6 +237,8 @@ pub struct BackendSelector {
     backends: Vec<BackendInfo>,
     /// Selection strategy (weighted round-robin or least-loaded)
     strategy: SelectionStrategy,
+    /// H4: Pre-computed sorted unique tiers (avoids Vec allocation in hot path)
+    sorted_tiers: smallvec::SmallVec<[u8; 4]>,
 }
 
 impl Default for BackendSelector {
@@ -286,6 +288,7 @@ impl BackendSelector {
             // Pre-allocate for typical number of backend servers (most setups have 2-8)
             backends: Vec::with_capacity(4),
             strategy: selection_strategy,
+            sorted_tiers: smallvec::SmallVec::new(),
         }
     }
 
@@ -349,6 +352,12 @@ impl BackendSelector {
             tier,
             pipeline_queue,
         });
+
+        // H4: Maintain sorted unique tiers (avoids Vec allocation in select_backend hot path)
+        if !self.sorted_tiers.contains(&tier) {
+            self.sorted_tiers.push(tier);
+            self.sorted_tiers.sort_unstable();
+        }
     }
 
     /// Select the next backend using the configured strategy with tier-aware prioritization
@@ -377,14 +386,10 @@ impl BackendSelector {
             return self.select_weighted(|b| is_available(b));
         }
 
-        // Tier filtering enabled - try tiers in order 0, 1, 2, ...
-        // Build sorted list of unique tiers
-        let mut tiers: Vec<u8> = self.backends.iter().map(|b| b.tier).collect();
-        tiers.sort_unstable();
-        tiers.dedup();
-
+        // H4: Tier filtering enabled - try tiers in order 0, 1, 2, ...
+        // Use pre-computed sorted tiers (no allocation)
         // Try each tier until we find an available backend
-        for tier in tiers {
+        for &tier in &self.sorted_tiers {
             let available_in_tier = self
                 .backends
                 .iter()

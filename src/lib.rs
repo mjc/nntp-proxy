@@ -75,6 +75,7 @@ pub mod streaming {
     //! fetch articles directly from servers.
     pub use crate::session::streaming::{
         stream_and_capture_multiline_response, stream_multiline_response,
+        stream_multiline_response_pipelined,
     };
 }
 

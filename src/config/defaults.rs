@@ -119,6 +119,18 @@ pub fn pipeline_batch_size() -> usize {
     4
 }
 
+/// Default connection replacement cooldown (30 seconds)
+#[inline]
+pub fn replacement_cooldown() -> Duration {
+    Duration::from_secs(30)
+}
+
+/// Default connection replacement cooldown option (Some(30 seconds))
+#[inline]
+pub fn replacement_cooldown_option() -> Option<Duration> {
+    Some(replacement_cooldown())
+}
+
 /// Default number of buffers in the main buffer pool
 /// Sized for ~50 concurrent connections with single buffer per connection
 /// Total memory: 50 × 724KB ≈ 35MB
@@ -133,4 +145,5 @@ pub fn buffer_pool_count() -> usize {
 #[inline]
 pub fn capture_pool_count() -> usize {
     16
+}
 }

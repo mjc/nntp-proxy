@@ -37,11 +37,21 @@ impl ClientSession {
         use crate::session::routing::{MetricsAction, determine_metrics_action};
         use crate::session::{backend, streaming};
 
-        // Route to a single backend for the whole batch.
+        // M1: Load availability for the first command's message-ID
+        let first_msg_id = crate::types::MessageId::extract_from_command_borrowed(commands[0]);
+        let availability = self
+            .load_article_availability(first_msg_id.as_ref(), router.backend_count())
+            .await;
+
+        // Route to a single backend for the whole batch with availability awareness
         // One pending count for one connection — don't inflate pending by N,
         // as that skews load_ratio and can cause other sessions to over-allocate
         // connections on other backends, hitting provider connection limits.
-        let backend_id = router.route_command(self.client_id, commands[0])?;
+        let backend_id = router.route_command_with_availability(
+            self.client_id,
+            commands[0],
+            Some(&availability),
+        )?;
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         let Some(provider) = router.backend_provider(backend_id) else {
@@ -133,7 +143,40 @@ impl ClientSession {
                     }
                 }
             };
+
+            // H5: If leftover was too short to validate, read more data
+            if n < crate::protocol::MIN_RESPONSE_LENGTH {
+                match buffer.read_from(&mut *conn).await {
+                    Ok(bytes_read) if bytes_read > 0 => {
+                        chunk_data.extend_from_slice(&buffer[..bytes_read]);
+                        // Update n for chunk reference below
+                    }
+                    Ok(_) => {
+                        // EOF with partial status line — send 430 for remaining
+                        for remaining in &commands[i..] {
+                            self.send_430_to_client(client_write, backend_to_client_bytes)
+                                .await?;
+                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                        }
+                        provider.remove_with_cooldown(conn);
+                        guard.complete();
+                        return Ok(());
+                    }
+                    Err(_e) => {
+                        // Read error with partial status line — send 430 for remaining
+                        for remaining in &commands[i..] {
+                            self.send_430_to_client(client_write, backend_to_client_bytes)
+                                .await?;
+                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                        }
+                        provider.remove_with_cooldown(conn);
+                        guard.complete();
+                        return Ok(());
+                    }
+                }
+            }
             let chunk = chunk_data.as_slice();
+            let n = chunk.len(); // Update n after potential additional read
 
             // Validate response
             let validated =
@@ -172,6 +215,10 @@ impl ClientSession {
                 self.send_430_to_client(client_write, backend_to_client_bytes)
                     .await?;
                 *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+                // M6: Record metrics for invalid responses (same as sequential path)
+                self.metrics.record_command(backend_id);
+                self.metrics.record_error_4xx(backend_id);
+                self.metrics.user_command(self.username());
                 continue;
             }
 
@@ -179,7 +226,7 @@ impl ClientSession {
             *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
             let bytes_written = if is_multiline {
-                match streaming::stream_multiline_response(
+                match streaming::stream_multiline_response_pipelined(
                     &mut *conn,
                     client_write,
                     chunk,
@@ -187,14 +234,26 @@ impl ClientSession {
                     self.client_addr,
                     backend_id,
                     &self.buffer_pool,
+                    &mut leftover,
                 )
                 .await
                 {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        // Connection has pipelined responses we can't cleanly drain.
+                        // C1: On streaming error, avoid duplicate responses
                         provider.remove_with_cooldown(conn);
-                        return Err(e);
+                        if is_client_disconnect_error(&e) {
+                            return Err(e);
+                        }
+                        // Backend died mid-stream. Commands 0..i already handled.
+                        // Send 430 for remaining commands to maintain protocol sync.
+                        for remaining in &commands[i + 1..] {
+                            self.send_430_to_client(client_write, backend_to_client_bytes)
+                                .await?;
+                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                        }
+                        guard.complete();
+                        return Ok(());
                     }
                 }
             } else {
@@ -276,6 +335,19 @@ impl ClientSession {
             CacheLookupResult::Miss => None,
         };
 
+        // H3: Hoist availability loading before pipeline/retry branch (compute once, use in both paths)
+        let availability = match &cached_availability {
+            Some(avail) => Some(*avail),
+            None => match &msg_id {
+                Some(msg_id_ref) => self
+                    .cache
+                    .get(msg_id_ref)
+                    .await
+                    .map(|entry| entry.to_availability(router.backend_count())),
+                None => None,
+            },
+        };
+
         // Adaptive prechecking for STAT/HEAD commands (if enabled and cache missed)
         if self.adaptive_precheck
             && let Some(ref msg_id_ref) = msg_id
@@ -317,16 +389,7 @@ impl ClientSession {
         // This allows N client sessions to share M backend connections (N >> M).
         // NOTE: Pipeline path uses route_command_with_availability to respect 430s
         if !is_large_transfer {
-            // Load availability for message-ID based commands
-            let availability = match &msg_id {
-                Some(msg_id_ref) => self
-                    .cache
-                    .get(msg_id_ref)
-                    .await
-                    .map(|entry| entry.to_availability(router.backend_count())),
-                None => None,
-            };
-
+            // H3: Use pre-loaded availability (no redundant cache lookup)
             // Route with availability awareness (avoids backends that returned 430)
             if let Ok(backend_id) = router.route_command_with_availability(
                 self.client_id,
@@ -421,14 +484,8 @@ impl ClientSession {
 
         let mut buffer = self.buffer_pool.acquire().await;
 
-        // Use pre-loaded availability if available, otherwise load from cache
-        let mut availability = match cached_availability {
-            Some(avail) => avail,
-            None => {
-                self.load_article_availability(msg_id.as_ref(), router.backend_count())
-                    .await
-            }
-        };
+        // H3: Use pre-loaded availability (already computed above)
+        let mut availability = availability.unwrap_or_default();
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
