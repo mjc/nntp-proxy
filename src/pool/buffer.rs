@@ -3,7 +3,7 @@ use crossbeam::queue::SegQueue;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::info;
+use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
 ///
