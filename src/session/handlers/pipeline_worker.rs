@@ -42,7 +42,6 @@ pub async fn backend_pipeline_worker(
     config: PipelineWorkerConfig,
     queue: Arc<BackendQueue>,
     provider: Arc<DeadpoolConnectionProvider>,
-    _router: Arc<crate::router::BackendSelector>,
     metrics: MetricsCollector,
     buffer_pool: BufferPool,
 ) {

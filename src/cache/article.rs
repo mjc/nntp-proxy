@@ -203,7 +203,7 @@ impl ArticleEntry {
     /// A valid response must:
     /// 1. Start with 3 ASCII digits (status code)
     /// 2. Have CRLF somewhere (line terminator)
-    /// 3. End with `.\r\n` for multiline responses (220/221/222)
+    /// 3. End with `\r\n.\r\n` for multiline responses (220/221/222)
     #[inline]
     pub fn is_valid_response(&self) -> bool {
         super::entry_helpers::is_valid_response(&self.buffer)

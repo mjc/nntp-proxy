@@ -417,12 +417,10 @@ impl BuildContext {
                 let metrics = self.metrics.clone();
                 let buffer_pool = self.buffer_pool.clone();
 
-                // C3: Pass router for pending_count tracking
                 tokio::spawn(backend_pipeline_worker(
                     config,
                     queue,
                     provider,
-                    Arc::clone(&self.router),
                     metrics,
                     buffer_pool,
                 ));

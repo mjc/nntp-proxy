@@ -133,7 +133,13 @@ impl ClientSession {
                 Ok(0) => break,
                 Ok(_) => {
                     // M4: Reject oversized commands (end batch on invalid command)
+                    // Treat as trailing so caller can send error response
+                    // (silently dropping would desynchronize client/server protocol)
                     if command_buf.len() > 512 {
+                        let start = batch_buf.len();
+                        batch_buf.push_str(command_buf);
+                        let end = batch_buf.len();
+                        trailing_range = Some((start, end));
                         break;
                     }
                     let parsed = NntpCommand::parse(command_buf);

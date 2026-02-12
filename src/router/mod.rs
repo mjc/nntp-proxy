@@ -390,17 +390,20 @@ impl BackendSelector {
         // Use pre-computed sorted tiers (no allocation)
         // Try each tier until we find an available backend
         for &tier in &self.sorted_tiers {
-            let available_in_tier = self
-                .backends
-                .iter()
-                .filter(|b| b.tier == tier && is_available(b))
-                .count();
+            // Only count available backends if debug logging is enabled (avoid O(n) scan)
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let available_in_tier = self
+                    .backends
+                    .iter()
+                    .filter(|b| b.tier == tier && is_available(b))
+                    .count();
 
-            tracing::debug!(
-                tier = tier,
-                available_in_tier = available_in_tier,
-                "Checking tier for available backends"
-            );
+                tracing::debug!(
+                    tier = tier,
+                    available_in_tier = available_in_tier,
+                    "Checking tier for available backends"
+                );
+            }
 
             // Try to select from this specific tier
             let tier_filter = |b: &&BackendInfo| b.tier == tier && is_available(b);

@@ -95,8 +95,8 @@ impl ClientSession {
         // One-way transition: PerCommand → Stateful
         self.mode_state.switch_to_stateful();
 
-        // Acquire backend connection
-        let (pooled_conn, backend_id) = self
+        // Acquire backend connection (returns CommandGuard to track pending_count)
+        let (pooled_conn, backend_id, _pending_guard) = self
             .acquire_stateful_backend(initial_command)
             .await
             .context("Failed to acquire backend for stateful mode")?;
@@ -142,10 +142,7 @@ impl ClientSession {
             )
             .await;
 
-        // Complete pending_count from acquire_stateful_backend
-        if let Some(router) = self.router.as_ref() {
-            router.complete_command(backend_id);
-        }
+        // pending_guard automatically calls complete_command via Drop
 
         // H1: Only return connection to pool on success
         match result {
@@ -162,13 +159,17 @@ impl ClientSession {
     /// Acquire a dedicated backend connection for stateful mode
     ///
     /// Routes the command to select a backend, then gets a pooled connection.
-    /// Returns both the connection and the backend ID for metrics tracking.
+    /// Returns the connection, backend ID, and a `CommandGuard` that decrements
+    /// `pending_count` on drop. Creating the guard here (immediately after
+    /// `route_command`) ensures the count is decremented even if
+    /// `get_pooled_connection` fails.
     async fn acquire_stateful_backend(
         &self,
         command: &str,
     ) -> Result<(
         deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         crate::types::BackendId,
+        crate::router::CommandGuard,
     )> {
         let router = self
             .router
@@ -177,13 +178,17 @@ impl ClientSession {
 
         let backend_id = router.route_command(self.client_id, command)?;
 
+        // Guard pending_count immediately — if get_pooled_connection fails,
+        // the guard drops and decrements automatically
+        let pending_guard = crate::router::CommandGuard::new(router.clone(), backend_id);
+
         let provider = router
             .backend_provider(backend_id)
             .ok_or_else(|| anyhow::anyhow!("{}: {:?}", error::BACKEND_NOT_FOUND, backend_id))?;
 
         let conn = provider.get_pooled_connection().await?;
 
-        Ok((conn, backend_id))
+        Ok((conn, backend_id, pending_guard))
     }
 }
 

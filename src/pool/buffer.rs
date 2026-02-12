@@ -99,26 +99,25 @@ impl PooledBuffer {
     /// pages are pre-faulted. As long as total accumulated data fits within
     /// capacity, this operation performs NO allocations or page faults.
     ///
+    /// If data exceeds capacity, the Vec will grow automatically (with allocation).
+    /// This ensures complete data is always captured rather than truncating, which
+    /// would corrupt cached responses.
+    ///
     /// # Note on length
     ///
     /// After calling this, `.len()` (via Deref) returns the total accumulated length.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
-        // M3: Runtime check instead of debug_assert to prevent realloc in release builds
+        // Warn if we need to grow beyond pre-allocated capacity (rare for typical articles)
         if self.buffer.len() + data.len() > self.buffer.capacity() {
             tracing::warn!(
-                "Capture buffer overflow: {} + {} > {} capacity, truncating",
+                "Capture buffer growing: {} + {} > {} capacity (will allocate)",
                 self.buffer.len(),
                 data.len(),
                 self.buffer.capacity()
             );
-            let available = self.buffer.capacity().saturating_sub(self.buffer.len());
-            if available > 0 {
-                self.buffer.extend_from_slice(&data[..available]);
-                self.initialized = self.buffer.len();
-            }
-            return;
         }
+        // Always extend - never truncate to prevent caching partial/corrupt data
         self.buffer.extend_from_slice(data);
         self.initialized = self.buffer.len();
     }

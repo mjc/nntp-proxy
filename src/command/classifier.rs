@@ -507,7 +507,7 @@ impl NntpCommand {
     #[inline]
     #[must_use]
     pub const fn is_pipelineable(&self) -> bool {
-        matches!(self, Self::ArticleByMessageId | Self::Stateless)
+        matches!(self, Self::ArticleByMessageId)
     }
 
     /// Parse an NNTP command for routing/handling strategy
@@ -940,12 +940,12 @@ mod tests {
         assert!(NntpCommand::parse("HEAD <msg@example.com>").is_pipelineable());
         assert!(NntpCommand::parse("STAT <msg@example.com>").is_pipelineable());
 
-        // Stateless commands are pipelineable
-        assert!(NntpCommand::Stateless.is_pipelineable());
-        assert!(NntpCommand::parse("LIST").is_pipelineable());
-        assert!(NntpCommand::parse("DATE").is_pipelineable());
-        assert!(NntpCommand::parse("CAPABILITIES").is_pipelineable());
-        assert!(NntpCommand::parse("HELP").is_pipelineable());
+        // Stateless commands are NOT pipelineable (QUIT would close worker connection)
+        assert!(!NntpCommand::Stateless.is_pipelineable());
+        assert!(!NntpCommand::parse("LIST").is_pipelineable());
+        assert!(!NntpCommand::parse("DATE").is_pipelineable());
+        assert!(!NntpCommand::parse("CAPABILITIES").is_pipelineable());
+        assert!(!NntpCommand::parse("HELP").is_pipelineable());
 
         // Auth commands are NOT pipelineable (state-changing)
         assert!(!NntpCommand::AuthUser.is_pipelineable());
