@@ -15,7 +15,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::command::classifier::is_large_transfer_command;
 use crate::command::{CommandAction, CommandHandler};
@@ -420,6 +420,17 @@ impl ClientSession {
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
             if let Some(trailing_cmd) = batch.trailing() {
+                // Reject oversized commands per RFC 3977 (512-byte limit)
+                if batch.is_trailing_oversized() {
+                    warn!(
+                        "Client {} sent oversized command ({} bytes), rejecting",
+                        self.client_addr,
+                        trailing_cmd.len()
+                    );
+                    client_write.write_all(b"500 Command too long\r\n").await?;
+                    continue;
+                }
+
                 debug!(
                     "Client {} trailing non-pipelineable: {:?}",
                     self.client_addr,

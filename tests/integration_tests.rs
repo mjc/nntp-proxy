@@ -1290,3 +1290,136 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that an oversized command (>512 bytes) sent as the second command in a
+/// pipelined batch receives a 500 error response instead of being forwarded.
+/// RFC 3977 §3.1: "command line MUST NOT exceed 512 octets"
+#[tokio::test]
+async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
+    let mock_port = get_available_port().await?;
+    let proxy_port = get_available_port().await?;
+
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("TestServer")
+        .on_command("STAT", "223 0 <test@example.com> status\r\n")
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = create_test_config(vec![(mock_port, "TestServer")]);
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+
+    spawn_test_proxy(proxy, proxy_port, true).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut buffer = [0; 4096];
+
+    // Read greeting
+    let _n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+
+    // Send a valid STAT command followed by an oversized command in one write
+    // (simulates TCP pipelining — both arrive in the same buffer)
+    let oversized_msg_id = format!("<{}@example.com>", "x".repeat(510));
+    let oversized_cmd = format!("STAT {}\r\n", oversized_msg_id);
+    assert!(
+        oversized_cmd.len() > 512,
+        "Test setup: command must exceed 512 bytes, got {}",
+        oversized_cmd.len()
+    );
+
+    let mut pipelined = b"STAT <valid@example.com>\r\n".to_vec();
+    pipelined.extend_from_slice(oversized_cmd.as_bytes());
+    client.write_all(&pipelined).await?;
+    client.flush().await?;
+
+    // Read response to first (valid) STAT command
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+
+    // The first command should get a normal 223 response
+    assert!(
+        response.contains("223"),
+        "Expected 223 for valid STAT, got: {}",
+        response
+    );
+
+    // Read response to the oversized command — should be 500 error, not forwarded
+    // (may have arrived in the same read above, check that too)
+    let full_response = if response.contains("500") {
+        response.to_string()
+    } else {
+        let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+        String::from_utf8_lossy(&buffer[..n]).to_string()
+    };
+
+    assert!(
+        full_response.contains("500"),
+        "Expected 500 error for oversized command, got: {}",
+        full_response
+    );
+
+    client.write_all(b"QUIT\r\n").await?;
+    Ok(())
+}
+
+/// Test that a partial command in the BufReader buffer doesn't cause the batch
+/// reader to block waiting for more data from the socket.
+///
+/// Scenario: Client sends a valid STAT + a partial (incomplete) second command
+/// in one TCP write. The proxy should process the first STAT immediately and
+/// respond, NOT block waiting for the partial command to complete.
+#[tokio::test]
+async fn test_partial_buffered_command_does_not_block() -> Result<()> {
+    let mock_port = get_available_port().await?;
+    let proxy_port = get_available_port().await?;
+
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("TestServer")
+        .on_command("STAT", "223 0 <test@example.com> status\r\n")
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = create_test_config(vec![(mock_port, "TestServer")]);
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+
+    spawn_test_proxy(proxy, proxy_port, true).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut buffer = [0; 4096];
+
+    // Read greeting
+    let _n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+
+    // Send a valid STAT command followed by a PARTIAL second command (no \n)
+    // Both arrive in the same TCP buffer, but the second is incomplete.
+    let mut pipelined = b"STAT <valid@example.com>\r\n".to_vec();
+    pipelined.extend_from_slice(b"STAT <partial-no-newline@examp"); // no \r\n!
+    client.write_all(&pipelined).await?;
+    client.flush().await?;
+
+    // The proxy must respond to the first STAT within a reasonable time.
+    // If it blocks trying to read_line() on the partial second command, this will timeout.
+    let n = timeout(Duration::from_millis(500), client.read(&mut buffer))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout! Proxy blocked on partial command instead of responding to first STAT"
+            )
+        })??;
+
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        response.contains("223"),
+        "Expected 223 for valid STAT, got: {}",
+        response
+    );
+
+    // Now complete the partial command so the session can clean up
+    client.write_all(b"le.com>\r\nQUIT\r\n").await?;
+    client.flush().await?;
+
+    Ok(())
+}

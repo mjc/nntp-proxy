@@ -27,6 +27,8 @@ pub(super) struct CommandBatch {
     offsets: smallvec::SmallVec<[usize; 4]>,
     /// Offset range for trailing non-pipelineable command if present
     trailing_range: Option<(usize, usize)>,
+    /// True if the trailing command exceeded the 512-byte RFC 3977 limit
+    trailing_oversized: bool,
 }
 
 impl CommandBatch {
@@ -51,6 +53,11 @@ impl CommandBatch {
     /// Number of pipelineable commands
     pub fn len(&self) -> usize {
         self.offsets.len()
+    }
+
+    /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
+    pub fn is_trailing_oversized(&self) -> bool {
+        self.trailing_oversized
     }
 
     /// Extract buffers for reuse in next batch (move out, leaving empty)
@@ -80,6 +87,7 @@ impl ClientSession {
         batch_buf.clear();
         batch_offsets.clear();
         let mut trailing_range: Option<(usize, usize)> = None;
+        let mut trailing_oversized = false;
 
         // First command: blocking read (must wait for client)
         command_buf.clear();
@@ -89,6 +97,7 @@ impl ClientSession {
                     buffer: String::new(),
                     offsets: smallvec::SmallVec::new(),
                     trailing_range: None,
+                    trailing_oversized: false,
                 });
             }
             Ok(_) => {
@@ -115,6 +124,7 @@ impl ClientSession {
                 buffer: std::mem::take(batch_buf),
                 offsets: smallvec::SmallVec::new(),
                 trailing_range,
+                trailing_oversized: false,
             });
         }
 
@@ -124,7 +134,11 @@ impl ClientSession {
 
         // Read more commands from the buffer (non-blocking)
         while batch_offsets.len() < MAX_PIPELINE_DEPTH {
-            if reader.buffer().is_empty() {
+            // Only proceed if buffer has a complete line (contains \n).
+            // Checking just is_empty() is insufficient: if the buffer has a partial
+            // command without \n, read_line() would block on the socket waiting for
+            // more data, defeating the non-blocking batch intent.
+            if memchr::memchr(b'\n', reader.buffer()).is_none() {
                 break;
             }
 
@@ -133,13 +147,13 @@ impl ClientSession {
                 Ok(0) => break,
                 Ok(_) => {
                     // M4: Reject oversized commands (end batch on invalid command)
-                    // Treat as trailing so caller can send error response
-                    // (silently dropping would desynchronize client/server protocol)
+                    // Mark as oversized so caller sends 500 error instead of forwarding
                     if command_buf.len() > 512 {
                         let start = batch_buf.len();
                         batch_buf.push_str(command_buf);
                         let end = batch_buf.len();
                         trailing_range = Some((start, end));
+                        trailing_oversized = true;
                         break;
                     }
                     let parsed = NntpCommand::parse(command_buf);
@@ -162,6 +176,7 @@ impl ClientSession {
             buffer: std::mem::take(batch_buf),
             offsets: std::mem::take(batch_offsets),
             trailing_range,
+            trailing_oversized,
         })
     }
 }
