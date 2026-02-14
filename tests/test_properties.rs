@@ -758,3 +758,132 @@ proptest! {
             count1, num_requests, min_expected);
     }
 }
+
+// =============================================================================
+// 11. validate_backend_response - Response validation robustness
+// =============================================================================
+
+use nntp_proxy::session::backend::validate_backend_response;
+
+proptest! {
+    #[test]
+    fn prop_validate_backend_response_never_panics(
+        data in prop::collection::vec(any::<u8>(), 0..200)
+    ) {
+        // validate_backend_response should never panic on arbitrary bytes
+        let _ = validate_backend_response(&data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
+    }
+
+    #[test]
+    fn prop_valid_nntp_response_never_classified_invalid(
+        code in 100u16..=599u16,
+        text in r"[A-Za-z0-9 ]{1,30}"
+    ) {
+        // Generate valid NNTP response: "{code} {text}\r\n"
+        let response = format!("{code} {text}\r\n");
+        let data = response.as_bytes();
+        let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
+
+        prop_assert_ne!(
+            validated.response,
+            nntp_proxy::protocol::NntpResponse::Invalid,
+            "Valid NNTP response '{}' should not be classified as Invalid", response
+        );
+        let status = validated.response.status_code().unwrap();
+        prop_assert_eq!(status.as_u16(), code,
+            "Parsed status code should match generated code");
+    }
+
+    #[test]
+    fn prop_status_code_parse_roundtrip(code in 100u16..=599u16) {
+        // Format as "{code} text\r\n", parse, check roundtrip
+        let response = format!("{code} text\r\n");
+        let parsed = StatusCode::parse(response.as_bytes());
+        prop_assert!(parsed.is_some(), "Valid code {code} should parse");
+        prop_assert_eq!(parsed.unwrap().as_u16(), code);
+    }
+
+    #[test]
+    fn prop_multiline_with_dot_stuffing(
+        code in prop::sample::select(vec![220u16, 221, 222]),
+        body_lines in prop::collection::vec(r"[A-Za-z0-9 .]{1,50}", 1..5)
+    ) {
+        // Generate body with dot-stuffed lines (lines starting with '.')
+        let mut response = format!("{code} 0 <test@id> article\r\n");
+        for line in &body_lines {
+            // Dot-stuff lines that start with '.'
+            if line.starts_with('.') {
+                response.push('.');
+            }
+            response.push_str(line);
+            response.push_str("\r\n");
+        }
+        response.push_str(".\r\n");
+
+        let data = response.as_bytes();
+        let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
+
+        // Should be multiline for 220/221/222
+        prop_assert!(validated.is_multiline,
+            "Code {code} should be detected as multiline");
+
+        // Terminator detection should find the real terminator, not a false positive
+        use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+        let tail = TailBuffer::default();
+        let status = tail.detect_terminator(data);
+        prop_assert!(status.is_found(),
+            "Terminator should be found in complete multiline response with code {code}");
+    }
+
+    #[test]
+    fn prop_terminator_detection_matches_reference(
+        data in prop::collection::vec(any::<u8>(), 0..500)
+    ) {
+        // TailBuffer::detect_terminator result should match naive memmem::find
+        use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+
+        let tail = TailBuffer::default();
+        let status = tail.detect_terminator(&data);
+
+        let reference_pos = memchr::memmem::find(&data, b"\r\n.\r\n");
+
+        match (status.is_found(), reference_pos) {
+            (true, Some(_)) => {} // Both found — good
+            (false, None) => {}   // Neither found — good
+            (true, None) => {
+                // TailBuffer says found but reference didn't — this shouldn't happen
+                // unless the data is very short (< 5 bytes where TailBuffer tracks cross-boundary)
+                // For a single-chunk call, they should always agree
+                prop_assert!(false, "TailBuffer found terminator but reference didn't in {} bytes", data.len());
+            }
+            (false, Some(pos)) => {
+                // Reference found but TailBuffer didn't — shouldn't happen for single-chunk
+                prop_assert!(false,
+                    "Reference found terminator at {} but TailBuffer didn't in {} bytes",
+                    pos, data.len());
+            }
+        }
+    }
+
+    #[test]
+    fn prop_single_line_response_leftover_correct(
+        code in 400u16..=599u16,
+        text in r"[A-Za-z0-9 ]{1,30}",
+        extra in prop::collection::vec(any::<u8>(), 0..50)
+    ) {
+        // Generate single-line response followed by random bytes
+        let response = format!("{code} {text}\r\n");
+        let mut data = response.as_bytes().to_vec();
+        let response_len = data.len();
+        data.extend_from_slice(&extra);
+
+        // After finding \r\n, leftover should be exactly the extra bytes
+        if let Some(pos) = memchr::memchr(b'\n', &data) {
+            let end = pos + 1;
+            let leftover = &data[end..];
+            prop_assert_eq!(leftover.len(), data.len() - response_len,
+                "Leftover should be {} bytes, got {}",
+                data.len() - response_len, leftover.len());
+        }
+    }
+}

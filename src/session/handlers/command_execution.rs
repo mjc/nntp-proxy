@@ -14,7 +14,7 @@ use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Result of attempting to execute a command on a backend
 pub(super) enum BackendAttemptResult {
@@ -73,7 +73,7 @@ impl ClientSession {
 
         // Reject invalid responses - never forward garbage to client
         if cmd_response.response == crate::protocol::NntpResponse::Invalid {
-            tracing::error!(
+            tracing::warn!(
                 backend_id = backend_id.as_index(),
                 first_bytes = ?&buffer[..cmd_response.bytes_read.min(64)],
                 "Backend returned invalid/unparseable response, rejecting"
@@ -115,6 +115,13 @@ impl ClientSession {
                 // Only mark as backend error metrics if it's NOT a client disconnect.
                 // Client disconnects are normal behavior and shouldn't penalize backends.
                 if !is_client_disconnect_error(e) {
+                    warn!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command = %command.trim(),
+                        error = %e,
+                        "Streaming error, removing connection from pool"
+                    );
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username());
                 }

@@ -22,11 +22,13 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let log_buffer = nntp_proxy::logging::init_tui_logging(args.no_tui);
     let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
 
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
+
+    let log_buffer =
+        nntp_proxy::logging::init_tui_logging(args.no_tui, &config.proxy.log_file_level);
 
     // Fix thread config fallback: merge args with config before building runtime
     let threads = args.common.threads.or(Some(config.proxy.threads));

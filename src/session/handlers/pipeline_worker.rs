@@ -156,11 +156,13 @@ async fn execute_pipeline_batch(
             }
             Err(e) => {
                 warn!(
-                    "Pipeline worker backend {:?}: read failed at response {}/{}: {}",
-                    backend_id,
-                    i + 1,
-                    batch_len,
-                    e
+                    backend = ?backend_id,
+                    response_index = i + 1,
+                    batch_size = batch_len,
+                    command = %req.command.trim(),
+                    error = %e,
+                    leftover_bytes = leftover.len(),
+                    "Pipeline worker read failed"
                 );
 
                 // Fail this request
@@ -297,5 +299,425 @@ fn fail_batch(batch: Vec<QueuedRequest>, error_msg: &str) {
         let _ = req
             .response_tx
             .send(PipelineResponse::Error(error_msg.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::BufferPool;
+    use crate::stream::ConnectionStream;
+    use bytes::BytesMut;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Helper: create a TCP pair where the server writes `data` then optionally closes.
+    /// Returns a ConnectionStream connected to the mock server.
+    async fn mock_backend_conn(data: &[u8]) -> ConnectionStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data = data.to_vec();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&data).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        ConnectionStream::Plain(stream)
+    }
+
+    /// Helper: create a TCP pair where the server writes `chunks` with delays.
+    /// Returns a ConnectionStream connected to the mock server.
+    async fn mock_backend_conn_chunked(chunks: Vec<Vec<u8>>) -> ConnectionStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for chunk in chunks {
+                stream.write_all(&chunk).await.unwrap();
+                // Small delay to ensure separate TCP segments
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        ConnectionStream::Plain(stream)
+    }
+
+    // ─── read_full_response unit tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_read_full_response_single_line() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut leftover = Vec::new();
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
+
+        let (data, status) =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
+                .await
+                .expect("should parse single-line response");
+
+        assert_eq!(status.as_u16(), 430);
+        assert_eq!(&data[..], b"430 No such article\r\n");
+        assert!(leftover.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_multiline() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut leftover = Vec::new();
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
+        let mut conn = mock_backend_conn(response).await;
+
+        let (data, status) =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
+                .await
+                .expect("should parse multiline response");
+
+        assert_eq!(status.as_u16(), 220);
+        assert_eq!(&data[..], &response[..]);
+        assert!(leftover.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_multiline_across_chunks() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut leftover = Vec::new();
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        // Split the terminator \r\n.\r\n across two chunks
+        let chunk1 = b"220 0 <msg@id> article\r\nBody\r\n.".to_vec();
+        let chunk2 = b"\r\n".to_vec();
+
+        let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
+
+        let (data, status) =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
+                .await
+                .expect("should detect terminator across chunks");
+
+        assert_eq!(status.as_u16(), 220);
+        assert!(
+            data.ends_with(b"\r\n.\r\n"),
+            "response should end with terminator"
+        );
+        assert!(leftover.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_with_leftover() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut leftover = Vec::new();
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        // Two responses packed together
+        let packed = b"220 0 <a@b> article\r\nBody\r\n.\r\n430 No such article\r\n";
+        let mut conn = mock_backend_conn(packed).await;
+
+        // First read should get the multiline response and save leftover
+        let (data1, status1) =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
+                .await
+                .expect("should parse first response");
+
+        assert_eq!(status1.as_u16(), 220);
+        assert!(data1.ends_with(b"\r\n.\r\n"));
+        assert!(
+            !leftover.is_empty(),
+            "should have leftover from second response"
+        );
+
+        // Second read should consume leftover and return the 430
+        let (data2, status2) =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
+                .await
+                .expect("should parse second response from leftover");
+
+        assert_eq!(status2.as_u16(), 430);
+        assert_eq!(&data2[..], b"430 No such article\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_eof_mid_stream() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut leftover = Vec::new();
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        // Multiline response without terminator — server disconnects
+        let mut conn = mock_backend_conn(b"220 0 <a@b> article\r\nBody line\r\n").await;
+
+        let result =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        assert!(result.is_err(), "EOF before terminator should be an error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("EOF") || err.contains("eof"),
+            "Error should mention EOF: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_invalid_status() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut leftover = Vec::new();
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        let mut conn = mock_backend_conn(b"garbage data here\r\n").await;
+
+        let result =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        assert!(result.is_err(), "Invalid status code should be an error");
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_short_leftover_triggers_h5() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
+        let mut leftover = b"43".to_vec();
+
+        // Backend will provide the rest of the response
+        let mut conn = mock_backend_conn(b"0 No such article\r\n").await;
+
+        let (data, status) =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
+                .await
+                .expect("short leftover + read should produce valid response");
+
+        assert_eq!(status.as_u16(), 430);
+        assert!(data.starts_with(b"430"));
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_empty_connection() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut leftover = Vec::new();
+        let mut result_buf = BytesMut::with_capacity(4096);
+
+        // Server immediately closes
+        let mut conn = mock_backend_conn(b"").await;
+
+        let result =
+            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        assert!(result.is_err(), "Empty connection should be an error");
+    }
+
+    // ─── validate_backend_response unit tests ────────────────────────────────
+
+    #[test]
+    fn test_validate_empty_response() {
+        let validated = validate_backend_response(b"", 0, crate::protocol::MIN_RESPONSE_LENGTH);
+        assert_eq!(validated.response, crate::protocol::NntpResponse::Invalid);
+    }
+
+    #[test]
+    fn test_validate_response_with_only_status_code() {
+        // "220" with no CRLF — too short
+        let data = b"220";
+        let validated =
+            validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+        // Should still parse the status code but emit warning for short response
+        assert!(!validated.warnings.is_empty());
+        // Status code parsing should work even for short responses
+        assert_ne!(
+            validated.response,
+            crate::protocol::NntpResponse::Invalid,
+            "3-digit code should be parseable even if short"
+        );
+    }
+
+    #[test]
+    fn test_validate_response_with_binary_garbage() {
+        let data = &[0xFF, 0xFE, 0x00, 0x01, 0x02];
+        let validated =
+            validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+        assert_eq!(validated.response, crate::protocol::NntpResponse::Invalid);
+    }
+
+    #[test]
+    fn test_validate_valid_single_line() {
+        let data = b"430 No such article\r\n";
+        let validated =
+            validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+        assert!(validated.response.status_code().is_some());
+        assert_eq!(validated.response.status_code().unwrap().as_u16(), 430);
+        assert!(!validated.is_multiline);
+    }
+
+    #[test]
+    fn test_validate_valid_multiline() {
+        let data = b"220 0 <msg@id> article\r\nBody\r\n.\r\n";
+        let validated =
+            validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+        assert!(validated.response.status_code().is_some());
+        assert_eq!(validated.response.status_code().unwrap().as_u16(), 220);
+        assert!(validated.is_multiline);
+    }
+
+    // ─── execute_pipeline_batch integration tests ────────────────────────────
+
+    #[tokio::test]
+    async fn test_pipeline_batch_single_430() {
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read command, then respond with 430
+            let mut buf = [0u8; 256];
+            let _ = stream.read(&mut buf).await;
+            stream.write_all(b"430 No such article\r\n").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn: crate::stream::ConnectionStream = ConnectionStream::Plain(stream);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = vec![QueuedRequest {
+            command: Arc::from("STAT <test@msg.id>\r\n"),
+            response_tx: tx,
+        }];
+
+        let success = execute_pipeline_batch(backend_id, &mut conn, batch, &metrics, &pool).await;
+
+        assert!(success, "single 430 should not mark connection as broken");
+        match rx.await.unwrap() {
+            PipelineResponse::Success { status_code, .. } => {
+                assert_eq!(status_code.as_u16(), 430);
+            }
+            other => panic!("Expected Success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_batch_multiple_responses() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read both commands
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            // Respond with two responses packed together
+            stream
+                .write_all(b"223 0 <a@b> status\r\n430 No such article\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::Plain(stream);
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let batch = vec![
+            QueuedRequest {
+                command: Arc::from("STAT <a@b>\r\n"),
+                response_tx: tx1,
+            },
+            QueuedRequest {
+                command: Arc::from("STAT <c@d>\r\n"),
+                response_tx: tx2,
+            },
+        ];
+
+        let success = execute_pipeline_batch(backend_id, &mut conn, batch, &metrics, &pool).await;
+        assert!(success);
+
+        match rx1.await.unwrap() {
+            PipelineResponse::Success { status_code, .. } => {
+                assert_eq!(status_code.as_u16(), 223);
+            }
+            other => panic!("Expected 223 Success, got {other:?}"),
+        }
+        match rx2.await.unwrap() {
+            PipelineResponse::Success { status_code, .. } => {
+                assert_eq!(status_code.as_u16(), 430);
+            }
+            other => panic!("Expected 430 Success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_batch_server_disconnect_mid_batch() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            // Only send first response, then disconnect
+            stream.write_all(b"223 0 <a@b> status\r\n").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::Plain(stream);
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let batch = vec![
+            QueuedRequest {
+                command: Arc::from("STAT <a@b>\r\n"),
+                response_tx: tx1,
+            },
+            QueuedRequest {
+                command: Arc::from("STAT <c@d>\r\n"),
+                response_tx: tx2,
+            },
+        ];
+
+        let success = execute_pipeline_batch(backend_id, &mut conn, batch, &metrics, &pool).await;
+        assert!(!success, "server disconnect should mark connection broken");
+
+        // First response should succeed
+        match rx1.await.unwrap() {
+            PipelineResponse::Success { status_code, .. } => {
+                assert_eq!(status_code.as_u16(), 223);
+            }
+            other => panic!("Expected first to succeed, got {other:?}"),
+        }
+        // Second response should be error
+        match rx2.await.unwrap() {
+            PipelineResponse::Error(_) => {} // Expected
+            other => panic!("Expected error for second, got {other:?}"),
+        }
     }
 }

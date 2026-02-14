@@ -13,7 +13,7 @@ use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::command::classifier::{is_head_command, is_large_transfer_command, is_stat_command};
 use crate::session::precheck;
@@ -66,18 +66,24 @@ impl ClientSession {
         // Phase 1: Write all commands, then flush
         for command in commands {
             if let Err(e) = conn.write_all(command.as_bytes()).await {
-                debug!(
-                    "Client {} batch write failed to backend {:?}: {}",
-                    self.client_addr, backend_id, e
+                warn!(
+                    client = %self.client_addr,
+                    backend = ?backend_id,
+                    batch_size = commands.len(),
+                    error = %e,
+                    "Batch write failed, removing connection"
                 );
                 provider.remove_with_cooldown(conn);
                 return Err(e.into());
             }
         }
         if let Err(e) = conn.flush().await {
-            debug!(
-                "Client {} batch flush failed to backend {:?}: {}",
-                self.client_addr, backend_id, e
+            warn!(
+                client = %self.client_addr,
+                backend = ?backend_id,
+                batch_size = commands.len(),
+                error = %e,
+                "Batch flush failed, removing connection"
             );
             provider.remove_with_cooldown(conn);
             return Err(e.into());
@@ -106,12 +112,12 @@ impl ClientSession {
                         bytes_read
                     }
                     Ok(_) => {
-                        debug!(
-                            "Client {} batch: backend {:?} EOF at response {}/{}",
-                            self.client_addr,
-                            backend_id,
-                            i + 1,
-                            commands.len()
+                        warn!(
+                            client = %self.client_addr,
+                            backend = ?backend_id,
+                            response_index = i + 1,
+                            total_commands = commands.len(),
+                            "Backend EOF during batch read, sending 430 for remaining commands"
                         );
                         // Send 430 for remaining commands to maintain protocol sync
                         for remaining in &commands[i..] {
@@ -124,12 +130,13 @@ impl ClientSession {
                         return Ok(());
                     }
                     Err(e) => {
-                        debug!(
-                            "Client {} batch: read error at response {}/{}: {}",
-                            self.client_addr,
-                            i + 1,
-                            commands.len(),
-                            e
+                        warn!(
+                            client = %self.client_addr,
+                            backend = ?backend_id,
+                            response_index = i + 1,
+                            total_commands = commands.len(),
+                            error = %e,
+                            "Backend read error during batch, sending 430 for remaining commands"
                         );
                         // Send 430 for remaining commands to maintain protocol sync
                         for remaining in &commands[i..] {
@@ -152,7 +159,13 @@ impl ClientSession {
                         // Update n for chunk reference below
                     }
                     Ok(_) => {
-                        // EOF with partial status line — send 430 for remaining
+                        warn!(
+                            client = %self.client_addr,
+                            backend = ?backend_id,
+                            response_index = i + 1,
+                            partial_bytes = chunk_data.len(),
+                            "Backend EOF with partial status line, sending 430 for remaining commands"
+                        );
                         for remaining in &commands[i..] {
                             self.send_430_to_client(client_write, backend_to_client_bytes)
                                 .await?;
@@ -162,8 +175,15 @@ impl ClientSession {
                         guard.complete();
                         return Ok(());
                     }
-                    Err(_e) => {
-                        // Read error with partial status line — send 430 for remaining
+                    Err(e) => {
+                        warn!(
+                            client = %self.client_addr,
+                            backend = ?backend_id,
+                            response_index = i + 1,
+                            partial_bytes = chunk_data.len(),
+                            error = %e,
+                            "Backend read error with partial status line, sending 430 for remaining commands"
+                        );
                         for remaining in &commands[i..] {
                             self.send_430_to_client(client_write, backend_to_client_bytes)
                                 .await?;
@@ -211,6 +231,13 @@ impl ClientSession {
 
             // Handle invalid response
             if response_code == crate::protocol::NntpResponse::Invalid {
+                warn!(
+                    client = %self.client_addr,
+                    backend = ?backend_id,
+                    command = %command.trim(),
+                    first_bytes = ?&chunk[..chunk.len().min(64)],
+                    "Backend returned invalid response during batch, sending 430"
+                );
                 // Send 430 to client as a safe fallback
                 self.send_430_to_client(client_write, backend_to_client_bytes)
                     .await?;
@@ -245,6 +272,14 @@ impl ClientSession {
                         if is_client_disconnect_error(&e) {
                             return Err(e);
                         }
+                        warn!(
+                            client = %self.client_addr,
+                            backend = ?backend_id,
+                            command_index = i + 1,
+                            total_commands = commands.len(),
+                            error = %e,
+                            "Streaming error during pipelined batch, sending 430 for remaining commands"
+                        );
                         // Backend died mid-stream. Commands 0..i already handled.
                         // Send 430 for remaining commands to maintain protocol sync.
                         for remaining in &commands[i + 1..] {
@@ -562,10 +597,12 @@ impl ClientSession {
                 }
                 Err(e) => {
                     // Backend error (timeout, connection error, etc.)
-                    // Log it but continue trying other backends
-                    debug!(
-                        "Client {} backend error (will try next): {:?}",
-                        self.client_addr, e
+                    // Log at warn level so root cause is visible before any
+                    // downstream ConnectionLimitExceeded errors
+                    warn!(
+                        client = %self.client_addr,
+                        error = %e,
+                        "Backend error during article retry (will try next backend)"
                     );
                     // Continue to next backend
                 }

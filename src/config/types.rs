@@ -151,6 +151,10 @@ pub struct Proxy {
     /// Only used when caching is enabled
     #[serde(default = "super::defaults::capture_pool_count")]
     pub capture_pool_count: usize,
+    /// Minimum log level for the debug.log file appender (default: "warn")
+    /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
+    #[serde(default = "super::defaults::log_file_level")]
+    pub log_file_level: String,
 }
 
 impl Proxy {
@@ -169,6 +173,7 @@ impl Default for Proxy {
             validate_yenc: true,
             buffer_pool_count: defaults::buffer_pool_count(),
             capture_pool_count: defaults::capture_pool_count(),
+            log_file_level: defaults::log_file_level(),
         }
     }
 }

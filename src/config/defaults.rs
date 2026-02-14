@@ -146,4 +146,9 @@ pub fn buffer_pool_count() -> usize {
 pub fn capture_pool_count() -> usize {
     16
 }
+
+/// Default log file level (warn)
+#[inline]
+pub fn log_file_level() -> String {
+    "warn".to_string()
 }

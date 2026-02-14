@@ -38,7 +38,7 @@ macro_rules! retry_once_on_stale {
         match $expr {
             Ok(val) => Ok(val),
             Err(first_error) => {
-                tracing::debug!($($key = %$val,)* "Stale connection, retrying");
+                tracing::warn!($($key = %$val,)* error = ?first_error, "Stale connection, retrying once");
 
                 // Jittered backoff: 10–59ms prevents thundering-herd retries
                 let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 10..60);
@@ -46,7 +46,10 @@ macro_rules! retry_once_on_stale {
 
                 match $expr {
                     Ok(val) => Ok(val),
-                    Err(_retry_error) => Err(first_error),
+                    Err(_retry_error) => {
+                        tracing::warn!($($key = %$val,)* retry_error = ?_retry_error, "Retry also failed");
+                        Err(first_error)
+                    }
                 }
             }
         }

@@ -58,10 +58,6 @@ mod terminator_finding {
         let tail = TailBuffer::default(); // Empty state - no previous chunks
         match tail.detect_terminator(data) {
             TerminatorStatus::FoundAt(pos) => Some(pos),
-            TerminatorStatus::Spanning => {
-                // Can't happen with empty tail + complete response, but handle it
-                Some(data.len())
-            }
             TerminatorStatus::NotFound => None,
         }
     }

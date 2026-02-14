@@ -15,13 +15,13 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    nntp_proxy::logging::init_dual_logging();
-
     let args = Args::parse();
     let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
 
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
+
+    nntp_proxy::logging::init_dual_logging(&config.proxy.log_file_level);
 
     build_runtime(&args, &config)?.block_on(run_proxy(args, config))
 }
