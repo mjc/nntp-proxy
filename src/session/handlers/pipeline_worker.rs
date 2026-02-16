@@ -202,6 +202,19 @@ async fn execute_pipeline_batch(
     }
 
     // All responses processed successfully — connection healthy
+    //
+    // Health validation: Successful reading of all responses (including
+    // terminators) serves as an implicit health check. If the connection
+    // was in a bad state, read_full_response would have failed. The leftover
+    // buffer bounds are enforced in read_full_response (MAX_LEFTOVER_BYTES),
+    // preventing protocol desync from leaving the connection unusable.
+    //
+    // Explicit health check: Verify leftover is reasonable
+    debug_assert!(
+        leftover.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
+        "Leftover buffer should never exceed MAX_LEFTOVER_BYTES after successful batch"
+    );
+
     true
 }
 

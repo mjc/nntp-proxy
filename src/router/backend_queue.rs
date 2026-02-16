@@ -71,6 +71,13 @@ impl BackendQueue {
     ///
     /// Uses compare-exchange loop to prevent TOCTOU race where multiple threads
     /// could both pass the depth check and exceed max_depth.
+    ///
+    /// # Atomicity
+    ///
+    /// The compare-exchange reserves a slot by incrementing depth, then pushes
+    /// to the queue. A RAII guard ensures depth is decremented if the push is
+    /// not committed (e.g., on panic). This prevents the invariant violation
+    /// where depth > actual queue size.
     pub fn try_enqueue(&self, request: QueuedRequest) -> Result<(), QueueError> {
         let mut current = self.depth.load(Ordering::Acquire);
         loop {
@@ -90,7 +97,29 @@ impl BackendQueue {
                 Err(actual) => current = actual,
             }
         }
+
+        // RAII guard ensures depth is decremented if we don't commit
+        struct EnqueueGuard<'a> {
+            depth: &'a AtomicUsize,
+            committed: bool,
+        }
+        impl Drop for EnqueueGuard<'_> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    self.depth.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+
+        let mut guard = EnqueueGuard {
+            depth: &self.depth,
+            committed: false,
+        };
+
+        // Push to queue (SegQueue::push is infallible)
         self.queue.push(request);
+        guard.committed = true; // Mark as committed so guard doesn't decrement
+
         self.notify.notify_one();
         Ok(())
     }
