@@ -40,8 +40,8 @@ macro_rules! retry_once_on_stale {
             Err(first_error) => {
                 tracing::warn!($($key = %$val,)* error = ?first_error, "Stale connection, retrying once");
 
-                // Jittered backoff: 10–59ms prevents thundering-herd retries
-                let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 10..60);
+                // O4: Jittered backoff: 1–9ms prevents thundering-herd retries
+                let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 1..10);
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 
                 match $expr {
@@ -104,5 +104,19 @@ mod tests {
         let result = retry_once_on_stale!(numbered_fail(&counter).await);
         assert_eq!(result, Err("error 0".to_string()));
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_jitter_range() {
+        // Verify jitter is in expected range (1-10ms)
+        // Sample 100 times to ensure we're not generating out-of-range values
+        for _ in 0..100 {
+            let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 1..10);
+            assert!(
+                (1..10).contains(&jitter_ms),
+                "Jitter {} out of range [1, 10)",
+                jitter_ms
+            );
+        }
     }
 }

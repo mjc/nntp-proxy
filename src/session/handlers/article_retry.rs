@@ -92,8 +92,8 @@ impl ClientSession {
         // Phase 2: Read and stream responses in order
         // Acquire buffer once before loop (reused across responses)
         let mut buffer = self.buffer_pool.acquire().await;
-        let mut leftover: Vec<u8> = Vec::new(); // Tracks data from previous response
-        let mut chunk_data: Vec<u8> = Vec::new(); // Holds leftover + new read combined
+        let mut leftover = bytes::BytesMut::new(); // Tracks data from previous response
+        let mut chunk_data = bytes::BytesMut::new(); // Holds leftover + new read combined
 
         for (i, command) in commands.iter().enumerate() {
             let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
@@ -195,7 +195,7 @@ impl ClientSession {
                     }
                 }
             }
-            let chunk = chunk_data.as_slice();
+            let chunk = &chunk_data[..];
             let n = chunk.len(); // Update n after potential additional read
 
             // Validate response
@@ -219,9 +219,12 @@ impl ClientSession {
                     .await?;
                 *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
-                // Record availability
-                self.record_article_missing(msg_id.as_ref(), backend_id, router)
-                    .await;
+                // O3: Record availability using atomic cache operation
+                if let Some(mid) = msg_id.as_ref() {
+                    self.cache
+                        .record_backend_missing(mid.clone(), backend_id)
+                        .await;
+                }
 
                 self.metrics.record_command(backend_id);
                 self.metrics.record_error_4xx(backend_id);
@@ -371,17 +374,8 @@ impl ClientSession {
         };
 
         // H3: Hoist availability loading before pipeline/retry branch (compute once, use in both paths)
-        let availability = match &cached_availability {
-            Some(avail) => Some(*avail),
-            None => match &msg_id {
-                Some(msg_id_ref) => self
-                    .cache
-                    .get(msg_id_ref)
-                    .await
-                    .map(|entry| entry.to_availability(router.backend_count())),
-                None => None,
-            },
-        };
+        // O1: cached_availability already contains the result of cache.get() - reuse it
+        let mut availability = cached_availability;
 
         // Adaptive prechecking for STAT/HEAD commands (if enabled and cache missed)
         if self.adaptive_precheck
@@ -475,10 +469,11 @@ impl ClientSession {
                                     "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
                                     self.client_addr, backend_id
                                 );
-                                // Record this backend as missing so retry loop skips it
-                                self.record_article_missing(msg_id.as_ref(), backend_id, &router)
-                                    .await;
+                                // O2: Record this backend as missing in local availability (no cache round-trip)
+                                let avail = availability.get_or_insert_default();
+                                avail.record_missing(backend_id);
                                 self.metrics.record_pipeline_complete();
+                                self.metrics.record_error_4xx(backend_id);
                                 // Fall through - guard drops, decrementing pending_count
                             }
                             Ok(PipelineResponse::Error(e)) => {
@@ -669,25 +664,6 @@ impl ClientSession {
         if let Some(msg_id_ref) = msg_id {
             self.cache
                 .sync_availability(msg_id_ref.clone(), availability)
-                .await;
-        }
-    }
-
-    /// Record that an article is missing on a specific backend and sync to cache.
-    ///
-    /// Loads the current availability, marks the backend as missing, and syncs back to cache.
-    pub(super) async fn record_article_missing(
-        &self,
-        msg_id: Option<&crate::types::MessageId<'_>>,
-        backend_id: crate::types::BackendId,
-        router: &std::sync::Arc<crate::router::BackendSelector>,
-    ) {
-        if let Some(msg_id_val) = msg_id {
-            let mut avail = self
-                .load_article_availability(Some(msg_id_val), router.backend_count())
-                .await;
-            avail.record_missing(backend_id);
-            self.sync_availability_if_needed(Some(msg_id_val), &avail)
                 .await;
         }
     }

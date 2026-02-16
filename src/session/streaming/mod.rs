@@ -191,7 +191,7 @@ pub async fn stream_multiline_response_pipelined<R, W>(
     client_addr: crate::types::ClientAddress,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
-    leftover: &mut Vec<u8>,
+    leftover: &mut bytes::BytesMut,
 ) -> Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -295,7 +295,7 @@ async fn stream_multiline_response_impl<R, W>(
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
     mut capture: Option<&mut crate::pool::PooledBuffer>,
-    mut leftover_out: Option<&mut Vec<u8>>,
+    mut leftover_out: Option<&mut bytes::BytesMut>,
 ) -> Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -324,7 +324,13 @@ where
             if let Some(leftover) = leftover_out.as_mut()
                 && write_len < first_n
             {
-                leftover.extend_from_slice(&first_chunk[write_len..first_n]);
+                let remainder = &first_chunk[write_len..first_n];
+                anyhow::ensure!(
+                    remainder.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
+                    "Leftover exceeds maximum ({} bytes)",
+                    remainder.len()
+                );
+                leftover.extend_from_slice(remainder);
             }
             debug!(
                 "Client {} multiline response complete ({})",
@@ -374,7 +380,13 @@ where
                 if let Some(leftover) = leftover_out.as_mut()
                     && write_len < n
                 {
-                    leftover.extend_from_slice(&buffers[idx][write_len..n]);
+                    let remainder = &buffers[idx][write_len..n];
+                    anyhow::ensure!(
+                        remainder.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
+                        "Leftover exceeds maximum ({} bytes)",
+                        remainder.len()
+                    );
+                    leftover.extend_from_slice(remainder);
                 }
                 debug!(
                     "Client {} multiline response complete ({})",
@@ -675,7 +687,7 @@ mod tests {
         // No backend reads needed — everything is in first chunk
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
-        let mut leftover = Vec::new();
+        let mut leftover = bytes::BytesMut::new();
         let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let client_addr = crate::types::ClientAddress::from(socket_addr);
         let backend_id = crate::types::BackendId::from_index(1);
@@ -711,7 +723,7 @@ mod tests {
 
         let mut reader = Cursor::new(second_read.as_slice());
         let mut writer = Vec::new();
-        let mut leftover = Vec::new();
+        let mut leftover = bytes::BytesMut::new();
         let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let client_addr = crate::types::ClientAddress::from(socket_addr);
         let backend_id = crate::types::BackendId::from_index(1);
@@ -750,7 +762,7 @@ mod tests {
         let response = b"220 Article follows\r\nBody\r\n.\r\n";
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
-        let mut leftover = Vec::new();
+        let mut leftover = bytes::BytesMut::new();
         let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let client_addr = crate::types::ClientAddress::from(socket_addr);
         let backend_id = crate::types::BackendId::from_index(1);
@@ -773,5 +785,49 @@ mod tests {
         assert_eq!(&writer[..], response.as_slice());
         // No leftover — terminator was at exact end
         assert!(leftover.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_leftover_exceeds_max_size() {
+        use crate::constants::buffer::MAX_LEFTOVER_BYTES;
+        use crate::types::BufferSize;
+
+        // Create a response where leftover after terminator exceeds MAX_LEFTOVER_BYTES
+        let response = b"220 Article follows\r\nBody\r\n.\r\n";
+        let mut combined = Vec::new();
+        combined.extend_from_slice(response);
+        // Add more than MAX_LEFTOVER_BYTES of extra data after terminator
+        combined.extend_from_slice(&vec![b'X'; MAX_LEFTOVER_BYTES + 1]);
+
+        let mut reader = Cursor::new(b"" as &[u8]);
+        let mut writer = Vec::new();
+        let mut leftover = bytes::BytesMut::new();
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+
+        let result = stream_multiline_response_pipelined(
+            &mut reader,
+            &mut writer,
+            &combined,
+            combined.len(),
+            client_addr,
+            backend_id,
+            &buffer_pool,
+            &mut leftover,
+        )
+        .await;
+
+        // Should fail with bounds check error
+        assert!(
+            result.is_err(),
+            "Should error when leftover exceeds max size"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Leftover exceeds") || err.contains("maximum"),
+            "Error should mention leftover size limit: {err}"
+        );
     }
 }
