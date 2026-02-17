@@ -290,7 +290,9 @@ pub struct DiskCache {
     /// - "zstd": Better compression ratio, moderate CPU overhead
     /// - "none": No compression, fastest but largest disk usage
     ///
-    /// SIMD optimizations (SSE2/AVX2/AVX512) are auto-detected and enabled by default.
+    /// For the "lz4" and "zstd" codecs, SIMD optimizations (SSE2/AVX2/AVX512) are
+    /// auto-detected and enabled by default. When `compression = "none"`, no
+    /// compression or SIMD acceleration is performed.
     #[serde(default = "super::defaults::disk_cache_compression_codec")]
     pub compression: CompressionCodec,
 
@@ -1042,5 +1044,17 @@ mod tests {
         "#;
         let disk_cache: DiskCache = toml::from_str(toml).unwrap();
         assert_eq!(disk_cache.compression, CompressionCodec::Zstd);
+    }
+
+    #[test]
+    fn test_disk_cache_deserialize_compression_none() {
+        let toml = r#"
+            path = "/tmp/cache"
+            capacity = "100mb"
+            compression = "none"
+            shards = 4
+        "#;
+        let disk_cache: DiskCache = toml::from_str(toml).unwrap();
+        assert_eq!(disk_cache.compression, CompressionCodec::None);
     }
 }

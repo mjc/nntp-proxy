@@ -33,7 +33,8 @@
 //! - **Zstd**: Better compression ratio, moderate CPU overhead, SIMD-accelerated
 //! - **None**: No compression, fastest but largest disk usage
 //!
-//! All codecs use auto-detected SIMD (SSE2/AVX2/AVX512) for maximum performance.
+//! The LZ4 and Zstd codecs use auto-detected SIMD (SSE2/AVX2/AVX512) for maximum performance;
+//! the `None` codec disables compression entirely and performs no codec-level SIMD work.
 //!
 //! # Performance Characteristics
 //!

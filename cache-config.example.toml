@@ -48,7 +48,7 @@ adaptive_precheck = false
 # #   "lz4"  - Fast compression (~60% reduction), minimal CPU, SIMD-accelerated
 # #   "zstd" - Better compression ratio, moderate CPU overhead, SIMD-accelerated
 # #   "none" - No compression, fastest but largest disk usage
-# # SIMD optimizations (SSE2/AVX2/AVX512) are auto-detected and enabled by default
+# # SIMD optimizations (SSE2/AVX2/AVX512) for "lz4" and "zstd" are auto-detected and enabled by default
 # compression = "lz4"
 # # Number of shards for concurrent disk access (default: 4)
 # # Higher values improve concurrency but use more file handles
