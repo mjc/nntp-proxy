@@ -187,7 +187,12 @@ tls_verify_cert = true
 # # Maximum disk cache size (default: 10gb)
 # # Supports: "100gb", "10gb", "1tb", or raw bytes
 # capacity = "10gb"
-# # Enable LZ4 compression (default: true, ~60% space savings)
-# compression = true
+# # Compression codec for disk storage (default: "lz4")
+# # Options:
+# #   "lz4"  - Fast compression (~60% reduction), minimal CPU, SIMD-accelerated
+# #   "zstd" - Better compression ratio, moderate CPU overhead, SIMD-accelerated
+# #   "none" - No compression, fastest but largest disk usage
+# # SIMD optimizations (SSE2/AVX2/AVX512) are auto-detected and enabled by default
+# compression = "lz4"
 # # Number of shards for concurrent access (default: 4)
 # shards = 4

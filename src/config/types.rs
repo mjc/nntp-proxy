@@ -229,6 +229,35 @@ pub struct Cache {
     pub disk: Option<DiskCache>,
 }
 
+/// Compression codec for disk cache storage
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionCodec {
+    /// No compression (fastest, largest disk usage)
+    None,
+    /// LZ4 compression (fast, ~60% reduction for typical NNTP articles, default)
+    ///
+    /// Uses SIMD (SSE2/AVX2) auto-detection for maximum throughput.
+    /// Compression level: fast mode (default).
+    #[default]
+    Lz4,
+    /// Zstandard compression (better ratio, moderate CPU overhead)
+    ///
+    /// Uses SIMD (SSE2/AVX2/AVX512) auto-detection.
+    /// Compression level: 3 (library default, balanced speed/ratio).
+    Zstd,
+}
+
+impl std::fmt::Display for CompressionCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Lz4 => write!(f, "lz4"),
+            Self::Zstd => write!(f, "zstd"),
+        }
+    }
+}
+
 /// Disk cache configuration for hybrid caching
 ///
 /// When enabled, creates a two-tier cache:
@@ -254,12 +283,16 @@ pub struct DiskCache {
     #[serde(default = "super::defaults::disk_cache_capacity")]
     pub capacity: CacheCapacity,
 
-    /// Enable LZ4 compression for disk storage (default: true)
+    /// Compression codec for disk storage (default: lz4)
     ///
-    /// Reduces disk usage by ~60% for typical NNTP articles.
-    /// Slight CPU overhead for compression/decompression.
-    #[serde(default = "super::defaults::disk_cache_compression")]
-    pub compression: bool,
+    /// Options:
+    /// - "lz4" (default): Fast compression (~60% reduction), minimal CPU overhead
+    /// - "zstd": Better compression ratio, moderate CPU overhead
+    /// - "none": No compression, fastest but largest disk usage
+    ///
+    /// SIMD optimizations (SSE2/AVX2/AVX512) are auto-detected and enabled by default.
+    #[serde(default = "super::defaults::disk_cache_compression_codec")]
+    pub compression: CompressionCodec,
 
     /// Number of shards for concurrent disk access (default: 4)
     ///
@@ -273,7 +306,7 @@ impl Default for DiskCache {
         Self {
             path: defaults::disk_cache_path(),
             capacity: defaults::disk_cache_capacity(),
-            compression: defaults::disk_cache_compression(),
+            compression: defaults::disk_cache_compression_codec(),
             shards: defaults::disk_cache_shards(),
         }
     }
@@ -955,5 +988,59 @@ mod tests {
         assert_eq!(config.proxy.host, "0.0.0.0");
         assert!(config.cache.is_none());
         assert!(!config.client_auth.is_enabled());
+    }
+
+    // CompressionCodec tests
+    #[test]
+    fn test_compression_codec_serde_lz4() {
+        let json = r#""lz4""#;
+        let codec: CompressionCodec = serde_json::from_str(json).unwrap();
+        assert_eq!(codec, CompressionCodec::Lz4);
+        assert_eq!(serde_json::to_string(&codec).unwrap(), json);
+    }
+
+    #[test]
+    fn test_compression_codec_serde_zstd() {
+        let json = r#""zstd""#;
+        let codec: CompressionCodec = serde_json::from_str(json).unwrap();
+        assert_eq!(codec, CompressionCodec::Zstd);
+    }
+
+    #[test]
+    fn test_compression_codec_serde_none() {
+        let json = r#""none""#;
+        let codec: CompressionCodec = serde_json::from_str(json).unwrap();
+        assert_eq!(codec, CompressionCodec::None);
+    }
+
+    #[test]
+    fn test_compression_codec_default_is_lz4() {
+        assert_eq!(CompressionCodec::default(), CompressionCodec::Lz4);
+    }
+
+    #[test]
+    fn test_compression_codec_display() {
+        assert_eq!(CompressionCodec::Lz4.to_string(), "lz4");
+        assert_eq!(CompressionCodec::Zstd.to_string(), "zstd");
+        assert_eq!(CompressionCodec::None.to_string(), "none");
+    }
+
+    // DiskCache tests with compression codec
+    #[test]
+    fn test_disk_cache_default_compression_is_lz4() {
+        let disk_cache = DiskCache::default();
+        assert_eq!(disk_cache.compression, CompressionCodec::Lz4);
+    }
+
+    #[test]
+    fn test_disk_cache_deserialize_compression_codec() {
+        let toml = r#"
+            path = "/tmp/cache"
+            capacity = "100mb"
+            compression = "zstd"
+            shards = 4
+        "#;
+        let disk_cache: DiskCache = toml::from_str(toml).unwrap();
+        assert_eq!(disk_cache.compression, CompressionCodec::Zstd);
     }
 }

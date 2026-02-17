@@ -2,6 +2,7 @@
 //!
 //! This module centralizes all default value functions used in serde deserialization.
 
+use super::types::CompressionCodec;
 use crate::types::{CacheCapacity, MaxConnections, MaxErrors};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -89,10 +90,10 @@ pub fn disk_cache_capacity() -> CacheCapacity {
     CacheCapacity::try_new(10 * 1024 * 1024 * 1024).expect("10GB is non-zero")
 }
 
-/// Default disk cache compression (true = LZ4 enabled)
+/// Default disk cache compression codec (LZ4 = fast, ~60% reduction)
 #[inline]
-pub fn disk_cache_compression() -> bool {
-    true
+pub fn disk_cache_compression_codec() -> CompressionCodec {
+    CompressionCodec::Lz4
 }
 
 /// Default disk cache shards
