@@ -6,25 +6,23 @@ use crate::protocol::TERMINATOR_TAIL_SIZE;
 
 /// Status of terminator detection in a chunk
 #[derive(Debug, Clone, Copy)]
-pub(super) enum TerminatorStatus {
+pub enum TerminatorStatus {
     /// Complete terminator found at this position (position is after terminator)
     FoundAt(usize),
-    /// Terminator spans the boundary between tail and current chunk
-    Spanning,
     /// No terminator found
     NotFound,
 }
 
 impl TerminatorStatus {
-    /// Returns true if a terminator was found (either complete or spanning)
-    pub(super) fn is_found(self) -> bool {
-        !matches!(self, Self::NotFound)
+    /// Returns true if a terminator was found
+    pub fn is_found(self) -> bool {
+        matches!(self, Self::FoundAt(_))
     }
     /// Get the number of bytes to write from the chunk
-    pub(super) fn write_len(self, chunk_size: usize) -> usize {
+    pub fn write_len(self, chunk_size: usize) -> usize {
         match self {
             Self::FoundAt(pos) => pos,
-            Self::Spanning | Self::NotFound => chunk_size,
+            Self::NotFound => chunk_size,
         }
     }
 }
@@ -33,14 +31,14 @@ impl TerminatorStatus {
 ///
 /// Used to detect terminators that span across chunk boundaries.
 #[derive(Default)]
-pub(super) struct TailBuffer {
+pub struct TailBuffer {
     data: [u8; TERMINATOR_TAIL_SIZE],
     len: usize,
 }
 
 impl TailBuffer {
     /// Update tail with the last bytes from a chunk
-    pub(super) fn update(&mut self, chunk: &[u8]) {
+    pub fn update(&mut self, chunk: &[u8]) {
         if chunk.len() >= TERMINATOR_TAIL_SIZE {
             self.data
                 .copy_from_slice(&chunk[chunk.len() - TERMINATOR_TAIL_SIZE..]);
@@ -51,35 +49,38 @@ impl TailBuffer {
         }
     }
     /// Get the tail data as a slice
-    pub(super) fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.data[..self.len]
     }
     /// Get the current length of valid tail data
-    pub(super) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
     /// Returns true if the buffer is empty
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-    /// Check if terminator spans the boundary between this tail and the given chunk
-    pub(super) fn has_spanning_terminator(&self, chunk: &[u8]) -> bool {
+    /// Find spanning terminator offset in chunk
+    ///
+    /// Returns the byte offset in the chunk where the terminator ends,
+    /// or None if no spanning terminator is found.
+    pub fn find_spanning_terminator(&self, chunk: &[u8]) -> Option<usize> {
         // Early return if buffer is empty - no boundary to span
         if self.is_empty() {
-            return false;
+            return None;
         }
-        has_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
+        find_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
     }
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
     /// **Performance**: find_terminator_end() checks end first (O(1)),
     /// only scans with memchr if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
-    pub(super) fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
+    pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
         if let Some(pos) = find_terminator_end(chunk) {
             TerminatorStatus::FoundAt(pos)
-        } else if self.has_spanning_terminator(chunk) {
-            TerminatorStatus::Spanning
+        } else if let Some(end) = self.find_spanning_terminator(chunk) {
+            TerminatorStatus::FoundAt(end)
         } else {
             TerminatorStatus::NotFound
         }
@@ -121,60 +122,62 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
         })
 }
 
-/// Check if a terminator spans across a boundary between tail and current chunk
+/// Find spanning terminator across boundary between tail and current chunk
+///
+/// Returns the byte offset in the current chunk where the terminator ends,
+/// or None if no spanning terminator is found.
 ///
 /// This handles the case where a multiline terminator is split across two read chunks.
-/// For example: previous chunk ends with "\r\n." and current starts with "\r\n"
+/// For example: previous chunk ends with "\r\n." and current starts with "\r\n" → returns Some(2)
 ///
 /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
 /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
 #[inline]
-fn has_spanning_terminator(
+fn find_spanning_terminator(
     tail: &[u8],
     tail_len: usize,
     current: &[u8],
     current_len: usize,
-) -> bool {
-    // Only check if we have a tail and current chunk is small enough for spanning
-    if tail_len < 1 || !(1..=4).contains(&current_len) {
-        return false;
+) -> Option<usize> {
+    if tail_len < 1 || current_len < 1 {
+        return None;
     }
 
     // Check all possible split positions of the 5-byte terminator "\r\n.\r\n"
-    // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n"
+    // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n" → offset 4
     if tail_len >= 1
         && current_len >= 4
         && tail[tail_len - 1] == b'\r'
         && current[..4] == *b"\n.\r\n"
     {
-        return true;
+        return Some(4);
     }
-    // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n"
+    // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n" → offset 3
     if tail_len >= 2
         && current_len >= 3
         && tail[tail_len - 2..tail_len] == *b"\r\n"
         && current[..3] == *b".\r\n"
     {
-        return true;
+        return Some(3);
     }
-    // Split after byte 3: tail ends with "\r\n.", current starts with "\r\n"
+    // Split after byte 3: tail ends with "\r\n.", current starts with "\r\n" → offset 2
     if tail_len >= 3
         && current_len >= 2
         && tail[tail_len - 3..tail_len] == *b"\r\n."
         && current[..2] == *b"\r\n"
     {
-        return true;
+        return Some(2);
     }
-    // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n"
+    // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n" → offset 1
     if tail_len >= 4
         && current_len >= 1
         && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
         && current[0] == b'\n'
     {
-        return true;
+        return Some(1);
     }
 
-    false
+    None
 }
 
 #[cfg(test)]
@@ -186,14 +189,12 @@ mod tests {
     #[test]
     fn test_terminator_status_is_found() {
         assert!(TerminatorStatus::FoundAt(10).is_found());
-        assert!(TerminatorStatus::Spanning.is_found());
         assert!(!TerminatorStatus::NotFound.is_found());
     }
 
     #[test]
     fn test_terminator_status_write_len() {
         assert_eq!(TerminatorStatus::FoundAt(42).write_len(100), 42);
-        assert_eq!(TerminatorStatus::Spanning.write_len(100), 100);
         assert_eq!(TerminatorStatus::NotFound.write_len(100), 100);
     }
 
@@ -281,51 +282,52 @@ mod tests {
         assert_eq!(tail.len(), TERMINATOR_TAIL_SIZE);
     }
 
-    // TailBuffer::has_spanning_terminator tests
+    // TailBuffer::find_spanning_terminator tests
 
     #[test]
-    fn test_has_spanning_terminator_empty_tail() {
+    fn test_find_spanning_terminator_empty_tail() {
         let tail = TailBuffer::default();
-        assert!(!tail.has_spanning_terminator(b"\r\n.\r\n"));
+        assert_eq!(tail.find_spanning_terminator(b"\r\n.\r\n"), None);
     }
 
     #[test]
-    fn test_has_spanning_terminator_no_match() {
+    fn test_find_spanning_terminator_no_match() {
         let mut tail = TailBuffer::default();
         tail.update(b"abcde");
-        assert!(!tail.has_spanning_terminator(b"fghij"));
+        assert_eq!(tail.find_spanning_terminator(b"fghij"), None);
     }
 
     #[test]
-    fn test_has_spanning_terminator_complete_in_chunk() {
+    fn test_find_spanning_terminator_complete_in_chunk() {
         let mut tail = TailBuffer::default();
         tail.update(b"data\r");
-        // Terminator completely in next chunk
-        assert!(!tail.has_spanning_terminator(b"\n.\r\nmore"));
+        // Terminator completely in next chunk, not spanning
+        // This used to incorrectly return false due to chunk size guard.
+        // Now it correctly returns Some(4) because tail ends with \r and chunk starts with \n.\r\n
+        assert_eq!(tail.find_spanning_terminator(b"\n.\r\nmore"), Some(4));
     }
 
     #[test]
-    fn test_has_spanning_terminator_actual_span() {
+    fn test_find_spanning_terminator_actual_span() {
         // Test case 1: tail ends with "\r\n", current starts with ".\r\n" (3 bytes)
         let mut tail = TailBuffer::default();
         tail.update(b"data\r\n"); // Last 4 bytes: "ta\r\n"
-        // Spanning requires current_len to be 1-4 bytes
-        assert!(tail.has_spanning_terminator(b".\r\n"));
+        assert_eq!(tail.find_spanning_terminator(b".\r\n"), Some(3));
 
         // Test case 2: tail ends with "\r\n.", current starts with "\r\n" (2 bytes)
         let mut tail2 = TailBuffer::default();
         tail2.update(b"line\r\n."); // Last 4 bytes: "e\r\n."
-        assert!(tail2.has_spanning_terminator(b"\r\n"));
+        assert_eq!(tail2.find_spanning_terminator(b"\r\n"), Some(2));
 
         // Test case 3: tail ends with "\r", current starts with "\n.\r\n" (4 bytes)
         let mut tail3 = TailBuffer::default();
         tail3.update(b"text\r"); // Last 4 bytes: "ext\r"
-        assert!(tail3.has_spanning_terminator(b"\n.\r\n"));
+        assert_eq!(tail3.find_spanning_terminator(b"\n.\r\n"), Some(4));
 
         // Test case 4: tail ends with "\r\n.\r", current starts with "\n" (1 byte)
         let mut tail4 = TailBuffer::default();
         tail4.update(b"abc\r\n.\r"); // Last 4 bytes: "\r\n.\r"
-        assert!(tail4.has_spanning_terminator(b"\n"));
+        assert_eq!(tail4.find_spanning_terminator(b"\n"), Some(1));
     }
 
     // TailBuffer::detect_terminator tests
@@ -366,7 +368,10 @@ mod tests {
         let chunk = b".\r\n";
         let status = tail.detect_terminator(chunk);
 
-        assert!(matches!(status, TerminatorStatus::Spanning));
+        match status {
+            TerminatorStatus::FoundAt(pos) => assert_eq!(pos, 3),
+            _ => panic!("Expected FoundAt(3), got {:?}", status),
+        }
     }
 
     #[test]
@@ -412,8 +417,7 @@ mod tests {
         // Terminator at position 500
         assert_eq!(TerminatorStatus::FoundAt(500).write_len(chunk_size), 500);
 
-        // Spanning or not found - write full chunk
-        assert_eq!(TerminatorStatus::Spanning.write_len(chunk_size), chunk_size);
+        // Not found - write full chunk
         assert_eq!(TerminatorStatus::NotFound.write_len(chunk_size), chunk_size);
     }
 
@@ -479,24 +483,25 @@ mod tests {
     }
 
     #[test]
-    fn prop_has_spanning_terminator_never_panics_all_splits() {
-        // Test all 4 possible split positions
+    fn prop_find_spanning_terminator_never_panics_all_splits() {
+        // Test all 4 possible split positions with expected offsets
         let terminators = vec![
-            (b"\r".to_vec(), b"\n.\r\n".to_vec()), // Split 1
-            (b"\r\n".to_vec(), b".\r\n".to_vec()), // Split 2
-            (b"\r\n.".to_vec(), b"\r\n".to_vec()), // Split 3
-            (b"\r\n.\r".to_vec(), b"\n".to_vec()), // Split 4
+            (b"\r".to_vec(), b"\n.\r\n".to_vec(), 4), // Split 1
+            (b"\r\n".to_vec(), b".\r\n".to_vec(), 3), // Split 2
+            (b"\r\n.".to_vec(), b"\r\n".to_vec(), 2), // Split 3
+            (b"\r\n.\r".to_vec(), b"\n".to_vec(), 1), // Split 4
         ];
 
-        for (tail_bytes, chunk_bytes) in terminators {
-            let result = has_spanning_terminator(
+        for (tail_bytes, chunk_bytes, expected_offset) in terminators {
+            let result = find_spanning_terminator(
                 &tail_bytes,
                 tail_bytes.len(),
                 &chunk_bytes,
                 chunk_bytes.len(),
             );
-            assert!(
+            assert_eq!(
                 result,
+                Some(expected_offset),
                 "Failed for tail={:?}, chunk={:?}",
                 std::str::from_utf8(&tail_bytes),
                 std::str::from_utf8(&chunk_bytes)
@@ -505,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn prop_has_spanning_terminator_rejects_non_spanning() {
+    fn prop_find_spanning_terminator_rejects_non_spanning() {
         // These should NOT be detected as spanning
         let non_spanning = vec![
             (b"abc".to_vec(), b"def".to_vec()),
@@ -515,14 +520,15 @@ mod tests {
         ];
 
         for (tail_bytes, chunk_bytes) in non_spanning {
-            let result = has_spanning_terminator(
+            let result = find_spanning_terminator(
                 &tail_bytes,
                 tail_bytes.len(),
                 &chunk_bytes,
                 chunk_bytes.len(),
             );
-            assert!(
-                !result,
+            assert_eq!(
+                result,
+                None,
                 "False positive for tail={:?}, chunk={:?}",
                 std::str::from_utf8(&tail_bytes),
                 std::str::from_utf8(&chunk_bytes)
@@ -588,24 +594,122 @@ mod tests {
     fn prop_spanning_junction_multiple_boundaries() {
         let mut tail = TailBuffer::default();
 
-        // Test each of the 4 split positions
-        // Split 1: tail ends with "\r", chunk starts with "\n.\r\n"
+        // Test each of the 4 split positions with expected offsets
+        // Split 1: tail ends with "\r", chunk starts with "\n.\r\n" → offset 4
         tail.update(b"text\r");
-        assert!(tail.has_spanning_terminator(b"\n.\r\n"));
+        assert_eq!(tail.find_spanning_terminator(b"\n.\r\n"), Some(4));
 
-        // Split 2: tail ends with "\r\n", chunk starts with ".\r\n"
+        // Split 2: tail ends with "\r\n", chunk starts with ".\r\n" → offset 3
         let mut tail = TailBuffer::default();
         tail.update(b"text\r\n");
-        assert!(tail.has_spanning_terminator(b".\r\n"));
+        assert_eq!(tail.find_spanning_terminator(b".\r\n"), Some(3));
 
-        // Split 3: tail ends with "\r\n.", chunk starts with "\r\n"
+        // Split 3: tail ends with "\r\n.", chunk starts with "\r\n" → offset 2
         let mut tail = TailBuffer::default();
         tail.update(b"text\r\n.");
-        assert!(tail.has_spanning_terminator(b"\r\n"));
+        assert_eq!(tail.find_spanning_terminator(b"\r\n"), Some(2));
 
-        // Split 4: tail ends with "\r\n.\r", chunk starts with "\n"
+        // Split 4: tail ends with "\r\n.\r", chunk starts with "\n" → offset 1
         let mut tail = TailBuffer::default();
         tail.update(b"text\r\n.\r");
-        assert!(tail.has_spanning_terminator(b"\n"));
+        assert_eq!(tail.find_spanning_terminator(b"\n"), Some(1));
+    }
+
+    // =========================================================================
+    // NEW TESTS for spanning terminator offset detection
+    // =========================================================================
+
+    #[test]
+    fn test_spanning_with_large_chunk() {
+        // Critical bug: spanning detection rejects chunks > 4 bytes
+        let mut tail = TailBuffer::default();
+        tail.update(b"text\r\n"); // tail ends "\r\n"
+
+        // Chunk: ".\r\n" + 8000 bytes of data (real-world TCP read size)
+        let mut chunk = b".\r\n".to_vec();
+        chunk.extend(vec![b'X'; 8000]);
+
+        let status = tail.detect_terminator(&chunk);
+        // Should return FoundAt(3), not NotFound
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(pos, 3, "Terminator ends at byte 3");
+            }
+            _ => panic!("Expected FoundAt(3), got {:?}", status),
+        }
+    }
+
+    #[test]
+    fn test_spanning_offset_split1() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"text\r"); // tail ends "\r"
+        let chunk = b"\n.\r\nLeftover data here";
+
+        let status = tail.detect_terminator(chunk);
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(pos, 4, "Split 1: terminator ends at byte 4");
+            }
+            _ => panic!("Expected FoundAt(4), got {:?}", status),
+        }
+    }
+
+    #[test]
+    fn test_spanning_offset_split2() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"text\r\n"); // tail ends "\r\n"
+        let chunk = b".\r\nLeftover data here";
+
+        let status = tail.detect_terminator(chunk);
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(pos, 3, "Split 2: terminator ends at byte 3");
+            }
+            _ => panic!("Expected FoundAt(3), got {:?}", status),
+        }
+    }
+
+    #[test]
+    fn test_spanning_offset_split3() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"text\r\n."); // tail ends "\r\n."
+        let chunk = b"\r\nLeftover data here";
+
+        let status = tail.detect_terminator(chunk);
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(pos, 2, "Split 3: terminator ends at byte 2");
+            }
+            _ => panic!("Expected FoundAt(2), got {:?}", status),
+        }
+    }
+
+    #[test]
+    fn test_spanning_offset_split4() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"text\r\n.\r"); // tail ends "\r\n.\r"
+        let chunk = b"\nLeftover data here";
+
+        let status = tail.detect_terminator(chunk);
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(pos, 1, "Split 4: terminator ends at byte 1");
+            }
+            _ => panic!("Expected FoundAt(1), got {:?}", status),
+        }
+    }
+
+    #[test]
+    fn test_spanning_write_len_not_full_chunk() {
+        // Verify write_len returns offset, not full chunk size
+        let mut tail = TailBuffer::default();
+        tail.update(b"text\r\n");
+        let chunk = b".\r\nLeftover123456789";
+
+        let status = tail.detect_terminator(chunk);
+        let write_len = status.write_len(chunk.len());
+
+        assert_eq!(write_len, 3, "Should write only up to terminator end");
+        assert!(write_len < chunk.len(), "Should not write full chunk");
     }
 }

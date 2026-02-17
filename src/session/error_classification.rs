@@ -2,8 +2,7 @@
 //!
 //! Provides helpers to classify errors wrapped in anyhow::Error
 
-use crate::connection_error::ConnectionError;
-use std::io::ErrorKind;
+use crate::connection_error::{ConnectionError, is_disconnect_kind};
 
 /// Classify an anyhow error and determine appropriate handling
 pub struct ErrorClassifier;
@@ -20,12 +19,9 @@ impl ErrorClassifier {
             return conn_err.is_client_disconnect();
         }
 
-        // Check raw IO error for both BrokenPipe and ConnectionReset
+        // Check raw IO error using centralized disconnect kinds
         if let Some(io_err) = error.downcast_ref::<std::io::Error>() {
-            return matches!(
-                io_err.kind(),
-                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-            );
+            return is_disconnect_kind(io_err.kind());
         }
 
         false
@@ -56,6 +52,7 @@ impl ErrorClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     #[test]
     fn test_is_client_disconnect_with_io_error() {

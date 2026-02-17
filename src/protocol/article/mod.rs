@@ -244,20 +244,9 @@ impl<'a> Article<'a> {
 
 /// Parse status code from buffer
 fn parse_status_code(buf: &[u8]) -> Result<u16, ParseError> {
-    if buf.len() < 3 {
-        return Err(ParseError::BufferTooShort);
-    }
-
-    // Status code is first 3 bytes
-    let code_bytes = &buf[..3];
-
-    // Parse as ASCII digits
-    let code = std::str::from_utf8(code_bytes)
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or(ParseError::InvalidStatusCode(0))?;
-
-    Ok(code)
+    crate::protocol::StatusCode::parse(buf)
+        .map(|sc| sc.as_u16())
+        .ok_or(ParseError::InvalidStatusCode(0))
 }
 
 /// Parse first line to extract message-id and optional article number

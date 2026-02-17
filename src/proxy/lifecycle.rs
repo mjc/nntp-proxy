@@ -140,7 +140,7 @@ impl NntpProxy {
         metrics: &types::TransferMetrics,
     ) {
         self.connection_stats
-            .record_disconnection(session.username().as_deref(), routing_mode.short_name());
+            .record_disconnection(session.username(), routing_mode.short_name());
 
         debug!(
             "Session {} [{}] ↑{} ↓{}",
@@ -291,7 +291,7 @@ impl NntpProxy {
         if !self.auth_handler.is_enabled() || session.username().is_none() {
             let mode = self.session_mode_label(session.mode());
             self.connection_stats
-                .record_connection(session.username().as_deref(), mode);
+                .record_connection(session.username(), mode);
         }
     }
 

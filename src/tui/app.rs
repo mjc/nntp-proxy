@@ -159,6 +159,7 @@ pub struct TuiAppBuilder {
     router: Arc<BackendSelector>,
     servers: Arc<Vec<Server>>,
     cache: Option<Arc<crate::cache::UnifiedCache>>,
+    buffer_pool: Option<crate::pool::BufferPool>,
     log_buffer: Option<LogBuffer>,
     history_size: HistorySize,
 }
@@ -176,6 +177,7 @@ impl TuiAppBuilder {
             router,
             servers,
             cache: None,
+            buffer_pool: None,
             log_buffer: None,
             history_size: HistorySize::DEFAULT,
         }
@@ -185,6 +187,13 @@ impl TuiAppBuilder {
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<crate::cache::UnifiedCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Set the buffer pool for monitoring I/O buffer statistics
+    #[must_use]
+    pub fn with_buffer_pool(mut self, buffer_pool: crate::pool::BufferPool) -> Self {
+        self.buffer_pool = Some(buffer_pool);
         self
     }
 
@@ -220,6 +229,7 @@ impl TuiAppBuilder {
             router: self.router,
             servers: self.servers,
             cache: self.cache,
+            buffer_pool: self.buffer_pool,
             snapshot,
             backend_history,
             client_history: ThroughputHistory::new(self.history_size),
@@ -264,6 +274,8 @@ pub struct TuiApp {
     system_stats: crate::tui::SystemStats,
     /// Article cache (optional - only present in caching mode)
     cache: Option<Arc<crate::cache::UnifiedCache>>,
+    /// Buffer pool for I/O operations (optional - for monitoring buffer stats)
+    buffer_pool: Option<crate::pool::BufferPool>,
 }
 
 impl TuiApp {
@@ -280,8 +292,7 @@ impl TuiApp {
         TuiAppBuilder::new(metrics, router, servers).build()
     }
 
-    /// Calculate throughput rate from byte delta and time delta
-    /// Calculate byte transfer rate
+    /// Calculate byte transfer rate from byte delta and time delta
     #[inline]
     fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> Throughput {
         if time_delta_secs > 0.0 {
@@ -529,6 +540,12 @@ impl TuiApp {
     #[must_use]
     pub const fn system_stats(&self) -> &crate::tui::SystemStats {
         &self.system_stats
+    }
+
+    /// Get buffer pool (optional - for monitoring buffer stats)
+    #[must_use]
+    pub fn buffer_pool(&self) -> Option<&crate::pool::BufferPool> {
+        self.buffer_pool.as_ref()
     }
 }
 

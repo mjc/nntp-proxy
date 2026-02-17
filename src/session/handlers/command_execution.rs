@@ -3,18 +3,18 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and streaming multiline responses to clients.
 
+use crate::is_client_disconnect_error;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::retry::retry_once_on_stale;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
-    is_430_status_code,
 };
 use crate::session::{ClientSession, backend, streaming};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Result of attempting to execute a command on a backend
 pub(super) enum BackendAttemptResult {
@@ -38,7 +38,7 @@ impl ClientSession {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn try_backend_for_article(
         &self,
-        router: Arc<BackendSelector>,
+        router: &Arc<BackendSelector>,
         command: &str,
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
@@ -50,7 +50,7 @@ impl ClientSession {
         let backend_id =
             router.route_command_with_availability(self.client_id, command, Some(availability))?;
 
-        // RAII guard ensures complete_command is called on all exit paths
+        // RAII guard ensures complete_command is called on all exit paths (clone Arc here)
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         // Get connection provider
@@ -61,45 +61,33 @@ impl ClientSession {
         };
 
         // Retry once on stale connection (fresh connection on second attempt)
-        let label = format!(
-            "client {} backend {}",
-            self.client_addr,
-            backend_id.as_index()
-        );
-        let (conn, n, response_code, is_multiline, ttfb, send, recv): (
-            _,
-            usize,
-            _,
-            bool,
-            u64,
-            u64,
-            u64,
-        ) = retry_once_on_stale!(
-            label,
+        let (conn, cmd_response, ttfb, send, recv) = retry_once_on_stale!(
             self.execute_backend_attempt(provider, backend_id, command, buffer)
-                .await
+                .await,
+            client = self.client_addr,
+            backend = backend_id.as_index()
         )?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
         *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
         // Reject invalid responses - never forward garbage to client
-        if response_code == crate::protocol::NntpResponse::Invalid {
-            tracing::error!(
+        if cmd_response.response == crate::protocol::NntpResponse::Invalid {
+            tracing::warn!(
                 backend_id = backend_id.as_index(),
-                first_bytes = ?&buffer[..n.min(64)],
+                first_bytes = ?&buffer[..cmd_response.bytes_read.min(64)],
                 "Backend returned invalid/unparseable response, rejecting"
             );
             // Mark backend as unavailable for this article so we try next one
             availability.record_missing(backend_id);
             // guard drops here → complete_command called automatically
-            crate::pool::remove_from_pool(conn);
+            provider.remove_with_cooldown(conn);
             return Ok(BackendAttemptResult::BackendUnavailable);
         }
 
         // Handle 430 - article not found
         // Note: response is already read into buffer, keeping connection clean
-        if self.is_430_response(&response_code) {
+        if cmd_response.is_430() {
             self.handle_430_availability(backend_id, availability);
             // guard drops here → complete_command called automatically
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
@@ -107,41 +95,43 @@ impl ClientSession {
 
         // Success - stream response
         let mut conn = conn;
-        let bytes_written = match self
+        let bytes_written = self
             .stream_response_to_client(
                 &mut conn,
                 client_write,
                 backend_id,
                 command,
                 msg_id,
-                &response_code,
-                is_multiline,
-                &buffer[..n],
-                n,
+                &cmd_response.response,
+                cmd_response.is_multiline,
+                &buffer[..cmd_response.bytes_read],
+                cmd_response.bytes_read,
             )
             .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
+            .inspect_err(|e| {
                 // guard drops here → complete_command called automatically
                 // (prevents TUI in-flight count drift on streaming errors)
 
                 // Only mark as backend error metrics if it's NOT a client disconnect.
                 // Client disconnects are normal behavior and shouldn't penalize backends.
-                if !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&e)
-                {
+                if !is_client_disconnect_error(e) {
+                    warn!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command = %command.trim(),
+                        error = %e,
+                        "Streaming error, removing connection from pool"
+                    );
                     self.metrics.record_error(backend_id);
-                    self.metrics.user_error(self.username().as_deref());
+                    self.metrics.user_error(self.username());
                 }
-                crate::pool::remove_from_pool(conn);
-                return Err(e);
-            }
-        };
+                provider.remove_with_cooldown(conn);
+            })?;
 
         self.record_response_metrics(
             backend_id,
-            &response_code,
-            is_multiline,
+            &cmd_response.response,
+            cmd_response.is_multiline,
             command.len() as u64,
             bytes_written,
         );
@@ -167,24 +157,21 @@ impl ClientSession {
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(
         deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        usize,
-        crate::protocol::NntpResponse,
-        bool,
+        backend::CommandResponse,
         u64,
         u64,
         u64,
     )> {
         let mut conn = provider.get_pooled_connection().await?;
 
-        match self
+        let result = self
             .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
-            .await
-        {
-            Ok((n, response_code, is_multiline, ttfb, send, recv)) => {
-                Ok((conn, n, response_code, is_multiline, ttfb, send, recv))
-            }
+            .await;
+
+        match result {
+            Ok((cmd_response, ttfb, send, recv)) => Ok((conn, cmd_response, ttfb, send, recv)),
             Err(e) => {
-                crate::pool::remove_from_pool(conn);
+                provider.remove_with_cooldown(conn);
                 Err(e)
             }
         }
@@ -200,37 +187,17 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         command: &str,
         buffer: &mut crate::pool::PooledBuffer,
-    ) -> Result<(usize, crate::protocol::NntpResponse, bool, u64, u64, u64)> {
+    ) -> Result<(backend::CommandResponse, u64, u64, u64)> {
         self.metrics.record_command(backend_id);
-        self.metrics.user_command(self.username().as_deref());
+        self.metrics.user_command(self.username());
 
         let (response, ttfb, send, recv) =
             backend::send_command_timed(conn, command, buffer).await?;
 
         // Log any validation warnings
-        backend::log_warnings(
-            &response.warnings,
-            &buffer[..response.bytes_read],
-            response.bytes_read,
-            self.client_addr,
-            backend_id,
-        );
+        response.log_warnings(&buffer[..response.bytes_read], self.client_addr, backend_id);
 
-        Ok((
-            response.bytes_read,
-            response.response,
-            response.is_multiline,
-            ttfb,
-            send,
-            recv,
-        ))
-    }
-
-    /// Check if response is 430 (article not found)
-    pub(super) fn is_430_response(&self, response_code: &crate::protocol::NntpResponse) -> bool {
-        response_code
-            .status_code()
-            .is_some_and(|code| is_430_status_code(code.as_u16()))
+        Ok((response, ttfb, send, recv))
     }
 
     /// Stream response from backend to client and handle caching
@@ -249,11 +216,11 @@ impl ClientSession {
     ) -> Result<u64> {
         // SAFETY: Caller must validate response before calling this function.
         // An invalid response (code 0) should never reach here.
-        let Some(status_code) = response_code.status_code() else {
+        let status_code = response_code.status_code().ok_or_else(|| {
             // This should never happen - caller should reject Invalid responses
             tracing::error!("BUG: stream_response_to_client called with Invalid response");
-            anyhow::bail!("Cannot stream invalid response");
-        };
+            anyhow::anyhow!("Cannot stream invalid response")
+        })?;
         let code = status_code.as_u16();
 
         let cache_action = determine_cache_action(
@@ -275,7 +242,7 @@ impl ClientSession {
 
         match (is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let mut captured = Vec::with_capacity(first_chunk.len() * 2);
+                let mut captured = self.buffer_pool.acquire_capture().await;
                 let bytes = streaming::stream_and_capture_multiline_response(
                     &mut **pooled_conn,
                     client_write,
@@ -295,9 +262,8 @@ impl ClientSession {
                         msg_id_ref,
                         captured.len()
                     );
-                    let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, captured, backend_id, tier);
                 }
+                self.maybe_cache_upsert(msg_id, &captured, backend_id);
                 Ok(bytes)
             }
             (true, CacheAction::TrackAvailability) => {
@@ -312,10 +278,13 @@ impl ClientSession {
                 )
                 .await?;
 
-                if let Some(msg_id_ref) = msg_id {
-                    let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, first_chunk.to_vec(), backend_id, tier);
-                }
+                // Extract first status line (~30-80 bytes) instead of copying
+                // full first_chunk (8-64KB). The cache only needs the status
+                // code to build an availability stub.
+                // SmallVec keeps small status lines on stack, avoiding heap allocation
+                // until the spawn boundary where .to_vec() happens inside spawn_cache_upsert.
+                let stub = crate::cache::extract_status_line(first_chunk);
+                self.maybe_cache_upsert(msg_id, &stub, backend_id);
                 Ok(bytes)
             }
             (true, _) => {
@@ -333,10 +302,7 @@ impl ClientSession {
             }
             (false, CacheAction::TrackStat) => {
                 client_write.write_all(first_chunk).await?;
-                if let Some(msg_id_ref) = msg_id {
-                    let tier = self.tier_for_backend(backend_id);
-                    self.spawn_cache_upsert(msg_id_ref, b"223\r\n".to_vec(), backend_id, tier);
-                }
+                self.maybe_cache_upsert(msg_id, b"223\r\n", backend_id);
                 Ok(first_chunk_size as u64)
             }
             (false, _) => {
@@ -374,6 +340,20 @@ impl ClientSession {
         self.metrics.record_send_recv_micros(backend_id, send, recv);
     }
 
+    /// Cache article data if message ID is present
+    #[inline]
+    fn maybe_cache_upsert(
+        &self,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        data: &[u8],
+        backend_id: BackendId,
+    ) {
+        if let Some(msg_id_ref) = msg_id {
+            let tier = self.tier_for_backend(backend_id);
+            self.spawn_cache_upsert(msg_id_ref, data, backend_id, tier);
+        }
+    }
+
     /// Record response metrics (errors, article sizes, command execution)
     fn record_response_metrics(
         &self,
@@ -399,9 +379,8 @@ impl ClientSession {
         let _ =
             self.metrics
                 .record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
+        self.metrics.user_bytes_sent(self.username(), cmd_bytes);
         self.metrics
-            .user_bytes_sent(self.username().as_deref(), cmd_bytes);
-        self.metrics
-            .user_bytes_received(self.username().as_deref(), resp_bytes);
+            .user_bytes_received(self.username(), resp_bytes);
     }
 }

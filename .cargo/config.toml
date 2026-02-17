@@ -1,0 +1,22 @@
+# Cargo configuration for nntp-proxy
+
+# Note: Use 'cargo nextest run' for faster parallel test execution
+# cargo-nextest provides ~4x faster test runs with better output
+
+# Use mold linker on Linux for much faster builds (10-20x faster than ld)
+# Uses clang as the linker driver with -fuse-ld=mold to forward to mold.
+# This ensures all rustc/sysroot flags are properly handled by clang.
+#
+# CROSS-COMPILATION NOTE:
+# When cross-compiling from macOS to Linux, mold won't be available on macOS.
+# In that case, use the environment variable approach instead:
+#   export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+#   cargo build --target x86_64-unknown-linux-gnu
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

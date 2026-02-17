@@ -77,7 +77,10 @@ impl NntpClient {
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
     #[inline]
-    pub async fn fetch_body(&self, message_id: &str) -> Result<PooledBuffer> {
+    pub async fn fetch_body(
+        &self,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Result<PooledBuffer> {
         let command = body_by_msgid(message_id);
         self.fetch_response(&command).await
     }
@@ -90,7 +93,10 @@ impl NntpClient {
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
     #[inline]
-    pub async fn fetch_head(&self, message_id: &str) -> Result<PooledBuffer> {
+    pub async fn fetch_head(
+        &self,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Result<PooledBuffer> {
         let command = head_by_msgid(message_id);
         self.fetch_response(&command).await
     }
@@ -103,7 +109,10 @@ impl NntpClient {
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
     #[inline]
-    pub async fn fetch_article(&self, message_id: &str) -> Result<PooledBuffer> {
+    pub async fn fetch_article(
+        &self,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Result<PooledBuffer> {
         let command = article_by_msgid(message_id);
         self.fetch_response(&command).await
     }
@@ -115,7 +124,7 @@ impl NntpClient {
     ///
     /// # Returns
     /// `true` if article exists, `false` if 430 (not found)
-    pub async fn stat(&self, message_id: &str) -> Result<bool> {
+    pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let command = stat_by_msgid(message_id);
         let mut conn = self.get_connection().await?;
         let mut buffer = self.buffer_pool.acquire().await;
@@ -127,10 +136,10 @@ impl NntpClient {
 
     /// Parse STAT response code into existence check
     #[inline]
-    fn parse_stat_response(status_code: Option<u16>) -> Result<bool> {
+    fn parse_stat_response(status_code: Option<crate::protocol::StatusCode>) -> Result<bool> {
         status_code
             .ok_or_else(|| anyhow::anyhow!("Invalid STAT response"))
-            .and_then(|code| match code {
+            .and_then(|code| match code.as_u16() {
                 223 => Ok(true),  // Article exists
                 430 => Ok(false), // No such article
                 _ => anyhow::bail!("Unexpected STAT response: {}", code),
@@ -234,22 +243,24 @@ mod tests {
 
     #[test]
     fn test_parse_stat_response_success() {
+        use crate::protocol::StatusCode;
         // Article exists (223)
-        assert!(NntpClient::parse_stat_response(Some(223)).unwrap());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"223")).unwrap());
 
         // Article not found (430)
-        assert!(!NntpClient::parse_stat_response(Some(430)).unwrap());
+        assert!(!NntpClient::parse_stat_response(StatusCode::parse(b"430")).unwrap());
     }
 
     #[test]
     fn test_parse_stat_response_errors() {
+        use crate::protocol::StatusCode;
         // No status code
         assert!(NntpClient::parse_stat_response(None).is_err());
 
         // Unexpected codes
-        assert!(NntpClient::parse_stat_response(Some(500)).is_err());
-        assert!(NntpClient::parse_stat_response(Some(200)).is_err());
-        assert!(NntpClient::parse_stat_response(Some(400)).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"500")).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"200")).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400")).is_err());
     }
 
     #[test]

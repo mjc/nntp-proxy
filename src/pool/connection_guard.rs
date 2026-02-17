@@ -4,26 +4,20 @@
 //! the pool when I/O errors occur, preventing stale connections from being recycled.
 
 use deadpool::managed::Object;
-use std::io::ErrorKind;
 
-use crate::connection_error::ConnectionError;
+use crate::connection_error::{ConnectionError, is_connection_error_kind};
 use crate::pool::deadpool_connection::TcpManager;
 
 /// Check if an error should cause the connection to be removed from the pool
+///
+/// Uses centralized CONNECTION_ERROR_KINDS from connection_error module.
 #[inline]
 pub fn is_connection_error(e: &anyhow::Error) -> bool {
     // Check for typed ConnectionError first
     if let Some(conn_err) = e.downcast_ref::<ConnectionError>() {
         return matches!(
             conn_err,
-            ConnectionError::IoError(io_err)
-                if matches!(
-                    io_err.kind(),
-                    ErrorKind::BrokenPipe
-                        | ErrorKind::ConnectionReset
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::UnexpectedEof
-                )
+            ConnectionError::IoError(io_err) if is_connection_error_kind(io_err.kind())
         ) || matches!(
             conn_err,
             ConnectionError::StaleConnection { .. } | ConnectionError::BackendTimeout { .. }
@@ -31,13 +25,7 @@ pub fn is_connection_error(e: &anyhow::Error) -> bool {
     }
     // Fallback for raw io::Error from non-pool paths
     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-        return matches!(
-            io_err.kind(),
-            ErrorKind::BrokenPipe
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::UnexpectedEof
-        );
+        return is_connection_error_kind(io_err.kind());
     }
     false
 }
@@ -46,9 +34,85 @@ pub fn is_connection_error(e: &anyhow::Error) -> bool {
 ///
 /// This should be called when a connection encounters an error that indicates
 /// it's broken and should not be reused.
+///
+/// The connection is shut down at the TCP level before being dropped, ensuring
+/// deadpool's recycle check reliably detects it as dead. The connection is then
+/// returned to the pool normally, where deadpool drops the broken connection
+/// BEFORE creating a replacement (preventing connection limit exceeded errors).
 #[inline]
 pub fn remove_from_pool(conn: Object<TcpManager>) {
-    drop(Object::take(conn));
+    // Shut down the raw TCP socket so recycle reliably detects it as dead
+    let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
+    // Return to pool normally — deadpool drops it before creating a replacement
+    drop(conn);
+}
+
+/// RAII guard for pooled connections
+///
+/// Automatically removes the connection from the pool on drop unless
+/// explicitly marked as healthy via `success()`.
+///
+/// Follows the same pattern as `CommandGuard` from `src/router/mod.rs`.
+pub struct ConnectionGuard {
+    conn: Option<Object<TcpManager>>,
+    remove_on_drop: bool,
+}
+
+impl ConnectionGuard {
+    /// Create a new guard (defaults to removing on drop)
+    pub fn new(conn: Object<TcpManager>) -> Self {
+        Self {
+            conn: Some(conn),
+            remove_on_drop: true,
+        }
+    }
+
+    /// Mark connection as healthy and return it
+    ///
+    /// Connection will be returned to pool normally when dropped.
+    pub fn success(mut self) -> Object<TcpManager> {
+        self.remove_on_drop = false;
+        self.conn
+            .take()
+            .expect("ConnectionGuard::success() called twice")
+    }
+
+    /// Get mutable reference to the connection
+    pub fn get_mut(&mut self) -> &mut Object<TcpManager> {
+        self.conn
+            .as_mut()
+            .expect("ConnectionGuard already consumed")
+    }
+
+    /// Get shared reference to the connection
+    pub fn get(&self) -> &Object<TcpManager> {
+        self.conn
+            .as_ref()
+            .expect("ConnectionGuard already consumed")
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if self.remove_on_drop
+            && let Some(conn) = self.conn.take()
+        {
+            remove_from_pool(conn);
+        }
+    }
+}
+
+impl std::ops::Deref for ConnectionGuard {
+    type Target = Object<TcpManager>;
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl std::ops::DerefMut for ConnectionGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.get_mut()
+    }
 }
 
 /// Drain response data from timed-out connection to allow pool reuse
@@ -67,7 +131,7 @@ pub async fn drain_connection_async(
     mut conn: Object<TcpManager>,
     buffer_pool: crate::pool::BufferPool,
 ) {
-    use crate::protocol::MULTILINE_TERMINATOR;
+    use crate::session::streaming::tail_buffer::TailBuffer;
     use std::time::Duration;
     use tracing::debug;
 
@@ -75,18 +139,18 @@ pub async fn drain_connection_async(
     const DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
     let mut buffer = buffer_pool.acquire().await;
+    let mut tail = TailBuffer::default();
 
     for _ in 0..MAX_DRAIN_ITERATIONS {
         match tokio::time::timeout(DRAIN_TIMEOUT, buffer.read_from(&mut *conn)).await {
             Ok(Ok(n)) if n > 0 => {
-                // Check for terminator - connection clean if found
-                if buffer[..n]
-                    .windows(MULTILINE_TERMINATOR.len())
-                    .any(|w| w == MULTILINE_TERMINATOR)
-                {
+                let data = &buffer[..n];
+                // Check for terminator (handles mid-chunk and cross-boundary spanning)
+                if tail.detect_terminator(data).is_found() {
                     debug!("Successfully drained connection - returning to pool");
                     return; // Drop returns connection to pool
                 }
+                tail.update(data);
             }
             _ => {
                 // Timeout, EOF, or error - connection broken
@@ -146,7 +210,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Error as IoError;
+    use std::io::{Error as IoError, ErrorKind};
 
     #[test]
     fn test_is_connection_error_broken_pipe() {
@@ -267,5 +331,43 @@ mod tests {
                 kind
             );
         }
+    }
+
+    /// Verify that TailBuffer detects terminators that span chunk boundaries,
+    /// which the old `windows()` approach in `drain_connection_async` would miss.
+    #[test]
+    fn test_drain_cross_boundary_terminator() {
+        use crate::session::streaming::tail_buffer::TailBuffer;
+
+        // Simulate two reads where the terminator \r\n.\r\n is split:
+        // First read ends with "\r\n.", second read starts with "\r\n"
+        let chunk1 = b"220 Article follows\r\nBody content\r\n.";
+        let chunk2 = b"\r\n";
+
+        // Old approach: windows() on each chunk independently — would MISS this
+        let terminator = b"\r\n.\r\n";
+        let found_by_windows_chunk1 = chunk1.windows(terminator.len()).any(|w| w == terminator);
+        let found_by_windows_chunk2 = chunk2.windows(terminator.len()).any(|w| w == terminator);
+        assert!(
+            !found_by_windows_chunk1,
+            "windows() should not find terminator in chunk1"
+        );
+        assert!(
+            !found_by_windows_chunk2,
+            "windows() should not find terminator in chunk2"
+        );
+
+        // New approach: TailBuffer tracks cross-boundary state
+        let mut tail = TailBuffer::default();
+
+        // Process chunk1 — no terminator yet
+        assert!(!tail.detect_terminator(chunk1).is_found());
+        tail.update(chunk1);
+
+        // Process chunk2 — spanning terminator detected!
+        assert!(
+            tail.detect_terminator(chunk2).is_found(),
+            "TailBuffer should detect terminator spanning chunk boundary"
+        );
     }
 }

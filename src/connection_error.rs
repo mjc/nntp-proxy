@@ -1,6 +1,38 @@
 //! Connection error types for the NNTP proxy
 
+use std::io::ErrorKind;
 use thiserror::Error;
+
+/// Error kinds that indicate the client disconnected
+///
+/// These errors should not be logged as backend failures - they're normal
+/// when clients close connections.
+pub const DISCONNECT_KINDS: &[ErrorKind] = &[ErrorKind::BrokenPipe, ErrorKind::ConnectionReset];
+
+/// Error kinds that indicate the connection is broken and should not be reused
+///
+/// When these errors occur, the connection should be removed from the pool
+/// rather than returned for reuse.
+pub const CONNECTION_ERROR_KINDS: &[ErrorKind] = &[
+    ErrorKind::BrokenPipe,
+    ErrorKind::ConnectionReset,
+    ErrorKind::ConnectionAborted,
+    ErrorKind::UnexpectedEof,
+];
+
+/// Check if an I/O error kind indicates a client disconnect
+#[inline]
+#[must_use]
+pub fn is_disconnect_kind(kind: ErrorKind) -> bool {
+    DISCONNECT_KINDS.contains(&kind)
+}
+
+/// Check if an I/O error kind indicates a broken connection
+#[inline]
+#[must_use]
+pub fn is_connection_error_kind(kind: ErrorKind) -> bool {
+    CONNECTION_ERROR_KINDS.contains(&kind)
+}
 
 /// Errors that can occur during connection management
 #[derive(Debug, Error)]
@@ -30,6 +62,9 @@ pub enum ConnectionError {
 
     #[error("Authentication failed for backend '{backend}': {response}")]
     AuthenticationFailed { backend: String, response: String },
+
+    #[error("Connection limit exceeded for backend '{backend}': {response}")]
+    ConnectionLimitExceeded { backend: String, response: String },
 
     #[error("Invalid greeting from backend '{backend}': {greeting}")]
     InvalidGreeting { backend: String, greeting: String },
@@ -70,10 +105,12 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
-    /// Check if this is a client disconnection (broken pipe)
+    /// Check if this is a client disconnection
+    ///
+    /// Returns true for error kinds in DISCONNECT_KINDS (BrokenPipe, ConnectionReset).
     #[must_use]
     pub fn is_client_disconnect(&self) -> bool {
-        matches!(self, Self::IoError(e) if e.kind() == std::io::ErrorKind::BrokenPipe)
+        matches!(self, Self::IoError(e) if is_disconnect_kind(e.kind()))
     }
 
     /// Check if this is an authentication error
@@ -184,11 +221,18 @@ mod tests {
 
     #[test]
     fn test_is_client_disconnect() {
+        // BrokenPipe is a disconnect
         let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let err = ConnectionError::IoError(io_err);
         assert!(err.is_client_disconnect());
 
+        // ConnectionReset is also a disconnect
         let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        let err = ConnectionError::IoError(io_err);
+        assert!(err.is_client_disconnect());
+
+        // Other errors are not disconnects
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "other");
         let err = ConnectionError::IoError(io_err);
         assert!(!err.is_client_disconnect());
     }
@@ -277,5 +321,18 @@ mod tests {
         assert!(msg.contains("invalid.example.com"));
         assert!(msg.contains("name not resolved"));
         assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn test_connection_limit_exceeded_error() {
+        let err = ConnectionError::ConnectionLimitExceeded {
+            backend: "news.example.com".to_string(),
+            response: "482 Connection limit exceeded".to_string(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("Connection limit exceeded"));
+        assert!(msg.contains("news.example.com"));
+        assert!(msg.contains("482"));
     }
 }

@@ -59,7 +59,7 @@ pub mod tls;
 pub mod types;
 
 // Public exports
-pub use args::{CacheArgs, CommonArgs};
+pub use args::CommonArgs;
 pub use config::{
     Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
     load_config, load_config_from_env, load_config_with_fallback,
@@ -75,6 +75,7 @@ pub mod streaming {
     //! fetch articles directly from servers.
     pub use crate::session::streaming::{
         stream_and_capture_multiline_response, stream_multiline_response,
+        stream_multiline_response_pipelined,
     };
 }
 

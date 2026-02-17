@@ -146,8 +146,8 @@ impl AuthState {
     /// ```
     #[inline]
     #[must_use]
-    pub fn username(&self) -> Option<Arc<str>> {
-        self.username.get().cloned()
+    pub fn username(&self) -> Option<&str> {
+        self.username.get().map(|arc| &**arc)
     }
 
     /// Check if authenticated, optionally bypassing the check
@@ -203,7 +203,7 @@ mod tests {
         state.mark_authenticated("testuser");
 
         assert!(state.is_authenticated());
-        assert_eq!(state.username().unwrap().as_ref(), "testuser");
+        assert_eq!(state.username().unwrap(), "testuser");
     }
 
     #[test]
@@ -213,20 +213,7 @@ mod tests {
         state.mark_authenticated(username.clone());
 
         assert!(state.is_authenticated());
-        assert_eq!(state.username().unwrap().as_ref(), "arcuser");
-    }
-
-    #[test]
-    fn test_username_clone_is_cheap() {
-        let state = AuthState::new();
-        state.mark_authenticated("clonetest");
-
-        let username1 = state.username().unwrap();
-        let username2 = state.username().unwrap();
-
-        // Both point to the same Arc
-        assert_eq!(username1.as_ref(), username2.as_ref());
-        assert_eq!(Arc::strong_count(&username1), Arc::strong_count(&username2));
+        assert_eq!(state.username().unwrap(), "arcuser");
     }
 
     #[test]
@@ -262,6 +249,6 @@ mod tests {
         state.mark_authenticated("same"); // Should not panic
 
         assert!(state.is_authenticated());
-        assert_eq!(state.username().unwrap().as_ref(), "same");
+        assert_eq!(state.username().unwrap(), "same");
     }
 }

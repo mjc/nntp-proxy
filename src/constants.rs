@@ -24,10 +24,22 @@ pub mod buffer {
     /// Aligned to 4KB page boundaries for optimal memory access
     pub const POOL: usize = 724 * 1024;
 
-    /// Number of buffers in the buffer pool
-    /// Sized for ~50 concurrent connections with a single buffer per connection
+    /// Default number of buffers in the buffer pool
+    /// Sized for ~50 concurrent streaming connections
     /// Total memory: 50 × 724KB ≈ 35MB
+    /// This is a conservative default; increase via config for higher concurrency
     pub const POOL_COUNT: usize = 50;
+
+    /// Size of each capture buffer (768KB, page-aligned)
+    /// Sized to capture typical yEnc articles (~750KB) without reallocation
+    /// Larger than POOL to handle 99th percentile articles
+    pub const CAPTURE: usize = 768 * 1024;
+
+    /// Default number of capture buffers in the pool
+    /// Sized for 16 concurrent caching operations
+    /// Total memory: 16 × 768KB ≈ 12MB
+    /// This is a conservative default; increase via config for higher caching throughput
+    pub const CAPTURE_COUNT: usize = 16;
 
     /// BufReader capacity for client command parsing (64KB)
     /// Large enough to handle any NNTP command line without multiple reads
@@ -55,10 +67,23 @@ pub mod buffer {
     /// Aligned to 4KB page boundaries for optimal zero-copy I/O
     pub const STREAM_CHUNK: usize = 724 * 1024;
 
+    /// Maximum leftover bytes between pipelined responses.
+    /// Leftover is a suffix of one TCP read, so normally bounded by buffer
+    /// capacity. This limit catches protocol desync where a backend sends
+    /// unexpected extra data after terminators. 128KB is generous — normal
+    /// leftover is under 8KB.
+    pub const MAX_LEFTOVER_BYTES: usize = 128 * 1024;
+
     // Compile-time validation
 
     /// Verify pool buffer is page-aligned at compile time
     const _POOL_ALIGNED: () = assert!(POOL.is_multiple_of(PAGE_SIZE), "POOL must be page-aligned");
+
+    /// Verify capture buffer is page-aligned at compile time
+    const _CAPTURE_ALIGNED: () = assert!(
+        CAPTURE.is_multiple_of(PAGE_SIZE),
+        "CAPTURE must be page-aligned"
+    );
 
     /// Verify stream chunk is page-aligned at compile time
     const _CHUNK_ALIGNED: () = assert!(
@@ -253,7 +278,7 @@ mod tests {
         // Calculate total pool memory
         let total_memory = buffer::POOL * buffer::POOL_COUNT;
 
-        // Should be approximately 36MB (50 buffers × 724KB)
+        // Should be approximately 35MB (50 buffers × 724KB)
         let expected_mb = 35;
         let actual_mb = total_memory / (1024 * 1024);
 

@@ -4,7 +4,7 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
-use crate::command::classifier::{STAT_CASES, matches_any};
+use crate::command::classifier::is_stat_command;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes};
@@ -77,8 +77,7 @@ impl ClientSession {
             // then fall through to use availability info for routing
             if self.adaptive_precheck {
                 let bytes = command.as_bytes();
-                let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-                if cmd_end >= 4 && matches_any(&bytes[..cmd_end], STAT_CASES) {
+                if is_stat_command(bytes) {
                     precheck::spawn_background_precheck(
                         self.precheck_deps(router),
                         command.to_string(),
@@ -92,13 +91,9 @@ impl ClientSession {
         // Check if this is a complete article we can serve
         // Stubs from STAT/HEAD precheck or availability tracking should not be served
         // Exception: STAT can be answered from any cache entry (we just need to know it exists)
-        let cmd_verb = command
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
+        let cmd_verb = command.split_whitespace().next().unwrap_or("");
 
-        if cmd_verb != "STAT" && !cached.is_complete_article() {
+        if !cmd_verb.eq_ignore_ascii_case("STAT") && !cached.is_complete_article() {
             debug!(
                 "Client {} cache entry for {} is a stub (len={}), fetching full article",
                 self.client_addr,
@@ -110,16 +105,8 @@ impl ClientSession {
 
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
-        let code = cached.status_code().map(|c| c.as_u16());
-        let Some(status_code) = code else {
-            debug!(
-                "Client {} cached response has no valid status code",
-                self.client_addr,
-            );
-            return Ok(CacheLookupResult::PartialHit(availability));
-        };
-
-        if !crate::cache::entry_helpers::matches_command_type_verb(status_code, &cmd_verb) {
+        if !cached.matches_command_type_verb(cmd_verb) {
+            let status_code = cached.status_code().map(|c| c.as_u16()).unwrap_or(0);
             debug!(
                 "Client {} cached response (code={}) can't serve '{}' command",
                 self.client_addr, status_code, cmd_verb
@@ -129,13 +116,14 @@ impl ClientSession {
 
         // STAT: synthesize a small response (no buffer copy needed)
         // Direct serve: write directly from the Arc-backed buffer (zero-copy)
-        let bytes_written = if cmd_verb == "STAT" {
+        let bytes_written = if cmd_verb.eq_ignore_ascii_case("STAT") {
             let stat_response = format!("223 0 {}\r\n", msg_id_ref.as_str());
             client_write.write_all(stat_response.as_bytes()).await?;
             stat_response.len()
         } else {
             // Validate before serving
-            if !crate::cache::entry_helpers::is_valid_response(cached.buffer()) {
+            if !cached.is_valid_response() {
+                let status_code = cached.status_code().map(|c| c.as_u16()).unwrap_or(0);
                 tracing::warn!(
                     code = status_code,
                     len = cached.buffer().len(),
@@ -164,15 +152,16 @@ impl ClientSession {
     pub(super) fn spawn_cache_upsert(
         &self,
         msg_id: &crate::types::MessageId<'_>,
-        buffer: Vec<u8>,
+        buffer: &[u8],
         backend_id: crate::types::BackendId,
         tier: u8,
     ) {
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
+        let buffer_owned = buffer.to_vec();
         tokio::spawn(async move {
             cache_clone
-                .upsert(msg_id_owned, buffer, backend_id, tier)
+                .upsert(msg_id_owned, buffer_owned, backend_id, tier)
                 .await;
         });
     }

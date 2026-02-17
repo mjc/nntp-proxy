@@ -30,6 +30,43 @@ mod error {
     pub const BACKEND_NOT_FOUND: &str = "Backend not found";
 }
 
+/// RAII guard for stateful session metrics
+///
+/// Automatically calls `stateful_session_ended()` on drop.
+/// Follows the same pattern as `CommandGuard` from `src/router/mod.rs`.
+struct StatefulSessionGuard<'a> {
+    metrics: &'a crate::metrics::MetricsCollector,
+    ended: bool,
+}
+
+impl<'a> StatefulSessionGuard<'a> {
+    /// Start a stateful session (calls stateful_session_started)
+    fn start(metrics: &'a crate::metrics::MetricsCollector) -> Self {
+        metrics.stateful_session_started();
+        Self {
+            metrics,
+            ended: false,
+        }
+    }
+
+    /// Explicitly end the session (optional — Drop handles it)
+    #[allow(dead_code)]
+    fn end(mut self) {
+        if !self.ended {
+            self.metrics.stateful_session_ended();
+            self.ended = true;
+        }
+    }
+}
+
+impl Drop for StatefulSessionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.metrics.stateful_session_ended();
+        }
+    }
+}
+
 impl ClientSession {
     /// Switch from per-command routing to stateful mode
     ///
@@ -58,11 +95,17 @@ impl ClientSession {
         // One-way transition: PerCommand → Stateful
         self.mode_state.switch_to_stateful();
 
-        // Acquire backend connection
-        let (mut pooled_conn, backend_id) = self
+        // Acquire backend connection (returns CommandGuard to track pending_count)
+        let (pooled_conn, backend_id, _pending_guard) = self
             .acquire_stateful_backend(initial_command)
             .await
             .context("Failed to acquire backend for stateful mode")?;
+
+        // Wrap connection in guard — removes from pool on any error
+        let mut conn_guard = crate::pool::ConnectionGuard::new(pooled_conn);
+
+        // Start stateful session metrics tracking
+        let _session_guard = StatefulSessionGuard::start(&self.metrics);
 
         info!(
             client = %self.client_addr,
@@ -70,11 +113,8 @@ impl ClientSession {
             "Switched to stateful mode"
         );
 
-        // Track session lifecycle
-        self.metrics.stateful_session_started();
-
         // Forward the triggering command (response handled by proxy loop)
-        pooled_conn
+        conn_guard
             .write_all(initial_command.as_bytes())
             .await
             .context("Failed to send initial command to backend")?;
@@ -88,10 +128,10 @@ impl ClientSession {
         );
 
         // Split backend for bidirectional proxy
-        let (backend_read, backend_write) = tokio::io::split(&mut *pooled_conn);
+        let (backend_read, backend_write) = tokio::io::split(&mut **conn_guard);
 
         // Delegate to stateful loop (handles all remaining commands + responses)
-        let metrics = self
+        let result = self
             .run_stateful_proxy_loop(
                 client_reader,
                 client_write,
@@ -100,22 +140,36 @@ impl ClientSession {
                 state,
                 backend_id,
             )
-            .await?;
+            .await;
 
-        self.metrics.stateful_session_ended();
-        Ok(metrics)
+        // pending_guard automatically calls complete_command via Drop
+
+        // H1: Only return connection to pool on success
+        match result {
+            Ok(_) => {
+                let _conn = conn_guard.success();
+            }
+            Err(_) => { /* guard drops → removes broken connection from pool */ }
+        }
+
+        // Metrics guard automatically ends session via Drop
+        result
     }
 
     /// Acquire a dedicated backend connection for stateful mode
     ///
     /// Routes the command to select a backend, then gets a pooled connection.
-    /// Returns both the connection and the backend ID for metrics tracking.
+    /// Returns the connection, backend ID, and a `CommandGuard` that decrements
+    /// `pending_count` on drop. Creating the guard here (immediately after
+    /// `route_command`) ensures the count is decremented even if
+    /// `get_pooled_connection` fails.
     async fn acquire_stateful_backend(
         &self,
         command: &str,
     ) -> Result<(
         deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         crate::types::BackendId,
+        crate::router::CommandGuard,
     )> {
         let router = self
             .router
@@ -124,13 +178,17 @@ impl ClientSession {
 
         let backend_id = router.route_command(self.client_id, command)?;
 
+        // Guard pending_count immediately — if get_pooled_connection fails,
+        // the guard drops and decrements automatically
+        let pending_guard = crate::router::CommandGuard::new(router.clone(), backend_id);
+
         let provider = router
             .backend_provider(backend_id)
             .ok_or_else(|| anyhow::anyhow!("{}: {:?}", error::BACKEND_NOT_FOUND, backend_id))?;
 
         let conn = provider.get_pooled_connection().await?;
 
-        Ok((conn, backend_id))
+        Ok((conn, backend_id, pending_guard))
     }
 }
 

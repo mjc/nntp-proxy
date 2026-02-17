@@ -90,7 +90,7 @@ macro_rules! command_cases {
 // Each command is documented with its RFC reference for traceability
 
 command_cases!(
-    ARTICLE_CASES,
+    pub ARTICLE_CASES,
     "ARTICLE",
     "article",
     "Article",
@@ -99,7 +99,7 @@ command_cases!(
 );
 
 command_cases!(
-    BODY_CASES,
+    pub BODY_CASES,
     "BODY",
     "body",
     "Body",
@@ -316,6 +316,39 @@ pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
     cases.contains(&cmd)
 }
 
+/// Check if a command is a large transfer command (ARTICLE or BODY)
+///
+/// These commands typically return multi-line responses with article content
+/// and are candidates for pipelining optimization.
+#[inline(always)]
+#[must_use]
+pub fn is_large_transfer_command(cmd: &[u8]) -> bool {
+    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    end >= 4 && (matches_any(&cmd[..end], ARTICLE_CASES) || matches_any(&cmd[..end], BODY_CASES))
+}
+
+/// Check if a command is a STAT command
+///
+/// STAT returns only the status line without article content, making it
+/// suitable for background prechecking.
+#[inline(always)]
+#[must_use]
+pub fn is_stat_command(cmd: &[u8]) -> bool {
+    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    end >= 4 && matches_any(&cmd[..end], STAT_CASES)
+}
+
+/// Check if a command is a HEAD command
+///
+/// HEAD returns article headers without the body, also suitable for
+/// background prechecking.
+#[inline(always)]
+#[must_use]
+pub fn is_head_command(cmd: &[u8]) -> bool {
+    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    end >= 4 && matches_any(&cmd[..end], HEAD_CASES)
+}
+
 /// Ultra-fast detection of article retrieval commands with message-ID
 ///
 /// **THE CRITICAL HOT PATH** for NZB downloads and binary retrieval (70%+ of traffic).
@@ -463,6 +496,18 @@ impl NntpCommand {
     #[must_use]
     pub const fn is_stateful(&self) -> bool {
         matches!(self, Self::Stateful)
+    }
+
+    /// Check if this command can be included in a TCP pipeline batch.
+    ///
+    /// Pipelineable commands can be dispatched concurrently to backends and
+    /// their responses streamed back in order. Non-pipelineable commands
+    /// (auth, mode changes, quit, stateful, non-routable) must flush the
+    /// pipeline and be processed individually.
+    #[inline]
+    #[must_use]
+    pub const fn is_pipelineable(&self) -> bool {
+        matches!(self, Self::ArticleByMessageId)
     }
 
     /// Parse an NNTP command for routing/handling strategy
@@ -884,6 +929,40 @@ mod tests {
         assert_eq!(NntpCommand::parse("IHAVE <msg>"), NntpCommand::NonRoutable);
 
         assert_eq!(NntpCommand::parse("ihave <msg>"), NntpCommand::NonRoutable);
+    }
+
+    #[test]
+    fn test_is_pipelineable() {
+        // Article by message-ID commands are pipelineable
+        assert!(NntpCommand::ArticleByMessageId.is_pipelineable());
+        assert!(NntpCommand::parse("ARTICLE <msg@example.com>").is_pipelineable());
+        assert!(NntpCommand::parse("BODY <msg@example.com>").is_pipelineable());
+        assert!(NntpCommand::parse("HEAD <msg@example.com>").is_pipelineable());
+        assert!(NntpCommand::parse("STAT <msg@example.com>").is_pipelineable());
+
+        // Stateless commands are NOT pipelineable (QUIT would close worker connection)
+        assert!(!NntpCommand::Stateless.is_pipelineable());
+        assert!(!NntpCommand::parse("LIST").is_pipelineable());
+        assert!(!NntpCommand::parse("DATE").is_pipelineable());
+        assert!(!NntpCommand::parse("CAPABILITIES").is_pipelineable());
+        assert!(!NntpCommand::parse("HELP").is_pipelineable());
+
+        // Auth commands are NOT pipelineable (state-changing)
+        assert!(!NntpCommand::AuthUser.is_pipelineable());
+        assert!(!NntpCommand::AuthPass.is_pipelineable());
+        assert!(!NntpCommand::parse("AUTHINFO USER test").is_pipelineable());
+        assert!(!NntpCommand::parse("AUTHINFO PASS secret").is_pipelineable());
+
+        // Stateful commands are NOT pipelineable
+        assert!(!NntpCommand::Stateful.is_pipelineable());
+        assert!(!NntpCommand::parse("GROUP alt.test").is_pipelineable());
+        assert!(!NntpCommand::parse("XOVER 1-100").is_pipelineable());
+        assert!(!NntpCommand::parse("ARTICLE 123").is_pipelineable());
+
+        // NonRoutable commands are NOT pipelineable
+        assert!(!NntpCommand::NonRoutable.is_pipelineable());
+        assert!(!NntpCommand::parse("POST").is_pipelineable());
+        assert!(!NntpCommand::parse("IHAVE <msg>").is_pipelineable());
     }
 
     #[test]

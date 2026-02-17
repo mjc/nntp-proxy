@@ -39,6 +39,14 @@ pub struct MetricsSnapshot {
     pub cache_hit_rate: f64,
     /// Disk cache statistics (only present when using hybrid cache)
     pub disk_cache: Option<DiskCacheStats>,
+    /// Number of pipelined batches (batches with >1 command)
+    pub pipeline_batches: u64,
+    /// Total commands processed in pipelined batches
+    pub pipeline_commands: u64,
+    /// Total requests enqueued to backend pipeline queues
+    pub pipeline_requests_queued: u64,
+    /// Total requests completed via backend pipeline
+    pub pipeline_requests_completed: u64,
 }
 
 /// Disk cache statistics for hybrid cache mode
@@ -269,6 +277,10 @@ mod tests {
             cache_size_bytes: 0,
             cache_hit_rate: 0.0,
             disk_cache: None,
+            pipeline_batches: 0,
+            pipeline_commands: 0,
+            pipeline_requests_queued: 0,
+            pipeline_requests_completed: 0,
         }
     }
 

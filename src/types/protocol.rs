@@ -51,11 +51,25 @@ impl<'a> MessageId<'a> {
         MessageId::new(wrapped)
     }
 
+    /// Extract message ID from NNTP command (zero-copy, returns borrowed)
+    ///
+    /// Uses SIMD-accelerated memchr for fast scanning.
+    #[inline]
+    pub fn extract_from_command_borrowed(command: &'a str) -> Option<MessageId<'a>> {
+        let bytes = command.as_bytes();
+        let start = memchr::memchr(b'<', bytes)?;
+        let end = memchr::memchr(b'>', &bytes[start..])?;
+        let slice = &command[start..start + end + 1];
+        if slice.len() < 3 {
+            return None; // Reject "<>"
+        }
+        // SAFETY: We verified starts_with('<'), ends_with('>'), len >= 3
+        Some(unsafe { Self::from_str_unchecked(slice) })
+    }
+
     /// Extract message ID from NNTP command (returns owned)
-    pub fn extract_from_command(command: &str) -> Option<MessageId<'static>> {
-        let start = command.find('<')?;
-        let end = command[start..].find('>')?;
-        MessageId::new(command[start..=start + end].to_string()).ok()
+    pub fn extract_from_command(command: &'a str) -> Option<MessageId<'static>> {
+        Self::extract_from_command_borrowed(command).map(|m| m.into_owned())
     }
 
     #[inline]

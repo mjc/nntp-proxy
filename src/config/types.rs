@@ -135,10 +135,26 @@ pub struct Proxy {
     pub port: Port,
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     pub threads: ThreadCount,
+    /// Routing mode for the proxy
+    pub routing_mode: RoutingMode,
     /// Backend selection strategy for load balancing
     pub backend_selection: BackendSelectionStrategy,
     /// Validate yEnc structure and checksums (default: true)
     pub validate_yenc: bool,
+    /// Number of buffers in the main buffer pool (default: 50)
+    /// Controls memory usage for I/O operations: count × 724KB
+    /// Higher values support more concurrent connections but use more memory
+    #[serde(default = "super::defaults::buffer_pool_count")]
+    pub buffer_pool_count: usize,
+    /// Number of buffers in the capture pool for caching (default: 16)
+    /// Controls memory usage for cache operations: count × 768KB
+    /// Only used when caching is enabled
+    #[serde(default = "super::defaults::capture_pool_count")]
+    pub capture_pool_count: usize,
+    /// Minimum log level for the debug.log file appender (default: "warn")
+    /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
+    #[serde(default = "super::defaults::log_file_level")]
+    pub log_file_level: String,
 }
 
 impl Proxy {
@@ -152,8 +168,12 @@ impl Default for Proxy {
             host: Self::DEFAULT_HOST.to_string(),
             port: Port::default(),
             threads: ThreadCount::default(),
+            routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),
             validate_yenc: true,
+            buffer_pool_count: defaults::buffer_pool_count(),
+            capture_pool_count: defaults::capture_pool_count(),
+            log_file_level: defaults::log_file_level(),
         }
     }
 }
@@ -365,6 +385,15 @@ pub struct Server {
         skip_serializing_if = "Option::is_none"
     )]
     pub connection_keepalive: Option<Duration>,
+    /// How long to wait before replacing an actively-removed connection.
+    /// Prevents backend connection limit exceeded (482) errors from connection churn.
+    /// Default: 30 seconds. Set to 0 to disable.
+    #[serde(
+        with = "option_duration_serde",
+        default = "super::defaults::replacement_cooldown_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub replacement_cooldown: Option<Duration>,
     /// Maximum number of connections to check per health check cycle
     /// Lower values reduce pool contention but may take longer to detect all stale connections
     #[serde(default = "super::defaults::health_check_max_per_cycle")]
@@ -387,6 +416,20 @@ pub struct Server {
     /// Compression level (0-9). None = fast (level 1). Higher = better ratio, more CPU.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compress_level: Option<u32>,
+
+    /// Enable backend pipelining (request multiplexing) for this server
+    /// When enabled, client requests are queued and batched onto shared connections
+    /// Default: true
+    #[serde(default = "super::defaults::enable_pipelining")]
+    pub enable_pipelining: bool,
+    /// Maximum queue depth for pipelined requests (backpressure threshold)
+    /// Default: 1000
+    #[serde(default = "super::defaults::pipeline_queue_depth")]
+    pub pipeline_queue_depth: usize,
+    /// Maximum number of commands per pipeline batch
+    /// Default: 4
+    #[serde(default = "super::defaults::pipeline_batch_size")]
+    pub pipeline_batch_size: usize,
 }
 
 /// Builder for constructing `Server` instances
@@ -426,11 +469,15 @@ pub struct ServerBuilder {
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
     connection_keepalive: Option<Duration>,
+    replacement_cooldown: Option<Duration>,
     health_check_max_per_cycle: Option<usize>,
     health_check_pool_timeout: Option<Duration>,
     tier: u8,
     compress: Option<bool>,
     compress_level: Option<u32>,
+    enable_pipelining: bool,
+    pipeline_queue_depth: Option<usize>,
+    pipeline_batch_size: Option<usize>,
 }
 
 impl ServerBuilder {
@@ -452,11 +499,15 @@ impl ServerBuilder {
             tls_verify_cert: true, // Secure by default
             tls_cert_path: None,
             connection_keepalive: None,
+            replacement_cooldown: None,
             health_check_max_per_cycle: None,
             health_check_pool_timeout: None,
             tier: 0,
             compress: None,
             compress_level: None,
+            enable_pipelining: true,
+            pipeline_queue_depth: None,
+            pipeline_batch_size: None,
         }
     }
 
@@ -516,6 +567,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Set connection replacement cooldown duration
+    #[must_use]
+    pub fn replacement_cooldown(mut self, cooldown: Duration) -> Self {
+        self.replacement_cooldown = Some(cooldown);
+        self
+    }
+
     /// Set maximum connections to check per health check cycle
     #[must_use]
     pub fn health_check_max_per_cycle(mut self, max: usize) -> Self {
@@ -556,6 +614,27 @@ impl ServerBuilder {
         self
     }
 
+    /// Enable or disable backend pipelining (request multiplexing)
+    #[must_use]
+    pub fn enable_pipelining(mut self, enabled: bool) -> Self {
+        self.enable_pipelining = enabled;
+        self
+    }
+
+    /// Set pipeline queue depth
+    #[must_use]
+    pub fn pipeline_queue_depth(mut self, depth: usize) -> Self {
+        self.pipeline_queue_depth = Some(depth);
+        self
+    }
+
+    /// Set pipeline batch size
+    #[must_use]
+    pub fn pipeline_batch_size(mut self, size: usize) -> Self {
+        self.pipeline_batch_size = Some(size);
+        self
+    }
+
     /// Build the Server
     ///
     /// # Errors
@@ -587,6 +666,14 @@ impl ServerBuilder {
             .health_check_pool_timeout
             .unwrap_or_else(super::defaults::health_check_pool_timeout);
 
+        let pipeline_queue_depth = self
+            .pipeline_queue_depth
+            .unwrap_or_else(super::defaults::pipeline_queue_depth);
+
+        let pipeline_batch_size = self
+            .pipeline_batch_size
+            .unwrap_or_else(super::defaults::pipeline_batch_size);
+
         Ok(Server {
             host,
             port,
@@ -598,11 +685,17 @@ impl ServerBuilder {
             tls_verify_cert: self.tls_verify_cert,
             tls_cert_path: self.tls_cert_path,
             connection_keepalive: self.connection_keepalive,
+            replacement_cooldown: self
+                .replacement_cooldown
+                .or_else(super::defaults::replacement_cooldown_option),
             health_check_max_per_cycle,
             health_check_pool_timeout,
             tier: self.tier,
             compress: self.compress,
             compress_level: self.compress_level,
+            enable_pipelining: self.enable_pipelining,
+            pipeline_queue_depth,
+            pipeline_batch_size,
         })
     }
 }

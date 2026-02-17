@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
@@ -19,16 +22,31 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let log_buffer = nntp_proxy::logging::init_tui_logging(args.no_tui);
+    let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
 
-    RuntimeConfig::from_args(args.common.threads)
+    // Apply CLI argument overrides to config
+    args.common.apply_overrides(&mut config);
+
+    let log_buffer =
+        nntp_proxy::logging::init_tui_logging(args.no_tui, &config.proxy.log_file_level);
+
+    // Fix thread config fallback: merge args with config before building runtime
+    let threads = args.common.threads.or(Some(config.proxy.threads));
+
+    RuntimeConfig::from_args(threads)
         .build_runtime()?
-        .block_on(run_proxy(args, log_buffer))
+        .block_on(run_proxy(args, config, log_buffer))
 }
 
-async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()> {
-    let (config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
-    let routing_mode = args.common.routing_mode;
+async fn run_proxy(
+    args: Args,
+    config: nntp_proxy::config::Config,
+    log_buffer: Option<tui::LogBuffer>,
+) -> Result<()> {
+    let routing_mode = args
+        .common
+        .routing_mode
+        .unwrap_or(config.proxy.routing_mode);
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
@@ -45,7 +63,11 @@ async fn run_proxy(args: Args, log_buffer: Option<tui::LogBuffer>) -> Result<()>
     )?;
     let listener = runtime::bind_listener(&host, port, routing_mode).await?;
 
-    runtime::spawn_connection_prewarming(&proxy);
+    // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
+    info!("Prewarming connection pools...");
+    proxy.prewarm_connections().await?;
+    info!("Connection pools ready, accepting clients");
+
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
     spawn_tui_shutdown_handler(&proxy, &shutdown_tx, tui_shutdown_tx);
@@ -99,6 +121,9 @@ fn launch_tui(
                 cache.weighted_size()
             );
             builder = builder.with_cache(cache.clone());
+
+            // Add buffer pool for monitoring
+            builder = builder.with_buffer_pool(proxy.buffer_pool().clone());
 
             let tui_app = builder.build();
 

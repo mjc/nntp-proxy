@@ -23,6 +23,7 @@ fn test_stateful_connection_reservation() {
         ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
         0, // tier
+        None,
     );
 
     // Should be able to acquire 2 stateful connections
@@ -53,6 +54,7 @@ fn test_stateful_connection_concurrent_access() {
         ServerName::try_new("test-backend".to_string()).unwrap(),
         create_test_provider(),
         0, // tier
+        None,
     );
 
     // Simulate concurrent access with multiple threads
@@ -116,12 +118,14 @@ fn test_stateful_connection_multiple_backends() {
         ServerName::try_new("backend-1".to_string()).unwrap(),
         provider1,
         0, // tier
+        None,
     );
     router.add_backend(
         backend2,
         ServerName::try_new("backend-2".to_string()).unwrap(),
         provider2,
         0, // tier
+        None,
     );
 
     // Each backend should have independent stateful counters
@@ -179,6 +183,7 @@ fn test_stateful_reservation_edge_cases() {
         ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
         0, // tier
+        None,
     );
 
     // Test multiple releases (should not go negative)

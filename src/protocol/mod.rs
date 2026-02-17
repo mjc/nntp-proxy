@@ -31,7 +31,7 @@ pub use responses::{
     BACKEND_UNAVAILABLE, COMMAND_NOT_SUPPORTED, COMMAND_NOT_SUPPORTED_STATELESS,
     CONNECTION_CLOSING, CRLF, GOODBYE, MIN_RESPONSE_LENGTH, MULTILINE_TERMINATOR, NO_SUCH_ARTICLE,
     PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE, error_response, greeting, greeting_readonly,
-    ok_response, response,
+    has_multiline_terminator, ok_response, response,
 };
 
 /// Send NNTP proxy greeting to a client

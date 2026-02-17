@@ -13,6 +13,9 @@ port = 8119
 # Validate yEnc structure and checksums (default: true)
 # Disable for better performance if you trust your backends
 validate_yenc = true
+# Minimum log level for debug.log file (default: "warn")
+# Options: "error", "warn", "info", "debug", "trace"
+# log_file_level = "warn"
 
 # Client Authentication Configuration
 # Two formats supported:

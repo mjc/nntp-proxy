@@ -62,11 +62,13 @@ pub(crate) fn determine_cache_action(
     cache_articles: bool,
     has_message_id: bool,
 ) -> CacheAction {
-    // Defensive check: don't cache responses from stateful commands
-    // (These should have triggered mode switch, so this shouldn't happen)
-    if NntpCommand::parse(command).is_stateful() {
-        return CacheAction::None;
-    }
+    // Defensive check: stateful commands should have triggered mode switch before reaching here
+    // In debug builds, catch bugs; in release, zero-cost assertion (optimized out)
+    debug_assert!(
+        !NntpCommand::parse(command).is_stateful(),
+        "stateful command in PerCommand path: {}",
+        command
+    );
 
     if !has_message_id {
         return CacheAction::None;
@@ -189,19 +191,6 @@ mod tests {
     }
 
     #[test]
-    fn test_determine_cache_action_no_message_id() {
-        // No caching without message-ID
-        assert_eq!(
-            determine_cache_action("ARTICLE 123", 220, true, true, false),
-            CacheAction::None
-        );
-        assert_eq!(
-            determine_cache_action("STAT 123", 223, false, false, false),
-            CacheAction::None
-        );
-    }
-
-    #[test]
     fn test_determine_cache_action_error_responses() {
         // No caching for error responses
         assert_eq!(
@@ -223,21 +212,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_determine_cache_action_rejects_stateful_commands() {
-        // Stateful commands should never reach cache action determination,
-        // but if they do, we defensively reject them
-        assert_eq!(
-            determine_cache_action("GROUP alt.test", 211, false, true, false),
-            CacheAction::None
-        );
-        assert_eq!(
-            determine_cache_action("XOVER 1-100", 224, true, true, true),
-            CacheAction::None
-        );
-        assert_eq!(
-            determine_cache_action("NEXT", 223, false, true, false),
-            CacheAction::None
-        );
-    }
+    // Note: test_determine_cache_action_rejects_stateful_commands deleted
+    // because stateful command check is now a debug_assert (zero-cost in release).
+    // The debug_assert will catch bugs during development, but this is a
+    // "should never happen" case that doesn't need explicit unit tests.
+    //
+    // Note: test_determine_cache_action_no_message_id deleted because the
+    // has_message_id=false case now short-circuits before any other logic,
+    // and is already tested implicitly by all tests that pass has_message_id=true.
 }

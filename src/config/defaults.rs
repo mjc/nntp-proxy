@@ -100,3 +100,55 @@ pub fn disk_cache_compression() -> bool {
 pub fn disk_cache_shards() -> usize {
     4
 }
+
+/// Default for backend pipelining (enabled)
+#[inline]
+pub fn enable_pipelining() -> bool {
+    true
+}
+
+/// Default pipeline queue depth
+#[inline]
+pub fn pipeline_queue_depth() -> usize {
+    1000
+}
+
+/// Default pipeline batch size
+#[inline]
+pub fn pipeline_batch_size() -> usize {
+    4
+}
+
+/// Default connection replacement cooldown (30 seconds)
+#[inline]
+pub fn replacement_cooldown() -> Duration {
+    Duration::from_secs(30)
+}
+
+/// Default connection replacement cooldown option (Some(30 seconds))
+#[inline]
+pub fn replacement_cooldown_option() -> Option<Duration> {
+    Some(replacement_cooldown())
+}
+
+/// Default number of buffers in the main buffer pool
+/// Sized for ~50 concurrent connections with single buffer per connection
+/// Total memory: 50 × 724KB ≈ 35MB
+#[inline]
+pub fn buffer_pool_count() -> usize {
+    50
+}
+
+/// Default number of buffers in the capture pool for caching
+/// Sized for 16 concurrent caching operations
+/// Total memory: 16 × 768KB ≈ 12MB
+#[inline]
+pub fn capture_pool_count() -> usize {
+    16
+}
+
+/// Default log file level (warn)
+#[inline]
+pub fn log_file_level() -> String {
+    "warn".to_string()
+}

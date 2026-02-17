@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::auth::AuthHandler;
 use crate::cache::{HybridCacheConfig, UnifiedCache};
 use crate::config::{Config, RoutingMode, Server};
-use crate::constants::buffer::{POOL, POOL_COUNT};
+use crate::constants::buffer::{CAPTURE, POOL};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::router;
@@ -68,7 +68,7 @@ pub struct NntpProxyBuilder {
 impl NntpProxyBuilder {
     /// Create a new builder with the given configuration
     ///
-    /// The routing mode defaults to `Standard` (1:1) mode.
+    /// The routing mode defaults to `Stateful` (1:1) mode.
     #[must_use]
     pub fn new(config: Config) -> Self {
         Self {
@@ -121,7 +121,9 @@ impl NntpProxyBuilder {
         }
 
         let buffer_size = self.buffer_size.unwrap_or(POOL);
-        let buffer_count = self.buffer_count.unwrap_or(POOL_COUNT);
+        let buffer_count = self
+            .buffer_count
+            .unwrap_or(self.config.proxy.buffer_pool_count);
 
         // Create deadpool connection providers for each server
         let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = self
@@ -143,7 +145,8 @@ impl NntpProxyBuilder {
             BufferSize::try_new(buffer_size)
                 .map_err(|_| anyhow::anyhow!("Buffer size must be non-zero"))?,
             buffer_count,
-        );
+        )
+        .with_capture_pool(CAPTURE, self.config.proxy.capture_pool_count);
 
         let metrics = MetricsCollector::new(self.config.servers.len());
 
@@ -164,11 +167,19 @@ impl NntpProxyBuilder {
                 router::BackendSelector::with_strategy(backend_strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
+                    let pipeline_queue = if servers[idx].enable_pipelining {
+                        Some(Arc::new(router::BackendQueue::new(
+                            servers[idx].pipeline_queue_depth,
+                        )))
+                    } else {
+                        None
+                    };
                     r.add_backend(
                         backend_id,
                         servers[idx].name.clone(),
                         provider.clone(),
                         servers[idx].tier,
+                        pipeline_queue,
                     );
                     r
                 },
@@ -357,6 +368,9 @@ pub(super) struct BuildContext {
 impl BuildContext {
     /// Construct the final `NntpProxy` from this context and a cache
     pub(super) fn into_proxy(self, cache: Arc<UnifiedCache>, cache_articles: bool) -> NntpProxy {
+        // Spawn pipeline workers for backends that have pipelining enabled
+        self.spawn_pipeline_workers();
+
         NntpProxy {
             servers: self.servers,
             router: self.router,
@@ -372,6 +386,50 @@ impl BuildContext {
             last_activity_nanos: Arc::new(AtomicU64::new(0)),
             active_clients: Arc::new(AtomicUsize::new(0)),
             start_instant: Instant::now(),
+        }
+    }
+
+    /// Spawn pipeline worker tasks for backends with pipelining enabled
+    ///
+    /// Only spawns if a Tokio runtime is available (skipped in sync test contexts).
+    fn spawn_pipeline_workers(&self) {
+        // Check if a Tokio runtime is available before spawning
+        let Ok(_handle) = tokio::runtime::Handle::try_current() else {
+            debug!("No Tokio runtime available, skipping pipeline worker spawning");
+            return;
+        };
+
+        use crate::session::handlers::pipeline_worker::{
+            PipelineWorkerConfig, backend_pipeline_worker,
+        };
+        use crate::types::BackendId;
+
+        for (idx, server) in self.servers.iter().enumerate() {
+            let backend_id = BackendId::from_index(idx);
+
+            if let Some(queue) = self.router.get_backend_queue(backend_id) {
+                let config = PipelineWorkerConfig {
+                    batch_size: server.pipeline_batch_size,
+                    backend_id,
+                };
+                let queue = queue.clone();
+                let provider = Arc::new(self.connection_providers[idx].clone());
+                let metrics = self.metrics.clone();
+                let buffer_pool = self.buffer_pool.clone();
+
+                tokio::spawn(backend_pipeline_worker(
+                    config,
+                    queue,
+                    provider,
+                    metrics,
+                    buffer_pool,
+                ));
+
+                info!(
+                    "Spawned pipeline worker for backend {:?} ({}) batch_size={}",
+                    backend_id, server.name, server.pipeline_batch_size
+                );
+            }
         }
     }
 }

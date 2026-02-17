@@ -330,7 +330,7 @@ impl ClientSession {
     /// Returns None if the client has not authenticated yet.
     #[inline]
     #[must_use]
-    pub fn username(&self) -> Option<Arc<str>> {
+    pub fn username(&self) -> Option<&str> {
         self.auth_state.username()
     }
 
@@ -986,7 +986,7 @@ mod tests {
 
         let username = session.username();
         assert!(username.is_some());
-        assert_eq!(username.as_deref(), Some("testuser"));
+        assert_eq!(username, Some("testuser"));
     }
 
     #[test]
@@ -1024,7 +1024,7 @@ mod tests {
         assert!(username1.is_some());
         assert!(username2.is_some());
         assert_eq!(username1, username2);
-        assert_eq!(username1.as_deref(), Some("testuser"));
+        assert_eq!(username1, Some("testuser"));
     }
 
     #[test]
@@ -1078,15 +1078,13 @@ mod tests {
 
         // Metrics is always present now
         session.metrics.record_command(BackendId::from_index(0));
-        session.metrics.user_command(session.username().as_deref());
+        session.metrics.user_command(session.username());
         session.metrics.stateful_session_started();
         session.metrics.stateful_session_ended();
+        session.metrics.user_bytes_sent(session.username(), 1024);
         session
             .metrics
-            .user_bytes_sent(session.username().as_deref(), 1024);
-        session
-            .metrics
-            .user_bytes_received(session.username().as_deref(), 2048);
+            .user_bytes_received(session.username(), 2048);
     }
 
     #[test]
@@ -1110,15 +1108,13 @@ mod tests {
 
         // Call metrics directly - should record
         session.metrics.record_command(BackendId::from_index(0));
-        session.metrics.user_command(session.username().as_deref());
+        session.metrics.user_command(session.username());
         session.metrics.stateful_session_started();
         session.metrics.stateful_session_ended();
+        session.metrics.user_bytes_sent(session.username(), 1024);
         session
             .metrics
-            .user_bytes_sent(session.username().as_deref(), 1024);
-        session
-            .metrics
-            .user_bytes_received(session.username().as_deref(), 2048);
+            .user_bytes_received(session.username(), 2048);
 
         // Verify metrics were recorded (snapshot should have data)
         let snapshot = metrics.snapshot(None);
@@ -1167,12 +1163,10 @@ mod tests {
         .build();
 
         session.set_username(Some("testuser".to_string()));
+        session.metrics.user_bytes_sent(session.username(), 1024);
         session
             .metrics
-            .user_bytes_sent(session.username().as_deref(), 1024);
-        session
-            .metrics
-            .user_bytes_received(session.username().as_deref(), 2048);
+            .user_bytes_received(session.username(), 2048);
 
         let snapshot = metrics.snapshot(None);
         let user_stats = snapshot

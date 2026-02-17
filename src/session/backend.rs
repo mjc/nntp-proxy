@@ -20,6 +20,7 @@
 //! ```
 
 use anyhow::Result;
+use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
@@ -43,7 +44,7 @@ pub enum ResponseWarning {
 pub struct ValidatedResponse {
     pub response: NntpResponse,
     pub is_multiline: bool,
-    pub warnings: Vec<ResponseWarning>,
+    pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
 /// Validate backend response data (pure function - easily testable)
@@ -66,7 +67,7 @@ pub fn validate_backend_response(
     bytes_read: usize,
     min_length: usize,
 ) -> ValidatedResponse {
-    let mut warnings = Vec::new();
+    let mut warnings = SmallVec::new();
 
     // Check minimum length
     if bytes_read < min_length {
@@ -110,7 +111,7 @@ pub struct CommandResponse {
     /// Whether this is a multiline response
     pub is_multiline: bool,
     /// Any validation warnings
-    pub warnings: Vec<ResponseWarning>,
+    pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
 impl CommandResponse {
@@ -124,8 +125,51 @@ impl CommandResponse {
 
     /// Get status code if valid
     #[inline]
-    pub fn status_code(&self) -> Option<u16> {
-        self.response.status_code().map(|c| c.as_u16())
+    pub fn status_code(&self) -> Option<crate::protocol::StatusCode> {
+        self.response.status_code()
+    }
+
+    /// Log validation warnings with context
+    pub fn log_warnings(
+        &self,
+        buffer: &[u8],
+        client_addr: impl std::fmt::Display,
+        backend_id: crate::types::BackendId,
+    ) {
+        use tracing::warn;
+
+        for warning in &self.warnings {
+            match warning {
+                ResponseWarning::ShortResponse { bytes, min } => {
+                    warn!(
+                        "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
+                        client_addr,
+                        backend_id,
+                        bytes,
+                        min,
+                        &buffer[..self.bytes_read]
+                    );
+                }
+                ResponseWarning::InvalidResponse => {
+                    warn!(
+                        "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
+                        client_addr,
+                        backend_id,
+                        self.bytes_read,
+                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                    );
+                }
+                ResponseWarning::UnusualStatusCode(code) => {
+                    warn!(
+                        "Client {} got unusual status code {} from backend {:?}: {:?}",
+                        client_addr,
+                        code,
+                        backend_id,
+                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -208,50 +252,6 @@ where
     ))
 }
 
-/// Log validation warnings with context
-pub fn log_warnings(
-    warnings: &[ResponseWarning],
-    buffer: &[u8],
-    bytes_read: usize,
-    client_addr: impl std::fmt::Display,
-    backend_id: crate::types::BackendId,
-) {
-    use tracing::warn;
-
-    for warning in warnings {
-        match warning {
-            ResponseWarning::ShortResponse { bytes, min } => {
-                warn!(
-                    "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
-                    client_addr,
-                    backend_id,
-                    bytes,
-                    min,
-                    &buffer[..bytes_read]
-                );
-            }
-            ResponseWarning::InvalidResponse => {
-                warn!(
-                    "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
-                    client_addr,
-                    backend_id,
-                    bytes_read,
-                    String::from_utf8_lossy(&buffer[..bytes_read.min(50)])
-                );
-            }
-            ResponseWarning::UnusualStatusCode(code) => {
-                warn!(
-                    "Client {} got unusual status code {} from backend {:?}: {:?}",
-                    client_addr,
-                    code,
-                    backend_id,
-                    String::from_utf8_lossy(&buffer[..bytes_read.min(50)])
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,7 +265,7 @@ mod tests {
             bytes_read: 20,
             response: NntpResponse::parse(b"430 No such article\r\n"),
             is_multiline: false,
-            warnings: vec![],
+            warnings: SmallVec::new(),
         };
         assert!(response.is_430());
 
@@ -274,7 +274,7 @@ mod tests {
             bytes_read: 30,
             response: NntpResponse::parse(b"220 0 <msg@example.com>\r\n"),
             is_multiline: true,
-            warnings: vec![],
+            warnings: SmallVec::new(),
         };
         assert!(!response.is_430());
     }
@@ -285,9 +285,9 @@ mod tests {
             bytes_read: 10,
             response: NntpResponse::parse(b"211 Group\r\n"),
             is_multiline: false,
-            warnings: vec![],
+            warnings: SmallVec::new(),
         };
-        assert_eq!(response.status_code(), Some(211));
+        assert_eq!(response.status_code().map(|c| c.as_u16()), Some(211));
     }
 
     // ─── Validation tests ───────────────────────────────────────────────────

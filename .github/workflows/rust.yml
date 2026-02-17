@@ -2,75 +2,51 @@ name: Rust
 
 on:
   pull_request:
+    paths:
+      - '**.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/workflows/rust.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0  # Disable incremental compilation for CI (not reused)
-  CARGO_PROFILE_DEV_DEBUG: 0  # Disable debug info in dev builds (faster compile)
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   test:
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@nightly
-    
+      with:
+        components: llvm-tools-preview
+
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: "test"
         cache-on-failure: true
 
-    - name: Install cargo-nextest
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+
+    - name: Install tools
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-nextest
+        tool: cargo-nextest,cargo-llvm-cov
 
-    - name: Run tests
-      run: cargo nextest run --all-features --workspace
+    - name: Run tests with coverage
+      run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
 
-  coverage:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: llvm-tools-preview
-    
-    - name: Setup Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: "coverage"
-        cache-on-failure: true
-
-    - name: Cache cargo-llvm-cov binary
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/cargo-llvm-cov
-        key: ${{ runner.os }}-cargo-llvm-cov-0.6.14
-
-    - name: Install cargo-llvm-cov
-      run: |
-        if ! command -v cargo-llvm-cov &> /dev/null; then
-          cargo install cargo-llvm-cov --version 0.6.14 --locked
-        fi
-
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-nextest
-
-    - name: Generate coverage report
-      run: |
-        cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
-
-    - name: Upload coverage reports to Codecov
+    - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
       with:
         file: lcov.info
@@ -80,7 +56,7 @@ jobs:
         verbose: true
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-    
+
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/test-results-action@v1

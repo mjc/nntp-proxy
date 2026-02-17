@@ -124,6 +124,13 @@ struct MetricsInner {
     backend_metrics: Vec<BackendMetrics>,
     user_metrics: DashMap<String, UserMetrics>,
     start_time: Instant,
+    // Pipeline metrics
+    pipeline_batches: AtomicU64,
+    pipeline_commands: AtomicU64,
+    /// Total requests enqueued to pipeline queues
+    pipeline_requests_queued: AtomicU64,
+    /// Total requests completed via pipeline
+    pipeline_requests_completed: AtomicU64,
     // Note: client_to_backend_bytes and backend_to_client_bytes are calculated
     // from backend_metrics sums, not stored separately
 }
@@ -132,13 +139,6 @@ impl MetricsCollector {
     #[inline]
     fn backend_get(&self, backend_id: BackendId) -> Option<&BackendMetrics> {
         self.inner.backend_metrics.get(backend_id.as_index())
-    }
-
-    #[inline]
-    fn normalize_username(username: Option<&str>) -> String {
-        username
-            .unwrap_or(crate::constants::user::ANONYMOUS)
-            .to_string()
     }
 
     #[inline]
@@ -157,18 +157,21 @@ impl MetricsCollector {
     where
         F: Fn(&mut UserMetrics),
     {
-        let key = Self::normalize_username(username);
+        let key = username.unwrap_or(crate::constants::user::ANONYMOUS);
 
-        // Fast path: try lock-free update if entry exists
-        if let Some(mut entry) = self.inner.user_metrics.get_mut(&key) {
+        // Fast path: zero-alloc &str lookup (DashMap String key supports Borrow<str>)
+        if let Some(mut entry) = self.inner.user_metrics.get_mut(key) {
             update(&mut entry);
             return;
         }
 
-        // Slow path: insert new entry (only happens once per user)
-        let new_metrics = UserMetrics::new(key.clone());
-        self.inner.user_metrics.insert(key.clone(), new_metrics);
-        if let Some(mut entry) = self.inner.user_metrics.get_mut(&key) {
+        // Slow path: insert once per user, then update
+        let owned = key.to_string();
+        self.inner
+            .user_metrics
+            .entry(owned)
+            .or_insert_with(|| UserMetrics::new(key.to_string()));
+        if let Some(mut entry) = self.inner.user_metrics.get_mut(key) {
             update(&mut entry);
         }
     }
@@ -190,6 +193,10 @@ impl MetricsCollector {
                 backend_metrics,
                 user_metrics: DashMap::new(),
                 start_time: Instant::now(),
+                pipeline_batches: AtomicU64::new(0),
+                pipeline_commands: AtomicU64::new(0),
+                pipeline_requests_queued: AtomicU64::new(0),
+                pipeline_requests_completed: AtomicU64::new(0),
             }),
         }
     }
@@ -386,8 +393,8 @@ impl MetricsCollector {
     }
 
     pub fn user_connection_closed(&self, username: Option<&str>) {
-        let key = Self::normalize_username(username);
-        if let Some(mut m) = self.inner.user_metrics.get_mut(&key) {
+        let key = username.unwrap_or(crate::constants::user::ANONYMOUS);
+        if let Some(mut m) = self.inner.user_metrics.get_mut(key) {
             m.active_connections = m.active_connections.saturating_sub(1);
         }
     }
@@ -406,6 +413,37 @@ impl MetricsCollector {
 
     pub fn user_error(&self, username: Option<&str>) {
         self.update_user_metrics(username, |m| m.errors += 1);
+    }
+
+    // Pipeline metrics
+
+    /// Record a pipelined batch execution.
+    ///
+    /// `batch_size` is the number of commands in the batch. Only called for
+    /// batches with more than 1 command (single-command batches use the
+    /// existing sequential path and are not counted).
+    #[inline]
+    pub fn record_pipeline_batch(&self, batch_size: u64) {
+        self.inner.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pipeline_commands
+            .fetch_add(batch_size, Ordering::Relaxed);
+    }
+
+    /// Record a request being enqueued to a pipeline queue
+    #[inline]
+    pub fn record_pipeline_enqueue(&self) {
+        self.inner
+            .pipeline_requests_queued
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a request being completed via pipeline
+    #[inline]
+    pub fn record_pipeline_complete(&self) {
+        self.inner
+            .pipeline_requests_completed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // Snapshot creation (pure functional transformations)
@@ -477,6 +515,13 @@ impl MetricsCollector {
             cache_size_bytes,
             cache_hit_rate,
             disk_cache,
+            pipeline_batches: self.inner.pipeline_batches.load(Ordering::Relaxed),
+            pipeline_commands: self.inner.pipeline_commands.load(Ordering::Relaxed),
+            pipeline_requests_queued: self.inner.pipeline_requests_queued.load(Ordering::Relaxed),
+            pipeline_requests_completed: self
+                .inner
+                .pipeline_requests_completed
+                .load(Ordering::Relaxed),
         }
     }
 

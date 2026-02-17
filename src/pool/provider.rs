@@ -16,6 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use deadpool::managed;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -30,6 +31,12 @@ pub struct DeadpoolConnectionProvider {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Metrics for health check operations (lock-free)
     pub health_check_metrics: Arc<HealthCheckMetrics>,
+    /// Original max pool size (before any cooldown reductions)
+    original_max_size: usize,
+    /// Number of active cooldown timers reducing pool size
+    active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
+    /// Connection replacement cooldown duration (None = disabled)
+    replacement_cooldown: Option<std::time::Duration>,
 }
 
 /// Builder for constructing `DeadpoolConnectionProvider` instances
@@ -335,6 +342,9 @@ impl DeadpoolConnectionProvider {
             name,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
+            original_max_size: max_size,
+            active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            replacement_cooldown: None, // Default: no cooldown
         }
     }
 
@@ -365,8 +375,9 @@ impl DeadpoolConnectionProvider {
             server.compress,
             server.compress_level,
         )?;
+        let max_size = server.max_connections.get();
         let pool = Pool::builder(manager)
-            .max_size(server.max_connections.get())
+            .max_size(max_size)
             .build()
             .expect("Failed to create connection pool");
 
@@ -402,6 +413,9 @@ impl DeadpoolConnectionProvider {
             name: server.name.to_string(),
             shutdown_tx,
             health_check_metrics: metrics,
+            original_max_size: max_size,
+            active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            replacement_cooldown: server.replacement_cooldown,
         })
     }
 
@@ -410,12 +424,25 @@ impl DeadpoolConnectionProvider {
         &self,
     ) -> Result<managed::Object<TcpManager>, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
-        self.pool.get().await.map_err(|e| match e {
-            deadpool::managed::PoolError::Backend(conn_err) => conn_err,
-            _other => ConnectionError::PoolExhausted {
-                backend: self.name.clone(),
-                max_size: self.pool.status().max_size,
-            },
+        self.pool.get().await.map_err(|e| {
+            let status = self.pool.status();
+            let err = match e {
+                deadpool::managed::PoolError::Backend(conn_err) => conn_err,
+                _other => ConnectionError::PoolExhausted {
+                    backend: self.name.clone(),
+                    max_size: status.max_size,
+                },
+            };
+            warn!(
+                pool = %self.name,
+                max_size = status.max_size,
+                available = status.available,
+                current_size = status.size,
+                waiting = status.waiting,
+                error = %err,
+                "Connection acquisition failed"
+            );
+            err
         })
     }
 
@@ -427,7 +454,6 @@ impl DeadpoolConnectionProvider {
     ///
     /// Use this to clear potentially stale connections after an idle period.
     pub fn clear_idle_connections(&self) {
-        let max_size = self.pool.status().max_size;
         let available = self.pool.status().available;
 
         if available > 0 {
@@ -437,11 +463,104 @@ impl DeadpoolConnectionProvider {
                 "Clearing idle connections from pool"
             );
 
+            // Calculate target max based on original size minus active cooldowns
+            let cooldowns = self.active_cooldowns.load(Ordering::Acquire);
+            let target_max = self.original_max_size.saturating_sub(cooldowns).max(1);
+
             // Resize to 0 drops all idle connections
             self.pool.resize(0);
-            // Resize back to original allows new connections
-            self.pool.resize(max_size);
+            // Resize back to target allows new connections
+            self.pool.resize(target_max);
         }
+    }
+
+    /// Remove a broken connection and temporarily reduce pool size.
+    ///
+    /// Gives the backend time to release the old connection's slot before
+    /// deadpool creates a replacement. Prevents connection count from
+    /// exceeding the backend's limit during high churn.
+    ///
+    /// If replacement_cooldown is None or Duration::ZERO (disabled), immediately drops
+    /// the connection without cooldown (behaves like normal pool removal).
+    ///
+    /// CRITICAL: When cooldown is active, we resize the pool BEFORE dropping the
+    /// connection. Otherwise, between `drop(conn)` and `pool.resize()`, any waiter
+    /// calling `pool.get()` sees `size < max_size` and immediately creates a
+    /// replacement — defeating the cooldown entirely.
+    ///
+    /// The ordering invariant is enforced at compile time: `conn` is moved into
+    /// either [`shutdown_and_drop`] or [`resize_then_drop`], so the caller cannot
+    /// accidentally `drop(conn)` before `pool.resize()`. Any attempt to reorder
+    /// would be a use-after-move error.
+    pub fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
+        // If cooldown is disabled (None or zero duration), just shut down and drop
+        let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
+            shutdown_and_drop(conn);
+            return;
+        };
+
+        // Cap cooldowns to prevent pool collapse: never reduce below half original size.
+        // If >50% of connections fail simultaneously, it's a systemic backend issue
+        // (restart, network partition). Continuing to reduce would starve all clients.
+        // Better to keep half the pool and let failed connections return errors.
+        let max_reduction = self.original_max_size / 2;
+        let current = self.active_cooldowns.load(Ordering::Acquire);
+        if current >= max_reduction {
+            // Already at max reduction — just shut down and drop without further cooldown
+            shutdown_and_drop(conn);
+            return;
+        }
+
+        // Reduce pool max, THEN drop. `conn` is moved into `resize_then_drop`,
+        // making it a compile error to drop conn before resize.
+        let cooldowns = self.active_cooldowns.fetch_add(1, Ordering::AcqRel) + 1;
+        let new_max = self.original_max_size.saturating_sub(cooldowns).max(1);
+        resize_then_drop(&self.pool, conn, new_max);
+
+        warn!(
+            pool = %self.name,
+            new_max_size = new_max,
+            original_max_size = self.original_max_size,
+            active_cooldowns = cooldowns,
+            cooldown_secs = cooldown.as_secs(),
+            "Connection removed, pool size temporarily reduced"
+        );
+
+        // Schedule restoration with Drop guard to ensure fetch_sub runs
+        let active_cooldowns = self.active_cooldowns.clone();
+        let pool = self.pool.clone();
+        let original_max = self.original_max_size;
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            // Drop guard ensures fetch_sub runs even if task is cancelled
+            struct CooldownGuard {
+                active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
+                pool: Pool,
+                original_max: usize,
+                name: String,
+            }
+            impl Drop for CooldownGuard {
+                fn drop(&mut self) {
+                    let remaining = self.active_cooldowns.fetch_sub(1, Ordering::AcqRel) - 1;
+                    let restored_max = self.original_max.saturating_sub(remaining);
+                    self.pool.resize(restored_max);
+                    debug!(
+                        pool = %self.name,
+                        restored_max_size = restored_max,
+                        remaining_cooldowns = remaining,
+                        "Connection cooldown expired, pool size restored"
+                    );
+                }
+            }
+            let _guard = CooldownGuard {
+                active_cooldowns,
+                pool,
+                original_max,
+                name,
+            };
+            tokio::time::sleep(cooldown).await;
+            // _guard drops here, running fetch_sub + resize
+        });
     }
 
     /// Get the maximum pool size
@@ -554,8 +673,11 @@ impl DeadpoolConnectionProvider {
                             error = %e,
                             "Health check failed, discarding connection"
                         );
-                        // Drop the connection without returning it to pool
-                        drop(managed::Object::take(conn_obj));
+                        // Shut down the raw TCP socket so recycle reliably detects it as dead
+                        let _ = socket2::SockRef::from(conn_obj.underlying_tcp_stream())
+                            .shutdown(std::net::Shutdown::Both);
+                        // Return to pool normally — deadpool drops it before creating a replacement
+                        drop(conn_obj);
                     } else {
                         // Connection is healthy, return to pool automatically via Drop
                         drop(conn_obj);
@@ -607,6 +729,29 @@ impl DeadpoolConnectionProvider {
 
         self.pool.close();
     }
+}
+
+/// Shut down TCP socket and drop a pooled connection.
+///
+/// Takes ownership so the caller cannot drop `conn` at a different point.
+fn shutdown_and_drop(conn: managed::Object<TcpManager>) {
+    let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
+    drop(conn);
+}
+
+/// Resize pool max THEN shut down and drop the connection.
+///
+/// **This function exists to make the wrong ordering a compile error.**
+/// Because `conn` is moved in, the caller cannot `drop(conn)` before `pool.resize()`.
+/// Any attempt to reorder operations would produce a use-after-move error.
+///
+/// The ordering matters: if we dropped first, waiters would see
+/// `pool.size < pool.max_size` and immediately create a replacement,
+/// defeating the cooldown.
+fn resize_then_drop(pool: &Pool, conn: managed::Object<TcpManager>, new_max: usize) {
+    pool.resize(new_max);
+    let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
+    drop(conn);
 }
 
 #[async_trait]
@@ -846,5 +991,173 @@ mod tests {
 
         assert_eq!(builder.name, Some("Second".to_string()));
         assert_eq!(builder.max_size, 20);
+    }
+
+    /// Helper: spawn a mock NNTP server that greets each connection and keeps it alive.
+    /// Returns the address to connect to.
+    async fn spawn_mock_nntp_server() -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Use a Notify that is never notified to keep connections alive
+        // indefinitely. Unlike sleep(), this won't auto-advance under
+        // start_paused = true.
+        let keep_alive = Arc::new(tokio::sync::Notify::new());
+
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        let keep = keep_alive.clone();
+                        // Spawn a handler per connection so they stay alive concurrently
+                        tokio::spawn(async move {
+                            let _ = stream.write_all(b"200 mock\r\n").await;
+                            // Keep alive until test drops the connection.
+                            // Notify::notified() does NOT auto-advance with
+                            // start_paused, unlike sleep().
+                            keep.notified().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        addr
+    }
+
+    /// Helper: create a provider with cooldown for testing
+    async fn provider_with_cooldown(
+        addr: std::net::SocketAddr,
+        max_size: usize,
+        cooldown: Option<std::time::Duration>,
+    ) -> DeadpoolConnectionProvider {
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            format!("test-{}", addr.port()),
+            None,
+            None,
+            None,
+            Some(false), // Disable compression — mock doesn't handle it
+            None,
+        )
+        .unwrap();
+
+        let pool = Pool::builder(manager).max_size(max_size).build().unwrap();
+
+        DeadpoolConnectionProvider {
+            pool,
+            name: format!("test-{}", addr.port()),
+            shutdown_tx: None,
+            health_check_metrics: Arc::new(crate::pool::health_check::HealthCheckMetrics::new()),
+            original_max_size: max_size,
+            active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            replacement_cooldown: cooldown,
+        }
+    }
+
+    /// Verify that remove_with_cooldown reduces pool max_size BEFORE releasing
+    /// the connection. This is the fix for the race where waiters would see
+    /// size < max_size and create a replacement connection.
+    #[tokio::test]
+    async fn test_remove_with_cooldown_resize_before_drop() {
+        let addr = spawn_mock_nntp_server().await;
+        let cooldown = std::time::Duration::from_secs(10);
+        let max_size = 4;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+
+        let conn = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(provider.pool.status().max_size, max_size);
+
+        // Remove with cooldown — this should reduce max_size BEFORE dropping conn
+        provider.remove_with_cooldown(conn);
+
+        // After remove_with_cooldown, max_size must be reduced immediately
+        let status = provider.pool.status();
+        assert_eq!(
+            status.max_size,
+            max_size - 1,
+            "Pool max_size should be reduced to {} after remove_with_cooldown, got {}",
+            max_size - 1,
+            status.max_size
+        );
+        assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 1);
+    }
+
+    /// Verify the cooldown cap: never reduce below half original size
+    #[tokio::test]
+    async fn test_remove_with_cooldown_cap() {
+        let addr = spawn_mock_nntp_server().await;
+        let cooldown = std::time::Duration::from_secs(10);
+        let max_size = 4;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+
+        // max_reduction = 4 / 2 = 2, so after 2 cooldowns it should stop reducing
+        let conn1 = provider.get_pooled_connection().await.unwrap();
+        let conn2 = provider.get_pooled_connection().await.unwrap();
+        let conn3 = provider.get_pooled_connection().await.unwrap();
+
+        provider.remove_with_cooldown(conn1);
+        assert_eq!(provider.pool.status().max_size, 3);
+
+        provider.remove_with_cooldown(conn2);
+        assert_eq!(provider.pool.status().max_size, 2);
+
+        // Third removal should NOT further reduce (at cap)
+        provider.remove_with_cooldown(conn3);
+        assert_eq!(
+            provider.pool.status().max_size,
+            2,
+            "Pool max_size should not drop below half (2) of original (4)"
+        );
+    }
+
+    /// Verify no cooldown when cooldown is disabled (None)
+    #[tokio::test]
+    async fn test_remove_with_cooldown_disabled() {
+        let addr = spawn_mock_nntp_server().await;
+        let max_size = 4;
+        let provider = provider_with_cooldown(addr, max_size, None).await;
+
+        let conn = provider.get_pooled_connection().await.unwrap();
+        provider.remove_with_cooldown(conn);
+
+        // With cooldown disabled, max_size should NOT be reduced
+        assert_eq!(provider.pool.status().max_size, max_size);
+        assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
+    }
+
+    /// Verify cooldown restoration after timer expires.
+    ///
+    /// Note: Cannot use `start_paused = true` here because the mock NNTP server
+    /// uses real TCP I/O which doesn't work with paused time (auto-advance
+    /// would resolve the Notify/sleep before the TCP handshake completes).
+    /// Instead we use a very short real cooldown.
+    #[tokio::test]
+    async fn test_remove_with_cooldown_restores_after_timer() {
+        let addr = spawn_mock_nntp_server().await;
+        let cooldown = std::time::Duration::from_millis(100);
+        let max_size = 4;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+
+        let conn = provider.get_pooled_connection().await.unwrap();
+        provider.remove_with_cooldown(conn);
+
+        assert_eq!(provider.pool.status().max_size, 3);
+        assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 1);
+
+        // Wait for the cooldown timer to restore the pool
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            provider.pool.status().max_size,
+            max_size,
+            "Pool max_size should be restored after cooldown expires"
+        );
+        assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
     }
 }

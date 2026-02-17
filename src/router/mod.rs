@@ -25,6 +25,7 @@
 //!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
 //!     0, // tier (lower = higher priority)
+//!     None, // pipeline_queue
 //! );
 //!
 //! // Route a command
@@ -36,6 +37,7 @@
 //! ```
 
 mod backend_info;
+pub mod backend_queue;
 mod strategies;
 
 use anyhow::Result;
@@ -43,6 +45,8 @@ use nutype::nutype;
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+pub use backend_queue::BackendQueue;
 
 use crate::config::BackendSelectionStrategy;
 use crate::pool::DeadpoolConnectionProvider;
@@ -220,6 +224,7 @@ impl Drop for CommandGuard {
 ///     ServerName::try_new("backend-1".to_string()).unwrap(),
 ///     provider,
 ///     0, // tier (lower = higher priority)
+///     None, // pipeline_queue
 /// );
 ///
 /// // Route commands
@@ -232,6 +237,8 @@ pub struct BackendSelector {
     backends: Vec<BackendInfo>,
     /// Selection strategy (weighted round-robin or least-loaded)
     strategy: SelectionStrategy,
+    /// H4: Pre-computed sorted unique tiers (avoids Vec allocation in hot path)
+    sorted_tiers: smallvec::SmallVec<[u8; 4]>,
 }
 
 impl Default for BackendSelector {
@@ -281,6 +288,7 @@ impl BackendSelector {
             // Pre-allocate for typical number of backend servers (most setups have 2-8)
             backends: Vec::with_capacity(4),
             strategy: selection_strategy,
+            sorted_tiers: smallvec::SmallVec::new(),
         }
     }
 
@@ -291,12 +299,14 @@ impl BackendSelector {
     /// * `name` - Human-readable name for logging
     /// * `provider` - Connection pool provider
     /// * `tier` - Server tier (lower = higher priority, 0 is highest)
+    /// * `pipeline_queue` - Optional pipeline queue for request multiplexing
     pub fn add_backend(
         &mut self,
         backend_id: BackendId,
         name: ServerName,
         provider: DeadpoolConnectionProvider,
         tier: u8,
+        pipeline_queue: Option<Arc<BackendQueue>>,
     ) {
         let max_connections = provider.max_size();
 
@@ -329,6 +339,10 @@ impl BackendSelector {
             }
         }
 
+        if pipeline_queue.is_some() {
+            info!("Backend {:?} ({}) pipeline queue enabled", backend_id, name);
+        }
+
         self.backends.push(BackendInfo {
             id: backend_id,
             name,
@@ -336,7 +350,14 @@ impl BackendSelector {
             pending_count: PendingCount::new(),
             stateful_count: StatefulCount::new(),
             tier,
+            pipeline_queue,
         });
+
+        // H4: Maintain sorted unique tiers (avoids Vec allocation in select_backend hot path)
+        if !self.sorted_tiers.contains(&tier) {
+            self.sorted_tiers.push(tier);
+            self.sorted_tiers.sort_unstable();
+        }
     }
 
     /// Select the next backend using the configured strategy with tier-aware prioritization
@@ -356,71 +377,95 @@ impl BackendSelector {
             return None;
         }
 
-        // Filter backends by availability if provided
+        // Availability check closure
         let is_available =
             |backend: &&BackendInfo| availability.is_none_or(|avail| avail.should_try(backend.id));
 
-        // Tier filtering only applies to article requests (when availability is provided).
-        // For non-article commands (LIST, CAPABILITIES, etc), use all backends regardless of tier.
-        let should_apply_tier_filtering = availability.is_some();
+        // No tier filtering - select from all available backends
+        if availability.is_none() {
+            return self.select_weighted(|b| is_available(b));
+        }
 
-        // If tiering applies, find the lowest available tier; otherwise this value is unused
-        let lowest_available_tier = if should_apply_tier_filtering {
-            self.backends
-                .iter()
-                .filter(|b| is_available(b))
-                .map(|b| b.tier)
-                .min()?
-        } else {
-            0 // Unused when should_apply_tier_filtering is false; see tier_filter closure
-        };
-
-        // Filter: if tiering applies, only backends in lowest tier; otherwise all available backends
-        let tier_filter = |backend: &&BackendInfo| {
-            if should_apply_tier_filtering {
-                backend.tier == lowest_available_tier && is_available(backend)
-            } else {
-                is_available(backend)
-            }
-        };
-
-        match &self.strategy {
-            SelectionStrategy::WeightedRoundRobin(wrr) => {
-                // Calculate total weight for this tier only
-                let tier_total_weight: usize = self
+        // H4: Tier filtering enabled - try tiers in order 0, 1, 2, ...
+        // Use pre-computed sorted tiers (no allocation)
+        // Try each tier until we find an available backend
+        for &tier in &self.sorted_tiers {
+            // Only count available backends if debug logging is enabled (avoid O(n) scan)
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let available_in_tier = self
                     .backends
                     .iter()
-                    .filter(tier_filter)
+                    .filter(|b| b.tier == tier && is_available(b))
+                    .count();
+
+                tracing::debug!(
+                    tier = tier,
+                    available_in_tier = available_in_tier,
+                    "Checking tier for available backends"
+                );
+            }
+
+            // Try to select from this specific tier
+            let tier_filter = |b: &&BackendInfo| b.tier == tier && is_available(b);
+
+            if let Some(backend) = self.select_weighted(tier_filter) {
+                tracing::debug!(
+                    backend_id = backend.id.as_index(),
+                    backend_name = backend.name.as_str(),
+                    tier = tier,
+                    "Selected backend"
+                );
+                return Some(backend);
+            }
+
+            tracing::debug!(tier = tier, "No available backends in tier, trying next");
+        }
+
+        // All tiers exhausted
+        tracing::debug!("All tiers exhausted, no backends available");
+        None
+    }
+
+    /// Select a backend using weighted round-robin from backends matching the filter
+    fn select_weighted<F>(&self, filter: F) -> Option<&BackendInfo>
+    where
+        F: Fn(&&BackendInfo) -> bool,
+    {
+        match &self.strategy {
+            SelectionStrategy::WeightedRoundRobin(wrr) => {
+                // Sum weights for backends passing filter
+                let total_weight: usize = self
+                    .backends
+                    .iter()
+                    .filter(&filter)
                     .map(|b| b.provider.max_size())
                     .sum();
 
-                if tier_total_weight == 0 {
-                    // No backends with positive weight - cannot route
-                    return None;
+                if total_weight == 0 {
+                    return None; // No backends match filter
                 }
 
-                // Use tier-specific weight for selection to avoid modulo bias
-                // (directly select within tier's weight range instead of global % tier)
-                let tier_position = wrr.select_with_weight(tier_total_weight)?;
+                // Select position in weighted distribution
+                let position = wrr.select_with_weight(total_weight)?;
 
-                // Find backend owning this weighted position using cumulative weights
+                // Find backend at that position
                 self.backends
                     .iter()
-                    .filter(tier_filter)
+                    .filter(&filter)
                     .scan(0, |cumulative, backend| {
                         *cumulative += backend.provider.max_size();
                         Some((*cumulative, backend))
                     })
-                    .find(|(cumulative_weight, _)| tier_position < *cumulative_weight)
+                    .find(|(cumulative_weight, _)| position < *cumulative_weight)
                     .map(|(_, backend)| backend)
                     .or_else(|| {
-                        // Fallback to first available backend in tier
-                        self.backends.iter().find(tier_filter)
+                        // Fallback: first backend matching filter
+                        self.backends.iter().find(&filter)
                     })
             }
             SelectionStrategy::LeastLoaded(_) => {
-                // Find backend with lowest load ratio in the lowest available tier
-                self.backends.iter().filter(tier_filter).min_by(|a, b| {
+                // Select backend with lowest load ratio
+                self.backends.iter().filter(&filter).min_by(|a, b| {
                     a.load_ratio()
                         .partial_cmp(&b.load_ratio())
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -479,6 +524,13 @@ impl BackendSelector {
     #[must_use]
     pub fn backend_provider(&self, backend_id: BackendId) -> Option<&DeadpoolConnectionProvider> {
         self.find_backend(backend_id).map(|b| &b.provider)
+    }
+
+    /// Get the pipeline queue for a backend (if pipelining is enabled)
+    #[must_use]
+    pub fn get_backend_queue(&self, backend_id: BackendId) -> Option<&Arc<BackendQueue>> {
+        self.find_backend(backend_id)
+            .and_then(|b| b.pipeline_queue.as_ref())
     }
 
     /// Get the number of backends
@@ -628,6 +680,7 @@ mod tests {
             ServerName::try_new("test-server".to_string()).unwrap(),
             provider,
             0,
+            None,
         );
         (Arc::new(selector), backend_id)
     }

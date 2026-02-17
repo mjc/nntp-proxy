@@ -37,6 +37,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
 crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data structures with minimal features
+tikv-jemallocator = "0.6"  # jemalloc allocator for reduced page allocation overhead
 nix = { version = "0.31", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.12.3"
 async-trait = "0.1.89"
@@ -104,10 +105,18 @@ name = "router_selection"
 harness = false
 
 
+[profile.dev]
+split-debuginfo = "unpacked"  # Faster linking — don't bundle debuginfo into binary
+
+[profile.dev.package."*"]
+opt-level = 1  # Compile dependencies with optimizations in dev mode
+               # Huge runtime speedup for rustls/ring/foyer/moka
+               # Minimal compile-time cost (deps cached after first build)
+
 [profile.release]
 debug = false          # No debug symbols for smaller binaries
 strip = true           # Strip symbols for even smaller size
-lto = true             # Full LTO for better optimization and much smaller binaries (note: increases build time ~10x)
+lto = "thin"           # Thin LTO: cross-module inlining at a fraction of full LTO's link time (~80% of the optimization)
 codegen-units = 1      # Single codegen unit for better optimization
 overflow-checks = true # Keep overflow checks for safety with untrusted network data
 

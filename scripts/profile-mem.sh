@@ -39,13 +39,25 @@ fi
 
 # Resolve binary name
 case "$BIN" in
-    tui) BINARY="$PROJECT_DIR/target/profiling/nntp-proxy-tui" ;;
-    cli) BINARY="$PROJECT_DIR/target/profiling/nntp-proxy" ;;
-    *)   BINARY="$BIN" ;;
+    tui)
+        BINARY="$PROJECT_DIR/target/profiling/nntp-proxy-tui"
+        BIN_NAME="nntp-proxy-tui"
+        ;;
+    cli)
+        BINARY="$PROJECT_DIR/target/profiling/nntp-proxy"
+        BIN_NAME="nntp-proxy"
+        ;;
+    *)
+        BINARY="$BIN"
+        BIN_NAME=""  # Custom path, skip build
+        ;;
 esac
 
-# Build with profiling flags
-RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --features zlib-ng
+# Build with profiling flags (only the binary we need)
+if [ -n "$BIN_NAME" ]; then
+    echo "Building $BIN_NAME..."
+    RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" cargo build --profile profiling --features zlib-ng --bin "$BIN_NAME"
+fi
 
 echo "=== Heap Profiling ==="
 echo ""

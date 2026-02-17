@@ -66,10 +66,9 @@ async fn query_backend(
     deps.router.mark_backend_pending(backend_id);
 
     // Retry once on stale connection (fresh connection on second attempt)
-    let label = format!("backend {}", backend_id.as_index());
     let query_result: QueryResult = crate::session::retry::retry_once_on_stale!(
-        label,
-        execute_backend_query(deps, provider, backend_id, command, multiline).await
+        execute_backend_query(deps, provider, backend_id, command, multiline).await,
+        backend = backend_id.as_index()
     )
     .unwrap_or(QueryResult::Error(backend_id));
 
@@ -105,10 +104,11 @@ async fn execute_backend_query(
                 return Err(());
             };
 
-            // For multiline responses, read remaining data
+            // For multiline responses, read remaining data until we have the full terminator
             let mut response = buffer[..cmd_response.bytes_read].to_vec();
             if multiline && cmd_response.is_multiline {
-                while !response.ends_with(b".\r\n") {
+                // Read until we have the complete NNTP terminator \r\n.\r\n
+                while !crate::protocol::has_multiline_terminator(&response) {
                     match conn.as_mut().read(buffer.as_mut_slice()).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => response.extend_from_slice(&buffer[..n]),
@@ -116,7 +116,7 @@ async fn execute_backend_query(
                 }
             }
 
-            Ok(match status_code {
+            Ok(match status_code.as_u16() {
                 220..=223 => {
                     // Record successful command and timing
                     tracing::debug!(
@@ -205,10 +205,10 @@ async fn query_all_backends_racing(
     let mut first_found = None;
 
     // Collect results until we find a success
-    while let Some(result) = pending.next().await {
-        match &result {
+    while let Some(mut result) = pending.next().await {
+        match &mut result {
             QueryResult::Found(id, response) if first_found.is_none() => {
-                first_found = Some((*id, response.clone()));
+                first_found = Some((*id, std::mem::take(response)));
                 results.push(result);
 
                 // Spawn background task to complete remaining backends and update cache
@@ -308,14 +308,13 @@ pub async fn precheck(
         // backend also has it but responded slower. Using tier 0 conservatively ensures
         // we don't overestimate TTL. Regular routing will discover higher-tier availability.
         let tier = 0;
-        // Construct the entry directly from the data we have, avoiding a redundant
-        // cache.get() round-trip after upsert.
-        let entry = ArticleEntry::from_arc_with_tier(std::sync::Arc::new(data.clone()), tier);
+        // Move data into upsert, then retrieve the entry via cache.get().
+        // The lookup is sub-microsecond vs 750KB memcpy from cloning.
         owned
             .cache
             .upsert(msg_id.to_owned(), data, backend_id, tier)
             .await;
-        Some(entry)
+        owned.cache.get(msg_id).await
     } else {
         // No article found - availability is synced by background task
         None

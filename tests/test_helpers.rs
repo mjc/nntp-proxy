@@ -254,26 +254,16 @@ pub async fn get_available_port() -> Result<u16> {
 
 /// Create a test configuration with servers on the given ports
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
-    use nntp_proxy::types::{HostName, MaxConnections, Port, ServerName};
+    use nntp_proxy::types::{MaxConnections, Port};
     Config {
         servers: server_ports
             .into_iter()
-            .map(|(port, name)| Server {
-                host: HostName::try_new("127.0.0.1".to_string()).unwrap(),
-                port: Port::try_new(port).unwrap(),
-                name: ServerName::try_new(name.to_string()).unwrap(),
-                username: None,
-                password: None,
-                max_connections: MaxConnections::try_new(5).unwrap(),
-                use_tls: false,
-                tls_verify_cert: true,
-                tls_cert_path: None,
-                connection_keepalive: None,
-                health_check_max_per_cycle: nntp_proxy::config::health_check_max_per_cycle(),
-                health_check_pool_timeout: nntp_proxy::config::health_check_pool_timeout(),
-                tier: 0,
-                compress: None,
-                compress_level: None,
+            .map(|(port, name)| {
+                Server::builder("127.0.0.1", Port::try_new(port).unwrap())
+                    .name(name)
+                    .max_connections(MaxConnections::try_new(5).unwrap())
+                    .build()
+                    .unwrap()
             })
             .collect(),
         proxy: Default::default(),

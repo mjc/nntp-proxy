@@ -125,11 +125,15 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         tls_verify_cert,
         tls_cert_path,
         connection_keepalive,
+        replacement_cooldown: crate::config::defaults::replacement_cooldown_option(),
         health_check_max_per_cycle,
         health_check_pool_timeout,
         tier,
         compress: None,
         compress_level: None,
+        enable_pipelining: crate::config::defaults::enable_pipelining(),
+        pipeline_queue_depth: crate::config::defaults::pipeline_queue_depth(),
+        pipeline_batch_size: crate::config::defaults::pipeline_batch_size(),
     })
 }
 
@@ -343,11 +347,15 @@ pub fn create_default_config() -> Config {
             tls_verify_cert: defaults::tls_verify_cert(),
             tls_cert_path: None,
             connection_keepalive: None,
+            replacement_cooldown: defaults::replacement_cooldown_option(),
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
             tier: 0,
             compress: None,
             compress_level: None,
+            enable_pipelining: defaults::enable_pipelining(),
+            pipeline_queue_depth: defaults::pipeline_queue_depth(),
+            pipeline_batch_size: defaults::pipeline_batch_size(),
         }],
         ..Default::default()
     }

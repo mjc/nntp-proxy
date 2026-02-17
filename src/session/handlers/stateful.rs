@@ -23,7 +23,7 @@ impl ClientSession {
         use crate::protocol::BACKEND_UNAVAILABLE;
 
         // Acquire backend connection
-        let mut backend_conn = match provider.get_pooled_connection().await {
+        let backend_conn = match provider.get_pooled_connection().await {
             Ok(conn) => {
                 debug!(server = server_name, "Got pooled connection");
                 conn
@@ -39,21 +39,35 @@ impl ClientSession {
             }
         };
 
+        // Wrap in guard — removes from pool on any error
+        let mut conn_guard = crate::pool::ConnectionGuard::new(backend_conn);
+
         // Split streams
         let (client_read, client_write) = client_stream.split();
         let client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
-        let (backend_read, backend_write) = tokio::io::split(&mut *backend_conn);
+        let (backend_read, backend_write) = tokio::io::split(&mut **conn_guard);
         let state = crate::session::state::SessionLoopState::new(self.auth_handler.is_enabled());
 
-        self.run_stateful_proxy_loop(
-            client_reader,
-            client_write,
-            backend_read,
-            backend_write,
-            state,
-            backend_id,
-        )
-        .await
+        let result = self
+            .run_stateful_proxy_loop(
+                client_reader,
+                client_write,
+                backend_read,
+                backend_write,
+                state,
+                backend_id,
+            )
+            .await;
+
+        // H2: Only return connection to pool on success
+        match &result {
+            Ok(_) => {
+                let _conn = conn_guard.success();
+            }
+            Err(_) => { /* guard drops → removes broken connection */ }
+        }
+
+        result
     }
 
     /// Core bidirectional proxy loop
@@ -82,7 +96,7 @@ impl ClientSession {
 
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
-                state.flush_byte_deltas(&self.metrics, backend_id, self.username().as_deref());
+                state.flush_byte_deltas(&self.metrics, backend_id, self.username());
             }
 
             tokio::select! {
@@ -139,10 +153,9 @@ impl ClientSession {
         }
 
         // Final metrics - report any remaining byte deltas
-        state.flush_byte_deltas(&self.metrics, backend_id, self.username().as_deref());
+        state.flush_byte_deltas(&self.metrics, backend_id, self.username());
 
-        self.metrics
-            .user_connection_closed(self.username().as_deref());
+        self.metrics.user_connection_closed(self.username());
 
         Ok(state.into_metrics())
     }
