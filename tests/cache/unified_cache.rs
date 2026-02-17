@@ -465,7 +465,10 @@ fn test_disk_cache_config_defaults() {
         std::path::PathBuf::from("/var/cache/nntp-proxy")
     );
     assert!(config.capacity.as_u64() > 0); // 10 GB default
-    assert!(config.compression); // Default is true
+    assert_eq!(
+        config.compression,
+        nntp_proxy::config::CompressionCodec::Lz4
+    ); // Default is lz4
     assert_eq!(config.shards, 4);
 }
 
@@ -476,7 +479,7 @@ fn test_disk_cache_config_serde_roundtrip() {
     let config = DiskCache {
         path: std::path::PathBuf::from("/tmp/test-cache"),
         capacity: nntp_proxy::types::CacheCapacity::try_new(1024 * 1024 * 1024).unwrap(),
-        compression: false,
+        compression: nntp_proxy::config::CompressionCodec::None,
         shards: 8,
     };
 
@@ -498,11 +501,11 @@ fn test_cache_config_with_disk() {
         ttl = 3600
         cache_articles = true
         adaptive_precheck = false
-        
+
         [disk]
         path = "/tmp/nntp-cache"
         capacity = "5gb"
-        compression = true
+        compression = "lz4"
         shards = 4
     "#;
 
@@ -511,7 +514,7 @@ fn test_cache_config_with_disk() {
     assert!(config.disk.is_some());
     let disk = config.disk.unwrap();
     assert_eq!(disk.path, std::path::PathBuf::from("/tmp/nntp-cache"));
-    assert!(disk.compression);
+    assert_eq!(disk.compression, nntp_proxy::config::CompressionCodec::Lz4);
 }
 
 #[test]
