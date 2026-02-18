@@ -99,6 +99,7 @@ impl ClientSession {
 
             // Get first chunk of this response
             chunk_data.clear();
+            let from_leftover = conn.has_leftover();
             let n = match buffer.read_from(&mut *conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
                     chunk_data.extend_from_slice(&buffer[..bytes_read]);
@@ -233,18 +234,55 @@ impl ClientSession {
                     client = %self.client_addr,
                     backend = ?backend_id,
                     command = %command.trim(),
-                    first_bytes = ?&chunk[..chunk.len().min(64)],
-                    "Backend returned invalid response during batch, sending 430"
+                    response_index = i + 1,
+                    total_commands = commands.len(),
+                    chunk_len = chunk.len(),
+                    first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
+                    first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
+                    source = if from_leftover { "leftover" } else { "fresh_read" },
+                    "Backend returned Invalid response during batch, aborting batch"
                 );
-                // Send 430 to client as a safe fallback
-                self.send_430_to_client(client_write, backend_to_client_bytes)
-                    .await?;
-                *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
-                // M6: Record metrics for invalid responses (same as sequential path)
-                self.metrics.record_command(backend_id);
-                self.metrics.record_error_4xx(backend_id);
-                self.metrics.user_command(self.username());
-                continue;
+
+                // Send 430 for this and all remaining commands.
+                for remaining_cmd in &commands[i..] {
+                    self.send_430_to_client(client_write, backend_to_client_bytes)
+                        .await?;
+                    *client_to_backend_bytes = client_to_backend_bytes.add(remaining_cmd.len());
+                    self.metrics.record_command(backend_id);
+                    self.metrics.record_error_4xx(backend_id);
+                    self.metrics.user_command(self.username());
+                }
+
+                // Try to salvage connection by draining remaining responses.
+                let remaining_responses = commands.len() - i;
+                debug!(
+                    backend = ?backend_id,
+                    remaining_responses,
+                    "Attempting to drain {} remaining batch responses",
+                    remaining_responses
+                );
+
+                let drained =
+                    Self::drain_batch_responses(&mut conn, &self.buffer_pool, remaining_responses)
+                        .await;
+
+                if drained {
+                    match crate::pool::health_check::check_date_response(&mut conn).await {
+                        Ok(()) => {
+                            debug!(backend = ?backend_id, "Connection salvaged after batch drain + DATE check");
+                            guard.complete();
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(backend = ?backend_id, error = %e, "DATE health check failed after batch drain");
+                        }
+                    }
+                }
+
+                warn!(backend = ?backend_id, "Failed to salvage connection after Invalid batch response");
+                provider.remove_with_cooldown(conn);
+                guard.complete();
+                return Ok(());
             }
 
             // Success — stream response to client
@@ -338,6 +376,138 @@ impl ClientSession {
         // Connection healthy — conn drops here, returning to pool automatically
         guard.complete();
         Ok(())
+    }
+
+    /// Drain remaining responses from batch after Invalid response detected.
+    ///
+    /// When an Invalid response is encountered mid-batch, commands have already
+    /// been written to the backend. Draining gives the connection a chance to
+    /// become reusable; a DATE health check verifies that before returning it.
+    async fn drain_batch_responses(
+        conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        buffer_pool: &crate::pool::BufferPool,
+        remaining_responses: usize,
+    ) -> bool {
+        use crate::session::backend::validate_backend_response;
+        use crate::session::streaming::tail_buffer::TailBuffer;
+        use std::time::Duration;
+
+        const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let mut buffer = buffer_pool.acquire().await;
+        let mut drained_count = 0;
+
+        for response_idx in 0..remaining_responses {
+            let chunk_len =
+                match tokio::time::timeout(DRAIN_TIMEOUT, buffer.read_from(&mut **conn)).await {
+                    Ok(Ok(n)) if n > 0 => n,
+                    Ok(Ok(_)) => {
+                        warn!(
+                            "EOF while draining batch response {}/{}",
+                            response_idx + 1,
+                            remaining_responses
+                        );
+                        return false;
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "Read error while draining batch response {}/{}: {}",
+                            response_idx + 1,
+                            remaining_responses,
+                            e
+                        );
+                        return false;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Timeout while draining batch response {}/{}",
+                            response_idx + 1,
+                            remaining_responses
+                        );
+                        return false;
+                    }
+                };
+
+            let chunk = &buffer[..chunk_len];
+            let validated =
+                validate_backend_response(chunk, chunk_len, crate::protocol::MIN_RESPONSE_LENGTH);
+
+            if validated.is_multiline {
+                let mut tail = TailBuffer::default();
+                let status = tail.detect_terminator(chunk);
+                let write_len = status.write_len(chunk_len);
+
+                if status.is_found() {
+                    if write_len < chunk_len && conn.stash_leftover(&chunk[write_len..]).is_err() {
+                        return false;
+                    }
+                    drained_count += 1;
+                    continue;
+                }
+
+                tail.update(chunk);
+                loop {
+                    match tokio::time::timeout(DRAIN_TIMEOUT, buffer.read_from(&mut **conn)).await {
+                        Ok(Ok(n)) if n > 0 => {
+                            let data = &buffer[..n];
+                            let status = tail.detect_terminator(data);
+                            let write_len = status.write_len(n);
+                            if status.is_found() {
+                                if write_len < n
+                                    && conn.stash_leftover(&data[write_len..]).is_err()
+                                {
+                                    return false;
+                                }
+                                break;
+                            }
+                            tail.update(&data[..write_len]);
+                        }
+                        Ok(Ok(_)) => {
+                            warn!(
+                                "EOF while draining multiline response {}/{}",
+                                response_idx + 1,
+                                remaining_responses
+                            );
+                            return false;
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                "Read error while draining multiline response {}/{}: {}",
+                                response_idx + 1,
+                                remaining_responses,
+                                e
+                            );
+                            return false;
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Timeout while draining multiline response {}/{}",
+                                response_idx + 1,
+                                remaining_responses
+                            );
+                            return false;
+                        }
+                    }
+                }
+            } else if let Some(pos) = memchr::memchr(b'\n', chunk) {
+                let end = pos + 1;
+                if end < chunk_len && conn.stash_leftover(&chunk[end..]).is_err() {
+                    return false;
+                }
+            } else {
+                warn!(
+                    "Single-line response missing \\r\\n while draining {}/{}",
+                    response_idx + 1,
+                    remaining_responses
+                );
+                return false;
+            }
+
+            drained_count += 1;
+        }
+
+        debug!("Successfully drained {} batch responses", drained_count);
+        true
     }
 
     /// Route a single command to a backend and execute it
