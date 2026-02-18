@@ -74,8 +74,16 @@ impl ClientSession {
         // Reject invalid responses - never forward garbage to client
         if cmd_response.response == crate::protocol::NntpResponse::Invalid {
             tracing::warn!(
-                backend_id = backend_id.as_index(),
-                first_bytes = ?&buffer[..cmd_response.bytes_read.min(64)],
+                client = %self.client_addr,
+                backend = ?backend_id,
+                command = %command.trim(),
+                bytes_read = cmd_response.bytes_read,
+                first_bytes_hex = %crate::session::backend::format_hex_preview(
+                    &buffer[..cmd_response.bytes_read], 256
+                ),
+                first_bytes_utf8 = %String::from_utf8_lossy(
+                    &buffer[..cmd_response.bytes_read.min(256)]
+                ),
                 "Backend returned invalid/unparseable response, rejecting"
             );
             // Mark backend as unavailable for this article so we try next one

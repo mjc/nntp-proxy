@@ -233,7 +233,9 @@ async fn read_full_response(
     let mut tail = TailBuffer::default();
     result_buf.clear(); // Reuse buffer from previous response
 
-    // Get first data directly into result_buf (no intermediate Vec)
+    // Get first data directly into result_buf (no intermediate Vec). ConnectionStream
+    // serves any stashed leftover bytes before polling the socket.
+    let from_leftover = conn.has_leftover();
     let n = buffer.read_from(conn).await?;
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
@@ -258,10 +260,17 @@ async fn read_full_response(
         result_buf.len(),
         crate::protocol::MIN_RESPONSE_LENGTH,
     );
-    let status_code = validated
-        .response
-        .status_code()
-        .ok_or_else(|| anyhow::anyhow!("Invalid status code in pipeline response"))?;
+    let status_code = validated.response.status_code().ok_or_else(|| {
+        // Log Invalid response with detailed context
+        tracing::warn!(
+            bytes_read = result_buf.len(),
+            first_bytes_hex = %crate::session::backend::format_hex_preview(result_buf, 256),
+            first_bytes_utf8 = %String::from_utf8_lossy(&result_buf[..result_buf.len().min(256)]),
+            source = if from_leftover { "leftover" } else { "fresh_read" },
+            "Invalid status code in pipeline response"
+        );
+        anyhow::anyhow!("Invalid status code in pipeline response")
+    })?;
 
     if !validated.is_multiline {
         // Single-line response: split at \r\n boundary to save leftover

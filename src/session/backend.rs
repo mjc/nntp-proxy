@@ -178,20 +178,23 @@ impl CommandResponse {
                 }
                 ResponseWarning::InvalidResponse => {
                     warn!(
-                        "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
-                        client_addr,
-                        backend_id,
-                        self.bytes_read,
-                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                        client = %client_addr,
+                        backend = ?backend_id,
+                        bytes_read = self.bytes_read,
+                        first_bytes_hex = %format_hex_preview(&buffer[..self.bytes_read], 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..self.bytes_read.min(256)]),
+                        "Backend returned invalid response"
                     );
                 }
                 ResponseWarning::UnusualStatusCode(code) => {
                     warn!(
-                        "Client {} got unusual status code {} from backend {:?}: {:?}",
-                        client_addr,
-                        code,
-                        backend_id,
-                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                        client = %client_addr,
+                        backend = ?backend_id,
+                        status_code = code,
+                        bytes_read = self.bytes_read,
+                        first_bytes_hex = %format_hex_preview(&buffer[..self.bytes_read], 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..self.bytes_read.min(256)]),
+                        "Backend returned unusual status code"
                     );
                 }
             }
