@@ -6,9 +6,10 @@ use crate::types::{
 };
 
 /// Statistics for a single backend (cloneable snapshot)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackendStats {
     pub backend_id: BackendId,
+    #[serde(skip, default)]
     pub active_connections: ActiveConnections,
     pub total_commands: CommandCount,
     pub bytes_sent: BytesSent,
@@ -23,6 +24,7 @@ pub struct BackendStats {
     pub send_micros_total: SendMicros,
     pub recv_micros_total: RecvMicros,
     pub connection_failures: FailureCount,
+    #[serde(skip, default)]
     pub health_status: BackendHealthStatus,
 }
 

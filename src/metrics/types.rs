@@ -20,7 +20,18 @@ use std::num::NonZeroU64;
 /// For display-oriented types with unit strings, see `types::metrics::define_counter!`.
 macro_rules! counter_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Default,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(u64);
 
         impl $name {
@@ -56,7 +67,18 @@ macro_rules! counter_type {
 /// Define a microseconds-based timing newtype that can average to milliseconds
 macro_rules! timing_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Default,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(u64);
 
         impl $name {
@@ -87,7 +109,7 @@ macro_rules! timing_type {
 /// Define a f64-based rate/measurement newtype
 macro_rules! f64_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+        #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, serde::Serialize, serde::Deserialize)]
         pub struct $name(f64);
 
         impl $name {
@@ -112,9 +134,10 @@ macro_rules! f64_type {
 ///
 /// This 3-state enum is used for UI/metrics purposes, while `health::HealthStatus`
 /// is a binary Healthy/Unhealthy used for actual health checking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BackendHealthStatus {
     /// Backend is healthy and responding normally
+    #[default]
     Healthy,
     /// Backend is degraded (high error rate or slow)
     Degraded,
@@ -151,7 +174,18 @@ counter_type!(CommandCount);
 counter_type!(FailureCount);
 
 /// Number of errors encountered
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ErrorCount(u64);
 
 impl ErrorCount {
@@ -194,7 +228,18 @@ impl std::fmt::Display for ErrorCount {
 }
 
 /// Number of articles retrieved
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ArticleCount(u64);
 
 impl ArticleCount {
@@ -231,7 +276,18 @@ impl std::fmt::Display for ArticleCount {
 }
 
 /// Number of active connections (non-zero validated)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ActiveConnections(usize);
 
 impl ActiveConnections {
@@ -261,7 +317,18 @@ timing_type!(SendMicros);
 timing_type!(RecvMicros);
 
 /// Time in microseconds (for precision timing)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Microseconds(u64);
 
 impl Microseconds {
@@ -311,7 +378,9 @@ impl OverheadMillis {
 // ============================================================================
 
 /// Bytes per second transfer rate
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, PartialOrd, Default, serde::Serialize, serde::Deserialize,
+)]
 pub struct BytesPerSecond(u64);
 
 impl BytesPerSecond {

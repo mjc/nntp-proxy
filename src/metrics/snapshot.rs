@@ -24,20 +24,27 @@ use super::UserStats;
 /// `backend_stats` is Arc-wrapped to avoid cloning the entire Vec when
 /// calculating user rates every TUI frame (4 Hz). This reduces allocations
 /// from O(backends) to O(1) per update.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSnapshot {
     pub total_connections: u64,
+    #[serde(skip, default)]
     pub active_connections: usize,
+    #[serde(skip, default)]
     pub stateful_sessions: usize,
     pub client_to_backend_bytes: ClientToBackendBytes,
     pub backend_to_client_bytes: BackendToClientBytes,
+    #[serde(skip, default)]
     pub uptime: Duration,
     pub backend_stats: Arc<Vec<BackendStats>>,
     pub user_stats: Vec<UserStats>,
+    #[serde(skip, default)]
     pub cache_entries: u64,
+    #[serde(skip, default)]
     pub cache_size_bytes: u64,
+    #[serde(skip, default)]
     pub cache_hit_rate: f64,
     /// Disk cache statistics (only present when using hybrid cache)
+    #[serde(skip, default)]
     pub disk_cache: Option<DiskCacheStats>,
     /// Number of pipelined batches (batches with >1 command)
     pub pipeline_batches: u64,
@@ -50,7 +57,7 @@ pub struct MetricsSnapshot {
 }
 
 /// Disk cache statistics for hybrid cache mode
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiskCacheStats {
     /// Number of cache hits from disk tier
     pub disk_hits: u64,

@@ -70,7 +70,19 @@ impl fmt::Display for ClientId {
 }
 
 /// Unique identifier for a backend server
-#[nutype(derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, From))]
+#[nutype(derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    From,
+    Serialize,
+    Deserialize
+))]
 pub struct BackendId(usize);
 
 impl BackendId {

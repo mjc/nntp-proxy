@@ -4,9 +4,10 @@ use crate::metrics::types::{CommandCount, ErrorCount};
 use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
 
 /// Statistics for a single user (snapshot)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserStats {
     pub username: String,
+    #[serde(skip, default)]
     pub active_connections: usize,
     pub total_connections: TotalConnections,
     pub bytes_sent: BytesSent,
@@ -14,7 +15,9 @@ pub struct UserStats {
     pub total_commands: CommandCount,
     pub errors: ErrorCount,
     /// Transfer rates (bytes/sec) - populated by TUI from deltas, 0 in raw snapshots
+    #[serde(skip, default)]
     pub bytes_sent_per_sec: BytesPerSecondRate,
+    #[serde(skip, default)]
     pub bytes_received_per_sec: BytesPerSecondRate,
 }
 

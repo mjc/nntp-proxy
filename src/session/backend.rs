@@ -99,6 +99,32 @@ pub fn validate_backend_response(
     }
 }
 
+/// Format a hex preview of response bytes for debugging Invalid responses
+///
+/// # Arguments
+/// * `data` - Raw response bytes
+/// * `max_bytes` - Maximum number of bytes to include in preview
+///
+/// # Returns
+/// Hex string with space-separated bytes (e.g., "41 42 43" for "ABC")
+///
+/// # Examples
+/// ```
+/// # use nntp_proxy::session::backend::format_hex_preview;
+/// let data = b"430 No such article\r\n";
+/// let hex = format_hex_preview(data, 256);
+/// assert!(hex.starts_with("34 33 30 20")); // "430 "
+/// ```
+#[must_use]
+pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
+    let preview = &data[..data.len().min(max_bytes)];
+    preview
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // ─── Command execution ──────────────────────────────────────────────────────
 
 /// Result of sending a command to a backend
@@ -412,5 +438,61 @@ mod tests {
         let w1 = ResponseWarning::UnusualStatusCode(999);
         let w2 = w1.clone();
         assert_eq!(w1, w2);
+    }
+
+    // ─── Hex preview tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_hex_preview_empty() {
+        let data = b"";
+        let result = format_hex_preview(data, 256);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_format_hex_preview_small() {
+        let data = b"ABC";
+        let result = format_hex_preview(data, 256);
+        // A=41, B=42, C=43
+        assert_eq!(result, "41 42 43");
+    }
+
+    #[test]
+    fn test_format_hex_preview_respects_max_bytes() {
+        let data = b"ABCDEFGH";
+        let result = format_hex_preview(data, 4);
+        // Only first 4 bytes: A=41, B=42, C=43, D=44
+        assert_eq!(result, "41 42 43 44");
+    }
+
+    #[test]
+    fn test_format_hex_preview_full_response() {
+        let data = b"430 No such article\r\n";
+        let result = format_hex_preview(data, 256);
+        // Should show full response in hex
+        assert!(result.starts_with("34 33 30 20")); // "430 "
+        assert!(result.ends_with("0d 0a")); // \r\n
+        assert_eq!(result.split_whitespace().count(), data.len());
+    }
+
+    #[test]
+    fn test_format_hex_preview_non_ascii() {
+        let data = &[0xFF, 0xFE, 0x00, 0x01];
+        let result = format_hex_preview(data, 256);
+        assert_eq!(result, "ff fe 00 01");
+    }
+
+    #[test]
+    fn test_format_hex_preview_256_bytes() {
+        // Create 300 byte array
+        let data: Vec<u8> = (0..=255).chain(0..44).collect();
+        assert_eq!(data.len(), 300);
+
+        let result = format_hex_preview(&data, 256);
+        // Should only include first 256 bytes
+        assert_eq!(result.split_whitespace().count(), 256);
+
+        // Verify last hex is "ff" (byte 255)
+        assert!(result.ends_with("ff"));
     }
 }

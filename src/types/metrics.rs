@@ -13,23 +13,78 @@ use std::ops::{Add, AddAssign};
 // ============================================================================
 
 /// Marker: Client → Backend traffic
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ClientToBackend;
 
 /// Marker: Backend → Client traffic
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BackendToClient;
 
 /// Marker: Generic client traffic
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Client;
 
 /// Marker: Bytes sent
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Sent;
 
 /// Marker: Bytes received
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Received;
 
 // ============================================================================
@@ -41,7 +96,18 @@ pub struct Received;
 /// This zero-cost abstraction provides type-safe byte counting where the direction
 /// is encoded in the type system. The `PhantomData<D>` has zero size at runtime.
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ByteCounter<D> {
     bytes: u64,
     _direction: PhantomData<D>,
@@ -157,7 +223,7 @@ pub type BytesSent = ByteCounter<Sent>;
 pub type BytesReceived = ByteCounter<Received>;
 
 /// Transfer statistics for a session
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransferMetrics {
     pub client_to_backend: ClientToBackendBytes,
     pub backend_to_client: BackendToClientBytes,
@@ -427,7 +493,18 @@ mod tests {
 macro_rules! define_counter {
     ($name:ident, $unit:expr) => {
         #[repr(transparent)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Default,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(u64);
 
         impl $name {

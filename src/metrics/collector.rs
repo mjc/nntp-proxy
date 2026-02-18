@@ -1,34 +1,36 @@
 //! Lock-free metrics collector
 
+use super::store::{BackendStore, MetricsStore, UserMetrics};
 use super::{BackendHealthStatus, BackendStats, MetricsSnapshot, UserStats};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
-use dashmap::DashMap;
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ============================================================================
 // Internal Storage Types
 // ============================================================================
 
-/// Backend metrics with atomic storage (zero-allocation concurrent updates)
-#[derive(Debug, Default)]
+/// Backend metrics wrapper: persistable store + live gauges
+///
+/// The `store` field contains all cumulative counters that survive restarts.
+/// Live gauges (active_connections, health_status) are ephemeral.
+#[derive(Debug)]
 struct BackendMetrics {
+    store: BackendStore,
     active_connections: AtomicUsize,
-    total_commands: AtomicU64,
-    bytes_sent: AtomicU64,
-    bytes_received: AtomicU64,
-    errors: AtomicU64,
-    errors_4xx: AtomicU64,
-    errors_5xx: AtomicU64,
-    article_bytes_total: AtomicU64,
-    article_count: AtomicU64,
-    ttfb_micros_total: AtomicU64,
-    ttfb_count: AtomicU64,
-    send_micros_total: AtomicU64,
-    recv_micros_total: AtomicU64,
-    connection_failures: AtomicU64,
     health_status: AtomicU8,
+}
+
+impl Default for BackendMetrics {
+    fn default() -> Self {
+        Self {
+            store: BackendStore::default(),
+            active_connections: AtomicUsize::new(0),
+            health_status: AtomicU8::new(BackendHealthStatus::Healthy as u8),
+        }
+    }
 }
 
 impl BackendMetrics {
@@ -42,69 +44,35 @@ impl BackendMetrics {
             active_connections: ActiveConnections::new(
                 self.active_connections.load(Ordering::Relaxed),
             ),
-            total_commands: CommandCount::new(self.total_commands.load(Ordering::Relaxed)),
-            bytes_sent: BytesSent::new(self.bytes_sent.load(Ordering::Relaxed)),
-            bytes_received: BytesReceived::new(self.bytes_received.load(Ordering::Relaxed)),
-            errors: ErrorCount::new(self.errors.load(Ordering::Relaxed)),
-            errors_4xx: ErrorCount::new(self.errors_4xx.load(Ordering::Relaxed)),
-            errors_5xx: ErrorCount::new(self.errors_5xx.load(Ordering::Relaxed)),
+            total_commands: CommandCount::new(self.store.total_commands.load(Ordering::Relaxed)),
+            bytes_sent: BytesSent::new(self.store.bytes_sent.load(Ordering::Relaxed)),
+            bytes_received: BytesReceived::new(self.store.bytes_received.load(Ordering::Relaxed)),
+            errors: ErrorCount::new(self.store.errors.load(Ordering::Relaxed)),
+            errors_4xx: ErrorCount::new(self.store.errors_4xx.load(Ordering::Relaxed)),
+            errors_5xx: ErrorCount::new(self.store.errors_5xx.load(Ordering::Relaxed)),
             article_bytes_total: ArticleBytesTotal::new(
-                self.article_bytes_total.load(Ordering::Relaxed),
+                self.store.article_bytes_total.load(Ordering::Relaxed),
             ),
-            article_count: ArticleCount::new(self.article_count.load(Ordering::Relaxed)),
-            ttfb_micros_total: TtfbMicros::new(self.ttfb_micros_total.load(Ordering::Relaxed)),
-            ttfb_count: TimingMeasurementCount::new(self.ttfb_count.load(Ordering::Relaxed)),
-            send_micros_total: SendMicros::new(self.send_micros_total.load(Ordering::Relaxed)),
-            recv_micros_total: RecvMicros::new(self.recv_micros_total.load(Ordering::Relaxed)),
+            article_count: ArticleCount::new(self.store.article_count.load(Ordering::Relaxed)),
+            ttfb_micros_total: TtfbMicros::new(
+                self.store.ttfb_micros_total.load(Ordering::Relaxed),
+            ),
+            ttfb_count: TimingMeasurementCount::new(self.store.ttfb_count.load(Ordering::Relaxed)),
+            send_micros_total: SendMicros::new(
+                self.store.send_micros_total.load(Ordering::Relaxed),
+            ),
+            recv_micros_total: RecvMicros::new(
+                self.store.recv_micros_total.load(Ordering::Relaxed),
+            ),
             connection_failures: FailureCount::new(
-                self.connection_failures.load(Ordering::Relaxed),
+                self.store.connection_failures.load(Ordering::Relaxed),
             ),
             health_status: self.health_status.load(Ordering::Relaxed).into(),
         }
     }
 }
 
-/// Metrics for a single user (internal storage)
-#[derive(Debug, Clone, Default)]
-struct UserMetrics {
-    username: String,
-    active_connections: usize,
-    total_connections: u64,
-    bytes_sent: u64,
-    bytes_received: u64,
-    total_commands: u64,
-    errors: u64,
-}
-
-impl UserMetrics {
-    fn new(username: String) -> Self {
-        Self {
-            username,
-            active_connections: 0,
-            total_connections: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            total_commands: 0,
-            errors: 0,
-        }
-    }
-
-    fn to_user_stats(&self) -> UserStats {
-        use crate::metrics::types::{CommandCount, ErrorCount};
-        use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
-        UserStats {
-            username: self.username.clone(),
-            active_connections: self.active_connections,
-            total_connections: TotalConnections::new(self.total_connections),
-            bytes_sent: BytesSent::new(self.bytes_sent),
-            bytes_received: BytesReceived::new(self.bytes_received),
-            total_commands: CommandCount::new(self.total_commands),
-            errors: ErrorCount::new(self.errors),
-            bytes_sent_per_sec: BytesPerSecondRate::ZERO,
-            bytes_received_per_sec: BytesPerSecondRate::ZERO,
-        }
-    }
-}
+// UserMetrics is now imported from store module (no longer duplicated here)
 
 // ============================================================================
 // Public API
@@ -118,19 +86,11 @@ pub struct MetricsCollector {
 
 #[derive(Debug)]
 struct MetricsInner {
-    total_connections: AtomicU64,
+    store: MetricsStore,
     active_connections: AtomicUsize,
     stateful_sessions: AtomicUsize,
     backend_metrics: Vec<BackendMetrics>,
-    user_metrics: DashMap<String, UserMetrics>,
     start_time: Instant,
-    // Pipeline metrics
-    pipeline_batches: AtomicU64,
-    pipeline_commands: AtomicU64,
-    /// Total requests enqueued to pipeline queues
-    pipeline_requests_queued: AtomicU64,
-    /// Total requests completed via pipeline
-    pipeline_requests_completed: AtomicU64,
     // Note: client_to_backend_bytes and backend_to_client_bytes are calculated
     // from backend_metrics sums, not stored separately
 }
@@ -160,7 +120,7 @@ impl MetricsCollector {
         let key = username.unwrap_or(crate::constants::user::ANONYMOUS);
 
         // Fast path: zero-alloc &str lookup (DashMap String key supports Borrow<str>)
-        if let Some(mut entry) = self.inner.user_metrics.get_mut(key) {
+        if let Some(mut entry) = self.inner.store.user_metrics.get_mut(key) {
             update(&mut entry);
             return;
         }
@@ -168,10 +128,11 @@ impl MetricsCollector {
         // Slow path: insert once per user, then update
         let owned = key.to_string();
         self.inner
+            .store
             .user_metrics
             .entry(owned)
             .or_insert_with(|| UserMetrics::new(key.to_string()));
-        if let Some(mut entry) = self.inner.user_metrics.get_mut(key) {
+        if let Some(mut entry) = self.inner.store.user_metrics.get_mut(key) {
             update(&mut entry);
         }
     }
@@ -181,31 +142,43 @@ impl MetricsCollector {
     /// # Arguments
     /// * `num_backends` - Number of backend servers to track
     pub fn new(num_backends: usize) -> Self {
+        Self::with_store(MetricsStore::new(num_backends))
+    }
+
+    /// Create a metrics collector with a restored store (for persistence)
+    ///
+    /// The store contains all cumulative counters that were saved to disk.
+    /// Live gauges (active_connections, health_status) start at zero.
+    pub fn with_store(store: MetricsStore) -> Self {
+        let num_backends = store.backend_stores.len();
         let backend_metrics = (0..num_backends)
             .map(|_| BackendMetrics::default())
             .collect();
 
         Self {
             inner: Arc::new(MetricsInner {
-                total_connections: AtomicU64::new(0),
+                store,
                 active_connections: AtomicUsize::new(0),
                 stateful_sessions: AtomicUsize::new(0),
                 backend_metrics,
-                user_metrics: DashMap::new(),
                 start_time: Instant::now(),
-                pipeline_batches: AtomicU64::new(0),
-                pipeline_commands: AtomicU64::new(0),
-                pipeline_requests_queued: AtomicU64::new(0),
-                pipeline_requests_completed: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Save metrics to disk (for persistence)
+    pub fn save_to_disk(&self, path: &Path, server_names: &[String]) -> anyhow::Result<()> {
+        self.inner.store.save(path, server_names)
     }
 
     // Connection lifecycle tracking
 
     #[inline]
     pub fn connection_opened(&self) {
-        self.inner.total_connections.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .store
+            .total_connections
+            .fetch_add(1, Ordering::Relaxed);
         self.inner
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -233,35 +206,35 @@ impl MetricsCollector {
     #[inline]
     pub fn record_command(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
-            b.total_commands.fetch_add(1, Ordering::Relaxed);
+            b.store.total_commands.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
     pub fn record_connection_failure(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
-            b.connection_failures.fetch_add(1, Ordering::Relaxed);
+            b.store.connection_failures.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
     pub fn record_error(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
-            b.errors.fetch_add(1, Ordering::Relaxed);
+            b.store.errors.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
     pub fn record_client_to_backend_bytes_for(&self, backend_id: BackendId, bytes: u64) {
         self.with_backend(backend_id, |b| {
-            b.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+            b.store.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         });
     }
 
     #[inline]
     pub fn record_backend_to_client_bytes_for(&self, backend_id: BackendId, bytes: u64) {
         self.with_backend(backend_id, |b| {
-            b.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+            b.store.bytes_received.fetch_add(bytes, Ordering::Relaxed);
         });
     }
 
@@ -332,32 +305,36 @@ impl MetricsCollector {
     #[inline]
     pub fn record_error_4xx(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
-            b.errors_4xx.fetch_add(1, Ordering::Relaxed);
-            b.errors.fetch_add(1, Ordering::Relaxed);
+            b.store.errors_4xx.fetch_add(1, Ordering::Relaxed);
+            b.store.errors.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
     pub fn record_error_5xx(&self, backend_id: BackendId) {
         self.with_backend(backend_id, |b| {
-            b.errors_5xx.fetch_add(1, Ordering::Relaxed);
-            b.errors.fetch_add(1, Ordering::Relaxed);
+            b.store.errors_5xx.fetch_add(1, Ordering::Relaxed);
+            b.store.errors.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
     pub fn record_article(&self, backend_id: BackendId, bytes: u64) {
         self.with_backend(backend_id, |b| {
-            b.article_bytes_total.fetch_add(bytes, Ordering::Relaxed);
-            b.article_count.fetch_add(1, Ordering::Relaxed);
+            b.store
+                .article_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+            b.store.article_count.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     #[inline]
     pub fn record_ttfb_micros(&self, backend_id: BackendId, micros: u64) {
         self.with_backend(backend_id, |b| {
-            b.ttfb_micros_total.fetch_add(micros, Ordering::Relaxed);
-            b.ttfb_count.fetch_add(1, Ordering::Relaxed);
+            b.store
+                .ttfb_micros_total
+                .fetch_add(micros, Ordering::Relaxed);
+            b.store.ttfb_count.fetch_add(1, Ordering::Relaxed);
         });
     }
 
@@ -369,9 +346,11 @@ impl MetricsCollector {
         recv_micros: u64,
     ) {
         self.with_backend(backend_id, |b| {
-            b.send_micros_total
+            b.store
+                .send_micros_total
                 .fetch_add(send_micros, Ordering::Relaxed);
-            b.recv_micros_total
+            b.store
+                .recv_micros_total
                 .fetch_add(recv_micros, Ordering::Relaxed);
         });
     }
@@ -394,7 +373,7 @@ impl MetricsCollector {
 
     pub fn user_connection_closed(&self, username: Option<&str>) {
         let key = username.unwrap_or(crate::constants::user::ANONYMOUS);
-        if let Some(mut m) = self.inner.user_metrics.get_mut(key) {
+        if let Some(mut m) = self.inner.store.user_metrics.get_mut(key) {
             m.active_connections = m.active_connections.saturating_sub(1);
         }
     }
@@ -424,8 +403,12 @@ impl MetricsCollector {
     /// existing sequential path and are not counted).
     #[inline]
     pub fn record_pipeline_batch(&self, batch_size: u64) {
-        self.inner.pipeline_batches.fetch_add(1, Ordering::Relaxed);
         self.inner
+            .store
+            .pipeline_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .store
             .pipeline_commands
             .fetch_add(batch_size, Ordering::Relaxed);
     }
@@ -434,6 +417,7 @@ impl MetricsCollector {
     #[inline]
     pub fn record_pipeline_enqueue(&self) {
         self.inner
+            .store
             .pipeline_requests_queued
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -442,6 +426,7 @@ impl MetricsCollector {
     #[inline]
     pub fn record_pipeline_complete(&self) {
         self.inner
+            .store
             .pipeline_requests_completed
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -475,6 +460,7 @@ impl MetricsCollector {
 
         let user_stats: Vec<UserStats> = self
             .inner
+            .store
             .user_metrics
             .iter()
             .map(|entry| entry.value().to_user_stats())
@@ -503,7 +489,7 @@ impl MetricsCollector {
             .unwrap_or((0, 0, 0.0, None));
 
         MetricsSnapshot {
-            total_connections: self.inner.total_connections.load(Ordering::Relaxed),
+            total_connections: self.inner.store.total_connections.load(Ordering::Relaxed),
             active_connections: self.inner.active_connections.load(Ordering::Relaxed),
             stateful_sessions: self.inner.stateful_sessions.load(Ordering::Relaxed),
             client_to_backend_bytes: ClientToBackendBytes::new(total_sent),
@@ -515,11 +501,16 @@ impl MetricsCollector {
             cache_size_bytes,
             cache_hit_rate,
             disk_cache,
-            pipeline_batches: self.inner.pipeline_batches.load(Ordering::Relaxed),
-            pipeline_commands: self.inner.pipeline_commands.load(Ordering::Relaxed),
-            pipeline_requests_queued: self.inner.pipeline_requests_queued.load(Ordering::Relaxed),
+            pipeline_batches: self.inner.store.pipeline_batches.load(Ordering::Relaxed),
+            pipeline_commands: self.inner.store.pipeline_commands.load(Ordering::Relaxed),
+            pipeline_requests_queued: self
+                .inner
+                .store
+                .pipeline_requests_queued
+                .load(Ordering::Relaxed),
             pipeline_requests_completed: self
                 .inner
+                .store
                 .pipeline_requests_completed
                 .load(Ordering::Relaxed),
         }
@@ -551,10 +542,10 @@ mod tests {
     #[test]
     fn test_backend_metrics_to_backend_stats() {
         let metrics = BackendMetrics::default();
-        metrics.total_commands.store(42, Ordering::Relaxed);
-        metrics.bytes_sent.store(1024, Ordering::Relaxed);
-        metrics.bytes_received.store(2048, Ordering::Relaxed);
-        metrics.errors.store(3, Ordering::Relaxed);
+        metrics.store.total_commands.store(42, Ordering::Relaxed);
+        metrics.store.bytes_sent.store(1024, Ordering::Relaxed);
+        metrics.store.bytes_received.store(2048, Ordering::Relaxed);
+        metrics.store.errors.store(3, Ordering::Relaxed);
 
         let stats = metrics.to_backend_stats(BackendId::from_index(5));
 
