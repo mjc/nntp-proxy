@@ -16,6 +16,11 @@ validate_yenc = true
 # Minimum log level for debug.log file (default: "warn")
 # Options: "error", "warn", "info", "debug", "trace"
 # log_file_level = "warn"
+# Path to stats file for metric persistence (optional)
+# When set, metrics are persisted to this file every 30 seconds and on shutdown
+# Defaults to "stats.json" alongside the config file if not specified
+# This allows the TUI dashboard metrics to persist across proxy restarts
+# stats_file = "/var/lib/nntp-proxy/stats.json"
 
 # Client Authentication Configuration
 # Two formats supported:

@@ -469,6 +469,116 @@ let threads = ThreadCount::new(4); // Some(4)
 
 ---
 
+## Metrics Persistence Pattern
+
+### MetricsStore Design
+
+**Why:** TUI dashboard metrics reset on proxy restart. `MetricsStore` persists cumulative counters to JSON every 30 seconds and on shutdown, restoring them on startup.
+
+**Architecture:**
+```
+MetricsCollector (public API — unchanged)
+└── inner: Arc<MetricsInner>
+    ├── store: MetricsStore (persistable cumulative counters)
+    │   ├── total_connections: AtomicU64
+    │   ├── backend_stores: Vec<BackendStore>  ← per-backend cumulative metrics
+    │   ├── pipeline_*: AtomicU64 fields
+    │   └── user_metrics: DashMap<String, UserMetrics>
+    ├── active_connections: AtomicUsize  ← live gauge (NOT persisted)
+    ├── stateful_sessions: AtomicUsize   ← live gauge (NOT persisted)
+    └── start_time: Instant              ← NOT persisted
+
+BackendMetrics (wraps persistable store + live gauges)
+├── store: BackendStore (persistable atomic counters)
+├── active_connections: AtomicUsize  ← live gauge
+└── health_status: BackendHealthStatus  ← live gauge
+```
+
+### File Format (Versioned JSON)
+
+```json
+{
+  "version": 1,
+  "saved_at": "2026-02-18T18:45:00Z",
+  "global": { "total_connections": 42 },
+  "backends": [
+    { "name": "server1", "total_commands": 1000, "bytes_sent": 50000, ... },
+    { "name": "server2", "total_commands": 900, "bytes_sent": 45000, ... }
+  ],
+  "users": [
+    { "username": "alice", "total_connections": 20, "bytes_sent": 25000, ... }
+  ],
+  "pipeline": { "batches": 100, "commands": 1600, ... }
+}
+```
+
+**Version migration:**
+- Each version gets its own deserializable struct (e.g., `PersistedBackend`)
+- `MetricsStore::load()` checks version, migrates old formats to current
+- Always write latest version; old versions migrated on load
+- Future v2 can add fields (e.g., retention tracking) — v1→v2 migration defaults new fields to zero
+
+### Integration Points
+
+**1. Binary startup (both nntp-proxy and nntp-proxy-tui):**
+```rust
+let stats_path = resolve_stats_file_path(config_path, config.proxy.stats_file);
+let metrics_store = load_metrics_from_disk(&stats_path, &server_names);
+
+let proxy = NntpProxy::builder(config)
+    .with_metrics_store(metrics_store)  // Pass restored store
+    .build()
+    .await?;
+```
+
+**2. Periodic saver (spawned after prewarm):**
+```rust
+tokio::spawn(async move {
+    let mut interval = interval(Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+        proxy.metrics().save_to_disk(&stats_path, &server_names).ok();
+    }
+});
+```
+
+**3. Shutdown save (in spawn_shutdown_handler):**
+```rust
+proxy.metrics().save_to_disk(&stats_path, &server_names).ok();
+proxy.graceful_shutdown().await;
+```
+
+### Configuration
+
+**config.toml:**
+```toml
+[proxy]
+# Optional: custom stats file location
+# Defaults to "stats.json" alongside config file if not specified
+stats_file = "/var/lib/nntp-proxy/stats.json"
+```
+
+### Testing Strategy
+
+**Tests in `src/metrics/store.rs`:**
+1. `test_metrics_store_save_load_roundtrip` — verify save/load cycle preserves data
+2. `test_metrics_store_backend_name_mapping` — backends matched by name across save/load
+3. `test_metrics_store_missing_file_returns_none` — graceful missing file handling
+4. `test_metrics_store_corrupt_file_returns_none` — graceful corruption handling
+5. `test_metrics_store_backend_mismatch` — servers added/removed between save/load
+
+**Serde tests in `src/metrics/mod.rs`:**
+- `test_backend_stats_serde_roundtrip` — ephemeral fields default correctly on deserialize
+
+### Extension Points (Future Use)
+
+**For retention tracking (separate branch):**
+- Add `oldest_served_article_age_secs`, `newest_missing_article_age_secs` to `PersistedBackend` in v2
+- Migration function v1→v2 defaults these to 0
+- TUI can query these fields for inventory analytics
+
+---
+
 ## Error Handling
 
 ### Error Types

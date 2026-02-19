@@ -63,6 +63,7 @@ pub struct NntpProxyBuilder {
     routing_mode: RoutingMode,
     buffer_size: Option<usize>,
     buffer_count: Option<usize>,
+    metrics_store: Option<crate::metrics::MetricsStore>,
 }
 
 impl NntpProxyBuilder {
@@ -76,6 +77,7 @@ impl NntpProxyBuilder {
             routing_mode: RoutingMode::Stateful,
             buffer_size: None,
             buffer_count: None,
+            metrics_store: None,
         }
     }
 
@@ -108,6 +110,16 @@ impl NntpProxyBuilder {
     #[must_use]
     pub fn with_buffer_pool_count(mut self, count: usize) -> Self {
         self.buffer_count = Some(count);
+        self
+    }
+
+    /// Restore metrics from a previously-saved store
+    ///
+    /// If provided, the builder will initialize the MetricsCollector with this store,
+    /// allowing metrics to persist across proxy restarts.
+    #[must_use]
+    pub fn with_metrics_store(mut self, store: crate::metrics::MetricsStore) -> Self {
+        self.metrics_store = Some(store);
         self
     }
 
@@ -148,7 +160,10 @@ impl NntpProxyBuilder {
         )
         .with_capture_pool(CAPTURE, self.config.proxy.capture_pool_count);
 
-        let metrics = MetricsCollector::new(self.config.servers.len());
+        let metrics = match self.metrics_store {
+            Some(store) => MetricsCollector::with_store(store),
+            None => MetricsCollector::new(self.config.servers.len()),
+        };
 
         let adaptive_precheck = self
             .config

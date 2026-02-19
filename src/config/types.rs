@@ -155,6 +155,11 @@ pub struct Proxy {
     /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
     #[serde(default = "super::defaults::log_file_level")]
     pub log_file_level: String,
+    /// Path to stats file for metric persistence (optional)
+    /// When set, metrics are persisted to this file every 30 seconds and on shutdown
+    /// Defaults to "stats.json" alongside the config file if not specified
+    #[serde(default)]
+    pub stats_file: Option<std::path::PathBuf>,
 }
 
 impl Proxy {
@@ -174,6 +179,7 @@ impl Default for Proxy {
             buffer_pool_count: defaults::buffer_pool_count(),
             capture_pool_count: defaults::capture_pool_count(),
             log_file_level: defaults::log_file_level(),
+            stats_file: None,
         }
     }
 }
