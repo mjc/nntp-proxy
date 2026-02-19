@@ -3,11 +3,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Result;
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, runtime, tui};
+use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, metrics::MetricsStore, runtime, tui};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "NNTP Proxy with TUI Dashboard", long_about = None)]
@@ -50,7 +51,19 @@ async fn run_proxy(
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
-    let proxy = build_proxy(config, routing_mode).await?;
+    // Resolve stats file path and load metrics if available
+    let stats_path = runtime::resolve_stats_file_path(
+        args.common.config.as_str(),
+        config.proxy.stats_file.as_ref(),
+    );
+    let server_names: Vec<String> = config
+        .servers
+        .iter()
+        .map(|s| s.name.as_ref().to_string())
+        .collect();
+    let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
+
+    let proxy = build_proxy(config, routing_mode, metrics_store).await?;
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -70,7 +83,15 @@ async fn run_proxy(
 
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
-    spawn_tui_shutdown_handler(&proxy, &shutdown_tx, tui_shutdown_tx);
+    runtime::spawn_metrics_saver(&proxy, stats_path.clone(), server_names.clone());
+
+    spawn_tui_shutdown_handler(
+        &proxy,
+        &shutdown_tx,
+        tui_shutdown_tx,
+        stats_path,
+        server_names,
+    );
 
     runtime::run_accept_loop(proxy, listener, shutdown_rx, routing_mode).await?;
 
@@ -84,13 +105,13 @@ async fn run_proxy(
 async fn build_proxy(
     config: nntp_proxy::config::Config,
     routing_mode: nntp_proxy::RoutingMode,
+    metrics_store: Option<MetricsStore>,
 ) -> Result<Arc<NntpProxy>> {
-    Ok(Arc::new(
-        NntpProxy::builder(config)
-            .with_routing_mode(routing_mode)
-            .build()
-            .await?,
-    ))
+    let mut builder = NntpProxy::builder(config).with_routing_mode(routing_mode);
+    if let Some(store) = metrics_store {
+        builder = builder.with_metrics_store(store);
+    }
+    Ok(Arc::new(builder.build().await?))
 }
 
 fn launch_tui(
@@ -142,6 +163,8 @@ fn spawn_tui_shutdown_handler(
     proxy: &Arc<NntpProxy>,
     shutdown_tx: &mpsc::Sender<()>,
     tui_shutdown_tx: mpsc::Sender<()>,
+    stats_path: PathBuf,
+    server_names: Vec<String>,
 ) {
     let proxy = Arc::clone(proxy);
     let shutdown_tx = shutdown_tx.clone();
@@ -152,6 +175,13 @@ fn spawn_tui_shutdown_handler(
 
         let _ = tui_shutdown_tx.send(()).await;
         let _ = shutdown_tx.send(()).await;
+
+        // Save metrics before shutting down
+        if let Err(e) = proxy.metrics().save_to_disk(&stats_path, &server_names) {
+            warn!("Failed to save metrics on shutdown: {}", e);
+        } else {
+            info!("Metrics saved to {}", stats_path.display());
+        }
 
         proxy.graceful_shutdown().await;
         info!("Graceful shutdown complete");

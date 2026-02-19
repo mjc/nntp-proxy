@@ -301,9 +301,11 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 #[must_use]
 pub fn spawn_shutdown_handler(
     proxy: &std::sync::Arc<crate::NntpProxy>,
+    stats_path: std::path::PathBuf,
+    server_names: Vec<String>,
 ) -> tokio::sync::mpsc::Receiver<()> {
     use std::sync::Arc;
-    use tracing::info;
+    use tracing::{info, warn};
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let proxy = Arc::clone(proxy);
@@ -311,6 +313,13 @@ pub fn spawn_shutdown_handler(
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("Shutdown signal received");
+
+        // Save metrics before shutting down
+        if let Err(e) = proxy.metrics().save_to_disk(&stats_path, &server_names) {
+            warn!("Failed to save metrics on shutdown: {}", e);
+        } else {
+            info!("Metrics saved to {}", stats_path.display());
+        }
 
         // Notify listeners
         let _ = shutdown_tx.send(()).await;
@@ -374,6 +383,95 @@ pub async fn run_accept_loop(
     info!("Proxy shutdown complete");
 
     Ok(())
+}
+
+// ============================================================================
+// Metrics Persistence Utilities
+// ============================================================================
+
+/// Resolve the metrics stats file path
+///
+/// If stats_file is configured, use it; otherwise default to "stats.json" alongside config file.
+///
+/// # Arguments
+/// * `config_path` - Path to the configuration file
+/// * `configured_path` - Optional configured path from config file
+#[must_use]
+pub fn resolve_stats_file_path(
+    config_path: &str,
+    configured_path: Option<&std::path::PathBuf>,
+) -> std::path::PathBuf {
+    use std::path::Path;
+
+    if let Some(path) = configured_path {
+        path.clone()
+    } else {
+        // Default to stats.json alongside config file
+        let config_dir = Path::new(config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        config_dir.join("stats.json")
+    }
+}
+
+/// Load metrics from disk if the stats file exists
+///
+/// Returns None if file doesn't exist, is empty, or can't be parsed.
+/// Errors are logged but not fatal.
+///
+/// # Arguments
+/// * `stats_path` - Path to the stats JSON file
+/// * `server_names` - Current backend server names (for matching restored data)
+pub fn load_metrics_from_disk(
+    stats_path: &std::path::Path,
+    server_names: &[String],
+) -> Option<crate::metrics::MetricsStore> {
+    use tracing::{info, warn};
+
+    match crate::metrics::MetricsStore::load(stats_path, server_names) {
+        Ok(Some(store)) => {
+            info!("Restored metrics from {}", stats_path.display());
+            Some(store)
+        }
+        Ok(None) => {
+            info!(
+                "Stats file {} is empty or doesn't exist, starting fresh",
+                stats_path.display()
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load stats from {}: {}, starting fresh",
+                stats_path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Spawn background task to periodically save metrics to disk
+///
+/// Saves every 30 seconds. Logs errors but doesn't fail.
+pub fn spawn_metrics_saver(
+    proxy: &std::sync::Arc<crate::NntpProxy>,
+    stats_path: std::path::PathBuf,
+    server_names: Vec<String>,
+) {
+    use std::sync::Arc;
+    use tracing::warn;
+
+    let proxy = Arc::clone(proxy);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(e) = proxy.metrics().save_to_disk(&stats_path, &server_names) {
+                warn!("Failed to save metrics to {}: {}", stats_path.display(), e);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -626,5 +724,46 @@ mod tests {
             RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap())).without_cpu_pinning();
         assert!(!config.is_single_threaded());
         assert!(!config.enable_cpu_pinning);
+    }
+
+    // ========================================================================
+    // Metrics Persistence Tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_stats_file_path_with_configured() {
+        use std::path::PathBuf;
+
+        let configured = PathBuf::from("/custom/path/stats.json");
+        let result = resolve_stats_file_path("config.toml", Some(&configured));
+
+        assert_eq!(result, configured);
+    }
+
+    #[test]
+    fn test_resolve_stats_file_path_default() {
+        let result = resolve_stats_file_path("/etc/nntp-proxy/config.toml", None);
+
+        // Should be /etc/nntp-proxy/stats.json
+        assert_eq!(result.file_name().unwrap(), "stats.json");
+        assert!(result.to_string_lossy().contains("nntp-proxy"));
+    }
+
+    #[test]
+    fn test_resolve_stats_file_path_bare_filename() {
+        let result = resolve_stats_file_path("config.toml", None);
+
+        // Bare filename should resolve to ./stats.json
+        assert_eq!(result.file_name().unwrap(), "stats.json");
+    }
+
+    #[test]
+    fn test_load_metrics_from_disk_missing_file() {
+        use std::path::Path;
+
+        let nonexistent_path = Path::new("/tmp/this-does-not-exist-12345.json");
+        let result = load_metrics_from_disk(nonexistent_path, &[]);
+
+        assert!(result.is_none(), "Missing file should return None");
     }
 }

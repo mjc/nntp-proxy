@@ -93,13 +93,17 @@ impl MetricsCollector {
         self.inner.backend_metrics.get(backend_id.as_index())
     }
 
+    /// Helper for record methods: access backend store by ID
+    ///
+    /// Out-of-bounds IDs silently no-op (safe for concurrent server addition/removal)
     #[inline]
-    fn with_backend<F>(&self, backend_id: BackendId, action: F)
+    fn with_backend_store<F>(&self, backend_id: BackendId, action: F)
     where
-        F: FnOnce(&BackendMetrics),
+        F: FnOnce(&BackendStore),
     {
-        if let Some(backend) = self.backend_get(backend_id) {
-            action(backend);
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            action(store);
         }
     }
 
@@ -193,53 +197,48 @@ impl MetricsCollector {
         self.inner.stateful_sessions.fetch_sub(1, Ordering::Relaxed);
     }
 
-    // Backend metrics recording (using with_backend pattern for cleaner code)
+    // Backend metrics recording (store access via with_backend_store, live gauges via backend_get)
 
     #[inline]
     pub fn record_command(&self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.total_commands.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn record_connection_failure(&self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.connection_failures.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn record_error(&self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.errors.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn record_client_to_backend_bytes_for(&self, backend_id: BackendId, bytes: u64) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn record_backend_to_client_bytes_for(&self, backend_id: BackendId, bytes: u64) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.bytes_received.fetch_add(bytes, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn backend_connection_opened(&self, backend_id: BackendId) {
-        self.with_backend(backend_id, |b| {
-            b.active_connections.fetch_add(1, Ordering::Relaxed);
-        });
+        if let Some(backend) = self.backend_get(backend_id) {
+            backend.active_connections.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Type-safe recording: consumes unrecorded bytes and returns recorded marker
@@ -301,40 +300,36 @@ impl MetricsCollector {
 
     #[inline]
     pub fn record_error_4xx(&self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.errors_4xx.fetch_add(1, Ordering::Relaxed);
             store.errors.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn record_error_5xx(&self, backend_id: BackendId) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.errors_5xx.fetch_add(1, Ordering::Relaxed);
             store.errors.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn record_article(&self, backend_id: BackendId, bytes: u64) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store
                 .article_bytes_total
                 .fetch_add(bytes, Ordering::Relaxed);
             store.article_count.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
     pub fn record_ttfb_micros(&self, backend_id: BackendId, micros: u64) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store.ttfb_micros_total.fetch_add(micros, Ordering::Relaxed);
             store.ttfb_count.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
@@ -344,15 +339,14 @@ impl MetricsCollector {
         send_micros: u64,
         recv_micros: u64,
     ) {
-        let idx = backend_id.as_index();
-        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+        self.with_backend_store(backend_id, |store| {
             store
                 .send_micros_total
                 .fetch_add(send_micros, Ordering::Relaxed);
             store
                 .recv_micros_total
                 .fetch_add(recv_micros, Ordering::Relaxed);
-        }
+        });
     }
 
     #[inline]
@@ -814,6 +808,135 @@ mod tests {
                 .load(Ordering::Relaxed),
             201,
             "Backend 1 should have 201 persisted"
+        );
+    }
+
+    #[test]
+    fn test_out_of_bounds_backend_id_is_noop() {
+        let collector = MetricsCollector::new(2);
+        let bad_id = BackendId::from_index(99);
+
+        // All these should silently no-op (not panic)
+        collector.record_command(bad_id);
+        collector.record_connection_failure(bad_id);
+        collector.record_error(bad_id);
+        collector.record_client_to_backend_bytes_for(bad_id, 1000);
+        collector.record_backend_to_client_bytes_for(bad_id, 2000);
+        collector.record_error_4xx(bad_id);
+        collector.record_error_5xx(bad_id);
+        collector.record_article(bad_id, 5000);
+        collector.record_ttfb_micros(bad_id, 100);
+        collector.record_send_recv_micros(bad_id, 50, 75);
+
+        // Verify nothing changed
+        let snapshot = collector.snapshot(None);
+        assert_eq!(snapshot.backend_stats[0].total_commands.get(), 0);
+        assert_eq!(snapshot.backend_stats[1].total_commands.get(), 0);
+    }
+
+    #[test]
+    fn test_record_error_4xx_increments_both_counters() {
+        let collector = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+
+        collector.record_error_4xx(backend_id);
+        collector.record_error_4xx(backend_id);
+
+        let snapshot = collector.snapshot(None);
+        assert_eq!(
+            snapshot.backend_stats[0].errors_4xx.get(),
+            2,
+            "errors_4xx should increment by 2"
+        );
+        assert_eq!(
+            snapshot.backend_stats[0].errors.get(),
+            2,
+            "errors total should also increment by 2"
+        );
+    }
+
+    #[test]
+    fn test_record_error_5xx_increments_both_counters() {
+        let collector = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+
+        collector.record_error_5xx(backend_id);
+        collector.record_error_5xx(backend_id);
+        collector.record_error_5xx(backend_id);
+
+        let snapshot = collector.snapshot(None);
+        assert_eq!(
+            snapshot.backend_stats[0].errors_5xx.get(),
+            3,
+            "errors_5xx should increment by 3"
+        );
+        assert_eq!(
+            snapshot.backend_stats[0].errors.get(),
+            3,
+            "errors total should also increment by 3"
+        );
+    }
+
+    #[test]
+    fn test_mixed_error_types_compose_correctly() {
+        let collector = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+
+        // Mix different error types
+        collector.record_error(backend_id); // Plain error (errors: 1)
+        collector.record_error_4xx(backend_id); // 4xx (errors_4xx: 1, errors: 2)
+        collector.record_error_5xx(backend_id); // 5xx (errors_5xx: 1, errors: 3)
+        collector.record_error(backend_id); // Plain error again (errors: 4)
+
+        let snapshot = collector.snapshot(None);
+        assert_eq!(
+            snapshot.backend_stats[0].errors.get(),
+            4,
+            "errors total: 2 plain + 1 from 4xx + 1 from 5xx = 4"
+        );
+        assert_eq!(
+            snapshot.backend_stats[0].errors_4xx.get(),
+            1,
+            "errors_4xx should be 1"
+        );
+        assert_eq!(
+            snapshot.backend_stats[0].errors_5xx.get(),
+            1,
+            "errors_5xx should be 1"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_recording() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let collector = Arc::new(MetricsCollector::new(1));
+        let backend_id = BackendId::from_index(0);
+        let mut handles = vec![];
+
+        // 4 threads, each recording 1000 commands
+        for _ in 0..4 {
+            let collector = Arc::clone(&collector);
+            let handle = thread::spawn(move || {
+                for _ in 0..1000 {
+                    collector.record_command(backend_id);
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should have exactly 4000 commands (4 threads * 1000)
+        let snapshot = collector.snapshot(None);
+        assert_eq!(
+            snapshot.backend_stats[0].total_commands.get(),
+            4000,
+            "4 threads x 1000 iterations = 4000 total commands"
         );
     }
 }

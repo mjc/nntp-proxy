@@ -4,6 +4,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
+use tracing::info;
 
 use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, runtime};
 
@@ -42,18 +43,37 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
-    let proxy = Arc::new(NntpProxy::new(config, routing_mode).await?);
+    // Resolve stats file path and load metrics if available
+    let stats_path = runtime::resolve_stats_file_path(
+        args.common.config.as_str(),
+        config.proxy.stats_file.as_ref(),
+    );
+    let server_names: Vec<String> = config
+        .servers
+        .iter()
+        .map(|s| s.name.as_ref().to_string())
+        .collect();
+    let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
+
+    // Build proxy with restored metrics
+    let mut builder = NntpProxy::builder(config).with_routing_mode(routing_mode);
+    if let Some(store) = metrics_store {
+        builder = builder.with_metrics_store(store);
+    }
+    let proxy = Arc::new(builder.build().await?);
+
     let listener = runtime::bind_listener(&host, port, routing_mode).await?;
 
     // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
-    tracing::info!("Prewarming connection pools...");
+    info!("Prewarming connection pools...");
     proxy.prewarm_connections().await?;
-    tracing::info!("Connection pools ready, accepting clients");
+    info!("Connection pools ready, accepting clients");
 
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
+    runtime::spawn_metrics_saver(&proxy, stats_path.clone(), server_names.clone());
 
-    let shutdown_rx = runtime::spawn_shutdown_handler(&proxy);
+    let shutdown_rx = runtime::spawn_shutdown_handler(&proxy, stats_path, server_names);
 
     runtime::run_accept_loop(proxy, listener, shutdown_rx, routing_mode).await
 }
