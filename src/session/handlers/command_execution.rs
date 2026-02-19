@@ -89,17 +89,16 @@ impl ClientSession {
             // Mark backend as unavailable for this article so we try next one
             availability.record_missing(backend_id);
 
-            // Try to salvage connection: drain any remaining data, then health check
+            // Try to salvage connection with DATE health check
             // Spawn in background so client can retry immediately
-            let buffer_pool = self.buffer_pool.clone();
             let cmd_for_log = command.trim().to_string();
             tokio::spawn(async move {
                 tracing::debug!(
                     backend = ?backend_id,
                     command = %cmd_for_log,
-                    "Attempting to drain and salvage connection after Invalid response"
+                    "Attempting to salvage connection after Invalid response"
                 );
-                crate::pool::drain_and_health_check(conn, buffer_pool).await;
+                crate::pool::salvage_with_health_check(conn).await;
             });
 
             // guard drops here → complete_command called automatically
