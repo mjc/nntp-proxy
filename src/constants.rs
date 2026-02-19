@@ -165,7 +165,8 @@ pub mod pool {
     pub const TCP_PEEK_BUFFER_SIZE: usize = 1;
 
     /// Health check timeout - how long to wait for DATE command response
-    pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+    /// CRITICAL: Must be < MAX_CONNECTION_SALVAGE_MS (1000ms) to prevent pool starvation
+    pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// Buffer size for reading health check responses
     pub const HEALTH_CHECK_BUFFER_SIZE: usize = 512;

@@ -14,6 +14,7 @@
 use deadpool::managed::Object;
 
 use crate::connection_error::{ConnectionError, is_connection_error_kind};
+use crate::constants::pool::HEALTH_CHECK_TIMEOUT;
 use crate::pool::deadpool_connection::TcpManager;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -60,8 +61,9 @@ const fn assert_no_timeout_loop(max_iterations: usize, timeout_per_iteration_ms:
 // Apply assertion to salvage_with_health_check (implicit: it has no loop)
 const _SALVAGE_NO_LOOP: () = {
     // salvage_with_health_check has exactly 1 operation (DATE check)
-    // with timeout from health_check module
-    assert_no_timeout_loop(1, MAX_CONNECTION_SALVAGE_MS);
+    // Verify the actual health check timeout doesn't exceed the salvage limit
+    const HEALTH_CHECK_TIMEOUT_MS: u64 = HEALTH_CHECK_TIMEOUT.as_millis() as u64;
+    assert_no_timeout_loop(1, HEALTH_CHECK_TIMEOUT_MS);
 };
 
 /// Check if an error should cause the connection to be removed from the pool

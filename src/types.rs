@@ -31,6 +31,8 @@ pub use protocol::MessageId;
 pub use validated::{ConfigPath, HostName, Password, ServerName, Username, ValidationError};
 
 use nutype::nutype;
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
