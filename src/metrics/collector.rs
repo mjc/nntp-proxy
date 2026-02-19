@@ -749,4 +749,71 @@ mod tests {
             2
         );
     }
+
+    #[test]
+    fn test_metrics_collector_with_store_records_to_correct_store() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let stats_path = temp_dir.path().join("stats.json");
+        let server_names = vec!["backend0".to_string(), "backend1".to_string()];
+
+        // Create initial store and save it
+        let initial_store = MetricsStore::new(2);
+        initial_store.backend_stores[0]
+            .total_commands
+            .store(100, Ordering::Relaxed);
+        initial_store.backend_stores[1]
+            .total_commands
+            .store(200, Ordering::Relaxed);
+        initial_store.save(&stats_path, &server_names).unwrap();
+
+        // Load the store
+        let loaded_store = MetricsStore::load(&stats_path, &server_names)
+            .unwrap()
+            .expect("Should load store");
+
+        // CRITICAL: Create collector with loaded store (this is the bug fix)
+        let collector = MetricsCollector::with_store(loaded_store);
+
+        // Record additional commands
+        collector.record_command(BackendId::from_index(0)); // Should go to 101
+        collector.record_command(BackendId::from_index(1)); // Should go to 201
+        collector.record_command(BackendId::from_index(0)); // Should go to 102
+
+        // Verify snapshot shows the correct totals (loaded + new)
+        let snapshot = collector.snapshot(None);
+        assert_eq!(
+            snapshot.backend_stats[0].total_commands.get(),
+            102,
+            "Backend 0 should have loaded 100 + recorded 2 = 102"
+        );
+        assert_eq!(
+            snapshot.backend_stats[1].total_commands.get(),
+            201,
+            "Backend 1 should have loaded 200 + recorded 1 = 201"
+        );
+
+        // Save again
+        collector.save_to_disk(&stats_path, &server_names).unwrap();
+
+        // Load a second time and verify persistence
+        let final_store = MetricsStore::load(&stats_path, &server_names)
+            .unwrap()
+            .expect("Should load store");
+        assert_eq!(
+            final_store.backend_stores[0]
+                .total_commands
+                .load(Ordering::Relaxed),
+            102,
+            "Backend 0 should have 102 persisted"
+        );
+        assert_eq!(
+            final_store.backend_stores[1]
+                .total_commands
+                .load(Ordering::Relaxed),
+            201,
+            "Backend 1 should have 201 persisted"
+        );
+    }
 }
