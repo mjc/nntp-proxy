@@ -73,16 +73,26 @@ impl ClientSession {
 
         // Reject invalid responses - never forward garbage to client
         if cmd_response.response == crate::protocol::NntpResponse::Invalid {
+            // Extract command verb for logging (avoid logging credentials in AUTHINFO/etc)
+            let cmd_verb = command
+                .split_whitespace()
+                .next()
+                .unwrap_or("UNKNOWN")
+                .to_uppercase();
+
+            // Safely clamp buffer slice to prevent panic on out-of-bounds bytes_read
+            let bytes_to_read = cmd_response.bytes_read.min(buffer.len());
+
             tracing::warn!(
                 client = %self.client_addr,
                 backend = ?backend_id,
-                command = %command.trim(),
+                command_verb = %cmd_verb,
                 bytes_read = cmd_response.bytes_read,
                 first_bytes_hex = %crate::session::backend::format_hex_preview(
-                    &buffer[..cmd_response.bytes_read], 256
+                    &buffer[..bytes_to_read], 256
                 ),
                 first_bytes_utf8 = %String::from_utf8_lossy(
-                    &buffer[..cmd_response.bytes_read.min(256)]
+                    &buffer[..bytes_to_read.min(256)]
                 ),
                 "Backend returned invalid/unparseable response, attempting to salvage connection"
             );

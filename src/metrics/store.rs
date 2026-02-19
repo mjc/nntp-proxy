@@ -393,7 +393,11 @@ impl MetricsStore {
         fs::write(&tmp_path, json)
             .with_context(|| format!("Failed to write stats to {:?}", tmp_path))?;
 
-        // Atomic rename
+        // Best-effort atomic replace: remove existing file (for Windows compatibility) then rename temp file
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("Failed to remove existing stats file at {:?}", path))?;
+        }
         fs::rename(&tmp_path, path)
             .with_context(|| format!("Failed to rename {:?} to {:?}", tmp_path, path))?;
 

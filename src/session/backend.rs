@@ -167,33 +167,36 @@ impl CommandResponse {
         for warning in &self.warnings {
             match warning {
                 ResponseWarning::ShortResponse { bytes, min } => {
+                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
                         "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
                         client_addr,
                         backend_id,
                         bytes,
                         min,
-                        &buffer[..self.bytes_read]
+                        &buffer[..clamped_len]
                     );
                 }
                 ResponseWarning::InvalidResponse => {
+                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
                         client = %client_addr,
                         backend = ?backend_id,
                         bytes_read = self.bytes_read,
-                        first_bytes_hex = %format_hex_preview(&buffer[..self.bytes_read], 256),
-                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..self.bytes_read.min(256)]),
+                        first_bytes_hex = %format_hex_preview(&buffer[..clamped_len], 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..clamped_len.min(256)]),
                         "Backend returned invalid response"
                     );
                 }
                 ResponseWarning::UnusualStatusCode(code) => {
+                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
                         client = %client_addr,
                         backend = ?backend_id,
                         status_code = code,
                         bytes_read = self.bytes_read,
-                        first_bytes_hex = %format_hex_preview(&buffer[..self.bytes_read], 256),
-                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..self.bytes_read.min(256)]),
+                        first_bytes_hex = %format_hex_preview(&buffer[..clamped_len], 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..clamped_len.min(256)]),
                         "Backend returned unusual status code"
                     );
                 }
