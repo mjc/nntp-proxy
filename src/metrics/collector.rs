@@ -12,13 +12,12 @@ use std::time::Instant;
 // Internal Storage Types
 // ============================================================================
 
-/// Backend metrics wrapper: persistable store + live gauges
+/// Backend metrics wrapper: live gauges only
 ///
-/// The `store` field contains all cumulative counters that survive restarts.
 /// Live gauges (active_connections, health_status) are ephemeral.
+/// Cumulative counters are stored in MetricsStore.backend_stores[idx].
 #[derive(Debug)]
 struct BackendMetrics {
-    store: BackendStore,
     active_connections: AtomicUsize,
     health_status: AtomicU8,
 }
@@ -26,7 +25,6 @@ struct BackendMetrics {
 impl Default for BackendMetrics {
     fn default() -> Self {
         Self {
-            store: BackendStore::default(),
             active_connections: AtomicUsize::new(0),
             health_status: AtomicU8::new(BackendHealthStatus::Healthy as u8),
         }
@@ -36,7 +34,7 @@ impl Default for BackendMetrics {
 impl BackendMetrics {
     /// Convert to immutable snapshot (public for testing)
     #[must_use]
-    pub fn to_backend_stats(&self, backend_id: BackendId) -> BackendStats {
+    pub fn to_backend_stats(&self, backend_id: BackendId, store: &BackendStore) -> BackendStats {
         use super::types::*;
         use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
         BackendStats {
@@ -44,28 +42,22 @@ impl BackendMetrics {
             active_connections: ActiveConnections::new(
                 self.active_connections.load(Ordering::Relaxed),
             ),
-            total_commands: CommandCount::new(self.store.total_commands.load(Ordering::Relaxed)),
-            bytes_sent: BytesSent::new(self.store.bytes_sent.load(Ordering::Relaxed)),
-            bytes_received: BytesReceived::new(self.store.bytes_received.load(Ordering::Relaxed)),
-            errors: ErrorCount::new(self.store.errors.load(Ordering::Relaxed)),
-            errors_4xx: ErrorCount::new(self.store.errors_4xx.load(Ordering::Relaxed)),
-            errors_5xx: ErrorCount::new(self.store.errors_5xx.load(Ordering::Relaxed)),
+            total_commands: CommandCount::new(store.total_commands.load(Ordering::Relaxed)),
+            bytes_sent: BytesSent::new(store.bytes_sent.load(Ordering::Relaxed)),
+            bytes_received: BytesReceived::new(store.bytes_received.load(Ordering::Relaxed)),
+            errors: ErrorCount::new(store.errors.load(Ordering::Relaxed)),
+            errors_4xx: ErrorCount::new(store.errors_4xx.load(Ordering::Relaxed)),
+            errors_5xx: ErrorCount::new(store.errors_5xx.load(Ordering::Relaxed)),
             article_bytes_total: ArticleBytesTotal::new(
-                self.store.article_bytes_total.load(Ordering::Relaxed),
+                store.article_bytes_total.load(Ordering::Relaxed),
             ),
-            article_count: ArticleCount::new(self.store.article_count.load(Ordering::Relaxed)),
-            ttfb_micros_total: TtfbMicros::new(
-                self.store.ttfb_micros_total.load(Ordering::Relaxed),
-            ),
-            ttfb_count: TimingMeasurementCount::new(self.store.ttfb_count.load(Ordering::Relaxed)),
-            send_micros_total: SendMicros::new(
-                self.store.send_micros_total.load(Ordering::Relaxed),
-            ),
-            recv_micros_total: RecvMicros::new(
-                self.store.recv_micros_total.load(Ordering::Relaxed),
-            ),
+            article_count: ArticleCount::new(store.article_count.load(Ordering::Relaxed)),
+            ttfb_micros_total: TtfbMicros::new(store.ttfb_micros_total.load(Ordering::Relaxed)),
+            ttfb_count: TimingMeasurementCount::new(store.ttfb_count.load(Ordering::Relaxed)),
+            send_micros_total: SendMicros::new(store.send_micros_total.load(Ordering::Relaxed)),
+            recv_micros_total: RecvMicros::new(store.recv_micros_total.load(Ordering::Relaxed)),
             connection_failures: FailureCount::new(
-                self.store.connection_failures.load(Ordering::Relaxed),
+                store.connection_failures.load(Ordering::Relaxed),
             ),
             health_status: self.health_status.load(Ordering::Relaxed).into(),
         }
@@ -205,37 +197,42 @@ impl MetricsCollector {
 
     #[inline]
     pub fn record_command(&self, backend_id: BackendId) {
-        self.with_backend(backend_id, |b| {
-            b.store.total_commands.fetch_add(1, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.total_commands.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_connection_failure(&self, backend_id: BackendId) {
-        self.with_backend(backend_id, |b| {
-            b.store.connection_failures.fetch_add(1, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.connection_failures.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_error(&self, backend_id: BackendId) {
-        self.with_backend(backend_id, |b| {
-            b.store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_client_to_backend_bytes_for(&self, backend_id: BackendId, bytes: u64) {
-        self.with_backend(backend_id, |b| {
-            b.store.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_backend_to_client_bytes_for(&self, backend_id: BackendId, bytes: u64) {
-        self.with_backend(backend_id, |b| {
-            b.store.bytes_received.fetch_add(bytes, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     #[inline]
@@ -297,45 +294,47 @@ impl MetricsCollector {
 
     #[inline]
     pub fn backend_connection_closed(&self, backend_id: BackendId) {
-        self.with_backend(backend_id, |b| {
-            b.active_connections.fetch_sub(1, Ordering::Relaxed);
-        });
+        if let Some(backend) = self.backend_get(backend_id) {
+            backend.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_error_4xx(&self, backend_id: BackendId) {
-        self.with_backend(backend_id, |b| {
-            b.store.errors_4xx.fetch_add(1, Ordering::Relaxed);
-            b.store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.errors_4xx.fetch_add(1, Ordering::Relaxed);
+            store.errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_error_5xx(&self, backend_id: BackendId) {
-        self.with_backend(backend_id, |b| {
-            b.store.errors_5xx.fetch_add(1, Ordering::Relaxed);
-            b.store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.errors_5xx.fetch_add(1, Ordering::Relaxed);
+            store.errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_article(&self, backend_id: BackendId, bytes: u64) {
-        self.with_backend(backend_id, |b| {
-            b.store
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store
                 .article_bytes_total
                 .fetch_add(bytes, Ordering::Relaxed);
-            b.store.article_count.fetch_add(1, Ordering::Relaxed);
-        });
+            store.article_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
     pub fn record_ttfb_micros(&self, backend_id: BackendId, micros: u64) {
-        self.with_backend(backend_id, |b| {
-            b.store
-                .ttfb_micros_total
-                .fetch_add(micros, Ordering::Relaxed);
-            b.store.ttfb_count.fetch_add(1, Ordering::Relaxed);
-        });
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store.ttfb_micros_total.fetch_add(micros, Ordering::Relaxed);
+            store.ttfb_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline]
@@ -345,21 +344,24 @@ impl MetricsCollector {
         send_micros: u64,
         recv_micros: u64,
     ) {
-        self.with_backend(backend_id, |b| {
-            b.store
+        let idx = backend_id.as_index();
+        if let Some(store) = self.inner.store.backend_stores.get(idx) {
+            store
                 .send_micros_total
                 .fetch_add(send_micros, Ordering::Relaxed);
-            b.store
+            store
                 .recv_micros_total
                 .fetch_add(recv_micros, Ordering::Relaxed);
-        });
+        }
     }
 
     #[inline]
     pub fn set_backend_health(&self, backend_id: BackendId, health: BackendHealthStatus) {
-        self.with_backend(backend_id, |b| {
-            b.health_status.store(health.into(), Ordering::Relaxed);
-        });
+        if let Some(backend) = self.backend_get(backend_id) {
+            backend
+                .health_status
+                .store(health.into(), Ordering::Relaxed);
+        }
     }
 
     // User metrics recording (functional update pattern)
@@ -455,7 +457,11 @@ impl MetricsCollector {
             .backend_metrics
             .iter()
             .enumerate()
-            .map(|(id, metrics)| metrics.to_backend_stats(BackendId::from_index(id)))
+            .map(|(id, metrics)| {
+                let backend_id = BackendId::from_index(id);
+                let store = &self.inner.store.backend_stores[id];
+                metrics.to_backend_stats(backend_id, store)
+            })
             .collect();
 
         let user_stats: Vec<UserStats> = self
@@ -531,7 +537,8 @@ mod tests {
     #[test]
     fn test_backend_metrics_default() {
         let metrics = BackendMetrics::default();
-        let stats = metrics.to_backend_stats(BackendId::from_index(0));
+        let store = BackendStore::default();
+        let stats = metrics.to_backend_stats(BackendId::from_index(0), &store);
 
         assert_eq!(stats.total_commands.get(), 0);
         assert_eq!(stats.bytes_sent.as_u64(), 0);
@@ -542,12 +549,13 @@ mod tests {
     #[test]
     fn test_backend_metrics_to_backend_stats() {
         let metrics = BackendMetrics::default();
-        metrics.store.total_commands.store(42, Ordering::Relaxed);
-        metrics.store.bytes_sent.store(1024, Ordering::Relaxed);
-        metrics.store.bytes_received.store(2048, Ordering::Relaxed);
-        metrics.store.errors.store(3, Ordering::Relaxed);
+        let store = BackendStore::default();
+        store.total_commands.store(42, Ordering::Relaxed);
+        store.bytes_sent.store(1024, Ordering::Relaxed);
+        store.bytes_received.store(2048, Ordering::Relaxed);
+        store.errors.store(3, Ordering::Relaxed);
 
-        let stats = metrics.to_backend_stats(BackendId::from_index(5));
+        let stats = metrics.to_backend_stats(BackendId::from_index(5), &store);
 
         assert_eq!(stats.backend_id.as_index(), 5);
         assert_eq!(stats.total_commands.get(), 42);
