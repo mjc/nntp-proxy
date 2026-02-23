@@ -8,7 +8,6 @@
 //! All connection salvage operations MUST complete in <1 second to prevent pool
 //! starvation and throughput collapse. This is enforced by:
 //! - Compile-time const assertions on timeout values
-//! - Runtime integration tests (tests/pool/connection_salvage_tests.rs)
 //! - Type-level guarantees preventing timeout loops
 
 use deadpool::managed::Object;
@@ -16,6 +15,7 @@ use deadpool::managed::Object;
 use crate::connection_error::{ConnectionError, is_connection_error_kind};
 use crate::constants::pool::HEALTH_CHECK_TIMEOUT;
 use crate::pool::deadpool_connection::TcpManager;
+use crate::pool::provider::DeadpoolConnectionProvider;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPILE-TIME SAFEGUARDS: Connection Hold Time Limits
@@ -25,7 +25,6 @@ use crate::pool::deadpool_connection::TcpManager;
 ///
 /// CRITICAL: If salvage takes longer than this, we risk pool starvation and
 /// throughput collapse. This constant is enforced by:
-/// - Integration tests in tests/pool/connection_salvage_tests.rs
 /// - Const assertions below
 /// - Code review guidelines
 ///
@@ -189,11 +188,15 @@ impl std::ops::DerefMut for ConnectionGuard {
 /// will fail - this is both faster (~1 RTT vs 10 seconds) and equally correct.
 ///
 /// On success: return connection to pool (just drop it normally)
-/// On failure: shutdown socket and drop (connection won't be reused)
+/// On failure: use `remove_with_cooldown` to remove gracefully with backoff
 ///
 /// # Arguments
 /// * `conn` - Pooled connection to verify
-pub async fn salvage_with_health_check(mut conn: Object<TcpManager>) {
+/// * `provider` - Connection provider (used for `remove_with_cooldown` on failure)
+pub async fn salvage_with_health_check(
+    mut conn: Object<TcpManager>,
+    provider: DeadpoolConnectionProvider,
+) {
     use tracing::{debug, warn};
 
     match crate::pool::health_check::check_date_response(&mut conn).await {
@@ -203,7 +206,7 @@ pub async fn salvage_with_health_check(mut conn: Object<TcpManager>) {
         }
         Err(e) => {
             warn!("DATE health check failed after Invalid response: {}", e);
-            remove_from_pool(conn);
+            provider.remove_with_cooldown(conn);
         }
     }
 }

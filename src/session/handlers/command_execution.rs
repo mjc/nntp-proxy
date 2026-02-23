@@ -121,13 +121,14 @@ impl ClientSession {
             // Try to salvage connection with DATE health check
             // Spawn in background so client can retry immediately
             let cmd_for_log = command.trim().to_string();
+            let provider_for_salvage = provider.clone();
             tokio::spawn(async move {
                 tracing::debug!(
                     backend = ?backend_id,
                     command = %cmd_for_log,
                     "Attempting to salvage connection after Invalid response"
                 );
-                crate::pool::salvage_with_health_check(conn).await;
+                crate::pool::salvage_with_health_check(conn, provider_for_salvage).await;
             });
 
             // guard drops here → complete_command called automatically

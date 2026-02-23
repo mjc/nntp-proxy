@@ -10,6 +10,11 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Per-process monotonic counter — ensures concurrent saves use distinct temp file names.
+/// Two simultaneous saves will produce e.g. `stats.json.0.tmp` and `stats.json.1.tmp`,
+/// so they cannot clobber each other before the final atomic rename.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 // ============================================================================
 // Serializable Format Types
 // ============================================================================
@@ -404,8 +409,16 @@ impl MetricsStore {
         let json =
             serde_json::to_string_pretty(&stats_file).context("Failed to serialize stats")?;
 
-        // Write to temp file
-        let tmp_path = path.with_extension("tmp");
+        // Write to a unique temp file to avoid racing with concurrent saves or shutdown saves.
+        // Each call gets a distinct name (stats.json.N.tmp) so concurrent calls don't clobber
+        // each other's in-progress write before atomically renaming to the final path.
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_filename = format!(
+            "{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            seq
+        );
+        let tmp_path = path.with_file_name(tmp_filename);
         fs::write(&tmp_path, json)
             .with_context(|| format!("Failed to write stats to {:?}", tmp_path))?;
 

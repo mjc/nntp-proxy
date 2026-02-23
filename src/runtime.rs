@@ -468,8 +468,14 @@ pub fn spawn_metrics_saver(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(e) = proxy.metrics().save_to_disk(&stats_path, &server_names) {
-                warn!("Failed to save metrics to {}: {}", stats_path.display(), e);
+            let path = stats_path.clone();
+            let names = server_names.clone();
+            let metrics = proxy.metrics().clone();
+            // Use spawn_blocking: save_to_disk uses std::fs blocking I/O
+            match tokio::task::spawn_blocking(move || metrics.save_to_disk(&path, &names)).await {
+                Ok(Err(e)) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
+                Err(e) => warn!("Metrics save task panicked: {}", e),
+                Ok(Ok(())) => {}
             }
         }
     });
