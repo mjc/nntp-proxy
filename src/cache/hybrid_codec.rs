@@ -171,10 +171,10 @@ impl Code for HybridArticleEntry {
             )));
         }
 
-        // Read exactly len bytes without pre-zeroing (idiomatic, safe).
+        // Read exactly len bytes with pre-allocated capacity (avoids reallocation).
         // Use take() to limit reads to len bytes, then collect into Vec.
         use std::io::Read;
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(len);
         reader
             .take(len as u64)
             .read_to_end(&mut buffer)

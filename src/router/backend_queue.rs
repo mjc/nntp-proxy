@@ -124,11 +124,18 @@ impl BackendQueue {
         Ok(())
     }
 
-    /// Dequeue up to `max_batch` requests. Waits if the queue is empty.
+    /// Dequeue up to `max_batch` requests, reusing the provided Vec's allocation.
     ///
-    /// Returns at least 1 request (blocks until one is available).
-    /// Greedily takes up to `max_batch` without waiting for more.
-    pub async fn dequeue_batch(&self, max_batch: usize) -> Vec<QueuedRequest> {
+    /// Takes ownership of `batch`, clears it, fills with at least 1 request (blocks until
+    /// one is available), then greedily takes up to `max_batch` without waiting for more.
+    /// Returns the filled Vec so the caller can thread ownership through a loop.
+    pub async fn dequeue_batch(
+        &self,
+        max_batch: usize,
+        mut batch: Vec<QueuedRequest>,
+    ) -> Vec<QueuedRequest> {
+        batch.clear();
+
         // Wait for at least one item
         loop {
             // Register interest before the final check to prevent missed notifications
@@ -136,7 +143,6 @@ impl BackendQueue {
 
             if let Some(first) = self.queue.pop() {
                 self.depth.fetch_sub(1, Ordering::AcqRel);
-                let mut batch = Vec::with_capacity(max_batch);
                 batch.push(first);
 
                 // Greedily drain up to max_batch - 1 more
@@ -244,11 +250,11 @@ mod tests {
                 .unwrap();
         }
 
-        let batch = queue.dequeue_batch(3).await;
+        let batch = queue.dequeue_batch(3, Vec::new()).await;
         assert_eq!(batch.len(), 3);
         assert_eq!(queue.len(), 2);
 
-        let batch = queue.dequeue_batch(10).await;
+        let batch = queue.dequeue_batch(10, batch).await;
         assert_eq!(batch.len(), 2);
         assert_eq!(queue.len(), 0);
     }
@@ -259,7 +265,7 @@ mod tests {
         let queue_clone = queue.clone();
 
         // Spawn dequeue that will wait
-        let handle = tokio::spawn(async move { queue_clone.dequeue_batch(5).await });
+        let handle = tokio::spawn(async move { queue_clone.dequeue_batch(5, Vec::new()).await });
 
         // Give it a moment to start waiting
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

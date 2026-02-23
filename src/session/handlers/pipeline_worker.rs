@@ -53,10 +53,11 @@ pub async fn backend_pipeline_worker(
 
     // Hoist buffers to worker lifetime (reused across batches)
     let mut result_buf = bytes::BytesMut::with_capacity(4096);
+    let mut batch = Vec::with_capacity(config.batch_size);
 
     loop {
         // Wait for at least one request, then grab up to batch_size
-        let batch = queue.dequeue_batch(config.batch_size).await;
+        batch = queue.dequeue_batch(config.batch_size, batch).await;
         let batch_len = batch.len();
 
         debug!(
@@ -76,13 +77,14 @@ pub async fn backend_pipeline_worker(
                     backend_id, e
                 );
                 metrics.record_connection_failure(backend_id);
-                fail_batch(batch, &format!("connection error: {e}"));
+                batch = fail_batch(batch, &format!("connection error: {e}"));
                 continue;
             }
         };
 
         // Execute the batch: write all commands, then read all responses
-        let success = execute_pipeline_batch(
+        let success;
+        (success, batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -106,15 +108,16 @@ pub async fn backend_pipeline_worker(
 
 /// Execute a batch of commands on a single connection using write-write-read-read pipelining.
 ///
-/// Returns `true` if the connection is still healthy, `false` if it should be removed from pool.
+/// Returns `(healthy, batch)` — whether the connection is still healthy, plus the
+/// (now-drained) batch Vec for allocation reuse.
 async fn execute_pipeline_batch(
     backend_id: BackendId,
     conn: &mut crate::stream::ConnectionStream,
-    batch: Vec<QueuedRequest>,
+    mut batch: Vec<QueuedRequest>,
     metrics: &MetricsCollector,
     buffer_pool: &BufferPool,
     result_buf: &mut bytes::BytesMut,
-) -> bool {
+) -> (bool, Vec<QueuedRequest>) {
     let batch_len = batch.len();
 
     // Phase 1: Write all commands
@@ -130,8 +133,8 @@ async fn execute_pipeline_batch(
             // We wrote commands 0..i successfully but can't read responses
             // because the connection is broken. Fail everything and return early.
             let err_msg = format!("write failed at command {}/{}", i + 1, batch_len);
-            fail_batch(batch, &err_msg);
-            return false;
+            let batch = fail_batch(batch, &err_msg);
+            return (false, batch);
         }
     }
     // All writes succeeded, continue to flush
@@ -142,15 +145,15 @@ async fn execute_pipeline_batch(
             "Pipeline worker backend {:?}: flush failed: {}",
             backend_id, e
         );
-        fail_batch(batch, &format!("flush failed: {e}"));
-        return false;
+        let batch = fail_batch(batch, &format!("flush failed: {e}"));
+        return (false, batch);
     }
 
-    // Phase 2: Read responses in order (with shared buffer + leftover tracking)
+    // Phase 2: Read responses in order (with shared buffer + connection-stashed leftovers)
     let mut buffer = buffer_pool.acquire().await;
-    // leftover and result_buf are now passed in as parameters (hoisted to worker loop)
+    // result_buf is passed in as a parameter (hoisted to worker loop)
 
-    let mut batch_iter = batch.into_iter().enumerate();
+    let mut batch_iter = batch.drain(..).enumerate();
     while let Some((i, req)) = batch_iter.next() {
         // Read the response for this command
         match read_full_response(&mut buffer, conn, result_buf).await {
@@ -192,10 +195,12 @@ async fn execute_pipeline_batch(
                 }
 
                 // Connection broken — return false immediately
-                return false;
+                return (false, batch);
             }
         }
     }
+    // Release the drain iterator's mutable borrow before returning batch
+    drop(batch_iter);
 
     // All responses processed successfully. Leftover is valid only while there
     // are more already-sent responses remaining in this borrow. If bytes remain
@@ -212,10 +217,10 @@ async fn execute_pipeline_batch(
             leftover_bytes = conn.leftover_len(),
             "Pipeline batch ended with buffered bytes; retiring connection to avoid cross-borrow desync"
         );
-        return false;
+        return (false, batch);
     }
 
-    true
+    (true, batch)
 }
 
 /// Read a complete NNTP response (status line + multiline body if applicable).
@@ -346,13 +351,17 @@ async fn read_full_response(
     Ok((result_buf.split().freeze(), status_code))
 }
 
-/// Send error responses to all requests in a batch
-fn fail_batch(batch: Vec<QueuedRequest>, error_msg: &str) {
-    for req in batch {
+/// Send error responses to all requests in a batch.
+///
+/// Takes ownership of the Vec, drains it, and returns the empty Vec
+/// so the caller can reuse the allocation.
+fn fail_batch(mut batch: Vec<QueuedRequest>, error_msg: &str) -> Vec<QueuedRequest> {
+    for req in batch.drain(..) {
         let _ = req
             .response_tx
             .send(PipelineResponse::Error(error_msg.to_string()));
     }
+    batch
 }
 
 #[cfg(test)]
@@ -711,7 +720,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -772,7 +781,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -835,7 +844,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,

@@ -51,6 +51,23 @@ impl PooledBuffer {
         Ok(n)
     }
 
+    /// Read more data at the current initialized offset, accumulating bytes.
+    ///
+    /// Unlike `read_from` which resets the buffer, this appends to existing data.
+    /// Used when a partial response needs more data (e.g., status code split
+    /// across TCP segments).
+    ///
+    /// Returns the number of NEW bytes read (not total).
+    pub async fn read_more<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
+    where
+        R: tokio::io::AsyncReadExt + Unpin,
+    {
+        let offset = self.initialized;
+        let n = reader.read(&mut self.buffer[offset..]).await?;
+        self.initialized += n;
+        Ok(n)
+    }
+
     /// Copy data into buffer and mark as initialized
     ///
     /// # Panics

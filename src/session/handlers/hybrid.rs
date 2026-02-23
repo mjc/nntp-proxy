@@ -48,15 +48,6 @@ impl<'a> StatefulSessionGuard<'a> {
             ended: false,
         }
     }
-
-    /// Explicitly end the session (optional — Drop handles it)
-    #[allow(dead_code)]
-    fn end(mut self) {
-        if !self.ended {
-            self.metrics.stateful_session_ended();
-            self.ended = true;
-        }
-    }
 }
 
 impl Drop for StatefulSessionGuard<'_> {

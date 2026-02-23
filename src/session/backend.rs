@@ -263,17 +263,33 @@ where
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
     }
+
+    // H5: If first read returned fewer bytes than needed to parse a status code,
+    // accumulate more data. This handles the rare case where a TCP segment
+    // boundary splits the 3-digit status code across reads.
+    let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
+    if n < min_len {
+        loop {
+            let more = buffer.read_more(conn).await?;
+            if more == 0 {
+                break; // EOF — validate what we have
+            }
+            if buffer.initialized() >= min_len {
+                break; // Enough data to validate
+            }
+        }
+    }
+    let total = buffer.initialized();
     let recv_elapsed = recv_start.elapsed();
 
     // Validate response
-    let validated =
-        validate_backend_response(&buffer[..n], n, crate::protocol::MIN_RESPONSE_LENGTH);
+    let validated = validate_backend_response(&buffer[..total], total, min_len);
 
     let elapsed = start.elapsed();
 
     Ok((
         CommandResponse {
-            bytes_read: n,
+            bytes_read: total,
             response: validated.response,
             is_multiline: validated.is_multiline,
             warnings: validated.warnings,
@@ -287,6 +303,106 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Mock stream that returns data in configurable chunks
+    struct ChunkedStream {
+        chunks: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl ChunkedStream {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ChunkedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                let len = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..len]);
+                if len < chunk.len() {
+                    // Put remainder back
+                    self.chunks.push_front(chunk[len..].to_vec());
+                }
+                Poll::Ready(Ok(()))
+            } else {
+                // EOF
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ChunkedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_command_partial_read_accumulates() {
+        // Simulate a backend that sends "200 OK\r\n" in two chunks:
+        // first read returns "20", second returns "0 OK\r\n"
+        let mut stream = ChunkedStream::new(vec![b"20".to_vec(), b"0 OK\r\n".to_vec()]);
+
+        let pool = crate::pool::BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+
+        let result = send_command(&mut stream, "DATE\r\n", &mut buffer).await;
+        assert!(result.is_ok(), "send_command should handle partial reads");
+        let resp = result.unwrap();
+        assert!(
+            matches!(resp.response, NntpResponse::Greeting(_)),
+            "Expected 200 greeting, got {:?}",
+            resp.response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_command_single_byte_reads() {
+        // Extreme case: each byte comes separately
+        let data = b"211 Group\r\n";
+        let chunks: Vec<Vec<u8>> = data.iter().map(|&b| vec![b]).collect();
+        let mut stream = ChunkedStream::new(chunks);
+
+        let pool = crate::pool::BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+
+        let result = send_command(&mut stream, "GROUP alt.test\r\n", &mut buffer).await;
+        assert!(
+            result.is_ok(),
+            "send_command should handle single-byte reads"
+        );
+        let resp = result.unwrap();
+        assert!(
+            matches!(resp.response, NntpResponse::SingleLine(_)),
+            "Expected 211 single-line, got {:?}",
+            resp.response
+        );
+    }
 
     // ─── Command response tests ─────────────────────────────────────────────
 
