@@ -452,7 +452,10 @@ impl ArticleCache {
 
                     // Decide whether to update buffer based on completeness
                     let existing_complete = entry.is_complete_article();
-                    let new_complete = new_buffer.len() >= 30 && new_buffer.ends_with(b".\r\n");
+                    let new_complete = new_buffer.len() >= 30
+                        && crate::session::streaming::tail_buffer::TailBuffer::default()
+                            .detect_terminator(&new_buffer)
+                            .is_found();
 
                     let should_replace = match (existing_complete, new_complete) {
                         (false, true) => true,  // Stub → Complete: Always replace

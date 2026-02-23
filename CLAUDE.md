@@ -44,7 +44,8 @@
            │
            ├──> Buffer Management
            │    ├─> BufferPool: zero-alloc I/O scratch buffers
-           │    └─> PooledBuffer: single-read scratch (not accumulator)
+           │    ├─> PooledBuffer [acquire()]: single-read I/O scratch (724KB, pre-faulted)
+           │    └─> PooledBuffer [acquire_capture()]: accumulator for caching (768KB, pre-faulted)
            │
            └──> Pipeline Engine (feature/tcp-command-pipelining)
                 ├─> BackendQueue: batched ARTICLE/BODY requests
@@ -74,76 +75,163 @@
 
 ### 1. Terminator Detection
 
-**✅ ALWAYS use `TailBuffer::detect_terminator()`** for NNTP multiline terminator detection (`\r\n.\r\n`).
+**`TailBuffer` is the ONE AND ONLY place terminator detection can exist in this codebase. There must never be any other implementation anywhere.**
 
-**❌ NEVER write:**
+ANNTP multiline response ends with `\r\n.\r\n` (5 bytes). Detecting this correctly across async chunk reads is subtle and easy to get wrong. Getting it wrong causes **connection pool collapse** (see below).
+
+#### Forbidden Patterns — Never Write These
+
 ```rust
-// BAD: Misses mid-chunk terminators
+// ❌ ends_with check on accumulated buffer
+if data.ends_with(b"\r\n.\r\n") { ... }
+if data.ends_with(b".\r\n") { ... }
+
+// ❌ Private helper that wraps ends_with
 fn has_terminator(data: &[u8]) -> bool {
     data.ends_with(b"\r\n.\r\n")
 }
-```
 
-**✅ DO write:**
-```rust
-use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
-
-let mut tail = TailBuffer::default();
-let status = tail.detect_terminator(chunk);
-match status {
-    TerminatorStatus::FoundAt(pos) => {
-        let write_len = pos + 5; // Include terminator
-        result.extend_from_slice(&chunk[..write_len]);
-        // chunk[write_len..] is leftover for next response
+// ❌ Manual byte loop scanning for terminator bytes
+fn find_terminator(buf: &[u8], start: usize) -> Option<usize> {
+    for i in start..buf.len().saturating_sub(4) {
+        if &buf[i..i+5] == b"\r\n.\r\n" { return Some(i); }
     }
-    _ => { /* continue reading */ }
+    None
+}
+
+// ❌ Constant replicated outside tail_buffer.rs
+const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n";
+const TERMINATOR: &[u8] = b"\r\n.\r\n";
+
+// ❌ has_multiline_terminator() wrapper function
+pub fn has_multiline_terminator(data: &[u8]) -> bool { ... }
+
+// ❌ Accumulate-then-check loop (the worst pattern)
+let mut accumulated = Vec::new();
+loop {
+    let n = stream.read(&mut buf).await?;
+    accumulated.extend_from_slice(&buf[..n]);
+    if accumulated.ends_with(b"\r\n.\r\n") { break; } // WRONG
 }
 ```
 
-**Why:**
-- `ends_with()` only checks the **end** of a buffer — misses terminators in the **middle** (pipelined responses)
-- `TailBuffer` handles: mid-chunk terminators, cross-boundary spanning, SIMD-accelerated scanning
-- **Location:** `src/session/streaming/tail_buffer.rs` (30+ tests, production-proven)
+#### Correct: Streaming (most common case)
+
+```rust
+use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+
+// Create ONE TailBuffer per response — use it across ALL chunks
+let mut tail = TailBuffer::default();
+
+loop {
+    let n = stream.read(buffer.as_mut_slice()).await?;
+    if n == 0 { break; }
+    let chunk = &buffer[..n];
+
+    match tail.detect_terminator(chunk) {
+        TerminatorStatus::FoundAt(pos) => {
+            // Write only up to (and including) the terminator
+            // CRITICAL: pos is byte offset of '\r' in "\r\n.\r\n"
+            // Do NOT write chunk[pos..] — that's the start of the next response
+            client.write_all(&chunk[..pos]).await?;
+            break;
+        }
+        TerminatorStatus::NotFound => {
+            client.write_all(chunk).await?;
+            tail.update(chunk); // Keep tail state for boundary detection
+        }
+    }
+}
+```
+
+#### Correct: Complete-buffer validation (already fully accumulated)
+
+When you have a fully-accumulated `Vec<u8>` (e.g., validating a cache entry that was already read) and just want to confirm it ends with the terminator:
+
+```rust
+use crate::session::streaming::tail_buffer::TailBuffer;
+
+// TailBuffer with no prior state, checking the complete buffer at once
+TailBuffer::default().detect_terminator(&buffer).is_found()
+```
+
+This is correct because a fresh `TailBuffer` with no prior tail state applied to the full buffer is equivalent to a full-buffer terminator check — but still handles the case where `\r\n.\r\n` appears mid-buffer (e.g., article followed by pipelined data).
+
+#### Why `ends_with()` Causes Connection Pool Collapse
+
+This is not a theoretical concern — it caused a production bug where 20 connections were removed from the pool in rapid succession, exhausting the pool entirely:
+
+1. Backend sends article body followed immediately by the start of the next pipelined response in the same TCP segment
+2. `stream.read()` returns a single chunk containing `[...article data...\r\n.\r\n200 Article follows\r\n...]`
+3. `accumulate.ends_with(b"\r\n.\r\n")` returns **false** because the buffer ends with `...200 Article follows\r\n...`, not with the terminator
+4. Loop continues reading — now it consumes the `220 0 <next-msg-id>\r\n` response for the **next** pipelined command
+5. The next pipelined command's response handler reads something that makes no sense — returns `Invalid`
+6. Connection marked broken → `remove_with_cooldown()` → pool size temporarily reduced
+7. Under load with 40 connections and many pipelined commands: cascade to zero
+
+`TailBuffer::detect_terminator()` returns `FoundAt(pos)` pointing to the `\r` of `\r\n.\r\n`, so you write only up to that position and stop — the pipelined response bytes are never consumed from the wrong context.
+
+**Location:** `src/session/streaming/tail_buffer.rs` (30+ tests, production-proven)
 
 **Pattern usage:**
-- Streaming responses: `stream_multiline_response_impl`
-- Pipeline worker: `read_full_response` (after commit 1)
-- Cache validation: check if cached data is complete
+- All streaming responses: `stream_multiline_response_impl`
+- Cache precheck queries: `precheck.rs`
+- Client-side article fetching: `client/mod.rs`
+- Cache entry completeness validation: `cache/entry_helpers.rs`, `cache/article.rs`
+- Article parsing: `protocol/article/mod.rs`
 
 ---
 
 ### 2. I/O Buffer Management
 
-**✅ ALWAYS use `BufferPool::acquire()`** for read scratch buffers in hot paths.
+`BufferPool` has **two distinct modes**. Using the wrong one causes silent reallocation and/or corrupted data.
 
-**❌ NEVER write:**
+#### Mode 1: Scratch buffers — `acquire()`
+
+For single read operations. The buffer is pre-allocated as a fixed-size `Vec<u8>` with `len == capacity` (724KB, page-faulted).
+
+**✅ ALWAYS use for socket reads:**
 ```rust
-// BAD: Allocates per request
+let mut buffer = buffer_pool.acquire().await;
+let n = buffer.read_from(stream).await?;
+let chunk = &buffer[..n]; // Only initialized portion
+// buffer automatically returned to pool on drop
+```
+
+**❌ NEVER do this with a scratch buffer:**
+```rust
+let mut buf = buffer_pool.acquire().await;
+// BAD: Vec already has len=724KB — extend_from_slice() grows BEYOND capacity,
+// causing realloc beyond the pre-faulted pages, and breaks pool debug_assert on return
+buf.extend_from_slice(data);
+
+// BAD: Allocates per-request (defeats the pool entirely)
 let mut scratch = vec![0u8; 8192];
 stream.read(&mut scratch).await?;
 ```
 
-**✅ DO write:**
-```rust
-use crate::pool::buffer::BufferPool;
+#### Mode 2: Capture buffers — `acquire_capture()`
 
-let buffer_pool = BufferPool::default(); // or get from context
-let mut buffer = buffer_pool.acquire().await;
-let n = buffer.read_from(stream).await?;
-let chunk = &buffer[..n];
-// buffer automatically returned to pool on drop
+For accumulating an entire streaming response (caching path only). The buffer is a pre-faulted **empty** `Vec<u8>` with `len == 0` and `capacity == 768KB`.
+
+**✅ ONLY use for the caching capture path:**
+```rust
+// Only under CacheAction::CaptureArticle in command_execution.rs
+let mut captured = self.buffer_pool.acquire_capture().await;
+streaming::stream_and_capture_multiline_response(
+    backend, client, first_chunk, ..., &mut captured
+).await?;
+self.maybe_cache_upsert(msg_id, &captured, backend_id);
 ```
 
-**Why:**
-- Eliminates per-request allocations (hot path optimization)
-- Pool reuses 8KB buffers across requests
-- **PooledBuffer is a single-read scratch buffer** — not an accumulator
-- Use `read_from()` per chunk, don't try to accumulate multiple reads in one buffer
+**❌ NEVER use for I/O scratch in hot paths** — capture buffers are exclusively for caching.
 
-**Pattern usage:**
-- Streaming: `stream_multiline_response_impl`
-- Pipeline: `read_full_response`
-- Any socket read in hot path
+#### Summary Table
+
+| Need | Method | Buffer state | Use `extend_from_slice`? |
+|---|---|---|---|
+| Socket read | `acquire()` | len=724KB (pre-set) | ❌ Never |
+| Cache accumulate | `acquire_capture()` | len=0, cap=768KB | ✅ Correct |
 
 **Location:** `src/pool/buffer.rs`
 
@@ -307,22 +395,19 @@ self.record_response_metrics(&command, &response);
 
 **Available:**
 ```rust
-pub const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n"; // 5 bytes
-pub const LINE_ENDING: &[u8] = b"\r\n";
-
-/// Check if data ends with NNTP multiline terminator
-#[inline]
-pub fn has_multiline_terminator(data: &[u8]) -> bool {
-    data.len() >= 5 && data.ends_with(MULTILINE_TERMINATOR)
-}
+pub const CRLF: &[u8] = b"\r\n";
+pub const TERMINATOR_TAIL_SIZE: usize = 4; // bytes TailBuffer keeps across chunks
 ```
+
+**⚠️ NOT available — these were deleted because they caused bugs:**
+- `MULTILINE_TERMINATOR` — deleted. Do not reintroduce. Use `TailBuffer` (see Mandatory Pattern #1).
+- `has_multiline_terminator()` — deleted. Do not reintroduce. Use `TailBuffer`.
 
 **Note:** The 3-byte `.\r\n` check (without leading `\r\n`) is for **line-based readers** only — different semantics from the 5-byte terminator used for **chunk-based detection**.
 
 **Why:**
-- Magic bytes scattered across codebase will diverge
-- Semantics documented at definition site
-- Easy to grep for usage
+- Having a named constant + helper function for the terminator bytes creates an irresistible footgun: callers use `ends_with(MULTILINE_TERMINATOR)` which misses cross-boundary terminators and consumes pipelined data
+- `TailBuffer` is the only correct interface; exposing the raw bytes encourages bypassing it
 
 ---
 
@@ -1028,16 +1113,27 @@ fn execute_command(
 
 ## Anti-Patterns (Don't Do This)
 
-### ❌ 1. Reimplementing Terminator Detection
+### ❌ 1. Any Terminator Detection Outside TailBuffer
 
-**Never write your own `has_terminator()` or `find_terminator()`:**
-- Use `TailBuffer::detect_terminator()` (SIMD-optimized, 30+ tests)
-- Handles all edge cases (mid-chunk, spanning boundaries)
+**There is exactly one place terminator detection can exist: `TailBuffer::detect_terminator()` in `src/session/streaming/tail_buffer.rs`.**
 
-**Location of duplicates found during refactoring:**
+Any occurrence of the following anywhere else in the codebase is a bug:
+- `ends_with(b"\r\n.\r\n")` or `ends_with(b".\r\n")`
+- `MULTILINE_TERMINATOR` or `TERMINATOR` constants containing terminator bytes
+- `has_multiline_terminator()` or `has_terminator()` helper functions
+- Any loop that manually scans bytes looking for `'.'` or `'\r'` to find the terminator
+- An accumulate-then-check pattern (accumulate into Vec, check ends_with in loop condition)
+
+This caused real connection pool collapse in production: `ends_with()` failed to stop at the terminator boundary, consumed pipelined response bytes into the wrong buffer, caused the next command to receive garbage, marked connections invalid, and cascaded to pool exhaustion. See Mandatory Pattern #1 for the full explanation.
+
+**Historical locations that were deleted — do not recreate:**
+- `src/protocol/responses.rs: MULTILINE_TERMINATOR`, `has_multiline_terminator()` — deleted
+- `src/client/mod.rs: TERMINATOR` const — deleted
+- `src/protocol/article/mod.rs: find_terminator()` — deleted
+- `src/session/precheck.rs`: accumulate+ends_with loop — deleted
+- `benches/response_parsing.rs:find_terminator_new()` — replaced with import
 - `pipeline_worker.rs:has_terminator()` — deleted
 - `fullduplex_worker.rs` (untracked, didn't compile) — deleted
-- `benches/response_parsing.rs:find_terminator_new()` — replaced with import
 
 ---
 
@@ -1074,7 +1170,7 @@ if response.status_code == 430 { /* type-safe */ }
 
 ---
 
-### ❌ 4. Allocating I/O Scratch Buffers
+### ❌ 4. Wrong Buffer Pool Usage
 
 **Never allocate scratch buffers in hot paths:**
 ```rust
@@ -1083,10 +1179,31 @@ let mut buf = vec![0u8; 8192];
 stream.read(&mut buf).await?;
 ```
 
-**Use buffer pool:**
+**Never call `extend_from_slice()` on a scratch buffer from `acquire()`:**
 ```rust
+// BAD: acquire() buffer has len==724KB pre-set; extend grows beyond capacity,
+// causes realloc, and breaks the pool debug_assert on return
+let mut buf = buffer_pool.acquire().await;
+buf.extend_from_slice(data); // ← WRONG MODE
+```
+
+**Never use `acquire_capture()` for single reads:**
+```rust
+// BAD: Capture buffers are single-use 768KB accumulators, not I/O scratch
+let mut buf = buffer_pool.acquire_capture().await;
+let n = buf.read_from(stream).await?; // ← WRONG MODE
+```
+
+**Correct usage:**
+```rust
+// For socket reads (scratch mode):
 let mut buffer = buffer_pool.acquire().await;
 let n = buffer.read_from(stream).await?;
+let chunk = &buffer[..n]; // Only initialized portion
+
+// For caching accumulation (capture mode, caching path only):
+let mut captured = buffer_pool.acquire_capture().await;
+// Then call streaming::stream_and_capture_multiline_response(...)
 ```
 
 ---

@@ -341,7 +341,7 @@ mod tests {
         };
         let mut config = Config {
             cache: None, // Start with no cache section
-            ..Default::default()
+            ..Config::default()
         };
 
         args.apply_overrides(&mut config);
