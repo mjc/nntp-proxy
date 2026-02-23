@@ -102,6 +102,15 @@ pub fn disk_cache_shards() -> usize {
     4
 }
 
+/// Default backend idle timeout (10 minutes)
+///
+/// After this duration of proxy-wide inactivity, idle backend connections are cleared.
+/// Prevents stale connections from accumulating during overnight idle periods.
+#[inline]
+pub fn backend_idle_timeout() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
 /// Default for backend pipelining (enabled)
 #[inline]
 pub fn enable_pipelining() -> bool {

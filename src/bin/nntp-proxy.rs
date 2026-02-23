@@ -72,6 +72,7 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
     runtime::spawn_metrics_saver(&proxy, stats_path.clone(), server_names.clone());
+    runtime::spawn_idle_connection_clearer(&proxy);
 
     let shutdown_rx = runtime::spawn_shutdown_handler(&proxy, stats_path, server_names);
 

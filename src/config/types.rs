@@ -458,6 +458,15 @@ pub struct Server {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compress_level: Option<u32>,
 
+    /// Duration of proxy-wide inactivity after which this backend's idle connections are cleared.
+    /// Prevents stale connections from accumulating during overnight idle periods.
+    /// Default: 600 seconds (10 minutes). Set to 0 to disable.
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::backend_idle_timeout"
+    )]
+    pub backend_idle_timeout: Duration,
+
     /// Enable backend pipelining (request multiplexing) for this server
     /// When enabled, client requests are queued and batched onto shared connections
     /// Default: true
@@ -516,6 +525,7 @@ pub struct ServerBuilder {
     tier: u8,
     compress: Option<bool>,
     compress_level: Option<u32>,
+    backend_idle_timeout: Option<Duration>,
     enable_pipelining: bool,
     pipeline_queue_depth: Option<usize>,
     pipeline_batch_size: Option<usize>,
@@ -546,6 +556,7 @@ impl ServerBuilder {
             tier: 0,
             compress: None,
             compress_level: None,
+            backend_idle_timeout: None,
             enable_pipelining: true,
             pipeline_queue_depth: None,
             pipeline_batch_size: None,
@@ -655,6 +666,16 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the backend idle timeout duration
+    ///
+    /// Connections to this backend are cleared after this duration of proxy-wide inactivity.
+    /// Default: 10 minutes.
+    #[must_use]
+    pub fn backend_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.backend_idle_timeout = Some(timeout);
+        self
+    }
+
     /// Enable or disable backend pipelining (request multiplexing)
     #[must_use]
     pub fn enable_pipelining(mut self, enabled: bool) -> Self {
@@ -734,6 +755,9 @@ impl ServerBuilder {
             tier: self.tier,
             compress: self.compress,
             compress_level: self.compress_level,
+            backend_idle_timeout: self
+                .backend_idle_timeout
+                .unwrap_or_else(super::defaults::backend_idle_timeout),
             enable_pipelining: self.enable_pipelining,
             pipeline_queue_depth,
             pipeline_batch_size,
