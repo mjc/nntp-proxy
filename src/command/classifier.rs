@@ -445,8 +445,8 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
 ///   - Per [RFC 3977 §6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1)
 ///   - Requires dedicated backend connection with maintained state
 ///
-/// - **NonRoutable**: Cannot be safely proxied (POST, IHAVE, etc.)
-///   - Commands: POST, IHAVE, NEWGROUPS, NEWNEWS
+/// - **NonRoutable**: Cannot be safely proxied (POST, IHAVE)
+///   - Commands: POST, IHAVE
 ///   - Per [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
 ///   - Typically rejected or require special handling
 ///
@@ -473,9 +473,8 @@ pub enum NntpCommand {
     /// [RFC 3977 §6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1)
     Stateful,
 
-    /// Commands that cannot work with multiplexing: POST, IHAVE, NEWGROUPS, NEWNEWS
-    /// [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3),
-    /// [RFC 3977 §7.3-7.4](https://datatracker.ietf.org/doc/html/rfc3977#section-7.3)
+    /// Commands that cannot work with multiplexing: POST, IHAVE
+    /// [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
     NonRoutable,
 
     /// Safe to proxy without state: LIST, DATE, CAPABILITIES, HELP, QUIT, etc.
@@ -623,12 +622,15 @@ impl NntpCommand {
         // Posting/transit commands (very rare in typical proxy usage) → NonRoutable
         // Cannot be safely multiplexed or require special handling
         // [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
-        if matches_any(cmd, POST_CASES)
-            || matches_any(cmd, IHAVE_CASES)
-            || matches_any(cmd, NEWGROUPS_CASES)
-            || matches_any(cmd, NEWNEWS_CASES)
-        {
+        if matches_any(cmd, POST_CASES) || matches_any(cmd, IHAVE_CASES) {
             return Self::NonRoutable;
+        }
+
+        // NEWGROUPS/NEWNEWS are read-only queries that don't require group state.
+        // They return multiline responses (231/230) and can be routed to any backend.
+        // [RFC 3977 §7.3-7.4](https://datatracker.ietf.org/doc/html/rfc3977#section-7.3)
+        if matches_any(cmd, NEWGROUPS_CASES) || matches_any(cmd, NEWNEWS_CASES) {
+            return Self::Stateless;
         }
 
         // Unknown commands: Treat as stateless and let backend handle
@@ -906,17 +908,28 @@ mod tests {
             NntpCommand::parse("IHAVE <test@example.com>"),
             NntpCommand::NonRoutable
         );
+    }
 
-        // NEWGROUPS command - cannot be routed per-command
+    #[test]
+    fn test_newgroups_newnews_are_stateless() {
+        // NEWGROUPS and NEWNEWS are read-only queries per RFC 3977 §7.3-7.4
+        // They don't require group state and can be routed to any backend
         assert_eq!(
             NntpCommand::parse("NEWGROUPS 20240101 000000 GMT"),
-            NntpCommand::NonRoutable
+            NntpCommand::Stateless
         );
-
-        // NEWNEWS command - cannot be routed per-command
         assert_eq!(
             NntpCommand::parse("NEWNEWS * 20240101 000000 GMT"),
-            NntpCommand::NonRoutable
+            NntpCommand::Stateless
+        );
+        // Case variants
+        assert_eq!(
+            NntpCommand::parse("newgroups 20240101 000000"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::parse("Newnews alt.* 20240101 000000"),
+            NntpCommand::Stateless
         );
     }
 

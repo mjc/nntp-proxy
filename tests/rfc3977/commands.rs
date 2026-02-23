@@ -303,6 +303,15 @@ fn test_classify_case_insensitive_stateless() {
     assert!(matches!(NntpCommand::parse("list"), NntpCommand::Stateless));
     assert!(matches!(NntpCommand::parse("help"), NntpCommand::Stateless));
     assert!(matches!(NntpCommand::parse("date"), NntpCommand::Stateless));
+    // NEWGROUPS/NEWNEWS are read-only queries (RFC 3977 §7.3-7.4)
+    assert!(matches!(
+        NntpCommand::parse("newgroups 20240101 000000"),
+        NntpCommand::Stateless
+    ));
+    assert!(matches!(
+        NntpCommand::parse("newnews * 20240101 000000"),
+        NntpCommand::Stateless
+    ));
 }
 
 #[test]

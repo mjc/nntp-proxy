@@ -358,22 +358,16 @@ mod tests {
             "Expected Reject for IHAVE"
         );
 
-        // NEWGROUPS should be rejected
-        assert!(
-            matches!(
-                CommandHandler::classify("NEWGROUPS 20240101 000000 GMT"),
-                CommandAction::Reject(msg) if msg.contains("routing")
-            ),
-            "Expected Reject for NEWGROUPS"
+        // NEWGROUPS/NEWNEWS are stateless (RFC 3977 §7.3-7.4) — forwarded, not rejected
+        assert_eq!(
+            CommandHandler::classify("NEWGROUPS 20240101 000000 GMT"),
+            CommandAction::ForwardStateless,
+            "NEWGROUPS should be forwarded as stateless"
         );
-
-        // NEWNEWS should be rejected
-        assert!(
-            matches!(
-                CommandHandler::classify("NEWNEWS * 20240101 000000 GMT"),
-                CommandAction::Reject(msg) if msg.contains("routing")
-            ),
-            "Expected Reject for NEWNEWS"
+        assert_eq!(
+            CommandHandler::classify("NEWNEWS * 20240101 000000 GMT"),
+            CommandAction::ForwardStateless,
+            "NEWNEWS should be forwarded as stateless"
         );
     }
 
@@ -436,7 +430,6 @@ mod tests {
             "LAST",
             "POST",
             "IHAVE <test@example.com>",
-            "NEWGROUPS 20240101 000000 GMT",
         ];
 
         for cmd in reject_commands {

@@ -166,8 +166,11 @@ impl NntpResponse {
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
             // All 1xx are informational multiline
             100..=199 => Self::MultilineData(code),
-            // Specific 2xx multiline responses
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
+            // Specific 2xx multiline responses:
+            // 215=LIST, 220=ARTICLE, 221=HEAD, 222=BODY, 224=XOVER/XHDR,
+            // 225=HEADERS, 230=NEWNEWS, 231=NEWGROUPS, 282=XZHDR/XZVER,
+            // 288=XFEATURE COMPRESS GZIP
+            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => Self::MultilineData(code),
 
             // Everything else is a single-line response
             _ => Self::SingleLine(code),
@@ -258,13 +261,13 @@ impl StatusCode {
     ///
     /// # Multiline Response Codes
     /// - **1xx**: All informational responses (100-199)
-    /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
+    /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282, 288
     #[inline]
     #[must_use]
     pub fn is_multiline(&self) -> bool {
         match **self {
             100..=199 => true, // All 1xx are multiline
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
+            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => true, // Specific 2xx codes
             _ => false,
         }
     }
@@ -292,6 +295,17 @@ mod tests {
         assert!(StatusCode::new(220).is_multiline());
         assert!(!StatusCode::new(200).is_multiline());
         assert!(!StatusCode::new(400).is_multiline());
+    }
+
+    #[test]
+    fn test_288_xfeature_compress_gzip_is_multiline() {
+        // 288 is returned by XFEATURE COMPRESS GZIP — enables compression.
+        // The response is multiline (compressed data stream follows).
+        assert!(StatusCode::new(288).is_multiline());
+        assert!(matches!(
+            NntpResponse::parse(b"288 XFEATURE COMPRESS GZIP\r\n"),
+            NntpResponse::MultilineData(_)
+        ));
     }
 
     #[test]
