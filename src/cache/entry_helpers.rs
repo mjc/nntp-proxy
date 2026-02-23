@@ -4,7 +4,7 @@
 //! providing common logic used by both `ArticleEntry` (moka) and
 //! `HybridArticleEntry` (foyer) cache implementations.
 
-use crate::protocol::has_multiline_terminator;
+use crate::session::streaming::tail_buffer::TailBuffer;
 use smallvec::SmallVec;
 
 /// Check if a buffer contains a valid NNTP multiline response
@@ -26,7 +26,7 @@ pub(super) fn is_valid_response(buffer: &[u8]) -> bool {
     }
 
     // Must end with \r\n.\r\n for multiline responses
-    if !has_multiline_terminator(buffer) {
+    if !TailBuffer::default().detect_terminator(buffer).is_found() {
         return false;
     }
 
@@ -47,7 +47,7 @@ pub(super) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
         return false;
     }
     const MIN_ARTICLE_SIZE: usize = 30;
-    buffer.len() >= MIN_ARTICLE_SIZE && has_multiline_terminator(buffer)
+    buffer.len() >= MIN_ARTICLE_SIZE && TailBuffer::default().detect_terminator(buffer).is_found()
 }
 
 /// Get the appropriate response bytes for a command verb

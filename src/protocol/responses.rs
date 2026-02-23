@@ -3,19 +3,6 @@
 //! This module provides pre-defined NNTP response messages and helpers
 //! for constructing responses according to RFC 3977.
 
-/// Multiline response terminator: "\r\n.\r\n" (RFC 3977)
-pub const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n";
-
-/// Check if data ends with the NNTP multiline terminator `\r\n.\r\n`
-///
-/// This is a convenience helper for the common pattern of checking if a
-/// complete multiline response has been received.
-#[inline]
-#[must_use]
-pub fn has_multiline_terminator(data: &[u8]) -> bool {
-    data.len() >= 5 && data.ends_with(MULTILINE_TERMINATOR)
-}
-
 /// Line ending: "\r\n"
 pub const CRLF: &[u8] = b"\r\n";
 
@@ -123,26 +110,7 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(CRLF, b"\r\n");
-        assert_eq!(MULTILINE_TERMINATOR, b"\r\n.\r\n");
-        assert_eq!(MULTILINE_TERMINATOR.len(), 5);
         assert_eq!(TERMINATOR_TAIL_SIZE, 4);
-    }
-
-    #[test]
-    fn test_has_multiline_terminator() {
-        // Valid terminators
-        assert!(has_multiline_terminator(b"220 Article\r\n.\r\n"));
-        assert!(has_multiline_terminator(b"\r\n.\r\n"));
-        assert!(has_multiline_terminator(
-            b"220 Article\r\nLine 1\r\nLine 2\r\n.\r\n"
-        ));
-
-        // Invalid or incomplete
-        assert!(!has_multiline_terminator(b"220 Article\r\n"));
-        assert!(!has_multiline_terminator(b"\r\n.\r"));
-        assert!(!has_multiline_terminator(b".\r\n")); // Only 3 bytes
-        assert!(!has_multiline_terminator(b"220"));
-        assert!(!has_multiline_terminator(b""));
     }
 
     #[test]
