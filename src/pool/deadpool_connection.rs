@@ -15,6 +15,21 @@ use crate::tls::{TlsConfig, TlsManager};
 /// Type alias for the deadpool connection pool
 pub type Pool = managed::Pool<TcpManager>;
 
+/// Optional settings for [`TcpManager`] construction
+///
+/// Groups optional parameters (credentials, TLS, compression) to keep
+/// the `TcpManager::new()` signature concise.
+#[derive(Debug, Clone, Default)]
+pub struct TcpManagerOptions {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub tls_config: Option<TlsConfig>,
+    /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
+    pub compress: Option<bool>,
+    /// Compression level (0-9). None = fast (level 1).
+    pub compress_level: Option<u32>,
+}
+
 /// TCP connection manager for deadpool with cached TLS config
 #[derive(Debug, Clone)]
 pub struct TcpManager {
@@ -34,22 +49,17 @@ pub struct TcpManager {
 
 impl TcpManager {
     /// Create a new TcpManager with optional TLS configuration
-    #[allow(clippy::too_many_arguments)]
     ///
-    /// If `tls_config` is `Some` with `use_tls = true`, the TLS manager is
+    /// If `options.tls_config` is `Some` with `use_tls = true`, the TLS manager is
     /// pre-initialized (certificates loaded). If `None` or `use_tls = false`,
     /// plain TCP connections are used.
     pub fn new(
         host: String,
         port: u16,
         name: String,
-        username: Option<String>,
-        password: Option<String>,
-        tls_config: Option<TlsConfig>,
-        compress: Option<bool>,
-        compress_level: Option<u32>,
+        options: TcpManagerOptions,
     ) -> Result<Self, ConnectionError> {
-        let (tls_config, tls_manager) = match tls_config {
+        let (tls_config, tls_manager) = match options.tls_config {
             Some(cfg) if cfg.use_tls => {
                 let mgr = Arc::new(TlsManager::new(cfg.clone()).map_err(|e| {
                     ConnectionError::TlsHandshake {
@@ -67,12 +77,12 @@ impl TcpManager {
             host,
             port,
             name,
-            username,
-            password,
+            username: options.username,
+            password: options.password,
             tls_config,
             tls_manager,
-            compress,
-            compress_level,
+            compress: options.compress,
+            compress_level: options.compress_level,
         })
     }
 
@@ -352,11 +362,11 @@ mod tests {
             "news.example.com".to_string(),
             119,
             "TestServer".to_string(),
-            Some("user".to_string()),
-            Some("pass".to_string()),
-            None,
-            None,
-            None,
+            TcpManagerOptions {
+                username: Some("user".to_string()),
+                password: Some("pass".to_string()),
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 
@@ -375,11 +385,7 @@ mod tests {
             "news.example.com".to_string(),
             563,
             "SecureServer".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
+            TcpManagerOptions::default(),
         )
         .unwrap();
 
@@ -397,11 +403,12 @@ mod tests {
             "news.example.com".to_string(),
             119,
             "PlainServer".to_string(),
-            Some("user".to_string()),
-            Some("pass".to_string()),
-            Some(tls_config),
-            None,
-            None,
+            TcpManagerOptions {
+                username: Some("user".to_string()),
+                password: Some("pass".to_string()),
+                tls_config: Some(tls_config),
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 
@@ -422,11 +429,12 @@ mod tests {
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
-            Some("user".to_string()),
-            Some("pass".to_string()),
-            Some(tls_config),
-            None,
-            None,
+            TcpManagerOptions {
+                username: Some("user".to_string()),
+                password: Some("pass".to_string()),
+                tls_config: Some(tls_config),
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 
@@ -442,11 +450,11 @@ mod tests {
             "news.example.com".to_string(),
             119,
             "TestServer".to_string(),
-            Some("user".to_string()),
-            Some("pass".to_string()),
-            None,
-            None,
-            None,
+            TcpManagerOptions {
+                username: Some("user".to_string()),
+                password: Some("pass".to_string()),
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 
@@ -464,11 +472,11 @@ mod tests {
             "news.example.com".to_string(),
             119,
             "TestServer".to_string(),
-            Some("user".to_string()),
-            Some("pass".to_string()),
-            None,
-            None,
-            None,
+            TcpManagerOptions {
+                username: Some("user".to_string()),
+                password: Some("pass".to_string()),
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 
@@ -489,11 +497,10 @@ mod tests {
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
-            None,
-            None,
-            Some(tls_config),
-            None,
-            None,
+            TcpManagerOptions {
+                tls_config: Some(tls_config),
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 
@@ -520,11 +527,10 @@ mod tests {
             "secure.example.com".to_string(),
             563,
             "SecureServer".to_string(),
-            None,
-            None,
-            Some(tls_config),
-            None,
-            None,
+            TcpManagerOptions {
+                tls_config: Some(tls_config),
+                ..TcpManagerOptions::default()
+            },
         );
 
         // Should fail because cert file doesn't exist

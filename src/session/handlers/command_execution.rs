@@ -30,46 +30,65 @@ pub(super) enum BackendAttemptResult {
     BackendUnavailable,
 }
 
+/// Mutable state for an article backend attempt loop
+///
+/// Groups the mutable parameters that track retry state across
+/// multiple `try_backend_for_article` calls.
+pub(super) struct ArticleAttemptState<'a> {
+    pub availability: &'a mut crate::cache::ArticleAvailability,
+    pub buffer: &'a mut crate::pool::PooledBuffer,
+    pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
+}
+
+/// Parameters describing the response to stream to the client
+struct ResponseStreamParams<'a> {
+    command: &'a str,
+    msg_id: Option<&'a crate::types::MessageId<'a>>,
+    response_code: &'a crate::protocol::NntpResponse,
+    is_multiline: bool,
+    first_chunk: &'a [u8],
+}
+
 impl ClientSession {
     /// Try executing command on next available backend
     ///
     /// If the pooled connection is stale (connection error), automatically retries
     /// with a fresh connection before returning an error.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn try_backend_for_article(
         &self,
         router: &Arc<BackendSelector>,
         command: &str,
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        availability: &mut crate::cache::ArticleAvailability,
-        buffer: &mut crate::pool::PooledBuffer,
-        client_to_backend_bytes: &mut ClientToBackendBytes,
+        state: &mut ArticleAttemptState<'_>,
     ) -> Result<BackendAttemptResult> {
         // Select least-loaded available backend
-        let backend_id =
-            router.route_command_with_availability(self.client_id, command, Some(availability))?;
+        let backend_id = router.route_command_with_availability(
+            self.client_id,
+            command,
+            Some(state.availability),
+        )?;
 
         // RAII guard ensures complete_command is called on all exit paths (clone Arc here)
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         // Get connection provider
         let Some(provider) = router.backend_provider(backend_id) else {
-            availability.record_missing(backend_id);
+            state.availability.record_missing(backend_id);
             // guard drops here → complete_command called automatically
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
         // Retry once on stale connection (fresh connection on second attempt)
         let (conn, cmd_response, ttfb, send, recv) = retry_once_on_stale!(
-            self.execute_backend_attempt(provider, backend_id, command, buffer)
+            self.execute_backend_attempt(provider, backend_id, command, state.buffer)
                 .await,
             client = self.client_addr,
             backend = backend_id.as_index()
         )?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
-        *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(command.len());
 
         // Reject invalid responses - never forward garbage to client
         if cmd_response.response == crate::protocol::NntpResponse::Invalid {
@@ -81,7 +100,7 @@ impl ClientSession {
                 .to_uppercase();
 
             // Safely clamp buffer slice to prevent panic on out-of-bounds bytes_read
-            let bytes_to_read = cmd_response.bytes_read.min(buffer.len());
+            let bytes_to_read = cmd_response.bytes_read.min(state.buffer.len());
 
             tracing::warn!(
                 client = %self.client_addr,
@@ -89,15 +108,15 @@ impl ClientSession {
                 command_verb = %cmd_verb,
                 bytes_read = cmd_response.bytes_read,
                 first_bytes_hex = %crate::session::backend::format_hex_preview(
-                    &buffer[..bytes_to_read], 256
+                    &state.buffer[..bytes_to_read], 256
                 ),
                 first_bytes_utf8 = %String::from_utf8_lossy(
-                    &buffer[..bytes_to_read.min(256)]
+                    &state.buffer[..bytes_to_read.min(256)]
                 ),
                 "Backend returned invalid/unparseable response, attempting to salvage connection"
             );
             // Mark backend as unavailable for this article so we try next one
-            availability.record_missing(backend_id);
+            state.availability.record_missing(backend_id);
 
             // Try to salvage connection with DATE health check
             // Spawn in background so client can retry immediately
@@ -118,24 +137,30 @@ impl ClientSession {
         // Handle 430 - article not found
         // Note: response is already read into buffer, keeping connection clean
         if cmd_response.is_430() {
-            self.handle_430_availability(backend_id, availability);
+            self.handle_430_availability(backend_id, state.availability);
             // guard drops here → complete_command called automatically
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
         }
 
         // Success - stream response
         let mut conn = conn;
+        let stream_ctx = streaming::StreamContext {
+            client_addr: self.client_addr,
+            backend_id,
+            buffer_pool: &self.buffer_pool,
+        };
         let bytes_written = self
             .stream_response_to_client(
                 &mut conn,
                 client_write,
-                backend_id,
-                command,
-                msg_id,
-                &cmd_response.response,
-                cmd_response.is_multiline,
-                &buffer[..cmd_response.bytes_read],
-                cmd_response.bytes_read,
+                &stream_ctx,
+                ResponseStreamParams {
+                    command,
+                    msg_id,
+                    response_code: &cmd_response.response,
+                    is_multiline: cmd_response.is_multiline,
+                    first_chunk: &state.buffer[..cmd_response.bytes_read],
+                },
             )
             .await
             .inspect_err(|e| {
@@ -231,22 +256,16 @@ impl ClientSession {
     }
 
     /// Stream response from backend to client and handle caching
-    #[allow(clippy::too_many_arguments)]
     async fn stream_response_to_client(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_id: crate::types::BackendId,
-        command: &str,
-        msg_id: Option<&crate::types::MessageId<'_>>,
-        response_code: &crate::protocol::NntpResponse,
-        is_multiline: bool,
-        first_chunk: &[u8],
-        first_chunk_size: usize,
+        ctx: &streaming::StreamContext<'_>,
+        params: ResponseStreamParams<'_>,
     ) -> Result<u64> {
         // SAFETY: Caller must validate response before calling this function.
         // An invalid response (code 0) should never reach here.
-        let status_code = response_code.status_code().ok_or_else(|| {
+        let status_code = params.response_code.status_code().ok_or_else(|| {
             // This should never happen - caller should reject Invalid responses
             tracing::error!("BUG: stream_response_to_client called with Invalid response");
             anyhow::anyhow!("Cannot stream invalid response")
@@ -254,38 +273,35 @@ impl ClientSession {
         let code = status_code.as_u16();
 
         let cache_action = determine_cache_action(
-            command,
+            params.command,
             code,
-            is_multiline,
+            params.is_multiline,
             self.cache_articles,
-            msg_id.is_some(),
+            params.msg_id.is_some(),
         );
 
         debug!(
             "stream_response_to_client: code={}, is_multiline={}, cache_articles={}, has_msg_id={}, action={:?}",
             code,
-            is_multiline,
+            params.is_multiline,
             self.cache_articles,
-            msg_id.is_some(),
+            params.msg_id.is_some(),
             cache_action
         );
 
-        match (is_multiline, cache_action) {
+        match (params.is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
                 let mut captured = self.buffer_pool.acquire_capture().await;
                 let bytes = streaming::stream_and_capture_multiline_response(
                     &mut **pooled_conn,
                     client_write,
-                    first_chunk,
-                    first_chunk_size,
-                    self.client_addr,
-                    backend_id,
-                    &self.buffer_pool,
+                    params.first_chunk,
+                    ctx,
                     &mut captured,
                 )
                 .await?;
 
-                if let Some(msg_id_ref) = msg_id {
+                if let Some(msg_id_ref) = params.msg_id {
                     debug!(
                         "Client {} caching full article for {} ({} bytes captured)",
                         self.client_addr,
@@ -293,18 +309,15 @@ impl ClientSession {
                         captured.len()
                     );
                 }
-                self.maybe_cache_upsert(msg_id, &captured, backend_id);
+                self.maybe_cache_upsert(params.msg_id, &captured, ctx.backend_id);
                 Ok(bytes)
             }
             (true, CacheAction::TrackAvailability) => {
                 let bytes = streaming::stream_multiline_response(
                     &mut **pooled_conn,
                     client_write,
-                    first_chunk,
-                    first_chunk_size,
-                    self.client_addr,
-                    backend_id,
-                    &self.buffer_pool,
+                    params.first_chunk,
+                    ctx,
                 )
                 .await?;
 
@@ -313,8 +326,8 @@ impl ClientSession {
                 // code to build an availability stub.
                 // SmallVec keeps small status lines on stack, avoiding heap allocation
                 // until the spawn boundary where .to_vec() happens inside spawn_cache_upsert.
-                let stub = crate::cache::extract_status_line(first_chunk);
-                self.maybe_cache_upsert(msg_id, &stub, backend_id);
+                let stub = crate::cache::extract_status_line(params.first_chunk);
+                self.maybe_cache_upsert(params.msg_id, &stub, ctx.backend_id);
                 Ok(bytes)
             }
             (true, _) => {
@@ -322,23 +335,20 @@ impl ClientSession {
                 streaming::stream_multiline_response(
                     &mut **pooled_conn,
                     client_write,
-                    first_chunk,
-                    first_chunk_size,
-                    self.client_addr,
-                    backend_id,
-                    &self.buffer_pool,
+                    params.first_chunk,
+                    ctx,
                 )
                 .await
             }
             (false, CacheAction::TrackStat) => {
-                client_write.write_all(first_chunk).await?;
-                self.maybe_cache_upsert(msg_id, b"223\r\n", backend_id);
-                Ok(first_chunk_size as u64)
+                client_write.write_all(params.first_chunk).await?;
+                self.maybe_cache_upsert(params.msg_id, b"223\r\n", ctx.backend_id);
+                Ok(params.first_chunk.len() as u64)
             }
             (false, _) => {
                 // Single-line, no caching
-                client_write.write_all(first_chunk).await?;
-                Ok(first_chunk_size as u64)
+                client_write.write_all(params.first_chunk).await?;
+                Ok(params.first_chunk.len() as u64)
             }
         }
     }

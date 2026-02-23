@@ -22,13 +22,11 @@ pub enum ForwardResult {
 ///
 /// Uses tokio::select! to forward data in both directions until either side disconnects.
 /// Returns ForwardResult indicating whether connection should be removed from pool.
-#[allow(clippy::too_many_arguments)]
 pub async fn bidirectional_forward<R, W, B>(
     client_reader: &mut R,
     client_write: &mut W,
     pooled_conn: &mut B,
     buffer_pool: &BufferPool,
-    _client_addr: impl std::fmt::Display,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: BackendToClientBytes,
 ) -> Result<ForwardResult>
@@ -262,7 +260,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 ClientToBackendBytes::zero(),
                 BackendToClientBytes::zero(),
             ),
@@ -307,7 +304,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 ClientToBackendBytes::zero(),
                 BackendToClientBytes::zero(),
             ),
@@ -372,7 +368,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 initial_c2b,
                 initial_b2c,
             ),
@@ -444,7 +439,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 ClientToBackendBytes::zero(),
                 BackendToClientBytes::zero(),
             ),

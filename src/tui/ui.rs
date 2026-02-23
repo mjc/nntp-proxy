@@ -61,9 +61,7 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
     // Normal mode - show all panels
     // Determine if we have enough space for a log window
     // We need at least 40 lines total to fit everything comfortably
-    const MIN_HEIGHT_FOR_LOGS: u16 = 40;
-    const LOG_WINDOW_HEIGHT: u16 = 10;
-    let show_logs = f.area().height >= MIN_HEIGHT_FOR_LOGS;
+    let show_logs = f.area().height >= layout::MIN_HEIGHT_FOR_LOGS;
 
     // Create main layout - dynamically add log section based on available space
     let chunks = if show_logs {
@@ -74,7 +72,7 @@ pub fn render_ui(f: &mut Frame, app: &TuiApp) {
                 Constraint::Length(layout::TITLE_HEIGHT),
                 Constraint::Length(layout::SUMMARY_HEIGHT),
                 Constraint::Min(layout::MIN_CHART_HEIGHT),
-                Constraint::Length(LOG_WINDOW_HEIGHT),
+                Constraint::Length(layout::LOG_WINDOW_HEIGHT),
                 Constraint::Length(layout::FOOTER_HEIGHT),
             ])
             .split(f.area())

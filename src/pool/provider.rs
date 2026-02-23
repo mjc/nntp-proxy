@@ -8,7 +8,7 @@
 //! - Graceful shutdown with QUIT commands
 
 use super::connection_trait::ConnectionProvider;
-use super::deadpool_connection::{Pool, TcpManager};
+use super::deadpool_connection::{Pool, TcpManager, TcpManagerOptions};
 use super::health_check::{HealthCheckMetrics, check_date_response};
 use crate::pool::PoolStatus;
 use crate::tls::TlsConfig;
@@ -149,11 +149,12 @@ impl Builder {
             self.host,
             self.port,
             name.clone(),
-            self.username,
-            self.password,
-            self.tls_config,
-            None,
-            None,
+            TcpManagerOptions {
+                username: self.username,
+                password: self.password,
+                tls_config: self.tls_config,
+                ..TcpManagerOptions::default()
+            },
         )?;
 
         Ok(DeadpoolConnectionProvider::from_manager(
@@ -295,11 +296,11 @@ impl DeadpoolConnectionProvider {
                 host,
                 port,
                 name.clone(),
-                username,
-                password,
-                None,
-                None,
-                None,
+                TcpManagerOptions {
+                    username,
+                    password,
+                    ..TcpManagerOptions::default()
+                },
             )
             .expect("Plain TCP TcpManager creation cannot fail"),
             name,
@@ -321,11 +322,12 @@ impl DeadpoolConnectionProvider {
             host,
             port,
             name.clone(),
-            username,
-            password,
-            Some(tls_config),
-            None,
-            None,
+            TcpManagerOptions {
+                username,
+                password,
+                tls_config: Some(tls_config),
+                ..TcpManagerOptions::default()
+            },
         )?;
         Ok(Self::from_manager(manager, name, max_size))
     }
@@ -369,11 +371,13 @@ impl DeadpoolConnectionProvider {
             server.host.to_string(),
             server.port.get(),
             server.name.to_string(),
-            server.username.clone(),
-            server.password.clone(),
-            Some(tls_config),
-            server.compress,
-            server.compress_level,
+            TcpManagerOptions {
+                username: server.username.clone(),
+                password: server.password.clone(),
+                tls_config: Some(tls_config),
+                compress: server.compress,
+                compress_level: server.compress_level,
+            },
         )?;
         let max_size = server.max_connections.get();
         let pool = Pool::builder(manager)
@@ -1039,11 +1043,10 @@ mod tests {
             addr.ip().to_string(),
             addr.port(),
             format!("test-{}", addr.port()),
-            None,
-            None,
-            None,
-            Some(false), // Disable compression — mock doesn't handle it
-            None,
+            TcpManagerOptions {
+                compress: Some(false), // Disable compression — mock doesn't handle it
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 

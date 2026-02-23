@@ -117,11 +117,13 @@ impl ClientSession {
                                     &line,
                                     &mut client_write,
                                     &mut state.auth_username,
-                                    &self.auth_handler,
-                                    &self.auth_state,
-                                    &crate::config::RoutingMode::Stateful,
-                                    &self.metrics,
-                                    self.connection_stats(),
+                                    &common::AuthCheckContext {
+                                        auth_handler: &self.auth_handler,
+                                        auth_state: &self.auth_state,
+                                        routing_mode: &crate::config::RoutingMode::Stateful,
+                                        metrics: &self.metrics,
+                                        connection_stats: self.connection_stats(),
+                                    },
                                     self.client_addr,
                                     |username| self.set_username(username),
                                 ).await?;

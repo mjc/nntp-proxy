@@ -8,7 +8,7 @@ use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::handlers::cache_operations::CacheLookupResult;
-use crate::session::handlers::command_execution::BackendAttemptResult;
+use crate::session::handlers::command_execution::{ArticleAttemptState, BackendAttemptResult};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
@@ -17,6 +17,14 @@ use tracing::{debug, warn};
 
 use crate::command::classifier::{is_head_command, is_large_transfer_command, is_stat_command};
 use crate::session::precheck;
+
+/// Mutable pipeline batch state passed into `batch_execute_articles`
+pub(super) struct BatchPipelineState<'a> {
+    pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
+    pub backend_to_client_bytes: &'a mut BackendToClientBytes,
+    pub leftover: &'a mut bytes::BytesMut,
+    pub chunk_data: &'a mut bytes::BytesMut,
+}
 
 impl ClientSession {
     /// Batch-execute ARTICLE/BODY commands using TCP pipelining.
@@ -30,12 +38,19 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         commands: &[&str],
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        client_to_backend_bytes: &mut ClientToBackendBytes,
-        backend_to_client_bytes: &mut BackendToClientBytes,
+        pipeline: BatchPipelineState<'_>,
     ) -> Result<()> {
         use crate::router::CommandGuard;
         use crate::session::routing::{MetricsAction, determine_metrics_action};
         use crate::session::{backend, streaming};
+
+        // Destructure pipeline state for ergonomic access throughout the function
+        let BatchPipelineState {
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+            leftover,
+            chunk_data,
+        } = pipeline;
 
         // M1: Load availability for the first command's message-ID
         let first_msg_id = crate::types::MessageId::extract_from_command_borrowed(commands[0]);
@@ -92,55 +107,64 @@ impl ClientSession {
         // Phase 2: Read and stream responses in order
         // Acquire buffer once before loop (reused across responses)
         let mut buffer = self.buffer_pool.acquire().await;
-        let mut chunk_data = bytes::BytesMut::new(); // Holds leftover + new read combined
+        // Clear caller-owned buffers for this batch (reused across batch_execute_articles calls)
+        leftover.clear();
+        chunk_data.clear();
 
         for (i, command) in commands.iter().enumerate() {
             let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
 
             // Get first chunk of this response
             chunk_data.clear();
-            let from_leftover = conn.has_leftover();
-            let n = match buffer.read_from(&mut *conn).await {
-                Ok(bytes_read) if bytes_read > 0 => {
-                    chunk_data.extend_from_slice(&buffer[..bytes_read]);
-                    bytes_read
-                }
-                Ok(_) => {
-                    warn!(
-                        client = %self.client_addr,
-                        backend = ?backend_id,
-                        response_index = i + 1,
-                        total_commands = commands.len(),
-                        "Backend EOF during batch read, sending 430 for remaining commands"
-                    );
-                    // Send 430 for remaining commands to maintain protocol sync
-                    for remaining in &commands[i..] {
-                        self.send_430_to_client(client_write, backend_to_client_bytes)
-                            .await?;
-                        *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+            let from_leftover = !leftover.is_empty();
+            let n = if from_leftover {
+                // Use leftover data from previous response
+                chunk_data.extend_from_slice(leftover);
+                leftover.clear();
+                chunk_data.len()
+            } else {
+                match buffer.read_from(&mut *conn).await {
+                    Ok(bytes_read) if bytes_read > 0 => {
+                        chunk_data.extend_from_slice(&buffer[..bytes_read]);
+                        bytes_read
                     }
-                    provider.remove_with_cooldown(conn);
-                    guard.complete();
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        client = %self.client_addr,
-                        backend = ?backend_id,
-                        response_index = i + 1,
-                        total_commands = commands.len(),
-                        error = %e,
-                        "Backend read error during batch, sending 430 for remaining commands"
-                    );
-                    // Send 430 for remaining commands to maintain protocol sync
-                    for remaining in &commands[i..] {
-                        self.send_430_to_client(client_write, backend_to_client_bytes)
-                            .await?;
-                        *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                    Ok(_) => {
+                        warn!(
+                            client = %self.client_addr,
+                            backend = ?backend_id,
+                            response_index = i + 1,
+                            total_commands = commands.len(),
+                            "Backend EOF during batch read, sending 430 for remaining commands"
+                        );
+                        // Send 430 for remaining commands to maintain protocol sync
+                        for remaining in &commands[i..] {
+                            self.send_430_to_client(client_write, backend_to_client_bytes)
+                                .await?;
+                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                        }
+                        provider.remove_with_cooldown(conn);
+                        guard.complete();
+                        return Ok(());
                     }
-                    provider.remove_with_cooldown(conn);
-                    guard.complete();
-                    return Ok(());
+                    Err(e) => {
+                        warn!(
+                            client = %self.client_addr,
+                            backend = ?backend_id,
+                            response_index = i + 1,
+                            total_commands = commands.len(),
+                            error = %e,
+                            "Backend read error during batch, sending 430 for remaining commands"
+                        );
+                        // Send 430 for remaining commands to maintain protocol sync
+                        for remaining in &commands[i..] {
+                            self.send_430_to_client(client_write, backend_to_client_bytes)
+                                .await?;
+                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
+                        }
+                        provider.remove_with_cooldown(conn);
+                        guard.complete();
+                        return Ok(());
+                    }
                 }
             };
 
@@ -202,11 +226,8 @@ impl ClientSession {
                 // For single-line 430, find boundary and save leftover
                 if !is_multiline && let Some(pos) = memchr::memchr(b'\n', chunk) {
                     let end = pos + 1;
-                    if end < n
-                        && let Err(e) = conn.stash_leftover(&chunk[end..])
-                    {
-                        provider.remove_with_cooldown(conn);
-                        return Err(e);
+                    if end < n {
+                        leftover.extend_from_slice(&chunk[end..]);
                     }
                 }
 
@@ -243,7 +264,7 @@ impl ClientSession {
                     "Backend returned Invalid response during batch, aborting batch"
                 );
 
-                // Send 430 for this and all remaining commands.
+                // Send 430 for this and all remaining commands
                 for remaining_cmd in &commands[i..] {
                     self.send_430_to_client(client_write, backend_to_client_bytes)
                         .await?;
@@ -281,14 +302,17 @@ impl ClientSession {
             *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
 
             let bytes_written = if is_multiline {
+                let ctx = streaming::StreamContext {
+                    client_addr: self.client_addr,
+                    backend_id,
+                    buffer_pool: &self.buffer_pool,
+                };
                 match streaming::stream_multiline_response_pipelined(
-                    &mut conn,
+                    &mut *conn,
                     client_write,
                     chunk,
-                    n,
-                    self.client_addr,
-                    backend_id,
-                    &self.buffer_pool,
+                    &ctx,
+                    leftover,
                 )
                 .await
                 {
@@ -322,11 +346,8 @@ impl ClientSession {
                 // Single-line response - find boundary and save leftover
                 let write_len = if let Some(pos) = memchr::memchr(b'\n', chunk) {
                     let end = pos + 1;
-                    if end < n
-                        && let Err(e) = conn.stash_leftover(&chunk[end..])
-                    {
-                        provider.remove_with_cooldown(conn);
-                        return Err(e);
+                    if end < n {
+                        leftover.extend_from_slice(&chunk[end..]);
                     }
                     end
                 } else {
@@ -351,18 +372,6 @@ impl ClientSession {
                     MetricsAction::None => {}
                 }
             }
-        }
-
-        if conn.has_leftover() {
-            warn!(
-                client = %self.client_addr,
-                backend = ?backend_id,
-                leftover_bytes = conn.leftover_len(),
-                "Batch article execution ended with buffered bytes; retiring connection to avoid cross-borrow desync"
-            );
-            provider.remove_with_cooldown(conn);
-            guard.complete();
-            return Ok(());
         }
 
         // Connection healthy — conn drops here, returning to pool automatically
@@ -597,9 +606,11 @@ impl ClientSession {
                     command,
                     msg_id.as_ref(),
                     client_write,
-                    &mut availability,
-                    &mut buffer,
-                    client_to_backend_bytes,
+                    &mut ArticleAttemptState {
+                        availability: &mut availability,
+                        buffer: &mut buffer,
+                        client_to_backend_bytes,
+                    },
                 )
                 .await
             {

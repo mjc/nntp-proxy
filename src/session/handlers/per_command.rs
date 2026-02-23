@@ -278,6 +278,10 @@ impl ClientSession {
         let mut batch_buf = String::with_capacity(512 * 4); // ~2KB for typical 4-command batch
         let mut batch_offsets: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
 
+        // Pipelining buffers reused across batch_execute_articles calls
+        let mut batch_leftover = bytes::BytesMut::new();
+        let mut batch_chunk_data = bytes::BytesMut::new();
+
         // Process commands in batches (single commands fall through with zero overhead)
         'command_batch_loop: loop {
             let batch = match self
@@ -343,8 +347,12 @@ impl ClientSession {
                             router,
                             &commands_vec,
                             &mut client_write,
-                            &mut client_to_backend_bytes,
-                            &mut backend_to_client_bytes,
+                            crate::session::handlers::article_retry::BatchPipelineState {
+                                client_to_backend_bytes: &mut client_to_backend_bytes,
+                                backend_to_client_bytes: &mut backend_to_client_bytes,
+                                leftover: &mut batch_leftover,
+                                chunk_data: &mut batch_chunk_data,
+                            },
                         )
                         .await
                     {
