@@ -359,6 +359,26 @@ impl MetricsStore {
 
     /// Save to file atomically (tmp + rename)
     pub fn save(&self, path: &Path, server_names: &[String]) -> Result<()> {
+        // Build backends list with bounds-safe indexing
+        let backends = server_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                self.backend_stores
+                    .get(i)
+                    .with_context(|| {
+                        format!(
+                            "Backend store index {} out of bounds (stores: {}, names: {})",
+                            i,
+                            self.backend_stores.len(),
+                            server_names.len()
+                        )
+                    })
+                    .map(|store| store.to_persisted(name))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into();
+
         // Create StatsFile
         let stats_file = StatsFile {
             version: STATS_FILE_VERSION,
@@ -366,11 +386,7 @@ impl MetricsStore {
             global: PersistedGlobal {
                 total_connections: self.total_connections.load(Ordering::Relaxed),
             },
-            backends: server_names
-                .iter()
-                .enumerate()
-                .map(|(i, name)| self.backend_stores[i].to_persisted(name))
-                .collect(),
+            backends,
             users: self
                 .user_metrics
                 .iter()
@@ -607,5 +623,21 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn test_metrics_store_save_with_too_many_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let stats_path = temp_dir.path().join("stats.json");
+
+        // Store with 1 backend, but 2 names supplied
+        let store = MetricsStore::new(1);
+        let server_names = vec!["backend1".to_string(), "backend2".to_string()];
+
+        // save() returns Err when server_names.len() > backend_stores.len()
+        let result = store.save(&stats_path, &server_names);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("out of bounds"), "error was: {err}");
     }
 }

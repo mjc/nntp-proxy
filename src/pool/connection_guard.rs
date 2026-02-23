@@ -61,9 +61,14 @@ const fn assert_no_timeout_loop(max_iterations: usize, timeout_per_iteration_ms:
 // Apply assertion to salvage_with_health_check (implicit: it has no loop)
 const _SALVAGE_NO_LOOP: () = {
     // salvage_with_health_check has exactly 1 operation (DATE check)
-    // Verify the actual health check timeout doesn't exceed the salvage limit
-    const HEALTH_CHECK_TIMEOUT_MS: u64 = HEALTH_CHECK_TIMEOUT.as_millis() as u64;
-    assert_no_timeout_loop(1, HEALTH_CHECK_TIMEOUT_MS);
+    // Compare as u128 to avoid truncating cast (as_millis() returns u128; safe for any
+    // reasonable timeout value, but avoids the footgun entirely)
+    assert!(
+        HEALTH_CHECK_TIMEOUT.as_millis() <= MAX_CONNECTION_SALVAGE_MS as u128,
+        "HEALTH_CHECK_TIMEOUT must be <= MAX_CONNECTION_SALVAGE_MS"
+    );
+    // Assert exactly 1 operation (no loop)
+    assert_no_timeout_loop(1, MAX_CONNECTION_SALVAGE_MS);
 };
 
 /// Check if an error should cause the connection to be removed from the pool
