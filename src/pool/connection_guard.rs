@@ -481,6 +481,153 @@ mod tests {
         );
     }
 
+    // ─── ConnectionGuard pool-fate invariants ───────────────────────────────
+    //
+    // These tests verify two invariants that callers must rely on:
+    //
+    //   1. release() returns the connection to pool — pool can reuse it without
+    //      creating a new TCP connection to the backend.
+    //
+    //   2. drop without release() removes the connection — pool creates a fresh
+    //      TCP connection on the next get().
+    //
+    // These invariants protect the A2 refactor: any call site that uses
+    // ConnectionGuard must call release() on "clean" paths (e.g. ClientDisconnect
+    // where the backend was drained successfully) and let the guard drop on
+    // "dirty" paths (backend errors, unknown state).
+    //
+    // A buggy A2 that drops the guard on ClientDisconnect without calling
+    // release() would cause release_reuses_pool_connection to fail — the pool
+    // would create a new TCP connection instead of reusing the existing one.
+
+    use super::ConnectionGuard;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// Spawn a minimal mock NNTP greeting server (no auth, no compression).
+    ///
+    /// Returns `(port, accept_count)` where `accept_count` increments on each
+    /// TCP accept. The server:
+    ///   1. Sends `200 Ready\r\n` greeting
+    ///   2. Responds to `COMPRESS DEFLATE` with `500 Not supported\r\n`
+    ///      (required so `TcpManager::create()` completes compression negotiation)
+    ///   3. Keeps the connection open until the client closes it
+    async fn spawn_greeting_server() -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accept_count);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+
+                    // Send NNTP greeting
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+
+                    // Handle TcpManager setup commands, then keep alive.
+                    // TcpManager::create() sends COMPRESS DEFLATE (auto-detect mode);
+                    // we reject it so create() completes and proceeds without compression.
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break, // Client closed connection
+                            Ok(_) => {
+                                if line.trim().eq_ignore_ascii_case("COMPRESS DEFLATE") {
+                                    let _ = write_half.write_all(b"500 Not supported\r\n").await;
+                                }
+                                // Other commands: stay alive, don't respond
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, accept_count)
+    }
+
+    fn make_provider(port: u16) -> crate::pool::DeadpoolConnectionProvider {
+        crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(5)
+            .build()
+            .unwrap()
+    }
+
+    /// Invariant: release() returns the connection to the pool.
+    ///
+    /// Pool must reuse the connection without creating a new TCP connection.
+    /// This is the path taken on success and on ClientDisconnect (backend was
+    /// cleanly drained — connection is still valid).
+    #[tokio::test]
+    async fn release_reuses_pool_connection() {
+        let (port, accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+
+        // First get — establishes TCP connection #1
+        let conn = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+
+        // release() returns conn to pool (no shutdown)
+        let guard = ConnectionGuard::new(conn, provider.clone());
+        drop(guard.release());
+
+        // Second get — pool recycles the existing connection (no new TCP handshake)
+        let _conn2 = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            1,
+            "release() must return connection to pool; next get() must reuse it without \
+             creating a new TCP connection"
+        );
+    }
+
+    /// Invariant: drop without release() removes the connection from the pool.
+    ///
+    /// remove_with_cooldown shuts down the socket; pool recycle detects EOF
+    /// and discards it; next get() creates a fresh TCP connection.
+    /// This is the path taken on backend errors and unknown connection state.
+    #[tokio::test]
+    async fn drop_without_release_forces_new_connection() {
+        let (port, accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+
+        // First get — establishes TCP connection #1
+        let conn = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+
+        // Drop without release → remove_with_cooldown → socket shut down
+        let guard = ConnectionGuard::new(conn, provider.clone());
+        drop(guard);
+
+        // remove_with_cooldown calls socket2::shutdown(Both) synchronously, so the OS
+        // has already marked the fd as EOF. However, tokio's non-blocking try_read()
+        // inside check_tcp_alive only returns Ok(0) once the tokio I/O driver has
+        // processed the POLLIN event from epoll. That requires the runtime to park
+        // (epoll_wait). A short sleep causes the current task to suspend, the runtime
+        // parks, epoll delivers the event, and the socket is marked readable (EOF) —
+        // so the next recycle() correctly detects the dead connection and discards it.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Second get — pool recycles, check_tcp_alive detects EOF, removes it,
+        // creates a new TCP connection (#2)
+        let _conn2 = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "drop without release() must remove connection; next get() must create \
+             a new TCP connection"
+        );
+    }
+
     // ─── drain_and_health_check tests ───────────────────────────────────────
 
     // Note: Full integration tests for drain_and_health_check would require
