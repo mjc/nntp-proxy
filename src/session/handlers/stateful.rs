@@ -19,7 +19,7 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         provider: &crate::pool::DeadpoolConnectionProvider,
         server_name: &str,
-    ) -> Result<TransferMetrics> {
+    ) -> Result<TransferMetrics, crate::session::SessionError> {
         use crate::protocol::BACKEND_UNAVAILABLE;
 
         // Acquire backend connection
@@ -30,12 +30,15 @@ impl ClientSession {
             }
             Err(e) => {
                 error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
-                client_stream.write_all(BACKEND_UNAVAILABLE).await?;
-                anyhow::bail!(
+                client_stream
+                    .write_all(BACKEND_UNAVAILABLE)
+                    .await
+                    .map_err(|ie| crate::session::SessionError::Backend(ie.into()))?;
+                return Err(crate::session::SessionError::Backend(anyhow::anyhow!(
                     "Failed to get pooled connection for '{}': {}",
                     server_name,
                     e
-                );
+                )));
             }
         };
 
@@ -67,7 +70,7 @@ impl ClientSession {
             Err(_) => { /* guard drops → removes broken connection */ }
         }
 
-        result
+        result.map_err(crate::session::SessionError::from)
     }
 
     /// Core bidirectional proxy loop

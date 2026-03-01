@@ -3,7 +3,7 @@
 //! Contains the private helper methods on `NntpProxy` for managing
 //! session setup, finalization, metrics recording, and idle pool cleanup.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -18,7 +18,9 @@ use crate::router;
 use crate::session::ClientSession;
 use crate::types::{self, ClientAddress, TransferMetrics};
 
-use super::{NntpProxy, is_client_disconnect_error};
+use crate::session::SessionError;
+
+use super::NntpProxy;
 
 impl NntpProxy {
     // Helper methods for session management
@@ -257,12 +259,12 @@ impl NntpProxy {
     /// Finalize stateful session with metrics and cleanup
     pub(super) fn finalize_stateful_session(
         &self,
-        metrics: Result<TransferMetrics>,
+        metrics: Result<TransferMetrics, SessionError>,
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
         backend_id: crate::types::BackendId,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         self.record_connection_if_unauthenticated(session);
         self.router.complete_command(backend_id);
         self.record_session_metrics(metrics, client_addr, session_id, session, Some(backend_id))?;
@@ -273,11 +275,11 @@ impl NntpProxy {
     /// Finalize per-command session with logging and cleanup
     pub(super) fn finalize_per_command_session(
         &self,
-        metrics: Result<TransferMetrics>,
+        metrics: Result<TransferMetrics, SessionError>,
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         self.record_session_metrics(metrics, client_addr, session_id, session, None)?;
         self.record_connection_closed();
         Ok(())
@@ -296,12 +298,12 @@ impl NntpProxy {
     /// Record session metrics and log completion or errors
     pub(super) fn record_session_metrics(
         &self,
-        metrics: Result<TransferMetrics>,
+        metrics: Result<TransferMetrics, SessionError>,
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
         backend_id: Option<crate::types::BackendId>,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         match metrics {
             Ok(m) => {
                 self.log_session_completion(
@@ -326,7 +328,7 @@ impl NntpProxy {
                 }
 
                 // Only log non-client-disconnect errors (avoid spam from normal disconnects)
-                if !is_client_disconnect_error(&e) {
+                if !e.is_client_disconnect() {
                     warn!("Session error for client {}: {:?}", client_addr, e);
                 }
                 Err(e)
@@ -353,17 +355,18 @@ impl NntpProxy {
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         debug!("New client connection from {}", client_addr);
 
         // Check for stale pools before handling (lazy recreation after idle)
         self.check_and_clear_stale_pools();
         self.increment_active_clients();
 
-        let result = async {
+        let result: Result<(), SessionError> = async {
             let backend_id = self
                 .prepare_stateful_connection(&mut client_stream, client_addr)
-                .await?;
+                .await
+                .map_err(SessionError::Backend)?;
             let server_idx = backend_id.as_index();
 
             let session = self.create_session(client_addr, None);
@@ -396,7 +399,7 @@ impl NntpProxy {
         &self,
         client_stream: TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         // Check for stale pools before handling (lazy recreation after idle)
         self.check_and_clear_stale_pools();
         self.increment_active_clients();
@@ -414,7 +417,7 @@ impl NntpProxy {
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         let mode_label = self.routing_mode_display_name();
         debug!(
             "New {} routing client connection from {}",
@@ -422,20 +425,13 @@ impl NntpProxy {
         );
 
         self.prepare_per_command_connection(&mut client_stream, client_addr)
-            .await?;
+            .await
+            .map_err(SessionError::Backend)?;
 
         let session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = self.generate_session_id(&session);
 
-        let metrics = session
-            .handle_per_command_routing(client_stream)
-            .await
-            .with_context(|| {
-                format!(
-                    "{} routing session failed for {} [{}]",
-                    mode_label, client_addr, session_id
-                )
-            });
+        let metrics = session.handle_per_command_routing(client_stream).await;
 
         self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
     }
@@ -588,7 +584,7 @@ mod tests {
         let session_id = proxy.generate_session_id(&session);
 
         let result = proxy.record_session_metrics(
-            Err(anyhow::anyhow!("test error")),
+            Err(SessionError::Backend(anyhow::anyhow!("test error"))),
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
             &session_id,
             &session,
@@ -740,7 +736,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(0);
 
         let result = proxy.finalize_stateful_session(
-            Err(anyhow::anyhow!("connection error")),
+            Err(SessionError::Backend(anyhow::anyhow!("connection error"))),
             client_addr,
             &session_id,
             &session,
@@ -782,7 +778,7 @@ mod tests {
         let session_id = proxy.generate_session_id(&session);
 
         let result = proxy.finalize_per_command_session(
-            Err(anyhow::anyhow!("session failed")),
+            Err(SessionError::Backend(anyhow::anyhow!("session failed"))),
             client_addr,
             &session_id,
             &session,

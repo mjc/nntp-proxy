@@ -14,7 +14,7 @@ use tail_buffer::TailBuffer;
 /// Outcome of a streaming operation that ended in error.
 ///
 /// Callers use `must_remove_connection()` to decide pool fate — no string
-/// inspection or `is_client_disconnect_error` downcast needed.
+/// inspection or downcast needed.
 #[derive(Debug)]
 pub(crate) enum StreamingError {
     /// Client disconnected; backend was drained and connection is clean.
@@ -44,10 +44,6 @@ impl StreamingError {
     /// and `drop(conn)` (returning to pool) when false.
     pub(crate) fn must_remove_connection(&self) -> bool {
         !matches!(self, Self::ClientDisconnect(_))
-    }
-
-    pub(crate) fn is_client_disconnect(&self) -> bool {
-        matches!(self, Self::ClientDisconnect(_))
     }
 }
 
@@ -83,9 +79,8 @@ impl StreamingError {
     /// Convert into an `anyhow::Error` for propagation across API boundaries that
     /// return `anyhow::Result`.
     ///
-    /// `ClientDisconnect` unwraps to the bare `io::Error` so that
-    /// `is_client_disconnect_error()` in outer callers can still downcast
-    /// and classify it correctly via `downcast_ref::<std::io::Error>()`.
+    /// `ClientDisconnect` unwraps to the bare `io::Error`. At top-level
+    /// `anyhow::Result` boundaries, callers can still classify via downcast.
     pub(crate) fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::ClientDisconnect(io_err) => anyhow::Error::from(io_err),

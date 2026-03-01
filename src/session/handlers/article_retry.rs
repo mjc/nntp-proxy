@@ -3,10 +3,10 @@
 //! Handles routing article commands across backends, using ArticleAvailability
 //! to skip backends that have already returned 430 for a given article.
 
-use crate::is_client_disconnect_error;
 use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
+use crate::session::SessionError;
 use crate::session::handlers::cache_operations::CacheLookupResult;
 use crate::session::handlers::command_execution::{ArticleAttemptState, BackendAttemptResult};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
@@ -32,7 +32,7 @@ enum BatchStep {
     Continue,
     /// Client disconnected; backend was cleanly drained.
     /// Caller should complete the guard and propagate the error.
-    ClientDisconnect(anyhow::Error),
+    ClientDisconnect(std::io::Error),
     /// Backend died; caller must send 430s for `commands[from_idx..]`,
     /// remove the connection, and complete the guard.
     BackendDead { from_idx: usize },
@@ -54,7 +54,7 @@ impl ClientSession {
         commands: &[&str],
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         pipeline: BatchPipelineState<'_>,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         let mut state = pipeline;
 
         // M1: Load availability for the first command's message-ID
@@ -75,13 +75,16 @@ impl ClientSession {
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         let Some(provider) = router.backend_provider(backend_id) else {
-            return Err(anyhow::anyhow!(
+            return Err(SessionError::Backend(anyhow::anyhow!(
                 "Backend {:?} has no connection provider",
                 backend_id
-            ));
+            )));
         };
 
-        let conn_raw = provider.get_pooled_connection().await?;
+        let conn_raw = provider
+            .get_pooled_connection()
+            .await
+            .map_err(|e| SessionError::Backend(e.into()))?;
         let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
         // Phase 1: Write all commands, then flush
@@ -97,7 +100,7 @@ impl ClientSession {
                 // Unconditional: write goes to the backend, not the client.
                 // A client disconnect cannot cause a backend write error.
                 // conn drops here → ConnectionGuard::remove_with_cooldown
-                return Err(e.into());
+                return Err(SessionError::Backend(e.into()));
             }
         }
         if let Err(e) = conn.flush().await {
@@ -111,7 +114,7 @@ impl ClientSession {
             // Unconditional: flush goes to the backend, not the client.
             // A client disconnect cannot cause a backend flush error.
             // conn drops here → ConnectionGuard::remove_with_cooldown
-            return Err(e.into());
+            return Err(SessionError::Backend(e.into()));
         }
 
         // Phase 2: Read and stream responses in order.
@@ -135,11 +138,11 @@ impl ClientSession {
                 .await?
             {
                 BatchStep::Continue => {}
-                BatchStep::ClientDisconnect(e) => {
+                BatchStep::ClientDisconnect(io_err) => {
                     // Backend was cleanly drained; return connection to pool.
                     let _ = conn.release();
                     guard.complete();
-                    return Err(e);
+                    return Err(SessionError::ClientDisconnect(io_err));
                 }
                 BatchStep::BackendDead { from_idx } => {
                     // Send 430s for any unhandled commands, then discard the connection.
@@ -379,11 +382,9 @@ impl ClientSession {
             .await
             {
                 Ok(bytes) => bytes,
-                Err(e) if e.is_client_disconnect() => {
+                Err(crate::session::streaming::StreamingError::ClientDisconnect(io_err)) => {
                     // Client disconnected — backend was cleanly drained by the streaming layer.
-                    // into_anyhow() unwraps to bare io::Error so is_client_disconnect_error()
-                    // in outer callers can still classify it correctly.
-                    return Ok(BatchStep::ClientDisconnect(e.into_anyhow()));
+                    return Ok(BatchStep::ClientDisconnect(io_err));
                 }
                 Err(e) => {
                     // Backend error or dirty disconnect (drain failed).
@@ -475,7 +476,7 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<crate::types::BackendId> {
+    ) -> Result<crate::types::BackendId, SessionError> {
         debug!(
             "Client {} ENTERED route_and_execute_command: {}",
             self.client_addr,
@@ -523,13 +524,17 @@ impl ClientSession {
                     match precheck::precheck(&deps, command, msg_id_ref, is_head).await {
                         Some(entry) => {
                             let buf = entry.buffer();
-                            client_write.write_all(buf).await?;
+                            client_write
+                                .write_all(buf)
+                                .await
+                                .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                             buf.len()
                         }
                         None => {
                             client_write
                                 .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                                .await?;
+                                .await
+                                .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                             crate::protocol::NO_SUCH_ARTICLE.len()
                         }
                     };
@@ -588,7 +593,10 @@ impl ClientSession {
                                 backend_id,
                             }) if status_code.as_u16() != 430 => {
                                 // Success - article found, return immediately
-                                client_write.write_all(&data).await?;
+                                client_write
+                                    .write_all(&data)
+                                    .await
+                                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                                 *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
                                 *client_to_backend_bytes =
                                     client_to_backend_bytes.add(command.len());
@@ -717,7 +725,7 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     // Continue to next backend
                 }
-                Err(e) if is_client_disconnect_error(&e) => {
+                Err(e @ SessionError::ClientDisconnect(_)) => {
                     // Client disconnected - stop trying backends
                     debug!(
                         "Client {} disconnected, stopping retry loop",
@@ -725,7 +733,7 @@ impl ClientSession {
                     );
                     return Err(e);
                 }
-                Err(e) => {
+                Err(SessionError::Backend(e)) => {
                     // Backend error (timeout, connection error, etc.)
                     // Log at warn level so root cause is visible before any
                     // downstream ConnectionLimitExceeded errors

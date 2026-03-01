@@ -4,6 +4,7 @@
 //! response validation, and streaming multiline responses to clients.
 
 use crate::router::{BackendSelector, CommandGuard};
+use crate::session::SessionError;
 use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
@@ -61,7 +62,7 @@ impl ClientSession {
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         state: &mut ArticleAttemptState<'_>,
-    ) -> Result<BackendAttemptResult> {
+    ) -> Result<BackendAttemptResult, SessionError> {
         // Select least-loaded available backend
         let backend_id = router.route_command_with_availability(
             self.client_id,
@@ -85,7 +86,8 @@ impl ClientSession {
                 .await,
             client = self.client_addr,
             backend = backend_id.as_index()
-        )?;
+        )
+        .map_err(SessionError::Backend)?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
         *state.client_to_backend_bytes = state.client_to_backend_bytes.add(command.len());
@@ -187,9 +189,8 @@ impl ClientSession {
                     // Client disconnect — backend was cleanly drained. Return to pool.
                     let _ = conn.release();
                 }
-                // into_anyhow() preserves io::Error for ClientDisconnect so that
-                // is_client_disconnect_error() in outer callers can still classify it.
-                return Err(e.into_anyhow());
+                // SessionError::from(StreamingError) preserves ClientDisconnect signal.
+                return Err(SessionError::from(e));
             }
         };
 

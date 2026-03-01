@@ -20,8 +20,8 @@ use tracing::{debug, info, warn};
 use crate::command::classifier::is_large_transfer_command;
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
-use crate::is_client_disconnect_error;
 use crate::router::BackendSelector;
+use crate::session::SessionError;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 /// Result of executing a routing decision
@@ -243,11 +243,13 @@ impl ClientSession {
     pub async fn handle_per_command_routing(
         &self,
         mut client_stream: TcpStream,
-    ) -> Result<TransferMetrics> {
+    ) -> Result<TransferMetrics, SessionError> {
         use tokio::io::BufReader;
 
         let Some(router) = self.router.as_ref() else {
-            anyhow::bail!("Per-command routing mode requires a router");
+            return Err(SessionError::Backend(anyhow::anyhow!(
+                "Per-command routing mode requires a router"
+            )));
         };
 
         let (client_read, mut client_write) = client_stream.split();
@@ -357,7 +359,7 @@ impl ClientSession {
                         .await
                     {
                         Ok(()) => true,
-                        Err(e) if is_client_disconnect_error(&e) => {
+                        Err(e) if e.is_client_disconnect() => {
                             return Err(e);
                         }
                         Err(e) => {
@@ -435,7 +437,10 @@ impl ClientSession {
                         self.client_addr,
                         trailing_cmd.len()
                     );
-                    client_write.write_all(b"500 Command too long\r\n").await?;
+                    client_write
+                        .write_all(b"500 Command too long\r\n")
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     continue;
                 }
 
@@ -507,7 +512,7 @@ mod tests {
         let broken_pipe = std::io::Error::new(ErrorKind::BrokenPipe, "broken pipe");
         let err: anyhow::Error = broken_pipe.into();
         assert!(
-            crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            crate::session::SessionError::from(err).is_client_disconnect(),
             "BrokenPipe should be classified as client disconnect"
         );
 
@@ -515,7 +520,7 @@ mod tests {
         let timeout = std::io::Error::new(ErrorKind::TimedOut, "timed out");
         let err: anyhow::Error = timeout.into();
         assert!(
-            !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            !crate::session::SessionError::from(err).is_client_disconnect(),
             "TimedOut should NOT be classified as client disconnect"
         );
 
@@ -523,7 +528,7 @@ mod tests {
         let other = std::io::Error::other("other error");
         let err: anyhow::Error = other.into();
         assert!(
-            !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            !crate::session::SessionError::from(err).is_client_disconnect(),
             "Other errors should NOT be classified as client disconnect"
         );
     }

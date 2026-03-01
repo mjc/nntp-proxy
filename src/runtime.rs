@@ -367,10 +367,12 @@ pub async fn run_accept_loop(
                         proxy.handle_client(stream, addr.into()).await
                     };
 
-                    if let Err(e) = result {
-                        // Only log non-client-disconnect errors (avoid duplicate logging)
-                        // Client disconnects are already handled gracefully in session handlers
-                        if !crate::is_client_disconnect_error(&e) {
+                    match result {
+                        Ok(()) => {}
+                        Err(crate::session::SessionError::ClientDisconnect(_)) => {
+                            // Normal client disconnect — already handled gracefully
+                        }
+                        Err(crate::session::SessionError::Backend(e)) => {
                             error!("Error handling client {}: {:?}", addr, e);
                         }
                     }

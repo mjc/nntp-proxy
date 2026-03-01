@@ -82,7 +82,7 @@ impl ClientSession {
         initial_command: &str,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
-    ) -> Result<TransferMetrics> {
+    ) -> Result<TransferMetrics, crate::session::SessionError> {
         // One-way transition: PerCommand → Stateful
         self.mode_state.switch_to_stateful();
 
@@ -144,7 +144,7 @@ impl ClientSession {
         }
 
         // Metrics guard automatically ends session via Drop
-        result
+        result.map_err(crate::session::SessionError::from)
     }
 
     /// Acquire a dedicated backend connection for stateful mode
