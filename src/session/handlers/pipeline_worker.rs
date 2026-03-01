@@ -95,7 +95,9 @@ pub async fn backend_pipeline_worker(
         .await;
 
         if !success {
-            // Connection is likely broken; remove from pool so it's not reused
+            // Unconditional: !success means a backend write, flush, or read failed.
+            // Client disconnects only close the oneshot response channel; they do
+            // not affect the backend connection and cannot cause !success here.
             provider.remove_with_cooldown(conn);
         }
 

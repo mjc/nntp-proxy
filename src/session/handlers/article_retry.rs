@@ -93,6 +93,8 @@ impl ClientSession {
                     error = %e,
                     "Batch write failed, removing connection"
                 );
+                // Unconditional: write goes to the backend, not the client.
+                // A client disconnect cannot cause a backend write error.
                 provider.remove_with_cooldown(conn);
                 return Err(e.into());
             }
@@ -105,6 +107,8 @@ impl ClientSession {
                 error = %e,
                 "Batch flush failed, removing connection"
             );
+            // Unconditional: flush goes to the backend, not the client.
+            // A client disconnect cannot cause a backend flush error.
             provider.remove_with_cooldown(conn);
             return Err(e.into());
         }
@@ -146,6 +150,8 @@ impl ClientSession {
                         backend_id,
                     )
                     .await?;
+                    // Unconditional: BackendDead signals backend-side failures only.
+                    // Client disconnects surface as BatchStep::ClientDisconnect (handled above).
                     provider.remove_with_cooldown(conn);
                     guard.complete();
                     return Ok(());

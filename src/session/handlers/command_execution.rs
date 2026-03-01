@@ -235,6 +235,10 @@ impl ClientSession {
         match result {
             Ok((cmd_response, ttfb, send, recv)) => Ok((conn, cmd_response, ttfb, send, recv)),
             Err(e) => {
+                // Unconditional: errors here originate from backend I/O only
+                // (sending the command, reading the first response chunk).
+                // No client writes happen in this path, so a client disconnect
+                // cannot be the cause.
                 provider.remove_with_cooldown(conn);
                 Err(e)
             }

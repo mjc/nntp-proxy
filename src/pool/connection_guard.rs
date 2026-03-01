@@ -206,6 +206,8 @@ pub async fn salvage_with_health_check(
         }
         Err(e) => {
             warn!("DATE health check failed after Invalid response: {}", e);
+            // Unconditional: this is a pool-level operation with no client involved.
+            // DATE failure means the connection is in an unknown/dirty state.
             provider.remove_with_cooldown(conn);
         }
     }
