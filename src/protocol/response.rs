@@ -145,9 +145,8 @@ impl NntpResponse {
     /// **Optimization**: Direct byte-to-digit conversion avoids UTF-8 overhead.
     #[inline]
     pub fn parse(data: &[u8]) -> Self {
-        let code = match StatusCode::parse(data) {
-            Some(c) => c,
-            None => return Self::Invalid,
+        let Some(code) = StatusCode::parse(data) else {
+            return Self::Invalid;
         };
 
         match code.as_u16() {

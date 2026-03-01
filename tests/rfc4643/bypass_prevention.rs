@@ -19,9 +19,8 @@ async fn test_standard_handler_validates_credentials() {
 
     // Step 1: AUTHINFO USER
     let action = CommandHandler::classify("AUTHINFO USER testuser\r\n");
-    let username = match action {
-        CommandAction::InterceptAuth(AuthAction::RequestPassword(u)) => u,
-        _ => panic!("Expected RequestPassword action"),
+    let CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) = action else {
+        panic!("Expected RequestPassword action")
     };
 
     let mut output = Vec::new();
@@ -35,9 +34,8 @@ async fn test_standard_handler_validates_credentials() {
 
     // Step 2: AUTHINFO PASS with WRONG password
     let action = CommandHandler::classify("AUTHINFO PASS wrongpass\r\n");
-    let password = match action {
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) => password,
-        _ => panic!("Expected ValidateAndRespond action"),
+    let CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) = action else {
+        panic!("Expected ValidateAndRespond action")
     };
 
     output.clear();
@@ -60,9 +58,8 @@ async fn test_standard_handler_validates_credentials() {
 
     // Step 3: AUTHINFO PASS with CORRECT password
     let action = CommandHandler::classify("AUTHINFO PASS testpass\r\n");
-    let password = match action {
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) => password,
-        _ => panic!("Expected ValidateAndRespond action"),
+    let CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) = action else {
+        panic!("Expected ValidateAndRespond action")
     };
 
     output.clear();
@@ -93,9 +90,8 @@ async fn test_pass_before_user_rejected() {
 
     // Try to send AUTHINFO PASS without first sending USER
     let action = CommandHandler::classify("AUTHINFO PASS testpass\r\n");
-    let password = match action {
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) => password,
-        _ => panic!("Expected ValidateAndRespond action"),
+    let CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) = action else {
+        panic!("Expected ValidateAndRespond action")
     };
 
     let mut output = Vec::new();

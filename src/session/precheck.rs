@@ -87,9 +87,8 @@ async fn execute_backend_query(
     command: &str,
     multiline: bool,
 ) -> Result<QueryResult, ()> {
-    let conn_raw = match provider.get_pooled_connection().await {
-        Ok(c) => c,
-        Err(_) => return Ok(QueryResult::Error(backend_id)),
+    let Ok(conn_raw) = provider.get_pooled_connection().await else {
+        return Ok(QueryResult::Error(backend_id));
     };
     let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 

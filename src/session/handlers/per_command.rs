@@ -95,9 +95,8 @@ impl ClientSession {
             CommandRoutingDecision::InterceptAuth => {
                 debug!("Client {} decision: InterceptAuth", self.client_addr);
                 let action = CommandHandler::classify(command);
-                let auth_action = match action {
-                    CommandAction::InterceptAuth(a) => a,
-                    _ => unreachable!("InterceptAuth decision must come from InterceptAuth action"),
+                let CommandAction::InterceptAuth(auth_action) = action else {
+                    unreachable!("InterceptAuth decision must come from InterceptAuth action")
                 };
 
                 let auth_succeeded = match common::handle_auth_command(
@@ -175,9 +174,8 @@ impl ClientSession {
             CommandRoutingDecision::Reject => {
                 debug!("Client {} decision: Reject", self.client_addr);
                 let action = CommandHandler::classify(command);
-                let response = match action {
-                    CommandAction::Reject(r) => r,
-                    _ => unreachable!("Reject decision must come from Reject action"),
+                let CommandAction::Reject(response) = action else {
+                    unreachable!("Reject decision must come from Reject action")
                 };
                 client_write.write_all(response.as_bytes()).await?;
                 *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
