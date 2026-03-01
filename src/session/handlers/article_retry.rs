@@ -274,12 +274,9 @@ impl ClientSession {
 
         // --- Handle 430 (article not found on this backend) ---
         if response_code.is_430() {
-            // Single-line 430: find the response boundary and save any trailing bytes.
-            if !is_multiline && let Some(pos) = memchr::memchr(b'\n', chunk) {
-                let end = pos + 1;
-                if end < chunk.len() {
-                    state.leftover.extend_from_slice(&chunk[end..]);
-                }
+            // Single-line 430: split at line boundary, saving the next response's prefix.
+            if !is_multiline {
+                super::split_single_line_response(state.chunk_data, state.leftover);
             }
 
             self.send_430_to_client(client_write, state.backend_to_client_bytes)
@@ -407,18 +404,10 @@ impl ClientSession {
                 }
             }
         } else {
-            // Single-line response: find the boundary and save any trailing bytes.
-            let write_len = if let Some(pos) = memchr::memchr(b'\n', chunk) {
-                let end = pos + 1;
-                if end < chunk.len() {
-                    state.leftover.extend_from_slice(&chunk[end..]);
-                }
-                end
-            } else {
-                chunk.len()
-            };
-            client_write.write_all(&chunk[..write_len]).await?;
-            write_len as u64
+            // Single-line response: split at line boundary, saving the next response's prefix.
+            super::split_single_line_response(state.chunk_data, state.leftover);
+            client_write.write_all(&state.chunk_data[..]).await?;
+            state.chunk_data.len() as u64
         };
 
         *state.backend_to_client_bytes = state.backend_to_client_bytes.add(bytes_written as usize);
