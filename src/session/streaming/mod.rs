@@ -66,14 +66,19 @@ where
     }
 
     // Drain backend if terminator not yet found to keep connection clean
-    if !ctx.terminator_found
-        && let Err(drain_err) =
-            drain_until_terminator(backend_read, ctx.partial_data, ctx.ctx).await
-    {
-        warn!(
-            "Client {} failed to drain backend {:?} after disconnect: {}",
-            ctx.ctx.client_addr, ctx.ctx.backend_id, drain_err
-        );
+    if !ctx.terminator_found {
+        match drain_until_terminator(backend_read, ctx.partial_data, ctx.ctx).await {
+            Ok(()) => {} // Drain succeeded — backend is clean
+            Err(drain_err) => {
+                warn!(
+                    "Client {} failed to drain backend {:?} after disconnect: {}",
+                    ctx.ctx.client_addr, ctx.ctx.backend_id, drain_err
+                );
+                // Return drain error (NOT a client disconnect error) so callers know
+                // the backend connection is dirty and must be removed from pool.
+                return drain_err.context("Backend connection dirty after client disconnect");
+            }
+        }
     }
 
     error.into()
@@ -426,6 +431,44 @@ mod tests {
 
         let result = drain_until_terminator(&mut reader, b"", &ctx).await;
         assert!(result.is_err(), "EOF before terminator must be an error");
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_write_error_dirty_drain() {
+        use crate::types::BufferSize;
+        // Client disconnects AND backend also dies before sending terminator.
+        // drain_until_terminator returns Err (EOF without terminator).
+        // handle_client_write_error must propagate the drain error so callers
+        // know the backend connection is dirty and must be removed from pool.
+        let mut backend = Cursor::new(b"partial data without terminator" as &[u8]);
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let stream_ctx = StreamContext {
+            client_addr,
+            backend_id,
+            buffer_pool: &buffer_pool,
+        };
+
+        let ctx = ClientWriteErrorContext {
+            write_len: 10,
+            chunk_len: 10,
+            total_bytes: 10,
+            partial_data: b"",
+            terminator_found: false, // Must drain
+            ctx: &stream_ctx,
+        };
+
+        let result = handle_client_write_error(error, &mut backend, ctx).await;
+        // Should return the drain error (not a client disconnect error),
+        // so callers know the backend connection is dirty and must be removed.
+        let err_str = result.to_string();
+        assert!(
+            !err_str.contains("broken pipe"),
+            "Should return drain error, not original IO error, but got: {err_str}"
+        );
     }
 
     #[tokio::test]
