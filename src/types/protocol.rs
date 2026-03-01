@@ -69,7 +69,7 @@ impl<'a> MessageId<'a> {
 
     /// Extract message ID from NNTP command (returns owned)
     pub fn extract_from_command(command: &'a str) -> Option<MessageId<'static>> {
-        Self::extract_from_command_borrowed(command).map(|m| m.into_owned())
+        Self::extract_from_command_borrowed(command).map(MessageId::into_owned)
     }
 
     #[inline]

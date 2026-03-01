@@ -156,7 +156,7 @@ fn load_servers_from_env() -> Option<Vec<Server>> {
 pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Server>> {
     let servers: Vec<Server> = (0..)
         .map(|i| parse_server_from_env(i, env))
-        .take_while(|s| s.is_some())
+        .take_while(std::option::Option::is_some)
         .flatten()
         .collect();
 

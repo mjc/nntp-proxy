@@ -520,7 +520,7 @@ fn render_backend_list(
             // Format dynamic text values
             let cmd_per_sec = app
                 .latest_backend_throughput(i)
-                .and_then(|p| p.commands_per_sec())
+                .and_then(super::app::ThroughputPoint::commands_per_sec)
                 .map_or_else(
                     || text::DEFAULT_CMD_RATE.to_string(),
                     |cps| format!("{:.0}", cps.get()),

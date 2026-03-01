@@ -67,7 +67,7 @@ impl RuntimeConfig {
                 .build()?
         } else {
             let num_cpus = std::thread::available_parallelism()
-                .map(|p| p.get())
+                .map(std::num::NonZero::get)
                 .unwrap_or(1);
             tracing::info!(
                 "Starting NNTP proxy with {} worker threads (detected {} CPUs)",

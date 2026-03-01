@@ -644,7 +644,8 @@ impl BackendSelector {
     /// Lower ratios indicate less loaded backends. Range: 0.0 (empty) to f64::MAX (no capacity).
     #[must_use]
     pub fn backend_load_ratio(&self, backend_id: BackendId) -> Option<LoadRatio> {
-        self.find_backend(backend_id).map(|b| b.load_ratio())
+        self.find_backend(backend_id)
+            .map(backend_info::BackendInfo::load_ratio)
     }
 
     /// Get the traffic share percentage for a backend

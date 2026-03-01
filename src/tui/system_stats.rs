@@ -79,7 +79,7 @@ impl SystemMonitor {
                 peak_cpu_usage: self.peak_cpu,
                 memory_bytes: memory,
                 peak_memory_bytes: self.peak_memory,
-                thread_count: process.tasks().map_or(1, |tasks| tasks.len()),
+                thread_count: process.tasks().map_or(1, std::collections::HashSet::len),
             }
         } else {
             // Process not found (shouldn't happen for our own PID)
@@ -98,7 +98,7 @@ impl SystemMonitor {
                 peak_cpu_usage: self.peak_cpu,
                 memory_bytes: process.memory(),
                 peak_memory_bytes: self.peak_memory,
-                thread_count: process.tasks().map_or(1, |tasks| tasks.len()),
+                thread_count: process.tasks().map_or(1, std::collections::HashSet::len),
             }
         } else {
             SystemStats::default()
