@@ -56,7 +56,7 @@ impl StaleConnectionServer {
         let ready = self.ready;
 
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
                 .await
                 .expect("Failed to bind");
 
@@ -165,7 +165,7 @@ impl FailFirstNServer {
         let ready = self.ready;
 
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
                 .await
                 .expect("Failed to bind");
 
@@ -248,7 +248,7 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn({
@@ -272,7 +272,7 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
 
     // Read greeting
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("200"), "Expected greeting, got: {}", line);
+    assert!(line.starts_with("200"), "Expected greeting, got: {line}");
     line.clear();
 
     // First STAT command - should work (fresh connection)
@@ -283,8 +283,7 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
     reader.read_line(&mut line).await?;
     assert!(
         line.starts_with("223"),
-        "First STAT should succeed, got: {}",
-        line
+        "First STAT should succeed, got: {line}"
     );
     line.clear();
 
@@ -303,16 +302,14 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
     // Should succeed (retry logic got fresh connection)
     assert!(
         line.starts_with("223"),
-        "Second STAT should succeed after retry, got: {}",
-        line
+        "Second STAT should succeed after retry, got: {line}"
     );
 
     // Verify multiple connections were made (original + retry)
     let total_conns = conn_count.load(Ordering::SeqCst);
     assert!(
         total_conns >= 2,
-        "Should have made at least 2 connections (got {})",
-        total_conns
+        "Should have made at least 2 connections (got {total_conns})"
     );
 
     reader.get_mut().write_all(b"QUIT\r\n").await?;
@@ -345,7 +342,7 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn({
@@ -376,7 +373,7 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
     // First command
     reader.get_mut().write_all(b"STAT <msg1@test>\r\n").await?;
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("223"), "First should work: {}", line);
+    assert!(line.starts_with("223"), "First should work: {line}");
     line.clear();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -384,11 +381,11 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
     // Second command - stale connection
     reader.get_mut().write_all(b"STAT <msg2@test>\r\n").await?;
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("223"), "Retry should work: {}", line);
+    assert!(line.starts_with("223"), "Retry should work: {line}");
 
     // Check connections
     let total = conn_count.load(Ordering::SeqCst);
-    assert!(total >= 2, "Need at least 2 connections, got {}", total);
+    assert!(total >= 2, "Need at least 2 connections, got {total}");
 
     reader.get_mut().write_all(b"QUIT\r\n").await?;
     Ok(())
@@ -418,7 +415,7 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn({
@@ -459,13 +456,13 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
     eprintln!("Connection count: {}, response: {}", total, line.trim());
 
     // Should have made multiple connection attempts
-    assert!(total >= 2, "Should have retried connections, got {}", total);
+    assert!(total >= 2, "Should have retried connections, got {total}");
 
     reader.get_mut().write_all(b"QUIT\r\n").await?;
     Ok(())
 }
 
-/// Test that merge_from respects NNTP semantics: 430 is authoritative
+/// Test that `merge_from` respects NNTP semantics: 430 is authoritative
 ///
 /// NNTP servers NEVER give false negatives (430 is always truthful).
 /// NNTP servers CAN give false positives (2xx might be corrupt/incomplete).
@@ -555,7 +552,7 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 
 /// Test that availability information remains accurate after clearing idle connections
 ///
-/// This is critical: when we clear stale pools, the BackendId → server mapping must
+/// This is critical: when we clear stale pools, the `BackendId` → server mapping must
 /// remain consistent. Backend 0 after clearing must still be the same server that
 /// returned 430 before clearing.
 ///
@@ -573,7 +570,7 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     let backend0_requests_clone = backend0_requests.clone();
 
     let handle0 = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port0))
+        let listener = TcpListener::bind(format!("127.0.0.1:{port0}"))
             .await
             .unwrap();
 
@@ -612,7 +609,7 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     let backend1_requests_clone = backend1_requests.clone();
 
     let handle1 = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port1))
+        let listener = TcpListener::bind(format!("127.0.0.1:{port1}"))
             .await
             .unwrap();
 
@@ -648,8 +645,8 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
         }
     });
 
-    wait_for_server(&format!("127.0.0.1:{}", port0), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{}", port1), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{port0}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{port1}"), 20).await?;
 
     // Create proxy with both backends - MUST enable cache for availability tracking!
     let config = Config {
@@ -669,7 +666,7 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     // Phase 1: Learn availability by making a request
     // The proxy will try backend 0 first, get 430, then try backend 1, get success
     let proxy_port = get_available_port().await?;
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     // Spawn proxy accept loop that handles multiple connections

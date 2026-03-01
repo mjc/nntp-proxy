@@ -24,7 +24,7 @@ async fn test_430_retry_finds_article_on_second_backend() -> Result<()> {
     )
     .await?;
 
-    eprintln!("Proxy running on port {}", proxy_port);
+    eprintln!("Proxy running on port {proxy_port}");
 
     // Connect and request article
     eprintln!("Connecting to proxy...");
@@ -36,7 +36,7 @@ async fn test_430_retry_finds_article_on_second_backend() -> Result<()> {
     eprintln!("Got response: {}", status.trim());
 
     // Should get article from Backend2 (after trying Backend1)
-    assert!(status.starts_with("220"), "Expected 220, got: {}", status);
+    assert!(status.starts_with("220"), "Expected 220, got: {status}");
     assert!(!body.is_empty(), "Expected article body");
 
     Ok(())
@@ -62,8 +62,7 @@ async fn test_430_retry_tries_all_backends_before_giving_up() -> Result<()> {
     // Should get 430 after trying all backends
     assert!(
         status.starts_with("430"),
-        "Expected 430 after all backends tried, got: {}",
-        status
+        "Expected 430 after all backends tried, got: {status}"
     );
     assert!(body.is_empty(), "430 response should have no body");
 
@@ -90,8 +89,7 @@ async fn test_430_retry_finds_article_on_third_backend() -> Result<()> {
     // Should get article from Backend3
     assert!(
         status.starts_with("220"),
-        "Expected 220 from Backend3, got: {}",
-        status
+        "Expected 220 from Backend3, got: {status}"
     );
     assert!(!body.is_empty(), "Expected article body");
 
@@ -113,8 +111,7 @@ async fn test_430_retry_works_in_hybrid_mode() -> Result<()> {
 
     assert!(
         status.starts_with("220"),
-        "Expected article in hybrid mode, got: {}",
-        status
+        "Expected article in hybrid mode, got: {status}"
     );
     assert!(!body.is_empty(), "Expected article body");
 

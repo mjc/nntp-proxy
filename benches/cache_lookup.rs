@@ -1,11 +1,11 @@
 //! Benchmarks for article cache and availability tracking
 //!
 //! Measures performance of hot-path cache operations:
-//! - ArticleAvailability bitset operations (record_missing, should_try, all_exhausted)
-//! - UnifiedCache memory-tier get (hit vs miss)
-//! - UnifiedCache upsert
+//! - `ArticleAvailability` bitset operations (`record_missing`, `should_try`, `all_exhausted`)
+//! - `UnifiedCache` memory-tier get (hit vs miss)
+//! - `UnifiedCache` upsert
 //!
-//! Run with: cargo bench --bench cache_lookup
+//! Run with: cargo bench --bench `cache_lookup`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::cache::{ArticleAvailability, UnifiedCache};
@@ -23,7 +23,7 @@ fn main() {
 // =============================================================================
 
 mod availability {
-    use super::*;
+    use super::{ArticleAvailability, BackendCount, BackendId, Bencher, black_box};
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn record_missing(bencher: Bencher) {
@@ -102,7 +102,9 @@ mod availability {
 // =============================================================================
 
 mod unified_cache {
-    use super::*;
+    use super::{
+        Arc, ArticleAvailability, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box,
+    };
 
     fn make_cache() -> Arc<UnifiedCache> {
         Arc::new(UnifiedCache::memory(
@@ -162,7 +164,7 @@ mod unified_cache {
                     cache
                         .upsert(msg_id.to_owned(), data.clone(), BackendId::from_index(0), 0)
                         .await;
-                })
+                });
             });
     }
 
@@ -178,7 +180,7 @@ mod unified_cache {
             rt.block_on(async {
                 let msg_id = MessageId::from_borrowed("<sync@test.com>").unwrap();
                 cache.sync_availability(msg_id.to_owned(), &avail).await;
-            })
+            });
         });
     }
 }

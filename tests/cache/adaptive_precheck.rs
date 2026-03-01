@@ -30,7 +30,7 @@ fn create_config_with_precheck(backend_port: u16, adaptive_precheck: bool) -> Co
     }
 }
 
-/// Helper to setup proxy and return proxy_port
+/// Helper to setup proxy and return `proxy_port`
 async fn setup_proxy_with_config(config: Config, routing_mode: RoutingMode) -> Result<u16> {
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
@@ -64,7 +64,7 @@ async fn test_stat_precheck_first_response() -> Result<()> {
 
     // Create backend that will respond after delay
     tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", backend_port))
+        let listener = TcpListener::bind(format!("127.0.0.1:{backend_port}"))
             .await
             .unwrap();
 
@@ -109,7 +109,7 @@ async fn test_stat_precheck_first_response() -> Result<()> {
     let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
 
     // Connect and send STAT command
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buf = vec![0u8; 4096];
 
     // Read greeting
@@ -124,15 +124,13 @@ async fn test_stat_precheck_first_response() -> Result<()> {
     // Should get first backend's response (waits for actual response, not optimistic)
     assert!(
         response.starts_with("223"),
-        "Expected 223 from backend, got: {}",
-        response
+        "Expected 223 from backend, got: {response}"
     );
 
     // Should be reasonably fast (first backend response + small overhead)
     assert!(
         elapsed < Duration::from_millis(200),
-        "Response took too long: {:?}",
-        elapsed
+        "Response took too long: {elapsed:?}"
     );
 
     // Wait for background task to complete
@@ -173,7 +171,7 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
     let backend2_checked_clone = backend2_checked.clone();
 
     tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", backend2_port))
+        let listener = TcpListener::bind(format!("127.0.0.1:{backend2_port}"))
             .await
             .unwrap();
 
@@ -235,7 +233,7 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
     let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
 
     // Connect and send HEAD command
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buf = vec![0u8; 4096];
 
     // Read greeting
@@ -250,13 +248,11 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
     // Should get fast backend's response quickly
     assert!(
         elapsed < Duration::from_millis(150),
-        "Response took too long: {:?}",
-        elapsed
+        "Response took too long: {elapsed:?}"
     );
     assert!(
         response.starts_with("221"),
-        "Expected 221 response, got: {}",
-        response
+        "Expected 221 response, got: {response}"
     );
 
     // Wait for background task to complete checking slow backend
@@ -289,7 +285,7 @@ async fn test_adaptive_precheck_disabled_by_default() -> Result<()> {
     let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
 
     // Send STAT command
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buf = vec![0u8; 4096];
 
     // Read greeting
@@ -302,8 +298,7 @@ async fn test_adaptive_precheck_disabled_by_default() -> Result<()> {
     // Should get response from backend (normal per-command routing)
     assert!(
         response.starts_with("223"),
-        "Expected 223 response, got: {}",
-        response
+        "Expected 223 response, got: {response}"
     );
 
     Ok(())
@@ -328,7 +323,7 @@ async fn test_precheck_requires_message_id() -> Result<()> {
     let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
 
     // Send STAT without message-ID (should not trigger precheck)
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buf = vec![0u8; 4096];
 
     // Read greeting
@@ -341,8 +336,7 @@ async fn test_precheck_requires_message_id() -> Result<()> {
     // Should get error from backend
     assert!(
         response.starts_with("412"),
-        "Expected error response, got: {}",
-        response
+        "Expected error response, got: {response}"
     );
 
     // Test passes if we get the 412 response and don't crash
@@ -369,7 +363,7 @@ async fn test_precheck_only_in_per_command_mode() -> Result<()> {
     let proxy_port = setup_proxy_with_config(config, RoutingMode::Stateful).await?;
 
     // Connect client
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buf = vec![0u8; 4096];
 
     // Read greeting

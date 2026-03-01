@@ -117,8 +117,8 @@ fn test_all_2xx_success_codes() {
     ];
     for code in codes {
         let sc = StatusCode::new(code);
-        assert!(sc.is_success(), "Code {} should be success", code);
-        assert!(!sc.is_error(), "Code {} should not be error", code);
+        assert!(sc.is_success(), "Code {code} should be success");
+        assert!(!sc.is_error(), "Code {code} should not be error");
     }
 }
 
@@ -129,8 +129,8 @@ fn test_all_3xx_continuation_codes() {
     let codes = [335, 340, 381, 383];
     for code in codes {
         let sc = StatusCode::new(code);
-        assert!(sc.is_continuation(), "Code {} should be continuation", code);
-        assert!(sc.is_success(), "Code {} should also be success", code);
+        assert!(sc.is_continuation(), "Code {code} should be continuation");
+        assert!(sc.is_success(), "Code {code} should also be success");
     }
 }
 
@@ -335,11 +335,10 @@ fn test_response_multiline_1xx() {
 fn test_response_multiline_specific_2xx() {
     let multiline_codes = [215, 220, 221, 222, 224, 225, 230, 231, 282];
     for code in multiline_codes {
-        let data = format!("{} Test\r\n", code);
+        let data = format!("{code} Test\r\n");
         assert!(
             NntpResponse::parse(data.as_bytes()).is_multiline(),
-            "Code {} should be multiline",
-            code
+            "Code {code} should be multiline"
         );
     }
 }
@@ -349,11 +348,10 @@ fn test_response_non_multiline_2xx() {
     // 200, 201, 205, 211 are NOT multiline
     let non_multiline = [200, 201, 205, 211, 281];
     for code in non_multiline {
-        let data = format!("{} Test\r\n", code);
+        let data = format!("{code} Test\r\n");
         assert!(
             !NntpResponse::parse(data.as_bytes()).is_multiline(),
-            "Code {} should not be multiline",
-            code
+            "Code {code} should not be multiline"
         );
     }
 }

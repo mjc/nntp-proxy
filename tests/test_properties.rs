@@ -26,7 +26,7 @@ proptest! {
         cmd in r"(ARTICLE|BODY|HEAD|STAT|GROUP|QUIT|LIST|DATE|HELP|NEXT|LAST)",
         arg in r"[a-z0-9@.<>-]*"
     ) {
-        let upper = format!("{} {}", cmd, arg);
+        let upper = format!("{cmd} {arg}");
         let lower = format!("{} {}", cmd.to_lowercase(), arg);
 
         let upper_result = NntpCommand::parse(&upper);
@@ -44,7 +44,7 @@ proptest! {
 
     #[test]
     fn prop_trimming_idempotent(s in ".*") {
-        let with_spaces = format!("  {}  ", s);
+        let with_spaces = format!("  {s}  ");
         let result1 = NntpCommand::parse(&with_spaces);
         let result2 = NntpCommand::parse(&s);
 
@@ -64,7 +64,7 @@ proptest! {
         arg in r"[a-z0-9@.+_-]+"
     ) {
         // With angle brackets, should be ArticleByMessageId
-        let with_brackets = format!("{} <{}>", cmd, arg);
+        let with_brackets = format!("{cmd} <{arg}>");
         match NntpCommand::parse(&with_brackets) {
             NntpCommand::ArticleByMessageId => {
                 // Expected
@@ -190,7 +190,7 @@ proptest! {
 
     #[test]
     fn prop_statuscode_roundtrip(code in 0u16..=999u16) {
-        let formatted = format!("{:03}", code).into_bytes();
+        let formatted = format!("{code:03}").into_bytes();
         if let Some(parsed) = StatusCode::parse(&formatted) {
             prop_assert_eq!(parsed.as_u16(), code);
         }
@@ -198,7 +198,7 @@ proptest! {
 
     #[test]
     fn prop_classification_mutually_exclusive(code in 100u16..=599u16) {
-        let formatted = format!("{:03}", code).into_bytes();
+        let formatted = format!("{code:03}").into_bytes();
         if let Some(status) = StatusCode::parse(&formatted) {
             let is_success = status.is_success();
             let is_error = status.is_error();
@@ -218,7 +218,7 @@ proptest! {
 
     #[test]
     fn prop_success_codes_2xx_to_3xx(code in 200u16..=399u16) {
-        let formatted = format!("{:03}", code).into_bytes();
+        let formatted = format!("{code:03}").into_bytes();
         if let Some(status) = StatusCode::parse(&formatted) {
             prop_assert!(status.is_success(), "Code {} should be success", code);
         }
@@ -226,7 +226,7 @@ proptest! {
 
     #[test]
     fn prop_error_codes_4xx_to_5xx(code in 400u16..=599u16) {
-        let formatted = format!("{:03}", code).into_bytes();
+        let formatted = format!("{code:03}").into_bytes();
         if let Some(status) = StatusCode::parse(&formatted) {
             prop_assert!(status.is_error(), "Code {} should be error", code);
         }
@@ -240,8 +240,8 @@ proptest! {
 proptest! {
     #[test]
     fn prop_messageid_requires_brackets(s in r"[a-zA-Z0-9@.+_-]+") {
-        let with_brackets = format!("<{}>", s);
-        let without = s.clone();
+        let with_brackets = format!("<{s}>");
+        let without = s;
 
         // With brackets should succeed
         let result_with = MessageId::new(with_brackets.clone());
@@ -254,7 +254,7 @@ proptest! {
 
     #[test]
     fn prop_messageid_without_brackets_inverse(s in r"[a-zA-Z0-9@.+_-]+") {
-        let with_brackets = format!("<{}>", s);
+        let with_brackets = format!("<{s}>");
         if let Ok(msg_id) = MessageId::new(with_brackets.clone()) {
             // Reconstruction should give original
             let reconstructed = format!("<{}>", msg_id.without_brackets());
@@ -362,10 +362,9 @@ proptest! {
         header_value in r"[A-Za-z0-9 ]{1,30}",
         body_text in r"[A-Za-z0-9 ]{1,50}"
     ) {
-        let msg_id = format!("<{}@{}>", msg_local, msg_domain);
+        let msg_id = format!("<{msg_local}@{msg_domain}>");
         let buf = format!(
-            "220 {} {} article\r\n{}: {}\r\n\r\n{}\r\n.\r\n",
-            article_num, msg_id, header_name, header_value, body_text
+            "220 {article_num} {msg_id} article\r\n{header_name}: {header_value}\r\n\r\n{body_text}\r\n.\r\n"
         );
         let result = nntp_proxy::protocol::Article::parse(buf.as_bytes(), false);
         if let Ok(article) = result {
@@ -386,10 +385,9 @@ proptest! {
         header_name in r"[A-Za-z][A-Za-z0-9-]{0,10}",
         header_value in r"[A-Za-z0-9 ]{1,30}"
     ) {
-        let msg_id = format!("<{}@{}>", msg_local, msg_domain);
+        let msg_id = format!("<{msg_local}@{msg_domain}>");
         let buf = format!(
-            "221 {} {} head\r\n{}: {}\r\n.\r\n",
-            article_num, msg_id, header_name, header_value
+            "221 {article_num} {msg_id} head\r\n{header_name}: {header_value}\r\n.\r\n"
         );
         let result = nntp_proxy::protocol::Article::parse(buf.as_bytes(), false);
         if let Ok(article) = result {
@@ -407,10 +405,9 @@ proptest! {
         msg_domain in r"[a-zA-Z0-9.-]{1,20}",
         body_text in r"[A-Za-z0-9 ]{1,50}"
     ) {
-        let msg_id = format!("<{}@{}>", msg_local, msg_domain);
+        let msg_id = format!("<{msg_local}@{msg_domain}>");
         let buf = format!(
-            "222 {} {} body\r\n{}\r\n.\r\n",
-            article_num, msg_id, body_text
+            "222 {article_num} {msg_id} body\r\n{body_text}\r\n.\r\n"
         );
         let result = nntp_proxy::protocol::Article::parse(buf.as_bytes(), false);
         if let Ok(article) = result {
@@ -427,10 +424,9 @@ proptest! {
         msg_local in r"[a-zA-Z0-9._+-]{1,20}",
         msg_domain in r"[a-zA-Z0-9.-]{1,20}"
     ) {
-        let msg_id = format!("<{}@{}>", msg_local, msg_domain);
+        let msg_id = format!("<{msg_local}@{msg_domain}>");
         let buf = format!(
-            "223 {} {}\r\n.\r\n",
-            article_num, msg_id
+            "223 {article_num} {msg_id}\r\n.\r\n"
         );
         let result = nntp_proxy::protocol::Article::parse(buf.as_bytes(), false);
         if let Ok(article) = result {
@@ -447,10 +443,9 @@ proptest! {
         msg_local in r"[a-zA-Z0-9._+-]{1,20}",
         msg_domain in r"[a-zA-Z0-9.-]{1,20}"
     ) {
-        let msg_id = format!("<{}@{}>", msg_local, msg_domain);
+        let msg_id = format!("<{msg_local}@{msg_domain}>");
         let buf = format!(
-            "223 {} {}\r\n.\r\n",
-            article_num, msg_id
+            "223 {article_num} {msg_id}\r\n.\r\n"
         );
         if let Ok(article) = nntp_proxy::protocol::Article::parse(buf.as_bytes(), false) {
             // Message ID must start with '<' and end with '>'
@@ -493,7 +488,7 @@ proptest! {
 
     #[test]
     fn prop_nntp_response_non_invalid_has_status_code(code in 100u16..=599u16) {
-        let formatted = format!("{:03} some text\r\n", code);
+        let formatted = format!("{code:03} some text\r\n");
         let response = NntpResponse::parse(formatted.as_bytes());
 
         // Non-Invalid responses must have a status code
@@ -508,7 +503,7 @@ proptest! {
 
     #[test]
     fn prop_nntp_response_multiline_consistency(code in 100u16..=599u16) {
-        let formatted = format!("{:03} text\r\n", code);
+        let formatted = format!("{code:03} text\r\n");
         let response = NntpResponse::parse(formatted.as_bytes());
 
         if let Some(sc) = StatusCode::parse(formatted.as_bytes()) {
@@ -526,7 +521,7 @@ proptest! {
 
     #[test]
     fn prop_nntp_response_success_error_exclusive(code in 100u16..=599u16) {
-        let formatted = format!("{:03} text\r\n", code);
+        let formatted = format!("{code:03} text\r\n");
         let response = NntpResponse::parse(formatted.as_bytes());
 
         if response != NntpResponse::Invalid {
@@ -559,7 +554,7 @@ proptest! {
         name in r"[A-Za-z][A-Za-z0-9-]{0,15}",
         value in r"[A-Za-z0-9 ]{1,30}"
     ) {
-        let raw = format!("{}: {}\r\n", name, value);
+        let raw = format!("{name}: {value}\r\n");
         let result = Headers::parse(raw.as_bytes());
         if let Ok(headers) = result {
             // as_bytes() should return the original data
@@ -573,7 +568,7 @@ proptest! {
         name in r"[A-Za-z][A-Za-z0-9-]{0,15}",
         value in r"[A-Za-z0-9 ]{1,30}"
     ) {
-        let raw = format!("{}: {}\r\n", name, value);
+        let raw = format!("{name}: {value}\r\n");
         if let Ok(headers) = Headers::parse(raw.as_bytes()) {
             let upper_result = headers.get(&name.to_ascii_uppercase());
             let lower_result = headers.get(&name.to_ascii_lowercase());
@@ -673,11 +668,11 @@ proptest! {
         for i in 0..num_backends {
             let id = nntp_proxy::types::BackendId::from_index(i);
             let provider = nntp_proxy::pool::DeadpoolConnectionProvider::new(
-                "localhost".to_string(), 119, format!("test-{}", i), 10, None, None
+                "localhost".to_string(), 119, format!("test-{i}"), 10, None, None
             );
             selector.add_backend(
                 id,
-                nntp_proxy::types::ServerName::try_new(format!("server-{}", i)).unwrap(),
+                nntp_proxy::types::ServerName::try_new(format!("server-{i}")).unwrap(),
                 provider,
                 0,
             None,

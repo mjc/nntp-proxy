@@ -83,7 +83,7 @@ async fn test_auth_handler_partial_config_disabled() {
 #[tokio::test]
 async fn test_auth_handler_empty_string_credentials() {
     // SECURITY: Empty credentials must be rejected, not silently disable auth
-    let result = AuthHandler::new(Some("".to_string()), Some("".to_string()));
+    let result = AuthHandler::new(Some(String::new()), Some(String::new()));
     assert!(
         result.is_err(),
         "Empty credentials should be rejected to prevent silent auth bypass"
@@ -136,7 +136,7 @@ async fn test_auth_handler_debug_redacts_credentials() {
     )
     .unwrap();
 
-    let debug_output = format!("{:?}", handler);
+    let debug_output = format!("{handler:?}");
 
     // Credentials should not appear in debug output
     assert!(!debug_output.contains("supersecret"));
@@ -149,7 +149,7 @@ async fn test_auth_handler_debug_redacts_credentials() {
 async fn test_auth_handler_debug_when_disabled() {
     let handler = AuthHandler::new(None, None).unwrap();
 
-    let debug_output = format!("{:?}", handler);
+    let debug_output = format!("{handler:?}");
     assert!(debug_output.contains("AuthHandler"));
     assert!(debug_output.contains("enabled: false"));
 }
@@ -390,13 +390,7 @@ async fn test_session_builder_with_auth_handler() {
     let addr = create_test_addr();
     let metrics = MetricsCollector::new(1);
 
-    let session = ClientSession::builder(
-        addr.into(),
-        buffer_pool.clone(),
-        auth_handler.clone(),
-        metrics,
-    )
-    .build();
+    let session = ClientSession::builder(addr.into(), buffer_pool, auth_handler, metrics).build();
 
     assert!(!session.is_per_command_routing());
 }
@@ -414,7 +408,7 @@ async fn test_session_builder_with_router_and_auth() {
     let addr = create_test_addr();
     let metrics = MetricsCollector::new(1);
 
-    let session = ClientSession::builder(addr.into(), buffer_pool.clone(), auth_handler, metrics)
+    let session = ClientSession::builder(addr.into(), buffer_pool, auth_handler, metrics)
         .with_router(router)
         .with_routing_mode(RoutingMode::PerCommand)
         .build();

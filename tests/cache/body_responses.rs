@@ -1,9 +1,9 @@
 //! Tests for caching BODY responses (222) and command type matching
 //!
 //! This test suite validates:
-//! 1. BODY (222) responses are cached when cache_articles=true
+//! 1. BODY (222) responses are cached when `cache_articles=true`
 //! 2. Upsert only replaces buffers when new buffer is larger (prevents stub overwrite)
-//! 3. matches_command_type() correctly validates cached response vs command
+//! 3. `matches_command_type()` correctly validates cached response vs command
 //! 4. Cache serves BODY from cache but fetches full ARTICLE when needed
 
 use anyhow::Result;

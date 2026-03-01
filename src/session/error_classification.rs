@@ -1,6 +1,6 @@
 //! Error classification utilities for routing errors
 //!
-//! Provides helpers to classify errors wrapped in anyhow::Error
+//! Provides helpers to classify errors wrapped in `anyhow::Error`
 
 use crate::connection_error::{ConnectionError, is_disconnect_kind};
 
@@ -24,22 +24,6 @@ impl ErrorClassifier {
             return is_disconnect_kind(io_err.kind());
         }
 
-        false
-    }
-
-    /// Check if error is an authentication failure
-    pub fn is_authentication_error(error: &anyhow::Error) -> bool {
-        if let Some(conn_err) = error.downcast_ref::<ConnectionError>() {
-            return conn_err.is_authentication_error();
-        }
-        false
-    }
-
-    /// Check if error is a network/connectivity issue
-    pub fn is_network_error(error: &anyhow::Error) -> bool {
-        if let Some(conn_err) = error.downcast_ref::<ConnectionError>() {
-            return conn_err.is_network_error();
-        }
         false
     }
 
@@ -70,23 +54,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_authentication_error_with_connection_error() {
-        let conn_err = ConnectionError::AuthenticationFailed {
-            backend: "test".to_string(),
-            response: "502 failed".to_string(),
-        };
-        let err: anyhow::Error = conn_err.into();
-        assert!(ErrorClassifier::is_authentication_error(&err));
-    }
-
-    #[test]
-    fn test_is_authentication_error_with_plain_message() {
-        // Plain anyhow errors without ConnectionError are no longer detected as auth errors
-        let err = anyhow::anyhow!("Auth failed: invalid credentials");
-        assert!(!ErrorClassifier::is_authentication_error(&err));
-    }
-
-    #[test]
     fn test_should_skip_client_error_response() {
         let io_err = std::io::Error::new(ErrorKind::BrokenPipe, "broken");
         let err: anyhow::Error = io_err.into();
@@ -111,39 +78,5 @@ mod tests {
         let err: anyhow::Error = reset.into();
         assert!(ErrorClassifier::is_client_disconnect(&err));
         assert!(ErrorClassifier::should_skip_client_error_response(&err));
-    }
-
-    #[test]
-    fn test_error_classification_layering() {
-        // Test that we can distinguish between different error types
-        // for proper logging at different levels
-
-        // 1. Client disconnect (broken pipe) - should be DEBUG in streaming layer
-        let broken_pipe = std::io::Error::new(ErrorKind::BrokenPipe, "pipe");
-        let err: anyhow::Error = broken_pipe.into();
-        assert!(ErrorClassifier::is_client_disconnect(&err));
-        assert!(!ErrorClassifier::is_authentication_error(&err));
-        assert!(!ErrorClassifier::is_network_error(&err));
-
-        // 2. Auth failure - should be ERROR
-        let auth_fail = ConnectionError::AuthenticationFailed {
-            backend: "test".to_string(),
-            response: "nope".to_string(),
-        };
-        let err: anyhow::Error = auth_fail.into();
-        assert!(!ErrorClassifier::is_client_disconnect(&err));
-        assert!(ErrorClassifier::is_authentication_error(&err));
-        assert!(!ErrorClassifier::is_network_error(&err));
-
-        // 3. Network error - should be WARN
-        let net_err = ConnectionError::TcpConnect {
-            host: "test".to_string(),
-            port: 119,
-            source: std::io::Error::new(ErrorKind::ConnectionRefused, "refused"),
-        };
-        let err: anyhow::Error = net_err.into();
-        assert!(!ErrorClassifier::is_client_disconnect(&err));
-        assert!(!ErrorClassifier::is_authentication_error(&err));
-        assert!(ErrorClassifier::is_network_error(&err));
     }
 }

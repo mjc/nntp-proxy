@@ -7,7 +7,7 @@
 //!
 //! Optimized for 40Gbit line rate with 1000 samples × 100 iterations per benchmark.
 //!
-//! Run with: cargo bench --bench command_parsing
+//! Run with: cargo bench --bench `command_parsing`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::command::classifier::NntpCommand;
@@ -107,7 +107,7 @@ bench_command!(
 // =============================================================================
 
 mod realistic_workload {
-    use super::*;
+    use super::{Bencher, NntpCommand, black_box};
 
     /// Simulates a realistic distribution of NNTP commands:
     /// - 70% article retrieval (ARTICLE/BODY/HEAD/STAT)

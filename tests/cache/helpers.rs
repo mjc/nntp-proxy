@@ -51,9 +51,9 @@ async fn test_multiple_cache_entries() -> Result<()> {
     let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
 
     for i in 1..=5 {
-        let msg_str = format!("<test{}@example.com>", i);
+        let msg_str = format!("<test{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
-        let buffer = format!("220 Body {}\r\n.\r\n", i).into_bytes();
+        let buffer = format!("220 Body {i}\r\n.\r\n").into_bytes();
         cache
             .upsert(msgid, buffer, BackendId::from_index(0), 0)
             .await;
@@ -67,7 +67,7 @@ async fn test_multiple_cache_entries() -> Result<()> {
 
     // Verify each is retrievable
     for i in 1..=5 {
-        let msg_str = format!("<test{}@example.com>", i);
+        let msg_str = format!("<test{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
         assert!(cache.get(&msgid).await.is_some());
     }
@@ -107,9 +107,9 @@ async fn test_cache_capacity_limit() -> Result<()> {
 
     // Insert 3 articles with delays for deterministic eviction
     for i in 1..=3 {
-        let msg_str = format!("<test{}@example.com>", i);
+        let msg_str = format!("<test{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
-        let buffer = format!("220 Body {}\r\n.\r\n", i).into_bytes();
+        let buffer = format!("220 Body {i}\r\n.\r\n").into_bytes();
         cache
             .upsert(msgid, buffer, BackendId::from_index(0), 0)
             .await;
@@ -126,7 +126,7 @@ async fn test_cache_capacity_limit() -> Result<()> {
     Ok(())
 }
 
-/// Test cache with different MessageId formats
+/// Test cache with different `MessageId` formats
 #[tokio::test]
 async fn test_cache_different_message_id_formats() -> Result<()> {
     let cache = Arc::new(ArticleCache::new(20000, Duration::from_secs(300), true));
@@ -141,7 +141,7 @@ async fn test_cache_different_message_id_formats() -> Result<()> {
 
     for msg_str in test_cases {
         let msgid = MessageId::from_borrowed(msg_str).unwrap();
-        let buffer = format!("220 {}\r\n.\r\n", msg_str).into_bytes();
+        let buffer = format!("220 {msg_str}\r\n.\r\n").into_bytes();
         cache
             .upsert(msgid.clone(), buffer, BackendId::from_index(0), 0)
             .await;
@@ -167,7 +167,7 @@ async fn test_cache_stats() -> Result<()> {
 
     // Add some entries
     for i in 1..=10 {
-        let msg_str = format!("<test{}@example.com>", i);
+        let msg_str = format!("<test{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
         let mut buffer = vec![0u8; 1024];
         // Put valid status code at start

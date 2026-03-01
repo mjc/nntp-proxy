@@ -54,7 +54,7 @@ async fn test_quit_command_integration() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect and test QUIT
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer = vec![0u8; 1024];
     let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
@@ -67,8 +67,7 @@ async fn test_quit_command_integration() -> Result<()> {
     // Should get goodbye response
     assert!(
         response.contains("205") || response.contains("Goodbye"),
-        "Expected goodbye response, got: {}",
-        response
+        "Expected goodbye response, got: {response}"
     );
 
     Ok(())
@@ -123,7 +122,7 @@ async fn test_auth_command_integration() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect and try to send command without auth
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer = vec![0u8; 1024];
     let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
@@ -134,8 +133,7 @@ async fn test_auth_command_integration() -> Result<()> {
     let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         response.starts_with("480"),
-        "Expected auth required, got: {}",
-        response
+        "Expected auth required, got: {response}"
     );
 
     // Authenticate
@@ -144,8 +142,7 @@ async fn test_auth_command_integration() -> Result<()> {
     let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         response.starts_with("381"),
-        "Expected password required, got: {}",
-        response
+        "Expected password required, got: {response}"
     );
 
     client.write_all(b"AUTHINFO PASS testpass\r\n").await?;
@@ -153,8 +150,7 @@ async fn test_auth_command_integration() -> Result<()> {
     let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         response.starts_with("281"),
-        "Expected auth success, got: {}",
-        response
+        "Expected auth success, got: {response}"
     );
 
     // Now HELP should work
@@ -163,8 +159,7 @@ async fn test_auth_command_integration() -> Result<()> {
     let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         response.contains("100"),
-        "Expected help response, got: {}",
-        response
+        "Expected help response, got: {response}"
     );
 
     Ok(())
@@ -240,8 +235,8 @@ async fn test_concurrent_auth_sessions() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect two clients and auth both
-    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
-    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer1 = vec![0u8; 1024];
     let mut buffer2 = vec![0u8; 1024];

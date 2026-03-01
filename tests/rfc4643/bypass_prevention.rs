@@ -7,7 +7,7 @@ use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Test that StandardHandler requires valid credentials
+/// Test that `StandardHandler` requires valid credentials
 #[tokio::test]
 async fn test_standard_handler_validates_credentials() {
     use crate::test_helpers::create_test_auth_handler_with;
@@ -173,7 +173,7 @@ async fn test_repeated_failures_dont_succeed() {
 
     // Try 100 times with wrong password
     for i in 0..100 {
-        let wrong_password = format!("wrongpass{}", i);
+        let wrong_password = format!("wrongpass{i}");
         let mut output = Vec::new();
         let (_, auth_success) = auth_handler
             .handle_auth_command(
@@ -198,7 +198,7 @@ async fn test_repeated_failures_dont_succeed() {
     );
 }
 
-/// Test that auth_success flag is the ONLY way to authenticate
+/// Test that `auth_success` flag is the ONLY way to authenticate
 #[tokio::test]
 async fn test_auth_success_is_only_path_to_authentication() {
     use crate::test_helpers::create_test_auth_handler;
@@ -263,7 +263,7 @@ async fn test_concurrent_auth_attempts() {
     for i in 0..50 {
         let handler = auth_handler.clone();
         set.spawn(async move {
-            let wrong_password = format!("wrongpass{}", i);
+            let wrong_password = format!("wrongpass{i}");
             let authenticated = Arc::new(AtomicBool::new(false));
             let mut output = Vec::new();
             let (_, auth_success) = handler
@@ -321,7 +321,7 @@ async fn test_concurrent_auth_attempts() {
     assert_eq!(correct_count, 50, "All correct attempts should succeed");
 }
 
-/// Test that session handlers respect auth_success flag
+/// Test that session handlers respect `auth_success` flag
 #[tokio::test]
 async fn test_session_handler_respects_auth_success() {
     use crate::test_helpers::create_test_auth_handler;

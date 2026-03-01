@@ -2,8 +2,8 @@
 //!
 //! These tests prove that:
 //! 1. Reject commands don't bypass authentication
-//! 2. There's no race condition in auth_username (each session has its own)
-//! 3. Uninit buffers with set_len are safe when used with AsyncRead/AsyncWrite
+//! 2. There's no race condition in `auth_username` (each session has its own)
+//! 3. Uninit buffers with `set_len` are safe when used with AsyncRead/AsyncWrite
 
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
@@ -73,14 +73,14 @@ async fn test_reject_commands_dont_bypass_authentication() {
     assert!(authenticated);
 }
 
-/// Test that auth_username has no race condition.
+/// Test that `auth_username` has no race condition.
 ///
-/// Claim: "The authenticated field uses AtomicBool but auth_username is not
+/// Claim: "The authenticated field uses `AtomicBool` but `auth_username` is not
 /// protected by the same atomic operation. A client could send concurrent
 /// AUTHINFO PASS commands with different usernames."
 ///
 /// Reality: Each TCP connection has its own session handler instance with its
-/// own auth_username local variable. There's no shared state between connections.
+/// own `auth_username` local variable. There's no shared state between connections.
 /// Concurrent PASS commands from the SAME connection are serialized by TCP's
 /// in-order delivery guarantee.
 #[tokio::test]
@@ -210,9 +210,9 @@ async fn test_auth_attempts_are_serialized_per_connection() {
     assert!(!success3); // Fails because otheruser/pass is wrong
 }
 
-/// Test that uninit buffers used with AsyncRead are safe.
+/// Test that uninit buffers used with `AsyncRead` are safe.
 ///
-/// Claim: "Using unsafe { buffer.set_len(size) } to create uninitialized buffers
+/// Claim: "Using unsafe { `buffer.set_len(size)` } to create uninitialized buffers
 /// is unsound. The mere act of creating a &[u8] reference to uninitialized memory is UB."
 ///
 /// Reality: This is explicitly documented as safe in Rust when:
@@ -220,11 +220,11 @@ async fn test_auth_attempts_are_serialized_per_connection() {
 /// 2. Only the initialized portion &buf[..n] is accessed after reading n bytes
 /// 3. This is the standard pattern used throughout the Rust async ecosystem
 ///
-/// See: https://doc.rust-lang.org/std/vec/struct.Vec.html#method.set_len
+/// See: <https://doc.rust-lang.org/std/vec/struct.Vec.html#method.set_len>
 /// "Notably, if the length is not set to the current logical length of the vector,
 /// then all elements between the old length and new length are in an uninitialized state."
 ///
-/// The safety invariant is: don't read uninitialized bytes. AsyncRead guarantees
+/// The safety invariant is: don't read uninitialized bytes. `AsyncRead` guarantees
 /// it initializes the bytes it writes, and we only access &buf[..n] where n is
 /// the number of bytes read.
 #[tokio::test]
@@ -346,7 +346,7 @@ fn test_uninit_vs_zeroed_performance_difference() {
     let uninit_time = start.elapsed();
 
     // set_len should be significantly faster
-    println!("Zeroed: {:?}, Uninit: {:?}", zeroed_time, uninit_time);
+    println!("Zeroed: {zeroed_time:?}, Uninit: {uninit_time:?}");
 
     // The uninit method should be at least 2x faster for large buffers
     // (actual difference is often 5-10x for 64KB buffers)

@@ -59,7 +59,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     // Start proxy server
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
@@ -152,7 +152,7 @@ async fn test_round_robin_distribution() -> Result<()> {
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start proxy server
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
@@ -206,7 +206,7 @@ name = "Test Server 2"
 "#;
 
     let mut temp_file = NamedTempFile::new()?;
-    write!(temp_file, "{}", config_content)?;
+    write!(temp_file, "{config_content}")?;
 
     let config = load_config(temp_file.path().to_str().unwrap())?;
 
@@ -242,7 +242,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start proxy server
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
@@ -268,8 +268,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         greeting.contains("200"),
-        "Expected greeting, got: {:?}",
-        greeting
+        "Expected greeting, got: {greeting:?}"
     );
 
     // Read error (sent by handle_stateful_session when backend connection fails)
@@ -277,8 +276,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     let error_response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         error_response.contains("400 Backend server unavailable"),
-        "Expected backend unavailable error, got: {:?}",
-        error_response
+        "Expected backend unavailable error, got: {error_response:?}"
     );
 
     Ok(())
@@ -313,25 +311,24 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect client
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting with short timeout - should arrive immediately
     let mut buffer = [0; 1024];
     let n = timeout(Duration::from_millis(500), client.read(&mut buffer))
         .await
         .map_err(|_| anyhow::anyhow!("Timeout reading greeting - not flushed!"))?
-        .map_err(|e| anyhow::anyhow!("Failed to read greeting: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read greeting: {e}"))?;
 
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         greeting.contains("200"),
-        "Expected greeting, got: {}",
-        greeting
+        "Expected greeting, got: {greeting}"
     );
 
     // Send rapid BODY commands - this is where flush issues would show up
     for i in 1..=10 {
-        let cmd = format!("BODY <msg{}@test.com>\r\n", i);
+        let cmd = format!("BODY <msg{i}@test.com>\r\n");
         client.write_all(cmd.as_bytes()).await?;
         client.flush().await?;
 
@@ -341,20 +338,17 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Timeout reading response #{} - proxy likely not flushing responses!",
-                    i
+                    "Timeout reading response #{i} - proxy likely not flushing responses!"
                 )
             })?
-            .map_err(|e| anyhow::anyhow!("Failed to read response #{}: {}", i, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to read response #{i}: {e}"))?;
 
         let response = String::from_utf8_lossy(&buffer[..n]);
 
         // Verify we got a complete response (should include terminator)
         assert!(
             response.contains("220") && response.contains(".\r\n"),
-            "Response #{} incomplete or malformed: {}",
-            i,
-            response
+            "Response #{i} incomplete or malformed: {response}"
         );
     }
 
@@ -387,14 +381,14 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
     spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting - should arrive quickly
     let mut buffer = [0; 1024];
     let n = timeout(Duration::from_millis(500), client.read(&mut buffer))
         .await
         .map_err(|_| anyhow::anyhow!("Timeout reading greeting - not flushed!"))?
-        .map_err(|e| anyhow::anyhow!("Failed to read greeting: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read greeting: {e}"))?;
 
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(greeting.contains("200"));
@@ -407,13 +401,12 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
     let n = timeout(Duration::from_millis(200), client.read(&mut buffer))
         .await
         .map_err(|_| anyhow::anyhow!("Timeout reading auth response - not flushed!"))?
-        .map_err(|e| anyhow::anyhow!("Failed to read auth response: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read auth response: {e}"))?;
 
     let auth_response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         auth_response.contains("381"),
-        "Expected password request, got: {}",
-        auth_response
+        "Expected password request, got: {auth_response}"
     );
 
     // Test command rejection (if any commands are rejected)
@@ -426,7 +419,7 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
     let n = timeout(Duration::from_millis(500), client.read(&mut buffer))
         .await
         .map_err(|_| anyhow::anyhow!("Timeout reading CAPABILITIES response!"))?
-        .map_err(|e| anyhow::anyhow!("Failed to read CAPABILITIES response: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read CAPABILITIES response: {e}"))?;
 
     let response = String::from_utf8_lossy(&buffer[..n]);
     // Should get some response (either from proxy or backend)
@@ -443,7 +436,7 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
 /// in per-command routing mode with connection pooling. Single-line responses have status
 /// codes where the second digit is 0, 4, or 8 (e.g., 200, 205, 400, 480).
 ///
-/// Per RFC 3977 Section 3.2 (https://tools.ietf.org/html/rfc3977#section-3.2):
+/// Per RFC 3977 Section 3.2 (<https://tools.ietf.org/html/rfc3977#section-3.2)>:
 /// "Multi-line responses have the second digit as 1, 2, or 3 (e.g., 215, 220, 231).
 ///  All other responses are single-line."
 ///
@@ -474,7 +467,7 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
     // Give proxy more time to initialize connection pool
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting
     let mut buffer = [0; 1024];
@@ -487,7 +480,7 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
 
     // Send just 5 commands to start (not 20)
     for i in 1..=5 {
-        let cmd = format!("STAT <msg{}@test.com>\r\n", i);
+        let cmd = format!("STAT <msg{i}@test.com>\r\n");
         println!("Sending command {}: {}", i, cmd.trim());
         client.write_all(cmd.as_bytes()).await?;
         client.flush().await?;
@@ -502,22 +495,19 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Timeout waiting for response to command {}. Possible server or network issue.",
-                    i
+                    "Timeout waiting for response to command {i}. Possible server or network issue."
                 )
             })?
-            .map_err(|e| anyhow::anyhow!("Read error on command {}: {}", i, e))?;
+            .map_err(|e| anyhow::anyhow!("Read error on command {i}: {e}"))?;
 
-        assert!(n > 0, "Empty response on command {}", i);
+        assert!(n > 0, "Empty response on command {i}");
 
         // Verify we got a proper response
         let response = String::from_utf8_lossy(&buffer[..n]);
         println!("Response {}: {}", i, response.trim());
         assert!(
             response.contains("200"),
-            "Expected '200' in response #{}, got: {}",
-            i,
-            response
+            "Expected '200' in response #{i}, got: {response}"
         );
     }
 
@@ -555,7 +545,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
@@ -642,7 +632,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
@@ -684,7 +674,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     let n = timeout(Duration::from_millis(2000), client.read(&mut buffer))
         .await
         .map_err(|_| anyhow::anyhow!("Timeout waiting for GROUP response"))?
-        .map_err(|e| anyhow::anyhow!("Read error for GROUP command: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Read error for GROUP command: {e}"))?;
 
     let response = String::from_utf8_lossy(&buffer[..n]);
     println!("GROUP Response: {}", response.trim());
@@ -740,7 +730,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
@@ -815,7 +805,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
 /// Create a smart mock server builder with comprehensive NNTP command handlers
 fn create_smart_mock_builder(port: u16, server_name: &str) -> MockNntpServer {
     MockNntpServer::new(port)
-        .with_name(format!("{} Mock NNTP Server", server_name))
+        .with_name(format!("{server_name} Mock NNTP Server"))
         .on_command("LIST", "215 List of newsgroups\r\nalt.test 100 1 y\r\n.\r\n")
         .on_command("DATE", "111 20231013120000\r\n")
         .on_command("CAPABILITIES", "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n")
@@ -874,7 +864,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
     // Start proxy in per-command mode (where this issue was observed)
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     let proxy_clone = proxy.clone();
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let proxy_addr_clone = proxy_addr.clone();
 
     let _proxy_handle = tokio::spawn(async move {
@@ -901,8 +891,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         greeting.starts_with("200"),
-        "Expected greeting, got: {}",
-        greeting
+        "Expected greeting, got: {greeting}"
     );
 
     // Request a missing article - backend will return 223
@@ -918,8 +907,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
     // Verify we get the 223 response from backend
     assert!(
         response.starts_with("223"),
-        "Expected 223 response, got: {}",
-        response
+        "Expected 223 response, got: {response}"
     );
     assert!(
         response.contains("<missing@example.com>"),
@@ -939,8 +927,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
     // Verify we get the 220 multiline response
     assert!(
         response.starts_with("220"),
-        "Expected 220 response, got: {}",
-        response
+        "Expected 220 response, got: {response}"
     );
     assert!(
         response.contains("Subject: Test"),
@@ -1038,7 +1025,7 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
 
     // Start proxy
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port)).await?;
+    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}")).await?;
 
     let proxy_clone = proxy.clone();
     tokio::spawn(async move {
@@ -1057,7 +1044,7 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Connect to proxy
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buffer = [0u8; 4096];
 
     // Read greeting
@@ -1065,8 +1052,7 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         greeting.starts_with("200"),
-        "Expected greeting, got: {}",
-        greeting
+        "Expected greeting, got: {greeting}"
     );
 
     // Request article - should try backend 0 (430), then backend 1 (220)
@@ -1083,22 +1069,20 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
     // NOT 430 (which would mean we didn't try backend 1)
     assert!(
         response.starts_with("220"),
-        "Expected 220 from backend 1 (tier 0), got: {}",
-        response
+        "Expected 220 from backend 1 (tier 0), got: {response}"
     );
 
     // CRITICAL ASSERTION: Response should contain "Body from backend 1"
     // This proves backend 1 was tried (not backend 2 from tier 1)
     assert!(
         response.contains("Body from backend 1"),
-        "Expected article from backend 1 (tier 0), got: {}",
-        response
+        "Expected article from backend 1 (tier 0), got: {response}"
     );
 
     // Test multiple requests to ensure consistent behavior
     for i in 1..=5 {
         client
-            .write_all(format!("ARTICLE <test{}@example.com>\r\n", i).as_bytes())
+            .write_all(format!("ARTICLE <test{i}@example.com>\r\n").as_bytes())
             .await?;
         client.flush().await?;
 
@@ -1108,15 +1092,11 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
 
         assert!(
             response.starts_with("220"),
-            "Request {}: Expected 220 from backend 1, got: {}",
-            i,
-            response
+            "Request {i}: Expected 220 from backend 1, got: {response}"
         );
         assert!(
             response.contains("Body from backend 1"),
-            "Request {}: Expected backend 1 response, got: {}",
-            i,
-            response
+            "Request {i}: Expected backend 1 response, got: {response}"
         );
     }
 
@@ -1203,7 +1183,7 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
 
     // Start proxy
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port)).await?;
+    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}")).await?;
 
     let proxy_clone = proxy.clone();
     tokio::spawn(async move {
@@ -1222,7 +1202,7 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Connect to proxy
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buffer = [0u8; 4096];
 
     // Read greeting
@@ -1230,8 +1210,7 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         greeting.starts_with("200"),
-        "Expected greeting, got: {}",
-        greeting
+        "Expected greeting, got: {greeting}"
     );
 
     // Request article - should try backend 0 (430), backend 1 (430), then backend 2 (220)
@@ -1248,22 +1227,20 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
     // This proves that tier 0 was fully exhausted before trying tier 1
     assert!(
         response.starts_with("220"),
-        "Expected 220 from backend 2 (tier 1), got: {}",
-        response
+        "Expected 220 from backend 2 (tier 1), got: {response}"
     );
 
     // CRITICAL ASSERTION: Response should contain "Body from tier 1"
     // This proves that backend 2 (tier 1) was tried after exhausting tier 0
     assert!(
         response.contains("Body from tier 1"),
-        "Expected article from tier 1, got: {}",
-        response
+        "Expected article from tier 1, got: {response}"
     );
 
     // Test multiple requests to ensure consistent behavior
     for i in 1..=5 {
         client
-            .write_all(format!("ARTICLE <test{}@example.com>\r\n", i).as_bytes())
+            .write_all(format!("ARTICLE <test{i}@example.com>\r\n").as_bytes())
             .await?;
         client.flush().await?;
 
@@ -1273,15 +1250,11 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
 
         assert!(
             response.starts_with("220"),
-            "Request {}: Expected 220 from tier 1, got: {}",
-            i,
-            response
+            "Request {i}: Expected 220 from tier 1, got: {response}"
         );
         assert!(
             response.contains("Body from tier 1"),
-            "Request {}: Expected tier 1 response, got: {}",
-            i,
-            response
+            "Request {i}: Expected tier 1 response, got: {response}"
         );
     }
 
@@ -1312,7 +1285,7 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
     spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buffer = [0; 4096];
 
     // Read greeting
@@ -1321,7 +1294,7 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
     // Send a valid STAT command followed by an oversized command in one write
     // (simulates TCP pipelining — both arrive in the same buffer)
     let oversized_msg_id = format!("<{}@example.com>", "x".repeat(510));
-    let oversized_cmd = format!("STAT {}\r\n", oversized_msg_id);
+    let oversized_cmd = format!("STAT {oversized_msg_id}\r\n");
     assert!(
         oversized_cmd.len() > 512,
         "Test setup: command must exceed 512 bytes, got {}",
@@ -1340,8 +1313,7 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
     // The first command should get a normal 223 response
     assert!(
         response.contains("223"),
-        "Expected 223 for valid STAT, got: {}",
-        response
+        "Expected 223 for valid STAT, got: {response}"
     );
 
     // Read response to the oversized command — should be 500 error, not forwarded
@@ -1355,15 +1327,14 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
 
     assert!(
         full_response.contains("500"),
-        "Expected 500 error for oversized command, got: {}",
-        full_response
+        "Expected 500 error for oversized command, got: {full_response}"
     );
 
     client.write_all(b"QUIT\r\n").await?;
     Ok(())
 }
 
-/// Test that a partial command in the BufReader buffer doesn't cause the batch
+/// Test that a partial command in the `BufReader` buffer doesn't cause the batch
 /// reader to block waiting for more data from the socket.
 ///
 /// Scenario: Client sends a valid STAT + a partial (incomplete) second command
@@ -1387,7 +1358,7 @@ async fn test_partial_buffered_command_does_not_block() -> Result<()> {
     spawn_test_proxy(proxy, proxy_port, true).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buffer = [0; 4096];
 
     // Read greeting
@@ -1413,8 +1384,7 @@ async fn test_partial_buffered_command_does_not_block() -> Result<()> {
     let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         response.contains("223"),
-        "Expected 223 for valid STAT, got: {}",
-        response
+        "Expected 223 for valid STAT, got: {response}"
     );
 
     // Now complete the partial command so the session can clean up

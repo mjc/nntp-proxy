@@ -22,7 +22,7 @@ async fn test_auth_flow_complete_with_valid_credentials() {
 
     // Start mock backend
     let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
-    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
         .await
         .unwrap();
 
@@ -101,7 +101,7 @@ async fn test_auth_disabled_allows_immediate_commands() {
 
     // Start mock backend
     let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
-    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
         .await
         .unwrap();
 
@@ -155,7 +155,7 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
 
     // Start mock backend that would fail if it receives AUTHINFO
     let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
-    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
         .await
         .unwrap();
 
@@ -221,7 +221,7 @@ async fn test_multiple_clients_with_auth() {
 
     // Start mock backend
     let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
-    wait_for_server(&format!("127.0.0.1:{}", backend_port), 10)
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
         .await
         .unwrap();
 
@@ -268,18 +268,18 @@ async fn test_multiple_clients_with_auth() {
 
             // Read greeting
             reader.read_line(&mut line).await.unwrap();
-            assert!(line.starts_with("200"), "Client {} got greeting", i);
+            assert!(line.starts_with("200"), "Client {i} got greeting");
 
             // Auth
             writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
             line.clear();
             reader.read_line(&mut line).await.unwrap();
-            assert!(line.starts_with("381"), "Client {} got password request", i);
+            assert!(line.starts_with("381"), "Client {i} got password request");
 
             writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
             line.clear();
             reader.read_line(&mut line).await.unwrap();
-            assert!(line.starts_with("281"), "Client {} authenticated", i);
+            assert!(line.starts_with("281"), "Client {i} authenticated");
 
             i
         });

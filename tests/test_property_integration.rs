@@ -3,12 +3,12 @@
 //! Uses proptest to test the proxy with randomized inputs, ensuring
 //! robust handling of edge cases and malformed inputs across the protocol.
 //!
-//! Note: Network-dependent property tests (prop_valid_commands_get_responses,
-//! prop_malformed_commands_handled, prop_sequential_commands) were removed because
+//! Note: Network-dependent property tests (`prop_valid_commands_get_responses`,
+//! `prop_malformed_commands_handled`, `prop_sequential_commands`) were removed because
 //! proptest's synchronous macro requires creating a new tokio runtime + full proxy
 //! per case (20 cases × 3 tests = 60 TCP listener pairs), causing resource contention
 //! and flaky timeouts under parallel nextest execution. The async
-//! test_property_concurrent_connections covers the network path reliably by reusing
+//! `test_property_concurrent_connections` covers the network path reliably by reusing
 //! a single proxy instance.
 
 use anyhow::Result;
@@ -25,7 +25,7 @@ use test_helpers::{MockNntpServer, create_test_server_config};
 fn message_id_strategy() -> impl Strategy<Value = String> {
     prop::string::string_regex("[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+")
         .unwrap()
-        .prop_map(|s| format!("<{}>", s))
+        .prop_map(|s| format!("<{s}>"))
 }
 
 /// Strategy for valid authentication credentials
@@ -108,8 +108,8 @@ proptest! {
 
         // Create handler with random credentials
         let handler = AuthHandler::new(
-            Some(username.to_string()),
-            Some(password.to_string())
+            Some(username.clone()),
+            Some(password.clone())
         ).unwrap();
 
         // Should validate exact match
@@ -134,7 +134,7 @@ async fn test_property_concurrent_connections() -> Result<()> {
     for i in 0..10 {
         let port = proxy_port;
         handles.push(tokio::spawn(async move {
-            let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+            let mut client = TcpStream::connect(format!("127.0.0.1:{port}"))
                 .await
                 .unwrap();
 
@@ -144,7 +144,7 @@ async fn test_property_concurrent_connections() -> Result<()> {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(n > 0, "Client {} should receive greeting", i);
+            assert!(n > 0, "Client {i} should receive greeting");
 
             // Send command
             client.write_all(b"HELP\r\n").await.unwrap();
@@ -154,7 +154,7 @@ async fn test_property_concurrent_connections() -> Result<()> {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(n > 0, "Client {} should receive response", i);
+            assert!(n > 0, "Client {i} should receive response");
         }));
     }
 

@@ -1,9 +1,9 @@
-//! Comprehensive tests for ArticleAvailability bitset semantics and retry logic
+//! Comprehensive tests for `ArticleAvailability` bitset semantics and retry logic
 //!
 //! Tests cover:
 //! - Bitset semantics (track missing backends, assume all have article by default)
-//! - should_try() behavior
-//! - all_missing() edge cases
+//! - `should_try()` behavior
+//! - `all_missing()` edge cases
 //! - Integration with 430 retry loop
 //! - Multi-backend exhaustion scenarios
 
@@ -19,8 +19,7 @@ fn test_fresh_availability_assumes_all_backends_have_article() {
     for i in 0..8 {
         assert!(
             avail.should_try(BackendId::from_index(i)),
-            "Fresh availability should allow trying backend {}",
-            i
+            "Fresh availability should allow trying backend {i}"
         );
     }
 }

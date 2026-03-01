@@ -142,17 +142,15 @@ fn test_all_4xx_codes_are_errors() {
 
     for code in codes_4xx {
         let sc = StatusCode::new(code);
-        assert!(sc.is_error(), "Code {} should be an error", code);
-        assert!(!sc.is_success(), "Code {} should not be success", code);
+        assert!(sc.is_error(), "Code {code} should be an error");
+        assert!(!sc.is_success(), "Code {code} should not be success");
         assert!(
             !sc.is_continuation(),
-            "Code {} should not be continuation",
-            code
+            "Code {code} should not be continuation"
         );
         assert!(
             !sc.is_informational(),
-            "Code {} should not be informational",
-            code
+            "Code {code} should not be informational"
         );
     }
 }
@@ -163,8 +161,8 @@ fn test_all_5xx_codes_are_errors() {
 
     for code in codes_5xx {
         let sc = StatusCode::new(code);
-        assert!(sc.is_error(), "Code {} should be an error", code);
-        assert!(!sc.is_success(), "Code {} should not be success", code);
+        assert!(sc.is_error(), "Code {code} should be an error");
+        assert!(!sc.is_success(), "Code {code} should not be success");
     }
 }
 
@@ -177,16 +175,14 @@ fn test_error_responses_parse_as_single_line() {
     ];
 
     for code in error_codes {
-        let data = format!("{} Error message\r\n", code);
+        let data = format!("{code} Error message\r\n");
         let response = NntpResponse::parse(data.as_bytes());
         assert!(
             matches!(
                 response,
                 NntpResponse::SingleLine(_) | NntpResponse::AuthRequired(_)
             ),
-            "Code {} should parse as SingleLine or AuthRequired, got {:?}",
-            code,
-            response
+            "Code {code} should parse as SingleLine or AuthRequired, got {response:?}"
         );
     }
 }
@@ -254,12 +250,11 @@ fn test_all_error_code_constants() {
 #[test]
 fn test_error_response_not_multiline() {
     for code in [400, 430, 500, 502] {
-        let data = format!("{} Error\r\n", code);
+        let data = format!("{code} Error\r\n");
         let response = NntpResponse::parse(data.as_bytes());
         assert!(
             !response.is_multiline(),
-            "Error code {} should not be multiline",
-            code
+            "Error code {code} should not be multiline"
         );
     }
 }
@@ -267,12 +262,11 @@ fn test_error_response_not_multiline() {
 #[test]
 fn test_error_response_not_success() {
     for code in [400, 430, 500, 502] {
-        let data = format!("{} Error\r\n", code);
+        let data = format!("{code} Error\r\n");
         let response = NntpResponse::parse(data.as_bytes());
         assert!(
             !response.is_success(),
-            "Error code {} should not be success",
-            code
+            "Error code {code} should not be success"
         );
     }
 }

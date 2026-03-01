@@ -1,13 +1,13 @@
 //! Integration tests for the critical 430 caching bug fix
 //!
-//! BUG: ArticleCache::record_backend_missing was silently doing nothing when
+//! BUG: `ArticleCache::record_backend_missing` was silently doing nothing when
 //! an article wasn't already cached. This caused:
 //! 1. Missing articles to be queried from ALL backends EVERY request
-//! 2. SABnzbd reporting "gigabytes of missing articles"
+//! 2. `SABnzbd` reporting "gigabytes of missing articles"
 //! 3. 4xx error metrics not incrementing properly
 //! 4. Only 5 cache entries instead of hundreds
 //!
-//! FIX: record_backend_missing now creates cache entries for 430 responses,
+//! FIX: `record_backend_missing` now creates cache entries for 430 responses,
 //! preventing repeated queries to backends that don't have the article.
 
 use nntp_proxy::cache::ArticleCache;
@@ -120,7 +120,7 @@ async fn test_cache_grows_with_430_responses() {
     // Keep the strings alive to prevent early eviction
     let mut msg_ids = Vec::new();
     for i in 0..100 {
-        let msg_id_str = format!("<missing{}@example.com>", i);
+        let msg_id_str = format!("<missing{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_id_str).unwrap();
 
         cache
@@ -154,7 +154,7 @@ async fn test_regression_bug_symptoms_fixed() {
     // Keep strings alive
     let mut msg_ids = Vec::new();
     for i in 0..500 {
-        let msg_id_str = format!("<missing{}@example.com>", i);
+        let msg_id_str = format!("<missing{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_id_str).unwrap();
 
         // Both backends return 430
@@ -183,8 +183,7 @@ async fn test_regression_bug_symptoms_fixed() {
     for (idx, backend_stats) in snapshot.backend_stats.iter().enumerate() {
         assert!(
             backend_stats.errors_4xx.get() > 0,
-            "Backend {} 4xx errors should be counted (was 0 before fix)",
-            idx
+            "Backend {idx} 4xx errors should be counted (was 0 before fix)"
         );
         assert_eq!(
             backend_stats.errors_4xx.get(),
@@ -198,8 +197,7 @@ async fn test_regression_bug_symptoms_fixed() {
         assert_eq!(
             backend_stats.errors.get(),
             backend_stats.errors_4xx.get(),
-            "Backend {} total errors should equal 4xx errors for this test",
-            idx
+            "Backend {idx} total errors should equal 4xx errors for this test"
         );
     }
 }

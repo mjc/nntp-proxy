@@ -113,7 +113,7 @@ fn test_excessive_complete_command_calls() {
     // After underflow, load will be very large (close to usize::MAX)
     let load = router.backend_load(backend_id).unwrap().get();
     // Check that it wrapped (should be > usize::MAX - 10)
-    assert!(load > usize::MAX - 10, "Expected underflow, got {}", load);
+    assert!(load > usize::MAX - 10, "Expected underflow, got {load}");
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn test_large_number_of_backends() {
     for i in 0..100 {
         router.add_backend(
             BackendId::from_index(i),
-            ServerName::try_new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
             None,
@@ -219,7 +219,7 @@ fn test_concurrent_route_command_calls() {
     for i in 0..3 {
         router.add_backend(
             BackendId::from_index(i),
-            ServerName::try_new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
             None,
@@ -251,8 +251,7 @@ fn test_concurrent_route_command_calls() {
     for count in &backend_counts {
         assert!(
             *count >= 28 && *count <= 38,
-            "Unexpected distribution: {:?}",
-            backend_counts
+            "Unexpected distribution: {backend_counts:?}"
         );
     }
 }
@@ -318,7 +317,7 @@ fn test_wrap_around_with_large_counter() {
     for i in 0..2 {
         router.add_backend(
             BackendId::from_index(i),
-            ServerName::try_new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
             None,

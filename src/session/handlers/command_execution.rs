@@ -4,7 +4,7 @@
 //! response validation, and streaming multiline responses to clients.
 
 use crate::router::{BackendSelector, CommandGuard};
-use crate::session::retry::retry_once_on_stale;
+use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
 };
@@ -79,8 +79,8 @@ impl ClientSession {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        // Retry once on stale connection (fresh connection on second attempt)
-        let (conn, cmd_response, ttfb, send, recv) = retry_once_on_stale!(
+        // Retry once on backend error (fresh connection on second attempt)
+        let (conn, cmd_response, ttfb, send, recv) = retry_once!(
             self.execute_backend_attempt(provider, backend_id, command, state.buffer)
                 .await,
             client = self.client_addr,

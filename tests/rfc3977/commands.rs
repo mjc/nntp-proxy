@@ -28,8 +28,7 @@ fn test_all_commands_end_with_crlf() {
     for cmd in &test_commands {
         assert!(
             cmd.ends_with("\r\n"),
-            "Command does not end with CRLF: {:?}",
-            cmd
+            "Command does not end with CRLF: {cmd:?}"
         );
     }
 
@@ -54,8 +53,7 @@ fn test_commands_only_one_crlf() {
         assert_eq!(
             cmd.matches("\r\n").count(),
             1,
-            "Command has multiple CRLFs (injection risk): {:?}",
-            cmd
+            "Command has multiple CRLFs (injection risk): {cmd:?}"
         );
     }
 }

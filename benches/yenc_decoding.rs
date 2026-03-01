@@ -39,7 +39,7 @@ fn generate_yenc_with_escapes(length: usize, escape_freq: usize) -> Vec<u8> {
 }
 
 mod yenc_crate_benches {
-    use super::*;
+    use super::{Bencher, black_box, generate_yenc_data, generate_yenc_with_escapes};
 
     #[divan::bench(sample_count = 1000)]
     fn yenc_decode_128_bytes(bencher: Bencher) {

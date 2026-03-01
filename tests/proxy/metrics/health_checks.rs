@@ -441,7 +441,7 @@ async fn test_date_health_check_malformed_response() -> Result<()> {
         let mut conn_stream = ConnectionStream::plain(stream);
 
         let result = check_date_response(&mut conn_stream).await;
-        assert!(result.is_err(), "Malformed response {} should fail", i);
+        assert!(result.is_err(), "Malformed response {i} should fail");
 
         server_handle.abort();
     }

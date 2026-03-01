@@ -269,8 +269,7 @@ async fn test_cache_higher_tier_longer_ttl() {
     let entry = cache.get(&msg_id).await;
     assert!(
         entry.is_some(),
-        "Tier 1 should survive past base TTL (waited 250ms, tier 1 TTL is 400ms, stored tier was {})",
-        stored_tier
+        "Tier 1 should survive past base TTL (waited 250ms, tier 1 TTL is 400ms, stored tier was {stored_tier})"
     );
 
     // Wait another 200ms (total 450ms) - should now be expired
