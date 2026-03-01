@@ -499,7 +499,9 @@ impl DeadpoolConnectionProvider {
     pub fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
         // If cooldown is disabled (None or zero duration), just shut down and drop
         let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
-            shutdown_and_drop(conn);
+            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
+                .shutdown(std::net::Shutdown::Both);
+            drop(conn);
             return;
         };
 
@@ -511,7 +513,9 @@ impl DeadpoolConnectionProvider {
         let current = self.active_cooldowns.load(Ordering::Acquire);
         if current >= max_reduction {
             // Already at max reduction — just shut down and drop without further cooldown
-            shutdown_and_drop(conn);
+            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
+                .shutdown(std::net::Shutdown::Both);
+            drop(conn);
             return;
         }
 
@@ -738,14 +742,6 @@ impl DeadpoolConnectionProvider {
 
         self.pool.close();
     }
-}
-
-/// Shut down TCP socket and drop a pooled connection.
-///
-/// Takes ownership so the caller cannot drop `conn` at a different point.
-fn shutdown_and_drop(conn: managed::Object<TcpManager>) {
-    let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
-    drop(conn);
 }
 
 /// Resize pool max THEN shut down and drop the connection.

@@ -87,13 +87,13 @@ impl ClientSession {
         self.mode_state.switch_to_stateful();
 
         // Acquire backend connection (returns CommandGuard to track pending_count)
-        let (pooled_conn, backend_id, _pending_guard) = self
+        let (pooled_conn, backend_id, _pending_guard, provider) = self
             .acquire_stateful_backend(initial_command)
             .await
             .context("Failed to acquire backend for stateful mode")?;
 
         // Wrap connection in guard — removes from pool on any error
-        let mut conn_guard = crate::pool::ConnectionGuard::new(pooled_conn);
+        let mut conn_guard = crate::pool::ConnectionGuard::new(pooled_conn, provider);
 
         // Start stateful session metrics tracking
         let _session_guard = StatefulSessionGuard::start(&self.metrics);
@@ -138,7 +138,7 @@ impl ClientSession {
         // H1: Only return connection to pool on success
         match result {
             Ok(_) => {
-                let _conn = conn_guard.success();
+                let _conn = conn_guard.release();
             }
             Err(_) => { /* guard drops → removes broken connection from pool */ }
         }
@@ -161,6 +161,7 @@ impl ClientSession {
         deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         crate::types::BackendId,
         crate::router::CommandGuard,
+        crate::pool::DeadpoolConnectionProvider,
     )> {
         let router = self
             .router
@@ -177,9 +178,10 @@ impl ClientSession {
             .backend_provider(backend_id)
             .ok_or_else(|| anyhow::anyhow!("{}: {:?}", error::BACKEND_NOT_FOUND, backend_id))?;
 
+        let provider = provider.clone();
         let conn = provider.get_pooled_connection().await?;
 
-        Ok((conn, backend_id, pending_guard))
+        Ok((conn, backend_id, pending_guard, provider))
     }
 }
 

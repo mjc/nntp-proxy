@@ -49,8 +49,7 @@ where
                     Ok(0) => break,
                     Ok(n) => {
                         if let Err(e) = pooled_conn.write_all(command.as_bytes()).await {
-                            let err: anyhow::Error = e.into();
-                            if crate::pool::is_connection_error(&err) {
+                            if crate::connection_error::is_connection_error_kind(e.kind()) {
                                 return Ok(ForwardResult::BackendError(
                                     TransferMetrics {
                                         client_to_backend: c2b,
@@ -82,8 +81,7 @@ where
                         b2c = b2c.add(n);
                     }
                     Err(e) => {
-                        let err: anyhow::Error = e.into();
-                        if crate::pool::is_connection_error(&err) {
+                        if crate::connection_error::is_connection_error_kind(e.kind()) {
                             return Ok(ForwardResult::BackendError(
                                 TransferMetrics {
                                     client_to_backend: c2b,

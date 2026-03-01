@@ -40,7 +40,7 @@ impl ClientSession {
         };
 
         // Wrap in guard — removes from pool on any error
-        let mut conn_guard = crate::pool::ConnectionGuard::new(backend_conn);
+        let mut conn_guard = crate::pool::ConnectionGuard::new(backend_conn, provider.clone());
 
         // Split streams
         let (client_read, client_write) = client_stream.split();
@@ -62,7 +62,7 @@ impl ClientSession {
         // H2: Only return connection to pool on success
         match &result {
             Ok(_) => {
-                let _conn = conn_guard.success();
+                let _conn = conn_guard.release();
             }
             Err(_) => { /* guard drops → removes broken connection */ }
         }

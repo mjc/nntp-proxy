@@ -12,7 +12,6 @@
 
 use deadpool::managed::Object;
 
-use crate::connection_error::{ConnectionError, is_connection_error_kind};
 use crate::constants::pool::HEALTH_CHECK_TIMEOUT;
 use crate::pool::deadpool_connection::TcpManager;
 use crate::pool::provider::DeadpoolConnectionProvider;
@@ -70,73 +69,38 @@ const _SALVAGE_NO_LOOP: () = {
     assert_no_timeout_loop(1, MAX_CONNECTION_SALVAGE_MS);
 };
 
-/// Check if an error should cause the connection to be removed from the pool
-///
-/// Uses centralized CONNECTION_ERROR_KINDS from connection_error module.
-#[inline]
-pub fn is_connection_error(e: &anyhow::Error) -> bool {
-    // Check for typed ConnectionError first
-    if let Some(conn_err) = e.downcast_ref::<ConnectionError>() {
-        return matches!(
-            conn_err,
-            ConnectionError::IoError(io_err) if is_connection_error_kind(io_err.kind())
-        ) || matches!(
-            conn_err,
-            ConnectionError::StaleConnection { .. } | ConnectionError::BackendTimeout { .. }
-        );
-    }
-    // Fallback for raw io::Error from non-pool paths
-    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-        return is_connection_error_kind(io_err.kind());
-    }
-    false
-}
-
-/// Take a connection out of the pool, preventing it from being recycled
-///
-/// This should be called when a connection encounters an error that indicates
-/// it's broken and should not be reused.
-///
-/// The connection is shut down at the TCP level before being dropped, ensuring
-/// deadpool's recycle check reliably detects it as dead. The connection is then
-/// returned to the pool normally, where deadpool drops the broken connection
-/// BEFORE creating a replacement (preventing connection limit exceeded errors).
-#[inline]
-pub fn remove_from_pool(conn: Object<TcpManager>) {
-    // Shut down the raw TCP socket so recycle reliably detects it as dead
-    let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
-    // Return to pool normally — deadpool drops it before creating a replacement
-    drop(conn);
-}
-
 /// RAII guard for pooled connections
 ///
-/// Automatically removes the connection from the pool on drop unless
-/// explicitly marked as healthy via `success()`.
+/// Automatically calls `remove_with_cooldown` on drop unless the connection is
+/// explicitly released via `release()`. This ensures all broken connections are
+/// cleaned up consistently, applying the cooldown logic regardless of call site.
 ///
 /// Follows the same pattern as `CommandGuard` from `src/router/mod.rs`.
 pub struct ConnectionGuard {
     conn: Option<Object<TcpManager>>,
-    remove_on_drop: bool,
+    provider: DeadpoolConnectionProvider,
+    released: bool,
 }
 
 impl ConnectionGuard {
-    /// Create a new guard (defaults to removing on drop)
-    pub fn new(conn: Object<TcpManager>) -> Self {
+    /// Create a new guard (calls remove_with_cooldown on drop unless released)
+    pub fn new(conn: Object<TcpManager>, provider: DeadpoolConnectionProvider) -> Self {
         Self {
             conn: Some(conn),
-            remove_on_drop: true,
+            provider,
+            released: false,
         }
     }
 
-    /// Mark connection as healthy and return it
+    /// Return connection to pool (healthy).
     ///
-    /// Connection will be returned to pool normally when dropped.
-    pub fn success(mut self) -> Object<TcpManager> {
-        self.remove_on_drop = false;
+    /// Connection will be returned to the pool normally when the returned
+    /// Object is dropped. The guard is consumed — no cleanup happens.
+    pub fn release(mut self) -> Object<TcpManager> {
+        self.released = true;
         self.conn
             .take()
-            .expect("ConnectionGuard::success() called twice")
+            .expect("ConnectionGuard::release() called on consumed guard")
     }
 
     /// Get mutable reference to the connection
@@ -156,10 +120,12 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        if self.remove_on_drop
+        if !self.released
             && let Some(conn) = self.conn.take()
         {
-            remove_from_pool(conn);
+            // Unconditional: remove_with_cooldown handles socket shutdown and
+            // optional pool-size reduction (when a replacement_cooldown is configured).
+            self.provider.remove_with_cooldown(conn);
         }
     }
 }
@@ -224,9 +190,11 @@ pub async fn salvage_with_health_check(
 ///
 /// # Arguments
 /// * `conn` - Pooled connection to drain
+/// * `provider` - Connection provider (used for `remove_with_cooldown` on failure)
 /// * `buffer_pool` - Buffer pool for reading response data
 pub async fn drain_connection_async(
     mut conn: Object<TcpManager>,
+    provider: DeadpoolConnectionProvider,
     buffer_pool: crate::pool::BufferPool,
 ) {
     use crate::session::streaming::tail_buffer::TailBuffer;
@@ -265,7 +233,8 @@ pub async fn drain_connection_async(
             _ => {
                 // Timeout, EOF, or error - connection broken
                 debug!("Failed to drain connection - removing from pool");
-                remove_from_pool(conn);
+                // Unconditional: drain failure means backend state is unknown.
+                provider.remove_with_cooldown(conn);
                 return;
             }
         }
@@ -273,175 +242,12 @@ pub async fn drain_connection_async(
 
     // Exceeded max time - connection likely broken
     debug!("Drain exceeded 5 minutes - removing connection from pool");
-    remove_from_pool(conn);
-}
-
-/// Execute a function with a pooled connection, automatically removing it from
-/// the pool if a connection-level I/O error occurs.
-///
-/// # Example
-/// ```no_run
-/// use anyhow::Result;
-/// use deadpool::managed::Object;
-/// use nntp_proxy::pool::deadpool_connection::TcpManager;
-/// use nntp_proxy::pool::execute_with_guard;
-///
-/// async fn example(conn: Object<TcpManager>) -> Result<()> {
-///     execute_with_guard(conn, |conn| async move {
-///         // Do work with connection
-///         // If this returns a BrokenPipe, ConnectionReset, etc.,
-///         // the connection will be automatically removed from the pool
-///         Ok(())
-///     }).await
-/// }
-/// ```
-pub async fn execute_with_guard<F, Fut, T>(
-    mut pooled_conn: Object<TcpManager>,
-    f: F,
-) -> anyhow::Result<T>
-where
-    F: FnOnce(&mut Object<TcpManager>) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    let result = f(&mut pooled_conn).await;
-
-    // If there was a connection error, remove from pool
-    if let Err(ref e) = result
-        && is_connection_error(e)
-    {
-        remove_from_pool(pooled_conn);
-        return result;
-    }
-
-    // Otherwise, connection will be returned to pool on drop
-    result
+    // Unconditional: drain failure means backend state is unknown.
+    provider.remove_with_cooldown(conn);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::io::{Error as IoError, ErrorKind};
-
-    #[test]
-    fn test_is_connection_error_broken_pipe() {
-        let io_err = IoError::new(ErrorKind::BrokenPipe, "broken pipe");
-        let err: anyhow::Error = io_err.into();
-        assert!(is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_connection_reset() {
-        let io_err = IoError::new(ErrorKind::ConnectionReset, "connection reset");
-        let err: anyhow::Error = io_err.into();
-        assert!(is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_connection_aborted() {
-        let io_err = IoError::new(ErrorKind::ConnectionAborted, "connection aborted");
-        let err: anyhow::Error = io_err.into();
-        assert!(is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_unexpected_eof() {
-        let io_err = IoError::new(ErrorKind::UnexpectedEof, "unexpected eof");
-        let err: anyhow::Error = io_err.into();
-        assert!(is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_would_block() {
-        let io_err = IoError::new(ErrorKind::WouldBlock, "would block");
-        let err: anyhow::Error = io_err.into();
-        assert!(!is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_timeout() {
-        let io_err = IoError::new(ErrorKind::TimedOut, "timed out");
-        let err: anyhow::Error = io_err.into();
-        assert!(!is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_permission_denied() {
-        let io_err = IoError::new(ErrorKind::PermissionDenied, "permission denied");
-        let err: anyhow::Error = io_err.into();
-        assert!(!is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_non_io_error() {
-        let err = anyhow::anyhow!("some other error");
-        assert!(!is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_custom_error() {
-        #[derive(Debug)]
-        struct CustomError;
-        impl std::fmt::Display for CustomError {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "custom error")
-            }
-        }
-        impl std::error::Error for CustomError {}
-
-        let err: anyhow::Error = CustomError.into();
-        assert!(!is_connection_error(&err));
-    }
-
-    #[test]
-    fn test_is_connection_error_all_connection_errors() {
-        // Test all the error kinds we consider "connection errors"
-        let error_kinds = vec![
-            ErrorKind::BrokenPipe,
-            ErrorKind::ConnectionReset,
-            ErrorKind::ConnectionAborted,
-            ErrorKind::UnexpectedEof,
-        ];
-
-        for kind in error_kinds {
-            let io_err = IoError::new(kind, format!("{:?}", kind));
-            let err: anyhow::Error = io_err.into();
-            assert!(
-                is_connection_error(&err),
-                "Expected {:?} to be a connection error",
-                kind
-            );
-        }
-    }
-
-    #[test]
-    fn test_is_connection_error_non_connection_errors() {
-        // Test error kinds that should NOT be considered connection errors
-        let error_kinds = vec![
-            ErrorKind::NotFound,
-            ErrorKind::PermissionDenied,
-            ErrorKind::AddrInUse,
-            ErrorKind::AddrNotAvailable,
-            ErrorKind::AlreadyExists,
-            ErrorKind::WouldBlock,
-            ErrorKind::InvalidInput,
-            ErrorKind::InvalidData,
-            ErrorKind::TimedOut,
-            ErrorKind::WriteZero,
-            ErrorKind::Interrupted,
-            ErrorKind::Unsupported,
-            ErrorKind::OutOfMemory,
-        ];
-
-        for kind in error_kinds {
-            let io_err = IoError::new(kind, format!("{:?}", kind));
-            let err: anyhow::Error = io_err.into();
-            assert!(
-                !is_connection_error(&err),
-                "Expected {:?} to NOT be a connection error",
-                kind
-            );
-        }
-    }
 
     /// Verify that TailBuffer sees pos < n for a mid-chunk terminator.
     /// This guards the condition checked by drain_connection_async: FoundAt(pos) with

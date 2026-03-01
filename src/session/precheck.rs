@@ -97,8 +97,8 @@ async fn execute_backend_query(
     match backend::send_command_timed(&mut *conn, command, &mut buffer).await {
         Ok((cmd_response, ttfb, send, recv)) => {
             let Some(status_code) = cmd_response.status_code() else {
-                // Invalid response - drop connection
-                crate::pool::remove_from_pool(conn);
+                // Invalid response - remove connection from pool
+                provider.remove_with_cooldown(conn);
                 return Err(());
             };
 
@@ -181,7 +181,7 @@ async fn execute_backend_query(
         }
         Err(_) => {
             // Connection error - remove stale connection from pool
-            crate::pool::remove_from_pool(conn);
+            provider.remove_with_cooldown(conn);
             Err(())
         }
     }
