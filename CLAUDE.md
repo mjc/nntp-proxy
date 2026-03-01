@@ -171,7 +171,7 @@ let n = buf.read_from(stream).await?; // WRONG MODE
 
 ### 3. Error Classification
 
-**✅ ALWAYS use centralized error kind constants** from `connection_error.rs`.
+**✅ ALWAYS use `SessionError` in handler code** — client disconnects are encoded as an enum variant, not detected via downcast.
 
 ```rust
 // ❌ NEVER inline — will diverge across call sites:
@@ -184,24 +184,37 @@ match e.kind() {
 use crate::connection_error::is_disconnect_kind;
 if is_disconnect_kind(e.kind()) { /* client gone */ }
 
-// ✅ For anyhow::Error (common in handlers):
-use crate::is_client_disconnect_error; // re-exported from proxy/mod.rs
-if is_client_disconnect_error(&e) { /* client disconnected */ }
+// ✅ In handler functions (return type is Result<_, SessionError>):
+match result {
+    Ok(v) => { /* success */ }
+    Err(SessionError::ClientDisconnect(_)) => { /* normal, don't log */ }
+    Err(SessionError::Backend(e)) => { warn!("{e}"); }
+}
 
-// ✅ For StreamingError (returned by streaming functions):
-if streaming_err.is_client_disconnect() { /* client disconnected, backend clean */ }
+// ✅ For match guards:
+Err(e @ SessionError::ClientDisconnect(_)) => return Err(e),
+
+// ✅ For io::Error inside From<anyhow::Error> impls only:
+use crate::connection_error::is_disconnect_kind;
+if is_disconnect_kind(e.kind()) { /* classify */ }
 ```
 
-**Canonical definitions** (`src/connection_error.rs`):
+**`SessionError`** (`src/session/session_error.rs`): The typed error threaded through the entire handler stack.
+- `ClientDisconnect(io::Error)` — client closed connection; **don't log, don't retry**
+- `Backend(anyhow::Error)` — all other errors; **log, maybe retry**
+- `From<anyhow::Error>`: classifies by downcasting to `io::Error`/`ConnectionError`
+- `From<StreamingError>`: preserves the disconnect signal directly
+
+**`StreamingError`** (`src/session/streaming/mod.rs`): Typed return from streaming functions.
+- `ClientDisconnect(io::Error)` — backend cleanly drained; **release connection to pool**
+- `BackendDirty(anyhow::Error)` — drain failed; **ConnectionGuard removes from pool**
+- `BackendEof { .. }` — backend closed before terminator; **ConnectionGuard removes from pool**
+- `Io(anyhow::Error)` — other error; **ConnectionGuard removes from pool**
+- Use `e.must_remove_connection()` to decide pool fate in `command_execution.rs`
+
+**Canonical disconnect kinds** (`src/connection_error.rs`):
 - `DISCONNECT_KINDS`: `[BrokenPipe, ConnectionReset]` — client gone, don't log as backend failure
 - `CONNECTION_ERROR_KINDS`: `[BrokenPipe, ConnectionReset, ConnectionAborted, UnexpectedEof]` — don't return to pool
-
-**`StreamingError`** (`src/session/streaming/mod.rs`): Typed return from all streaming functions.
-- `ClientDisconnect(io::Error)` — backend was cleanly drained; **return connection to pool**
-- `BackendDirty(anyhow::Error)` — drain failed; **remove from pool**
-- `BackendEof { .. }` — backend closed before terminator; **remove from pool**
-- `Io(anyhow::Error)` — other error; **remove from pool**
-- Use `e.must_remove_connection()` to decide pool fate; `e.into_anyhow()` to propagate as `anyhow::Error` (preserves `io::Error` root cause for `is_client_disconnect_error()` compatibility)
 
 ---
 
@@ -215,7 +228,7 @@ if response.data.starts_with(b"430") { ... }
 
 // ✅ Use typed status codes:
 if response.status_code == 430 { ... }
-if cmd_response.is_430() { ... }
+if cmd_response.response.is_430() { ... }
 ```
 
 ---
@@ -298,17 +311,18 @@ BackendMetrics
 ### Error Types
 
 - **`ConnectionError`** (`src/connection_error.rs`): wraps I/O/TLS errors, protocol violations
-- **`StreamingError`** (`src/session/streaming/mod.rs`): typed outcome of streaming operations; use `must_remove_connection()` to decide pool fate (see Pattern #3)
-- **`anyhow::Error`** (handlers): general propagation; check with `is_client_disconnect_error()`
+- **`SessionError`** (`src/session/session_error.rs`): typed error for the entire handler stack; match on variants directly (see Pattern #3)
+- **`StreamingError`** (`src/session/streaming/mod.rs`): typed outcome of streaming operations; use `must_remove_connection()` to decide pool fate
 - **Protocol errors**: return NNTP error response to client, don't terminate unless fatal
 
 ### Connection Pool Discipline
 
 On streaming error, the pool fate depends on whether the backend was cleanly drained:
-- `ClientDisconnect` → `drop(conn)` (returns to pool — backend is clean)
-- All other `StreamingError` variants → `provider.remove_with_cooldown(conn)` (connection state unknown)
+- `SessionError::ClientDisconnect` → `conn.release()` (backend clean, return to pool)
+- `SessionError::Backend` from streaming → `ConnectionGuard` drops automatically, calling `remove_with_cooldown`
 
-Always add a comment at each `remove_with_cooldown` call site explaining why a disconnect check is/isn't needed.
+`ConnectionGuard` RAII handles removal on all error paths — explicitly call `guard.release()` only on success.
+Always add a comment at each `remove_with_cooldown` call site (inside `ConnectionGuard::drop`) explaining why.
 
 ### Panic Safety
 
@@ -388,15 +402,23 @@ Any occurrence of the following anywhere outside `tail_buffer.rs` is a bug:
 
 This caused real connection pool collapse in production. See Pattern #1 for the full explanation.
 
-### ❌ 2. Inline Error Kind Checks
+### ❌ 2. Inline Error Kind Checks or Helper Predicate Methods
 
 ```rust
-// BAD: will diverge across call sites
+// BAD: inline io::ErrorKind check
 match e.kind() { ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => ... }
 
-// GOOD:
+// BAD: predicate helper method that duplicates enum variant info
+if session_err.is_client_disconnect() { ... }   // removed — use pattern matching
+if conn_err.is_client_disconnect() { ... }       // removed — use pattern matching
+
+// GOOD: direct enum pattern matching in handler code
+if let SessionError::ClientDisconnect(_) = &e { ... }
+Err(e @ SessionError::ClientDisconnect(_)) => return Err(e),
+
+// GOOD: is_disconnect_kind only inside From<anyhow::Error> impls
 use crate::connection_error::is_disconnect_kind;
-if is_disconnect_kind(e.kind()) { ... }
+if is_disconnect_kind(e.kind()) { /* inside SessionError::from() only */ }
 ```
 
 ### ❌ 3. Raw Byte Status Code Checks
