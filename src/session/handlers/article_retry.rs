@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
 use crate::command::classifier::{is_head_command, is_large_transfer_command, is_stat_command};
+use crate::session::handlers::pipeline::CommandBatch;
 use crate::session::precheck;
 
 /// Mutable pipeline batch state passed into `batch_execute_articles`
@@ -51,14 +52,14 @@ impl ClientSession {
     pub(super) async fn batch_execute_articles(
         &self,
         router: &Arc<BackendSelector>,
-        commands: &[&str],
+        batch: &CommandBatch,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         pipeline: BatchPipelineState<'_>,
     ) -> Result<(), SessionError> {
         let mut state = pipeline;
 
         // M1: Load availability for the first command's message-ID
-        let first_msg_id = crate::types::MessageId::extract_from_command_borrowed(commands[0]);
+        let first_msg_id = crate::types::MessageId::extract_from_command_borrowed(batch.command(0));
         let availability = self
             .load_article_availability(first_msg_id.as_ref(), router.backend_count())
             .await;
@@ -69,7 +70,7 @@ impl ClientSession {
         // connections on other backends, hitting provider connection limits.
         let backend_id = router.route_command_with_availability(
             self.client_id,
-            commands[0],
+            batch.command(0),
             Some(&availability),
         )?;
         let guard = CommandGuard::new(router.clone(), backend_id);
@@ -88,12 +89,13 @@ impl ClientSession {
         let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
         // Phase 1: Write all commands, then flush
-        for command in commands {
+        for i in 0..batch.len() {
+            let command = batch.command(i);
             if let Err(e) = conn.write_all(command.as_bytes()).await {
                 warn!(
                     client = %self.client_addr,
                     backend = ?backend_id,
-                    batch_size = commands.len(),
+                    batch_size = batch.len(),
                     error = %e,
                     "Batch write failed, removing connection"
                 );
@@ -107,7 +109,7 @@ impl ClientSession {
             warn!(
                 client = %self.client_addr,
                 backend = ?backend_id,
-                batch_size = commands.len(),
+                batch_size = batch.len(),
                 error = %e,
                 "Batch flush failed, removing connection"
             );
@@ -124,10 +126,10 @@ impl ClientSession {
         state.leftover.clear();
         state.chunk_data.clear();
 
-        for i in 0..commands.len() {
+        for i in 0..batch.len() {
             match self
                 .process_batch_response(
-                    commands,
+                    batch,
                     i,
                     &mut conn,
                     client_write,
@@ -147,7 +149,7 @@ impl ClientSession {
                 BatchStep::BackendDead { from_idx } => {
                     // Send 430s for any unhandled commands, then discard the connection.
                     self.send_430s_from(
-                        commands,
+                        batch,
                         from_idx,
                         client_write,
                         state.backend_to_client_bytes,
@@ -188,7 +190,7 @@ impl ClientSession {
     #[allow(clippy::too_many_arguments)]
     async fn process_batch_response(
         &self,
-        commands: &[&str],
+        batch: &CommandBatch,
         idx: usize,
         conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
@@ -199,7 +201,7 @@ impl ClientSession {
         use crate::session::routing::{MetricsAction, determine_metrics_action};
         use crate::session::{backend, streaming};
 
-        let command = commands[idx];
+        let command = batch.command(idx);
         let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
 
         // --- Read first chunk (from leftover or fresh read) ---
@@ -220,7 +222,7 @@ impl ClientSession {
                         client = %self.client_addr,
                         backend = ?backend_id,
                         response_index = idx + 1,
-                        total_commands = commands.len(),
+                        total_commands = batch.len(),
                         "Backend EOF during batch read, sending 430 for remaining commands"
                     );
                     // Backend dead — unconditional remove (write/flush already succeeded,
@@ -232,7 +234,7 @@ impl ClientSession {
                         client = %self.client_addr,
                         backend = ?backend_id,
                         response_index = idx + 1,
-                        total_commands = commands.len(),
+                        total_commands = batch.len(),
                         error = %e,
                         "Backend read error during batch, sending 430 for remaining commands"
                     );
@@ -314,7 +316,7 @@ impl ClientSession {
                 backend = ?backend_id,
                 command = %command.trim(),
                 response_index = idx + 1,
-                total_commands = commands.len(),
+                total_commands = batch.len(),
                 chunk_len = chunk.len(),
                 first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
                 first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
@@ -324,7 +326,7 @@ impl ClientSession {
 
             // Send 430 for this and all remaining commands.
             self.send_430s_from(
-                commands,
+                batch,
                 idx,
                 client_write,
                 state.backend_to_client_bytes,
@@ -357,7 +359,7 @@ impl ClientSession {
                     );
                     // All 430s sent; caller removes conn + completes guard.
                     return Ok(BatchStep::BackendDead {
-                        from_idx: commands.len(),
+                        from_idx: batch.len(),
                     });
                 }
             }
@@ -393,14 +395,14 @@ impl ClientSession {
                         client = %self.client_addr,
                         backend = ?backend_id,
                         command_index = idx + 1,
-                        total_commands = commands.len(),
+                        total_commands = batch.len(),
                         error = %e,
                         "Streaming error during pipelined batch, sending 430 for remaining commands"
                     );
                     // Commands 0..idx already handled; send 430 for commands[idx+1..].
                     // Unconditional remove: StreamingError guarantees must_remove_connection().
                     self.send_430s_from(
-                        commands,
+                        batch,
                         idx + 1,
                         client_write,
                         state.backend_to_client_bytes,
@@ -410,7 +412,7 @@ impl ClientSession {
                     .await?;
                     // All 430s sent; caller removes conn + completes guard.
                     return Ok(BatchStep::BackendDead {
-                        from_idx: commands.len(),
+                        from_idx: batch.len(),
                     });
                 }
             }
@@ -447,14 +449,15 @@ impl ClientSession {
     /// returns. Consistent 4xx accounting across all backend-dead recovery sites.
     async fn send_430s_from(
         &self,
-        commands: &[&str],
+        batch: &CommandBatch,
         from: usize,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_id: BackendId,
     ) -> Result<()> {
-        for cmd in &commands[from..] {
+        for i in from..batch.len() {
+            let cmd = batch.command(i);
             self.send_430_to_client(client_write, backend_to_client_bytes)
                 .await?;
             *client_to_backend_bytes = client_to_backend_bytes.add(cmd.len());

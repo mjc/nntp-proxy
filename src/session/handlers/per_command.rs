@@ -340,14 +340,10 @@ impl ClientSession {
                 // Try batch pipelining for all-ARTICLE/BODY batches;
                 // fall through to individual processing on failure.
                 let batch_handled = if all_large_transfer {
-                    // Create temporary slice vector for batch_execute_articles
-                    // (TODO: refactor batch_execute_articles to take CommandBatch directly)
-                    let commands_vec: Vec<&str> =
-                        (0..batch_size).map(|i| batch.command(i)).collect();
                     match self
                         .batch_execute_articles(
                             router,
-                            &commands_vec,
+                            &batch,
                             &mut client_write,
                             crate::session::handlers::article_retry::BatchPipelineState {
                                 client_to_backend_bytes: &mut client_to_backend_bytes,
