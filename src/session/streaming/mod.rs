@@ -100,7 +100,7 @@ where
             .await
             .context("Failed to read from backend while draining response")?;
         if n == 0 {
-            break; // EOF
+            anyhow::bail!("Backend closed connection before multiline terminator during drain");
         }
         let data = &chunk[..n];
         if tail.detect_terminator(data).is_found() {
@@ -425,7 +425,7 @@ mod tests {
         };
 
         let result = drain_until_terminator(&mut reader, b"", &ctx).await;
-        assert!(result.is_ok());
+        assert!(result.is_err(), "EOF before terminator must be an error");
     }
 
     #[tokio::test]
