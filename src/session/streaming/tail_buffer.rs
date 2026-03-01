@@ -378,7 +378,7 @@ mod tests {
 
         match status {
             TerminatorStatus::FoundAt(pos) => assert_eq!(pos, chunk.len()),
-            _ => panic!("Expected FoundAt, got {:?}", status),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt, got {:?}", status),
         }
     }
 
@@ -393,7 +393,7 @@ mod tests {
                 assert!(pos < chunk.len());
                 assert!(pos > 0);
             }
-            _ => panic!("Expected FoundAt, got {:?}", status),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt, got {:?}", status),
         }
     }
 

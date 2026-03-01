@@ -96,7 +96,7 @@ fn try_decompress(
     let before_in = decompressor.total_in();
     let before_out = decompressor.total_out();
 
-    let status = decompressor
+    let decompress_status = decompressor
         .decompress(input, out_slice, flate2::FlushDecompress::None)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -110,7 +110,7 @@ fn try_decompress(
 
     Ok((
         consumed,
-        produced > 0 || matches!(status, flate2::Status::StreamEnd),
+        produced > 0 || matches!(decompress_status, flate2::Status::StreamEnd),
     ))
 }
 

@@ -739,7 +739,7 @@ mod tests {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 430);
             }
-            other => panic!("Expected Success, got {other:?}"),
+            other @ PipelineResponse::Error(_) => panic!("Expected Success, got {other:?}"),
         }
     }
 
@@ -800,13 +800,13 @@ mod tests {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 223);
             }
-            other => panic!("Expected 223 Success, got {other:?}"),
+            other @ PipelineResponse::Error(_) => panic!("Expected 223 Success, got {other:?}"),
         }
         match rx2.await.unwrap() {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 430);
             }
-            other => panic!("Expected 430 Success, got {other:?}"),
+            other @ PipelineResponse::Error(_) => panic!("Expected 430 Success, got {other:?}"),
         }
     }
 
@@ -864,12 +864,16 @@ mod tests {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 223);
             }
-            other => panic!("Expected first to succeed, got {other:?}"),
+            other @ PipelineResponse::Error(_) => {
+                panic!("Expected first to succeed, got {other:?}")
+            }
         }
         // Second response should be error
         match rx2.await.unwrap() {
             PipelineResponse::Error(_) => {} // Expected
-            other => panic!("Expected error for second, got {other:?}"),
+            other @ PipelineResponse::Success { .. } => {
+                panic!("Expected error for second, got {other:?}")
+            }
         }
     }
 
