@@ -285,15 +285,14 @@ impl TcpManager {
                     backend: self.name.clone(),
                     response: response_str.trim().to_string(),
                 });
-            } else {
-                tracing::debug!(
-                    "Successfully authenticated to {} ({}:{}) as {}",
-                    self.name,
-                    self.host,
-                    self.port,
-                    username
-                );
             }
+            tracing::debug!(
+                "Successfully authenticated to {} ({}:{}) as {}",
+                self.name,
+                self.host,
+                self.port,
+                username
+            );
         } else if !matches!(
             crate::protocol::NntpResponse::parse(response),
             crate::protocol::NntpResponse::AuthSuccess

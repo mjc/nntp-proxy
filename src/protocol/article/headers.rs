@@ -92,11 +92,10 @@ impl<'a> Headers<'a> {
                 // Check if preceded by \r
                 if i > 0 && data[i - 1] == b'\r' {
                     return Ok(i - 1); // Return position of \r
-                } else {
-                    return Err(ParseError::InvalidHeader(
-                        "LF not preceded by CR".to_string(),
-                    ));
                 }
+                return Err(ParseError::InvalidHeader(
+                    "LF not preceded by CR".to_string(),
+                ));
             }
             if data[i] == b'\r' {
                 // Check for \n following \r
@@ -105,11 +104,10 @@ impl<'a> Headers<'a> {
                 } else if i + 1 >= data.len() {
                     // CR at end of buffer - might be incomplete
                     return Ok(i);
-                } else {
-                    return Err(ParseError::InvalidHeader(
-                        "CR not followed by LF".to_string(),
-                    ));
                 }
+                return Err(ParseError::InvalidHeader(
+                    "CR not followed by LF".to_string(),
+                ));
             }
         }
 
@@ -189,13 +187,12 @@ impl<'a> Headers<'a> {
                 // Otherwise return the original slice (zero-copy)
                 if folded_value.is_empty() {
                     return Some(value);
-                } else {
-                    // We have to allocate for folded headers
-                    // This is a limitation - we could return Cow<'a, [u8]> instead
-                    // For now, just return the first line
-                    // TODO: Return Cow to handle folding without allocation in non-folded case
-                    return Some(value);
                 }
+                // We have to allocate for folded headers
+                // This is a limitation - we could return Cow<'a, [u8]> instead
+                // For now, just return the first line
+                // TODO: Return Cow to handle folding without allocation in non-folded case
+                return Some(value);
             }
 
             pos = line_end + 2;
