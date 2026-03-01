@@ -26,6 +26,21 @@ pub(super) struct BatchPipelineState<'a> {
     pub chunk_data: &'a mut bytes::BytesMut,
 }
 
+/// Per-response outcome from `process_batch_response`
+enum BatchStep {
+    /// Response handled successfully; continue to the next command.
+    Continue,
+    /// Client disconnected; backend was cleanly drained.
+    /// Caller should complete the guard and propagate the error.
+    ClientDisconnect(anyhow::Error),
+    /// Backend died; caller must send 430s for `commands[from_idx..]`,
+    /// remove the connection, and complete the guard.
+    BackendDead { from_idx: usize },
+    /// All remaining 430s were already sent internally (Invalid + DATE salvage path).
+    /// Caller should complete the guard; connection fate already decided.
+    BatchComplete,
+}
+
 impl ClientSession {
     /// Batch-execute ARTICLE/BODY commands using TCP pipelining.
     ///
@@ -40,17 +55,7 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         pipeline: BatchPipelineState<'_>,
     ) -> Result<()> {
-        use crate::router::CommandGuard;
-        use crate::session::routing::{MetricsAction, determine_metrics_action};
-        use crate::session::{backend, streaming};
-
-        // Destructure pipeline state for ergonomic access throughout the function
-        let BatchPipelineState {
-            client_to_backend_bytes,
-            backend_to_client_bytes,
-            leftover,
-            chunk_data,
-        } = pipeline;
+        let mut state = pipeline;
 
         // M1: Load availability for the first command's message-ID
         let first_msg_id = crate::types::MessageId::extract_from_command_borrowed(commands[0]);
@@ -58,7 +63,7 @@ impl ClientSession {
             .load_article_availability(first_msg_id.as_ref(), router.backend_count())
             .await;
 
-        // Route to a single backend for the whole batch with availability awareness
+        // Route to a single backend for the whole batch with availability awareness.
         // One pending count for one connection — don't inflate pending by N,
         // as that skews load_ratio and can cause other sessions to over-allocate
         // connections on other backends, hitting provider connection limits.
@@ -104,312 +109,335 @@ impl ClientSession {
             return Err(e.into());
         }
 
-        // Phase 2: Read and stream responses in order
-        // Acquire buffer once before loop (reused across responses)
+        // Phase 2: Read and stream responses in order.
+        // Buffer acquired once, reused across all responses.
+        // State buffers cleared here; they persist across batch_execute_articles calls.
         let mut buffer = self.buffer_pool.acquire().await;
-        // Clear caller-owned buffers for this batch (reused across batch_execute_articles calls)
-        leftover.clear();
-        chunk_data.clear();
+        state.leftover.clear();
+        state.chunk_data.clear();
 
-        for (i, command) in commands.iter().enumerate() {
-            let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
-
-            // Get first chunk of this response
-            chunk_data.clear();
-            let from_leftover = !leftover.is_empty();
-            let n = if from_leftover {
-                // Use leftover data from previous response
-                chunk_data.extend_from_slice(leftover);
-                leftover.clear();
-                chunk_data.len()
-            } else {
-                match buffer.read_from(&mut *conn).await {
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        chunk_data.extend_from_slice(&buffer[..bytes_read]);
-                        bytes_read
-                    }
-                    Ok(_) => {
-                        warn!(
-                            client = %self.client_addr,
-                            backend = ?backend_id,
-                            response_index = i + 1,
-                            total_commands = commands.len(),
-                            "Backend EOF during batch read, sending 430 for remaining commands"
-                        );
-                        // Backend dead — unconditional remove (write/flush already succeeded,
-                        // so this is a backend-side failure, not a client disconnect).
-                        self.send_430s_from(
-                            commands,
-                            i,
-                            client_write,
-                            backend_to_client_bytes,
-                            client_to_backend_bytes,
-                            backend_id,
-                        )
-                        .await?;
-                        provider.remove_with_cooldown(conn);
-                        guard.complete();
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(
-                            client = %self.client_addr,
-                            backend = ?backend_id,
-                            response_index = i + 1,
-                            total_commands = commands.len(),
-                            error = %e,
-                            "Backend read error during batch, sending 430 for remaining commands"
-                        );
-                        // Backend dead — unconditional remove (write/flush already succeeded,
-                        // so this is a backend-side failure, not a client disconnect).
-                        self.send_430s_from(
-                            commands,
-                            i,
-                            client_write,
-                            backend_to_client_bytes,
-                            client_to_backend_bytes,
-                            backend_id,
-                        )
-                        .await?;
-                        provider.remove_with_cooldown(conn);
-                        guard.complete();
-                        return Ok(());
-                    }
-                }
-            };
-
-            // H5: If leftover was too short to validate, read more data
-            if n < crate::protocol::MIN_RESPONSE_LENGTH {
-                match buffer.read_from(&mut *conn).await {
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        chunk_data.extend_from_slice(&buffer[..bytes_read]);
-                        // Update n for chunk reference below
-                    }
-                    Ok(_) => {
-                        warn!(
-                            client = %self.client_addr,
-                            backend = ?backend_id,
-                            response_index = i + 1,
-                            partial_bytes = chunk_data.len(),
-                            "Backend EOF with partial status line, sending 430 for remaining commands"
-                        );
-                        // Backend dead — unconditional remove (partial read means backend state unknown).
-                        self.send_430s_from(
-                            commands,
-                            i,
-                            client_write,
-                            backend_to_client_bytes,
-                            client_to_backend_bytes,
-                            backend_id,
-                        )
-                        .await?;
-                        provider.remove_with_cooldown(conn);
-                        guard.complete();
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(
-                            client = %self.client_addr,
-                            backend = ?backend_id,
-                            response_index = i + 1,
-                            partial_bytes = chunk_data.len(),
-                            error = %e,
-                            "Backend read error with partial status line, sending 430 for remaining commands"
-                        );
-                        // Backend dead — unconditional remove (partial read means backend state unknown).
-                        self.send_430s_from(
-                            commands,
-                            i,
-                            client_write,
-                            backend_to_client_bytes,
-                            client_to_backend_bytes,
-                            backend_id,
-                        )
-                        .await?;
-                        provider.remove_with_cooldown(conn);
-                        guard.complete();
-                        return Ok(());
-                    }
-                }
-            }
-            let chunk = &chunk_data[..];
-            let n = chunk.len(); // Update n after potential additional read
-
-            // Validate response
-            let validated =
-                backend::validate_backend_response(chunk, n, crate::protocol::MIN_RESPONSE_LENGTH);
-            let response_code = validated.response;
-            let is_multiline = validated.is_multiline;
-
-            // Handle 430 — article not found on this backend
-            if response_code.is_430() {
-                // For single-line 430, find boundary and save leftover
-                if !is_multiline && let Some(pos) = memchr::memchr(b'\n', chunk) {
-                    let end = pos + 1;
-                    if end < n {
-                        leftover.extend_from_slice(&chunk[end..]);
-                    }
-                }
-
-                // Send 430 to client for this command
-                self.send_430_to_client(client_write, backend_to_client_bytes)
-                    .await?;
-                *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
-
-                // O3: Record availability using atomic cache operation
-                if let Some(mid) = msg_id.as_ref() {
-                    self.cache
-                        .record_backend_missing(mid.clone(), backend_id)
-                        .await;
-                }
-
-                self.metrics.record_command(backend_id);
-                self.metrics.record_error_4xx(backend_id);
-                self.metrics.user_command(self.username());
-                continue;
-            }
-
-            // Handle invalid response
-            if response_code == crate::protocol::NntpResponse::Invalid {
-                warn!(
-                    client = %self.client_addr,
-                    backend = ?backend_id,
-                    command = %command.trim(),
-                    response_index = i + 1,
-                    total_commands = commands.len(),
-                    chunk_len = chunk.len(),
-                    first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
-                    first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
-                    source = if from_leftover { "leftover" } else { "fresh_read" },
-                    "Backend returned Invalid response during batch, aborting batch"
-                );
-
-                // Send 430 for this and all remaining commands (metrics recorded per command).
-                self.send_430s_from(
+        for i in 0..commands.len() {
+            match self
+                .process_batch_response(
                     commands,
                     i,
+                    &mut conn,
                     client_write,
-                    backend_to_client_bytes,
-                    client_to_backend_bytes,
                     backend_id,
+                    &mut state,
+                    &mut buffer,
                 )
-                .await?;
-
-                // Try to salvage connection with DATE health check
-                // If leftover data exists in the stream, DATE response will be corrupted
-                debug!(
-                    backend = ?backend_id,
-                    "Attempting to salvage connection after batch Invalid with DATE check"
-                );
-
-                match crate::pool::health_check::check_date_response(&mut conn).await {
-                    Ok(()) => {
-                        debug!(backend = ?backend_id, "Connection salvaged after batch Invalid + DATE check");
-                        guard.complete();
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(backend = ?backend_id, error = %e, "DATE check failed after batch Invalid");
-                    }
+                .await?
+            {
+                BatchStep::Continue => {}
+                BatchStep::ClientDisconnect(e) => {
+                    // Backend was cleanly drained; return connection to pool.
+                    guard.complete();
+                    return Err(e);
                 }
-
-                // DATE failed — connection broken
-                provider.remove_with_cooldown(conn);
-                guard.complete();
-                return Ok(());
-            }
-
-            // Success — stream response to client
-            *client_to_backend_bytes = client_to_backend_bytes.add(command.len());
-
-            let bytes_written = if is_multiline {
-                let ctx = streaming::StreamContext {
-                    client_addr: self.client_addr,
-                    backend_id,
-                    buffer_pool: &self.buffer_pool,
-                };
-                match streaming::stream_multiline_response_pipelined(
-                    &mut *conn,
-                    client_write,
-                    chunk,
-                    &ctx,
-                    leftover,
-                )
-                .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(e) if e.is_client_disconnect() => {
-                        // Client disconnected — backend was cleanly drained by streaming layer
-                        // (handle_client_write_error ran drain_until_terminator successfully).
-                        // Return connection to pool without cooldown.
-                        guard.complete();
-                        // into_anyhow() unwraps to bare io::Error so is_client_disconnect_error()
-                        // in outer callers can still classify it correctly.
-                        return Err(e.into_anyhow());
-                    }
-                    Err(e) => {
-                        // C1: Backend error or dirty disconnect (drain failed).
-                        // Connection in unknown state — remove from pool.
-                        provider.remove_with_cooldown(conn);
-                        warn!(
-                            client = %self.client_addr,
-                            backend = ?backend_id,
-                            command_index = i + 1,
-                            total_commands = commands.len(),
-                            error = %e,
-                            "Streaming error during pipelined batch, sending 430 for remaining commands"
-                        );
-                        // Backend died mid-stream. Commands 0..i already handled;
-                        // send 430 for commands[i+1..] to maintain protocol sync.
-                        // Unconditional remove: StreamingError guarantees must_remove_connection().
-                        self.send_430s_from(
-                            commands,
-                            i + 1,
-                            client_write,
-                            backend_to_client_bytes,
-                            client_to_backend_bytes,
-                            backend_id,
-                        )
-                        .await?;
-                        guard.complete();
-                        return Ok(());
-                    }
+                BatchStep::BackendDead { from_idx } => {
+                    // Send 430s for any unhandled commands, then discard the connection.
+                    self.send_430s_from(
+                        commands,
+                        from_idx,
+                        client_write,
+                        state.backend_to_client_bytes,
+                        state.client_to_backend_bytes,
+                        backend_id,
+                    )
+                    .await?;
+                    provider.remove_with_cooldown(conn);
+                    guard.complete();
+                    return Ok(());
                 }
-            } else {
-                // Single-line response - find boundary and save leftover
-                let write_len = if let Some(pos) = memchr::memchr(b'\n', chunk) {
-                    let end = pos + 1;
-                    if end < n {
-                        leftover.extend_from_slice(&chunk[end..]);
-                    }
-                    end
-                } else {
-                    n
-                };
-                client_write.write_all(&chunk[..write_len]).await?;
-                write_len as u64
-            };
-
-            *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
-
-            // Record metrics
-            self.metrics.record_command(backend_id);
-            self.metrics.user_command(self.username());
-            if let Some(status_code) = response_code.status_code() {
-                match determine_metrics_action(status_code.as_u16(), is_multiline) {
-                    MetricsAction::Article => {
-                        self.metrics.record_article(backend_id, bytes_written);
-                    }
-                    MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
-                    MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
-                    MetricsAction::None => {}
+                BatchStep::BatchComplete => {
+                    // All 430s already sent internally (Invalid + DATE salvage path).
+                    guard.complete();
+                    return Ok(());
                 }
             }
         }
 
-        // Connection healthy — conn drops here, returning to pool automatically
+        // All commands handled — conn returns to pool on drop.
         guard.complete();
         Ok(())
+    }
+
+    /// Process one response in a pipelined batch.
+    ///
+    /// Reads the next response from `conn`, validates it, and streams it to the client.
+    /// Returns a [`BatchStep`] that tells the caller how to proceed.
+    ///
+    /// # Connection pool discipline
+    /// This method does **not** call `remove_with_cooldown` — that responsibility belongs
+    /// to the caller. Instead it returns `BackendDead` or `BatchComplete` to signal what
+    /// action is required.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_batch_response(
+        &self,
+        commands: &[&str],
+        idx: usize,
+        conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_id: BackendId,
+        state: &mut BatchPipelineState<'_>,
+        buffer: &mut crate::pool::PooledBuffer,
+    ) -> Result<BatchStep> {
+        use crate::session::routing::{MetricsAction, determine_metrics_action};
+        use crate::session::{backend, streaming};
+
+        let command = commands[idx];
+        let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
+
+        // --- Read first chunk (from leftover or fresh read) ---
+        state.chunk_data.clear();
+        let from_leftover = !state.leftover.is_empty();
+        let initial_chunk_len = if from_leftover {
+            state.chunk_data.extend_from_slice(state.leftover);
+            state.leftover.clear();
+            state.chunk_data.len()
+        } else {
+            match buffer.read_from(&mut **conn).await {
+                Ok(bytes_read) if bytes_read > 0 => {
+                    state.chunk_data.extend_from_slice(&buffer[..bytes_read]);
+                    bytes_read
+                }
+                Ok(_) => {
+                    warn!(
+                        client = %self.client_addr,
+                        backend = ?backend_id,
+                        response_index = idx + 1,
+                        total_commands = commands.len(),
+                        "Backend EOF during batch read, sending 430 for remaining commands"
+                    );
+                    // Backend dead — unconditional remove (write/flush already succeeded,
+                    // so this is a backend-side failure, not a client disconnect).
+                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                }
+                Err(e) => {
+                    warn!(
+                        client = %self.client_addr,
+                        backend = ?backend_id,
+                        response_index = idx + 1,
+                        total_commands = commands.len(),
+                        error = %e,
+                        "Backend read error during batch, sending 430 for remaining commands"
+                    );
+                    // Backend dead — unconditional remove.
+                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                }
+            }
+        };
+
+        // --- Read more if the initial chunk was too short to parse ---
+        if initial_chunk_len < crate::protocol::MIN_RESPONSE_LENGTH {
+            match buffer.read_from(&mut **conn).await {
+                Ok(bytes_read) if bytes_read > 0 => {
+                    state.chunk_data.extend_from_slice(&buffer[..bytes_read]);
+                }
+                Ok(_) => {
+                    warn!(
+                        client = %self.client_addr,
+                        backend = ?backend_id,
+                        response_index = idx + 1,
+                        partial_bytes = state.chunk_data.len(),
+                        "Backend EOF with partial status line, sending 430 for remaining commands"
+                    );
+                    // Backend dead — partial read means backend state unknown.
+                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                }
+                Err(e) => {
+                    warn!(
+                        client = %self.client_addr,
+                        backend = ?backend_id,
+                        response_index = idx + 1,
+                        partial_bytes = state.chunk_data.len(),
+                        error = %e,
+                        "Backend read error with partial status line, sending 430 for remaining commands"
+                    );
+                    // Backend dead — partial read means backend state unknown.
+                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                }
+            }
+        }
+
+        let chunk = &state.chunk_data[..];
+
+        // --- Validate response ---
+        let validated = backend::validate_backend_response(
+            chunk,
+            chunk.len(),
+            crate::protocol::MIN_RESPONSE_LENGTH,
+        );
+        let response_code = validated.response;
+        let is_multiline = validated.is_multiline;
+
+        // --- Handle 430 (article not found on this backend) ---
+        if response_code.is_430() {
+            // Single-line 430: find the response boundary and save any trailing bytes.
+            if !is_multiline && let Some(pos) = memchr::memchr(b'\n', chunk) {
+                let end = pos + 1;
+                if end < chunk.len() {
+                    state.leftover.extend_from_slice(&chunk[end..]);
+                }
+            }
+
+            self.send_430_to_client(client_write, state.backend_to_client_bytes)
+                .await?;
+            *state.client_to_backend_bytes = state.client_to_backend_bytes.add(command.len());
+
+            if let Some(mid) = msg_id.as_ref() {
+                self.cache
+                    .record_backend_missing(mid.clone(), backend_id)
+                    .await;
+            }
+            self.metrics.record_command(backend_id);
+            self.metrics.record_error_4xx(backend_id);
+            self.metrics.user_command(self.username());
+            return Ok(BatchStep::Continue);
+        }
+
+        // --- Handle Invalid response ---
+        if response_code == crate::protocol::NntpResponse::Invalid {
+            warn!(
+                client = %self.client_addr,
+                backend = ?backend_id,
+                command = %command.trim(),
+                response_index = idx + 1,
+                total_commands = commands.len(),
+                chunk_len = chunk.len(),
+                first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
+                first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
+                source = if from_leftover { "leftover" } else { "fresh_read" },
+                "Backend returned Invalid response during batch, aborting batch"
+            );
+
+            // Send 430 for this and all remaining commands.
+            self.send_430s_from(
+                commands,
+                idx,
+                client_write,
+                state.backend_to_client_bytes,
+                state.client_to_backend_bytes,
+                backend_id,
+            )
+            .await?;
+
+            // Attempt DATE health-check to salvage the connection.
+            // If leftover data exists in the stream, the DATE response will be corrupted
+            // and the check will fail — this is correct behaviour.
+            debug!(
+                backend = ?backend_id,
+                "Attempting to salvage connection after batch Invalid with DATE check"
+            );
+            match crate::pool::health_check::check_date_response(conn).await {
+                Ok(()) => {
+                    debug!(
+                        backend = ?backend_id,
+                        "Connection salvaged after batch Invalid + DATE check"
+                    );
+                    // All 430s sent; caller completes guard (conn returns to pool).
+                    return Ok(BatchStep::BatchComplete);
+                }
+                Err(e) => {
+                    warn!(
+                        backend = ?backend_id,
+                        error = %e,
+                        "DATE check failed after batch Invalid"
+                    );
+                    // All 430s sent; caller removes conn + completes guard.
+                    return Ok(BatchStep::BackendDead {
+                        from_idx: commands.len(),
+                    });
+                }
+            }
+        }
+
+        // --- Success: stream response to client ---
+        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(command.len());
+
+        let bytes_written = if is_multiline {
+            let ctx = streaming::StreamContext {
+                client_addr: self.client_addr,
+                backend_id,
+                buffer_pool: &self.buffer_pool,
+            };
+            match streaming::stream_multiline_response_pipelined(
+                &mut **conn,
+                client_write,
+                chunk,
+                &ctx,
+                state.leftover,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) if e.is_client_disconnect() => {
+                    // Client disconnected — backend was cleanly drained by the streaming layer.
+                    // into_anyhow() unwraps to bare io::Error so is_client_disconnect_error()
+                    // in outer callers can still classify it correctly.
+                    return Ok(BatchStep::ClientDisconnect(e.into_anyhow()));
+                }
+                Err(e) => {
+                    // Backend error or dirty disconnect (drain failed).
+                    // Connection in unknown state — caller must remove it.
+                    warn!(
+                        client = %self.client_addr,
+                        backend = ?backend_id,
+                        command_index = idx + 1,
+                        total_commands = commands.len(),
+                        error = %e,
+                        "Streaming error during pipelined batch, sending 430 for remaining commands"
+                    );
+                    // Commands 0..idx already handled; send 430 for commands[idx+1..].
+                    // Unconditional remove: StreamingError guarantees must_remove_connection().
+                    self.send_430s_from(
+                        commands,
+                        idx + 1,
+                        client_write,
+                        state.backend_to_client_bytes,
+                        state.client_to_backend_bytes,
+                        backend_id,
+                    )
+                    .await?;
+                    // All 430s sent; caller removes conn + completes guard.
+                    return Ok(BatchStep::BackendDead {
+                        from_idx: commands.len(),
+                    });
+                }
+            }
+        } else {
+            // Single-line response: find the boundary and save any trailing bytes.
+            let write_len = if let Some(pos) = memchr::memchr(b'\n', chunk) {
+                let end = pos + 1;
+                if end < chunk.len() {
+                    state.leftover.extend_from_slice(&chunk[end..]);
+                }
+                end
+            } else {
+                chunk.len()
+            };
+            client_write.write_all(&chunk[..write_len]).await?;
+            write_len as u64
+        };
+
+        *state.backend_to_client_bytes = state.backend_to_client_bytes.add(bytes_written as usize);
+
+        // Record metrics
+        self.metrics.record_command(backend_id);
+        self.metrics.user_command(self.username());
+        if let Some(status_code) = response_code.status_code() {
+            match determine_metrics_action(status_code.as_u16(), is_multiline) {
+                MetricsAction::Article => {
+                    self.metrics.record_article(backend_id, bytes_written);
+                }
+                MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+                MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+                MetricsAction::None => {}
+            }
+        }
+
+        Ok(BatchStep::Continue)
     }
 
     /// Send 430 "No Such Article" to the client for each command in `commands[from..]`.
