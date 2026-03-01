@@ -319,12 +319,11 @@ where
             .context("Failed to read next chunk from backend")?;
 
         if n == 0 {
-            debug!(
-                "Client {} multiline streaming complete ({}, EOF)",
-                ctx.client_addr,
-                crate::formatting::format_bytes(total_bytes)
-            );
-            break;
+            return Err(anyhow::anyhow!(
+                "Backend {:?} closed connection before sending multiline terminator ({} bytes received)",
+                ctx.backend_id,
+                total_bytes
+            ));
         }
 
         let data = &buffers[idx][..n];
@@ -363,8 +362,6 @@ where
 
         idx ^= 1; // Toggle buffer index
     }
-
-    Ok(total_bytes)
 }
 
 #[cfg(test)]
@@ -430,6 +427,28 @@ mod tests {
         };
 
         let result = drain_until_terminator(&mut reader, b"", &ctx).await;
+        assert!(result.is_err(), "EOF before terminator must be an error");
+    }
+
+    #[tokio::test]
+    async fn test_stream_multiline_response_backend_eof_before_terminator() {
+        use crate::types::BufferSize;
+        // Backend sends partial response (no terminator) then closes connection.
+        // Phase 1 processes `partial` (no terminator found), Phase 2 reads EOF immediately.
+        let partial = b"220 Article follows\r\nIncomplete body\r\n";
+        let mut reader = Cursor::new(&[] as &[u8]);
+        let mut writer = Vec::new();
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let ctx = StreamContext {
+            client_addr,
+            backend_id,
+            buffer_pool: &buffer_pool,
+        };
+
+        let result = stream_multiline_response(&mut reader, &mut writer, partial, &ctx).await;
         assert!(result.is_err(), "EOF before terminator must be an error");
     }
 
