@@ -317,12 +317,17 @@ impl ClientSession {
                 .await
                 {
                     Ok(bytes) => bytes,
+                    Err(e) if is_client_disconnect_error(&e) => {
+                        // Client disconnected — backend was cleanly drained by streaming layer
+                        // (handle_client_write_error ran drain_until_terminator successfully).
+                        // Return connection to pool without cooldown.
+                        guard.complete();
+                        return Err(e);
+                    }
                     Err(e) => {
-                        // C1: On streaming error, avoid duplicate responses
+                        // C1: Backend error or dirty disconnect (drain failed).
+                        // Connection in unknown state — remove from pool.
                         provider.remove_with_cooldown(conn);
-                        if is_client_disconnect_error(&e) {
-                            return Err(e);
-                        }
                         warn!(
                             client = %self.client_addr,
                             backend = ?backend_id,
