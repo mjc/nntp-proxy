@@ -136,12 +136,17 @@ impl ClientSession {
                             total_commands = commands.len(),
                             "Backend EOF during batch read, sending 430 for remaining commands"
                         );
-                        // Send 430 for remaining commands to maintain protocol sync
-                        for remaining in &commands[i..] {
-                            self.send_430_to_client(client_write, backend_to_client_bytes)
-                                .await?;
-                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
-                        }
+                        // Backend dead — unconditional remove (write/flush already succeeded,
+                        // so this is a backend-side failure, not a client disconnect).
+                        self.send_430s_from(
+                            commands,
+                            i,
+                            client_write,
+                            backend_to_client_bytes,
+                            client_to_backend_bytes,
+                            backend_id,
+                        )
+                        .await?;
                         provider.remove_with_cooldown(conn);
                         guard.complete();
                         return Ok(());
@@ -155,12 +160,17 @@ impl ClientSession {
                             error = %e,
                             "Backend read error during batch, sending 430 for remaining commands"
                         );
-                        // Send 430 for remaining commands to maintain protocol sync
-                        for remaining in &commands[i..] {
-                            self.send_430_to_client(client_write, backend_to_client_bytes)
-                                .await?;
-                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
-                        }
+                        // Backend dead — unconditional remove (write/flush already succeeded,
+                        // so this is a backend-side failure, not a client disconnect).
+                        self.send_430s_from(
+                            commands,
+                            i,
+                            client_write,
+                            backend_to_client_bytes,
+                            client_to_backend_bytes,
+                            backend_id,
+                        )
+                        .await?;
                         provider.remove_with_cooldown(conn);
                         guard.complete();
                         return Ok(());
@@ -183,11 +193,16 @@ impl ClientSession {
                             partial_bytes = chunk_data.len(),
                             "Backend EOF with partial status line, sending 430 for remaining commands"
                         );
-                        for remaining in &commands[i..] {
-                            self.send_430_to_client(client_write, backend_to_client_bytes)
-                                .await?;
-                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
-                        }
+                        // Backend dead — unconditional remove (partial read means backend state unknown).
+                        self.send_430s_from(
+                            commands,
+                            i,
+                            client_write,
+                            backend_to_client_bytes,
+                            client_to_backend_bytes,
+                            backend_id,
+                        )
+                        .await?;
                         provider.remove_with_cooldown(conn);
                         guard.complete();
                         return Ok(());
@@ -201,11 +216,16 @@ impl ClientSession {
                             error = %e,
                             "Backend read error with partial status line, sending 430 for remaining commands"
                         );
-                        for remaining in &commands[i..] {
-                            self.send_430_to_client(client_write, backend_to_client_bytes)
-                                .await?;
-                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
-                        }
+                        // Backend dead — unconditional remove (partial read means backend state unknown).
+                        self.send_430s_from(
+                            commands,
+                            i,
+                            client_write,
+                            backend_to_client_bytes,
+                            client_to_backend_bytes,
+                            backend_id,
+                        )
+                        .await?;
                         provider.remove_with_cooldown(conn);
                         guard.complete();
                         return Ok(());
@@ -264,15 +284,16 @@ impl ClientSession {
                     "Backend returned Invalid response during batch, aborting batch"
                 );
 
-                // Send 430 for this and all remaining commands
-                for remaining_cmd in &commands[i..] {
-                    self.send_430_to_client(client_write, backend_to_client_bytes)
-                        .await?;
-                    *client_to_backend_bytes = client_to_backend_bytes.add(remaining_cmd.len());
-                    self.metrics.record_command(backend_id);
-                    self.metrics.record_error_4xx(backend_id);
-                    self.metrics.user_command(self.username());
-                }
+                // Send 430 for this and all remaining commands (metrics recorded per command).
+                self.send_430s_from(
+                    commands,
+                    i,
+                    client_write,
+                    backend_to_client_bytes,
+                    client_to_backend_bytes,
+                    backend_id,
+                )
+                .await?;
 
                 // Try to salvage connection with DATE health check
                 // If leftover data exists in the stream, DATE response will be corrupted
@@ -338,13 +359,18 @@ impl ClientSession {
                             error = %e,
                             "Streaming error during pipelined batch, sending 430 for remaining commands"
                         );
-                        // Backend died mid-stream. Commands 0..i already handled.
-                        // Send 430 for remaining commands to maintain protocol sync.
-                        for remaining in &commands[i + 1..] {
-                            self.send_430_to_client(client_write, backend_to_client_bytes)
-                                .await?;
-                            *client_to_backend_bytes = client_to_backend_bytes.add(remaining.len());
-                        }
+                        // Backend died mid-stream. Commands 0..i already handled;
+                        // send 430 for commands[i+1..] to maintain protocol sync.
+                        // Unconditional remove: StreamingError guarantees must_remove_connection().
+                        self.send_430s_from(
+                            commands,
+                            i + 1,
+                            client_write,
+                            backend_to_client_bytes,
+                            client_to_backend_bytes,
+                            backend_id,
+                        )
+                        .await?;
                         guard.complete();
                         return Ok(());
                     }
@@ -383,6 +409,31 @@ impl ClientSession {
 
         // Connection healthy — conn drops here, returning to pool automatically
         guard.complete();
+        Ok(())
+    }
+
+    /// Send 430 "No Such Article" to the client for each command in `commands[from..]`.
+    ///
+    /// Updates byte counters and records per-command metrics (command count + 4xx error).
+    /// Does NOT touch the backend connection or guard — callers handle those after this
+    /// returns. Consistent 4xx accounting across all backend-dead recovery sites.
+    async fn send_430s_from(
+        &self,
+        commands: &[&str],
+        from: usize,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+        backend_id: BackendId,
+    ) -> Result<()> {
+        for cmd in &commands[from..] {
+            self.send_430_to_client(client_write, backend_to_client_bytes)
+                .await?;
+            *client_to_backend_bytes = client_to_backend_bytes.add(cmd.len());
+            self.metrics.record_command(backend_id);
+            self.metrics.record_error_4xx(backend_id);
+            self.metrics.user_command(self.username());
+        }
         Ok(())
     }
 
