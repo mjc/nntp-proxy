@@ -87,18 +87,19 @@ async fn execute_backend_query(
     command: &str,
     multiline: bool,
 ) -> Result<QueryResult, ()> {
-    let Ok(mut conn) = provider.get_pooled_connection().await else {
-        return Ok(QueryResult::Error(backend_id));
+    let conn_raw = match provider.get_pooled_connection().await {
+        Ok(c) => c,
+        Err(_) => return Ok(QueryResult::Error(backend_id)),
     };
+    let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
     let mut buffer = deps.buffer_pool.acquire().await;
 
     // Use shared backend command execution with timing
-    match backend::send_command_timed(&mut *conn, command, &mut buffer).await {
+    match backend::send_command_timed(&mut **conn, command, &mut buffer).await {
         Ok((cmd_response, ttfb, send, recv)) => {
             let Some(status_code) = cmd_response.status_code() else {
-                // Invalid response - remove connection from pool
-                provider.remove_with_cooldown(conn);
+                // Invalid response - conn drops → remove_with_cooldown
                 return Err(());
             };
 
@@ -111,7 +112,6 @@ async fn execute_backend_query(
                     TerminatorStatus::FoundAt(pos) => {
                         // pos is after the terminator (terminator included in [..pos])
                         if pos < response.len() && conn.stash_leftover(&response[pos..]).is_err() {
-                            crate::pool::remove_from_pool(conn);
                             return Err(());
                         }
                         response.truncate(pos);
@@ -120,19 +120,11 @@ async fn execute_backend_query(
                         tail.update(&response);
                         loop {
                             match buffer.read_from(conn.as_mut()).await {
-                                Ok(0) => {
-                                    crate::pool::remove_from_pool(conn);
-                                    return Err(());
-                                }
-                                Err(_) => {
-                                    crate::pool::remove_from_pool(conn);
-                                    return Err(());
-                                }
+                                Ok(0) | Err(_) => return Err(()),
                                 Ok(n) => match tail.detect_terminator(&buffer[..n]) {
                                     TerminatorStatus::FoundAt(pos) => {
                                         if pos < n && conn.stash_leftover(&buffer[pos..n]).is_err()
                                         {
-                                            crate::pool::remove_from_pool(conn);
                                             return Err(());
                                         }
                                         response.extend_from_slice(&buffer[..pos]);
@@ -149,7 +141,7 @@ async fn execute_backend_query(
                 }
             }
 
-            let query_result = match status_code.as_u16() {
+            let result = match status_code.as_u16() {
                 220..=223 => {
                     // Record successful command and timing
                     tracing::debug!(
@@ -177,11 +169,11 @@ async fn execute_backend_query(
                 _ => QueryResult::Error(backend_id),
             };
 
-            Ok(query_result)
+            let _ = conn.release(); // response received; connection healthy, return to pool
+            Ok(result)
         }
         Err(_) => {
-            // Connection error - remove stale connection from pool
-            provider.remove_with_cooldown(conn);
+            // Connection error - conn drops → remove_with_cooldown
             Err(())
         }
     }

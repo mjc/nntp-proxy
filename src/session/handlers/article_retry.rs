@@ -81,7 +81,8 @@ impl ClientSession {
             ));
         };
 
-        let mut conn = provider.get_pooled_connection().await?;
+        let conn_raw = provider.get_pooled_connection().await?;
+        let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
         // Phase 1: Write all commands, then flush
         for command in commands {
@@ -95,7 +96,7 @@ impl ClientSession {
                 );
                 // Unconditional: write goes to the backend, not the client.
                 // A client disconnect cannot cause a backend write error.
-                provider.remove_with_cooldown(conn);
+                // conn drops here → ConnectionGuard::remove_with_cooldown
                 return Err(e.into());
             }
         }
@@ -109,7 +110,7 @@ impl ClientSession {
             );
             // Unconditional: flush goes to the backend, not the client.
             // A client disconnect cannot cause a backend flush error.
-            provider.remove_with_cooldown(conn);
+            // conn drops here → ConnectionGuard::remove_with_cooldown
             return Err(e.into());
         }
 
@@ -136,6 +137,7 @@ impl ClientSession {
                 BatchStep::Continue => {}
                 BatchStep::ClientDisconnect(e) => {
                     // Backend was cleanly drained; return connection to pool.
+                    let _ = conn.release();
                     guard.complete();
                     return Err(e);
                 }
@@ -152,19 +154,21 @@ impl ClientSession {
                     .await?;
                     // Unconditional: BackendDead signals backend-side failures only.
                     // Client disconnects surface as BatchStep::ClientDisconnect (handled above).
-                    provider.remove_with_cooldown(conn);
+                    // conn drops here → ConnectionGuard::remove_with_cooldown
                     guard.complete();
                     return Ok(());
                 }
                 BatchStep::BatchComplete => {
-                    // All 430s already sent internally (Invalid + DATE salvage path).
+                    // All 430s already sent internally; DATE check passed → connection healthy.
+                    let _ = conn.release();
                     guard.complete();
                     return Ok(());
                 }
             }
         }
 
-        // All commands handled — conn returns to pool on drop.
+        // All commands handled — connection healthy, return to pool.
+        let _ = conn.release();
         guard.complete();
         Ok(())
     }

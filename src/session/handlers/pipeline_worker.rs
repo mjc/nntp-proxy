@@ -69,7 +69,7 @@ pub async fn backend_pipeline_worker(
         result_buf.clear();
 
         // Acquire a connection from the pool
-        let mut conn = match provider.get_pooled_connection().await {
+        let conn_raw = match provider.get_pooled_connection().await {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -81,6 +81,7 @@ pub async fn backend_pipeline_worker(
                 continue;
             }
         };
+        let mut conn = crate::pool::ConnectionGuard::new(conn_raw, (*provider).clone());
 
         // Execute the batch: write all commands, then read all responses
         let success;
@@ -94,12 +95,13 @@ pub async fn backend_pipeline_worker(
         )
         .await;
 
-        if !success {
-            // Unconditional: !success means a backend write, flush, or read failed.
-            // Client disconnects only close the oneshot response channel; they do
-            // not affect the backend connection and cannot cause !success here.
-            provider.remove_with_cooldown(conn);
+        if success {
+            let _ = conn.release(); // batch healthy; return connection to pool
         }
+        // !success: conn drops here → ConnectionGuard::remove_with_cooldown
+        // Unconditional: !success means a backend write, flush, or read failed.
+        // Client disconnects only close the oneshot response channel; they do
+        // not affect the backend connection and cannot cause !success here.
 
         // Record pipeline batch metrics
         if batch_len > 1 {

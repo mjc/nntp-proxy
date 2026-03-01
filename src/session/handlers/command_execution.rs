@@ -122,13 +122,15 @@ impl ClientSession {
             // Spawn in background so client can retry immediately
             let cmd_for_log = command.trim().to_string();
             let provider_for_salvage = provider.clone();
+            let conn_for_salvage = conn.release(); // hand off; salvage decides pool fate
             tokio::spawn(async move {
                 tracing::debug!(
                     backend = ?backend_id,
                     command = %cmd_for_log,
                     "Attempting to salvage connection after Invalid response"
                 );
-                crate::pool::salvage_with_health_check(conn, provider_for_salvage).await;
+                crate::pool::salvage_with_health_check(conn_for_salvage, provider_for_salvage)
+                    .await;
             });
 
             // guard drops here → complete_command called automatically
@@ -139,7 +141,7 @@ impl ClientSession {
         // Note: response is already read into buffer, keeping connection clean
         if cmd_response.is_430() {
             self.handle_430_availability(backend_id, state.availability);
-            // guard drops here → complete_command called automatically
+            let _ = conn.release(); // connection is healthy; return to pool
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
         }
 
@@ -171,7 +173,7 @@ impl ClientSession {
                 // (prevents TUI in-flight count drift on streaming errors)
                 if e.must_remove_connection() {
                     // Backend error or dirty disconnect (drain failed) —
-                    // connection in unknown state, remove from pool.
+                    // connection in unknown state; ConnectionGuard removes from pool on drop.
                     warn!(
                         client = %self.client_addr,
                         backend = backend_id.as_index(),
@@ -181,10 +183,9 @@ impl ClientSession {
                     );
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username());
-                    provider.remove_with_cooldown(conn);
                 } else {
                     // Client disconnect — backend was cleanly drained. Return to pool.
-                    drop(conn);
+                    let _ = conn.release();
                 }
                 // into_anyhow() preserves io::Error for ClientDisconnect so that
                 // is_client_disconnect_error() in outer callers can still classify it.
@@ -202,6 +203,7 @@ impl ClientSession {
 
         // Explicitly complete the guard on the success path
         guard.complete();
+        let _ = conn.release(); // streaming completed; connection healthy, return to pool
 
         Ok(BackendAttemptResult::Success {
             backend_id,
@@ -220,28 +222,22 @@ impl ClientSession {
         command: &str,
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(
-        deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        crate::pool::ConnectionGuard,
         backend::CommandResponse,
         u64,
         u64,
         u64,
     )> {
-        let mut conn = provider.get_pooled_connection().await?;
+        let conn = provider.get_pooled_connection().await?;
+        let mut guard = crate::pool::ConnectionGuard::new(conn, provider.clone());
 
         let result = self
-            .execute_and_get_first_chunk(&mut conn, backend_id, command, buffer)
+            .execute_and_get_first_chunk(&mut guard, backend_id, command, buffer)
             .await;
 
         match result {
-            Ok((cmd_response, ttfb, send, recv)) => Ok((conn, cmd_response, ttfb, send, recv)),
-            Err(e) => {
-                // Unconditional: errors here originate from backend I/O only
-                // (sending the command, reading the first response chunk).
-                // No client writes happen in this path, so a client disconnect
-                // cannot be the cause.
-                provider.remove_with_cooldown(conn);
-                Err(e)
-            }
+            Ok((cmd_response, ttfb, send, recv)) => Ok((guard, cmd_response, ttfb, send, recv)),
+            Err(e) => Err(e), // guard drops → remove_with_cooldown
         }
     }
 
