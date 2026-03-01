@@ -167,10 +167,9 @@ impl ClientSession {
             .inspect_err(|e| {
                 // guard drops here → complete_command called automatically
                 // (prevents TUI in-flight count drift on streaming errors)
-
-                // Only mark as backend error metrics if it's NOT a client disconnect.
-                // Client disconnects are normal behavior and shouldn't penalize backends.
                 if !is_client_disconnect_error(e) {
+                    // Backend error or dirty disconnect (drain failed) —
+                    // connection in unknown state, remove from pool.
                     warn!(
                         client = %self.client_addr,
                         backend = backend_id.as_index(),
@@ -180,8 +179,11 @@ impl ClientSession {
                     );
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username());
+                    provider.remove_with_cooldown(conn);
+                } else {
+                    // Client disconnect — backend was cleanly drained. Return to pool.
+                    drop(conn);
                 }
-                provider.remove_with_cooldown(conn);
             })?;
 
         self.record_response_metrics(
