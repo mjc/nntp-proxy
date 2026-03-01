@@ -22,13 +22,6 @@ pub enum SessionError {
     Backend(anyhow::Error),
 }
 
-impl SessionError {
-    /// Returns true if this is a client disconnect (not a real error).
-    pub fn is_client_disconnect(&self) -> bool {
-        matches!(self, Self::ClientDisconnect(_))
-    }
-}
-
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -95,28 +88,26 @@ mod tests {
     fn client_disconnect_from_broken_pipe_io_error() {
         let io_err = std::io::Error::from(ErrorKind::BrokenPipe);
         let e = SessionError::from(anyhow::Error::from(io_err));
-        assert!(e.is_client_disconnect());
+        assert!(matches!(e, SessionError::ClientDisconnect(_)));
     }
 
     #[test]
     fn client_disconnect_from_connection_reset_io_error() {
         let io_err = std::io::Error::from(ErrorKind::ConnectionReset);
         let e = SessionError::from(anyhow::Error::from(io_err));
-        assert!(e.is_client_disconnect());
+        assert!(matches!(e, SessionError::ClientDisconnect(_)));
     }
 
     #[test]
     fn backend_from_non_disconnect_io_error() {
         let io_err = std::io::Error::from(ErrorKind::TimedOut);
         let e = SessionError::from(anyhow::Error::from(io_err));
-        assert!(!e.is_client_disconnect());
         assert!(matches!(e, SessionError::Backend(_)));
     }
 
     #[test]
     fn backend_from_non_io_error() {
         let e = SessionError::from(anyhow::anyhow!("generic error"));
-        assert!(!e.is_client_disconnect());
         assert!(matches!(e, SessionError::Backend(_)));
     }
 
@@ -125,7 +116,7 @@ mod tests {
         let io_err = std::io::Error::from(ErrorKind::BrokenPipe);
         let streaming_err = crate::session::streaming::StreamingError::ClientDisconnect(io_err);
         let e = SessionError::from(streaming_err);
-        assert!(e.is_client_disconnect());
+        assert!(matches!(e, SessionError::ClientDisconnect(_)));
     }
 
     #[test]
@@ -135,7 +126,6 @@ mod tests {
             bytes_received: 100,
         };
         let e = SessionError::from(streaming_err);
-        assert!(!e.is_client_disconnect());
         assert!(matches!(e, SessionError::Backend(_)));
     }
 }

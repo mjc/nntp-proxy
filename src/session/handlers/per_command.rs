@@ -359,7 +359,7 @@ impl ClientSession {
                         .await
                     {
                         Ok(()) => true,
-                        Err(e) if e.is_client_disconnect() => {
+                        Err(e @ SessionError::ClientDisconnect(_)) => {
                             return Err(e);
                         }
                         Err(e) => {
@@ -512,7 +512,10 @@ mod tests {
         let broken_pipe = std::io::Error::new(ErrorKind::BrokenPipe, "broken pipe");
         let err: anyhow::Error = broken_pipe.into();
         assert!(
-            crate::session::SessionError::from(err).is_client_disconnect(),
+            matches!(
+                crate::session::SessionError::from(err),
+                crate::session::SessionError::ClientDisconnect(_)
+            ),
             "BrokenPipe should be classified as client disconnect"
         );
 
@@ -520,7 +523,10 @@ mod tests {
         let timeout = std::io::Error::new(ErrorKind::TimedOut, "timed out");
         let err: anyhow::Error = timeout.into();
         assert!(
-            !crate::session::SessionError::from(err).is_client_disconnect(),
+            matches!(
+                crate::session::SessionError::from(err),
+                crate::session::SessionError::Backend(_)
+            ),
             "TimedOut should NOT be classified as client disconnect"
         );
 
@@ -528,7 +534,10 @@ mod tests {
         let other = std::io::Error::other("other error");
         let err: anyhow::Error = other.into();
         assert!(
-            !crate::session::SessionError::from(err).is_client_disconnect(),
+            matches!(
+                crate::session::SessionError::from(err),
+                crate::session::SessionError::Backend(_)
+            ),
             "Other errors should NOT be classified as client disconnect"
         );
     }

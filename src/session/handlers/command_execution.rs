@@ -141,7 +141,7 @@ impl ClientSession {
 
         // Handle 430 - article not found
         // Note: response is already read into buffer, keeping connection clean
-        if cmd_response.is_430() {
+        if cmd_response.response.is_430() {
             self.handle_430_availability(backend_id, state.availability);
             let _ = conn.release(); // connection is healthy; return to pool
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });

@@ -141,14 +141,6 @@ pub struct CommandResponse {
 }
 
 impl CommandResponse {
-    /// Check if response is 430 (article not found)
-    #[inline]
-    pub fn is_430(&self) -> bool {
-        self.response
-            .status_code()
-            .is_some_and(|code| code.as_u16() == 430)
-    }
-
     /// Get status code if valid
     #[inline]
     pub fn status_code(&self) -> Option<crate::protocol::StatusCode> {
@@ -415,7 +407,7 @@ mod tests {
             is_multiline: false,
             warnings: SmallVec::new(),
         };
-        assert!(response.is_430());
+        assert!(response.response.is_430());
 
         // Create a 220 response
         let response = CommandResponse {
@@ -424,7 +416,7 @@ mod tests {
             is_multiline: true,
             warnings: SmallVec::new(),
         };
-        assert!(!response.is_430());
+        assert!(!response.response.is_430());
     }
 
     #[test]

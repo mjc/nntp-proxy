@@ -327,9 +327,9 @@ impl NntpProxy {
                     self.metrics.record_error(bid);
                 }
 
-                // Only log non-client-disconnect errors (avoid spam from normal disconnects)
-                if !e.is_client_disconnect() {
-                    warn!("Session error for client {}: {:?}", client_addr, e);
+                // Only log backend errors — client disconnects are normal operation
+                if let SessionError::Backend(ref inner) = e {
+                    warn!("Session error for client {}: {:?}", client_addr, inner);
                 }
                 Err(e)
             }

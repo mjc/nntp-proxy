@@ -73,16 +73,6 @@ pub enum ConnectionError {
     CompressionRequired { backend: String, response: String },
 }
 
-impl ConnectionError {
-    /// Check if this is a client disconnection
-    ///
-    /// Returns true for error kinds in [`DISCONNECT_KINDS`] (`BrokenPipe`, `ConnectionReset`).
-    #[must_use]
-    pub fn is_client_disconnect(&self) -> bool {
-        matches!(self, Self::IoError(e) if is_disconnect_kind(e.kind()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,21 +123,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_client_disconnect() {
-        // BrokenPipe is a disconnect
-        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
-        let err = ConnectionError::IoError(io_err);
-        assert!(err.is_client_disconnect());
+    fn io_error_disconnect_kinds_are_classified_correctly() {
+        let broken_pipe = ConnectionError::IoError(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        assert!(
+            matches!(&broken_pipe, ConnectionError::IoError(e) if is_disconnect_kind(e.kind()))
+        );
 
-        // ConnectionReset is also a disconnect
-        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
-        let err = ConnectionError::IoError(io_err);
-        assert!(err.is_client_disconnect());
+        let reset = ConnectionError::IoError(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(matches!(&reset, ConnectionError::IoError(e) if is_disconnect_kind(e.kind())));
 
-        // Other errors are not disconnects
-        let io_err = std::io::Error::other("other");
-        let err = ConnectionError::IoError(io_err);
-        assert!(!err.is_client_disconnect());
+        let other = ConnectionError::IoError(std::io::Error::other("other"));
+        assert!(!matches!(&other, ConnectionError::IoError(e) if is_disconnect_kind(e.kind())));
     }
 
     #[test]
