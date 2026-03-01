@@ -46,7 +46,7 @@ macro_rules! counter_type {
             }
 
             #[inline]
-            pub fn increment(&mut self) {
+            pub const fn increment(&mut self) {
                 self.0 += 1;
             }
 
@@ -93,7 +93,7 @@ macro_rules! timing_type {
             }
 
             #[inline]
-            pub fn add(&mut self, other: Self) {
+            pub const fn add(&mut self, other: Self) {
                 self.0 += other.0;
             }
 
@@ -200,12 +200,12 @@ impl ErrorCount {
     }
 
     #[inline]
-    pub fn increment(&mut self) {
+    pub const fn increment(&mut self) {
         self.0 += 1;
     }
 
     #[inline]
-    pub fn add(&mut self, other: ErrorCount) {
+    pub const fn add(&mut self, other: Self) {
         self.0 += other.0;
     }
 
@@ -254,13 +254,13 @@ impl ArticleCount {
     }
 
     #[inline]
-    pub fn increment(&mut self) {
+    pub const fn increment(&mut self) {
         self.0 += 1;
     }
 
     /// Calculate average bytes per article
     #[must_use]
-    pub fn average_bytes(self, total_bytes: u64) -> Option<u64> {
+    pub const fn average_bytes(self, total_bytes: u64) -> Option<u64> {
         if self.0 > 0 {
             Some(total_bytes / self.0)
         } else {
@@ -343,7 +343,7 @@ impl Microseconds {
     }
 
     #[inline]
-    pub fn add(&mut self, other: Microseconds) {
+    pub const fn add(&mut self, other: Self) {
         self.0 += other.0;
     }
 
@@ -379,7 +379,7 @@ impl OverheadMillis {
 
 /// Bytes per second transfer rate
 #[derive(
-    Debug, Clone, Copy, PartialEq, PartialOrd, Default, serde::Serialize, serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Default, serde::Serialize, serde::Deserialize,
 )]
 pub struct BytesPerSecond(u64);
 

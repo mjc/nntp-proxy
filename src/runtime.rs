@@ -35,7 +35,7 @@ impl RuntimeConfig {
 
     /// Disable CPU pinning
     #[must_use]
-    pub fn without_cpu_pinning(mut self) -> Self {
+    pub const fn without_cpu_pinning(mut self) -> Self {
         self.enable_cpu_pinning = false;
         self
     }

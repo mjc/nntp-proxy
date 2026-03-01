@@ -23,7 +23,7 @@ pub struct WeightedRoundRobin {
 impl WeightedRoundRobin {
     /// Create a new weighted round-robin strategy
     #[must_use]
-    pub fn new(total_weight: usize) -> Self {
+    pub const fn new(total_weight: usize) -> Self {
         Self {
             counter: AtomicUsize::new(0),
             total_weight,
@@ -31,7 +31,7 @@ impl WeightedRoundRobin {
     }
 
     /// Update total weight when backends are added
-    pub fn set_total_weight(&mut self, total_weight: usize) {
+    pub const fn set_total_weight(&mut self, total_weight: usize) {
         self.total_weight = total_weight;
     }
 
@@ -55,7 +55,7 @@ impl WeightedRoundRobin {
 
     /// Get total weight
     #[must_use]
-    pub fn total_weight(&self) -> usize {
+    pub const fn total_weight(&self) -> usize {
         self.total_weight
     }
 }

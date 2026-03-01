@@ -55,7 +55,7 @@ pub enum HealthCheckError {
 
 impl From<HealthCheckError> for managed::RecycleError<crate::connection_error::ConnectionError> {
     fn from(err: HealthCheckError) -> Self {
-        managed::RecycleError::Message(err.to_string().into())
+        Self::Message(err.to_string().into())
     }
 }
 

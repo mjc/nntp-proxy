@@ -125,7 +125,7 @@ impl NntpProxy {
     /// # }
     /// ```
     #[must_use]
-    pub fn builder(config: crate::config::Config) -> NntpProxyBuilder {
+    pub const fn builder(config: crate::config::Config) -> NntpProxyBuilder {
         NntpProxyBuilder::new(config)
     }
 
@@ -171,7 +171,7 @@ impl NntpProxy {
     /// Get the router
     #[must_use]
     #[inline]
-    pub fn router(&self) -> &Arc<router::BackendSelector> {
+    pub const fn router(&self) -> &Arc<router::BackendSelector> {
         &self.router
     }
 
@@ -185,28 +185,28 @@ impl NntpProxy {
     /// Get the buffer pool
     #[must_use]
     #[inline]
-    pub fn buffer_pool(&self) -> &BufferPool {
+    pub const fn buffer_pool(&self) -> &BufferPool {
         &self.buffer_pool
     }
 
     /// Get the article cache (always present - capacity 0 if not configured)
     #[must_use]
     #[inline]
-    pub fn cache(&self) -> &Arc<UnifiedCache> {
+    pub const fn cache(&self) -> &Arc<UnifiedCache> {
         &self.cache
     }
 
     /// Get the metrics collector
     #[must_use]
     #[inline]
-    pub fn metrics(&self) -> &MetricsCollector {
+    pub const fn metrics(&self) -> &MetricsCollector {
         &self.metrics
     }
 
     /// Get connection stats aggregator
     #[must_use]
     #[inline]
-    pub fn connection_stats(&self) -> &ConnectionStatsAggregator {
+    pub const fn connection_stats(&self) -> &ConnectionStatsAggregator {
         &self.connection_stats
     }
 }

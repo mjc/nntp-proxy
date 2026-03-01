@@ -306,13 +306,13 @@ impl HybridArticleEntry {
     ///
     /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
-    pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
+    pub const fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
         super::entry_helpers::matches_command_type_verb(self.status_code.as_u16(), cmd_verb)
     }
 
     /// Get backend availability as ArticleAvailability struct
     #[inline]
-    pub fn availability(&self) -> ArticleAvailability {
+    pub const fn availability(&self) -> ArticleAvailability {
         self.availability
     }
 
@@ -321,7 +321,7 @@ impl HybridArticleEntry {
     /// Returns true if at least one backend has been checked.
     /// Wrapper around `ArticleAvailability::has_availability_info()` for convenience.
     #[inline]
-    pub fn has_availability_info(&self) -> bool {
+    pub const fn has_availability_info(&self) -> bool {
         self.availability.has_availability_info()
     }
 
@@ -331,7 +331,7 @@ impl HybridArticleEntry {
     /// handles eviction based on insertion time. This method is kept for compatibility
     /// and always returns false since the cache layer manages staleness.
     #[inline]
-    pub fn is_availability_stale(&self, _ttl_millis: u64) -> bool {
+    pub const fn is_availability_stale(&self, _ttl_millis: u64) -> bool {
         // Foyer cache handles TTL-based eviction separately
         false
     }
@@ -341,7 +341,7 @@ impl HybridArticleEntry {
     /// HybridArticleEntry now tracks timestamps via `timestamp` field for tier-aware TTL,
     /// but foyer handles eviction separately. This method is a no-op for compatibility.
     #[inline]
-    pub fn clear_stale_availability(&mut self, _ttl_millis: u64) {
+    pub const fn clear_stale_availability(&mut self, _ttl_millis: u64) {
         // Foyer cache handles TTL-based eviction, no need to clear here
     }
 
@@ -355,7 +355,7 @@ impl HybridArticleEntry {
 
     /// Get the tier of the backend that provided this article
     #[inline]
-    pub fn tier(&self) -> u8 {
+    pub const fn tier(&self) -> u8 {
         self.tier
     }
 }

@@ -103,7 +103,7 @@ pub(super) fn response_for_command(
 /// Simpler version of `response_for_command` for boolean checks.
 /// Case-insensitive per RFC 3977 (commands are case-insensitive).
 #[inline]
-pub(super) fn matches_command_type_verb(status_code: u16, cmd_verb: &str) -> bool {
+pub(super) const fn matches_command_type_verb(status_code: u16, cmd_verb: &str) -> bool {
     match status_code {
         220 => {
             cmd_verb.eq_ignore_ascii_case("ARTICLE")

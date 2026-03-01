@@ -179,7 +179,7 @@ impl Timestamp {
     /// Duration between two timestamps
     #[must_use]
     #[inline]
-    pub fn duration_since(&self, earlier: Timestamp) -> std::time::Duration {
+    pub fn duration_since(&self, earlier: Self) -> std::time::Duration {
         self.0.duration_since(earlier.0)
     }
 }

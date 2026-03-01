@@ -111,25 +111,25 @@ pub struct Password(String);
 // Convert nutype errors to our ValidationError
 impl From<HostNameError> for ValidationError {
     fn from(_: HostNameError) -> Self {
-        ValidationError::EmptyHostName
+        Self::EmptyHostName
     }
 }
 
 impl From<ServerNameError> for ValidationError {
     fn from(_: ServerNameError) -> Self {
-        ValidationError::EmptyServerName
+        Self::EmptyServerName
     }
 }
 
 impl From<UsernameError> for ValidationError {
     fn from(_: UsernameError) -> Self {
-        ValidationError::EmptyUsername
+        Self::EmptyUsername
     }
 }
 
 impl From<PasswordError> for ValidationError {
     fn from(_: PasswordError) -> Self {
-        ValidationError::EmptyPassword
+        Self::EmptyPassword
     }
 }
 

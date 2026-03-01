@@ -205,7 +205,7 @@ impl<'a> Headers<'a> {
     }
 
     /// Iterate over all headers (zero-copy)
-    pub fn iter(&self) -> HeaderIter<'a> {
+    pub const fn iter(&self) -> HeaderIter<'a> {
         HeaderIter {
             data: self.data,
             pos: 0,
@@ -213,7 +213,7 @@ impl<'a> Headers<'a> {
     }
 
     /// Get raw header bytes
-    pub fn as_bytes(&self) -> &'a [u8] {
+    pub const fn as_bytes(&self) -> &'a [u8] {
         self.data
     }
 }

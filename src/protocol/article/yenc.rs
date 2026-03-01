@@ -133,7 +133,7 @@ struct YencLines<'a> {
 
 impl<'a> YencLines<'a> {
     #[inline]
-    fn new(reader: &'a mut BufReader<&'a [u8]>) -> Self {
+    const fn new(reader: &'a mut BufReader<&'a [u8]>) -> Self {
         Self {
             reader,
             line_buf: Vec::new(),

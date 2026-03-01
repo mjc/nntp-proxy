@@ -8,7 +8,7 @@ use crate::config::RoutingMode;
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommandRoutingDecision {
+pub enum CommandRoutingDecision {
     /// Intercept and handle authentication locally
     InterceptAuth,
     /// Forward command to backend (authenticated or auth disabled)
@@ -33,7 +33,7 @@ pub(crate) enum CommandRoutingDecision {
 ///
 /// # Returns
 /// A `CommandRoutingDecision` indicating what action to take
-pub(crate) fn decide_command_routing(
+pub fn decide_command_routing(
     command: &str,
     is_authenticated: bool,
     auth_enabled: bool,

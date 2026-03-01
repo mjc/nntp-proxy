@@ -109,7 +109,7 @@ impl Builder {
 
     /// Set the maximum number of concurrent connections in the pool
     #[must_use]
-    pub fn max_connections(mut self, max_size: usize) -> Self {
+    pub const fn max_connections(mut self, max_size: usize) -> Self {
         self.max_size = max_size;
         self
     }

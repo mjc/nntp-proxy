@@ -55,7 +55,7 @@ impl BackendStats {
     /// Calculate average article size
     #[must_use]
     #[inline]
-    pub fn average_article_size(&self) -> Option<u64> {
+    pub const fn average_article_size(&self) -> Option<u64> {
         self.article_count
             .average_bytes(self.article_bytes_total.get())
     }
@@ -134,7 +134,7 @@ impl BackendStats {
     /// Get total bytes transferred
     #[must_use]
     #[inline]
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.bytes_sent
             .as_u64()
             .saturating_add(self.bytes_received.as_u64())
@@ -143,7 +143,7 @@ impl BackendStats {
     /// Check if backend has any activity
     #[must_use]
     #[inline]
-    pub fn has_activity(&self) -> bool {
+    pub const fn has_activity(&self) -> bool {
         self.total_commands.get() > 0
     }
 }

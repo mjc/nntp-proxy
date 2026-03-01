@@ -108,7 +108,7 @@ impl ClientSessionBuilder {
     ///
     /// Note: If you use `with_router()`, you typically want PerCommand or Hybrid mode.
     #[must_use]
-    pub fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
+    pub const fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
         self.routing_mode = mode;
         self
     }
@@ -142,13 +142,13 @@ impl ClientSessionBuilder {
     /// When false, only backend availability is tracked (saves memory).
     /// When true, full article bodies are cached.
     #[must_use]
-    pub fn with_cache_articles(mut self, cache: bool) -> Self {
+    pub const fn with_cache_articles(mut self, cache: bool) -> Self {
         self.cache_articles = cache;
         self
     }
 
     /// Configure adaptive availability prechecking
-    pub fn with_adaptive_precheck(mut self, enable: bool) -> Self {
+    pub const fn with_adaptive_precheck(mut self, enable: bool) -> Self {
         self.adaptive_precheck = enable;
         self
     }
@@ -302,7 +302,7 @@ impl ClientSession {
     /// Get the unique client ID
     #[must_use]
     #[inline]
-    pub fn client_id(&self) -> ClientId {
+    pub const fn client_id(&self) -> ClientId {
         self.client_id
     }
 
@@ -313,7 +313,7 @@ impl ClientSession {
     /// but be in Stateful mode (e.g., after hybrid mode switches).
     #[must_use]
     #[inline]
-    pub fn is_per_command_routing(&self) -> bool {
+    pub const fn is_per_command_routing(&self) -> bool {
         self.router.is_some()
     }
 
@@ -347,7 +347,9 @@ impl ClientSession {
     /// Get the connection stats aggregator (if enabled)
     #[must_use]
     #[inline]
-    pub(crate) fn connection_stats(&self) -> Option<&crate::metrics::ConnectionStatsAggregator> {
+    pub(crate) const fn connection_stats(
+        &self,
+    ) -> Option<&crate::metrics::ConnectionStatsAggregator> {
         self.connection_stats.as_ref()
     }
 

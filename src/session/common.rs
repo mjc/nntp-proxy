@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthResult {
+pub enum AuthResult {
     /// Authentication succeeded
     Authenticated(BackendToClientBytes),
     /// Authentication failed or not required yet
@@ -19,7 +19,7 @@ pub(crate) enum AuthResult {
 
 /// Result of checking for QUIT command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuitStatus {
+pub enum QuitStatus {
     /// QUIT command was detected and response sent (contains bytes written)
     Quit(BackendToClientBytes),
     /// Not a QUIT command
@@ -27,7 +27,7 @@ pub(crate) enum QuitStatus {
 }
 
 /// Handle AUTHINFO command and update auth state
-pub(crate) async fn handle_auth_command<W>(
+pub async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction<'_>,
     client_write: &mut W,
@@ -59,10 +59,7 @@ where
 }
 
 /// Check if command is QUIT and send closing response
-pub(crate) async fn handle_quit_command<W>(
-    command: &str,
-    client_write: &mut W,
-) -> Result<QuitStatus>
+pub async fn handle_quit_command<W>(command: &str, client_write: &mut W) -> Result<QuitStatus>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -86,7 +83,7 @@ where
 /// Handle successful authentication with all side effects
 ///
 /// Sets username, records connection stats, updates metrics
-pub(crate) fn on_authentication_success(
+pub fn on_authentication_success(
     client_addr: impl std::fmt::Display,
     username: Option<String>,
     routing_mode: &crate::config::RoutingMode,
@@ -225,7 +222,7 @@ impl AuthHandlerResult {
 ///
 /// Groups the session-level references needed by [`handle_stateful_auth_check`]
 /// to keep its parameter list concise.
-pub(crate) struct AuthCheckContext<'a> {
+pub struct AuthCheckContext<'a> {
     pub auth_handler: &'a std::sync::Arc<crate::auth::AuthHandler>,
     pub auth_state: &'a crate::session::AuthState,
     pub routing_mode: &'a crate::config::RoutingMode,

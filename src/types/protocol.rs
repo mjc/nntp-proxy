@@ -33,7 +33,7 @@ impl<'a> MessageId<'a> {
     /// # Safety
     /// Caller must ensure: `s.len() >= 3`, `s.starts_with('<')`, `s.ends_with('>')`
     #[inline(always)]
-    pub unsafe fn from_str_unchecked(s: &'a str) -> Self {
+    pub const unsafe fn from_str_unchecked(s: &'a str) -> Self {
         Self(Cow::Borrowed(s))
     }
 
@@ -55,7 +55,7 @@ impl<'a> MessageId<'a> {
     ///
     /// Uses SIMD-accelerated memchr for fast scanning.
     #[inline]
-    pub fn extract_from_command_borrowed(command: &'a str) -> Option<MessageId<'a>> {
+    pub fn extract_from_command_borrowed(command: &'a str) -> Option<Self> {
         let bytes = command.as_bytes();
         let start = memchr::memchr(b'<', bytes)?;
         let end = memchr::memchr(b'>', &bytes[start..])?;

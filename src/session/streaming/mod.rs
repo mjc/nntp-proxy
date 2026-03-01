@@ -42,7 +42,7 @@ impl StreamingError {
     ///
     /// Callers should call `provider.remove_with_cooldown(conn)` when this is true,
     /// and `drop(conn)` (returning to pool) when false.
-    pub(crate) fn must_remove_connection(&self) -> bool {
+    pub(crate) const fn must_remove_connection(&self) -> bool {
         !matches!(self, Self::ClientDisconnect(_))
     }
 }

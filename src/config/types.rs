@@ -126,7 +126,7 @@ pub struct Config {
 }
 
 /// Proxy server settings
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Proxy {
     /// Host/IP to bind to (default: 0.0.0.0)
@@ -185,7 +185,7 @@ impl Default for Proxy {
 }
 
 /// Cache configuration for article caching
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cache {
     /// Maximum cache size in bytes (memory tier for hybrid cache)
     ///
@@ -271,7 +271,7 @@ impl std::fmt::Display for CompressionCodec {
 /// - Cold articles on disk (slower, larger capacity)
 ///
 /// Requires the `hybrid-cache` feature to be enabled.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskCache {
     /// Path to disk cache directory
     ///
@@ -333,7 +333,7 @@ impl Default for Cache {
 }
 
 /// Health check configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthCheck {
     /// Interval between health checks
     #[serde(
@@ -363,7 +363,7 @@ impl Default for HealthCheck {
 }
 
 /// Client authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ClientAuth {
     /// Optional custom greeting message
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,7 +374,7 @@ pub struct ClientAuth {
 }
 
 /// Individual user credentials
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserCredentials {
     pub username: String,
     pub password: String,
@@ -382,7 +382,7 @@ pub struct UserCredentials {
 
 impl ClientAuth {
     /// Check if authentication is enabled
-    pub fn is_enabled(&self) -> bool {
+    pub const fn is_enabled(&self) -> bool {
         !self.users.is_empty()
     }
 
@@ -396,7 +396,7 @@ impl ClientAuth {
 }
 
 /// Configuration for a single backend server
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Server {
     pub host: HostName,
     pub port: Port,
@@ -586,21 +586,21 @@ impl ServerBuilder {
 
     /// Set maximum number of concurrent connections
     #[must_use]
-    pub fn max_connections(mut self, max: MaxConnections) -> Self {
+    pub const fn max_connections(mut self, max: MaxConnections) -> Self {
         self.max_connections = Some(max);
         self
     }
 
     /// Enable TLS/SSL for this backend connection
     #[must_use]
-    pub fn use_tls(mut self, enabled: bool) -> Self {
+    pub const fn use_tls(mut self, enabled: bool) -> Self {
         self.use_tls = enabled;
         self
     }
 
     /// Set whether to verify TLS certificates
     #[must_use]
-    pub fn tls_verify_cert(mut self, verify: bool) -> Self {
+    pub const fn tls_verify_cert(mut self, verify: bool) -> Self {
         self.tls_verify_cert = verify;
         self
     }
@@ -614,42 +614,42 @@ impl ServerBuilder {
 
     /// Set keep-alive interval for idle connections
     #[must_use]
-    pub fn connection_keepalive(mut self, interval: Duration) -> Self {
+    pub const fn connection_keepalive(mut self, interval: Duration) -> Self {
         self.connection_keepalive = Some(interval);
         self
     }
 
     /// Set connection replacement cooldown duration
     #[must_use]
-    pub fn replacement_cooldown(mut self, cooldown: Duration) -> Self {
+    pub const fn replacement_cooldown(mut self, cooldown: Duration) -> Self {
         self.replacement_cooldown = Some(cooldown);
         self
     }
 
     /// Set maximum connections to check per health check cycle
     #[must_use]
-    pub fn health_check_max_per_cycle(mut self, max: usize) -> Self {
+    pub const fn health_check_max_per_cycle(mut self, max: usize) -> Self {
         self.health_check_max_per_cycle = Some(max);
         self
     }
 
     /// Set timeout for acquiring connections during health checks
     #[must_use]
-    pub fn health_check_pool_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn health_check_pool_timeout(mut self, timeout: Duration) -> Self {
         self.health_check_pool_timeout = Some(timeout);
         self
     }
 
     /// Set server tier for prioritization (lower = higher priority)
     #[must_use]
-    pub fn tier(mut self, tier: u8) -> Self {
+    pub const fn tier(mut self, tier: u8) -> Self {
         self.tier = tier;
         self
     }
 
     /// Set wire compression mode (RFC 8054 COMPRESS DEFLATE)
     #[must_use]
-    pub fn compress(mut self, compress: Option<bool>) -> Self {
+    pub const fn compress(mut self, compress: Option<bool>) -> Self {
         self.compress = compress;
         self
     }
@@ -671,28 +671,28 @@ impl ServerBuilder {
     /// Connections to this backend are cleared after this duration of proxy-wide inactivity.
     /// Default: 10 minutes.
     #[must_use]
-    pub fn backend_idle_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn backend_idle_timeout(mut self, timeout: Duration) -> Self {
         self.backend_idle_timeout = Some(timeout);
         self
     }
 
     /// Enable or disable backend pipelining (request multiplexing)
     #[must_use]
-    pub fn enable_pipelining(mut self, enabled: bool) -> Self {
+    pub const fn enable_pipelining(mut self, enabled: bool) -> Self {
         self.enable_pipelining = enabled;
         self
     }
 
     /// Set pipeline queue depth
     #[must_use]
-    pub fn pipeline_queue_depth(mut self, depth: usize) -> Self {
+    pub const fn pipeline_queue_depth(mut self, depth: usize) -> Self {
         self.pipeline_queue_depth = Some(depth);
         self
     }
 
     /// Set pipeline batch size
     #[must_use]
-    pub fn pipeline_batch_size(mut self, size: usize) -> Self {
+    pub const fn pipeline_batch_size(mut self, size: usize) -> Self {
         self.pipeline_batch_size = Some(size);
         self
     }

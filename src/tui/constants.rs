@@ -22,7 +22,7 @@ pub mod layout {
     pub const BACKEND_LIST_WIDTH_PCT: u16 = 50;
     pub const CHART_WIDTH_PCT: u16 = 50;
 
-    pub fn main_sections() -> [Constraint; 4] {
+    pub const fn main_sections() -> [Constraint; 4] {
         [
             Constraint::Length(TITLE_HEIGHT),
             Constraint::Length(SUMMARY_HEIGHT),
@@ -31,7 +31,7 @@ pub mod layout {
         ]
     }
 
-    pub fn backend_columns() -> [Constraint; 3] {
+    pub const fn backend_columns() -> [Constraint; 3] {
         [
             Constraint::Percentage(BACKEND_LIST_WIDTH_PCT),
             Constraint::Percentage(CHART_WIDTH_PCT),

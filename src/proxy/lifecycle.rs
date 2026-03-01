@@ -338,7 +338,7 @@ impl NntpProxy {
 
     /// Get session mode label for logging
     #[inline]
-    pub(super) fn session_mode_label(
+    pub(super) const fn session_mode_label(
         &self,
         session_mode: crate::session::SessionMode,
     ) -> &'static str {

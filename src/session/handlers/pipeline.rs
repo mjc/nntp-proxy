@@ -56,7 +56,7 @@ impl CommandBatch {
     }
 
     /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
-    pub fn is_trailing_oversized(&self) -> bool {
+    pub const fn is_trailing_oversized(&self) -> bool {
         self.trailing_oversized
     }
 

@@ -164,7 +164,7 @@ pub struct CommandGuard {
 
 impl CommandGuard {
     /// Create a new guard that will call `complete_command` on drop.
-    pub fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
+    pub const fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
         Self {
             router,
             backend_id,
@@ -180,7 +180,7 @@ impl CommandGuard {
 
     /// Get the backend ID this guard is protecting.
     #[must_use]
-    pub fn backend_id(&self) -> BackendId {
+    pub const fn backend_id(&self) -> BackendId {
         self.backend_id
     }
 }

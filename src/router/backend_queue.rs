@@ -178,7 +178,7 @@ impl BackendQueue {
 
     /// Maximum queue depth
     #[inline]
-    pub fn max_depth(&self) -> usize {
+    pub const fn max_depth(&self) -> usize {
         self.max_depth
     }
 }

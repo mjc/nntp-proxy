@@ -93,7 +93,7 @@ impl PoolUtilization {
 
     #[inline]
     #[must_use]
-    pub fn as_percentage(self) -> f64 {
+    pub const fn as_percentage(self) -> f64 {
         self.0
     }
 

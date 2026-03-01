@@ -31,7 +31,7 @@ struct UserConnectionStats {
 
 impl UserConnectionStats {
     /// Create new stats for a single event
-    fn new(routing_mode: &'static str, timestamp: Instant) -> Self {
+    const fn new(routing_mode: &'static str, timestamp: Instant) -> Self {
         Self {
             count: AtomicU64::new(1),
             routing_mode,

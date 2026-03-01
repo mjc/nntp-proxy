@@ -243,7 +243,7 @@ impl MetricsCollector {
 
     /// Type-safe recording: consumes unrecorded bytes and returns recorded marker
     #[inline]
-    pub fn record_client_to_backend(
+    pub const fn record_client_to_backend(
         &self,
         bytes: crate::types::MetricsBytes<crate::types::Unrecorded>,
     ) -> crate::types::MetricsBytes<crate::types::Recorded> {
@@ -252,7 +252,7 @@ impl MetricsCollector {
 
     /// Type-safe recording: consumes unrecorded bytes and returns recorded marker
     #[inline]
-    pub fn record_backend_to_client(
+    pub const fn record_backend_to_client(
         &self,
         bytes: crate::types::MetricsBytes<crate::types::Unrecorded>,
     ) -> crate::types::MetricsBytes<crate::types::Recorded> {

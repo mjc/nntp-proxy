@@ -4,7 +4,7 @@
 
 /// Determine what action to take for metrics recording based on response code
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MetricsAction {
+pub enum MetricsAction {
     /// Record 4xx error (excluding 423, 430)
     Error4xx,
     /// Record 5xx error
@@ -26,7 +26,7 @@ pub(crate) enum MetricsAction {
 /// # Excluded Error Codes
 /// - 423 (no such article number in group) - expected for article numbers
 /// - 430 (no such article) - expected, handled by retry logic
-pub(crate) fn determine_metrics_action(response_code: u16, is_multiline: bool) -> MetricsAction {
+pub fn determine_metrics_action(response_code: u16, is_multiline: bool) -> MetricsAction {
     if (400..500).contains(&response_code) && response_code != 423 && response_code != 430 {
         MetricsAction::Error4xx
     } else if response_code >= 500 {

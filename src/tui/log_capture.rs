@@ -129,7 +129,7 @@ pub struct LogMakeWriter {
 impl LogMakeWriter {
     /// Create a new MakeWriter for the given buffer
     #[must_use]
-    pub fn new(buffer: LogBuffer) -> Self {
+    pub const fn new(buffer: LogBuffer) -> Self {
         Self { buffer }
     }
 }

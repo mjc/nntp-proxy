@@ -106,7 +106,7 @@ impl ConnectionStream {
 
     /// Returns the connection type as a string for logging/debugging
     #[must_use]
-    pub fn connection_type(&self) -> &'static str {
+    pub const fn connection_type(&self) -> &'static str {
         match &self.transport {
             ConnectionTransport::Plain(_) => "TCP",
             ConnectionTransport::Tls(_) => "TLS",
@@ -150,7 +150,7 @@ impl ConnectionStream {
     /// Returns None for TLS or compressed streams.
     /// Useful for socket optimization that requires direct TCP access.
     #[must_use]
-    pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
+    pub const fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match &self.transport {
             ConnectionTransport::Plain(tcp) => Some(tcp),
             _ => None,
@@ -158,7 +158,7 @@ impl ConnectionStream {
     }
 
     /// Get a mutable reference to the underlying TCP stream (if plain, uncompressed TCP)
-    pub fn as_tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
+    pub const fn as_tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
         match &mut self.transport {
             ConnectionTransport::Plain(tcp) => Some(tcp),
             _ => None,

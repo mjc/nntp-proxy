@@ -7,6 +7,6 @@ mod cache_policy;
 mod decisions;
 mod metrics_policy;
 
-pub(crate) use cache_policy::{CacheAction, determine_cache_action};
-pub(crate) use decisions::{CommandRoutingDecision, decide_command_routing};
-pub(crate) use metrics_policy::{MetricsAction, determine_metrics_action};
+pub use cache_policy::{CacheAction, determine_cache_action};
+pub use decisions::{CommandRoutingDecision, decide_command_routing};
+pub use metrics_policy::{MetricsAction, determine_metrics_action};

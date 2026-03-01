@@ -15,13 +15,13 @@ pub fn max_connections() -> MaxConnections {
 
 /// Default health check interval
 #[inline]
-pub fn health_check_interval() -> Duration {
+pub const fn health_check_interval() -> Duration {
     Duration::from_secs(30)
 }
 
 /// Default health check timeout
 #[inline]
-pub fn health_check_timeout() -> Duration {
+pub const fn health_check_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
@@ -40,38 +40,38 @@ pub fn cache_max_capacity() -> CacheCapacity {
 
 /// Default cache TTL (1 hour)
 #[inline]
-pub fn cache_ttl() -> Duration {
+pub const fn cache_ttl() -> Duration {
     Duration::from_secs(3600)
 }
 
 /// Default for caching article bodies (true = full caching)
 #[inline]
-pub fn cache_articles() -> bool {
+pub const fn cache_articles() -> bool {
     true
 }
 
 /// Default for adaptive availability prechecking (false = disabled)
 #[inline]
-pub fn adaptive_precheck() -> bool {
+pub const fn adaptive_precheck() -> bool {
     false
 }
 
 /// Default for TLS certificate verification (true for security)
 #[inline]
-pub fn tls_verify_cert() -> bool {
+pub const fn tls_verify_cert() -> bool {
     true
 }
 
 /// Default maximum number of connections to check per health check cycle
 #[inline]
-pub fn health_check_max_per_cycle() -> usize {
+pub const fn health_check_max_per_cycle() -> usize {
     use crate::constants::pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE;
     MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE
 }
 
 /// Default timeout when acquiring a connection for health checking
 #[inline]
-pub fn health_check_pool_timeout() -> Duration {
+pub const fn health_check_pool_timeout() -> Duration {
     use crate::constants::pool::HEALTH_CHECK_POOL_TIMEOUT_MS;
     Duration::from_millis(HEALTH_CHECK_POOL_TIMEOUT_MS)
 }
@@ -92,13 +92,13 @@ pub fn disk_cache_capacity() -> CacheCapacity {
 
 /// Default disk cache compression codec (LZ4 = fast, ~60% reduction)
 #[inline]
-pub fn disk_cache_compression_codec() -> CompressionCodec {
+pub const fn disk_cache_compression_codec() -> CompressionCodec {
     CompressionCodec::Lz4
 }
 
 /// Default disk cache shards
 #[inline]
-pub fn disk_cache_shards() -> usize {
+pub const fn disk_cache_shards() -> usize {
     4
 }
 
@@ -107,37 +107,37 @@ pub fn disk_cache_shards() -> usize {
 /// After this duration of proxy-wide inactivity, idle backend connections are cleared.
 /// Prevents stale connections from accumulating during overnight idle periods.
 #[inline]
-pub fn backend_idle_timeout() -> Duration {
+pub const fn backend_idle_timeout() -> Duration {
     Duration::from_secs(10 * 60)
 }
 
 /// Default for backend pipelining (enabled)
 #[inline]
-pub fn enable_pipelining() -> bool {
+pub const fn enable_pipelining() -> bool {
     true
 }
 
 /// Default pipeline queue depth
 #[inline]
-pub fn pipeline_queue_depth() -> usize {
+pub const fn pipeline_queue_depth() -> usize {
     1000
 }
 
 /// Default pipeline batch size
 #[inline]
-pub fn pipeline_batch_size() -> usize {
+pub const fn pipeline_batch_size() -> usize {
     4
 }
 
 /// Default connection replacement cooldown (30 seconds)
 #[inline]
-pub fn replacement_cooldown() -> Duration {
+pub const fn replacement_cooldown() -> Duration {
     Duration::from_secs(30)
 }
 
 /// Default connection replacement cooldown option (Some(30 seconds))
 #[inline]
-pub fn replacement_cooldown_option() -> Option<Duration> {
+pub const fn replacement_cooldown_option() -> Option<Duration> {
     Some(replacement_cooldown())
 }
 
@@ -145,7 +145,7 @@ pub fn replacement_cooldown_option() -> Option<Duration> {
 /// Sized for ~50 concurrent connections with single buffer per connection
 /// Total memory: 50 × 724KB ≈ 35MB
 #[inline]
-pub fn buffer_pool_count() -> usize {
+pub const fn buffer_pool_count() -> usize {
     50
 }
 
@@ -153,7 +153,7 @@ pub fn buffer_pool_count() -> usize {
 /// Sized for 16 concurrent caching operations
 /// Total memory: 16 × 768KB ≈ 12MB
 #[inline]
-pub fn capture_pool_count() -> usize {
+pub const fn capture_pool_count() -> usize {
     16
 }
 

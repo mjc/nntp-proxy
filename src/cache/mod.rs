@@ -222,7 +222,7 @@ impl UnifiedCache {
 
     /// Check if this is a hybrid cache (has disk tier)
     #[must_use]
-    pub fn is_hybrid(&self) -> bool {
+    pub const fn is_hybrid(&self) -> bool {
         matches!(self, Self::Hybrid(_))
     }
 

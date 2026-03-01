@@ -245,7 +245,7 @@ pub enum ConfigSource {
 impl ConfigSource {
     /// Get a human-readable description
     #[must_use]
-    pub fn description(&self) -> &'static str {
+    pub const fn description(&self) -> &'static str {
         match self {
             Self::File => "configuration file",
             Self::Environment => "environment variables",

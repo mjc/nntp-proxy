@@ -15,11 +15,11 @@ pub enum TerminatorStatus {
 
 impl TerminatorStatus {
     /// Returns true if a terminator was found
-    pub fn is_found(self) -> bool {
+    pub const fn is_found(self) -> bool {
         matches!(self, Self::FoundAt(_))
     }
     /// Get the number of bytes to write from the chunk
-    pub fn write_len(self, chunk_size: usize) -> usize {
+    pub const fn write_len(self, chunk_size: usize) -> usize {
         match self {
             Self::FoundAt(pos) => pos,
             Self::NotFound => chunk_size,
@@ -70,11 +70,11 @@ impl TailBuffer {
         &self.data[..self.len]
     }
     /// Get the current length of valid tail data
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
     /// Returns true if the buffer is empty
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
     /// Find spanning terminator offset in chunk

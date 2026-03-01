@@ -94,7 +94,7 @@ pub struct TcpOptimizer<'a> {
 
 impl<'a> TcpOptimizer<'a> {
     /// Create a new TCP optimizer with default high-throughput settings
-    pub fn new(stream: &'a TcpStream) -> Self {
+    pub const fn new(stream: &'a TcpStream) -> Self {
         Self {
             stream,
             recv_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER,
@@ -153,7 +153,7 @@ pub struct ConnectionOptimizer<'a> {
 
 impl<'a> ConnectionOptimizer<'a> {
     /// Create a new connection optimizer with default buffer sizes
-    pub fn new(stream: &'a ConnectionStream) -> Self {
+    pub const fn new(stream: &'a ConnectionStream) -> Self {
         Self {
             stream,
             recv_buffer_size: None,
@@ -162,7 +162,7 @@ impl<'a> ConnectionOptimizer<'a> {
     }
 
     /// Create a connection optimizer with custom buffer sizes
-    pub fn with_buffer_sizes(
+    pub const fn with_buffer_sizes(
         stream: &'a ConnectionStream,
         recv_size: usize,
         send_size: usize,

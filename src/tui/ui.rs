@@ -212,7 +212,7 @@ fn create_app_summary(
     }
 
     /// Color for buffer pool utilization
-    fn buffer_color(in_use: usize, total: usize) -> Color {
+    const fn buffer_color(in_use: usize, total: usize) -> Color {
         let percent = if total > 0 { (in_use * 100) / total } else { 0 };
         if percent > 80 {
             Color::Red
@@ -309,7 +309,7 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
         }
     }
 
-    fn non_zero_color(value: u64) -> Color {
+    const fn non_zero_color(value: u64) -> Color {
         if value > 0 {
             styles::VALUE_INFO
         } else {

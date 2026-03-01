@@ -125,7 +125,7 @@ impl MetricsSnapshot {
     /// This is a pure calculation method - no side effects.
     #[must_use]
     #[inline]
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.client_to_backend_bytes.as_u64() + self.backend_to_client_bytes.as_u64()
     }
 

@@ -206,7 +206,7 @@ pub struct UserMetrics {
 }
 
 impl UserMetrics {
-    pub fn new(username: String) -> Self {
+    pub const fn new(username: String) -> Self {
         Self {
             username,
             active_connections: 0,
@@ -246,7 +246,7 @@ impl UserMetrics {
         }
     }
 
-    fn restore_from(&mut self, persisted: &PersistedUser) {
+    const fn restore_from(&mut self, persisted: &PersistedUser) {
         self.total_connections = persisted.total_connections;
         self.bytes_sent = persisted.bytes_sent;
         self.bytes_received = persisted.bytes_received;

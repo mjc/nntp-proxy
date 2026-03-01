@@ -101,19 +101,19 @@ impl ArticleEntry {
 
     /// Get the tier of the backend that provided this article
     #[inline]
-    pub fn tier(&self) -> u8 {
+    pub const fn tier(&self) -> u8 {
         self.tier
     }
 
     /// Set the tier (used when updating entry)
     #[inline]
-    pub fn set_tier(&mut self, tier: u8) {
+    pub const fn set_tier(&mut self, tier: u8) {
         self.tier = tier;
     }
 
     /// Get raw buffer for serving to client
     #[inline]
-    pub fn buffer(&self) -> &Arc<Vec<u8>> {
+    pub const fn buffer(&self) -> &Arc<Vec<u8>> {
         &self.buffer
     }
 
@@ -145,7 +145,7 @@ impl ArticleEntry {
     }
 
     /// Set backend availability (used for hydrating from hybrid cache)
-    pub fn set_availability(&mut self, availability: ArticleAvailability) {
+    pub const fn set_availability(&mut self, availability: ArticleAvailability) {
         self.backend_availability = availability;
     }
 
@@ -165,7 +165,7 @@ impl ArticleEntry {
     ///
     /// This provides the same interface as the old CachedArticle.response field.
     #[inline]
-    pub fn response(&self) -> &Arc<Vec<u8>> {
+    pub const fn response(&self) -> &Arc<Vec<u8>> {
         &self.buffer
     }
 
@@ -175,7 +175,7 @@ impl ArticleEntry {
     /// If false, we haven't tried any backends yet and should run precheck instead of
     /// serving from cache.
     #[inline]
-    pub fn has_availability_info(&self) -> bool {
+    pub const fn has_availability_info(&self) -> bool {
         self.backend_availability.has_availability_info()
     }
 
@@ -644,7 +644,7 @@ impl ArticleCache {
 
     /// Get maximum cache capacity
     #[inline]
-    pub fn capacity(&self) -> u64 {
+    pub const fn capacity(&self) -> u64 {
         self.capacity
     }
 

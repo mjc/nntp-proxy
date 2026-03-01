@@ -116,7 +116,7 @@ impl TlsConfigBuilder {
     /// Enable or disable TLS
     ///
     /// Default: `false`
-    pub fn enabled(mut self, use_tls: bool) -> Self {
+    pub const fn enabled(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
         self
     }
@@ -127,7 +127,7 @@ impl TlsConfigBuilder {
     /// be used for testing or with trusted private networks.
     ///
     /// Default: `true`
-    pub fn verify_cert(mut self, verify: bool) -> Self {
+    pub const fn verify_cert(mut self, verify: bool) -> Self {
         self.tls_verify_cert = verify;
         self
     }

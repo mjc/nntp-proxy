@@ -45,7 +45,7 @@ impl SessionLoopState {
     /// # Arguments
     /// * `auth_enabled` - If true, auth checking starts enabled; if false, it's skipped
     #[must_use]
-    pub fn new(auth_enabled: bool) -> Self {
+    pub const fn new(auth_enabled: bool) -> Self {
         Self {
             client_to_backend: ClientToBackendBytes::zero(),
             backend_to_client: BackendToClientBytes::zero(),
@@ -62,7 +62,7 @@ impl SessionLoopState {
     /// Used by hybrid mode when switching from per-command to stateful,
     /// to carry forward the bytes already transferred.
     #[must_use]
-    pub fn from_initial_bytes(
+    pub const fn from_initial_bytes(
         client_to_backend: u64,
         backend_to_client: u64,
         auth_enabled: bool,
@@ -72,7 +72,7 @@ impl SessionLoopState {
 
     /// Builder method: set initial byte counts
     #[must_use]
-    pub fn with_initial_bytes(mut self, c2b: u64, b2c: u64) -> Self {
+    pub const fn with_initial_bytes(mut self, c2b: u64, b2c: u64) -> Self {
         self.client_to_backend = ClientToBackendBytes::new(c2b);
         self.backend_to_client = BackendToClientBytes::new(b2c);
         self.last_reported_c2b = self.client_to_backend;
@@ -84,7 +84,7 @@ impl SessionLoopState {
     ///
     /// Returns `true` every `METRICS_FLUSH_INTERVAL` iterations.
     #[inline]
-    pub fn check_and_maybe_flush_metrics(&mut self) -> bool {
+    pub const fn check_and_maybe_flush_metrics(&mut self) -> bool {
         self.iteration_count += 1;
         if self.iteration_count >= crate::constants::session::METRICS_FLUSH_INTERVAL {
             self.iteration_count = 0;
@@ -96,13 +96,13 @@ impl SessionLoopState {
 
     /// Add bytes to client-to-backend counter
     #[inline]
-    pub fn add_client_to_backend(&mut self, bytes: usize) {
+    pub const fn add_client_to_backend(&mut self, bytes: usize) {
         self.client_to_backend = self.client_to_backend.add(bytes);
     }
 
     /// Add bytes to backend-to-client counter
     #[inline]
-    pub fn add_backend_to_client(&mut self, bytes: u64) {
+    pub const fn add_backend_to_client(&mut self, bytes: u64) {
         self.backend_to_client = self.backend_to_client.add_u64(bytes);
     }
 
@@ -149,14 +149,14 @@ impl SessionLoopState {
 
     /// Mark authentication as complete (skip future checks)
     #[inline]
-    pub fn mark_authenticated(&mut self) {
+    pub const fn mark_authenticated(&mut self) {
         self.skip_auth_check = true;
     }
 
     /// Update state based on auth handler result
     ///
     /// Returns the bytes written for convenience in chaining.
-    pub fn apply_auth_result(&mut self, result: &super::common::AuthHandlerResult) -> u64 {
+    pub const fn apply_auth_result(&mut self, result: &super::common::AuthHandlerResult) -> u64 {
         let bytes = result.bytes_written();
         self.add_backend_to_client(bytes);
         if result.should_skip_further_checks() {

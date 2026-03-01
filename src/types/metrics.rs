@@ -248,13 +248,13 @@ impl TransferMetrics {
 
     #[must_use]
     #[inline]
-    pub fn total(&self) -> u64 {
+    pub const fn total(&self) -> u64 {
         self.client_to_backend.as_u64() + self.backend_to_client.as_u64()
     }
 
     #[must_use]
     #[inline]
-    pub fn as_tuple(&self) -> (u64, u64) {
+    pub const fn as_tuple(&self) -> (u64, u64) {
         (
             self.client_to_backend.as_u64(),
             self.backend_to_client.as_u64(),
@@ -263,7 +263,7 @@ impl TransferMetrics {
 
     /// Saturating subtraction of two transfer metrics
     #[must_use]
-    pub fn saturating_sub(self, other: Self) -> Self {
+    pub const fn saturating_sub(self, other: Self) -> Self {
         Self {
             client_to_backend: self
                 .client_to_backend

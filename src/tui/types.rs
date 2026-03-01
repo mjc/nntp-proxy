@@ -61,7 +61,7 @@ impl ChartY {
     /// Get maximum of two values
     #[must_use]
     #[inline]
-    pub fn max(self, other: Self) -> Self {
+    pub const fn max(self, other: Self) -> Self {
         Self::new(self.0.max(other.0))
     }
 }

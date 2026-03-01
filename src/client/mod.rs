@@ -61,7 +61,7 @@ impl NntpClient {
     ///
     /// The buffer pool can be shared across multiple clients via `Clone`.
     #[must_use]
-    pub fn new(conn_pool: DeadpoolConnectionProvider, buffer_pool: BufferPool) -> Self {
+    pub const fn new(conn_pool: DeadpoolConnectionProvider, buffer_pool: BufferPool) -> Self {
         Self {
             conn_pool,
             buffer_pool,

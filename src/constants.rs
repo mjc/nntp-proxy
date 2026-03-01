@@ -68,6 +68,7 @@ pub mod buffer {
     pub const STREAM_CHUNK: usize = 724 * 1024;
 
     /// Maximum leftover bytes between pipelined responses.
+    ///
     /// Leftover is a suffix of one TCP read, so normally bounded by buffer
     /// capacity. This limit catches protocol desync where a backend sends
     /// unexpected extra data after terminators. 128KB is generous — normal

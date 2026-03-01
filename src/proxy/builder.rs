@@ -71,7 +71,7 @@ impl NntpProxyBuilder {
     ///
     /// The routing mode defaults to `Stateful` (1:1) mode.
     #[must_use]
-    pub fn new(config: Config) -> Self {
+    pub const fn new(config: Config) -> Self {
         Self {
             config,
             routing_mode: RoutingMode::Stateful,
@@ -88,7 +88,7 @@ impl NntpProxyBuilder {
     /// - `PerCommand`: Each command routes to a different backend
     /// - `Hybrid`: Starts in per-command mode, switches to stateful when needed
     #[must_use]
-    pub fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
+    pub const fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
         self.routing_mode = mode;
         self
     }
@@ -98,7 +98,7 @@ impl NntpProxyBuilder {
     /// This affects the size of each buffer in the pool. Larger buffers
     /// can improve throughput for large article transfers but use more memory.
     #[must_use]
-    pub fn with_buffer_pool_size(mut self, size: usize) -> Self {
+    pub const fn with_buffer_pool_size(mut self, size: usize) -> Self {
         self.buffer_size = Some(size);
         self
     }
@@ -108,7 +108,7 @@ impl NntpProxyBuilder {
     /// This affects how many buffers are pre-allocated. Should roughly match
     /// the expected number of concurrent connections.
     #[must_use]
-    pub fn with_buffer_pool_count(mut self, count: usize) -> Self {
+    pub const fn with_buffer_pool_count(mut self, count: usize) -> Self {
         self.buffer_count = Some(count);
         self
     }

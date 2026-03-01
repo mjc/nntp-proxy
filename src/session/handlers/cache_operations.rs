@@ -175,7 +175,7 @@ impl ClientSession {
     }
 
     /// Create precheck dependencies
-    pub(super) fn precheck_deps<'a>(
+    pub(super) const fn precheck_deps<'a>(
         &'a self,
         router: &'a Arc<BackendSelector>,
     ) -> precheck::PrecheckDeps<'a> {

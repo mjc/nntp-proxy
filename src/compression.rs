@@ -172,19 +172,19 @@ impl<S> DecompressStream<S> {
 
     /// Get a reference to the inner stream.
     #[inline]
-    pub fn get_ref(&self) -> &S {
+    pub const fn get_ref(&self) -> &S {
         &self.inner
     }
 
     /// Get a mutable reference to the inner stream.
     #[inline]
-    pub fn get_mut(&mut self) -> &mut S {
+    pub const fn get_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 
     /// Get bandwidth stats: (compressed bytes read from network, decompressed bytes delivered).
     #[inline]
-    pub fn bandwidth_stats(&self) -> (u64, u64) {
+    pub const fn bandwidth_stats(&self) -> (u64, u64) {
         (self.bytes_compressed_in, self.bytes_decompressed_out)
     }
 }

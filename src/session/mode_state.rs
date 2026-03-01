@@ -128,7 +128,7 @@ impl ModeState {
     /// ```
     #[inline]
     #[must_use]
-    pub fn new(initial_mode: SessionMode, routing_mode: RoutingMode) -> Self {
+    pub const fn new(initial_mode: SessionMode, routing_mode: RoutingMode) -> Self {
         Self {
             mode: AtomicU8::new(initial_mode.to_u8()),
             routing_mode,

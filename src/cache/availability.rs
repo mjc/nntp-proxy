@@ -147,7 +147,7 @@ impl ArticleAvailability {
     /// Therefore: `missing` state ALWAYS wins over `has` state.
     /// We trust 430s absolutely but treat successes with skepticism.
     #[inline]
-    pub fn merge_from(&mut self, other: &Self) {
+    pub const fn merge_from(&mut self, other: &Self) {
         // Simple union: trust all 430s from both sources
         // 430 is authoritative, so missing bits should accumulate
         self.checked |= other.checked;

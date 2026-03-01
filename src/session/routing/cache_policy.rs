@@ -7,7 +7,7 @@ use crate::command::NntpCommand;
 
 /// Determine what caching action to take for a response
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheAction {
+pub enum CacheAction {
     /// Capture full article content and cache it
     CaptureArticle,
     /// Track availability only (for HEAD/BODY/STAT success)
@@ -27,7 +27,7 @@ pub(crate) enum CacheAction {
 /// - 222 = BODY (body only - cache this for yEnc content)
 /// - 223 = STAT (status only)
 #[inline]
-pub(crate) fn should_capture_for_cache(
+pub const fn should_capture_for_cache(
     response_code: u16,
     is_multiline: bool,
     cache_articles: bool,
@@ -41,7 +41,7 @@ pub(crate) fn should_capture_for_cache(
 
 /// Check if a response should be tracked for availability (HEAD/BODY/ARTICLE/STAT success)
 #[inline]
-pub(crate) fn should_track_availability(response_code: u16, has_message_id: bool) -> bool {
+pub const fn should_track_availability(response_code: u16, has_message_id: bool) -> bool {
     has_message_id && matches!(response_code, 220..=223)
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn should_track_availability(response_code: u16, has_message_id: bool
 ///
 /// The command is validated to ensure it's not a stateful command
 /// that would require mode switching (GROUP, NEXT, XOVER, etc.)
-pub(crate) fn determine_cache_action(
+pub fn determine_cache_action(
     command: &str,
     response_code: u16,
     is_multiline: bool,

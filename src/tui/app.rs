@@ -119,7 +119,7 @@ impl ThroughputHistory {
 
     /// Get all points
     #[must_use]
-    fn points(&self) -> &VecDeque<ThroughputPoint> {
+    const fn points(&self) -> &VecDeque<ThroughputPoint> {
         &self.points
     }
 
@@ -167,7 +167,7 @@ pub struct TuiAppBuilder {
 impl TuiAppBuilder {
     /// Create a new TUI app builder
     #[must_use]
-    pub fn new(
+    pub const fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
         servers: Arc<Vec<Server>>,
@@ -206,7 +206,7 @@ impl TuiAppBuilder {
 
     /// Set custom history size (default is 60 points)
     #[must_use]
-    pub fn with_history_size(mut self, history_size: HistorySize) -> Self {
+    pub const fn with_history_size(mut self, history_size: HistorySize) -> Self {
         self.history_size = history_size;
         self
     }
@@ -443,7 +443,7 @@ impl TuiApp {
 
     /// Get client throughput history (global)
     #[must_use]
-    pub fn client_throughput_history(&self) -> &VecDeque<ThroughputPoint> {
+    pub const fn client_throughput_history(&self) -> &VecDeque<ThroughputPoint> {
         self.client_history.points()
     }
 
@@ -507,7 +507,7 @@ impl TuiApp {
 
     /// Get log buffer for displaying recent log messages
     #[must_use]
-    pub fn log_buffer(&self) -> &Arc<LogBuffer> {
+    pub const fn log_buffer(&self) -> &Arc<LogBuffer> {
         &self.log_buffer
     }
 
@@ -518,7 +518,7 @@ impl TuiApp {
     }
 
     /// Toggle between normal and log fullscreen view
-    pub fn toggle_log_fullscreen(&mut self) {
+    pub const fn toggle_log_fullscreen(&mut self) {
         self.view_mode = match self.view_mode {
             ViewMode::Normal => ViewMode::LogFullscreen,
             ViewMode::LogFullscreen => ViewMode::Normal,
@@ -526,13 +526,13 @@ impl TuiApp {
     }
 
     /// Toggle detailed metrics display
-    pub fn toggle_details(&mut self) {
+    pub const fn toggle_details(&mut self) {
         self.show_details = !self.show_details;
     }
 
     /// Get current details display state
     #[must_use]
-    pub fn show_details(&self) -> bool {
+    pub const fn show_details(&self) -> bool {
         self.show_details
     }
 
@@ -544,7 +544,7 @@ impl TuiApp {
 
     /// Get buffer pool (optional - for monitoring buffer stats)
     #[must_use]
-    pub fn buffer_pool(&self) -> Option<&crate::pool::BufferPool> {
+    pub const fn buffer_pool(&self) -> Option<&crate::pool::BufferPool> {
         self.buffer_pool.as_ref()
     }
 }
