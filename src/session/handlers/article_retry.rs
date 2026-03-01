@@ -27,6 +27,16 @@ pub(super) struct BatchPipelineState<'a> {
     pub chunk_data: &'a mut bytes::BytesMut,
 }
 
+/// Backend connection context for `process_batch_response`
+///
+/// Groups the backend connection, its ID, and the scratch buffer to keep
+/// `process_batch_response`'s parameter count within clippy limits.
+struct BatchConnContext<'a> {
+    conn: &'a mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+    backend_id: BackendId,
+    buffer: &'a mut crate::pool::PooledBuffer,
+}
+
 /// Per-response outcome from `process_batch_response`
 enum BatchStep {
     /// Response handled successfully; continue to the next command.
@@ -127,16 +137,13 @@ impl ClientSession {
         state.chunk_data.clear();
 
         for i in 0..batch.len() {
+            let mut bcc = BatchConnContext {
+                conn: &mut conn,
+                backend_id,
+                buffer: &mut buffer,
+            };
             match self
-                .process_batch_response(
-                    batch,
-                    i,
-                    &mut conn,
-                    client_write,
-                    backend_id,
-                    &mut state,
-                    &mut buffer,
-                )
+                .process_batch_response(batch, i, &mut bcc, client_write, &mut state)
                 .await?
             {
                 BatchStep::Continue => {}
@@ -187,20 +194,18 @@ impl ClientSession {
     /// This method does **not** call `remove_with_cooldown` — that responsibility belongs
     /// to the caller. Instead it returns `BackendDead` or `BatchComplete` to signal what
     /// action is required.
-    #[allow(clippy::too_many_arguments)]
     async fn process_batch_response(
         &self,
         batch: &CommandBatch,
         idx: usize,
-        conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        bcc: &mut BatchConnContext<'_>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_id: BackendId,
         state: &mut BatchPipelineState<'_>,
-        buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<BatchStep> {
         use crate::session::routing::{MetricsAction, determine_metrics_action};
         use crate::session::{backend, streaming};
 
+        let backend_id = bcc.backend_id;
         let command = batch.command(idx);
         let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
 
@@ -212,9 +217,11 @@ impl ClientSession {
             state.leftover.clear();
             state.chunk_data.len()
         } else {
-            match buffer.read_from(&mut **conn).await {
+            match bcc.buffer.read_from(&mut **bcc.conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
-                    state.chunk_data.extend_from_slice(&buffer[..bytes_read]);
+                    state
+                        .chunk_data
+                        .extend_from_slice(&bcc.buffer[..bytes_read]);
                     bytes_read
                 }
                 Ok(_) => {
@@ -246,9 +253,11 @@ impl ClientSession {
 
         // --- Read more if the initial chunk was too short to parse ---
         if initial_chunk_len < crate::protocol::MIN_RESPONSE_LENGTH {
-            match buffer.read_from(&mut **conn).await {
+            match bcc.buffer.read_from(&mut **bcc.conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
-                    state.chunk_data.extend_from_slice(&buffer[..bytes_read]);
+                    state
+                        .chunk_data
+                        .extend_from_slice(&bcc.buffer[..bytes_read]);
                 }
                 Ok(_) => {
                     warn!(
@@ -342,7 +351,7 @@ impl ClientSession {
                 backend = ?backend_id,
                 "Attempting to salvage connection after batch Invalid with DATE check"
             );
-            match crate::pool::health_check::check_date_response(conn).await {
+            match crate::pool::health_check::check_date_response(bcc.conn).await {
                 Ok(()) => {
                     debug!(
                         backend = ?backend_id,
@@ -375,7 +384,7 @@ impl ClientSession {
                 buffer_pool: &self.buffer_pool,
             };
             match streaming::stream_multiline_response_pipelined(
-                &mut **conn,
+                &mut **bcc.conn,
                 client_write,
                 chunk,
                 &ctx,

@@ -219,23 +219,17 @@ impl BufferPool {
     ///
     /// The public API (`acquire()`) returns a `PooledBuffer` which is a safe wrapper that
     /// enforces this contract through the type system and usage patterns.
-    #[allow(clippy::uninit_vec)]
     fn create_aligned_buffer(size: usize) -> Vec<u8> {
         // Align to page boundaries (4KB) for better memory performance
         let page_size = 4096;
         let aligned_size = size.div_ceil(page_size) * page_size;
 
-        // Use aligned allocation for better cache performance
+        // Pre-allocate with page-aligned capacity, then zero-initialize to `size`.
+        // prefault_pages then touches every page up to `capacity` (including alignment
+        // padding) to force physical page allocation upfront, eliminating page-fault
+        // latency during I/O.
         let mut buffer = Vec::with_capacity(aligned_size);
-        // SAFETY: We're setting the length without initializing the data.
-        // This is safe because:
-        // 1. The Vec is wrapped in PooledBuffer which derefs to &[u8]
-        // 2. PooledBuffer is immediately used with AsyncRead which writes into it
-        // 3. Callers only access &buffer[..n] where n is the bytes actually read
-        // 4. Unwritten/uninitialized bytes are never accessed
-        unsafe {
-            buffer.set_len(size);
-        }
+        buffer.resize(size, 0u8);
         Self::prefault_pages(&mut buffer);
         buffer
     }
