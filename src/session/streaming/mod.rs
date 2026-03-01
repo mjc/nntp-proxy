@@ -126,12 +126,17 @@ pub(crate) struct StreamContext<'a> {
     pub buffer_pool: &'a crate::pool::BufferPool,
 }
 
-/// Context for handling client write errors during streaming
-struct ClientWriteErrorContext<'a> {
+/// Context used to drain the backend after a client disconnects mid-stream.
+///
+/// Carries the state needed by `handle_client_write_error` to seed `TailBuffer`
+/// and decide whether a drain is still necessary.
+struct DrainContext<'a> {
     write_len: usize,
     chunk_len: usize,
     total_bytes: u64,
-    partial_data: &'a [u8],
+    /// The slice already written (or attempted) — used to seed `TailBuffer.update()`
+    /// so cross-chunk terminator detection works correctly across the drain boundary.
+    tail_data: &'a [u8],
     terminator_found: bool,
     ctx: &'a StreamContext<'a>,
 }
@@ -145,7 +150,7 @@ struct ClientWriteErrorContext<'a> {
 async fn handle_client_write_error<R>(
     error: std::io::Error,
     backend_read: &mut R,
-    ctx: ClientWriteErrorContext<'_>,
+    ctx: DrainContext<'_>,
 ) -> StreamingError
 where
     R: AsyncReadExt + Unpin,
@@ -173,9 +178,9 @@ where
     }
 
     // Drain backend if terminator not yet found to keep connection clean.
-    // TailBuffer in drain_until_terminator handles cross-chunk boundary detection.
+    // tail_data seeds TailBuffer so cross-chunk boundary detection works correctly.
     if !ctx.terminator_found {
-        match drain_until_terminator(backend_read, ctx.partial_data, ctx.ctx).await {
+        match drain_until_terminator(backend_read, ctx.tail_data, ctx.ctx).await {
             Ok(()) => {} // Drain succeeded — backend is clean
             Err(drain_err) => {
                 warn!(
@@ -343,11 +348,11 @@ where
         return Err(handle_client_write_error(
             e,
             backend_read,
-            ClientWriteErrorContext {
+            DrainContext {
                 write_len,
                 chunk_len: data.len(),
                 total_bytes: *total_bytes,
-                partial_data: &data[..write_len],
+                tail_data: &data[..write_len],
                 terminator_found: status.is_found(),
                 ctx,
             },
@@ -572,11 +577,11 @@ mod tests {
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
 
-        let ctx = ClientWriteErrorContext {
+        let ctx = DrainContext {
             write_len: 10,
             chunk_len: 10,
             total_bytes: 10,
-            partial_data: b"",
+            tail_data: b"",
             terminator_found: false, // Must drain
             ctx: &stream_ctx,
         };
@@ -679,11 +684,11 @@ mod tests {
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
 
-        let ctx = ClientWriteErrorContext {
+        let ctx = DrainContext {
             write_len: 100,
             chunk_len: 100, // Same as write_len = complete chunk
             total_bytes: 100,
-            partial_data: b"test",
+            tail_data: b"test",
             terminator_found: true,
             ctx: &stream_ctx,
         };
@@ -705,11 +710,11 @@ mod tests {
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
 
-        let ctx = ClientWriteErrorContext {
+        let ctx = DrainContext {
             write_len: 50,
             chunk_len: 100, // Different from write_len = incomplete
             total_bytes: 500,
-            partial_data: b"",
+            tail_data: b"",
             terminator_found: false, // Need to drain
             ctx: &stream_ctx,
         };
@@ -732,11 +737,11 @@ mod tests {
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
 
-        let ctx = ClientWriteErrorContext {
+        let ctx = DrainContext {
             write_len: 10,
             chunk_len: 10,
             total_bytes: 10,
-            partial_data: b"",
+            tail_data: b"",
             terminator_found: false,
             ctx: &stream_ctx,
         };
