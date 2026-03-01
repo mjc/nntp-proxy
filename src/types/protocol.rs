@@ -179,7 +179,7 @@ mod tests {
         assert!(MessageId::new("<12345@example.com>".to_string()).is_ok());
         assert!(MessageId::new("missing-brackets".to_string()).is_err());
         assert!(MessageId::new("<>".to_string()).is_err());
-        assert!(MessageId::new("".to_string()).is_err());
+        assert!(MessageId::new(String::new()).is_err());
     }
 
     #[test]

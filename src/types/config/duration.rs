@@ -70,7 +70,7 @@ mod tests {
     proptest! {
         /// Property: Duration serialization round-trips correctly for any valid second value
         #[test]
-        fn prop_duration_serde_roundtrip(secs in 0u64..100000) {
+        fn prop_duration_serde_roundtrip(secs in 0u64..100_000) {
             let original = TestDuration {
                 timeout: Duration::from_secs(secs),
             };
@@ -81,7 +81,7 @@ mod tests {
 
         /// Property: Duration JSON format is always `{"timeout":N}`
         #[test]
-        fn prop_duration_json_format(secs in 0u64..100000) {
+        fn prop_duration_json_format(secs in 0u64..100_000) {
             let test = TestDuration {
                 timeout: Duration::from_secs(secs),
             };
@@ -92,7 +92,7 @@ mod tests {
 
         /// Property: Option<Duration> with Some serializes to number
         #[test]
-        fn prop_option_duration_some_roundtrip(secs in 0u64..100000) {
+        fn prop_option_duration_some_roundtrip(secs in 0u64..100_000) {
             let original = TestOptionDuration {
                 timeout: Some(Duration::from_secs(secs)),
             };
@@ -103,7 +103,7 @@ mod tests {
 
         /// Property: TOML serialization round-trips correctly
         #[test]
-        fn prop_duration_toml_roundtrip(secs in 0u64..100000) {
+        fn prop_duration_toml_roundtrip(secs in 0u64..100_000) {
             let original = TestDuration {
                 timeout: Duration::from_secs(secs),
             };

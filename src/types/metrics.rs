@@ -303,7 +303,7 @@ mod tests {
     proptest! {
         /// Property: ByteCounter arithmetic works correctly across all direction types
         #[test]
-        fn prop_byte_counter_arithmetic(initial in 0u64..1000000, increment in 0usize..1000000, b in 0u64..1000000) {
+        fn prop_byte_counter_arithmetic(initial in 0u64..1_000_000, increment in 0usize..1_000_000, b in 0u64..1_000_000) {
             // Test add() method
             let c2b = ClientToBackendBytes::new(initial).add(increment);
             let b2c = BackendToClientBytes::new(initial).add(increment);
@@ -351,14 +351,14 @@ mod tests {
     proptest! {
         /// Property: total() equals sum of components
         #[test]
-        fn prop_transfer_metrics_total(c2b in 0u64..1000000, b2c in 0u64..1000000) {
+        fn prop_transfer_metrics_total(c2b in 0u64..1_000_000, b2c in 0u64..1_000_000) {
             let metrics = TransferMetrics::new(c2b, b2c);
             prop_assert_eq!(metrics.total(), c2b + b2c);
         }
 
         /// Property: saturating_sub works on TransferMetrics
         #[test]
-        fn prop_transfer_metrics_saturating_sub(a1 in 0u64..1000000, a2 in 0u64..1000000, b1 in 0u64..1000000, b2 in 0u64..1000000) {
+        fn prop_transfer_metrics_saturating_sub(a1 in 0u64..1_000_000, a2 in 0u64..1_000_000, b1 in 0u64..1_000_000, b2 in 0u64..1_000_000) {
             let metrics1 = TransferMetrics::new(a1, a2);
             let metrics2 = TransferMetrics::new(b1, b2);
             let diff = metrics1.saturating_sub(metrics2);

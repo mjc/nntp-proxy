@@ -51,16 +51,16 @@ mod persistence_tests {
             active_connections: ActiveConnections::new(5), // Should be skipped
             total_commands: CommandCount::new(1000),
             bytes_sent: BytesSent::new(50000),
-            bytes_received: BytesReceived::new(100000),
+            bytes_received: BytesReceived::new(100_000),
             errors: ErrorCount::new(10),
             errors_4xx: ErrorCount::new(5),
             errors_5xx: ErrorCount::new(5),
             article_bytes_total: ArticleBytesTotal::new(90000),
             article_count: ArticleCount::new(100),
-            ttfb_micros_total: TtfbMicros::new(5000000),
+            ttfb_micros_total: TtfbMicros::new(5_000_000),
             ttfb_count: TimingMeasurementCount::new(100),
-            send_micros_total: SendMicros::new(1000000),
-            recv_micros_total: RecvMicros::new(3000000),
+            send_micros_total: SendMicros::new(1_000_000),
+            recv_micros_total: RecvMicros::new(3_000_000),
             connection_failures: FailureCount::new(2),
             health_status: BackendHealthStatus::Degraded, // Should be skipped
         };
