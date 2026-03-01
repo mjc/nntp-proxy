@@ -3,12 +3,12 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and streaming multiline responses to clients.
 
-use crate::is_client_disconnect_error;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::retry::retry_once_on_stale;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
 };
+use crate::session::streaming::{StreamingError, classify_client_write_err};
 use crate::session::{ClientSession, backend, streaming};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -150,7 +150,7 @@ impl ClientSession {
             backend_id,
             buffer_pool: &self.buffer_pool,
         };
-        let bytes_written = self
+        let bytes_written = match self
             .stream_response_to_client(
                 &mut conn,
                 client_write,
@@ -164,10 +164,12 @@ impl ClientSession {
                 },
             )
             .await
-            .inspect_err(|e| {
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
                 // guard drops here → complete_command called automatically
                 // (prevents TUI in-flight count drift on streaming errors)
-                if !is_client_disconnect_error(e) {
+                if e.must_remove_connection() {
                     // Backend error or dirty disconnect (drain failed) —
                     // connection in unknown state, remove from pool.
                     warn!(
@@ -184,7 +186,11 @@ impl ClientSession {
                     // Client disconnect — backend was cleanly drained. Return to pool.
                     drop(conn);
                 }
-            })?;
+                // into_anyhow() preserves io::Error for ClientDisconnect so that
+                // is_client_disconnect_error() in outer callers can still classify it.
+                return Err(e.into_anyhow());
+            }
+        };
 
         self.record_response_metrics(
             backend_id,
@@ -258,21 +264,28 @@ impl ClientSession {
         Ok((response, ttfb, send, recv))
     }
 
-    /// Stream response from backend to client and handle caching
+    /// Stream response from backend to client and handle caching.
+    ///
+    /// Returns `StreamingError` so callers can decide the connection's pool fate
+    /// without string/downcast inspection.
     async fn stream_response_to_client(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         ctx: &streaming::StreamContext<'_>,
         params: ResponseStreamParams<'_>,
-    ) -> Result<u64> {
+    ) -> Result<u64, StreamingError> {
         // SAFETY: Caller must validate response before calling this function.
         // An invalid response (code 0) should never reach here.
-        let status_code = params.response_code.status_code().ok_or_else(|| {
-            // This should never happen - caller should reject Invalid responses
-            tracing::error!("BUG: stream_response_to_client called with Invalid response");
-            anyhow::anyhow!("Cannot stream invalid response")
-        })?;
+        let status_code = params
+            .response_code
+            .status_code()
+            .ok_or_else(|| {
+                // This should never happen - caller should reject Invalid responses
+                tracing::error!("BUG: stream_response_to_client called with Invalid response");
+                anyhow::anyhow!("Cannot stream invalid response")
+            })
+            .map_err(StreamingError::Io)?;
         let code = status_code.as_u16();
 
         let cache_action = determine_cache_action(
@@ -344,13 +357,22 @@ impl ClientSession {
                 .await
             }
             (false, CacheAction::TrackStat) => {
-                client_write.write_all(params.first_chunk).await?;
+                // Single-line: backend already has complete response in first_chunk,
+                // so any write failure is a client-side error (backend is always clean here).
+                client_write
+                    .write_all(params.first_chunk)
+                    .await
+                    .map_err(classify_client_write_err)?;
                 self.maybe_cache_upsert(params.msg_id, b"223\r\n", ctx.backend_id);
                 Ok(params.first_chunk.len() as u64)
             }
             (false, _) => {
-                // Single-line, no caching
-                client_write.write_all(params.first_chunk).await?;
+                // Single-line, no caching.
+                // Backend is clean regardless of outcome — response was fully read.
+                client_write
+                    .write_all(params.first_chunk)
+                    .await
+                    .map_err(classify_client_write_err)?;
                 Ok(params.first_chunk.len() as u64)
             }
         }

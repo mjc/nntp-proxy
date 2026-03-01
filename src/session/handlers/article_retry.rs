@@ -317,12 +317,14 @@ impl ClientSession {
                 .await
                 {
                     Ok(bytes) => bytes,
-                    Err(e) if is_client_disconnect_error(&e) => {
+                    Err(e) if e.is_client_disconnect() => {
                         // Client disconnected — backend was cleanly drained by streaming layer
                         // (handle_client_write_error ran drain_until_terminator successfully).
                         // Return connection to pool without cooldown.
                         guard.complete();
-                        return Err(e);
+                        // into_anyhow() unwraps to bare io::Error so is_client_disconnect_error()
+                        // in outer callers can still classify it correctly.
+                        return Err(e.into_anyhow());
                     }
                     Err(e) => {
                         // C1: Backend error or dirty disconnect (drain failed).
