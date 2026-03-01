@@ -148,7 +148,6 @@ pub enum BackendHealthStatus {
 impl From<u8> for BackendHealthStatus {
     fn from(value: u8) -> Self {
         match value {
-            0 => Self::Healthy,
             1 => Self::Degraded,
             2 => Self::Down,
             _ => Self::Healthy,

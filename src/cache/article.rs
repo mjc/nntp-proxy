@@ -460,8 +460,7 @@ impl ArticleCache {
                     let should_replace = match (existing_complete, new_complete) {
                         (false, true) => true,  // Stub → Complete: Always replace
                         (true, false) => false, // Complete → Stub: Never replace
-                        (true, true) => new_buffer.len() > entry.buffer.len(), // Both complete: larger wins
-                        (false, false) => new_buffer.len() > entry.buffer.len(), // Both stubs: larger wins
+                        (true, true) | (false, false) => new_buffer.len() > entry.buffer.len(), // Same type: larger wins
                     };
 
                     if should_replace {

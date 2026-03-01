@@ -272,9 +272,8 @@ impl<S: AsyncWrite> AsyncWrite for DecompressStream<S> {
                 len: produced,
             };
             match poll_drain_buf(this.inner.as_mut(), cx, this.write_buf, this.write_drain) {
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(())) | Poll::Pending => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
             }
         }
 

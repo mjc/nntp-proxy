@@ -78,8 +78,9 @@ impl CommandHandler {
                 // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
                 CommandAction::Reject("502 Command not implemented in per-command routing mode\r\n")
             }
-            NntpCommand::ArticleByMessageId => CommandAction::ForwardStateless,
-            NntpCommand::Stateless => CommandAction::ForwardStateless,
+            NntpCommand::ArticleByMessageId | NntpCommand::Stateless => {
+                CommandAction::ForwardStateless
+            }
         }
     }
 }
