@@ -624,7 +624,7 @@ impl ArticleCache {
     }
 
     /// Get cache statistics
-    pub async fn stats(&self) -> CacheStats {
+    pub fn stats(&self) -> CacheStats {
         CacheStats {
             entry_count: self.cache.entry_count(),
             weighted_size: self.cache.weighted_size(),
@@ -965,7 +965,7 @@ mod tests {
         let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true); // 1MB
 
         // Initial stats
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         assert_eq!(stats.entry_count, 0);
 
         // Insert one article
@@ -977,7 +977,7 @@ mod tests {
         cache.sync().await;
 
         // Check stats again
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         assert_eq!(stats.entry_count, 1);
     }
 
@@ -1060,7 +1060,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         cache.sync().await;
 
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         assert!(
             stats.entry_count <= 3,
             "Cache should have at most 3 entries with 500 byte capacity"
@@ -1131,7 +1131,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         cache.sync().await;
 
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         // With actual size (no multiplier), should fit 11-13 large articles
         assert!(
             stats.entry_count >= 11,
@@ -1172,7 +1172,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         cache.sync().await;
 
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         // Should be able to fit ~150-185 small stubs in 1MB
         assert!(
             stats.entry_count >= 100,

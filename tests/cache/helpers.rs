@@ -62,7 +62,7 @@ async fn test_multiple_cache_entries() -> Result<()> {
     // Sync cache to ensure all inserts are processed
     cache.sync().await;
 
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert_eq!(stats.entry_count, 5);
 
     // Verify each is retrievable
@@ -116,7 +116,7 @@ async fn test_cache_capacity_limit() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert!(
         stats.entry_count <= 2,
         "Cache should respect capacity limit, got {}",
@@ -162,7 +162,7 @@ async fn test_cache_stats() -> Result<()> {
     let cache = Arc::new(ArticleCache::new(100_000, Duration::from_secs(300), true));
 
     // Initially empty
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert_eq!(stats.entry_count, 0);
 
     // Add some entries
@@ -180,7 +180,7 @@ async fn test_cache_stats() -> Result<()> {
     // Run pending background tasks to ensure cache is fully updated
     cache.sync().await;
 
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert_eq!(stats.entry_count, 10);
     assert!(stats.weighted_size > 0);
 

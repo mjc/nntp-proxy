@@ -459,7 +459,7 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
 ///   - Commands: AUTHINFO USER, AUTHINFO PASS
 ///   - Per [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
 ///   - Handled by proxy authentication layer
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum NntpCommand {
     /// Authentication: AUTHINFO USER
     /// [RFC 4643 §2.3.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.1)

@@ -113,7 +113,7 @@ async fn test_cache_grows_with_430_responses() {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
 
     // Initial stats
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert_eq!(stats.entry_count, 0);
 
     // Record 100 different missing articles
@@ -133,7 +133,7 @@ async fn test_cache_grows_with_430_responses() {
     cache.sync().await;
 
     // Cache should have 100 entries now
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert!(
         stats.entry_count >= 100,
         "Cache should have at least 100 entries, got {}",
@@ -171,7 +171,7 @@ async fn test_regression_bug_symptoms_fixed() {
     cache.sync().await;
 
     // BUG SYMPTOM 1: Cache should have hundreds of entries, not just 5
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert!(
         stats.entry_count >= 500,
         "Cache should have 500+ entries (was 5 before fix), got {}",

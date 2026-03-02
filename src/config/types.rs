@@ -106,7 +106,7 @@ impl std::fmt::Display for BackendSelectionStrategy {
 }
 
 /// Main proxy configuration
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]

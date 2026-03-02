@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     /// Helper: create a provider with cooldown for testing
-    async fn provider_with_cooldown(
+    fn provider_with_cooldown(
         addr: std::net::SocketAddr,
         max_size: usize,
         cooldown: Option<std::time::Duration>,
@@ -1067,7 +1067,7 @@ mod tests {
         let addr = spawn_mock_nntp_server().await;
         let cooldown = std::time::Duration::from_secs(10);
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         let conn = provider.get_pooled_connection().await.unwrap();
         assert_eq!(provider.pool.status().max_size, max_size);
@@ -1093,7 +1093,7 @@ mod tests {
         let addr = spawn_mock_nntp_server().await;
         let cooldown = std::time::Duration::from_secs(10);
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         // max_reduction = 4 / 2 = 2, so after 2 cooldowns it should stop reducing
         let conn1 = provider.get_pooled_connection().await.unwrap();
@@ -1120,7 +1120,7 @@ mod tests {
     async fn test_remove_with_cooldown_disabled() {
         let addr = spawn_mock_nntp_server().await;
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, None).await;
+        let provider = provider_with_cooldown(addr, max_size, None);
 
         let conn = provider.get_pooled_connection().await.unwrap();
         provider.remove_with_cooldown(conn);
@@ -1141,7 +1141,7 @@ mod tests {
         let addr = spawn_mock_nntp_server().await;
         let cooldown = std::time::Duration::from_millis(100);
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         let conn = provider.get_pooled_connection().await.unwrap();
         provider.remove_with_cooldown(conn);
