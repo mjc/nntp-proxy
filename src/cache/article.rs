@@ -399,7 +399,7 @@ impl ArticleCache {
     ///
     /// **Tier-aware TTL**: Even if moka hasn't expired the entry yet, we check if the entry
     /// is expired based on tier-aware TTL. Higher tier entries get longer TTLs.
-    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<ArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<ArticleEntry> {
         // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
         // This is zero-allocation: no Arc<str> is created for the lookup
         let result = self.cache.get(message_id.without_brackets()).await;
@@ -439,9 +439,9 @@ impl ArticleCache {
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
     /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
-    pub async fn upsert<'a>(
+    pub async fn upsert(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         buffer: Vec<u8>,
         backend_id: BackendId,
         tier: u8,
@@ -453,7 +453,7 @@ impl ArticleCache {
         let new_buffer = if cache_articles {
             buffer
         } else {
-            self.create_minimal_stub(&buffer)
+            Self::create_minimal_stub(&buffer)
         };
 
         // Wrap in Arc so we can efficiently share/move into closure without clone.
@@ -515,7 +515,7 @@ impl ArticleCache {
     ///
     /// Extracts the status code from the first line and creates a minimal stub.
     /// Falls back to "200\r\n" if parsing fails.
-    fn create_minimal_stub(&self, buffer: &[u8]) -> Vec<u8> {
+    fn create_minimal_stub(buffer: &[u8]) -> Vec<u8> {
         // Find first line (status code line)
         if let Some(end) = buffer.iter().position(|&b| b == b'\n') {
             // Extract status code (first 3 digits)
@@ -544,11 +544,7 @@ impl ArticleCache {
     /// Note: We don't store the actual backend 430 response because:
     /// 1. We always send a standardized 430 to clients, never the backend's response
     /// 2. The only info we need is the availability bitset (which backends returned 430)
-    pub async fn record_backend_missing<'a>(
-        &self,
-        message_id: MessageId<'a>,
-        backend_id: BackendId,
-    ) {
+    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key: Arc<str> = message_id.without_brackets().into();
         let misses = &self.misses;
 
@@ -591,9 +587,9 @@ impl ArticleCache {
     /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
     /// (the actual article will be cached via upsert, which may race with this call).
-    pub async fn sync_availability<'a>(
+    pub async fn sync_availability(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
         use moka::ops::compute::Op;
@@ -655,7 +651,7 @@ impl ArticleCache {
     /// This is a low-level method that bypasses the usual upsert logic.
     /// Only use this in tests where you need precise control over cache state.
     #[cfg(test)]
-    pub async fn insert<'a>(&self, message_id: MessageId<'a>, entry: ArticleEntry) {
+    pub async fn insert(&self, message_id: MessageId<'_>, entry: ArticleEntry) {
         let key: Arc<str> = message_id.without_brackets().into();
         self.cache.insert(key, entry).await;
     }

@@ -303,7 +303,7 @@ impl HybridArticleCache {
     ///
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
-    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<HybridArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
         let key = message_id.without_brackets().to_string();
         let result = self.cache.get(&key).await;
 
@@ -350,9 +350,9 @@ impl HybridArticleCache {
     /// A cached full article (220/222 response) must not be replaced by a STAT stub.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert<'a>(
+    pub async fn upsert(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         buffer: Vec<u8>,
         backend_id: BackendId,
         tier: u8,
@@ -410,7 +410,7 @@ impl HybridArticleCache {
     }
 
     /// Record that a backend doesn't have an article (430 response)
-    pub async fn record_missing<'a>(&self, message_id: MessageId<'a>, backend_id: BackendId) {
+    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
 
         // Get existing entry or create a minimal stub
@@ -439,9 +439,9 @@ impl HybridArticleCache {
     /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
     /// (the actual article will be cached via upsert, which may race with this call).
-    pub async fn sync_availability<'a>(
+    pub async fn sync_availability(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
         // Only sync if we actually tried some backends

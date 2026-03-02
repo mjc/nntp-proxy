@@ -75,6 +75,7 @@ struct YencFooter {
 impl YencFooter {
     /// Parse from line bytes
     #[inline]
+    #[allow(clippy::unnecessary_wraps)] // Result is forward-compatible; consistent with other parse fns
     fn parse(line: &[u8], is_multipart: bool) -> Result<Self, ParseError> {
         let line_str = String::from_utf8_lossy(line);
 
@@ -209,6 +210,7 @@ pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
 
 /// Decode a yenc data line and update checksum
 #[inline]
+#[allow(clippy::unnecessary_wraps)] // Result for consistency; decode_yenc_line may fail in future
 fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> Result<(), ParseError> {
     let decoded = line
         .strip_suffix(b"\r\n")

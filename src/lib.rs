@@ -31,6 +31,10 @@
 //! - **Per-command routing mode**: Each command is routed to a backend (round-robin),
 //!   but commands are still processed serially (NNTP is synchronous)
 
+// option_if_let_else is a nursery lint that often produces less readable code
+// with multi-line closures; if let/else is clearer in complex cases.
+#![allow(clippy::option_if_let_else)]
+
 // Module declarations
 pub mod args;
 pub mod auth;

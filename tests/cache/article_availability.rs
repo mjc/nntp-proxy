@@ -180,8 +180,6 @@ fn test_retry_loop_simulation_two_backends() {
 #[test]
 fn test_retry_loop_simulation_finds_on_third() {
     let mut avail = ArticleAvailability::new();
-    let _backend_count = 4;
-
     let mut attempts = Vec::new();
 
     // Backend 0: 430

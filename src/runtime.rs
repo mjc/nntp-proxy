@@ -101,6 +101,7 @@ impl Default for RuntimeConfig {
 /// # Arguments
 /// * `num_cores` - Number of CPU cores to pin to (`0..num_cores`)
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)] // Non-fatal: errors are logged as warnings, always returns Ok
 fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
     use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;

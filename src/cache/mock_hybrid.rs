@@ -30,7 +30,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<HybridArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
         let key = message_id.without_brackets().to_string();
         let storage = self.storage.lock().unwrap();
 
@@ -43,12 +43,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn upsert<'a>(
-        &self,
-        message_id: MessageId<'a>,
-        buffer: Vec<u8>,
-        backend_id: BackendId,
-    ) {
+    pub async fn upsert(&self, message_id: MessageId<'_>, buffer: Vec<u8>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
@@ -69,7 +64,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn record_missing<'a>(&self, message_id: MessageId<'a>, backend_id: BackendId) {
+    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
@@ -86,9 +81,9 @@ impl MockHybridCache {
         storage.insert(key, entry);
     }
 
-    pub async fn sync_availability<'a>(
+    pub async fn sync_availability(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
         if availability.checked_bits() == 0 {

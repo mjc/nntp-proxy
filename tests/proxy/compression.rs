@@ -282,7 +282,7 @@ async fn test_compression_required_fails_on_unsupported() -> Result<()> {
             );
         }
         // Connection closed, read error, or timeout — all expected/acceptable
-        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+        Ok(Ok(_) | Err(_)) | Err(_) => {}
     }
 
     Ok(())

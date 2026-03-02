@@ -350,6 +350,7 @@ pub async fn precheck(
 /// Spawn background precheck. Results go to cache only.
 ///
 /// Skips backend queries entirely if we already have a complete article cached.
+#[allow(clippy::needless_pass_by_value)]
 pub fn spawn_background_precheck(
     deps: PrecheckDeps<'_>,
     command: String,

@@ -518,7 +518,7 @@ mod tests {
 
         let optimizer = TcpOptimizer::new(&stream);
         // Can be used as a trait object
-        let _trait_obj: &dyn NetworkOptimizer = &optimizer;
+        let _: &dyn NetworkOptimizer = &optimizer;
     }
 
     #[tokio::test]
@@ -530,7 +530,7 @@ mod tests {
 
         let optimizer = ConnectionOptimizer::new(&stream);
         // Can be used as a trait object
-        let _trait_obj: &dyn NetworkOptimizer = &optimizer;
+        let _: &dyn NetworkOptimizer = &optimizer;
     }
 
     // Constants tests

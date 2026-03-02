@@ -132,7 +132,12 @@ pub struct BackendChartData {
 impl BackendChartData {
     /// Create new chart data with pre-computed tuples
     #[must_use]
-    pub fn new(name: String, color: Color, sent_points: PointVec, recv_points: PointVec) -> Self {
+    pub fn new(
+        name: String,
+        color: Color,
+        sent_points: &[ChartPoint],
+        recv_points: &[ChartPoint],
+    ) -> Self {
         let sent_tuples = sent_points.iter().map(ChartPoint::as_tuple).collect();
         let recv_tuples = recv_points.iter().map(ChartPoint::as_tuple).collect();
         Self {
@@ -218,8 +223,8 @@ mod tests {
         let data = BackendChartData::new(
             "Test".to_string(),
             Color::Green,
-            sent_points,
-            PointVec::new(),
+            &sent_points,
+            &PointVec::new(),
         );
 
         let tuples = data.sent_points_as_tuples();

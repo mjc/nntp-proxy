@@ -36,7 +36,7 @@ impl Config {
         }
 
         for server in &self.servers {
-            validate_server(server)?;
+            validate_server(server);
         }
 
         Ok(())
@@ -44,7 +44,7 @@ impl Config {
 }
 
 /// Validate a single server configuration
-fn validate_server(server: &Server) -> Result<()> {
+fn validate_server(server: &Server) {
     // Name, host, port, max_connections validations now enforced by types:
     // - HostName/ServerName cannot be empty (validated at construction)
     // - Port cannot be 0 (NonZeroU16)
@@ -72,8 +72,6 @@ fn validate_server(server: &Server) -> Result<()> {
             );
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -153,38 +151,38 @@ mod tests {
     #[test]
     fn test_validate_server_with_recommended_keepalive() {
         let server = create_test_server("test", Some(Duration::from_secs(60)));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_with_low_keepalive_warns() {
         // This should warn but not fail
         let server = create_test_server("test", Some(Duration::from_secs(5)));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_with_high_keepalive_warns() {
         // This should warn but not fail
         let server = create_test_server("test", Some(Duration::from_secs(600)));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_with_no_keepalive() {
         let server = create_test_server("test", None);
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_at_min_boundary() {
         let server = create_test_server("test", Some(MIN_RECOMMENDED_KEEPALIVE));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_at_max_boundary() {
         let server = create_test_server("test", Some(MAX_RECOMMENDED_KEEPALIVE));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 }

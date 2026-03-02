@@ -93,8 +93,8 @@ pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64)
             BackendChartData::new(
                 server.name.as_str().to_string(),
                 backend_color(index),
-                sent_points,
-                recv_points,
+                &sent_points,
+                &recv_points,
             ),
             backend_max.get(),
         )
@@ -368,8 +368,8 @@ mod tests {
             chart_data.push(BackendChartData::new(
                 format!("Server {i}"),
                 backend_color(i),
-                PointVec::new(),
-                PointVec::new(),
+                &PointVec::new(),
+                &PointVec::new(),
             ));
         }
 
@@ -383,8 +383,8 @@ mod tests {
         let data = BackendChartData::new(
             "Test Server".to_string(),
             backend_color(0),
-            PointVec::new(),
-            PointVec::new(),
+            &PointVec::new(),
+            &PointVec::new(),
         );
 
         assert_eq!(data.name, "Test Server");

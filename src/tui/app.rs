@@ -315,7 +315,6 @@ impl TuiApp {
     /// Calculate per-user rates from deltas
     #[inline]
     fn calculate_user_rates(
-        &self,
         current: &crate::metrics::UserStats,
         prev_snapshot: &crate::metrics::MetricsSnapshot,
         time_delta: f64,
@@ -412,7 +411,7 @@ impl TuiApp {
             let user_stats = new_snapshot
                 .user_stats
                 .iter()
-                .map(|stats| self.calculate_user_rates(stats, prev, time_delta))
+                .map(|stats| Self::calculate_user_rates(stats, prev, time_delta))
                 .collect();
 
             // Build enriched snapshot (shares backend_stats via Arc)
