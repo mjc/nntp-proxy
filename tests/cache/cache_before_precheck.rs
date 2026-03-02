@@ -52,7 +52,7 @@ impl BackendQueryCounter {
 }
 
 /// Spawn mock server that counts queries
-async fn spawn_counting_mock_server(
+fn spawn_counting_mock_server(
     port: u16,
     name: &str,
     counter: BackendQueryCounter,
@@ -181,8 +181,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     let counter = BackendQueryCounter::new();
 
     // Spawn counting mock server (has article)
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Create proxy config with caching and adaptive precheck
@@ -286,8 +285,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
     let backend_port = get_available_port().await.unwrap();
 
     let counter = BackendQueryCounter::new();
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -392,8 +390,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
     let backend_port = get_available_port().await.unwrap();
 
     let counter = BackendQueryCounter::new();
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -498,8 +495,7 @@ async fn test_cached_430_zero_backend_queries() {
 
     let counter = BackendQueryCounter::new();
     // Server doesn't have article (returns 430)
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), false).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), false);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {

@@ -21,6 +21,11 @@
 //! - **SIMD-friendly**: Compiler auto-vectorizes with SSE2/AVX2
 //! - **Branch prediction**: UPPERCASE checked first (95% hit rate in real traffic)
 
+// All public functions in this module use #[inline(always)] — this is intentional.
+// The classifier is the hot path (70%+ of traffic, 4-6ns target), profiling confirms
+// that inlining these tiny functions avoids measurable call overhead.
+#![allow(clippy::inline_always)]
+
 // =============================================================================
 // Case-insensitive command matching tables
 // =============================================================================

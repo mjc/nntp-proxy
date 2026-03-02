@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_lines)]
 use anyhow::Result;
 use std::io::Write;
 use tempfile::NamedTempFile;

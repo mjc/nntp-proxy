@@ -35,13 +35,13 @@ impl ClientSession {
     /// wasn't servable (carries availability to avoid a redundant lookup), or `Miss`.
     pub(super) async fn try_serve_from_cache(
         &self,
-        msg_id: &Option<crate::types::MessageId<'_>>,
+        msg_id: Option<&crate::types::MessageId<'_>>,
         command: &str,
         router: &Arc<BackendSelector>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CacheLookupResult> {
-        let Some(msg_id_ref) = msg_id.as_ref() else {
+        let Some(msg_id_ref) = msg_id else {
             return Ok(CacheLookupResult::Miss);
         };
 

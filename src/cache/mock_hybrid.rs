@@ -3,6 +3,8 @@
 //! Provides a simple in-memory implementation that mimics `HybridArticleCache`
 //! behavior without foyer's complexity. Used in tests to avoid foyer's
 //! runtime issues.
+// Methods are async to match the HybridArticleCache trait interface; no internal awaits needed.
+#![allow(clippy::unused_async)]
 
 use super::{ArticleAvailability, HybridArticleEntry, HybridCacheStats};
 use crate::types::{BackendId, MessageId};

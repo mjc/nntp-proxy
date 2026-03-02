@@ -1,4 +1,6 @@
 //! Comprehensive tests for metrics module
+// assert_eq! on f64 rate values is correct here — comparing computed rates that should be exact.
+#![allow(clippy::float_cmp)]
 
 use nntp_proxy::metrics::*;
 use nntp_proxy::types::{

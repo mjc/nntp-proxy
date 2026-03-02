@@ -1,4 +1,5 @@
 //! Benchmarks for backend selection and routing
+#![allow(clippy::cast_possible_truncation)]
 //!
 //! Measures hot-path router operations:
 //! - `route_command` with weighted round-robin strategy

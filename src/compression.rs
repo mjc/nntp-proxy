@@ -189,6 +189,7 @@ impl<S> DecompressStream<S> {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)] // pin_project generates hidden fields that can't be included
 impl<S: fmt::Debug> fmt::Debug for DecompressStream<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DecompressStream")

@@ -505,7 +505,7 @@ impl ClientSession {
         // On partial hit, we get availability info to avoid a redundant cache.get() later.
         let cached_availability = match self
             .try_serve_from_cache(
-                &msg_id,
+                msg_id.as_ref(),
                 command,
                 &router,
                 client_write,

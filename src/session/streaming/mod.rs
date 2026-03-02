@@ -314,6 +314,7 @@ enum ChunkResult {
 /// Returns `ChunkResult::Done` if terminator found, or
 /// `ChunkResult::Continue` to keep streaming. Total bytes are tracked
 /// via the `total_bytes` mutable reference.
+#[allow(clippy::inline_always)] // hot streaming path — profiling confirms inlining beneficial
 #[inline(always)]
 async fn process_chunk<R, W>(
     data: &[u8],

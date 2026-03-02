@@ -168,6 +168,7 @@ pub fn format_throughput_label(value: f64) -> String {
 
 /// Format throughput strings for summary display
 #[must_use]
+#[allow(clippy::map_unwrap_or)] // map_or_else reverses closure order, making multi-line form less readable
 pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) -> (String, String) {
     use super::constants::text;
 

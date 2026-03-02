@@ -35,10 +35,11 @@ pub mod buffer {
     /// Larger than POOL to handle 99th percentile articles
     pub const CAPTURE: usize = 768 * 1024;
 
-    /// Default number of capture buffers in the pool
-    /// Sized for 16 concurrent caching operations
-    /// Total memory: 16 × 768KB ≈ 12MB
-    /// This is a conservative default; increase via config for higher caching throughput
+    /// Default number of capture buffers in the pool.
+    ///
+    /// Sized for 16 concurrent caching operations.
+    /// Total memory: 16 × 768KB ≈ 12MB.
+    /// This is a conservative default; increase via config for higher caching throughput.
     pub const CAPTURE_COUNT: usize = 16;
 
     /// `BufReader` capacity for client command parsing (64KB)

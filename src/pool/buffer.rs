@@ -396,6 +396,7 @@ impl BufferPool {
     /// - Callers use `AsyncRead` which writes into the buffer
     /// - They get back `n` bytes written and access only `&buf[..n]`
     /// - Stale data beyond `n` is never accessed
+    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
     pub async fn acquire(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
@@ -428,6 +429,7 @@ impl BufferPool {
     ///
     /// Pages are pre-faulted to eliminate soft page faults during streaming,
     /// which profiling showed accounted for 96.75% of memmove time.
+    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
     pub async fn acquire_capture(&self) -> PooledBuffer {
         let buffer = if let Some(mut buffer) = self.capture_pool.pop() {
             self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
