@@ -196,7 +196,7 @@ impl ClientSession {
 
         self.record_response_metrics(
             backend_id,
-            &cmd_response.response,
+            cmd_response.response,
             cmd_response.is_multiline,
             command.len() as u64,
             bytes_written,
@@ -424,7 +424,7 @@ impl ClientSession {
     fn record_response_metrics(
         &self,
         backend_id: crate::types::BackendId,
-        response_code: &crate::protocol::NntpResponse,
+        response_code: crate::protocol::NntpResponse,
         is_multiline: bool,
         cmd_bytes: u64,
         resp_bytes: u64,

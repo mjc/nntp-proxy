@@ -22,7 +22,7 @@ impl ChartX {
     /// Get raw value
     #[must_use]
     #[inline]
-    pub const fn get(&self) -> f64 {
+    pub const fn get(self) -> f64 {
         self.0
     }
 }
@@ -54,7 +54,7 @@ impl ChartY {
     /// Get raw value
     #[must_use]
     #[inline]
-    pub const fn get(&self) -> f64 {
+    pub const fn get(self) -> f64 {
         self.0
     }
 

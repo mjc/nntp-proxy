@@ -328,11 +328,8 @@ mod tests {
                     // Put remainder back
                     self.chunks.push_front(chunk[len..].to_vec());
                 }
-                Poll::Ready(Ok(()))
-            } else {
-                // EOF
-                Poll::Ready(Ok(()))
             }
+            Poll::Ready(Ok(()))
         }
     }
 

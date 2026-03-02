@@ -106,6 +106,7 @@ async fn test_430_increments_4xx_metrics() {
 
 /// Test cache growth with missing articles
 #[tokio::test]
+#[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_cache_grows_with_430_responses() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes
@@ -143,6 +144,7 @@ async fn test_cache_grows_with_430_responses() {
 
 /// Regression test: Verify bug symptoms are fixed
 #[tokio::test]
+#[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_regression_bug_symptoms_fixed() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes

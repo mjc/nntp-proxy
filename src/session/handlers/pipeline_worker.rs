@@ -114,6 +114,7 @@ pub async fn backend_pipeline_worker(
 ///
 /// Returns `(healthy, batch)` — whether the connection is still healthy, plus the
 /// (now-drained) batch Vec for allocation reuse.
+#[allow(clippy::iter_with_drain)] // batch returned to caller for reuse; drain preserves allocation
 async fn execute_pipeline_batch(
     backend_id: BackendId,
     conn: &mut crate::stream::ConnectionStream,
@@ -359,6 +360,7 @@ async fn read_full_response(
 ///
 /// Takes ownership of the Vec, drains it, and returns the empty Vec
 /// so the caller can reuse the allocation.
+#[allow(clippy::iter_with_drain)] // drain used intentionally; empty Vec returned for allocation reuse
 fn fail_batch(mut batch: Vec<QueuedRequest>, error_msg: &str) -> Vec<QueuedRequest> {
     for req in batch.drain(..) {
         let _ = req

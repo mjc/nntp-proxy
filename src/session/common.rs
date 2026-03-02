@@ -87,7 +87,7 @@ where
 pub fn on_authentication_success(
     client_addr: impl std::fmt::Display,
     username: Option<String>,
-    routing_mode: &crate::config::RoutingMode,
+    routing_mode: crate::config::RoutingMode,
     metrics: &crate::metrics::MetricsCollector,
     connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
     set_username_fn: impl FnOnce(Option<String>),
@@ -275,7 +275,7 @@ where
                     on_authentication_success(
                         client_addr,
                         auth_username.clone(),
-                        ctx.routing_mode,
+                        *ctx.routing_mode,
                         ctx.metrics,
                         ctx.connection_stats,
                         set_username_fn,

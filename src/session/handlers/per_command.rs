@@ -112,7 +112,7 @@ impl ClientSession {
                         common::on_authentication_success(
                             self.client_addr,
                             auth_username.clone(),
-                            &self.mode_state.routing_mode(),
+                            self.mode_state.routing_mode(),
                             &self.metrics,
                             self.connection_stats(),
                             |username| self.set_username(username),
