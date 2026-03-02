@@ -207,7 +207,7 @@ impl HybridArticleCache {
                         config.disk_capacity / (1024 * 1024 * 1024)
                     )
                 } else {
-                    anyhow::anyhow!("Failed to initialize disk cache: {}", e)
+                    anyhow::anyhow!("Failed to initialize disk cache: {e}")
                 }
             })?;
 
@@ -228,7 +228,7 @@ impl HybridArticleCache {
             .thread_name("foyer-disk-io")
             .enable_all()
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create foyer runtime: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create foyer runtime: {e}"))?;
 
         let mut builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
@@ -276,7 +276,7 @@ impl HybridArticleCache {
                     config.disk_capacity / (1024 * 1024 * 1024)
                 )
             } else {
-                anyhow::anyhow!("Failed to build hybrid cache: {}", e)
+                anyhow::anyhow!("Failed to build hybrid cache: {e}")
             }
         })?;
 
@@ -343,7 +343,7 @@ impl HybridArticleCache {
 
     /// Insert or update an article in the cache
     ///
-    /// With WriteOnInsertion policy, articles are written to disk immediately
+    /// With `WriteOnInsertion` policy, articles are written to disk immediately
     /// in a background task (non-blocking).
     ///
     /// **UPSERT SEMANTICS**: Never overwrites a larger buffer with a smaller one.
@@ -437,7 +437,7 @@ impl HybridArticleCache {
     ///
     /// This is called ONCE at the end of a retry loop to persist all the
     /// backends that returned 430 during this request. Much more efficient
-    /// than calling record_missing for each backend individually.
+    /// than calling `record_missing` for each backend individually.
     ///
     /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
@@ -524,7 +524,7 @@ impl HybridArticleCache {
         self.cache
             .close()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to close cache: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to close cache: {e}"))
     }
 }
 
@@ -570,7 +570,7 @@ impl HybridCacheStats {
 /// Create a memory-only hybrid cache (for testing without disk I/O)
 ///
 /// This uses foyer's Noop device to avoid any disk setup, making tests fast
-/// and avoiding io_uring initialization issues.
+/// and avoiding `io_uring` initialization issues.
 #[cfg(test)]
 impl HybridArticleCache {
     /// Create a memory-only cache for testing
@@ -634,14 +634,14 @@ impl HybridArticleCache {
 //   cargo test --features hybrid-cache cache::hybrid -- --ignored
 #[cfg(test)]
 mod tests {
-    //! Cache-level integration tests for HybridArticleCache
+    //! Cache-level integration tests for `HybridArticleCache`
     //!
     //! NOTE: These tests are marked as #[ignore] due to foyer runtime issues in test context.
-    //! Entry-level tests (HybridArticleEntry, CacheableStatusCode, Code encode/decode)
+    //! Entry-level tests (`HybridArticleEntry`, `CacheableStatusCode`, Code encode/decode)
     //! are in the `hybrid_codec` module.
     //!
     //! To run these ignored tests manually:
-    //!   cargo test --package nntp-proxy --lib cache::hybrid::tests -- --ignored --nocapture
+    //!   cargo test --package nntp-proxy --lib `cache::hybrid::tests` -- --ignored --nocapture
 
     use super::*;
 

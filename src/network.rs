@@ -13,13 +13,13 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-/// SO_LINGER timeout - prevents indefinite blocking on socket close
+/// `SO_LINGER` timeout - prevents indefinite blocking on socket close
 const LINGER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// TCP_USER_TIMEOUT - faster dead connection detection on Linux
+/// `TCP_USER_TIMEOUT` - faster dead connection detection on Linux
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// IP_TOS value for throughput optimization
+/// `IP_TOS` value for throughput optimization
 const TOS_THROUGHPUT: u32 = 0x08;
 
 /// Trait for network optimization strategies
@@ -144,7 +144,7 @@ impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
     }
 }
 
-/// High-level optimizer that works with ConnectionStream
+/// High-level optimizer that works with `ConnectionStream`
 pub struct ConnectionOptimizer<'a> {
     stream: &'a ConnectionStream,
     recv_buffer_size: Option<usize>,

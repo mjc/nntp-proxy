@@ -92,7 +92,7 @@ impl AuthHandler {
         }
     }
 
-    /// Handle an auth command - writes response to client and returns (bytes_written, auth_success)
+    /// Handle an auth command - writes response to client and returns (`bytes_written`, `auth_success`)
     /// This is the ONE place where auth interception happens
     pub async fn handle_auth_command<W>(
         &self,

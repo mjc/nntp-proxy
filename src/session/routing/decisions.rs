@@ -29,7 +29,7 @@ pub enum CommandRoutingDecision {
 /// * `command` - The raw NNTP command string
 /// * `is_authenticated` - Whether the client has authenticated
 /// * `auth_enabled` - Whether authentication is required
-/// * `routing_mode` - Current routing mode (PerCommand, Stateful, Hybrid)
+/// * `routing_mode` - Current routing mode (`PerCommand`, Stateful, Hybrid)
 ///
 /// # Returns
 /// A `CommandRoutingDecision` indicating what action to take
@@ -181,24 +181,21 @@ mod tests {
             assert_eq!(
                 decide_command_routing(cmd, true, false, RoutingMode::Hybrid),
                 CommandRoutingDecision::SwitchToStateful,
-                "Failed for command: {}",
-                cmd
+                "Failed for command: {cmd}"
             );
 
             // Per-command mode: reject
             assert_eq!(
                 decide_command_routing(cmd, true, false, RoutingMode::PerCommand),
                 CommandRoutingDecision::Reject,
-                "Failed for command: {}",
-                cmd
+                "Failed for command: {cmd}"
             );
 
             // Stateful mode: reject (though shouldn't reach this in practice)
             assert_eq!(
                 decide_command_routing(cmd, true, false, RoutingMode::Stateful),
                 CommandRoutingDecision::Reject,
-                "Failed for command: {}",
-                cmd
+                "Failed for command: {cmd}"
             );
         }
     }

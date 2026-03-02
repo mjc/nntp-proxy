@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 /// Trait for async streams that can be used for NNTP connections
 ///
 /// This trait is automatically implemented for any type that implements
-/// AsyncRead + AsyncWrite + Unpin + Send, making it easy to support
+/// `AsyncRead` + `AsyncWrite` + Unpin + Send, making it easy to support
 /// different connection types (TCP, TLS, etc.).
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -499,6 +499,24 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "cannot enable compression on an already-compressed connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plain_connection_debug_format() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let conn = ConnectionStream::plain(server_stream);
+        // Test Debug implementation
+        let debug_str = format!("{conn:?}");
+        assert!(
+            debug_str.contains("Plain"),
+            "Debug output should indicate Plain TCP"
         );
     }
 }

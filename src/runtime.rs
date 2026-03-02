@@ -25,7 +25,7 @@ impl RuntimeConfig {
     /// Single-threaded runtime is used if threads == 1.
     #[must_use]
     pub fn from_args(threads: Option<ThreadCount>) -> Self {
-        let worker_threads = threads.map(|t| t.get()).unwrap_or(1);
+        let worker_threads = threads.map_or(1, |t| t.get());
 
         Self {
             worker_threads,
@@ -99,7 +99,7 @@ impl Default for RuntimeConfig {
 /// This is a best-effort operation - failures are logged but not fatal.
 ///
 /// # Arguments
-/// * `num_cores` - Number of CPU cores to pin to (0..num_cores)
+/// * `num_cores` - Number of CPU cores to pin to (`0..num_cores`)
 #[cfg(target_os = "linux")]
 fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
     use nix::sched::{CpuSet, sched_setaffinity};
@@ -197,9 +197,7 @@ pub fn resolve_listen_address(
     port_arg: Option<crate::types::Port>,
     config: &crate::config::Config,
 ) -> (String, crate::types::Port) {
-    let host = host_arg
-        .map(String::from)
-        .unwrap_or_else(|| config.proxy.host.clone());
+    let host = host_arg.map_or_else(|| config.proxy.host.clone(), String::from);
     let port = port_arg.unwrap_or(config.proxy.port);
     (host, port)
 }
@@ -295,7 +293,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 ///
 /// Waits for shutdown signal, then:
 /// 1. Sends shutdown notification via channel
-/// 2. Calls graceful_shutdown() on proxy
+/// 2. Calls `graceful_shutdown()` on proxy
 ///
 /// Returns the shutdown receiver channel.
 #[must_use]
@@ -338,7 +336,7 @@ pub fn spawn_shutdown_handler(
 /// Exits when shutdown signal is received.
 ///
 /// # Errors
-/// Returns error if listener.accept() fails
+/// Returns error if `listener.accept()` fails
 pub async fn run_accept_loop(
     proxy: std::sync::Arc<crate::NntpProxy>,
     listener: tokio::net::TcpListener,
@@ -393,7 +391,7 @@ pub async fn run_accept_loop(
 
 /// Resolve the metrics stats file path
 ///
-/// If stats_file is configured, use it; otherwise default to "stats.json" alongside config file.
+/// If `stats_file` is configured, use it; otherwise default to "stats.json" alongside config file.
 ///
 /// # Arguments
 /// * `config_path` - Path to the configuration file
@@ -608,7 +606,7 @@ mod tests {
     #[test]
     fn test_runtime_config_debug() {
         let config = RuntimeConfig::from_args(Some(ThreadCount::new(2).unwrap()));
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         assert!(debug_str.contains("RuntimeConfig"));
         assert!(debug_str.contains("worker_threads"));

@@ -75,7 +75,7 @@ impl std::fmt::Display for RoutingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendSelectionStrategy {
-    /// Weighted round-robin - distributes requests proportionally to max_connections
+    /// Weighted round-robin - distributes requests proportionally to `max_connections`
     WeightedRoundRobin,
     /// Least-loaded - routes to backend with fewest pending requests
     LeastLoaded,
@@ -218,7 +218,7 @@ pub struct Cache {
     /// - Returns optimistic response to client immediately (assumes article exists)
     /// - Updates availability cache in background based on actual backend responses
     /// - Improves future routing decisions by learning which backends have articles
-    /// - For HEAD with cache_articles=true, also caches the headers
+    /// - For HEAD with `cache_articles=true`, also caches the headers
     ///
     /// When false:
     /// - STAT/HEAD commands use normal routing (single backend check)
@@ -276,7 +276,7 @@ pub struct DiskCache {
     /// Path to disk cache directory
     ///
     /// Directory will be created if it doesn't exist.
-    /// Recommended: Use a fast SSD or NVMe drive.
+    /// Recommended: Use a fast SSD or `NVMe` drive.
     #[serde(default = "super::defaults::disk_cache_path")]
     pub path: std::path::PathBuf,
 

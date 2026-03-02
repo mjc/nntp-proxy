@@ -90,7 +90,7 @@ impl TailBuffer {
     }
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
-    /// **Performance**: find_terminator_end() checks end first (O(1)),
+    /// **Performance**: `find_terminator_end()` checks end first (O(1)),
     /// only scans with memchr if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
@@ -378,7 +378,7 @@ mod tests {
 
         match status {
             TerminatorStatus::FoundAt(pos) => assert_eq!(pos, chunk.len()),
-            TerminatorStatus::NotFound => panic!("Expected FoundAt, got {:?}", status),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt, got {status:?}"),
         }
     }
 
@@ -393,7 +393,7 @@ mod tests {
                 assert!(pos < chunk.len());
                 assert!(pos > 0);
             }
-            TerminatorStatus::NotFound => panic!("Expected FoundAt, got {:?}", status),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt, got {status:?}"),
         }
     }
 
@@ -408,7 +408,7 @@ mod tests {
 
         match status {
             TerminatorStatus::FoundAt(pos) => assert_eq!(pos, 3),
-            _ => panic!("Expected FoundAt(3), got {:?}", status),
+            _ => panic!("Expected FoundAt(3), got {status:?}"),
         }
     }
 
@@ -673,7 +673,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 3, "Terminator ends at byte 3");
             }
-            _ => panic!("Expected FoundAt(3), got {:?}", status),
+            _ => panic!("Expected FoundAt(3), got {status:?}"),
         }
     }
 
@@ -688,7 +688,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 4, "Split 1: terminator ends at byte 4");
             }
-            _ => panic!("Expected FoundAt(4), got {:?}", status),
+            _ => panic!("Expected FoundAt(4), got {status:?}"),
         }
     }
 
@@ -703,7 +703,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 3, "Split 2: terminator ends at byte 3");
             }
-            _ => panic!("Expected FoundAt(3), got {:?}", status),
+            _ => panic!("Expected FoundAt(3), got {status:?}"),
         }
     }
 
@@ -718,7 +718,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 2, "Split 3: terminator ends at byte 2");
             }
-            _ => panic!("Expected FoundAt(2), got {:?}", status),
+            _ => panic!("Expected FoundAt(2), got {status:?}"),
         }
     }
 
@@ -733,7 +733,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 1, "Split 4: terminator ends at byte 1");
             }
-            _ => panic!("Expected FoundAt(1), got {:?}", status),
+            _ => panic!("Expected FoundAt(1), got {status:?}"),
         }
     }
 

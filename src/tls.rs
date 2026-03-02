@@ -43,7 +43,7 @@ impl Default for TlsConfig {
 }
 
 impl TlsConfig {
-    /// Create a builder for TlsConfig
+    /// Create a builder for `TlsConfig`
     ///
     /// # Example
     /// ```
@@ -140,7 +140,7 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Build the TlsConfig
+    /// Build the `TlsConfig`
     pub fn build(self) -> TlsConfig {
         TlsConfig {
             use_tls: self.use_tls,
@@ -352,7 +352,7 @@ impl TlsManager {
         use anyhow::Context;
 
         let cert_data = std::fs::read(cert_path)
-            .with_context(|| format!("Failed to read TLS certificate from {}", cert_path))?;
+            .with_context(|| format!("Failed to read TLS certificate from {cert_path}"))?;
 
         let certs = rustls_pemfile::certs(&mut cert_data.as_slice())
             .collect::<Result<Vec<_>, _>>()
@@ -560,7 +560,7 @@ mod tests {
     fn test_tls_manager_debug() {
         let config = TlsConfig::default();
         let manager = TlsManager::new(config).unwrap();
-        let debug_str = format!("{:?}", manager);
+        let debug_str = format!("{manager:?}");
 
         assert!(debug_str.contains("TlsManager"));
         assert!(debug_str.contains("<TlsConnector>"));
@@ -657,7 +657,7 @@ mod tests {
             .cert_path("/test")
             .build();
 
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         assert!(debug_str.contains("TlsConfig"));
         assert!(debug_str.contains("use_tls"));
@@ -668,7 +668,7 @@ mod tests {
     fn test_tls_config_builder_debug_format() {
         let builder = TlsConfig::builder().enabled(true).verify_cert(false);
 
-        let debug_str = format!("{:?}", builder);
+        let debug_str = format!("{builder:?}");
 
         assert!(debug_str.contains("TlsConfigBuilder"));
     }
@@ -678,7 +678,7 @@ mod tests {
         use rustls_backend::NoVerifier;
 
         let verifier = NoVerifier;
-        let debug_str = format!("{:?}", verifier);
+        let debug_str = format!("{verifier:?}");
 
         assert!(debug_str.contains("NoVerifier"));
     }
@@ -688,7 +688,7 @@ mod tests {
         let config = TlsConfig::default();
         let result = TlsManager::load_certificates_sync(&config).unwrap();
 
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
 
         assert!(debug_str.contains("CertificateLoadResult"));
         assert!(debug_str.contains("root_store"));
@@ -724,11 +724,11 @@ mod tests {
             .build();
 
         let manager1 = TlsManager::new(config.clone()).unwrap();
-        let manager2 = TlsManager::new(config.clone()).unwrap();
+        let manager2 = TlsManager::new(config).unwrap();
 
         // Both should successfully initialize
-        let debug1 = format!("{:?}", manager1);
-        let debug2 = format!("{:?}", manager2);
+        let debug1 = format!("{manager1:?}");
+        let debug2 = format!("{manager2:?}");
 
         assert!(debug1.contains("TlsManager"));
         assert!(debug2.contains("TlsManager"));

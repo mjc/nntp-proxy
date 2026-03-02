@@ -48,7 +48,7 @@ pub struct TcpManager {
 }
 
 impl TcpManager {
-    /// Create a new TcpManager with optional TLS configuration
+    /// Create a new `TcpManager` with optional TLS configuration
     ///
     /// If `options.tls_config` is `Some` with `use_tls = true`, the TLS manager is
     /// pre-initialized (certificates loaded). If `None` or `use_tls = false`,
@@ -479,7 +479,7 @@ mod tests {
         )
         .unwrap();
 
-        let debug_str = format!("{:?}", manager);
+        let debug_str = format!("{manager:?}");
         assert!(debug_str.contains("TcpManager"));
         assert!(debug_str.contains("news.example.com"));
         assert!(debug_str.contains("119"));

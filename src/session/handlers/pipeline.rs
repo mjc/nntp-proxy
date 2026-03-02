@@ -19,7 +19,7 @@ const MAX_PIPELINE_DEPTH: usize = 16;
 /// Uses an accumulator buffer pattern to avoid per-command allocations:
 /// - All commands stored contiguously in a single String buffer
 /// - Offsets track command boundaries (end position of each command)
-/// - SmallVec keeps offsets on stack for common case (≤4 commands)
+/// - `SmallVec` keeps offsets on stack for common case (≤4 commands)
 pub(super) struct CommandBatch {
     /// All commands accumulated in a single buffer
     buffer: String,
@@ -70,7 +70,7 @@ impl ClientSession {
     /// Read a batch of commands from the client's buffered reader.
     ///
     /// The first command always blocks (waiting for client input). Subsequent
-    /// commands are read non-blocking from the BufReader's userspace buffer —
+    /// commands are read non-blocking from the `BufReader`'s userspace buffer —
     /// if data is already available, it's consumed; otherwise the batch ends.
     ///
     /// Returns empty batch on client disconnect.

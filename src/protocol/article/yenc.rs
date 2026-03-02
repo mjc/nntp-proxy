@@ -55,13 +55,12 @@ impl YencHeader {
         footer
             .size
             .filter(|&size| size != self.expected_size)
-            .map(|size| {
+            .map_or(Ok(()), |size| {
                 Err(ParseError::InvalidYenc(format!(
                     "Size mismatch: header={}, footer={}",
                     self.expected_size, size
                 )))
             })
-            .unwrap_or(Ok(()))
     }
 }
 
@@ -92,14 +91,13 @@ impl YencFooter {
     fn validate_checksum(&self, checksum: &crc32fast::Hasher) -> Result<(), ParseError> {
         self.crc32
             .filter(|&expected| checksum.clone().finalize() != expected)
-            .map(|expected| {
+            .map_or(Ok(()), |expected| {
                 Err(ParseError::InvalidYenc(format!(
                     "CRC mismatch: expected={:08x}, actual={:08x}",
                     expected,
                     checksum.clone().finalize()
                 )))
             })
-            .unwrap_or(Ok(()))
     }
 }
 
@@ -125,7 +123,7 @@ impl YencLine {
     }
 }
 
-/// Iterator adapter for reading lines from BufReader
+/// Iterator adapter for reading lines from `BufReader`
 struct YencLines<'a> {
     reader: &'a mut BufReader<&'a [u8]>,
     line_buf: Vec<u8>,
@@ -149,7 +147,7 @@ impl Iterator for YencLines<'_> {
         match self
             .reader
             .read_until(b'\n', &mut self.line_buf)
-            .map_err(|e| ParseError::InvalidYenc(format!("Failed to read yenc: {}", e)))
+            .map_err(|e| ParseError::InvalidYenc(format!("Failed to read yenc: {e}")))
         {
             Ok(0) => None,
             Ok(_) => Some(Ok(self.line_buf.clone())),
@@ -224,7 +222,7 @@ fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> Result<
 /// Extract a parameter value from a yenc metadata line
 #[inline]
 fn extract_param<'a>(line: &'a str, param: &str) -> Option<&'a str> {
-    line.find(&format!("{}=", param))
+    line.find(&format!("{param}="))
         .map(|start| &line[start + param.len() + 1..])
         .and_then(|rest| rest.split_whitespace().next())
 }

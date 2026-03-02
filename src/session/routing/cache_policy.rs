@@ -66,8 +66,7 @@ pub fn determine_cache_action(
     // In debug builds, catch bugs; in release, zero-cost assertion (optimized out)
     debug_assert!(
         !NntpCommand::parse(command).is_stateful(),
-        "stateful command in PerCommand path: {}",
-        command
+        "stateful command in PerCommand path: {command}"
     );
 
     if !has_message_id {

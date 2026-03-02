@@ -1,7 +1,7 @@
-//! Configuration-related type-safe wrappers using NonZero types
+//! Configuration-related type-safe wrappers using `NonZero` types
 //!
 //! This module provides validated configuration types that enforce
-//! invariants at the type level using Rust's NonZero types.
+//! invariants at the type level using Rust's `NonZero` types.
 
 #[macro_use]
 mod buffer;
@@ -66,7 +66,7 @@ mod tests {
         assert_eq!(size.get(), 4096);
 
         // Test Display
-        assert_eq!(format!("{}", size), "4096");
+        assert_eq!(format!("{size}"), "4096");
 
         // Test From (nutype uses into_inner, not From)
         let val: usize = size.into_inner();
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn test_nonzero_newtype_debug() {
         let size = BufferSize::try_new(16384).unwrap();
-        let debug = format!("{:?}", size);
+        let debug = format!("{size:?}");
         assert!(debug.contains("BufferSize"));
     }
 }

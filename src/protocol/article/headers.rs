@@ -21,7 +21,7 @@ impl<'a> Headers<'a> {
     /// * `data` - Raw header bytes (should NOT include the trailing blank line)
     ///
     /// # Returns
-    /// Validated Headers or ParseError
+    /// Validated Headers or `ParseError`
     pub fn parse(data: &'a [u8]) -> Result<Self, ParseError> {
         Self::validate_headers(data)?;
         Ok(Headers { data })

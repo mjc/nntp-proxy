@@ -396,7 +396,7 @@ mod tests {
         let mut original = Vec::with_capacity(1024 * 1024);
         for i in 0..1024 * 64 {
             original.extend_from_slice(
-                format!("Line {}: Some NNTP article content here\r\n", i).as_bytes(),
+                format!("Line {i}: Some NNTP article content here\r\n").as_bytes(),
             );
         }
 
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn test_debug_impl() {
         let stream = DecompressStream::new(std::io::Cursor::new(Vec::<u8>::new()));
-        let debug_str = format!("{:?}", stream);
+        let debug_str = format!("{stream:?}");
         assert!(debug_str.contains("DecompressStream"));
         assert!(debug_str.contains("compressed_pos"));
         assert!(debug_str.contains("bytes_compressed_in"));

@@ -74,7 +74,7 @@ impl Default for LogBuffer {
     }
 }
 
-/// Writer that appends to LogBuffer
+/// Writer that appends to `LogBuffer`
 pub struct LogWriter {
     buffer: LogBuffer,
     line_buffer: String,
@@ -121,13 +121,13 @@ impl Write for LogWriter {
     }
 }
 
-/// MakeWriter implementation for tracing_subscriber
+/// `MakeWriter` implementation for `tracing_subscriber`
 pub struct LogMakeWriter {
     buffer: LogBuffer,
 }
 
 impl LogMakeWriter {
-    /// Create a new MakeWriter for the given buffer
+    /// Create a new `MakeWriter` for the given buffer
     #[must_use]
     pub const fn new(buffer: LogBuffer) -> Self {
         Self { buffer }
@@ -166,7 +166,7 @@ mod tests {
 
         // Add more than MAX_LOG_LINES
         for i in 0..1500 {
-            buffer.push(format!("Line {}", i));
+            buffer.push(format!("Line {i}"));
         }
 
         let lines = buffer.all_lines();
@@ -179,7 +179,7 @@ mod tests {
     fn test_log_buffer_recent_lines() {
         let buffer = LogBuffer::new();
         for i in 0..10 {
-            buffer.push(format!("Line {}", i));
+            buffer.push(format!("Line {i}"));
         }
 
         let recent = buffer.recent_lines(3);

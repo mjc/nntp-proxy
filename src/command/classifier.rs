@@ -62,7 +62,7 @@
 macro_rules! command_cases {
     (pub $name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
-        pub const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
+        pub const $name: &[&[u8]; 3] = &[b"STAT", b"stat", b"Stat"];
 
         // Compile-time validation: ensure documentation starts with RFC reference
         // This creates a const assertion that the doc string contains expected patterns
@@ -74,7 +74,7 @@ macro_rules! command_cases {
     };
     ($name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
-        const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
+        const $name: &[&[u8]; 3] = &[b"NEWNEWS", b"newnews", b"Newnews"];
 
         // Compile-time validation: ensure documentation starts with RFC reference
         // This creates a const assertion that the doc string contains expected patterns
@@ -435,7 +435,7 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
 ///
 /// ## Classification Categories
 ///
-/// - **ArticleByMessageId**: High-throughput binary retrieval (can be multiplexed)
+/// - **`ArticleByMessageId`**: High-throughput binary retrieval (can be multiplexed)
 ///   - Commands: ARTICLE/BODY/HEAD/STAT with message-ID argument
 ///   - Per [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2)
 ///   - 70%+ of NZB download traffic
@@ -445,7 +445,7 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
 ///   - Per [RFC 3977 §6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1)
 ///   - Requires dedicated backend connection with maintained state
 ///
-/// - **NonRoutable**: Cannot be safely proxied (POST, IHAVE)
+/// - **`NonRoutable`**: Cannot be safely proxied (POST, IHAVE)
 ///   - Commands: POST, IHAVE
 ///   - Per [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
 ///   - Typically rejected or require special handling

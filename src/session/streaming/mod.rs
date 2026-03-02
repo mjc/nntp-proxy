@@ -367,7 +367,7 @@ where
 
 /// Internal implementation that optionally captures while streaming.
 ///
-/// Phase 1: Process first_chunk directly (zero-copy, no pooled buffer needed).
+/// Phase 1: Process `first_chunk` directly (zero-copy, no pooled buffer needed).
 /// Phase 2: For multi-chunk responses, acquire two pooled buffers and double-buffer.
 ///
 /// All terminator detection is delegated to `TailBuffer` — one instance spans
@@ -556,8 +556,7 @@ mod tests {
         let result = stream_multiline_response(&mut reader, &mut writer, partial, &ctx).await;
         assert!(
             matches!(result, Err(StreamingError::BackendEof { .. })),
-            "EOF before terminator must be BackendEof, got: {:?}",
-            result
+            "EOF before terminator must be BackendEof, got: {result:?}"
         );
     }
 
@@ -584,8 +583,7 @@ mod tests {
         let result = handle_client_write_error(error, &mut backend, ctx).await;
         assert!(
             matches!(result, StreamingError::BackendDirty(_)),
-            "Should return BackendDirty when drain fails, got: {:?}",
-            result
+            "Should return BackendDirty when drain fails, got: {result:?}"
         );
         assert!(
             result.must_remove_connection(),
@@ -650,7 +648,7 @@ mod tests {
         let header = b"220 Article follows\r\n";
         let mut body = Vec::new();
         for i in 0..1000 {
-            body.extend_from_slice(format!("Line {}\r\n", i).as_bytes());
+            body.extend_from_slice(format!("Line {i}\r\n").as_bytes());
         }
         let terminator = b".\r\n";
 
@@ -691,8 +689,7 @@ mod tests {
         let result = handle_client_write_error(error, &mut backend, ctx).await;
         assert!(
             matches!(result, StreamingError::ClientDisconnect(_)),
-            "Should return ClientDisconnect, got: {:?}",
-            result
+            "Should return ClientDisconnect, got: {result:?}"
         );
         assert!(!result.must_remove_connection());
     }
@@ -717,8 +714,7 @@ mod tests {
         let result = handle_client_write_error(error, &mut backend, ctx).await;
         assert!(
             matches!(result, StreamingError::ClientDisconnect(_)),
-            "Should return ClientDisconnect after successful drain, got: {:?}",
-            result
+            "Should return ClientDisconnect after successful drain, got: {result:?}"
         );
         assert!(!result.must_remove_connection());
     }
@@ -744,8 +740,7 @@ mod tests {
         let result = handle_client_write_error(error, &mut backend, ctx).await;
         assert!(
             matches!(result, StreamingError::ClientDisconnect(_)),
-            "Should return ClientDisconnect after successful drain, got: {:?}",
-            result
+            "Should return ClientDisconnect after successful drain, got: {result:?}"
         );
 
         // Verify backend was drained (cursor should be at or near end)
@@ -882,8 +877,7 @@ mod tests {
         // Should fail with Io variant containing the bounds check error
         assert!(
             matches!(result, Err(StreamingError::Io(_))),
-            "Should return Io error when leftover exceeds max size, got: {:?}",
-            result
+            "Should return Io error when leftover exceeds max size, got: {result:?}"
         );
         let err = result.unwrap_err().to_string();
         assert!(

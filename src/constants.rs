@@ -41,7 +41,7 @@ pub mod buffer {
     /// This is a conservative default; increase via config for higher caching throughput
     pub const CAPTURE_COUNT: usize = 16;
 
-    /// BufReader capacity for client command parsing (64KB)
+    /// `BufReader` capacity for client command parsing (64KB)
     /// Large enough to handle any NNTP command line without multiple reads
     /// Sized for efficient line-based reading with minimal syscalls
     pub const READER_CAPACITY: usize = 64 * 1024;
@@ -166,7 +166,7 @@ pub mod pool {
     pub const TCP_PEEK_BUFFER_SIZE: usize = 1;
 
     /// Health check timeout - how long to wait for DATE command response
-    /// CRITICAL: Must be < MAX_CONNECTION_SALVAGE_MS (1000ms) to prevent pool starvation
+    /// CRITICAL: Must be < `MAX_CONNECTION_SALVAGE_MS` (1000ms) to prevent pool starvation
     pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// Buffer size for reading health check responses
@@ -219,7 +219,7 @@ pub mod session {
 pub mod user {
     /// Display name for anonymous/unauthenticated users
     ///
-    /// Used as HashMap key and display value for users who haven't authenticated.
+    /// Used as `HashMap` key and display value for users who haven't authenticated.
     /// The `<anonymous>` format is chosen to:
     /// - Sort first in alphabetical listings (< comes before letters)
     /// - Be clearly distinguished from actual usernames
@@ -288,9 +288,7 @@ mod tests {
 
         assert!(
             actual_mb >= expected_mb - 1 && actual_mb <= expected_mb + 1,
-            "Pool memory should be ~{}MB, got {}MB",
-            expected_mb,
-            actual_mb
+            "Pool memory should be ~{expected_mb}MB, got {actual_mb}MB"
         );
     }
 

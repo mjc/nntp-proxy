@@ -379,7 +379,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     /// Helper: create a TCP pair where the server writes `data` then optionally closes.
-    /// Returns a ConnectionStream connected to the mock server.
+    /// Returns a `ConnectionStream` connected to the mock server.
     async fn mock_backend_conn(data: &[u8]) -> ConnectionStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -396,7 +396,7 @@ mod tests {
     }
 
     /// Helper: create a TCP pair where the server writes `chunks` with delays.
-    /// Returns a ConnectionStream connected to the mock server.
+    /// Returns a `ConnectionStream` connected to the mock server.
     async fn mock_backend_conn_chunked(chunks: Vec<Vec<u8>>) -> ConnectionStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

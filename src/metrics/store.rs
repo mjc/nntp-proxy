@@ -84,7 +84,7 @@ pub(crate) struct PersistedPipeline {
 /// Persistable backend metrics storage (atomic counters only)
 ///
 /// This struct contains only cumulative counters that should survive restarts.
-/// Live gauges (active_connections, health_status) are kept separately on BackendMetrics.
+/// Live gauges (`active_connections`, `health_status`) are kept separately on `BackendMetrics`.
 #[derive(Debug)]
 pub struct BackendStore {
     pub total_commands: AtomicU64,
@@ -185,7 +185,7 @@ impl BackendStore {
 pub struct MetricsStore {
     pub total_connections: AtomicU64,
     pub backend_stores: Vec<BackendStore>,
-    /// User metrics (keyed by username) - uses DashMap for concurrent access
+    /// User metrics (keyed by username) - uses `DashMap` for concurrent access
     pub user_metrics: dashmap::DashMap<String, UserMetrics>,
     pub pipeline_batches: AtomicU64,
     pub pipeline_commands: AtomicU64,
@@ -218,7 +218,7 @@ impl UserMetrics {
         }
     }
 
-    /// Convert to UserStats for snapshot (used by collector)
+    /// Convert to `UserStats` for snapshot (used by collector)
     pub(crate) fn to_user_stats(&self) -> crate::metrics::UserStats {
         use crate::metrics::types::{CommandCount, ErrorCount};
         use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
@@ -420,15 +420,15 @@ impl MetricsStore {
         );
         let tmp_path = path.with_file_name(tmp_filename);
         fs::write(&tmp_path, json)
-            .with_context(|| format!("Failed to write stats to {:?}", tmp_path))?;
+            .with_context(|| format!("Failed to write stats to {tmp_path:?}"))?;
 
         // Best-effort atomic replace: remove existing file (for Windows compatibility) then rename temp file
         if path.exists() {
             fs::remove_file(path)
-                .with_context(|| format!("Failed to remove existing stats file at {:?}", path))?;
+                .with_context(|| format!("Failed to remove existing stats file at {path:?}"))?;
         }
         fs::rename(&tmp_path, path)
-            .with_context(|| format!("Failed to rename {:?} to {:?}", tmp_path, path))?;
+            .with_context(|| format!("Failed to rename {tmp_path:?} to {path:?}"))?;
 
         tracing::debug!("Saved stats to {:?}", path);
         Ok(())

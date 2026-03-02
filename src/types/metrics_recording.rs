@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn test_transfer_direction_debug() {
         let dir = TransferDirection::ClientToBackend;
-        let debug_str = format!("{:?}", dir);
+        let debug_str = format!("{dir:?}");
         assert!(debug_str.contains("ClientToBackend"));
     }
 
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_directional_debug() {
         let bytes = DirectionalBytes::client_to_backend(1024);
-        let debug_str = format!("{:?}", bytes);
+        let debug_str = format!("{bytes:?}");
         assert!(debug_str.contains("DirectionalBytes"));
     }
 

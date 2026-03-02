@@ -67,7 +67,7 @@ pub(super) fn response_for_command(
 ) -> Option<Vec<u8>> {
     match (status_code, cmd_verb) {
         // STAT just needs existence confirmation - synthesize response
-        (220..=222, "STAT") => Some(format!("223 0 {}\r\n", message_id).into_bytes()),
+        (220..=222, "STAT") => Some(format!("223 0 {message_id}\r\n").into_bytes()),
         // Direct match - return cached buffer if valid
         (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
             if is_valid_response(buffer) {
@@ -125,9 +125,9 @@ pub(super) const fn matches_command_type_verb(status_code: u16, cmd_verb: &str) 
 ///
 /// This is used when `cache_articles=false` to reduce memory copies —
 /// the cache only needs the status code to build an availability stub,
-/// not the full article content (which can be 8-64KB in first_chunk).
+/// not the full article content (which can be 8-64KB in `first_chunk`).
 ///
-/// Uses SmallVec to keep typical status lines (~30-80 bytes) on the stack,
+/// Uses `SmallVec` to keep typical status lines (~30-80 bytes) on the stack,
 /// avoiding heap allocation in the common case.
 #[inline]
 pub fn extract_status_line(buffer: &[u8]) -> SmallVec<[u8; 128]> {

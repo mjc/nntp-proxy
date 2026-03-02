@@ -1,6 +1,6 @@
 //! Extension trait for optional metrics collection
 //!
-//! Provides a clean API for recording metrics when MetricsCollector is available,
+//! Provides a clean API for recording metrics when `MetricsCollector` is available,
 //! with no-op behavior when it's not. This eliminates the need for repeated
 //! `if let Some(ref m) = self.metrics` patterns throughout the codebase.
 

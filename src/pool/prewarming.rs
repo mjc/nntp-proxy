@@ -133,7 +133,7 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            let addr = format!("127.0.0.1:{}", port);
+            let addr = format!("127.0.0.1:{port}");
             let Ok(listener) = TcpListener::bind(&addr).await else {
                 return;
             };

@@ -332,7 +332,7 @@ impl DeadpoolConnectionProvider {
         Ok(Self::from_manager(manager, name, max_size))
     }
 
-    /// Construct a provider from a pre-built TcpManager
+    /// Construct a provider from a pre-built `TcpManager`
     fn from_manager(manager: TcpManager, name: String, max_size: usize) -> Self {
         let pool = Pool::builder(manager)
             .max_size(max_size)
@@ -484,7 +484,7 @@ impl DeadpoolConnectionProvider {
     /// deadpool creates a replacement. Prevents connection count from
     /// exceeding the backend's limit during high churn.
     ///
-    /// If replacement_cooldown is None or Duration::ZERO (disabled), immediately drops
+    /// If `replacement_cooldown` is None or `Duration::ZERO` (disabled), immediately drops
     /// the connection without cooldown (behaves like normal pool removal).
     ///
     /// CRITICAL: When cooldown is active, we resize the pool BEFORE dropping the
@@ -617,7 +617,7 @@ impl DeadpoolConnectionProvider {
     /// Run periodic health checks on idle connections
     ///
     /// This task runs in the background checking a limited number of idle connections
-    /// each cycle. It can be gracefully shut down via the shutdown_rx channel.
+    /// each cycle. It can be gracefully shut down via the `shutdown_rx` channel.
     /// Health check metrics are recorded in the provided metrics object.
     async fn run_periodic_health_checks(
         pool: Pool,
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn test_builder_with_tls_config() {
         let tls_config = TlsConfig::builder().enabled(true).build();
-        let builder = Builder::new("example.com", 563).tls_config(tls_config.clone());
+        let builder = Builder::new("example.com", 563).tls_config(tls_config);
         assert!(builder.tls_config.is_some());
     }
 
@@ -1059,9 +1059,9 @@ mod tests {
         }
     }
 
-    /// Verify that remove_with_cooldown reduces pool max_size BEFORE releasing
+    /// Verify that `remove_with_cooldown` reduces pool `max_size` BEFORE releasing
     /// the connection. This is the fix for the race where waiters would see
-    /// size < max_size and create a replacement connection.
+    /// size < `max_size` and create a replacement connection.
     #[tokio::test]
     async fn test_remove_with_cooldown_resize_before_drop() {
         let addr = spawn_mock_nntp_server().await;

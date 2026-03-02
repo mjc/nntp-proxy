@@ -13,7 +13,7 @@ pub trait EnvProvider {
     fn get(&self, key: &str) -> Option<String>;
 }
 
-/// Standard environment provider using std::env::var
+/// Standard environment provider using `std::env::var`
 #[derive(Default)]
 pub struct StdEnvProvider;
 
@@ -33,30 +33,30 @@ impl EnvProvider for StdEnvProvider {
 /// Some(Server) if HOST variable exists, None otherwise
 pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Server> {
     // Check if this server index exists by looking for HOST
-    let host_key = format!("NNTP_SERVER_{}_HOST", index);
+    let host_key = format!("NNTP_SERVER_{index}_HOST");
     let host = env.get(&host_key)?;
 
     // Parse port (required)
-    let port_key = format!("NNTP_SERVER_{}_PORT", index);
+    let port_key = format!("NNTP_SERVER_{index}_PORT");
     let port = env
         .get(&port_key)
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(119); // Default NNTP port
 
     // Get name (required, use host as fallback)
-    let name_key = format!("NNTP_SERVER_{}_NAME", index);
+    let name_key = format!("NNTP_SERVER_{index}_NAME");
     let name = env
         .get(&name_key)
-        .unwrap_or_else(|| format!("Server {}", index));
+        .unwrap_or_else(|| format!("Server {index}"));
 
     // Optional fields
-    let username_key = format!("NNTP_SERVER_{}_USERNAME", index);
+    let username_key = format!("NNTP_SERVER_{index}_USERNAME");
     let username = env.get(&username_key);
 
-    let password_key = format!("NNTP_SERVER_{}_PASSWORD", index);
+    let password_key = format!("NNTP_SERVER_{index}_PASSWORD");
     let password = env.get(&password_key);
 
-    let max_conn_key = format!("NNTP_SERVER_{}_MAX_CONNECTIONS", index);
+    let max_conn_key = format!("NNTP_SERVER_{index}_MAX_CONNECTIONS");
     let max_connections = env
         .get(&max_conn_key)
         .and_then(|m| m.parse::<usize>().ok())
@@ -64,60 +64,59 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         .unwrap_or_else(defaults::max_connections);
 
     // TLS configuration
-    let use_tls_key = format!("NNTP_SERVER_{}_USE_TLS", index);
+    let use_tls_key = format!("NNTP_SERVER_{index}_USE_TLS");
     let use_tls = env
         .get(&use_tls_key)
         .and_then(|v| v.parse::<bool>().ok())
         .unwrap_or(false);
 
-    let tls_verify_key = format!("NNTP_SERVER_{}_TLS_VERIFY_CERT", index);
+    let tls_verify_key = format!("NNTP_SERVER_{index}_TLS_VERIFY_CERT");
     let tls_verify_cert = env
         .get(&tls_verify_key)
         .and_then(|v| v.parse::<bool>().ok())
         .unwrap_or_else(defaults::tls_verify_cert);
 
-    let tls_cert_path_key = format!("NNTP_SERVER_{}_TLS_CERT_PATH", index);
+    let tls_cert_path_key = format!("NNTP_SERVER_{index}_TLS_CERT_PATH");
     let tls_cert_path = env.get(&tls_cert_path_key);
 
     // Connection keepalive (in seconds)
-    let keepalive_key = format!("NNTP_SERVER_{}_CONNECTION_KEEPALIVE", index);
+    let keepalive_key = format!("NNTP_SERVER_{index}_CONNECTION_KEEPALIVE");
     let connection_keepalive = env
         .get(&keepalive_key)
         .and_then(|k| k.parse::<u64>().ok())
         .map(std::time::Duration::from_secs);
 
     // Health check configuration
-    let health_max_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_MAX_PER_CYCLE", index);
+    let health_max_key = format!("NNTP_SERVER_{index}_HEALTH_CHECK_MAX_PER_CYCLE");
     let health_check_max_per_cycle = env
         .get(&health_max_key)
         .and_then(|h| h.parse::<usize>().ok())
         .unwrap_or_else(defaults::health_check_max_per_cycle);
 
-    let health_timeout_key = format!("NNTP_SERVER_{}_HEALTH_CHECK_POOL_TIMEOUT", index);
+    let health_timeout_key = format!("NNTP_SERVER_{index}_HEALTH_CHECK_POOL_TIMEOUT");
     let health_check_pool_timeout = env
         .get(&health_timeout_key)
         .and_then(|h| h.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(defaults::health_check_pool_timeout);
+        .map_or_else(
+            defaults::health_check_pool_timeout,
+            std::time::Duration::from_secs,
+        );
 
-    let tier_key = format!("NNTP_SERVER_{}_TIER", index);
+    let tier_key = format!("NNTP_SERVER_{index}_TIER");
     let tier = match env.get(&tier_key) {
-        Some(tier_str) => tier_str.parse::<u8>().unwrap_or_else(|_| {
-            panic!(
-                "Invalid tier in {}: '{}' (must be 0-255)",
-                tier_key, tier_str
-            )
-        }),
+        Some(tier_str) => tier_str
+            .parse::<u8>()
+            .unwrap_or_else(|_| panic!("Invalid tier in {tier_key}: '{tier_str}' (must be 0-255)")),
         None => 0,
     };
 
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
-            .unwrap_or_else(|_| panic!("Invalid hostname in {}: '{}'", host_key, host)),
+            .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
         port: crate::types::Port::try_new(port)
-            .unwrap_or_else(|_| panic!("Invalid port in {}: {}", port_key, port)),
+            .unwrap_or_else(|_| panic!("Invalid port in {port_key}: {port}")),
         name: crate::types::ServerName::try_new(name.clone())
-            .unwrap_or_else(|_| panic!("Invalid server name in {}: '{}'", name_key, name)),
+            .unwrap_or_else(|_| panic!("Invalid server name in {name_key}: '{name}'")),
         username,
         password,
         max_connections,
@@ -169,14 +168,14 @@ pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Ser
 
 /// Check if any backend server environment variables are set
 ///
-/// Returns true if at least NNTP_SERVER_0_HOST is set
+/// Returns true if at least `NNTP_SERVER_0_HOST` is set
 pub fn has_server_env_vars() -> bool {
     std::env::var("NNTP_SERVER_0_HOST").is_ok()
 }
 
 /// Load configuration from environment variables only
 ///
-/// Used when no config file is present. Requires at least NNTP_SERVER_0_HOST to be set.
+/// Used when no config file is present. Requires at least `NNTP_SERVER_0_HOST` to be set.
 ///
 /// # Errors
 ///
@@ -211,10 +210,10 @@ pub fn load_config(config_path: &str) -> Result<Config> {
     use anyhow::Context;
 
     let config_content = std::fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read config file '{}'", config_path))?;
+        .with_context(|| format!("Failed to read config file '{config_path}'"))?;
 
     let mut config: Config = toml::from_str(&config_content)
-        .with_context(|| format!("Failed to parse config file '{}'", config_path))?;
+        .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
 
     // Check for environment variable server overrides
     if let Some(env_servers) = load_servers_from_env() {
@@ -265,7 +264,7 @@ impl ConfigSource {
 /// * `config_path` - Path to configuration file
 ///
 /// # Returns
-/// Tuple of (Config, ConfigSource) indicating where config came from
+/// Tuple of (Config, `ConfigSource`) indicating where config came from
 ///
 /// # Errors
 /// Returns error if:
@@ -325,7 +324,7 @@ pub fn load_config_with_fallback(config_path: &str) -> Result<(Config, ConfigSou
         toml::to_string_pretty(&default_config).context("Failed to serialize default config")?;
 
     std::fs::write(config_path, &config_toml)
-        .with_context(|| format!("Failed to write default config to '{}'", config_path))?;
+        .with_context(|| format!("Failed to write default config to '{config_path}'"))?;
 
     tracing::info!("Created default config file: {}", config_path);
     Ok((default_config, ConfigSource::DefaultCreated))

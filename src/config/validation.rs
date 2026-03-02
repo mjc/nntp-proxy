@@ -15,7 +15,7 @@ const MAX_RECOMMENDED_KEEPALIVE: Duration = Duration::from_secs(MAX_RECOMMENDED_
 impl Config {
     /// Validate configuration for correctness
     ///
-    /// Most validations are now enforced by type system (NonZero types, validated strings, etc.)
+    /// Most validations are now enforced by type system (`NonZero` types, validated strings, etc.)
     /// This checks remaining semantic constraints:
     /// - At least one server configured
     /// - Maximum 8 servers (bitset limitation for article availability tracking)
@@ -113,7 +113,7 @@ mod tests {
     fn test_validate_eight_servers_succeeds() {
         let config = Config {
             servers: (0..8)
-                .map(|i| create_test_server(&format!("server{}", i), None))
+                .map(|i| create_test_server(&format!("server{i}"), None))
                 .collect(),
             ..Default::default()
         };
@@ -124,7 +124,7 @@ mod tests {
     fn test_validate_nine_servers_fails() {
         let config = Config {
             servers: (0..9)
-                .map(|i| create_test_server(&format!("server{}", i), None))
+                .map(|i| create_test_server(&format!("server{i}"), None))
                 .collect(),
             ..Default::default()
         };

@@ -83,7 +83,7 @@ impl ThreadCount {
     /// Default thread count (single-threaded)
     pub const DEFAULT: Self = Self(NonZeroUsize::new(1).unwrap());
 
-    /// Create a new ThreadCount
+    /// Create a new `ThreadCount`
     ///
     /// - If value is 0, returns the number of CPU cores
     /// - Otherwise returns the specified value
@@ -103,7 +103,7 @@ impl ThreadCount {
         }
     }
 
-    /// Create a new ThreadCount from a value
+    /// Create a new `ThreadCount` from a value
     ///
     /// - If value is 0, returns the number of CPU cores
     /// - Otherwise returns the specified value

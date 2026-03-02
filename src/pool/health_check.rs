@@ -154,7 +154,7 @@ pub fn check_tcp_alive(
 
 /// Validate DATE command response
 ///
-/// Returns Ok(()) if the response starts with "111 " (EXPECTED_DATE_RESPONSE_PREFIX),
+/// Returns Ok(()) if the response starts with "111 " (`EXPECTED_DATE_RESPONSE_PREFIX`),
 /// otherwise returns an error with the actual response.
 ///
 /// This is a pure function extracted for testability.

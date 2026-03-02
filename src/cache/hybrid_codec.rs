@@ -128,7 +128,7 @@ impl Code for HybridArticleEntry {
         let status_code = CacheableStatusCode::try_from(raw_code).map_err(|code| {
             foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid cached status code: {}", code),
+                format!("Invalid cached status code: {code}"),
             ))
         })?;
 
@@ -164,10 +164,7 @@ impl Code for HybridArticleEntry {
         if len > MAX_BUFFER_SIZE {
             return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "Cached article too large: {} bytes (max {} bytes)",
-                    len, MAX_BUFFER_SIZE
-                ),
+                format!("Cached article too large: {len} bytes (max {MAX_BUFFER_SIZE} bytes)"),
             )));
         }
 
@@ -240,7 +237,7 @@ impl HybridArticleEntry {
     /// Get the validated status code
     ///
     /// This always returns a valid code because entries cannot be created
-    /// with invalid status codes. Returns Option for API consistency with ArticleEntry.
+    /// with invalid status codes. Returns Option for API consistency with `ArticleEntry`.
     #[inline]
     pub fn status_code(&self) -> Option<StatusCode> {
         // SAFETY: Invariant enforced by new() and decode()
@@ -310,7 +307,7 @@ impl HybridArticleEntry {
         super::entry_helpers::matches_command_type_verb(self.status_code.as_u16(), cmd_verb)
     }
 
-    /// Get backend availability as ArticleAvailability struct
+    /// Get backend availability as `ArticleAvailability` struct
     #[inline]
     pub const fn availability(&self) -> ArticleAvailability {
         self.availability
@@ -325,9 +322,9 @@ impl HybridArticleEntry {
         self.availability.has_availability_info()
     }
 
-    /// Check if availability information is stale (older than ttl_millis)
+    /// Check if availability information is stale (older than `ttl_millis`)
     ///
-    /// HybridArticleEntry stores timestamps for tier-aware TTL, but foyer's cache
+    /// `HybridArticleEntry` stores timestamps for tier-aware TTL, but foyer's cache
     /// handles eviction based on insertion time. This method is kept for compatibility
     /// and always returns false since the cache layer manages staleness.
     #[inline]
@@ -338,7 +335,7 @@ impl HybridArticleEntry {
 
     /// Clear stale availability information
     ///
-    /// HybridArticleEntry now tracks timestamps via `timestamp` field for tier-aware TTL,
+    /// `HybridArticleEntry` now tracks timestamps via `timestamp` field for tier-aware TTL,
     /// but foyer handles eviction separately. This method is a no-op for compatibility.
     #[inline]
     pub const fn clear_stale_availability(&mut self, _ttl_millis: u64) {
@@ -563,7 +560,7 @@ mod tests {
         ];
         for (buf, expected) in cases {
             let entry = HybridArticleEntry::new(buf.to_vec())
-                .unwrap_or_else(|| panic!("should accept code {}", expected));
+                .unwrap_or_else(|| panic!("should accept code {expected}"));
             assert_eq!(entry.status_code().unwrap().as_u16(), *expected);
         }
     }
@@ -571,11 +568,10 @@ mod tests {
     #[test]
     fn test_entry_rejects_non_cacheable_nntp_codes() {
         for code in [200, 201, 211, 411, 480, 500, 502] {
-            let buf = format!("{} response\r\n", code).into_bytes();
+            let buf = format!("{code} response\r\n").into_bytes();
             assert!(
                 HybridArticleEntry::new(buf).is_none(),
-                "code {} should be rejected",
-                code
+                "code {code} should be rejected"
             );
         }
     }

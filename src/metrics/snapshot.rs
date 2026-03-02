@@ -1,6 +1,6 @@
 //! Metrics snapshot type and methods
 //!
-//! Contains the immutable MetricsSnapshot struct with functional methods
+//! Contains the immutable `MetricsSnapshot` struct with functional methods
 //! for querying and aggregating metrics across backends.
 
 use super::types::*;
@@ -79,7 +79,7 @@ impl MetricsSnapshot {
     /// Update backend active connections from pool status
     ///
     /// Populates `active_connections` for each backend by querying the connection pool.
-    /// Active connections = max_size - available connections.
+    /// Active connections = `max_size` - available connections.
     ///
     /// This is a fluent method for functional composition: `snapshot.with_pool_status(router)`
     #[must_use]
@@ -112,11 +112,11 @@ impl MetricsSnapshot {
         let seconds = secs % 60;
 
         if hours > 0 {
-            format!("{}h {}m {}s", hours, minutes, seconds)
+            format!("{hours}h {minutes}m {seconds}s")
         } else if minutes > 0 {
-            format!("{}m {}s", minutes, seconds)
+            format!("{minutes}m {seconds}s")
         } else {
-            format!("{}s", seconds)
+            format!("{seconds}s")
         }
     }
 
@@ -202,7 +202,7 @@ impl MetricsSnapshot {
 
     /// Get backend statistics by ID
     ///
-    /// Returns None if backend_id is out of range.
+    /// Returns None if `backend_id` is out of range.
     #[must_use]
     pub fn backend(&self, backend_id: BackendId) -> Option<&BackendStats> {
         self.backend_stats.get(backend_id.as_index())

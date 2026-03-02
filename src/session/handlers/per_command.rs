@@ -36,7 +36,7 @@ enum CommandResult {
 enum SingleCommandResult {
     /// Continue processing commands
     Continue { auth_succeeded: bool },
-    /// Client sent QUIT command (bytes already added to backend_to_client_bytes)
+    /// Client sent QUIT command (bytes already added to `backend_to_client_bytes`)
     Quit,
     /// Switch to stateful mode (early return from loop)
     SwitchToStateful,
@@ -188,7 +188,7 @@ impl ClientSession {
 
     /// Process a single command (handles QUIT, auth, routing decision)
     ///
-    /// Returns SingleCommandResult indicating whether to continue, quit, or switch to stateful mode.
+    /// Returns `SingleCommandResult` indicating whether to continue, quit, or switch to stateful mode.
     async fn process_single_command(
         &self,
         params: ProcessCommandParams<'_, '_>,

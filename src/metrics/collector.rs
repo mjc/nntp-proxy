@@ -14,8 +14,8 @@ use std::time::Instant;
 
 /// Backend metrics wrapper: live gauges only
 ///
-/// Live gauges (active_connections, health_status) are ephemeral.
-/// Cumulative counters are stored in MetricsStore.backend_stores[idx].
+/// Live gauges (`active_connections`, `health_status`) are ephemeral.
+/// Cumulative counters are stored in `MetricsStore.backend_stores`[idx].
 #[derive(Debug)]
 struct BackendMetrics {
     active_connections: AtomicUsize,
@@ -144,7 +144,7 @@ impl MetricsCollector {
     /// Create a metrics collector with a restored store (for persistence)
     ///
     /// The store contains all cumulative counters that were saved to disk.
-    /// Live gauges (active_connections, health_status) start at zero.
+    /// Live gauges (`active_connections`, `health_status`) start at zero.
     pub fn with_store(store: MetricsStore) -> Self {
         let num_backends = store.backend_stores.len();
         let backend_metrics = (0..num_backends)
@@ -438,7 +438,7 @@ impl MetricsCollector {
         self.snapshot_with_cache(cache_stats)
     }
 
-    /// Create a snapshot with any cache type that implements CacheStatsProvider
+    /// Create a snapshot with any cache type that implements `CacheStatsProvider`
     ///
     /// Returns cumulative counters - no rate calculations.
     /// Use `MetricsSnapshot::with_pool_status()` to add pool utilization data.
@@ -472,8 +472,8 @@ impl MetricsCollector {
             .map(|b| b.bytes_received.as_u64())
             .sum();
 
-        let (cache_entries, cache_size_bytes, cache_hit_rate, disk_cache) = cache
-            .map(|c| {
+        let (cache_entries, cache_size_bytes, cache_hit_rate, disk_cache) =
+            cache.map_or((0, 0, 0.0, None), |c| {
                 let stats = c.display_stats();
                 let disk = stats.disk.map(|d| super::snapshot::DiskCacheStats {
                     disk_hits: d.disk_hits,
@@ -485,8 +485,7 @@ impl MetricsCollector {
                     read_ios: d.read_ios,
                 });
                 (stats.entry_count, stats.size_bytes, stats.hit_rate, disk)
-            })
-            .unwrap_or((0, 0, 0.0, None));
+            });
 
         MetricsSnapshot {
             total_connections: self.inner.store.total_connections.load(Ordering::Relaxed),

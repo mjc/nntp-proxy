@@ -104,14 +104,14 @@ mod tests {
         #[test]
         fn buffer_size_display_shows_value(size in 1usize..10_000_000usize) {
             let buffer = BufferSize::try_new(size).unwrap();
-            let display = format!("{}", buffer);
+            let display = format!("{buffer}");
             prop_assert!(display.contains(&size.to_string()));
         }
 
         #[test]
         fn buffer_size_debug_shows_value(size in 1usize..10_000_000usize) {
             let buffer = BufferSize::try_new(size).unwrap();
-            let debug = format!("{:?}", buffer);
+            let debug = format!("{buffer:?}");
             prop_assert!(debug.contains("BufferSize"));
             prop_assert!(debug.contains(&size.to_string()));
         }
@@ -151,7 +151,7 @@ mod tests {
         #[test]
         fn window_size_display_shows_value(size in 1u64..100_000u64) {
             let window = WindowSize::try_new(size).unwrap();
-            let display = format!("{}", window);
+            let display = format!("{window}");
             prop_assert!(display.contains(&size.to_string()));
         }
 

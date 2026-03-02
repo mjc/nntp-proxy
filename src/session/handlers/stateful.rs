@@ -35,9 +35,7 @@ impl ClientSession {
                     .await
                     .map_err(|ie| crate::session::SessionError::Backend(ie.into()))?;
                 return Err(crate::session::SessionError::Backend(anyhow::anyhow!(
-                    "Failed to get pooled connection for '{}': {}",
-                    server_name,
-                    e
+                    "Failed to get pooled connection for '{server_name}': {e}"
                 )));
             }
         };

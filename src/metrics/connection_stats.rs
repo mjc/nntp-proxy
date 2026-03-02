@@ -51,11 +51,9 @@ impl UserConnectionStats {
     /// Duration between first and last event
     #[inline]
     fn duration_secs(&self) -> f64 {
-        self.last_seen
-            .lock()
-            .ok()
-            .map(|last| last.duration_since(self.first_seen).as_secs_f64())
-            .unwrap_or(0.0)
+        self.last_seen.lock().ok().map_or(0.0, |last| {
+            last.duration_since(self.first_seen).as_secs_f64()
+        })
     }
 
     /// Get current count
@@ -347,7 +345,7 @@ mod tests {
 
         aggregator.record_connection(Some("alice"), "per-command");
 
-        let cloned = aggregator.clone();
+        let cloned = aggregator;
 
         // Clone shares the same underlying data (Arc)
         assert_eq!(cloned.user_count(), 1);

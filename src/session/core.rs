@@ -104,9 +104,9 @@ impl ClientSessionBuilder {
     /// Set the routing mode for this session
     ///
     /// # Arguments
-    /// * `mode` - The routing mode (Stateful, PerCommand, or Hybrid)
+    /// * `mode` - The routing mode (Stateful, `PerCommand`, or Hybrid)
     ///
-    /// Note: If you use `with_router()`, you typically want PerCommand or Hybrid mode.
+    /// Note: If you use `with_router()`, you typically want `PerCommand` or Hybrid mode.
     #[must_use]
     pub const fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
         self.routing_mode = mode;
@@ -359,7 +359,7 @@ impl ClientSession {
     /// * `skip_auth_check` - If true, bypasses the authentication check
     ///
     /// # Returns
-    /// Returns true if authenticated or if skip_auth_check is true
+    /// Returns true if authenticated or if `skip_auth_check` is true
     #[inline]
     pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
         self.auth_state.is_authenticated_or_skipped(skip_auth_check)
@@ -375,12 +375,12 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
-    /// Helper to create a default AuthHandler for tests (no auth)
+    /// Helper to create a default `AuthHandler` for tests (no auth)
     fn test_auth_handler() -> Arc<AuthHandler> {
         Arc::new(AuthHandler::new(None, None).unwrap())
     }
 
-    /// Helper to create a MetricsCollector for tests
+    /// Helper to create a `MetricsCollector` for tests
     fn test_metrics() -> MetricsCollector {
         MetricsCollector::new(1)
     }
@@ -391,7 +391,7 @@ mod tests {
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
         let session = ClientSession::new(
             addr.into(),
-            buffer_pool.clone(),
+            buffer_pool,
             test_auth_handler(),
             test_metrics(),
         );
@@ -415,7 +415,7 @@ mod tests {
         let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090);
         let session2 = ClientSession::new(
             addr2.into(),
-            buffer_pool.clone(),
+            buffer_pool,
             test_auth_handler(),
             test_metrics(),
         );
@@ -840,7 +840,7 @@ mod tests {
             test_auth_handler(),
             test_metrics(),
         )
-        .with_auth_handler(auth_handler.clone())
+        .with_auth_handler(auth_handler)
         .build();
 
         // Verify auth_handler is set (can't test internals, but creation succeeds)
@@ -897,7 +897,7 @@ mod tests {
             test_auth_handler(),
             test_metrics(),
         )
-        .with_cache(cache.clone())
+        .with_cache(cache)
         .build();
 
         // Cache is always present now (Arc not Option)
@@ -939,7 +939,7 @@ mod tests {
         let session = ClientSession::new_with_router(
             addr.into(),
             buffer_pool.clone(),
-            router.clone(),
+            router,
             RoutingMode::PerCommand,
             test_auth_handler(),
             test_metrics(),

@@ -60,7 +60,7 @@ pub struct ValidatedResponse {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// ValidatedResponse with parsed response and any warnings
+/// `ValidatedResponse` with parsed response and any warnings
 #[must_use]
 pub fn validate_backend_response(
     chunk: &[u8],
@@ -120,7 +120,7 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
     let preview = &data[..data.len().min(max_bytes)];
     preview
         .iter()
-        .map(|b| format!("{:02x}", b))
+        .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -204,7 +204,7 @@ impl CommandResponse {
 /// stream the rest.
 ///
 /// # Arguments
-/// * `conn` - Backend connection (anything implementing AsyncRead + AsyncWrite)
+/// * `conn` - Backend connection (anything implementing `AsyncRead` + `AsyncWrite`)
 /// * `command` - NNTP command to send (should include \r\n)
 /// * `buffer` - Buffer to read response into
 ///
@@ -231,7 +231,7 @@ where
 /// Like `send_command` but also returns timing information for metrics.
 ///
 /// # Returns
-/// Tuple of (CommandResponse, ttfb_micros, send_micros, recv_micros)
+/// Tuple of (`CommandResponse`, `ttfb_micros`, `send_micros`, `recv_micros`)
 pub async fn send_command_timed<C>(
     conn: &mut C,
     command: &str,

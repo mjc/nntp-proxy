@@ -9,10 +9,8 @@ use std::time::Duration;
 
 /// Parse port from command line argument
 fn parse_port(s: &str) -> Result<Port, String> {
-    let port: u16 = s
-        .parse()
-        .map_err(|e| format!("Invalid port number: {}", e))?;
-    Port::try_new(port).map_err(|e| format!("Invalid port: {}", e))
+    let port: u16 = s.parse().map_err(|e| format!("Invalid port number: {e}"))?;
+    Port::try_new(port).map_err(|e| format!("Invalid port: {e}"))
 }
 
 /// Common command-line arguments for NNTP proxy binaries

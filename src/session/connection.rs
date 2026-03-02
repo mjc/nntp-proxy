@@ -20,8 +20,8 @@ pub enum ForwardResult {
 
 /// Bidirectional forwarding between client and backend in stateful mode
 ///
-/// Uses tokio::select! to forward data in both directions until either side disconnects.
-/// Returns ForwardResult indicating whether connection should be removed from pool.
+/// Uses `tokio::select`! to forward data in both directions until either side disconnects.
+/// Returns `ForwardResult` indicating whether connection should be removed from pool.
 pub async fn bidirectional_forward<R, W, B>(
     client_reader: &mut R,
     client_write: &mut W,

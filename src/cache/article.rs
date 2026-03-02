@@ -22,8 +22,8 @@ use super::ttl;
 pub struct ArticleEntry {
     /// Backend availability bitset (2 bytes)
     ///
-    /// No mutex needed: moka clones entries on get(), and updates go through
-    /// cache.insert() which replaces the whole entry atomically.
+    /// No mutex needed: moka clones entries on `get()`, and updates go through
+    /// `cache.insert()` which replaces the whole entry atomically.
     backend_availability: ArticleAvailability,
 
     /// Complete response buffer (Arc for cheap cloning)
@@ -241,7 +241,7 @@ impl ArticleEntry {
 
     /// Initialize availability tracker from this cached entry
     ///
-    /// Creates a fresh ArticleAvailability with backends marked missing based on
+    /// Creates a fresh `ArticleAvailability` with backends marked missing based on
     /// cached knowledge (backends that previously returned 430).
     pub fn to_availability(&self, total_backends: BackendCount) -> ArticleAvailability {
         let mut availability = ArticleAvailability::new();
@@ -373,7 +373,7 @@ impl ArticleCache {
 
     /// Get an article from the cache
     ///
-    /// Accepts any lifetime MessageId and uses the string content (without brackets) as key.
+    /// Accepts any lifetime `MessageId` and uses the string content (without brackets) as key.
     ///
     /// **Zero-allocation**: `without_brackets()` returns `&str`, which moka accepts directly
     /// for `Arc<str>` keys via the `Borrow<str>` trait. This avoids allocating a new `Arc<str>`
@@ -409,7 +409,7 @@ impl ArticleCache {
     /// Upsert cache entry (insert or update) - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
-    /// This eliminates the race condition of separate get() + insert() calls
+    /// This eliminates the race condition of separate `get()` + `insert()` calls
     /// and provides key-level locking for concurrent operations.
     ///
     /// If entry exists: updates the entry and marks backend as having the article
@@ -516,7 +516,7 @@ impl ArticleCache {
     /// Record that a backend returned 430 for this article - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
-    /// This eliminates the race condition of separate get() + insert() calls
+    /// This eliminates the race condition of separate `get()` + `insert()` calls
     /// and provides key-level locking for concurrent operations.
     ///
     /// If the article is already cached, updates the availability bitset.
@@ -563,12 +563,12 @@ impl ArticleCache {
     /// Sync availability state from local tracker to cache - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_compute_with()` for atomic get-modify-store.
-    /// This eliminates the race condition of separate get() + insert() calls
+    /// This eliminates the race condition of separate `get()` + `insert()` calls
     /// and provides key-level locking for concurrent operations.
     ///
     /// This is called ONCE at the end of a retry loop to persist all the
     /// backends that returned 430 during this request. Much more efficient
-    /// than calling record_backend_missing for each backend individually.
+    /// than calling `record_backend_missing` for each backend individually.
     ///
     /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
@@ -696,7 +696,7 @@ mod tests {
     use std::time::Duration;
 
     fn create_test_article(msgid: &str) -> ArticleEntry {
-        let buffer = format!("220 0 {}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n", msgid).into_bytes();
+        let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
         ArticleEntry::new(buffer)
     }
 
@@ -893,14 +893,14 @@ mod tests {
         assert!(!retrieved.should_try_backend(BackendId::from_index(1)));
     }
 
-    /// CRITICAL BUG FIX TEST: record_backend_missing must create cache entries
+    /// CRITICAL BUG FIX TEST: `record_backend_missing` must create cache entries
     /// for articles that don't exist anywhere (all backends return 430).
     ///
-    /// Bug: Previously, if an article wasn't cached, record_backend_missing
+    /// Bug: Previously, if an article wasn't cached, `record_backend_missing`
     /// would silently do nothing. This caused repeated queries to all backends
     /// for missing articles, resulting in:
     /// - Massive bandwidth waste
-    /// - SABnzbd reporting "gigabytes of missing articles"
+    /// - `SABnzbd` reporting "gigabytes of missing articles"
     /// - 4xx/5xx error counts not increasing (metrics bug)
     #[tokio::test]
     async fn test_record_backend_missing_creates_new_entry() {
@@ -1019,16 +1019,10 @@ mod tests {
         let stub_size = retrieved.buffer().len();
 
         // Stub should be much smaller than full article (just "220\r\n")
-        assert!(
-            stub_size < 10,
-            "Stub size {} should be < 10 bytes",
-            stub_size
-        );
+        assert!(stub_size < 10, "Stub size {stub_size} should be < 10 bytes");
         assert!(
             stub_size < full_size,
-            "Stub {} should be smaller than full {}",
-            stub_size,
-            full_size
+            "Stub {stub_size} should be smaller than full {full_size}"
         );
 
         // Test with cache_articles=true - should store full article
@@ -1055,7 +1049,7 @@ mod tests {
 
         // Insert 3 articles (exceeds capacity)
         for i in 1..=3 {
-            let msgid_str = format!("<article{}@example.com>", i);
+            let msgid_str = format!("<article{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let article = create_test_article(msgid.as_ref());
             cache.insert(msgid, article).await;
@@ -1122,7 +1116,7 @@ mod tests {
 
         // Insert 12 more articles (13 total)
         for i in 2..=13 {
-            let msgid_str = format!("<article{}@example.com>", i);
+            let msgid_str = format!("<article{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let response = format!(
                 "222 0 {}\r\n{}\r\n.\r\n",
@@ -1167,7 +1161,7 @@ mod tests {
 
         // Insert many small stubs
         for i in 2..=200 {
-            let msgid_str = format!("<stub{}@example.com>", i);
+            let msgid_str = format!("<stub{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let stub = format!("223 0 {}\r\n", msgid.as_str());
             let article = ArticleEntry::new(stub.as_bytes().to_vec());

@@ -127,7 +127,7 @@ mod tests {
             COMPRESSION_ACTIVE,
         ];
         for code in codes {
-            assert!((200..300).contains(&code), "Code {} should be 2xx", code);
+            assert!((200..300).contains(&code), "Code {code} should be 2xx");
         }
     }
 
@@ -140,7 +140,7 @@ mod tests {
             SASL_CONTINUE,
         ];
         for code in codes {
-            assert!((300..400).contains(&code), "Code {} should be 3xx", code);
+            assert!((300..400).contains(&code), "Code {code} should be 3xx");
         }
     }
 
@@ -162,7 +162,7 @@ mod tests {
             ENCRYPTION_REQUIRED,
         ];
         for code in codes {
-            assert!((400..500).contains(&code), "Code {} should be 4xx", code);
+            assert!((400..500).contains(&code), "Code {code} should be 4xx");
         }
     }
 
@@ -175,7 +175,7 @@ mod tests {
             FEATURE_NOT_SUPPORTED,
         ];
         for code in codes {
-            assert!((500..600).contains(&code), "Code {} should be 5xx", code);
+            assert!((500..600).contains(&code), "Code {code} should be 5xx");
         }
     }
 

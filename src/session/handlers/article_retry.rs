@@ -1,6 +1,6 @@
 //! Article routing with availability-aware backend selection
 //!
-//! Handles routing article commands across backends, using ArticleAvailability
+//! Handles routing article commands across backends, using `ArticleAvailability`
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
@@ -87,8 +87,7 @@ impl ClientSession {
 
         let Some(provider) = router.backend_provider(backend_id) else {
             return Err(SessionError::Backend(anyhow::anyhow!(
-                "Backend {:?} has no connection provider",
-                backend_id
+                "Backend {backend_id:?} has no connection provider"
             )));
         };
 

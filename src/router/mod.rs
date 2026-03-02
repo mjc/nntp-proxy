@@ -95,7 +95,7 @@ impl BackendCount {
     }
 }
 
-/// Total weight across all backends (sum of max_connections)
+/// Total weight across all backends (sum of `max_connections`)
 #[nutype(derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Display, From, AsRef
 ))]
@@ -139,7 +139,7 @@ impl TrafficShare {
         self.into_inner()
     }
 
-    /// Calculate traffic share from max_connections and total_weight
+    /// Calculate traffic share from `max_connections` and `total_weight`
     #[inline]
     #[must_use]
     pub fn from_weight(max_connections: usize, total_weight: TotalWeight) -> Self {
@@ -203,7 +203,7 @@ impl Drop for CommandGuard {
 ///
 /// # Load Balancing
 ///
-/// - **Strategy**: Weighted round-robin based on max_connections
+/// - **Strategy**: Weighted round-robin based on `max_connections`
 /// - **Tracking**: Atomic counters track pending commands per backend
 /// - **Monitoring**: Load statistics available via `backend_load()`
 /// - **Fairness**: Backends with larger pools receive proportionally more requests
@@ -364,7 +364,7 @@ impl BackendSelector {
     ///
     /// Selection is tier-aware: backends with lower tier numbers are tried first.
     /// Within each tier, the configured strategy applies:
-    /// - **Weighted round-robin**: Distributes proportionally to max_connections
+    /// - **Weighted round-robin**: Distributes proportionally to `max_connections`
     /// - **Least-loaded**: Routes to backend with fewest pending requests
     ///
     /// # Arguments
@@ -513,7 +513,7 @@ impl BackendSelector {
     }
 
     /// Manually increment pending count for a specific backend
-    /// Used when directly selecting a backend instead of using route_command
+    /// Used when directly selecting a backend instead of using `route_command`
     pub fn mark_backend_pending(&self, backend_id: BackendId) {
         if let Some(backend) = self.find_backend(backend_id) {
             backend.pending_count.increment();
@@ -540,7 +540,7 @@ impl BackendSelector {
         BackendCount::new(self.backends.len())
     }
 
-    /// Get total weight (sum of all max_connections)
+    /// Get total weight (sum of all `max_connections`)
     /// Only applicable for weighted round-robin strategy
     #[must_use]
     #[inline]
@@ -556,7 +556,7 @@ impl BackendSelector {
 
     /// Get backend load (pending requests) for monitoring
     ///
-    /// Returns a clone of the PendingCount for the backend, allowing the caller
+    /// Returns a clone of the `PendingCount` for the backend, allowing the caller
     /// to query the current value or track it over time.
     #[must_use]
     pub fn backend_load(&self, backend_id: BackendId) -> Option<PendingCount> {
@@ -631,7 +631,7 @@ impl BackendSelector {
 
     /// Get the number of stateful connections for a backend
     ///
-    /// Returns a clone of the StatefulCount for the backend, allowing the caller
+    /// Returns a clone of the `StatefulCount` for the backend, allowing the caller
     /// to query the current value or track it over time.
     #[must_use]
     pub fn stateful_count(&self, backend_id: BackendId) -> Option<StatefulCount> {
@@ -639,9 +639,9 @@ impl BackendSelector {
             .map(|b| b.stateful_count.clone())
     }
 
-    /// Get the load ratio for a backend (pending / max_connections)
+    /// Get the load ratio for a backend (pending / `max_connections`)
     ///
-    /// Lower ratios indicate less loaded backends. Range: 0.0 (empty) to f64::MAX (no capacity).
+    /// Lower ratios indicate less loaded backends. Range: 0.0 (empty) to `f64::MAX` (no capacity).
     #[must_use]
     pub fn backend_load_ratio(&self, backend_id: BackendId) -> Option<LoadRatio> {
         self.find_backend(backend_id)
@@ -651,7 +651,7 @@ impl BackendSelector {
     /// Get the traffic share percentage for a backend
     ///
     /// Only applicable for weighted round-robin strategy. Returns the percentage
-    /// of traffic this backend should receive based on its max_connections.
+    /// of traffic this backend should receive based on its `max_connections`.
     #[must_use]
     pub fn backend_traffic_share(&self, backend_id: BackendId) -> Option<TrafficShare> {
         self.find_backend(backend_id).map(|b| {

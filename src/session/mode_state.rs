@@ -60,12 +60,12 @@ impl SessionMode {
 /// # Design
 ///
 /// - **Current Mode**: `AtomicU8` for lock-free concurrent reads/writes
-/// - **Routing Mode**: Immutable configuration (Stateful, PerCommand, or Hybrid)
+/// - **Routing Mode**: Immutable configuration (Stateful, `PerCommand`, or Hybrid)
 /// - Mode transitions are only allowed in Hybrid mode
 ///
 /// # One-Way Transition Invariant
 ///
-/// **CRITICAL**: In Hybrid mode, the transition from PerCommand → Stateful is
+/// **CRITICAL**: In Hybrid mode, the transition from `PerCommand` → Stateful is
 /// **permanent and irreversible** for the lifetime of the connection:
 ///
 /// ```text
@@ -78,7 +78,7 @@ impl SessionMode {
 /// - Connection acquires a dedicated backend
 /// - All subsequent commands use that backend
 /// - Connection stays stateful until client disconnects
-/// - New client connection starts fresh in PerCommand mode (if Hybrid)
+/// - New client connection starts fresh in `PerCommand` mode (if Hybrid)
 ///
 /// # Examples
 ///
@@ -267,7 +267,7 @@ impl ModeState {
 
     /// Check if this session is using per-command routing
     ///
-    /// Returns true if routing_mode is PerCommand or Hybrid.
+    /// Returns true if `routing_mode` is `PerCommand` or Hybrid.
     ///
     /// # Examples
     ///

@@ -130,7 +130,7 @@ macro_rules! f64_type {
 // Backend Health Status (for metrics display)
 // ============================================================================
 
-/// Backend health status for metrics display (distinct from health::HealthStatus)
+/// Backend health status for metrics display (distinct from `health::HealthStatus`)
 ///
 /// This 3-state enum is used for UI/metrics purposes, while `health::HealthStatus`
 /// is a binary Healthy/Unhealthy used for actual health checking.
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn test_command_count_display() {
         let count = CommandCount::new(1234);
-        assert_eq!(format!("{}", count), "1234");
+        assert_eq!(format!("{count}"), "1234");
     }
 
     // ErrorCount tests
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn test_active_connections_display() {
         let active = ActiveConnections::new(42);
-        assert_eq!(format!("{}", active), "42");
+        assert_eq!(format!("{active}"), "42");
     }
 
     // Timing types tests

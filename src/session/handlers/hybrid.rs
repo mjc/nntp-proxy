@@ -40,7 +40,7 @@ struct StatefulSessionGuard<'a> {
 }
 
 impl<'a> StatefulSessionGuard<'a> {
-    /// Start a stateful session (calls stateful_session_started)
+    /// Start a stateful session (calls `stateful_session_started`)
     fn start(metrics: &'a crate::metrics::MetricsCollector) -> Self {
         metrics.stateful_session_started();
         Self {

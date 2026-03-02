@@ -135,24 +135,24 @@
 //! 1. **Stateful (1:1) Mode** - `handle_with_pooled_backend()`
 //!    - One client maps to one backend connection for entire session
 //!    - Lowest latency, simplest model
-//!    - Used when routing_mode = Stateful
+//!    - Used when `routing_mode` = Stateful
 //!
 //! 2. **Per-Command Mode (Stateless)** - `handle_per_command_routing()`
 //!    - Each command is independently routed to potentially different backends
 //!    - Enables load balancing across multiple backend servers
 //!    - Rejects stateful commands (GROUP, NEXT, LAST, etc.)
-//!    - Used when routing_mode = PerCommand
+//!    - Used when `routing_mode` = `PerCommand`
 //!
 //! 3. **Hybrid Mode** - `handle_per_command_routing()` + dynamic switching
 //!    - Starts in per-command mode (stateless) for load balancing
 //!    - Automatically switches to stateful mode when stateful command detected
 //!    - Best of both worlds: load balancing + stateful command support
-//!    - Used when routing_mode = Hybrid
+//!    - Used when `routing_mode` = Hybrid
 //!
 //! ## Key Functions
 //!
 //! - `handle_stateful_proxy_loop()` - **PERFORMANCE CRITICAL HOT PATH**
-//!   - Bidirectional streaming with tokio::select! for concurrent I/O
+//!   - Bidirectional streaming with `tokio::select`! for concurrent I/O
 //!   - Used by both stateful mode and hybrid mode after switching
 //!
 //! - `switch_to_stateful_mode()` - Hybrid mode transition

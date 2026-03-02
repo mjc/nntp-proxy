@@ -48,7 +48,7 @@ pub fn create_sparkline(value: u64, max_value: u64) -> String {
 /// 2. Folds over history points to build point vectors and track max
 /// 3. Accumulates results with global max tracking
 ///
-/// Returns (chart_data, global_max_throughput)
+/// Returns (`chart_data`, `global_max_throughput`)
 pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64) {
     /// Extract data from a single throughput point
     #[inline]
@@ -158,7 +158,7 @@ pub fn format_throughput_label(value: f64) -> String {
     } else if value >= throughput::ONE_KB {
         format!("{:.0} KB/s", value / throughput::ONE_KB)
     } else {
-        format!("{:.0} B/s", value)
+        format!("{value:.0} B/s")
     }
 }
 
@@ -207,8 +207,8 @@ pub const fn health_indicator(
 #[must_use]
 pub fn format_error_rate(rate: f64) -> String {
     match rate {
-        r if r > 5.0 => format!(" ⚠ {:.1}%", r),
-        r if r > 0.0 => format!(" {:.1}%", r),
+        r if r > 5.0 => format!(" ⚠ {r:.1}%"),
+        r if r > 0.0 => format!(" {r:.1}%"),
         _ => String::new(),
     }
 }
@@ -366,7 +366,7 @@ mod tests {
         // Add 8 backends (at SmallVec capacity)
         for i in 0..8 {
             chart_data.push(BackendChartData::new(
-                format!("Server {}", i),
+                format!("Server {i}"),
                 backend_color(i),
                 PointVec::new(),
                 PointVec::new(),

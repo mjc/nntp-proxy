@@ -106,7 +106,7 @@ impl ClientSession {
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
         if !cached.matches_command_type_verb(cmd_verb) {
-            let status_code = cached.status_code().map(|c| c.as_u16()).unwrap_or(0);
+            let status_code = cached.status_code().map_or(0, |c| c.as_u16());
             debug!(
                 "Client {} cached response (code={}) can't serve '{}' command",
                 self.client_addr, status_code, cmd_verb
@@ -123,7 +123,7 @@ impl ClientSession {
         } else {
             // Validate before serving
             if !cached.is_valid_response() {
-                let status_code = cached.status_code().map(|c| c.as_u16()).unwrap_or(0);
+                let status_code = cached.status_code().map_or(0, |c| c.as_u16());
                 tracing::warn!(
                     code = status_code,
                     len = cached.buffer().len(),

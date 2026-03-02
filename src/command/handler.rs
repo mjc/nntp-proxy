@@ -1,6 +1,6 @@
 //! Command handling with action types
 //!
-//! This module provides a CommandHandler that processes NNTP commands
+//! This module provides a `CommandHandler` that processes NNTP commands
 //! and returns actions to be taken, separating command interpretation
 //! from command execution.
 //!
@@ -151,7 +151,7 @@ mod tests {
                 CommandAction::Reject(msg) => {
                     assert!(msg.contains("stateless") || msg.contains("not supported"));
                 }
-                other => panic!("Expected Reject for '{}', got {:?}", cmd, other),
+                other => panic!("Expected Reject for '{cmd}', got {other:?}"),
             }
         }
     }
@@ -170,8 +170,7 @@ mod tests {
             assert_eq!(
                 CommandHandler::classify(cmd),
                 CommandAction::ForwardStateless,
-                "Command '{}' should be forwarded as stateless",
-                cmd
+                "Command '{cmd}' should be forwarded as stateless"
             );
         }
     }
@@ -192,8 +191,7 @@ mod tests {
             assert_eq!(
                 CommandHandler::classify(cmd),
                 CommandAction::ForwardStateless,
-                "Command '{}' should be stateless",
-                cmd
+                "Command '{cmd}' should be stateless"
             );
         }
     }
@@ -290,7 +288,7 @@ mod tests {
         let long_group = format!("GROUP {}", "alt.".repeat(1000));
         match CommandHandler::classify(&long_group) {
             CommandAction::Reject(_) => {} // Expected
-            other => panic!("Expected Reject for long GROUP, got {:?}", other),
+            other => panic!("Expected Reject for long GROUP, got {other:?}"),
         }
     }
 
@@ -417,8 +415,7 @@ mod tests {
         // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
         assert!(
             response.starts_with("502 "),
-            "Expected 502 status code, got: {}",
-            response
+            "Expected 502 status code, got: {response}"
         );
     }
 
@@ -435,33 +432,25 @@ mod tests {
 
         for cmd in reject_commands {
             let CommandAction::Reject(response) = CommandHandler::classify(cmd) else {
-                panic!("Expected Reject for command: {}", cmd);
+                panic!("Expected Reject for command: {cmd}");
             };
 
             // All must be valid NNTP format
             assert!(
                 response.len() >= 5,
-                "Response too short for {}: {}",
-                cmd,
-                response
+                "Response too short for {cmd}: {response}"
             );
             assert!(
                 response.starts_with(|c: char| c.is_ascii_digit()),
-                "Must start with digit for {}: {}",
-                cmd,
-                response
+                "Must start with digit for {cmd}: {response}"
             );
             assert!(
                 response.ends_with("\r\n"),
-                "Must end with CRLF for {}: {}",
-                cmd,
-                response
+                "Must end with CRLF for {cmd}: {response}"
             );
             assert!(
                 response.contains(' '),
-                "Must have space separator for {}: {}",
-                cmd,
-                response
+                "Must have space separator for {cmd}: {response}"
             );
         }
     }
@@ -479,8 +468,7 @@ mod tests {
         };
         assert!(
             response.starts_with("502 "),
-            "Stateful commands should return 502, got: {}",
-            response
+            "Stateful commands should return 502, got: {response}"
         );
 
         // Non-routable commands in routing mode
@@ -489,8 +477,7 @@ mod tests {
         };
         assert!(
             response.starts_with("502 "),
-            "Non-routable commands should return 502, got: {}",
-            response
+            "Non-routable commands should return 502, got: {response}"
         );
     }
 
@@ -503,8 +490,7 @@ mod tests {
         assert!(
             stateful.to_lowercase().contains("stateless")
                 || stateful.to_lowercase().contains("mode"),
-            "Should explain stateless mode restriction: {}",
-            stateful
+            "Should explain stateless mode restriction: {stateful}"
         );
 
         let CommandAction::Reject(routing) = CommandHandler::classify("POST") else {
@@ -512,8 +498,7 @@ mod tests {
         };
         assert!(
             routing.to_lowercase().contains("routing") || routing.to_lowercase().contains("mode"),
-            "Should explain routing mode restriction: {}",
-            routing
+            "Should explain routing mode restriction: {routing}"
         );
     }
 }

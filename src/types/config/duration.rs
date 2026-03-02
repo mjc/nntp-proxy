@@ -86,7 +86,7 @@ mod tests {
                 timeout: Duration::from_secs(secs),
             };
             let json = serde_json::to_string(&test).unwrap();
-            let expected = format!(r#"{{"timeout":{}}}"#, secs);
+            let expected = format!(r#"{{"timeout":{secs}}}"#);
             prop_assert_eq!(json, expected);
         }
 
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_option_duration_deserialize_missing_field() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let result: Result<TestOptionDuration, _> = serde_json::from_str(json);
         // serde will error on missing required field
         assert!(result.is_err());

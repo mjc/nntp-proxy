@@ -2,7 +2,7 @@
 //!
 //! Uses phantom types to provide zero-cost newtype wrappers with compile-time direction tracking.
 //! All byte counter types share the same implementation via `ByteCounter<D>` where `D` is a
-//! direction marker type (ClientToBackend, BackendToClient, etc.).
+//! direction marker type (`ClientToBackend`, `BackendToClient`, etc.).
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -375,44 +375,44 @@ mod tests {
     #[test]
     fn test_counter_display_with_unit() {
         let c = TotalConnections::new(42);
-        assert_eq!(format!("{}", c), "42 connections");
+        assert_eq!(format!("{c}"), "42 connections");
     }
 
     #[test]
     fn test_counter_display_with_unit_zero() {
         let c = TotalConnections::new(0);
-        assert_eq!(format!("{}", c), "0 connections");
+        assert_eq!(format!("{c}"), "0 connections");
     }
 
     #[test]
     fn test_counter_display_bytes_per_second() {
         let c = BytesPerSecondRate::new(1500);
-        assert_eq!(format!("{}", c), "1500 B/s");
+        assert_eq!(format!("{c}"), "1500 B/s");
     }
 
     #[test]
     fn test_counter_display_article_bytes() {
         let c = ArticleBytesTotal::new(999999);
-        assert_eq!(format!("{}", c), "999999 bytes");
+        assert_eq!(format!("{c}"), "999999 bytes");
     }
 
     #[test]
     fn test_counter_display_empty_unit() {
         // TimingMeasurementCount uses empty unit — should NOT have trailing space
         let c = TimingMeasurementCount::new(7);
-        assert_eq!(format!("{}", c), "7");
+        assert_eq!(format!("{c}"), "7");
     }
 
     #[test]
     fn test_counter_display_empty_unit_zero() {
         let c = TimingMeasurementCount::new(0);
-        assert_eq!(format!("{}", c), "0");
+        assert_eq!(format!("{c}"), "0");
     }
 
     #[test]
     fn test_counter_display_empty_unit_large() {
         let c = TimingMeasurementCount::new(u64::MAX);
-        assert_eq!(format!("{}", c), format!("{}", u64::MAX));
+        assert_eq!(format!("{c}"), format!("{}", u64::MAX));
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn test_timing_measurement_count_debug() {
         let c = TimingMeasurementCount::new(99);
-        let dbg = format!("{:?}", c);
+        let dbg = format!("{c:?}");
         assert!(dbg.contains("99"));
     }
 

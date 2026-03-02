@@ -68,19 +68,19 @@ pub const COMMAND_NOT_SUPPORTED_STATELESS: &[u8] =
 /// ```
 #[inline]
 pub fn greeting(message: &str) -> String {
-    format!("200 {}\r\n", message)
+    format!("200 {message}\r\n")
 }
 
 /// Construct a read-only greeting response (201)
 #[inline]
 pub fn greeting_readonly(message: &str) -> String {
-    format!("201 {}\r\n", message)
+    format!("201 {message}\r\n")
 }
 
 /// Construct a generic OK response (200)
 #[inline]
 pub fn ok_response(message: &str) -> String {
-    format!("200 {}\r\n", message)
+    format!("200 {message}\r\n")
 }
 
 /// Construct a generic error response with custom code and message
@@ -94,13 +94,13 @@ pub fn ok_response(message: &str) -> String {
 /// ```
 #[inline]
 pub fn error_response(code: u16, message: &str) -> String {
-    format!("{} {}\r\n", code, message)
+    format!("{code} {message}\r\n")
 }
 
 /// Construct a response with custom status code and message
 #[inline]
 pub fn response(code: u16, message: &str) -> String {
-    format!("{} {}\r\n", code, message)
+    format!("{code} {message}\r\n")
 }
 
 #[cfg(test)]

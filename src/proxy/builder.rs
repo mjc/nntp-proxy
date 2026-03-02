@@ -115,7 +115,7 @@ impl NntpProxyBuilder {
 
     /// Restore metrics from a previously-saved store
     ///
-    /// If provided, the builder will initialize the MetricsCollector with this store,
+    /// If provided, the builder will initialize the `MetricsCollector` with this store,
     /// allowing metrics to persist across proxy restarts.
     #[must_use]
     pub fn with_metrics_store(mut self, store: crate::metrics::MetricsStore) -> Self {
@@ -169,8 +169,7 @@ impl NntpProxyBuilder {
             .config
             .cache
             .as_ref()
-            .map(|c| c.adaptive_precheck)
-            .unwrap_or(false);
+            .is_some_and(|c| c.adaptive_precheck);
 
         let backend_strategy = self.config.proxy.backend_selection;
         let cache_config = self.config.cache;

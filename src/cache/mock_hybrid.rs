@@ -1,6 +1,6 @@
 //! Mock hybrid cache for testing
 //!
-//! Provides a simple in-memory implementation that mimics HybridArticleCache
+//! Provides a simple in-memory implementation that mimics `HybridArticleCache`
 //! behavior without foyer's complexity. Used in tests to avoid foyer's
 //! runtime issues.
 

@@ -141,7 +141,7 @@ impl NntpClient {
             .and_then(|code| match code.as_u16() {
                 223 => Ok(true),  // Article exists
                 430 => Ok(false), // No such article
-                _ => anyhow::bail!("Unexpected STAT response: {}", code),
+                _ => anyhow::bail!("Unexpected STAT response: {code}"),
             })
     }
 
@@ -154,7 +154,7 @@ impl NntpClient {
             .context("Failed to get connection from pool")
     }
 
-    /// Internal: fetch response into PooledBuffer
+    /// Internal: fetch response into `PooledBuffer`
     async fn fetch_response(&self, command: &str) -> Result<PooledBuffer> {
         let mut conn = self.get_connection().await?;
         let mut io_buffer = self.buffer_pool.acquire().await;
@@ -255,7 +255,7 @@ impl NntpClient {
             .ok_or_else(|| anyhow::anyhow!("Invalid response from server"))
             .and_then(|code| match code.as_u16() {
                 430 => anyhow::bail!("Article not found (430)"),
-                code if code >= 400 => anyhow::bail!("Server error: {}", code),
+                code if code >= 400 => anyhow::bail!("Server error: {code}"),
                 _ => Ok(()),
             })
     }

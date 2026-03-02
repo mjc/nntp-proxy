@@ -20,7 +20,7 @@
 use crate::router::BackendCount;
 use crate::types::BackendId;
 
-/// Maximum number of backends supported by ArticleAvailability bitset
+/// Maximum number of backends supported by `ArticleAvailability` bitset
 pub const MAX_BACKENDS: usize = 8;
 
 /// Status of a backend for a specific article
@@ -91,15 +91,13 @@ impl ArticleAvailability {
     /// See module-level docs for full explanation.
     ///
     /// # Panics (debug builds only)
-    /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
+    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn record_missing(&mut self, backend_id: BackendId) -> &mut Self {
         let idx = backend_id.as_index();
         debug_assert!(
             idx < MAX_BACKENDS,
-            "Backend index {} exceeds MAX_BACKENDS ({})",
-            idx,
-            MAX_BACKENDS
+            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
         );
         self.checked |= 1u8 << idx; // Mark as checked
         self.missing |= 1u8 << idx; // Mark as missing
@@ -115,15 +113,13 @@ impl ArticleAvailability {
     /// See module-level docs for full explanation.
     ///
     /// # Panics (debug builds only)
-    /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
+    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn record_has(&mut self, backend_id: BackendId) -> &mut Self {
         let idx = backend_id.as_index();
         debug_assert!(
             idx < MAX_BACKENDS,
-            "Backend index {} exceeds MAX_BACKENDS ({})",
-            idx,
-            MAX_BACKENDS
+            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
         );
         self.checked |= 1u8 << idx; // Mark as checked
         self.missing &= !(1u8 << idx); // Clear missing bit (has the article)
@@ -157,15 +153,13 @@ impl ArticleAvailability {
     /// Check if a backend is known to be missing (returned 430)
     ///
     /// # Panics (debug builds only)
-    /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
+    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn is_missing(&self, backend_id: BackendId) -> bool {
         let idx = backend_id.as_index();
         debug_assert!(
             idx < MAX_BACKENDS,
-            "Backend index {} exceeds MAX_BACKENDS ({})",
-            idx,
-            MAX_BACKENDS
+            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
         );
         self.missing & (1u8 << idx) != 0
     }
@@ -175,7 +169,7 @@ impl ArticleAvailability {
     /// Returns `true` if backend might have the article (not yet marked missing).
     ///
     /// # Panics (debug builds only)
-    /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
+    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn should_try(&self, backend_id: BackendId) -> bool {
         !self.is_missing(backend_id)
@@ -198,15 +192,13 @@ impl ArticleAvailability {
     /// Check if all backends have been tried and returned 430
     ///
     /// # Panics (debug builds only)
-    /// Panics if backend_count > 8. Config validation enforces max 8 backends.
+    /// Panics if `backend_count` > 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn all_exhausted(&self, backend_count: BackendCount) -> bool {
         let count = backend_count.get();
         debug_assert!(
             count <= MAX_BACKENDS,
-            "Backend count {} exceeds MAX_BACKENDS ({})",
-            count,
-            MAX_BACKENDS
+            "Backend count {count} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
         );
         match count {
             0 => true,
@@ -267,15 +259,13 @@ impl ArticleAvailability {
     /// Query backend availability status
     ///
     /// # Panics (debug builds only)
-    /// Panics if backend_id >= 8. Config validation enforces max 8 backends.
+    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn status(&self, backend_id: BackendId) -> BackendStatus {
         let idx = backend_id.as_index();
         debug_assert!(
             idx < MAX_BACKENDS,
-            "Backend index {} exceeds MAX_BACKENDS ({})",
-            idx,
-            MAX_BACKENDS
+            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
         );
         let mask = 1u8 << idx;
         if self.checked & mask == 0 {

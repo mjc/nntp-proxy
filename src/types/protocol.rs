@@ -15,13 +15,13 @@ use super::ValidationError;
 pub struct MessageId<'a>(Cow<'a, str>);
 
 impl<'a> MessageId<'a> {
-    /// Create owned MessageId from String with validation
+    /// Create owned `MessageId` from String with validation
     pub fn new(s: String) -> Result<Self, ValidationError> {
         Self::validate(&s)?;
         Ok(Self(Cow::Owned(s)))
     }
 
-    /// Create borrowed MessageId from &str (zero-copy)
+    /// Create borrowed `MessageId` from &str (zero-copy)
     #[inline]
     pub fn from_borrowed(s: &'a str) -> Result<Self, ValidationError> {
         Self::validate(s)?;
@@ -37,7 +37,7 @@ impl<'a> MessageId<'a> {
         Self(Cow::Borrowed(s))
     }
 
-    /// Create owned MessageId, auto-wrapping in angle brackets if needed
+    /// Create owned `MessageId`, auto-wrapping in angle brackets if needed
     pub fn from_str_or_wrap(s: impl AsRef<str>) -> Result<MessageId<'static>, ValidationError> {
         let s = s.as_ref();
         if s.is_empty() {
@@ -46,7 +46,7 @@ impl<'a> MessageId<'a> {
         let wrapped = if s.starts_with('<') && s.ends_with('>') {
             s.to_string()
         } else {
-            format!("<{}>", s)
+            format!("<{s}>")
         };
         MessageId::new(wrapped)
     }

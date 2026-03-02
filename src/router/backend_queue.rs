@@ -70,7 +70,7 @@ impl BackendQueue {
     /// Try to enqueue a request. Returns `QueueFull` if at capacity.
     ///
     /// Uses compare-exchange loop to prevent TOCTOU race where multiple threads
-    /// could both pass the depth check and exceed max_depth.
+    /// could both pass the depth check and exceed `max_depth`.
     ///
     /// # Atomicity
     ///
@@ -217,7 +217,7 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             queue
                 .try_enqueue(QueuedRequest {
-                    command: format!("ARTICLE <test{}@example.com>\r\n", i).into(),
+                    command: format!("ARTICLE <test{i}@example.com>\r\n").into(),
                     response_tx: tx,
                 })
                 .unwrap();
@@ -244,7 +244,7 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             queue
                 .try_enqueue(QueuedRequest {
-                    command: format!("CMD {}\r\n", i).into(),
+                    command: format!("CMD {i}\r\n").into(),
                     response_tx: tx,
                 })
                 .unwrap();

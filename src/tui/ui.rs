@@ -420,10 +420,10 @@ fn backend_header_line<'a>(
 
 /// Create address line: host:port with optional traffic share
 fn backend_address_line(host: &str, port: u16, traffic_share: Option<f64>) -> Line<'static> {
-    let mut spans: Vec<Span> = vec!["  ".into(), format!("{}:{}", host, port).fg(styles::LABEL)];
+    let mut spans: Vec<Span> = vec!["  ".into(), format!("{host}:{port}").fg(styles::LABEL)];
 
     if let Some(share) = traffic_share {
-        spans.push(format!(" ({:.1}% share)", share).fg(Color::Cyan));
+        spans.push(format!(" ({share:.1}% share)").fg(Color::Cyan));
     }
 
     Line::from(spans)
@@ -438,7 +438,7 @@ fn backend_metrics_line(
 ) -> Line<'static> {
     Line::from(vec![
         "  Used/Max: ".fg(styles::LABEL),
-        format!("{}/{}", active, max).fg(styles::VALUE_SECONDARY),
+        format!("{active}/{max}").fg(styles::VALUE_SECONDARY),
         " | Cmd/s: ".fg(styles::LABEL),
         cmd_per_sec.fg(styles::VALUE_INFO),
         " | TTFB: ".fg(styles::LABEL),
@@ -462,7 +462,7 @@ fn backend_article_line(avg_size: String, count: u64) -> Line<'static> {
         "  Avg Article: ".fg(styles::LABEL),
         avg_size.fg(styles::VALUE_INFO),
         " | Articles: ".fg(styles::LABEL),
-        format!("{}", count).fg(styles::VALUE_NEUTRAL),
+        format!("{count}").fg(styles::VALUE_NEUTRAL),
     ])
 }
 
@@ -475,9 +475,9 @@ fn backend_error_line(
 ) -> Line<'static> {
     Line::from(vec![
         "  Errors: ".fg(styles::LABEL),
-        format!("4xx:{} 5xx:{}", errors_4xx, errors_5xx).fg(error_count_color(has_errors)),
+        format!("4xx:{errors_4xx} 5xx:{errors_5xx}").fg(error_count_color(has_errors)),
         " | Conn Fails: ".fg(styles::LABEL),
-        format!("{}", failures).fg(connection_failure_color(failures)),
+        format!("{failures}").fg(connection_failure_color(failures)),
     ])
 }
 
@@ -485,16 +485,16 @@ fn backend_error_line(
 fn backend_details_line(pending: usize, load_ratio: Option<f64>, stateful: usize) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
         "  Load: ".fg(styles::LABEL),
-        format!("{} in-flight", pending).fg(pending_count_color(pending)),
+        format!("{pending} in-flight").fg(pending_count_color(pending)),
     ];
 
     if let Some(ratio) = load_ratio {
         let ratio_percent = ratio * 100.0;
-        spans.push(format!(" ({:.0}%)", ratio_percent).fg(load_percentage_color(ratio_percent)));
+        spans.push(format!(" ({ratio_percent:.0}%)").fg(load_percentage_color(ratio_percent)));
     }
 
     if stateful > 0 {
-        spans.push(format!(" | Stateful: {}", stateful).fg(Color::Cyan));
+        spans.push(format!(" | Stateful: {stateful}").fg(Color::Cyan));
     }
 
     Line::from(spans)
@@ -528,7 +528,7 @@ fn render_backend_list(
 
             let ttfb = stats
                 .average_ttfb_ms()
-                .map_or_else(|| "N/A".to_string(), |ms| format!("{:.1}ms", ms));
+                .map_or_else(|| "N/A".to_string(), |ms| format!("{ms:.1}ms"));
 
             let avg_size = stats
                 .average_article_size()
@@ -715,7 +715,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
             let truncated: String = username.chars().take(TRUNCATE_AT).collect();
             format!("{truncated}...")
         } else {
-            format!("{:<MAX_LEN$}", username)
+            format!("{username:<MAX_LEN$}")
         }
     }
 
