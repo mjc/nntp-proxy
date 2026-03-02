@@ -116,6 +116,7 @@ impl TlsConfigBuilder {
     /// Enable or disable TLS
     ///
     /// Default: `false`
+    #[must_use]
     pub const fn enabled(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
         self
@@ -127,6 +128,7 @@ impl TlsConfigBuilder {
     /// be used for testing or with trusted private networks.
     ///
     /// Default: `true`
+    #[must_use]
     pub const fn verify_cert(mut self, verify: bool) -> Self {
         self.tls_verify_cert = verify;
         self
@@ -135,6 +137,7 @@ impl TlsConfigBuilder {
     /// Set path to custom CA certificate file
     ///
     /// The certificate should be in PEM format.
+    #[must_use]
     pub fn cert_path<S: Into<String>>(mut self, path: S) -> Self {
         self.tls_cert_path = Some(path.into());
         self

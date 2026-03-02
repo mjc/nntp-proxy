@@ -420,17 +420,23 @@ impl MetricsStore {
         );
         let tmp_path = path.with_file_name(tmp_filename);
         fs::write(&tmp_path, json)
-            .with_context(|| format!("Failed to write stats to {tmp_path:?}"))?;
+            .with_context(|| format!("Failed to write stats to {}", tmp_path.display()))?;
 
         // Best-effort atomic replace: remove existing file (for Windows compatibility) then rename temp file
         if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("Failed to remove existing stats file at {path:?}"))?;
+            fs::remove_file(path).with_context(|| {
+                format!("Failed to remove existing stats file at {}", path.display())
+            })?;
         }
-        fs::rename(&tmp_path, path)
-            .with_context(|| format!("Failed to rename {tmp_path:?} to {path:?}"))?;
+        fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
 
-        tracing::debug!("Saved stats to {:?}", path);
+        tracing::debug!("Saved stats to {}", path.display());
         Ok(())
     }
 }

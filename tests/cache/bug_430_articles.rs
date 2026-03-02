@@ -355,8 +355,8 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
     sync_task.await?;
 
     // Regardless of order, we should NOT have a 430 stub
-    let cached = cache.get(&msg_id).await;
-    if let Some(entry) = cached {
+    let article = cache.get(&msg_id).await;
+    if let Some(entry) = article {
         assert!(
             entry.status_code().map(|s| s.as_u16()) != Some(430),
             "Concurrent operations should not result in 430 stub when backend has article"

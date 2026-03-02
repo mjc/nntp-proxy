@@ -10,10 +10,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// at the specified `file_level` (default "warn") so that root-cause errors
 /// are in debug.log even if `RUST_LOG` is set to a narrow filter.
 ///
-/// The _guard is forgotten to keep the file appender alive for the program lifetime.
+/// The guard is forgotten to keep the file appender alive for the program lifetime.
 pub fn init_dual_logging(file_level: &str) {
     let file_appender = tracing_appender::rolling::never(".", "debug.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -37,7 +37,7 @@ pub fn init_dual_logging(file_level: &str) {
 
     // SAFETY: Intentionally leak the WorkerGuard to keep the file appender
     // alive for the program lifetime. Drop would flush and close the writer.
-    std::mem::forget(_guard);
+    std::mem::forget(guard);
 }
 
 /// Initialize logging with TUI buffer + debug.log file
@@ -47,7 +47,7 @@ pub fn init_dual_logging(file_level: &str) {
 /// Both modes also write to debug.log at the specified `file_level`.
 pub fn init_tui_logging(headless: bool, file_level: &str) -> Option<crate::tui::LogBuffer> {
     let file_appender = tracing_appender::rolling::never(".", "debug.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -71,7 +71,7 @@ pub fn init_tui_logging(headless: bool, file_level: &str) -> Option<crate::tui::
             .init();
         // SAFETY: Intentionally leak the WorkerGuard to keep the file appender
         // alive for the program lifetime. Drop would flush and close the writer.
-        std::mem::forget(_guard);
+        std::mem::forget(guard);
         return None;
     }
 
@@ -97,6 +97,6 @@ pub fn init_tui_logging(headless: bool, file_level: &str) -> Option<crate::tui::
 
     // SAFETY: Intentionally leak the WorkerGuard to keep the file appender
     // alive for the program lifetime. Drop would flush and close the writer.
-    std::mem::forget(_guard);
+    std::mem::forget(guard);
     Some(log_buffer)
 }

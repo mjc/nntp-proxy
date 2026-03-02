@@ -152,12 +152,14 @@ impl MockNntpServer {
     }
 
     /// Set the server name that appears in the greeting
+    #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
     /// Require authentication with the given credentials
+    #[must_use]
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.require_auth = true;
         self.credentials = Some((username.into(), password.into()));
@@ -167,6 +169,7 @@ impl MockNntpServer {
     /// Add a custom handler for a specific command prefix
     ///
     /// When a command starting with `cmd` is received, respond with `response`.
+    #[must_use]
     pub fn on_command(mut self, cmd: impl Into<String>, response: impl Into<String>) -> Self {
         self.command_handlers
             .insert(cmd.into().to_uppercase(), response.into());

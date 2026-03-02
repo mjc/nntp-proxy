@@ -1051,7 +1051,7 @@ mod tests {
     //
     // The check still provides defense-in-depth against protocol desync, even though
     // it's hard to test. In practice, normal leftover is < 8KB, so 128KB is generous.
-    #[ignore]
+    #[ignore = "flaky: TCP read sizes are unpredictable; leftover check requires single read > 128KB"]
     #[tokio::test]
     async fn test_leftover_exceeds_max_size() {
         use crate::constants::buffer::MAX_LEFTOVER_BYTES;
@@ -1069,23 +1069,23 @@ mod tests {
 
         let mut chunks = Vec::new();
 
-        // Chunk 1: Response header + body start (no terminator yet)
-        let mut chunk1 = Vec::new();
-        chunk1.extend_from_slice(b"220 0 <id> article\r\n");
-        chunk1.extend_from_slice(&vec![b'B'; 50000]); // 50KB of body
-        chunks.push(chunk1);
+        // Part 1: Response header + body start (no terminator yet)
+        let mut part1 = Vec::new();
+        part1.extend_from_slice(b"220 0 <id> article\r\n");
+        part1.extend_from_slice(&vec![b'B'; 50000]); // 50KB of body
+        chunks.push(part1);
 
-        // Chunk 2: More body (no terminator yet)
-        let mut chunk2 = Vec::new();
-        chunk2.extend_from_slice(&vec![b'O'; 50000]); // Another 50KB
-        chunks.push(chunk2);
+        // Part 2: More body (no terminator yet)
+        let mut part2 = Vec::new();
+        part2.extend_from_slice(&vec![b'O'; 50000]); // Another 50KB
+        chunks.push(part2);
 
-        // Chunk 3: Terminator + oversized leftover
-        let mut chunk3 = Vec::new();
-        chunk3.extend_from_slice(&vec![b'D'; 10000]); // 10KB more body
-        chunk3.extend_from_slice(b"\r\n.\r\n"); // Terminator
-        chunk3.extend_from_slice(&vec![b'X'; MAX_LEFTOVER_BYTES + 1000]); // Oversized leftover
-        chunks.push(chunk3);
+        // Part 3: Terminator + oversized leftover
+        let mut part3 = Vec::new();
+        part3.extend_from_slice(&vec![b'D'; 10000]); // 10KB more body
+        part3.extend_from_slice(b"\r\n.\r\n"); // Terminator
+        part3.extend_from_slice(&vec![b'X'; MAX_LEFTOVER_BYTES + 1000]); // Oversized leftover
+        chunks.push(part3);
 
         let mut conn = mock_backend_conn_chunked(chunks).await;
 

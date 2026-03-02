@@ -50,6 +50,7 @@ macro_rules! counter_type {
                 self.0 += 1;
             }
 
+            #[must_use]
             #[inline]
             pub const fn saturating_sub(self, other: Self) -> Self {
                 Self(self.0.saturating_sub(other.0))
@@ -208,6 +209,7 @@ impl ErrorCount {
         self.0 += other.0;
     }
 
+    #[must_use]
     #[inline]
     pub const fn saturating_sub(self, other: Self) -> Self {
         Self(self.0.saturating_sub(other.0))

@@ -148,6 +148,7 @@ impl ClientSessionBuilder {
     }
 
     /// Configure adaptive availability prechecking
+    #[must_use]
     pub const fn with_adaptive_precheck(mut self, enable: bool) -> Self {
         self.adaptive_precheck = enable;
         self
