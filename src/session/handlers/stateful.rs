@@ -61,12 +61,9 @@ impl ClientSession {
             .await;
 
         // H2: Only return connection to pool on success
-        match &result {
-            Ok(_) => {
-                let _conn = conn_guard.release();
-            }
-            Err(_) => { /* guard drops → removes broken connection */ }
-        }
+        if result.is_ok() {
+            let _conn = conn_guard.release();
+        } // else: guard drops → removes broken connection
 
         result.map_err(crate::session::SessionError::from)
     }

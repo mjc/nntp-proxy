@@ -28,6 +28,7 @@ impl WindowSize {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.into_inner()
     }
@@ -68,21 +69,25 @@ impl BufferSize {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> usize {
         self.into_inner()
     }
 
     /// Create command buffer size instance
+    #[must_use]
     pub fn command() -> Self {
         Self::try_new(Self::COMMAND).unwrap()
     }
 
     /// Create medium buffer size instance
+    #[must_use]
     pub fn medium() -> Self {
         Self::try_new(Self::MEDIUM).unwrap()
     }
 
     /// Create large buffer size instance
+    #[must_use]
     pub fn large() -> Self {
         Self::try_new(Self::LARGE).unwrap()
     }

@@ -143,6 +143,7 @@ pub struct CommandResponse {
 impl CommandResponse {
     /// Get status code if valid
     #[inline]
+    #[must_use]
     pub fn status_code(&self) -> Option<crate::protocol::StatusCode> {
         self.response.status_code()
     }

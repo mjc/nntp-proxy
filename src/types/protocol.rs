@@ -33,6 +33,7 @@ impl<'a> MessageId<'a> {
     /// # Safety
     /// Caller must ensure: `s.len() >= 3`, `s.starts_with('<')`, `s.ends_with('>')`
     #[inline(always)]
+    #[must_use]
     pub const unsafe fn from_str_unchecked(s: &'a str) -> Self {
         Self(Cow::Borrowed(s))
     }
@@ -55,11 +56,12 @@ impl<'a> MessageId<'a> {
     ///
     /// Uses SIMD-accelerated memchr for fast scanning.
     #[inline]
+    #[must_use]
     pub fn extract_from_command_borrowed(command: &'a str) -> Option<Self> {
         let bytes = command.as_bytes();
         let start = memchr::memchr(b'<', bytes)?;
         let end = memchr::memchr(b'>', &bytes[start..])?;
-        let slice = &command[start..start + end + 1];
+        let slice = &command[start..=(start + end)];
         if slice.len() < 3 {
             return None; // Reject "<>"
         }
@@ -95,10 +97,12 @@ impl<'a> MessageId<'a> {
         &self.0[1..self.0.len() - 1]
     }
 
+    #[must_use]
     pub fn into_owned(self) -> MessageId<'static> {
         MessageId(Cow::Owned(self.0.into_owned()))
     }
 
+    #[must_use]
     pub fn to_owned(&self) -> MessageId<'static> {
         MessageId(Cow::Owned(self.0.clone().into_owned()))
     }
@@ -111,14 +115,14 @@ impl FromStr for MessageId<'static> {
     }
 }
 
-impl<'a> AsRef<str> for MessageId<'a> {
+impl AsRef<str> for MessageId<'_> {
     #[inline]
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-impl<'a> std::ops::Deref for MessageId<'a> {
+impl std::ops::Deref for MessageId<'_> {
     type Target = str;
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -126,13 +130,13 @@ impl<'a> std::ops::Deref for MessageId<'a> {
     }
 }
 
-impl<'a> Borrow<str> for MessageId<'a> {
+impl Borrow<str> for MessageId<'_> {
     fn borrow(&self) -> &str {
         &self.0
     }
 }
 
-impl<'a> fmt::Display for MessageId<'a> {
+impl fmt::Display for MessageId<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -151,7 +155,7 @@ impl<'a> From<MessageId<'a>> for String {
     }
 }
 
-impl<'a> Serialize for MessageId<'a> {
+impl Serialize for MessageId<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,

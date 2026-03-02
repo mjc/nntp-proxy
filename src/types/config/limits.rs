@@ -33,6 +33,7 @@ impl MaxConnections {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> usize {
         self.into_inner()
     }
@@ -66,6 +67,7 @@ impl MaxErrors {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> u32 {
         self.into_inner()
     }

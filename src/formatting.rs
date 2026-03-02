@@ -2,6 +2,7 @@
 
 /// Format bytes in human-readable format (KB, MB, GB)
 #[inline]
+#[must_use]
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -20,6 +21,7 @@ pub fn format_bytes(bytes: u64) -> String {
 
 /// Shorten UUID to first 8 characters for log readability
 #[inline]
+#[must_use]
 pub fn short_id(uuid: &uuid::Uuid) -> String {
     uuid.to_string()[..8].to_string()
 }

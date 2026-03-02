@@ -136,12 +136,9 @@ impl ClientSession {
         // pending_guard automatically calls complete_command via Drop
 
         // H1: Only return connection to pool on success
-        match result {
-            Ok(_) => {
-                let _conn = conn_guard.release();
-            }
-            Err(_) => { /* guard drops → removes broken connection from pool */ }
-        }
+        if result.is_ok() {
+            let _conn = conn_guard.release();
+        } // else: guard drops → removes broken connection from pool
 
         // Metrics guard automatically ends session via Drop
         result.map_err(crate::session::SessionError::from)

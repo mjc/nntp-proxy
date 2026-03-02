@@ -16,6 +16,7 @@ use std::io::{BufRead, BufReader};
 ///
 /// Delegates to yenc crate which is faster and handles all edge cases correctly
 #[inline]
+#[must_use]
 pub fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
     // yenc crate returns Result but decoding never actually fails
     // (it just returns empty/partial on malformed input)

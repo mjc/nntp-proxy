@@ -15,10 +15,12 @@ pub enum TerminatorStatus {
 
 impl TerminatorStatus {
     /// Returns true if a terminator was found
+    #[must_use]
     pub const fn is_found(self) -> bool {
         matches!(self, Self::FoundAt(_))
     }
     /// Get the number of bytes to write from the chunk
+    #[must_use]
     pub const fn write_len(self, chunk_size: usize) -> usize {
         match self {
             Self::FoundAt(pos) => pos,
@@ -66,14 +68,17 @@ impl TailBuffer {
         }
     }
     /// Get the tail data as a slice
+    #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.data[..self.len]
     }
     /// Get the current length of valid tail data
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.len
     }
     /// Returns true if the buffer is empty
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -81,6 +86,7 @@ impl TailBuffer {
     ///
     /// Returns the byte offset in the chunk where the terminator ends,
     /// or None if no spanning terminator is found.
+    #[must_use]
     pub fn find_spanning_terminator(&self, chunk: &[u8]) -> Option<usize> {
         // Early return if buffer is empty - no boundary to span
         if self.is_empty() {
@@ -93,6 +99,7 @@ impl TailBuffer {
     /// **Performance**: `find_terminator_end()` checks end first (O(1)),
     /// only scans with memchr if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
+    #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
         if let Some(pos) = find_terminator_end(chunk) {
             TerminatorStatus::FoundAt(pos)

@@ -206,6 +206,7 @@ pub struct UserMetrics {
 }
 
 impl UserMetrics {
+    #[must_use]
     pub const fn new(username: String) -> Self {
         Self {
             username,
@@ -258,6 +259,7 @@ impl UserMetrics {
 
 impl MetricsStore {
     /// Create fresh store with N backends
+    #[must_use]
     pub fn new(num_backends: usize) -> Self {
         Self {
             total_connections: AtomicU64::new(0),

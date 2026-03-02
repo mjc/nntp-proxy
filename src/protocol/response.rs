@@ -144,6 +144,7 @@ impl NntpResponse {
     ///
     /// **Optimization**: Direct byte-to-digit conversion avoids UTF-8 overhead.
     #[inline]
+    #[must_use]
     pub fn parse(data: &[u8]) -> Self {
         let Some(code) = StatusCode::parse(data) else {
             return Self::Invalid;
@@ -232,6 +233,7 @@ impl StatusCode {
     /// **Optimization**: Direct byte-to-digit conversion without UTF-8 validation.
     /// Status codes are guaranteed to be ASCII digits per the RFC.
     #[inline]
+    #[must_use]
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 3 {
             return None;
@@ -249,7 +251,7 @@ impl StatusCode {
         }
 
         // Combine into u16: d0*100 + d1*10 + d2
-        let code = (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16);
+        let code = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
         Some(Self::new(code))
     }
 

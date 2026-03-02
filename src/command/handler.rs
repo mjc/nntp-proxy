@@ -13,7 +13,7 @@
 //!
 //! - `480` Authentication required
 //!   <https://www.rfc-editor.org/rfc/rfc4643.html#section-2.4.1>
-//! - `502` Command not implemented  
+//! - `502` Command not implemented\
 //!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
 //!   Used when a command is recognized but not supported by this server
 
@@ -46,6 +46,7 @@ pub struct CommandHandler;
 
 impl CommandHandler {
     /// Classify a command and return the action to take
+    #[must_use]
     pub fn classify(command: &str) -> CommandAction<'_> {
         match NntpCommand::parse(command) {
             NntpCommand::AuthUser => {

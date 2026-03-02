@@ -116,7 +116,7 @@ impl<'a> TcpOptimizer<'a> {
     }
 }
 
-impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
+impl NetworkOptimizer for TcpOptimizer<'_> {
     fn optimize(&self) -> Result<()> {
         let sock_ref = SockRef::from(self.stream);
 
@@ -175,7 +175,7 @@ impl<'a> ConnectionOptimizer<'a> {
     }
 }
 
-impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
+impl NetworkOptimizer for ConnectionOptimizer<'_> {
     fn optimize(&self) -> Result<()> {
         // Use functional pattern matching to create and optimize in one step
         let optimize_fn = |desc: &str, result: Result<()>| {
@@ -185,26 +185,23 @@ impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
 
         // Get the underlying TCP stream for optimization regardless of compression layer
         let tcp = self.stream.underlying_tcp_stream();
-        match (self.recv_buffer_size, self.send_buffer_size) {
-            (Some(recv), Some(send)) => {
-                let desc = if self.stream.is_encrypted() {
-                    "TLS optimization via underlying TCP stream with custom buffers"
-                } else {
-                    "TCP high-throughput optimization with custom buffers"
-                };
-                optimize_fn(
-                    desc,
-                    TcpOptimizer::with_buffer_sizes(tcp, recv, send).optimize(),
-                )
-            }
-            _ => {
-                let desc = if self.stream.is_encrypted() {
-                    "TLS optimization via underlying TCP stream"
-                } else {
-                    "TCP high-throughput optimization"
-                };
-                optimize_fn(desc, TcpOptimizer::new(tcp).optimize())
-            }
+        if let (Some(recv), Some(send)) = (self.recv_buffer_size, self.send_buffer_size) {
+            let desc = if self.stream.is_encrypted() {
+                "TLS optimization via underlying TCP stream with custom buffers"
+            } else {
+                "TCP high-throughput optimization with custom buffers"
+            };
+            optimize_fn(
+                desc,
+                TcpOptimizer::with_buffer_sizes(tcp, recv, send).optimize(),
+            )
+        } else {
+            let desc = if self.stream.is_encrypted() {
+                "TLS optimization via underlying TCP stream"
+            } else {
+                "TCP high-throughput optimization"
+            };
+            optimize_fn(desc, TcpOptimizer::new(tcp).optimize())
         }
     }
 

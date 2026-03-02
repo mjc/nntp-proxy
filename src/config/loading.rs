@@ -169,6 +169,7 @@ pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Ser
 /// Check if any backend server environment variables are set
 ///
 /// Returns true if at least `NNTP_SERVER_0_HOST` is set
+#[must_use]
 pub fn has_server_env_vars() -> bool {
     std::env::var("NNTP_SERVER_0_HOST").is_ok()
 }

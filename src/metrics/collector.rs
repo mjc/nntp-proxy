@@ -35,7 +35,10 @@ impl BackendMetrics {
     /// Convert to immutable snapshot (public for testing)
     #[must_use]
     pub fn to_backend_stats(&self, backend_id: BackendId, store: &BackendStore) -> BackendStats {
-        use super::types::*;
+        use super::types::{
+            ActiveConnections, ArticleCount, CommandCount, ErrorCount, FailureCount, RecvMicros,
+            SendMicros, TtfbMicros,
+        };
         use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
         BackendStats {
             backend_id,
@@ -137,6 +140,7 @@ impl MetricsCollector {
     ///
     /// # Arguments
     /// * `num_backends` - Number of backend servers to track
+    #[must_use]
     pub fn new(num_backends: usize) -> Self {
         Self::with_store(MetricsStore::new(num_backends))
     }
@@ -243,6 +247,7 @@ impl MetricsCollector {
 
     /// Type-safe recording: consumes unrecorded bytes and returns recorded marker
     #[inline]
+    #[must_use]
     pub const fn record_client_to_backend(
         &self,
         bytes: crate::types::MetricsBytes<crate::types::Unrecorded>,
@@ -252,6 +257,7 @@ impl MetricsCollector {
 
     /// Type-safe recording: consumes unrecorded bytes and returns recorded marker
     #[inline]
+    #[must_use]
     pub const fn record_backend_to_client(
         &self,
         bytes: crate::types::MetricsBytes<crate::types::Unrecorded>,
@@ -268,6 +274,7 @@ impl MetricsCollector {
     ///
     /// Returns recorded byte markers for compile-time tracking.
     #[inline]
+    #[must_use]
     pub fn record_command_execution(
         &self,
         backend_id: BackendId,
@@ -433,6 +440,7 @@ impl MetricsCollector {
     ///
     /// Returns cumulative counters - no rate calculations.
     /// Use `MetricsSnapshot::with_pool_status()` to add pool utilization data.
+    #[must_use]
     pub fn snapshot(&self, cache: Option<&crate::cache::UnifiedCache>) -> MetricsSnapshot {
         let cache_stats = cache.map(|c| c as &dyn crate::cache::CacheStatsProvider);
         self.snapshot_with_cache(cache_stats)
@@ -442,6 +450,7 @@ impl MetricsCollector {
     ///
     /// Returns cumulative counters - no rate calculations.
     /// Use `MetricsSnapshot::with_pool_status()` to add pool utilization data.
+    #[must_use]
     pub fn snapshot_with_cache(
         &self,
         cache: Option<&dyn crate::cache::CacheStatsProvider>,

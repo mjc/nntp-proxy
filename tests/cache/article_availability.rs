@@ -264,7 +264,7 @@ fn test_all_exhausted_panics_with_nine_backends() {
     }
 
     // This should panic in debug builds (config validation prevents this)
-    avail.all_exhausted(BackendCount::new(9));
+    let _ = avail.all_exhausted(BackendCount::new(9));
 }
 
 #[test]

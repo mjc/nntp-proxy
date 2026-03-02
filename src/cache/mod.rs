@@ -115,6 +115,7 @@ pub enum UnifiedCache {
 
 impl UnifiedCache {
     /// Create a memory-only cache
+    #[must_use]
     pub fn memory(capacity: u64, ttl: std::time::Duration, cache_articles: bool) -> Self {
         Self::Memory(ArticleCache::new(capacity, ttl, cache_articles))
     }

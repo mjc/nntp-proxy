@@ -38,16 +38,19 @@ impl Port {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> u16 {
         self.into_inner()
     }
 
     /// Create NNTP port instance
+    #[must_use]
     pub fn nntp() -> Self {
         Self::try_new(Self::NNTP).unwrap()
     }
 
     /// Create NNTPS port instance
+    #[must_use]
     pub fn nntps() -> Self {
         Self::try_new(Self::NNTPS).unwrap()
     }

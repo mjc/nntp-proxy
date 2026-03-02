@@ -67,18 +67,21 @@ pub const COMMAND_NOT_SUPPORTED_STATELESS: &[u8] =
 /// assert_eq!(msg, "200 news.example.com ready\r\n");
 /// ```
 #[inline]
+#[must_use]
 pub fn greeting(message: &str) -> String {
     format!("200 {message}\r\n")
 }
 
 /// Construct a read-only greeting response (201)
 #[inline]
+#[must_use]
 pub fn greeting_readonly(message: &str) -> String {
     format!("201 {message}\r\n")
 }
 
 /// Construct a generic OK response (200)
 #[inline]
+#[must_use]
 pub fn ok_response(message: &str) -> String {
     format!("200 {message}\r\n")
 }
@@ -93,12 +96,14 @@ pub fn ok_response(message: &str) -> String {
 /// assert_eq!(msg, "430 No such article\r\n");
 /// ```
 #[inline]
+#[must_use]
 pub fn error_response(code: u16, message: &str) -> String {
     format!("{code} {message}\r\n")
 }
 
 /// Construct a response with custom status code and message
 #[inline]
+#[must_use]
 pub fn response(code: u16, message: &str) -> String {
     format!("{code} {message}\r\n")
 }

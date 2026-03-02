@@ -8,7 +8,7 @@ use std::time::Duration;
 /// TOML/JSON configs typically specify durations in seconds, so we need
 /// custom serde to convert from u64 seconds to Duration
 pub mod duration_serde {
-    use super::*;
+    use super::{Deserialize, Deserializer, Duration, Serializer};
 
     pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -28,7 +28,7 @@ pub mod duration_serde {
 
 /// Helper for deserializing `Option<Duration>` from seconds
 pub mod option_duration_serde {
-    use super::*;
+    use super::{Deserialize, Deserializer, Duration, Serializer};
 
     pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
     where

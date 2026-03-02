@@ -212,7 +212,7 @@ impl NntpProxy {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub mod tests {
     use super::*;
     use crate::config::{Config, Server};
     use crate::types::{MaxConnections, Port};

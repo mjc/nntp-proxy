@@ -531,24 +531,22 @@ impl ClientSession {
             let is_head = is_head_command(bytes);
             if is_stat_command(bytes) || is_head {
                 let deps = self.precheck_deps(&router);
-                let bytes_written =
-                    match precheck::precheck(&deps, command, msg_id_ref, is_head).await {
-                        Some(entry) => {
-                            let buf = entry.buffer();
-                            client_write
-                                .write_all(buf)
-                                .await
-                                .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                            buf.len()
-                        }
-                        None => {
-                            client_write
-                                .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                                .await
-                                .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                            crate::protocol::NO_SUCH_ARTICLE.len()
-                        }
-                    };
+                let bytes_written = if let Some(entry) =
+                    precheck::precheck(&deps, command, msg_id_ref, is_head).await
+                {
+                    let buf = entry.buffer();
+                    client_write
+                        .write_all(buf)
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                    buf.len()
+                } else {
+                    client_write
+                        .write_all(crate::protocol::NO_SUCH_ARTICLE)
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                    crate::protocol::NO_SUCH_ARTICLE.len()
+                };
                 *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
                 return Ok(BackendId::from_index(0));
             }

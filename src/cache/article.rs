@@ -48,6 +48,7 @@ impl ArticleEntry {
     ///
     /// Backend availability starts with assumption all backends have the article.
     /// Tier defaults to 0, timestamp is set to now.
+    #[must_use]
     pub fn new(buffer: Vec<u8>) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -60,6 +61,7 @@ impl ArticleEntry {
     /// Create from response buffer with a specific tier
     ///
     /// Used when caching articles from backends with known tier.
+    #[must_use]
     pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -72,6 +74,7 @@ impl ArticleEntry {
     /// Create from pre-wrapped Arc buffer
     ///
     /// Use this when the buffer is already wrapped in Arc to avoid double wrapping.
+    #[must_use]
     pub fn from_arc(buffer: Arc<Vec<u8>>) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -82,6 +85,7 @@ impl ArticleEntry {
     }
 
     /// Create from pre-wrapped Arc buffer with a specific tier
+    #[must_use]
     pub fn from_arc_with_tier(buffer: Arc<Vec<u8>>, tier: u8) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -95,12 +99,14 @@ impl ArticleEntry {
     ///
     /// See [`super::ttl`] for the TTL formula.
     #[inline]
+    #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
         ttl::is_expired(self.inserted_at, base_ttl_millis, self.tier)
     }
 
     /// Get the tier of the backend that provided this article
     #[inline]
+    #[must_use]
     pub const fn tier(&self) -> u8 {
         self.tier
     }
@@ -113,6 +119,7 @@ impl ArticleEntry {
 
     /// Get raw buffer for serving to client
     #[inline]
+    #[must_use]
     pub const fn buffer(&self) -> &Arc<Vec<u8>> {
         &self.buffer
     }
@@ -122,6 +129,7 @@ impl ArticleEntry {
     /// Parses the first 3 bytes as the status code.
     /// Returns None if buffer is too short or invalid.
     #[inline]
+    #[must_use]
     pub fn status_code(&self) -> Option<StatusCode> {
         StatusCode::parse(&self.buffer)
     }
@@ -130,6 +138,7 @@ impl ArticleEntry {
     ///
     /// Returns false if backend is known to not have this article (returned 430 before).
     #[inline]
+    #[must_use]
     pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
         self.backend_availability.should_try(backend_id)
     }
@@ -150,11 +159,13 @@ impl ArticleEntry {
     }
 
     /// Check if all backends have been tried and none have the article
+    #[must_use]
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
         self.backend_availability.all_exhausted(total_backends)
     }
 
     /// Get backends that might have this article
+    #[must_use]
     pub fn available_backends(&self, total_backends: BackendCount) -> Vec<BackendId> {
         self.backend_availability
             .available_backends(total_backends)
@@ -165,6 +176,7 @@ impl ArticleEntry {
     ///
     /// This provides the same interface as the old CachedArticle.response field.
     #[inline]
+    #[must_use]
     pub const fn response(&self) -> &Arc<Vec<u8>> {
         &self.buffer
     }
@@ -175,6 +187,7 @@ impl ArticleEntry {
     /// If false, we haven't tried any backends yet and should run precheck instead of
     /// serving from cache.
     #[inline]
+    #[must_use]
     pub const fn has_availability_info(&self) -> bool {
         self.backend_availability.has_availability_info()
     }
@@ -191,6 +204,7 @@ impl ArticleEntry {
     /// This is used when `cache_articles=true` to determine if we can serve
     /// directly from cache or need to fetch additional data.
     #[inline]
+    #[must_use]
     pub fn is_complete_article(&self) -> bool {
         let Some(code) = self.status_code() else {
             return false;
@@ -205,6 +219,7 @@ impl ArticleEntry {
     /// 2. Have CRLF somewhere (line terminator)
     /// 3. End with `\r\n.\r\n` for multiline responses (220/221/222)
     #[inline]
+    #[must_use]
     pub fn is_valid_response(&self) -> bool {
         super::entry_helpers::is_valid_response(&self.buffer)
     }
@@ -219,6 +234,7 @@ impl ArticleEntry {
     ///
     /// Returns `None` if cached response can't serve this command type or if
     /// the cached buffer fails validation.
+    #[must_use]
     pub fn response_for_command(
         &self,
         cmd_verb: &str,
@@ -232,6 +248,7 @@ impl ArticleEntry {
     ///
     /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
+    #[must_use]
     pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
         let Some(code) = self.status_code() else {
             return false;
@@ -282,6 +299,7 @@ impl ArticleCache {
     /// * `max_capacity` - Maximum cache size in bytes (uses weighted entries)
     /// * `ttl` - Time-to-live for cached articles
     /// * `cache_articles` - Whether to cache full article bodies (true) or just availability (false)
+    #[must_use]
     pub fn new(max_capacity: u64, ttl: Duration, cache_articles: bool) -> Self {
         // Build cache with byte-based capacity using weigher
         // max_capacity is total bytes allowed
@@ -624,6 +642,7 @@ impl ArticleCache {
     }
 
     /// Get cache statistics
+    #[must_use]
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             entry_count: self.cache.entry_count(),
@@ -643,24 +662,28 @@ impl ArticleCache {
 
     /// Get maximum cache capacity
     #[inline]
+    #[must_use]
     pub const fn capacity(&self) -> u64 {
         self.capacity
     }
 
     /// Get current number of cached entries (synchronous)
     #[inline]
+    #[must_use]
     pub fn entry_count(&self) -> u64 {
         self.cache.entry_count()
     }
 
     /// Get current weighted size in bytes (synchronous)
     #[inline]
+    #[must_use]
     pub fn weighted_size(&self) -> u64 {
         self.cache.weighted_size()
     }
 
     /// Get cache hit rate as percentage (0.0 to 100.0)
     #[inline]
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);

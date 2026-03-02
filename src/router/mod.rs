@@ -83,6 +83,7 @@ impl PartialOrd<usize> for BackendCount {
 
 impl BackendCount {
     /// Zero backends
+    #[must_use]
     pub fn zero() -> Self {
         Self::new(0)
     }
@@ -115,6 +116,7 @@ impl PartialOrd<usize> for TotalWeight {
 
 impl TotalWeight {
     /// Zero weight
+    #[must_use]
     pub fn zero() -> Self {
         Self::new(0)
     }

@@ -141,6 +141,7 @@ impl MockNntpServer {
     }
 
     /// Create a new mock server builder on the specified port
+    #[must_use]
     pub fn new(port: u16) -> Self {
         Self {
             port,
@@ -240,6 +241,7 @@ impl MockNntpServer {
 /// * `port` - Port to listen on
 /// * `server_name` - Name to include in greeting message
 #[allow(dead_code)]
+#[must_use]
 pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
     MockNntpServer::new(port).with_name(server_name).spawn()
 }
@@ -291,6 +293,7 @@ pub async fn get_available_port() -> Result<u16> {
 }
 
 /// Create a test configuration with servers on the given ports
+#[must_use]
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     use nntp_proxy::types::{MaxConnections, Port};
     Config {
@@ -356,6 +359,7 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
 /// let pool = create_test_buffer_pool();
 /// let session = ClientSession::new(addr.into(), pool, auth_handler);
 /// ```
+#[must_use]
 pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
     use nntp_proxy::pool::BufferPool;
     use nntp_proxy::types::BufferSize;
@@ -364,11 +368,13 @@ pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
 }
 
 /// Create a test auth handler with standard credentials (user/pass)
+#[must_use]
 pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     create_test_auth_handler_with("user", "pass")
 }
 
 /// Create a test auth handler with custom credentials
+#[must_use]
 pub fn create_test_auth_handler_with(
     username: &str,
     password: &str,
@@ -380,11 +386,13 @@ pub fn create_test_auth_handler_with(
 }
 
 /// Create a disabled (no-auth) test auth handler
+#[must_use]
 pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     std::sync::Arc::new(nntp_proxy::auth::AuthHandler::new(None, None).unwrap())
 }
 
 /// Create a test backend selector (router)
+#[must_use]
 pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelector> {
     std::sync::Arc::new(nntp_proxy::router::BackendSelector::new())
 }
@@ -398,6 +406,7 @@ pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelecto
 /// let addr = create_test_addr();
 /// let session = ClientSession::new(addr.into(), pool, auth);
 /// ```
+#[must_use]
 pub fn create_test_addr() -> std::net::SocketAddr {
     "127.0.0.1:9999".parse().unwrap()
 }
@@ -564,6 +573,7 @@ pub async fn send_article_read_full_response(
 
 /// Create a basic server configuration for testing (no TLS)
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
     Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
@@ -574,6 +584,7 @@ pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
 
 /// Create a server configuration with authentication
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config_with_auth(
     host: &str,
     port: u16,
@@ -592,6 +603,7 @@ pub fn create_test_server_config_with_auth(
 
 /// Create a TLS-enabled server configuration
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config_with_tls(
     host: &str,
     port: u16,
@@ -614,6 +626,7 @@ pub fn create_test_server_config_with_tls(
 
 /// Create a server configuration with custom max_connections
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config_with_max_connections(
     host: &str,
     port: u16,
@@ -629,6 +642,7 @@ pub fn create_test_server_config_with_max_connections(
 
 /// Create a full Config with client authentication enabled
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_config_with_auth(
     backend_ports: Vec<u16>,
     username: &str,

@@ -20,6 +20,7 @@ pub struct MockHybridCache {
 }
 
 impl MockHybridCache {
+    #[must_use]
     pub fn new(_memory_capacity: u64) -> Self {
         Self {
             storage: Arc::new(Mutex::new(HashMap::new())),
@@ -72,17 +73,14 @@ impl MockHybridCache {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
-        let entry = match storage.get(&key) {
-            Some(existing) => {
-                let mut updated = existing.clone();
-                updated.record_backend_missing(backend_id);
-                updated
-            }
-            None => {
-                let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is valid");
-                entry.record_backend_missing(backend_id);
-                entry
-            }
+        let entry = if let Some(existing) = storage.get(&key) {
+            let mut updated = existing.clone();
+            updated.record_backend_missing(backend_id);
+            updated
+        } else {
+            let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is valid");
+            entry.record_backend_missing(backend_id);
+            entry
         };
 
         storage.insert(key, entry);
@@ -138,6 +136,7 @@ impl MockHybridCache {
         }
     }
 
+    #[must_use]
     pub fn stats(&self) -> HybridCacheStats {
         HybridCacheStats {
             hits: self.hits.load(Ordering::Relaxed),

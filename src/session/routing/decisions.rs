@@ -39,7 +39,7 @@ pub fn decide_command_routing(
     auth_enabled: bool,
     routing_mode: RoutingMode,
 ) -> CommandRoutingDecision {
-    use CommandAction::*;
+    use CommandAction::{ForwardStateless, InterceptAuth, Reject};
 
     // Classify the command
     let action = CommandHandler::classify(command);

@@ -73,6 +73,7 @@ impl AuthHandler {
 
     /// Check if authentication is enabled
     #[inline]
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.users.is_empty()
     }
@@ -80,6 +81,7 @@ impl AuthHandler {
     /// Validate client credentials
     ///
     /// If auth is disabled (no users configured), returns true for all credentials
+    #[must_use]
     pub fn validate_credentials(&self, username: &str, password: &str) -> bool {
         if self.users.is_empty() {
             // Auth disabled - allow all
@@ -131,12 +133,14 @@ impl AuthHandler {
 
     /// Get the AUTHINFO USER response
     #[inline]
+    #[must_use]
     pub const fn user_response(&self) -> &'static [u8] {
         AUTH_REQUIRED
     }
 
     /// Get the AUTHINFO PASS response
     #[inline]
+    #[must_use]
     pub const fn pass_response(&self) -> &'static [u8] {
         AUTH_ACCEPTED
     }

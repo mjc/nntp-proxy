@@ -282,6 +282,7 @@ impl DeadpoolConnectionProvider {
     /// Create a new connection provider (plain TCP, no TLS)
     ///
     /// For TLS support, use `new_with_tls()` or the builder API.
+    #[must_use]
     pub fn new(
         host: String,
         port: u16,
@@ -600,6 +601,7 @@ impl DeadpoolConnectionProvider {
     }
 
     /// Get a reference to the health check metrics
+    #[must_use]
     pub fn health_check_metrics(&self) -> &HealthCheckMetrics {
         &self.health_check_metrics
     }
@@ -639,7 +641,7 @@ impl DeadpoolConnectionProvider {
 
         loop {
             tokio::select! {
-                _ = sleep(interval) => {
+                () = sleep(interval) => {
                     // Time to run health check
                 }
                 _ = shutdown_rx.recv() => {

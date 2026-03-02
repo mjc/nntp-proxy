@@ -76,6 +76,7 @@ pub struct ArticleAvailability {
 impl ArticleAvailability {
     /// Create empty availability - assume all backends have article until proven otherwise
     #[inline]
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             checked: 0,
@@ -155,6 +156,7 @@ impl ArticleAvailability {
     /// # Panics (debug builds only)
     /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
+    #[must_use]
     pub fn is_missing(&self, backend_id: BackendId) -> bool {
         let idx = backend_id.as_index();
         debug_assert!(
@@ -171,18 +173,21 @@ impl ArticleAvailability {
     /// # Panics (debug builds only)
     /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
+    #[must_use]
     pub fn should_try(&self, backend_id: BackendId) -> bool {
         !self.is_missing(backend_id)
     }
 
     /// Get the raw missing bitset for debugging
     #[inline]
+    #[must_use]
     pub const fn missing_bits(&self) -> u8 {
         self.missing
     }
 
     /// Get the raw checked bitset for debugging
     #[inline]
+    #[must_use]
     pub const fn checked_bits(&self) -> u8 {
         self.checked
     }
@@ -194,6 +199,7 @@ impl ArticleAvailability {
     /// # Panics (debug builds only)
     /// Panics if `backend_count` > 8. Config validation enforces max 8 backends.
     #[inline]
+    #[must_use]
     pub fn all_exhausted(&self, backend_count: BackendCount) -> bool {
         let count = backend_count.get();
         debug_assert!(
@@ -221,6 +227,7 @@ impl ArticleAvailability {
 
     /// Get the underlying bitset value (for debugging)
     #[inline]
+    #[must_use]
     pub const fn as_u8(&self) -> u8 {
         self.missing
     }
@@ -231,6 +238,7 @@ impl ArticleAvailability {
     /// The caller must ensure the bits represent valid backend states.
     /// This is primarily used when deserializing from disk cache.
     #[inline]
+    #[must_use]
     pub const fn from_bits(checked: u8, missing: u8) -> Self {
         Self { checked, missing }
     }
@@ -241,6 +249,7 @@ impl ArticleAvailability {
     /// If this returns false, we haven't tried any backends yet and shouldn't
     /// serve from cache (should try backends first).
     #[inline]
+    #[must_use]
     pub const fn has_availability_info(&self) -> bool {
         self.checked != 0
     }
@@ -250,6 +259,7 @@ impl ArticleAvailability {
     /// Returns true if at least one backend was checked and did NOT return 430.
     /// This is the inverse check from `all_exhausted` - at least one success.
     #[inline]
+    #[must_use]
     pub const fn any_backend_has_article(&self) -> bool {
         // A backend "has" the article if it's checked but not missing
         // checked & !missing gives us the backends that have it
@@ -261,6 +271,7 @@ impl ArticleAvailability {
     /// # Panics (debug builds only)
     /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
+    #[must_use]
     pub fn status(&self, backend_id: BackendId) -> BackendStatus {
         let idx = backend_id.as_index();
         debug_assert!(

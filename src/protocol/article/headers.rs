@@ -122,6 +122,7 @@ impl<'a> Headers<'a> {
     ///
     /// # Returns
     /// Header value slice (trimmed leading/trailing whitespace) or None
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&'a [u8]> {
         let name_lower = name.to_ascii_lowercase();
         let mut pos = 0;
@@ -202,6 +203,7 @@ impl<'a> Headers<'a> {
     }
 
     /// Iterate over all headers (zero-copy)
+    #[must_use]
     pub const fn iter(&self) -> HeaderIter<'a> {
         HeaderIter {
             data: self.data,
@@ -210,6 +212,7 @@ impl<'a> Headers<'a> {
     }
 
     /// Get raw header bytes
+    #[must_use]
     pub const fn as_bytes(&self) -> &'a [u8] {
         self.data
     }

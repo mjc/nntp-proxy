@@ -38,7 +38,7 @@ struct OwnedDeps {
     cache_articles: bool,
 }
 
-impl<'a> PrecheckDeps<'a> {
+impl PrecheckDeps<'_> {
     fn to_owned(&self) -> OwnedDeps {
         OwnedDeps {
             router: Arc::clone(self.router),

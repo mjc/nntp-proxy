@@ -190,11 +190,13 @@ pub struct ErrorCount(u64);
 
 impl ErrorCount {
     #[inline]
+    #[must_use]
     pub const fn new(count: u64) -> Self {
         Self(count)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -245,11 +247,13 @@ pub struct ArticleCount(u64);
 
 impl ArticleCount {
     #[inline]
+    #[must_use]
     pub const fn new(count: u64) -> Self {
         Self(count)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -293,11 +297,13 @@ pub struct ActiveConnections(usize);
 
 impl ActiveConnections {
     #[inline]
+    #[must_use]
     pub const fn new(count: usize) -> Self {
         Self(count)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> usize {
         self.0
     }
@@ -334,11 +340,13 @@ pub struct Microseconds(u64);
 
 impl Microseconds {
     #[inline]
+    #[must_use]
     pub const fn new(micros: u64) -> Self {
         Self(micros)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -359,6 +367,7 @@ f64_type!(Milliseconds);
 
 impl Milliseconds {
     #[inline]
+    #[must_use]
     pub fn from_micros(micros: f64) -> Self {
         Self(micros / 1000.0)
     }
@@ -386,11 +395,13 @@ pub struct BytesPerSecond(u64);
 
 impl BytesPerSecond {
     #[inline]
+    #[must_use]
     pub const fn new(bps: u64) -> Self {
         Self(bps)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }

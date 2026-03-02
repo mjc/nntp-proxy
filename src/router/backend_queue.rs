@@ -58,6 +58,7 @@ pub struct BackendQueue {
 
 impl BackendQueue {
     /// Create a new queue with the given maximum depth
+    #[must_use]
     pub fn new(max_depth: usize) -> Self {
         Self {
             queue: SegQueue::new(),

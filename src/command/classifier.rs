@@ -62,7 +62,8 @@
 macro_rules! command_cases {
     (pub $name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
-        pub const $name: &[&[u8]; 3] = &[b"STAT", b"stat", b"Stat"];
+        #[allow(clippy::string_lit_as_bytes)]
+        pub const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
 
         // Compile-time validation: ensure documentation starts with RFC reference
         // This creates a const assertion that the doc string contains expected patterns
@@ -74,7 +75,8 @@ macro_rules! command_cases {
     };
     ($name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
-        const $name: &[&[u8]; 3] = &[b"NEWNEWS", b"newnews", b"Newnews"];
+        #[allow(clippy::string_lit_as_bytes)]
+        const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
 
         // Compile-time validation: ensure documentation starts with RFC reference
         // This creates a const assertion that the doc string contains expected patterns
@@ -311,6 +313,7 @@ command_cases!(
 ///
 /// Uses const generic to support flexible case counts at compile time.
 #[inline(always)]
+#[must_use]
 pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
     // Compiler optimizes contains() to unrolled comparisons for small N
     cases.contains(&cmd)
@@ -538,6 +541,7 @@ impl NntpCommand {
     /// commands are case-insensitive. We match against pre-computed literal
     /// variations (UPPER/lower/Title) for maximum performance.
     #[inline]
+    #[must_use]
     pub fn parse(command: &str) -> Self {
         let trimmed = command.trim();
         let bytes = trimmed.as_bytes();

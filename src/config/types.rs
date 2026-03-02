@@ -382,11 +382,13 @@ pub struct UserCredentials {
 
 impl ClientAuth {
     /// Check if authentication is enabled
+    #[must_use]
     pub const fn is_enabled(&self) -> bool {
         !self.users.is_empty()
     }
 
     /// Get all users
+    #[must_use]
     pub fn all_users(&self) -> Vec<(&str, &str)> {
         self.users
             .iter()

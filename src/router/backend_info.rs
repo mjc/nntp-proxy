@@ -138,6 +138,7 @@ impl StatefulCount {
     /// Try to acquire a stateful slot (compare-exchange loop)
     ///
     /// Returns true if successfully incremented below `max_stateful` limit
+    #[must_use]
     pub fn try_acquire(&self, max_stateful: usize) -> bool {
         let mut current = self.0.load(Ordering::Acquire);
         loop {

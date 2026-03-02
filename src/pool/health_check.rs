@@ -72,6 +72,7 @@ pub struct HealthCheckMetrics {
 
 impl HealthCheckMetrics {
     /// Create a new metrics instance
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

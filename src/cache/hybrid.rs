@@ -414,20 +414,17 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
 
         // Get existing entry or create a minimal stub
-        let entry = match self.cache.get(&key).await {
-            Ok(Some(existing)) => {
-                let mut updated = existing.value().clone();
-                updated.record_backend_missing(backend_id);
-                updated
-            }
-            _ => {
-                // Create stub entry for availability tracking
-                // SAFETY: "430\r\n" is a valid NNTP response
-                let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec())
-                    .expect("430 is a valid status code");
-                entry.record_backend_missing(backend_id);
-                entry
-            }
+        let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
+            let mut updated = existing.value().clone();
+            updated.record_backend_missing(backend_id);
+            updated
+        } else {
+            // Create stub entry for availability tracking
+            // SAFETY: "430\r\n" is a valid NNTP response
+            let mut entry =
+                HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is a valid status code");
+            entry.record_backend_missing(backend_id);
+            entry
         };
 
         self.cache.insert(key, entry);
@@ -548,6 +545,7 @@ pub struct HybridCacheStats {
 
 impl HybridCacheStats {
     /// Calculate hit rate as a percentage
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -558,6 +556,7 @@ impl HybridCacheStats {
     }
 
     /// Calculate disk hit rate (hits from disk vs total hits)
+    #[must_use]
     pub fn disk_hit_rate(&self) -> f64 {
         if self.hits == 0 {
             0.0

@@ -54,6 +54,7 @@ impl TlsConfig {
     ///     .verify_cert(true)
     ///     .build();
     /// ```
+    #[must_use]
     pub fn builder() -> TlsConfigBuilder {
         TlsConfigBuilder::default()
     }
@@ -144,6 +145,7 @@ impl TlsConfigBuilder {
     }
 
     /// Build the `TlsConfig`
+    #[must_use]
     pub fn build(self) -> TlsConfig {
         TlsConfig {
             use_tls: self.use_tls,
@@ -156,7 +158,10 @@ impl TlsConfigBuilder {
 // Certificate handling and custom verifiers
 
 mod rustls_backend {
-    use super::*;
+    use super::{
+        CertificateDer, DigitallySignedStruct, HandshakeSignatureValid, RootCertStore, RustlsError,
+        ServerCertVerified, ServerCertVerifier, ServerName, SignatureScheme, UnixTime,
+    };
 
     /// Certificate loading results
     #[derive(Debug)]

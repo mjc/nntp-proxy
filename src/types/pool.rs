@@ -51,6 +51,7 @@ pool_count_type!(
 impl InUseConnections {
     /// Calculate from pool capacity and availability
     #[inline]
+    #[must_use]
     pub fn from_pool_stats(max: MaxPoolSize, available: AvailableConnections) -> Self {
         Self::new(max.get().saturating_sub(available.get()))
     }
@@ -69,6 +70,7 @@ impl PoolUtilization {
     /// # Panics
     /// Panics if percentage is not in range [0.0, 100.0]
     #[inline]
+    #[must_use]
     pub fn new(percentage: f64) -> Self {
         assert!(
             (0.0..=100.0).contains(&percentage),
@@ -79,6 +81,7 @@ impl PoolUtilization {
 
     /// Calculate utilization from pool stats
     #[inline]
+    #[must_use]
     pub fn from_pool_stats(max: MaxPoolSize, available: AvailableConnections) -> Self {
         let max_size = max.get();
         if max_size == 0 {
@@ -217,7 +220,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Utilization must be 0-100%")]
     fn test_pool_utilization_invalid() {
-        PoolUtilization::new(150.0);
+        let _ = PoolUtilization::new(150.0);
     }
 
     #[test]

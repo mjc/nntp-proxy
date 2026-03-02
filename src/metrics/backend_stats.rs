@@ -1,6 +1,9 @@
 //! Backend statistics snapshot type
 
-use super::types::*;
+use super::types::{
+    ActiveConnections, ArticleCount, BackendHealthStatus, CommandCount, ErrorCount,
+    ErrorRatePercent, FailureCount, OverheadMillis, RecvMicros, SendMicros, TtfbMicros,
+};
 use crate::types::{
     ArticleBytesTotal, BackendId, BytesReceived, BytesSent, TimingMeasurementCount,
 };

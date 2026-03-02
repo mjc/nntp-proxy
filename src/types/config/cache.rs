@@ -28,12 +28,14 @@ impl Default for CacheCapacity {
 impl CacheCapacity {
     /// Get capacity in bytes
     #[inline]
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.into_inner()
     }
 
     /// Get capacity as u64 for moka
     #[inline]
+    #[must_use]
     pub fn as_u64(&self) -> u64 {
         self.into_inner()
     }

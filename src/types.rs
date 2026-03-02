@@ -44,6 +44,7 @@ pub struct ClientId(Uuid);
 impl ClientId {
     /// Generate a new random client ID
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -88,6 +89,7 @@ pub struct BackendId(usize);
 impl BackendId {
     /// Create a backend ID from an index
     #[inline]
+    #[must_use]
     pub fn from_index(index: usize) -> Self {
         Self::new(index)
     }
