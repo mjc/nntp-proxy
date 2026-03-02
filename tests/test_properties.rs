@@ -355,7 +355,7 @@ proptest! {
 
     #[test]
     fn prop_article_220_has_headers_and_body(
-        article_num in 0u64..100000u64,
+        article_num in 0u64..100_000u64,
         msg_local in r"[a-zA-Z0-9._+-]{1,20}",
         msg_domain in r"[a-zA-Z0-9.-]{1,20}",
         header_name in r"[A-Za-z][A-Za-z0-9-]{0,10}",
@@ -379,7 +379,7 @@ proptest! {
 
     #[test]
     fn prop_article_221_has_headers_no_body(
-        article_num in 0u64..100000u64,
+        article_num in 0u64..100_000u64,
         msg_local in r"[a-zA-Z0-9._+-]{1,20}",
         msg_domain in r"[a-zA-Z0-9.-]{1,20}",
         header_name in r"[A-Za-z][A-Za-z0-9-]{0,10}",
@@ -400,7 +400,7 @@ proptest! {
 
     #[test]
     fn prop_article_222_has_body_no_headers(
-        article_num in 0u64..100000u64,
+        article_num in 0u64..100_000u64,
         msg_local in r"[a-zA-Z0-9._+-]{1,20}",
         msg_domain in r"[a-zA-Z0-9.-]{1,20}",
         body_text in r"[A-Za-z0-9 ]{1,50}"
@@ -420,7 +420,7 @@ proptest! {
 
     #[test]
     fn prop_article_223_has_neither(
-        article_num in 0u64..100000u64,
+        article_num in 0u64..100_000u64,
         msg_local in r"[a-zA-Z0-9._+-]{1,20}",
         msg_domain in r"[a-zA-Z0-9.-]{1,20}"
     ) {
@@ -439,7 +439,7 @@ proptest! {
 
     #[test]
     fn prop_article_message_id_format_validated(
-        article_num in 0u64..100000u64,
+        article_num in 0u64..100_000u64,
         msg_local in r"[a-zA-Z0-9._+-]{1,20}",
         msg_domain in r"[a-zA-Z0-9.-]{1,20}"
     ) {
@@ -843,8 +843,8 @@ proptest! {
         let reference_pos = memchr::memmem::find(&data, b"\r\n.\r\n");
 
         match (status.is_found(), reference_pos) {
-            (true, Some(_)) => {} // Both found — good
-            (false, None) => {}   // Neither found — good
+            // Both found or neither found — results agree
+            (true, Some(_)) | (false, None) => {}
             (true, None) => {
                 // TailBuffer says found but reference didn't — this shouldn't happen
                 // unless the data is very short (< 5 bytes where TailBuffer tracks cross-boundary)

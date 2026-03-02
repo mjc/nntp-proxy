@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-use nntp_proxy::config::Server;
+use nntp_proxy::config::{ClientAuth, HealthCheck, Proxy, Server};
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
 mod test_helpers;
@@ -1017,10 +1017,10 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
             .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
             .build()?,
         ],
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: Default::default(),
-        client_auth: Default::default(),
+        proxy: Proxy::default(),
+        health_check: HealthCheck::default(),
+        cache: None,
+        client_auth: ClientAuth::default(),
     };
 
     // Start proxy
@@ -1175,10 +1175,10 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
             .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
             .build()?,
         ],
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: Default::default(),
-        client_auth: Default::default(),
+        proxy: Proxy::default(),
+        health_check: HealthCheck::default(),
+        cache: None,
+        client_auth: ClientAuth::default(),
     };
 
     // Start proxy

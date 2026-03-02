@@ -407,8 +407,7 @@ mod tests {
     #[test]
     fn test_high_error_backends_empty() {
         let snapshot = MetricsSnapshot::default();
-        let high_error: Vec<_> = snapshot.high_error_backends().collect();
-        assert_eq!(high_error.len(), 0);
+        assert_eq!(snapshot.high_error_backends().count(), 0);
     }
 
     #[test]
@@ -431,8 +430,7 @@ mod tests {
             ..Default::default()
         };
 
-        let healthy: Vec<_> = snapshot.healthy_backends().collect();
-        assert_eq!(healthy.len(), 0);
+        assert_eq!(snapshot.healthy_backends().count(), 0);
     }
 
     #[test]

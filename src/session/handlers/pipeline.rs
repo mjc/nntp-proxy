@@ -144,7 +144,7 @@ impl ClientSession {
 
             command_buf.clear();
             match reader.read_line(command_buf).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
@@ -168,7 +168,6 @@ impl ClientSession {
                     batch_buf.push_str(command_buf);
                     batch_offsets.push(batch_buf.len());
                 }
-                Err(_) => break,
             }
         }
 

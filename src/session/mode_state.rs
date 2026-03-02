@@ -45,9 +45,8 @@ impl SessionMode {
     #[inline]
     const fn from_u8(value: u8) -> Self {
         match value {
-            0 => Self::PerCommand,
             1 => Self::Stateful,
-            _ => Self::PerCommand, // Safe default
+            _ => Self::PerCommand, // 0 or any unknown value
         }
     }
 }

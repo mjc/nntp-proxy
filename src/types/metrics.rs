@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_counter_display_article_bytes() {
-        let c = ArticleBytesTotal::new(999999);
+        let c = ArticleBytesTotal::new(999_999);
         assert_eq!(format!("{c}"), "999999 bytes");
     }
 

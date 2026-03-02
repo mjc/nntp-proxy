@@ -77,9 +77,8 @@ impl StaleConnectionServer {
 
                     loop {
                         let n = match stream.read(&mut buffer).await {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => break,
                             Ok(n) => n,
-                            Err(_) => break,
                         };
 
                         let cmd = String::from_utf8_lossy(&buffer[..n]);
@@ -191,9 +190,8 @@ impl FailFirstNServer {
 
                     loop {
                         let n = match stream.read(&mut buffer).await {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => break,
                             Ok(n) => n,
-                            Err(_) => break,
                         };
 
                         let cmd = String::from_utf8_lossy(&buffer[..n]);

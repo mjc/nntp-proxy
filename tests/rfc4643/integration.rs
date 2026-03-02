@@ -339,13 +339,13 @@ async fn test_auth_handler_integration() {
 
 #[tokio::test]
 async fn test_config_auth_round_trip() {
-    use nntp_proxy::config::{ClientAuth, Config};
+    use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy};
 
     // Create config with auth
     let config = Config {
         servers: vec![],
-        proxy: Default::default(),
-        health_check: Default::default(),
+        proxy: Proxy::default(),
+        health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth {
             users: vec![UserCredentials {

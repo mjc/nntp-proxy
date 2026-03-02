@@ -366,10 +366,8 @@ pub async fn run_accept_loop(
                     };
 
                     match result {
-                        Ok(()) => {}
-                        Err(crate::session::SessionError::ClientDisconnect(_)) => {
-                            // Normal client disconnect — already handled gracefully
-                        }
+                        // Normal completion or client disconnect — no action needed
+                        Ok(()) | Err(crate::session::SessionError::ClientDisconnect(_)) => {}
                         Err(crate::session::SessionError::Backend(e)) => {
                             error!("Error handling client {}: {:?}", addr, e);
                         }

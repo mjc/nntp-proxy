@@ -338,7 +338,7 @@ async fn test_config_client_auth_disabled_both_missing() {
 async fn test_config_default_client_auth_is_disabled() {
     use nntp_proxy::config::ClientAuth;
 
-    let config: ClientAuth = Default::default();
+    let config = ClientAuth::default();
     assert!(!config.is_enabled());
 }
 

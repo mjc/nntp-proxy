@@ -84,7 +84,7 @@ impl StreamingError {
     pub(crate) fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::ClientDisconnect(io_err) => anyhow::Error::from(io_err),
-            Self::BackendDirty(e) => e,
+            Self::BackendDirty(e) | Self::Io(e) => e,
             Self::BackendEof {
                 backend_id,
                 bytes_received,
@@ -92,7 +92,6 @@ impl StreamingError {
                 "Backend {backend_id:?} closed connection before multiline terminator \
                  ({bytes_received} bytes received)"
             ),
-            Self::Io(e) => e,
         }
     }
 }

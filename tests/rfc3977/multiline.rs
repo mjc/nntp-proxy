@@ -305,12 +305,10 @@ fn test_bare_lf_handling() {
     let raw = "Line1\nLine2\n.\n";
 
     // CRLF split treats this as one long line
-    let crlf_lines: Vec<&str> = raw.split("\r\n").filter(|s| !s.is_empty()).collect();
-    assert_eq!(crlf_lines.len(), 1);
+    assert_eq!(raw.split("\r\n").filter(|s| !s.is_empty()).count(), 1);
 
     // LF split would produce multiple lines
-    let lf_lines: Vec<&str> = raw.split('\n').filter(|s| !s.is_empty()).collect();
-    assert_eq!(lf_lines.len(), 3);
+    assert_eq!(raw.split('\n').filter(|s| !s.is_empty()).count(), 3);
 }
 
 #[test]
@@ -318,11 +316,8 @@ fn test_bare_cr_handling() {
     // RFC 3977 requires \r\n; bare \r is not compliant
     let raw = "Line1\rLine2\r.\r";
 
-    let crlf_lines: Vec<&str> = raw.split("\r\n").filter(|s| !s.is_empty()).collect();
-    assert_eq!(crlf_lines.len(), 1);
-
-    let cr_lines: Vec<&str> = raw.split('\r').filter(|s| !s.is_empty()).collect();
-    assert_eq!(cr_lines.len(), 3);
+    assert_eq!(raw.split("\r\n").filter(|s| !s.is_empty()).count(), 1);
+    assert_eq!(raw.split('\r').filter(|s| !s.is_empty()).count(), 3);
 }
 
 #[test]

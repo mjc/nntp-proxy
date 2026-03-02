@@ -165,10 +165,10 @@ impl ClientSessionBuilder {
             (Some(_), RoutingMode::PerCommand | RoutingMode::Hybrid) => {
                 (SessionMode::PerCommand, self.routing_mode)
             }
-            // Stateful mode with router: honor the Stateful mode request
-            (Some(_), RoutingMode::Stateful) => (SessionMode::Stateful, RoutingMode::Stateful),
-            // No router: always Stateful mode
-            (None, _) => (SessionMode::Stateful, RoutingMode::Stateful),
+            // Stateful mode with router, or no router: always Stateful
+            (Some(_), RoutingMode::Stateful) | (None, _) => {
+                (SessionMode::Stateful, RoutingMode::Stateful)
+            }
         };
 
         ClientSession {

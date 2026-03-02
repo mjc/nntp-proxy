@@ -49,8 +49,8 @@ fn test_effective_ttl_formula() {
     assert_eq!(effective_ttl(base_ttl, 4), 16000); // tier 4: 16x
     assert_eq!(effective_ttl(base_ttl, 5), 32000); // tier 5: 32x
     assert_eq!(effective_ttl(base_ttl, 6), 64000); // tier 6: 64x
-    assert_eq!(effective_ttl(base_ttl, 7), 128000); // tier 7: 128x
-    assert_eq!(effective_ttl(base_ttl, 10), 1024000); // tier 10: 1024x
+    assert_eq!(effective_ttl(base_ttl, 7), 128_000); // tier 7: 128x
+    assert_eq!(effective_ttl(base_ttl, 10), 1_024_000); // tier 10: 1024x
 }
 
 #[test]

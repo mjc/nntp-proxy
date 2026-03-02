@@ -65,9 +65,8 @@ impl CompressionMockServer {
 
                     loop {
                         let n = match stream.read(&mut buffer).await {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => break,
                             Ok(n) => n,
-                            Err(_) => break,
                         };
 
                         let cmd = String::from_utf8_lossy(&buffer[..n]);
@@ -275,16 +274,15 @@ async fn test_compression_required_fails_on_unsupported() -> Result<()> {
     let result = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await;
 
     match result {
-        Ok(Ok(0)) => {} // Connection closed — expected
-        Ok(Ok(_)) => {
+        Ok(Ok(n)) if n > 0 => {
             // Got a response — it should not be a successful article response
             assert!(
                 !line.starts_with("223"),
                 "Should not get successful response when compression is required but unsupported, got: {line}"
             );
         }
-        Ok(Err(_)) => {} // Read error — expected when backend unavailable
-        Err(_) => {}     // Timeout — acceptable, proxy couldn't get a backend
+        // Connection closed, read error, or timeout — all expected/acceptable
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
     }
 
     Ok(())

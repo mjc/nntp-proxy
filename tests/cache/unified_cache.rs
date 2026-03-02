@@ -340,7 +340,7 @@ fn test_availability_from_bits_some_missing() {
     // checked=0b00000011, missing=0b00000001 means:
     // - backend 0: checked and missing (430)
     // - backend 1: checked and has article
-    let avail = ArticleAvailability::from_bits(0b00000011, 0b00000001);
+    let avail = ArticleAvailability::from_bits(0b0000_0011, 0b0000_0001);
 
     assert!(avail.has_availability_info());
     assert_eq!(

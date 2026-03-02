@@ -164,13 +164,12 @@ impl NntpResponse {
             381 | 480 => Self::AuthRequired(code),
 
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
-            // All 1xx are informational multiline
-            100..=199 => Self::MultilineData(code),
-            // Specific 2xx multiline responses:
+            // All 1xx are informational multiline; specific 2xx multiline responses:
             // 215=LIST, 220=ARTICLE, 221=HEAD, 222=BODY, 224=XOVER/XHDR,
-            // 225=HEADERS, 230=NEWNEWS, 231=NEWGROUPS, 282=XZHDR/XZVER,
-            // 288=XFEATURE COMPRESS GZIP
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => Self::MultilineData(code),
+            // 225=HEADERS, 230=NEWNEWS, 231=NEWGROUPS, 282=XZHDR/XZVER, 288=XFEATURE COMPRESS GZIP
+            100..=199 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => {
+                Self::MultilineData(code)
+            }
 
             // Everything else is a single-line response
             _ => Self::SingleLine(code),
@@ -266,11 +265,11 @@ impl StatusCode {
     #[inline]
     #[must_use]
     pub fn is_multiline(&self) -> bool {
-        match **self {
-            100..=199 => true, // All 1xx are multiline
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => true, // Specific 2xx codes
-            _ => false,
-        }
+        // All 1xx are multiline; specific 2xx multiline codes
+        matches!(
+            **self,
+            100..=199 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
+        )
     }
 }
 

@@ -92,11 +92,10 @@ async fn test_stat_precheck_first_response() -> Result<()> {
                                 stream.write_all(b"200 OK\r\n").await.ok();
                             }
                         }
-                        Ok(_) => break,
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             sleep(Duration::from_millis(10)).await;
                         }
-                        Err(_) => break,
+                        Ok(_) | Err(_) => break,
                     }
                 }
             });
@@ -203,11 +202,10 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
                                 stream.write_all(b"200 OK\r\n").await.ok();
                             }
                         }
-                        Ok(_) => break,
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             sleep(Duration::from_millis(10)).await;
                         }
-                        Err(_) => break,
+                        Ok(_) | Err(_) => break,
                     }
                 }
             });

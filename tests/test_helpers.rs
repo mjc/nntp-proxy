@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use nntp_proxy::NntpProxy;
-use nntp_proxy::config::{Config, Server};
+use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy, Server};
 use nntp_proxy::types::{MaxConnections, Port};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -221,7 +221,7 @@ impl MockNntpServer {
             let listener = match TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("Failed to bind mock server on {}: {}", addr, e);
+                    eprintln!("Failed to bind mock server on {addr}: {e}");
                     return;
                 }
             };
@@ -307,10 +307,10 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                     .unwrap()
             })
             .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: Default::default(),
-        client_auth: Default::default(),
+        proxy: Proxy::default(),
+        health_check: HealthCheck::default(),
+        cache: None,
+        client_auth: ClientAuth::default(),
     }
 }
 
@@ -653,10 +653,10 @@ pub fn create_test_config_with_auth(
     Config {
         servers: backend_ports
             .into_iter()
-            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
+            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{port}")))
             .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
+        proxy: Proxy::default(),
+        health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth {
             users: vec![UserCredentials {

@@ -478,8 +478,8 @@ impl BackendSelector {
 
     /// Select a backend for the given command using round-robin
     /// Returns the backend ID to use for this command
-    pub fn route_command(&self, _client_id: ClientId, _command: &str) -> Result<BackendId> {
-        self.route_command_with_availability(_client_id, _command, None)
+    pub fn route_command(&self, client_id: ClientId, command: &str) -> Result<BackendId> {
+        self.route_command_with_availability(client_id, command, None)
     }
 
     /// Select a backend for the given command, optionally filtering by availability

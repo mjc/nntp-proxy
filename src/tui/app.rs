@@ -239,7 +239,7 @@ impl TuiAppBuilder {
             view_mode: ViewMode::default(),
             show_details: false,
             system_monitor: SystemMonitor::new(),
-            system_stats: Default::default(),
+            system_stats: crate::tui::SystemStats::default(),
         }
     }
 }

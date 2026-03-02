@@ -415,7 +415,7 @@ mod tests {
 
         match status {
             TerminatorStatus::FoundAt(pos) => assert_eq!(pos, 3),
-            _ => panic!("Expected FoundAt(3), got {status:?}"),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(3), got {status:?}"),
         }
     }
 
@@ -680,7 +680,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 3, "Terminator ends at byte 3");
             }
-            _ => panic!("Expected FoundAt(3), got {status:?}"),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(3), got {status:?}"),
         }
     }
 
@@ -695,7 +695,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 4, "Split 1: terminator ends at byte 4");
             }
-            _ => panic!("Expected FoundAt(4), got {status:?}"),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(4), got {status:?}"),
         }
     }
 
@@ -710,7 +710,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 3, "Split 2: terminator ends at byte 3");
             }
-            _ => panic!("Expected FoundAt(3), got {status:?}"),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(3), got {status:?}"),
         }
     }
 
@@ -725,7 +725,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 2, "Split 3: terminator ends at byte 2");
             }
-            _ => panic!("Expected FoundAt(2), got {status:?}"),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(2), got {status:?}"),
         }
     }
 
@@ -740,7 +740,7 @@ mod tests {
             TerminatorStatus::FoundAt(pos) => {
                 assert_eq!(pos, 1, "Split 4: terminator ends at byte 1");
             }
-            _ => panic!("Expected FoundAt(1), got {status:?}"),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(1), got {status:?}"),
         }
     }
 

@@ -97,25 +97,25 @@ mod yenc_crate_benches {
 
     #[divan::bench(sample_count = 200)]
     fn yenc_decode_128k_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(131072);
+        let data = generate_yenc_data(131_072);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 200)]
     fn yenc_decode_256k_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(262144);
+        let data = generate_yenc_data(262_144);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 100)]
     fn yenc_decode_512k_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(524288);
+        let data = generate_yenc_data(524_288);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 50)]
     fn yenc_decode_1mb_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(1048576);
+        let data = generate_yenc_data(1_048_576);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
