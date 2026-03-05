@@ -148,6 +148,15 @@ impl ClientSession {
         }
 
         // Success - stream response
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command = %command.trim(),
+            first_chunk_bytes = cmd_response.bytes_read,
+            response = ?cmd_response.response,
+            is_multiline = cmd_response.is_multiline,
+            "Streaming backend response to client"
+        );
         let mut conn = conn;
         let stream_ctx = streaming::StreamContext {
             client_addr: self.client_addr,
@@ -215,6 +224,13 @@ impl ClientSession {
             }
         };
 
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            msg_id = ?msg_id,
+            bytes_written = bytes_written,
+            "Article streaming complete"
+        );
         self.record_response_metrics(
             backend_id,
             cmd_response.response,

@@ -134,6 +134,13 @@ impl ClientSession {
         let mut buffer = self.buffer_pool.acquire().await;
         state.leftover.clear();
         state.chunk_data.clear();
+        debug!(
+            client = %self.client_addr,
+            backend = ?backend_id,
+            batch_size = batch.len(),
+            first_msg_id = ?first_msg_id,
+            "Batch Phase 2: reading responses"
+        );
 
         for i in 0..batch.len() {
             let mut bcc = BatchConnContext {
@@ -215,8 +222,18 @@ impl ClientSession {
         state.chunk_data.clear();
         let from_leftover = !state.leftover.is_empty();
         let initial_chunk_len = if from_leftover {
+            let leftover_len = state.leftover.len();
+            let leftover_hex = crate::session::backend::format_hex_preview(state.leftover, 64);
             state.chunk_data.extend_from_slice(state.leftover);
             state.leftover.clear();
+            debug!(
+                client = %self.client_addr,
+                backend = ?backend_id,
+                idx = idx,
+                leftover_len = leftover_len,
+                leftover_hex = %leftover_hex,
+                "Batch response starting from leftover bytes"
+            );
             state.chunk_data.len()
         } else {
             match bcc.buffer.read_from(&mut **bcc.conn).await {
@@ -394,7 +411,18 @@ impl ClientSession {
             )
             .await
             {
-                Ok(bytes) => bytes,
+                Ok(bytes) => {
+                    debug!(
+                        client = %self.client_addr,
+                        backend = ?backend_id,
+                        idx = idx,
+                        bytes_written = bytes,
+                        new_leftover_len = state.leftover.len(),
+                        new_leftover_hex = %crate::session::backend::format_hex_preview(state.leftover, 64),
+                        "Batch multiline response streamed"
+                    );
+                    bytes
+                }
                 Err(crate::session::streaming::StreamingError::ClientDisconnect(io_err)) => {
                     // Client disconnected — backend was cleanly drained by the streaming layer.
                     return Ok(BatchStep::ClientDisconnect(io_err));

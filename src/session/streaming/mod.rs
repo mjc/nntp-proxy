@@ -423,6 +423,13 @@ where
     }
 
     // Phase 2: Multi-chunk response — acquire pooled buffers for double-buffering
+    debug!(
+        client = %ctx.client_addr,
+        backend = ?ctx.backend_id,
+        first_chunk_bytes = first_chunk.len(),
+        pipelined = leftover_out.is_some(),
+        "Multiline Phase 2: first chunk incomplete, streaming remaining chunks"
+    );
     let mut buffers = [
         ctx.buffer_pool.acquire().await,
         ctx.buffer_pool.acquire().await,
@@ -437,6 +444,14 @@ where
         })?;
 
         if n == 0 {
+            warn!(
+                client = %ctx.client_addr,
+                backend = ?ctx.backend_id,
+                bytes_before_eof = total_bytes,
+                first_chunk_bytes = first_chunk.len(),
+                pipelined = leftover_out.is_some(),
+                "Backend EOF before multiline terminator"
+            );
             return Err(StreamingError::BackendEof {
                 backend_id: ctx.backend_id,
                 bytes_received: total_bytes,
