@@ -428,31 +428,30 @@ impl ClientSession {
                     return Ok(BatchStep::ClientDisconnect(io_err));
                 }
                 Err(e) => {
-                    // Backend error or dirty disconnect (drain failed).
-                    // Connection in unknown state — caller must remove it.
+                    // Backend died mid-article after partial data was already written to the
+                    // client. Sending 430s for the remaining commands would inject garbage into
+                    // the middle of the in-progress article body — corrupting the protocol
+                    // stream and causing nzbget/sabnzbd to see BrokenPipe or hang waiting for
+                    // \r\n.\r\n that never arrives.
+                    //
+                    // The only safe recovery is to close the client connection; the download
+                    // client will retry the segment on a fresh connection.
+                    //
+                    // ConnectionGuard drop → remove_with_cooldown (must_remove_connection()
+                    // is always true for BackendEof / BackendDirty / Io).
                     warn!(
                         client = %self.client_addr,
                         backend = ?backend_id,
                         command_index = idx + 1,
                         total_commands = batch.len(),
                         error = %e,
-                        "Streaming error during pipelined batch, sending 430 for remaining commands"
+                        "Backend died mid-batch article after partial data sent to client; \
+                         closing client connection to prevent protocol corruption"
                     );
-                    // Commands 0..idx already handled; send 430 for commands[idx+1..].
-                    // Unconditional remove: StreamingError guarantees must_remove_connection().
-                    self.send_430s_from(
-                        batch,
-                        idx + 1,
-                        client_write,
-                        state.backend_to_client_bytes,
-                        state.client_to_backend_bytes,
-                        backend_id,
-                    )
-                    .await?;
-                    // All 430s sent; caller removes conn + completes guard.
-                    return Ok(BatchStep::BackendDead {
-                        from_idx: batch.len(),
-                    });
+                    return Ok(BatchStep::ClientDisconnect(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "backend error mid-batch; partial article already sent",
+                    )));
                 }
             }
         } else {
