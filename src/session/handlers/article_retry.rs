@@ -147,8 +147,11 @@ impl ClientSession {
             {
                 BatchStep::Continue => {}
                 BatchStep::ClientDisconnect(io_err) => {
-                    // Backend was cleanly drained; return connection to pool.
-                    let _ = conn.release();
+                    // Articles i+1..N-1 responses are still unread on the backend stream.
+                    // Releasing would return a dirty connection to the pool; the next request
+                    // would read stale response bytes as if they were a fresh response,
+                    // triggering Invalid → remove_with_cooldown cascade.
+                    // ConnectionGuard drop → remove_with_cooldown is the correct fate.
                     guard.complete();
                     return Err(SessionError::ClientDisconnect(io_err));
                 }

@@ -189,6 +189,27 @@ impl ClientSession {
                     // Client disconnect — backend was cleanly drained. Return to pool.
                     let _ = conn.release();
                 }
+                // BackendEof and BackendDirty mean Phase 1 already wrote the status line +
+                // partial body to the client. Retrying on the next backend would concatenate
+                // a second full article onto the partial first one, corrupting the stream.
+                // Signal ClientDisconnect so the session ends cleanly; nzbget/sabnzbd will
+                // retry the segment on their end.
+                if matches!(
+                    e,
+                    StreamingError::BackendEof { .. } | StreamingError::BackendDirty(_)
+                ) {
+                    warn!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command = %command.trim(),
+                        "Backend died mid-stream after partial data sent to client; \
+                         closing client connection to prevent protocol corruption"
+                    );
+                    return Err(SessionError::ClientDisconnect(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "backend closed mid-stream; partial article already sent",
+                    )));
+                }
                 // SessionError::from(StreamingError) preserves ClientDisconnect signal.
                 return Err(SessionError::from(e));
             }
