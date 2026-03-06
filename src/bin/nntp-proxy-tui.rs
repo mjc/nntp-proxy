@@ -123,7 +123,7 @@ fn launch_tui(
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
     (!args.no_tui)
         .then(|| {
-            println!("⏳ Building TUI dashboard...");
+            info!("Building TUI dashboard...");
             let mut builder = tui::TuiAppBuilder::new(
                 proxy.metrics().clone(),
                 proxy.router().clone(),
@@ -150,11 +150,11 @@ fn launch_tui(
             let tui_app = builder.build();
 
             tokio::spawn(async move {
-                println!("\n🚀 Initializing TUI dashboard...");
+                info!("Initializing TUI dashboard...");
                 if let Err(e) = tui::run_tui(tui_app, shutdown_tx, tui_shutdown_rx).await {
                     error!("TUI error: {}", e);
                 }
-                println!("✅ TUI closed. Shutting down proxy...\n");
+                info!("TUI closed. Shutting down proxy...");
                 info!("TUI exited, initiating shutdown");
             })
         })
