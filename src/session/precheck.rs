@@ -107,11 +107,31 @@ async fn execute_backend_query(
             // For multiline responses, read remaining data until we have the full terminator
             let mut response = buffer[..cmd_response.bytes_read].to_vec();
             if multiline && cmd_response.is_multiline {
-                // Read until we have the complete NNTP terminator \r\n.\r\n
-                while !crate::protocol::has_multiline_terminator(&response) {
-                    match conn.as_mut().read(buffer.as_mut_slice()).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => response.extend_from_slice(&buffer[..n]),
+                use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+                let mut tail = TailBuffer::default();
+                match tail.detect_terminator(&response) {
+                    TerminatorStatus::FoundAt(pos) => {
+                        // First chunk already contains terminator; drop any bytes after it
+                        response.truncate(pos);
+                    }
+                    TerminatorStatus::NotFound => {
+                        tail.update(&response);
+                        loop {
+                            match conn.as_mut().read(buffer.as_mut_slice()).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => match tail.detect_terminator(&buffer[..n]) {
+                                    TerminatorStatus::FoundAt(pos) => {
+                                        // Only extend up to terminator end; discard leftover bytes
+                                        response.extend_from_slice(&buffer[..pos]);
+                                        break;
+                                    }
+                                    TerminatorStatus::NotFound => {
+                                        tail.update(&buffer[..n]);
+                                        response.extend_from_slice(&buffer[..n]);
+                                    }
+                                },
+                            }
+                        }
                     }
                 }
             }
