@@ -144,13 +144,25 @@ pub async fn drain_connection_async(
     for _ in 0..MAX_DRAIN_ITERATIONS {
         match tokio::time::timeout(DRAIN_TIMEOUT, buffer.read_from(&mut *conn)).await {
             Ok(Ok(n)) if n > 0 => {
+                use crate::session::streaming::tail_buffer::TerminatorStatus;
                 let data = &buffer[..n];
-                // Check for terminator (handles mid-chunk and cross-boundary spanning)
-                if tail.detect_terminator(data).is_found() {
-                    debug!("Successfully drained connection - returning to pool");
-                    return; // Drop returns connection to pool
+                match tail.detect_terminator(data) {
+                    TerminatorStatus::FoundAt(pos) if pos == n => {
+                        // Terminator at exact end of chunk — no leftover bytes, connection clean
+                        debug!("Successfully drained connection - returning to pool");
+                        return; // Drop returns connection to pool
+                    }
+                    TerminatorStatus::FoundAt(_) => {
+                        // Terminator mid-chunk: leftover bytes already consumed from socket,
+                        // connection is desynchronized and cannot be safely reused
+                        debug!("Leftover bytes after terminator - removing from pool");
+                        remove_from_pool(conn);
+                        return;
+                    }
+                    TerminatorStatus::NotFound => {
+                        tail.update(data);
+                    }
                 }
-                tail.update(data);
             }
             _ => {
                 // Timeout, EOF, or error - connection broken
