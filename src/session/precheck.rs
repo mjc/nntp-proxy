@@ -106,12 +106,18 @@ async fn execute_backend_query(
 
             // For multiline responses, read remaining data until we have the full terminator
             let mut response = buffer[..cmd_response.bytes_read].to_vec();
+            let mut conn_desynced = false;
             if multiline && cmd_response.is_multiline {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
                 let mut tail = TailBuffer::default();
                 match tail.detect_terminator(&response) {
                     TerminatorStatus::FoundAt(pos) => {
-                        // First chunk already contains terminator; drop any bytes after it
+                        // Terminator found in first chunk; truncate to terminator end.
+                        // If pos < response.len(), extra bytes were already consumed from
+                        // the socket — connection is desynchronized and must not be reused.
+                        if pos < response.len() {
+                            conn_desynced = true;
+                        }
                         response.truncate(pos);
                     }
                     TerminatorStatus::NotFound => {
@@ -121,7 +127,11 @@ async fn execute_backend_query(
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => match tail.detect_terminator(&buffer[..n]) {
                                     TerminatorStatus::FoundAt(pos) => {
-                                        // Only extend up to terminator end; discard leftover bytes
+                                        // Only extend up to terminator end.
+                                        // If pos < n, leftover bytes already consumed from socket.
+                                        if pos < n {
+                                            conn_desynced = true;
+                                        }
                                         response.extend_from_slice(&buffer[..pos]);
                                         break;
                                     }
@@ -136,7 +146,7 @@ async fn execute_backend_query(
                 }
             }
 
-            Ok(match status_code.as_u16() {
+            let query_result = match status_code.as_u16() {
                 220..=223 => {
                     // Record successful command and timing
                     tracing::debug!(
@@ -162,7 +172,12 @@ async fn execute_backend_query(
                     QueryResult::Missing(backend_id)
                 }
                 _ => QueryResult::Error(backend_id),
-            })
+            };
+
+            if conn_desynced {
+                crate::pool::remove_from_pool(conn);
+            }
+            Ok(query_result)
         }
         Err(_) => {
             // Connection error - remove stale connection from pool
