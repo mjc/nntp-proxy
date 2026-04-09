@@ -106,18 +106,13 @@ async fn execute_backend_query(
 
             // For multiline responses, read remaining data until we have the full terminator
             let mut response = buffer[..cmd_response.bytes_read].to_vec();
-            let mut conn_desynced = false;
             if multiline && cmd_response.is_multiline {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
                 let mut tail = TailBuffer::default();
                 match tail.detect_terminator(&response) {
                     TerminatorStatus::FoundAt(pos) => {
-                        // Terminator found in first chunk; truncate to terminator end.
-                        // If pos < response.len(), extra bytes were already consumed from
-                        // the socket — connection is desynchronized and must not be reused.
-                        if pos < response.len() {
-                            conn_desynced = true;
-                        }
+                        // pos is the position after the terminator (terminator included).
+                        // Truncate response to pos; discard any bytes read past the terminator.
                         response.truncate(pos);
                     }
                     TerminatorStatus::NotFound => {
@@ -127,11 +122,7 @@ async fn execute_backend_query(
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => match tail.detect_terminator(&buffer[..n]) {
                                     TerminatorStatus::FoundAt(pos) => {
-                                        // Only extend up to terminator end.
-                                        // If pos < n, leftover bytes already consumed from socket.
-                                        if pos < n {
-                                            conn_desynced = true;
-                                        }
+                                        // pos is after the terminator (terminator included).
                                         response.extend_from_slice(&buffer[..pos]);
                                         break;
                                     }
@@ -174,9 +165,6 @@ async fn execute_backend_query(
                 _ => QueryResult::Error(backend_id),
             };
 
-            if conn_desynced {
-                crate::pool::remove_from_pool(conn);
-            }
             Ok(query_result)
         }
         Err(_) => {

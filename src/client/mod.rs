@@ -167,29 +167,20 @@ impl NntpClient {
         // Handle multiline responses - need to stream remaining data
         // For single-line responses, io_buffer already has correct initialized count
         if response.is_multiline {
-            let desynced = self
-                .handle_multiline_response(&mut conn, &mut io_buffer, response.bytes_read)
+            self.handle_multiline_response(&mut conn, &mut io_buffer, response.bytes_read)
                 .await?;
-            if desynced {
-                crate::pool::remove_from_pool(conn);
-                return Ok(io_buffer);
-            }
         }
 
         Ok(io_buffer)
     }
 
     /// Handle multiline response - stream until terminator, extending io_buffer in-place.
-    ///
-    /// Returns `true` if the connection is desynchronized (terminator found mid-chunk
-    /// with leftover bytes already consumed from socket). Caller must remove the
-    /// connection from pool in that case.
     async fn handle_multiline_response(
         &self,
         conn: &mut Object<TcpManager>,
         io_buffer: &mut PooledBuffer,
         first_chunk_size: usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 
         // Copy first chunk out before using io_buffer for subsequent reads
@@ -198,11 +189,9 @@ impl NntpClient {
 
         match tail.detect_terminator(&first_chunk) {
             TerminatorStatus::FoundAt(pos) => {
-                // Terminator found in first chunk. If pos < first_chunk_size, extra bytes
-                // were already read from the socket — connection is desynchronized.
-                let desynced = pos < first_chunk_size;
+                // pos is after the terminator (terminator included in [..pos]).
                 io_buffer.copy_from_slice(&first_chunk[..pos]);
-                return Ok(desynced);
+                return Ok(());
             }
             TerminatorStatus::NotFound => tail.update(&first_chunk),
         }
@@ -211,7 +200,6 @@ impl NntpClient {
         // Accumulate into Vec because articles can exceed io_buffer's fixed capacity.
         let mut accumulated = Vec::with_capacity(first_chunk_size * 2);
         accumulated.extend_from_slice(&first_chunk);
-        let mut desynced = false;
 
         while let Ok(n) = io_buffer.read_from(&mut **conn).await {
             if n == 0 {
@@ -224,11 +212,8 @@ impl NntpClient {
                 (tail.detect_terminator(chunk), n)
             };
             match status {
-                (TerminatorStatus::FoundAt(pos), n) => {
-                    // If pos < n, leftover bytes already consumed from socket.
-                    if pos < n {
-                        desynced = true;
-                    }
+                (TerminatorStatus::FoundAt(pos), _) => {
+                    // pos is after the terminator (terminator included in [..pos]).
                     accumulated.extend_from_slice(&io_buffer.as_mut_slice()[..pos]);
                     break;
                 }
@@ -242,7 +227,7 @@ impl NntpClient {
 
         // Copy accumulated data back to io_buffer (sets initialized count)
         io_buffer.copy_from_slice(&accumulated);
-        Ok(desynced)
+        Ok(())
     }
 
     /// Validate NNTP response status code
