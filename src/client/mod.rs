@@ -164,69 +164,73 @@ impl NntpClient {
         // Validate response - early return on errors
         Self::validate_response(&response)?;
 
-        // Handle multiline responses - need to stream remaining data
-        // For single-line responses, io_buffer already has correct initialized count
         if response.is_multiline {
-            self.handle_multiline_response(&mut conn, &mut io_buffer, response.bytes_read)
-                .await?;
+            // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
+            // capacity without panicking, returned to pool on drop.
+            let mut capture = self.buffer_pool.acquire_capture().await;
+            Self::drain_multiline_into(
+                &mut conn,
+                &mut io_buffer,
+                &mut capture,
+                response.bytes_read,
+            )
+            .await?;
+            Ok(capture)
+        } else {
+            Ok(io_buffer)
         }
-
-        Ok(io_buffer)
     }
 
-    /// Handle multiline response - stream until terminator, extending io_buffer in-place.
-    async fn handle_multiline_response(
-        &self,
+    /// Stream remaining multiline response data into `capture`.
+    ///
+    /// `io_buffer` is the scratch buffer for socket reads (fixed size).
+    /// `capture` is the accumulator returned to the caller (can grow).
+    async fn drain_multiline_into(
         conn: &mut Object<TcpManager>,
         io_buffer: &mut PooledBuffer,
+        capture: &mut PooledBuffer,
         first_chunk_size: usize,
     ) -> Result<()> {
         use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 
-        // Copy first chunk out before using io_buffer for subsequent reads
-        let first_chunk: Vec<u8> = io_buffer.as_mut_slice()[..first_chunk_size].to_vec();
+        let first_chunk = &io_buffer.as_mut_slice()[..first_chunk_size];
         let mut tail = TailBuffer::default();
 
-        match tail.detect_terminator(&first_chunk) {
+        match tail.detect_terminator(first_chunk) {
             TerminatorStatus::FoundAt(pos) => {
-                // pos is after the terminator (terminator included in [..pos]).
-                io_buffer.copy_from_slice(&first_chunk[..pos]);
+                // pos is after the terminator (terminator included in [..pos])
+                capture.extend_from_slice(&first_chunk[..pos]);
                 return Ok(());
             }
-            TerminatorStatus::NotFound => tail.update(&first_chunk),
+            TerminatorStatus::NotFound => {
+                tail.update(first_chunk);
+                capture.extend_from_slice(first_chunk);
+            }
         }
-
-        // Stream remaining chunks until terminator.
-        // Accumulate into Vec because articles can exceed io_buffer's fixed capacity.
-        let mut accumulated = Vec::with_capacity(first_chunk_size * 2);
-        accumulated.extend_from_slice(&first_chunk);
 
         while let Ok(n) = io_buffer.read_from(&mut **conn).await {
             if n == 0 {
                 break; // EOF
             }
-
-            // NLL: chunk borrow ends after match block, before next read_from call
-            let status = {
+            // NLL: chunk borrow ends before next read_from call
+            let found_at = {
                 let chunk = &io_buffer.as_mut_slice()[..n];
-                (tail.detect_terminator(chunk), n)
+                tail.detect_terminator(chunk)
             };
-            match status {
-                (TerminatorStatus::FoundAt(pos), _) => {
-                    // pos is after the terminator (terminator included in [..pos]).
-                    accumulated.extend_from_slice(&io_buffer.as_mut_slice()[..pos]);
+            match found_at {
+                TerminatorStatus::FoundAt(pos) => {
+                    // pos is after the terminator (terminator included in [..pos])
+                    capture.extend_from_slice(&io_buffer.as_mut_slice()[..pos]);
                     break;
                 }
-                (TerminatorStatus::NotFound, n) => {
+                TerminatorStatus::NotFound => {
                     let chunk = &io_buffer.as_mut_slice()[..n];
                     tail.update(chunk);
-                    accumulated.extend_from_slice(chunk);
+                    capture.extend_from_slice(chunk);
                 }
             }
         }
 
-        // Copy accumulated data back to io_buffer (sets initialized count)
-        io_buffer.copy_from_slice(&accumulated);
         Ok(())
     }
 
