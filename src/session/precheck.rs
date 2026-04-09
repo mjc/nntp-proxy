@@ -111,8 +111,7 @@ async fn execute_backend_query(
                 let mut tail = TailBuffer::default();
                 match tail.detect_terminator(&response) {
                     TerminatorStatus::FoundAt(pos) => {
-                        // pos is the position after the terminator (terminator included).
-                        // Truncate response to pos; discard any bytes read past the terminator.
+                        // pos is after the terminator (terminator included in [..pos])
                         response.truncate(pos);
                     }
                     TerminatorStatus::NotFound => {
@@ -122,7 +121,6 @@ async fn execute_backend_query(
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => match tail.detect_terminator(&buffer[..n]) {
                                     TerminatorStatus::FoundAt(pos) => {
-                                        // pos is after the terminator (terminator included).
                                         response.extend_from_slice(&buffer[..pos]);
                                         break;
                                     }
