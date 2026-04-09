@@ -164,9 +164,12 @@ impl NntpProxy {
 
         // Flush cache writes to disk before shutting down
         // With WriteOnInsertion, writes are enqueued async - close() waits for completion
+        // Use a timeout: foyer's close() can hang if the runtime is winding down
         info!("Flushing disk cache writes...");
-        if let Err(e) = self.cache.close().await {
-            tracing::warn!("Error closing cache: {}", e);
+        match tokio::time::timeout(std::time::Duration::from_secs(3), self.cache.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("Error closing cache: {}", e),
+            Err(_) => tracing::warn!("Cache close timed out after 3s, forcing shutdown"),
         }
 
         info!("Shutting down connection pools...");

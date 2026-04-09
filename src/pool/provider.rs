@@ -721,7 +721,12 @@ impl DeadpoolConnectionProvider {
         for _ in 0..status.available {
             if let Ok(conn_obj) = self.pool.timeout_get(&timeouts).await {
                 let mut conn = Object::take(conn_obj);
-                let _ = conn.write_all(b"QUIT\r\n").await;
+                // Timeout the write: a half-closed backend connection can block indefinitely
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    conn.write_all(b"QUIT\r\n"),
+                )
+                .await;
             } else {
                 break;
             }
