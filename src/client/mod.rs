@@ -43,9 +43,6 @@ use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
 use crate::protocol::{article_by_msgid, body_by_msgid, head_by_msgid, stat_by_msgid};
 use crate::session::backend::send_command;
 
-/// NNTP multiline terminator
-const TERMINATOR: &[u8] = b"\r\n.\r\n";
-
 /// Standalone NNTP client for fetching articles
 ///
 /// Zero-allocation design using caller-provided buffer pool.
@@ -184,10 +181,14 @@ impl NntpClient {
         io_buffer: &mut PooledBuffer,
         first_chunk_size: usize,
     ) -> Result<()> {
-        // Early return if first chunk contains terminator
+        use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+
         let first_chunk = &io_buffer.as_mut_slice()[..first_chunk_size];
-        if first_chunk.ends_with(TERMINATOR) {
-            return Ok(());
+        let mut tail = TailBuffer::default();
+
+        match tail.detect_terminator(first_chunk) {
+            TerminatorStatus::FoundAt(_) => return Ok(()),
+            TerminatorStatus::NotFound => tail.update(first_chunk),
         }
 
         // Stream remaining chunks until terminator
@@ -201,10 +202,16 @@ impl NntpClient {
                 break; // EOF
             }
 
-            accumulated.extend_from_slice(&io_buffer.as_mut_slice()[..n]);
-
-            if accumulated.ends_with(TERMINATOR) {
-                break;
+            let chunk = &io_buffer.as_mut_slice()[..n];
+            match tail.detect_terminator(chunk) {
+                TerminatorStatus::FoundAt(pos) => {
+                    accumulated.extend_from_slice(&chunk[..pos]);
+                    break;
+                }
+                TerminatorStatus::NotFound => {
+                    tail.update(chunk);
+                    accumulated.extend_from_slice(chunk);
+                }
             }
         }
 
@@ -233,15 +240,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_terminator_detection() {
-        let with_term = b"content\r\n.\r\n";
-        let without_term = b"content\r\n";
-
-        assert!(with_term.ends_with(TERMINATOR));
-        assert!(!without_term.ends_with(TERMINATOR));
-    }
-
-    #[test]
     fn test_parse_stat_response_success() {
         use crate::protocol::StatusCode;
         // Article exists (223)
@@ -261,11 +259,5 @@ mod tests {
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"500")).is_err());
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"200")).is_err());
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400")).is_err());
-    }
-
-    #[test]
-    fn test_terminator_constant() {
-        assert_eq!(TERMINATOR, b"\r\n.\r\n");
-        assert_eq!(TERMINATOR.len(), 5);
     }
 }
