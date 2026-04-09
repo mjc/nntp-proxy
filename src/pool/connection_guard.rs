@@ -345,6 +345,63 @@ mod tests {
         }
     }
 
+    /// Verify that a mid-chunk terminator (pos < n) is treated as a desynchronized
+    /// connection, not a clean one. This guards the pool-removal branch added in
+    /// drain_connection_async: FoundAt(pos) with leftover bytes must remove from pool.
+    #[test]
+    fn test_drain_mid_chunk_terminator_is_desynced() {
+        use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+
+        // Chunk contains the terminator mid-way, with extra bytes after it.
+        // Simulates a backend that sent two pipelined responses in one TCP read.
+        let chunk = b"220 Article follows\r\nBody\r\n.\r\nEXTRA DATA FROM NEXT RESPONSE";
+        let n = chunk.len();
+
+        let mut tail = TailBuffer::default();
+        let status = tail.detect_terminator(chunk);
+
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert!(
+                    pos < n,
+                    "Terminator should be mid-chunk (pos={} < n={})",
+                    pos,
+                    n
+                );
+                // This is the condition that triggers remove_from_pool in
+                // drain_connection_async — connection is desynchronized
+            }
+            other => panic!("Expected FoundAt, got {:?}", other),
+        }
+    }
+
+    /// Verify that a terminator at the exact end of a chunk (pos == n) is treated
+    /// as a clean connection that can safely be returned to the pool.
+    #[test]
+    fn test_drain_end_of_chunk_terminator_is_clean() {
+        use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+
+        // Chunk ends exactly with the terminator — no leftover bytes.
+        let chunk = b"220 Article follows\r\nBody\r\n.\r\n";
+        let n = chunk.len();
+
+        let mut tail = TailBuffer::default();
+        let status = tail.detect_terminator(chunk);
+
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(
+                    pos, n,
+                    "Terminator at end of chunk should have pos == n ({} == {})",
+                    pos, n
+                );
+                // This is the condition that allows returning to pool in
+                // drain_connection_async — connection is clean
+            }
+            other => panic!("Expected FoundAt, got {:?}", other),
+        }
+    }
+
     /// Verify that TailBuffer detects terminators that span chunk boundaries,
     /// which the old `windows()` approach in `drain_connection_async` would miss.
     #[test]

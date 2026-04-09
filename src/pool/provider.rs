@@ -716,14 +716,14 @@ impl DeadpoolConnectionProvider {
 
         // Send QUIT to idle connections with minimal timeout
         let mut timeouts = managed::Timeouts::new();
-        timeouts.wait = Some(std::time::Duration::from_millis(1));
+        timeouts.wait = Some(crate::constants::timeout::SHUTDOWN_POOL_GET);
 
         for _ in 0..status.available {
             if let Ok(conn_obj) = self.pool.timeout_get(&timeouts).await {
                 let mut conn = Object::take(conn_obj);
                 // Timeout the write: a half-closed backend connection can block indefinitely
                 let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
+                    crate::constants::timeout::SHUTDOWN_QUIT_WRITE,
                     conn.write_all(b"QUIT\r\n"),
                 )
                 .await;
