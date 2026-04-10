@@ -327,16 +327,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_stream_tcp_access() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let std_stream = std::net::TcpStream::connect(addr).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client_handle.await.unwrap();
 
-        let tokio_stream = TcpStream::from_std(server_stream).unwrap();
-        let _client_stream = TcpStream::from_std(std_stream).unwrap();
-
-        let mut conn_stream = ConnectionStream::plain(tokio_stream);
+        let mut conn_stream = ConnectionStream::plain(server_stream);
 
         assert!(conn_stream.is_unencrypted());
         assert!(conn_stream.as_tcp_stream().is_some());
@@ -350,16 +348,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_plain_connection_type_checks() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let std_stream = std::net::TcpStream::connect(addr).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
 
-        let stream = TcpStream::from_std(server_stream).unwrap();
-        let _client = TcpStream::from_std(std_stream).unwrap();
-
-        let conn = ConnectionStream::plain(stream);
+        let conn = ConnectionStream::plain(server_stream);
 
         assert_eq!(conn.connection_type(), "TCP");
         assert!(conn.is_unencrypted());
@@ -369,16 +365,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_access_methods_work() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let std_stream = std::net::TcpStream::connect(addr).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
 
-        let stream = TcpStream::from_std(server_stream).unwrap();
-        let _client = TcpStream::from_std(std_stream).unwrap();
-
-        let conn = ConnectionStream::plain(stream);
+        let conn = ConnectionStream::plain(server_stream);
 
         assert!(conn.as_tcp_stream().is_some());
         assert!(conn.as_tls_stream().is_none());
@@ -386,16 +380,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_mutable_tcp_access_methods_work() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let std_stream = std::net::TcpStream::connect(addr).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
 
-        let stream = TcpStream::from_std(server_stream).unwrap();
-        let _client = TcpStream::from_std(std_stream).unwrap();
-
-        let mut conn = ConnectionStream::plain(stream);
+        let mut conn = ConnectionStream::plain(server_stream);
 
         assert!(conn.as_tcp_stream_mut().is_some());
         assert!(conn.as_tls_stream_mut().is_none());
@@ -406,16 +398,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_constructor_creates_plain_variant() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let std_stream = std::net::TcpStream::connect(addr).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
 
-        let stream = TcpStream::from_std(server_stream).unwrap();
-        let _client = TcpStream::from_std(std_stream).unwrap();
-
-        let plain_conn = ConnectionStream::plain(stream);
+        let plain_conn = ConnectionStream::plain(server_stream);
 
         assert_eq!(plain_conn.connection_type(), "TCP");
         assert!(plain_conn.is_unencrypted());
@@ -447,18 +437,16 @@ mod tests {
         assert_eq!(&buf, b"socket");
     }
 
-    #[test]
-    fn test_stash_leftover_rejects_oversize() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    #[tokio::test]
+    async fn test_stash_leftover_rejects_oversize() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let std_stream = std::net::TcpStream::connect(addr).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
 
-        let stream = TcpStream::from_std(server_stream).unwrap();
-        let _client = TcpStream::from_std(std_stream).unwrap();
-
-        let mut conn = ConnectionStream::plain(stream);
+        let mut conn = ConnectionStream::plain(server_stream);
         let oversized = vec![b'x'; MAX_LEFTOVER_BYTES + 1];
         assert!(conn.stash_leftover(&oversized).is_err());
     }

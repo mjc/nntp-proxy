@@ -385,10 +385,14 @@ pub async fn setup_proxy_with_backends(
 ) -> Result<(u16, Vec<u16>, Vec<AbortHandle>)> {
     use nntp_proxy::NntpProxy;
 
-    // Allocate ports using helper
+    // Bind backend listeners up front so the ports cannot be stolen between
+    // "pick a port" and "start the mock server".
+    let mut backend_listeners = Vec::new();
     let mut backend_ports = Vec::new();
     for _ in 0..backend_configs.len() {
-        backend_ports.push(get_available_port().await?);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        backend_ports.push(listener.local_addr()?.port());
+        backend_listeners.push(listener);
     }
 
     let proxy_port = get_available_port().await?;
@@ -396,21 +400,56 @@ pub async fn setup_proxy_with_backends(
 
     // Start mock backends
     let mut mock_handles = Vec::new();
-    for (i, (name, has_article)) in backend_configs.iter().enumerate() {
-        let port = backend_ports[i];
-
+    for ((name, has_article), listener) in backend_configs.iter().zip(backend_listeners) {
         let response = if *has_article {
             "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
         } else {
             "430 No such article\r\n"
         };
 
-        let handle = MockNntpServer::new(port)
-            .with_name(*name)
-            .on_command("DATE", "111 20251203120000\r\n")
-            .on_command("QUIT", "205 Goodbye\r\n")
-            .on_command("ARTICLE", response) // ARTICLE command (any message-ID)
-            .spawn();
+        let name = (*name).to_string();
+        let response = response.to_string();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let name = name.clone();
+                let response = response.clone();
+
+                drop(tokio::spawn(async move {
+                    let greeting = format!("200 {} Ready\r\n", name);
+                    if stream.write_all(greeting.as_bytes()).await.is_err() {
+                        return;
+                    }
+
+                    let mut buffer = [0; 1024];
+                    loop {
+                        let n = match stream.read(&mut buffer).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+
+                        let cmd_str = String::from_utf8_lossy(&buffer[..n]);
+                        let cmd_upper = cmd_str.trim().to_uppercase();
+
+                        if cmd_upper.starts_with("QUIT") {
+                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                            break;
+                        }
+
+                        let reply = if cmd_upper.starts_with("DATE") {
+                            "111 20251203120000\r\n"
+                        } else if cmd_upper.starts_with("ARTICLE") {
+                            &response
+                        } else {
+                            "200 OK\r\n"
+                        };
+
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    }
+                }));
+            }
+        })
+        .abort_handle();
         mock_handles.push(handle);
     }
 

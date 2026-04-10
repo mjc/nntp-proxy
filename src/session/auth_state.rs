@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 /// // After authentication
 /// auth_state.mark_authenticated("user@example.com");
 /// assert!(auth_state.is_authenticated());
-/// assert_eq!(auth_state.username().unwrap().as_ref(), "user@example.com");
+/// assert_eq!(auth_state.username().unwrap(), "user@example.com");
 /// ```
 #[derive(Debug)]
 pub struct AuthState {
@@ -112,7 +112,7 @@ impl AuthState {
     /// auth_state.mark_authenticated("bob");
     ///
     /// assert!(auth_state.is_authenticated());
-    /// assert_eq!(auth_state.username().unwrap().as_ref(), "bob");
+    /// assert_eq!(auth_state.username().unwrap(), "bob");
     /// ```
     #[inline]
     pub fn mark_authenticated(&self, username: impl Into<Arc<str>>) {
@@ -138,11 +138,11 @@ impl AuthState {
     ///
     /// auth_state.mark_authenticated("charlie");
     /// let username = auth_state.username().unwrap();
-    /// assert_eq!(username.as_ref(), "charlie");
+    /// assert_eq!(username, "charlie");
     ///
     /// // Cloning is cheap (Arc reference count bump)
     /// let username2 = username.clone();
-    /// assert_eq!(username2.as_ref(), "charlie");
+    /// assert_eq!(username2, "charlie");
     /// ```
     #[inline]
     #[must_use]

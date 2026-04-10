@@ -12,7 +12,7 @@
 //! use nntp_proxy::client::NntpClient;
 //! use nntp_proxy::pool::{BufferPool, DeadpoolConnectionProvider};
 //! use nntp_proxy::protocol::Article;
-//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::types::{BufferSize, MessageId};
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! // One buffer pool shared across all clients
@@ -23,9 +23,9 @@
 //! )?;
 //! let client = NntpClient::new(conn_pool, buffer_pool.clone());
 //!
-//! # let message_ids: Vec<&str> = vec![];
+//! # let message_ids: Vec<MessageId<'static>> = vec![];
 //! for msg_id in message_ids {
-//!     let buffer = client.fetch_body(msg_id).await?;
+//!     let buffer = client.fetch_body(&msg_id).await?;
 //!     let article = Article::parse(&buffer, true)?;
 //!     if let Some(decoded) = article.decode() {
 //!         process(&decoded);
