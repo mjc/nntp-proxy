@@ -215,9 +215,13 @@ impl NntpClient {
             }
         }
 
-        while let Ok(n) = io_buffer.read_from(conn).await {
+        loop {
+            let n = io_buffer
+                .read_from(conn)
+                .await
+                .context("Failed to read multiline response from backend")?;
             if n == 0 {
-                break; // EOF
+                anyhow::bail!("Backend closed connection before multiline terminator");
             }
             // NLL: chunk borrow ends before next read_from call
             let found_at = {
@@ -231,7 +235,7 @@ impl NntpClient {
                     if pos < n {
                         conn.stash_leftover(&io_buffer.as_mut_slice()[pos..n])?;
                     }
-                    break;
+                    return Ok(());
                 }
                 TerminatorStatus::NotFound => {
                     let chunk = &io_buffer.as_mut_slice()[..n];
@@ -240,8 +244,6 @@ impl NntpClient {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Validate NNTP response status code
@@ -317,6 +319,36 @@ mod tests {
                         let _ = stream.write_all(article_data).await;
                         // Keep alive so recycle's try_read sees WouldBlock
                         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    });
+                }
+            }
+        });
+
+        (addr, notify)
+    }
+
+    async fn spawn_truncated_test_server(
+        article_prefix: &'static [u8],
+    ) -> (std::net::SocketAddr, std::sync::Arc<tokio::sync::Notify>) {
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notify = Arc::new(Notify::new());
+        let n = Arc::clone(&notify);
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let wake = Arc::clone(&n);
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        wake.notified().await;
+                        let _ = stream.write_all(article_prefix).await;
+                        let _ = stream.shutdown().await;
                     });
                 }
             }
@@ -403,5 +435,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(&capture[..], article as &[u8]);
+    }
+
+    #[tokio::test]
+    async fn test_drain_multiline_into_errors_on_truncated_response() {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+
+        let article_prefix = b"220 body follows\r\npartial article";
+        let (addr, notify) = spawn_truncated_test_server(article_prefix).await;
+        let pool = make_test_pool(addr).await;
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 4);
+
+        let mut conn = pool.get().await.unwrap();
+        notify.notify_one();
+
+        let mut io_buffer = buffer_pool.acquire().await;
+        let mut capture = buffer_pool.acquire_capture().await;
+
+        let err = NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Backend closed connection before multiline terminator"),
+            "unexpected error: {err:#}"
+        );
     }
 }
