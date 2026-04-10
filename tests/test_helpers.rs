@@ -404,8 +404,8 @@ pub async fn setup_proxy_with_backends(
         backend_listeners.push(listener);
     }
 
-    let proxy_port = get_available_port().await?;
-    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port)).await?;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy_listener.local_addr()?.port();
 
     // Start mock backends
     let mut mock_handles = Vec::new();
@@ -429,6 +429,7 @@ pub async fn setup_proxy_with_backends(
                         return;
                     }
 
+                    let mut pending = bytes::BytesMut::new();
                     let mut buffer = [0; 1024];
                     loop {
                         let n = match stream.read(&mut buffer).await {
@@ -437,23 +438,28 @@ pub async fn setup_proxy_with_backends(
                             Err(_) => break,
                         };
 
-                        let cmd_str = String::from_utf8_lossy(&buffer[..n]);
-                        let cmd_upper = cmd_str.trim().to_uppercase();
+                        pending.extend_from_slice(&buffer[..n]);
 
-                        if cmd_upper.starts_with("QUIT") {
-                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                            break;
+                        while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
+                            let line = pending.split_to(line_end + 2);
+                            let cmd_str = String::from_utf8_lossy(&line);
+                            let cmd_upper = cmd_str.trim().to_uppercase();
+
+                            if cmd_upper.starts_with("QUIT") {
+                                let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                                return;
+                            }
+
+                            let reply = if cmd_upper.starts_with("DATE") {
+                                "111 20251203120000\r\n"
+                            } else if cmd_upper.starts_with("ARTICLE") {
+                                &response
+                            } else {
+                                "200 OK\r\n"
+                            };
+
+                            let _ = stream.write_all(reply.as_bytes()).await;
                         }
-
-                        let reply = if cmd_upper.starts_with("DATE") {
-                            "111 20251203120000\r\n"
-                        } else if cmd_upper.starts_with("ARTICLE") {
-                            &response
-                        } else {
-                            "200 OK\r\n"
-                        };
-
-                        let _ = stream.write_all(reply.as_bytes()).await;
                     }
                 }));
             }
@@ -810,12 +816,27 @@ mod tests {
 
         stream.write_all(b"DATE\r\nHELP\r\n").await.unwrap();
 
-        let n = stream.read(&mut buffer).await.unwrap();
-        let response = String::from_utf8_lossy(&buffer[..n]);
-        assert!(response.contains("111 20260410235959"));
+        let mut response_bytes = Vec::new();
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                .await
+                .expect("timed out waiting for mock server responses")
+                .unwrap();
 
-        let n = stream.read(&mut buffer).await.unwrap();
-        let response = String::from_utf8_lossy(&buffer[..n]);
+            assert!(
+                n > 0,
+                "mock server closed connection before sending both responses"
+            );
+
+            response_bytes.extend_from_slice(&buffer[..n]);
+            let response = String::from_utf8_lossy(&response_bytes);
+            if response.contains("111 20260410235959") && response.contains("100 help follows") {
+                break;
+            }
+        }
+
+        let response = String::from_utf8_lossy(&response_bytes);
+        assert!(response.contains("111 20260410235959"));
         assert!(response.contains("100 help follows"));
     }
 
