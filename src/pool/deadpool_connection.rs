@@ -127,9 +127,9 @@ impl TcpManager {
                     backend: self.name.clone(),
                     source: e.into(),
                 })?;
-            Ok(ConnectionStream::Tls(Box::new(tls_stream)))
+            Ok(ConnectionStream::tls(tls_stream))
         } else {
-            Ok(ConnectionStream::Plain(tcp_stream))
+            Ok(ConnectionStream::plain(tcp_stream))
         }
     }
 }
@@ -307,8 +307,6 @@ impl managed::Manager for TcpManager {
     type Error = ConnectionError;
 
     async fn create(&self) -> Result<ConnectionStream, ConnectionError> {
-        use crate::compression::DecompressStream;
-
         let mut stream = self.create_optimized_stream().await?;
         let mut buffer = [0u8; 4096];
 
@@ -317,18 +315,7 @@ impl managed::Manager for TcpManager {
 
         if self.negotiate_compression(&mut stream, &mut buffer).await? {
             let level = self.compress_level.unwrap_or(1);
-            stream = match stream {
-                ConnectionStream::Plain(tcp) => ConnectionStream::CompressedPlain(Box::new(
-                    DecompressStream::with_level(tcp, level),
-                )),
-                ConnectionStream::Tls(tls) => ConnectionStream::CompressedTls(Box::new(
-                    DecompressStream::with_level(*tls, level),
-                )),
-                // create_optimized_stream() only returns Plain or Tls
-                ConnectionStream::CompressedPlain(_) | ConnectionStream::CompressedTls(_) => {
-                    unreachable!("fresh connections are never already compressed")
-                }
-            };
+            stream = stream.into_compressed(level);
         }
 
         Ok(stream)

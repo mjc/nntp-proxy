@@ -52,7 +52,6 @@ pub async fn backend_pipeline_worker(
     );
 
     // Hoist buffers to worker lifetime (reused across batches)
-    let mut leftover = bytes::BytesMut::new();
     let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
     loop {
@@ -66,7 +65,6 @@ pub async fn backend_pipeline_worker(
         );
 
         // Clear buffers for this batch
-        leftover.clear();
         result_buf.clear();
 
         // Acquire a connection from the pool
@@ -90,7 +88,6 @@ pub async fn backend_pipeline_worker(
             batch,
             &metrics,
             &buffer_pool,
-            &mut leftover,
             &mut result_buf,
         )
         .await;
@@ -116,7 +113,6 @@ async fn execute_pipeline_batch(
     batch: Vec<QueuedRequest>,
     metrics: &MetricsCollector,
     buffer_pool: &BufferPool,
-    leftover: &mut bytes::BytesMut,
     result_buf: &mut bytes::BytesMut,
 ) -> bool {
     let batch_len = batch.len();
@@ -157,7 +153,7 @@ async fn execute_pipeline_batch(
     let mut batch_iter = batch.into_iter().enumerate();
     while let Some((i, req)) = batch_iter.next() {
         // Read the response for this command
-        match read_full_response(&mut buffer, conn, leftover, result_buf).await {
+        match read_full_response(&mut buffer, conn, result_buf).await {
             Ok((data, status_code)) => {
                 metrics.record_command(backend_id);
                 let data_len = data.len();
@@ -178,7 +174,7 @@ async fn execute_pipeline_batch(
                     batch_size = batch_len,
                     command = %req.command.trim(),
                     error = %e,
-                    leftover_bytes = leftover.len(),
+                    leftover_bytes = conn.leftover_len(),
                     "Pipeline worker read failed"
                 );
 
@@ -211,7 +207,7 @@ async fn execute_pipeline_batch(
     //
     // Explicit health check: Verify leftover is reasonable
     debug_assert!(
-        leftover.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
+        conn.leftover_len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
         "Leftover buffer should never exceed MAX_LEFTOVER_BYTES after successful batch"
     );
 
@@ -221,13 +217,11 @@ async fn execute_pipeline_batch(
 /// Read a complete NNTP response (status line + multiline body if applicable).
 ///
 /// Returns the full response as `Bytes` and the parsed status code.
-/// If leftover bytes from a previous response are provided, they are processed first.
 ///
 /// `result_buf` is cleared and reused for each response to avoid per-response allocations.
 async fn read_full_response(
     buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
-    leftover: &mut bytes::BytesMut,
     result_buf: &mut bytes::BytesMut,
 ) -> Result<(bytes::Bytes, crate::protocol::StatusCode)> {
     use crate::session::streaming::tail_buffer::TailBuffer;
@@ -236,16 +230,11 @@ async fn read_full_response(
     result_buf.clear(); // Reuse buffer from previous response
 
     // Get first data directly into result_buf (no intermediate Vec)
-    if !leftover.is_empty() {
-        result_buf.extend_from_slice(leftover);
-        leftover.clear();
-    } else {
-        let n = buffer.read_from(conn).await?;
-        if n == 0 {
-            anyhow::bail!("Backend connection closed unexpectedly");
-        }
-        result_buf.extend_from_slice(&buffer[..n]);
+    let n = buffer.read_from(conn).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
     }
+    result_buf.extend_from_slice(&buffer[..n]);
 
     // H5: If leftover was too short to validate, read more data
     if result_buf.len() < crate::protocol::MIN_RESPONSE_LENGTH {
@@ -282,7 +271,7 @@ async fn read_full_response(
                     crate::constants::buffer::MAX_LEFTOVER_BYTES,
                     remainder.len()
                 );
-                leftover.extend_from_slice(remainder);
+                conn.stash_leftover(remainder)?;
                 result_buf.truncate(end);
             }
         }
@@ -302,7 +291,7 @@ async fn read_full_response(
             crate::constants::buffer::MAX_LEFTOVER_BYTES,
             remainder.len()
         );
-        leftover.extend_from_slice(remainder);
+        conn.stash_leftover(remainder)?;
         result_buf.truncate(write_len);
     }
 
@@ -333,7 +322,7 @@ async fn read_full_response(
                         crate::constants::buffer::MAX_LEFTOVER_BYTES,
                         remainder.len()
                     );
-                    leftover.extend_from_slice(remainder);
+                    conn.stash_leftover(remainder)?;
                 }
                 break;
             }
@@ -376,7 +365,7 @@ mod tests {
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        ConnectionStream::Plain(stream)
+        ConnectionStream::plain(stream)
     }
 
     /// Helper: create a TCP pair where the server writes `chunks` with delays.
@@ -396,7 +385,7 @@ mod tests {
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        ConnectionStream::Plain(stream)
+        ConnectionStream::plain(stream)
     }
 
     // ─── read_full_response unit tests ───────────────────────────────────────
@@ -405,46 +394,41 @@ mod tests {
     async fn test_read_full_response_single_line() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
 
-        let (data, status) =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
-                .await
-                .expect("should parse single-line response");
+        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+            .await
+            .expect("should parse single-line response");
 
         assert_eq!(status.as_u16(), 430);
         assert_eq!(&data[..], b"430 No such article\r\n");
-        assert!(leftover.is_empty());
+        assert!(!conn.has_leftover());
     }
 
     #[tokio::test]
     async fn test_read_full_response_multiline() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
         let mut conn = mock_backend_conn(response).await;
 
-        let (data, status) =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
-                .await
-                .expect("should parse multiline response");
+        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+            .await
+            .expect("should parse multiline response");
 
         assert_eq!(status.as_u16(), 220);
         assert_eq!(&data[..], &response[..]);
-        assert!(leftover.is_empty());
+        assert!(!conn.has_leftover());
     }
 
     #[tokio::test]
     async fn test_read_full_response_multiline_across_chunks() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         // Split the terminator \r\n.\r\n across two chunks
@@ -453,24 +437,22 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
 
-        let (data, status) =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
-                .await
-                .expect("should detect terminator across chunks");
+        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+            .await
+            .expect("should detect terminator across chunks");
 
         assert_eq!(status.as_u16(), 220);
         assert!(
             data.ends_with(b"\r\n.\r\n"),
             "response should end with terminator"
         );
-        assert!(leftover.is_empty());
+        assert!(!conn.has_leftover());
     }
 
     #[tokio::test]
     async fn test_read_full_response_with_leftover() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         // Two responses packed together
@@ -478,23 +460,21 @@ mod tests {
         let mut conn = mock_backend_conn(packed).await;
 
         // First read should get the multiline response and save leftover
-        let (data1, status1) =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
-                .await
-                .expect("should parse first response");
+        let (data1, status1) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+            .await
+            .expect("should parse first response");
 
         assert_eq!(status1.as_u16(), 220);
         assert!(data1.ends_with(b"\r\n.\r\n"));
         assert!(
-            !leftover.is_empty(),
+            conn.has_leftover(),
             "should have leftover from second response"
         );
 
         // Second read should consume leftover and return the 430
-        let (data2, status2) =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
-                .await
-                .expect("should parse second response from leftover");
+        let (data2, status2) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+            .await
+            .expect("should parse second response from leftover");
 
         assert_eq!(status2.as_u16(), 430);
         assert_eq!(&data2[..], b"430 No such article\r\n");
@@ -504,14 +484,12 @@ mod tests {
     async fn test_read_full_response_eof_mid_stream() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         // Multiline response without terminator — server disconnects
         let mut conn = mock_backend_conn(b"220 0 <a@b> article\r\nBody line\r\n").await;
 
-        let result =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
         assert!(result.is_err(), "EOF before terminator should be an error");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -524,13 +502,11 @@ mod tests {
     async fn test_read_full_response_invalid_status() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         let mut conn = mock_backend_conn(b"garbage data here\r\n").await;
 
-        let result =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
         assert!(result.is_err(), "Invalid status code should be an error");
     }
 
@@ -540,16 +516,14 @@ mod tests {
         let mut buffer = pool.acquire().await;
         let mut result_buf = BytesMut::with_capacity(4096);
 
-        // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
-        let mut leftover = BytesMut::from(&b"43"[..]);
-
         // Backend will provide the rest of the response
         let mut conn = mock_backend_conn(b"0 No such article\r\n").await;
+        // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
+        conn.stash_leftover(b"43").unwrap();
 
-        let (data, status) =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf)
-                .await
-                .expect("short leftover + read should produce valid response");
+        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+            .await
+            .expect("short leftover + read should produce valid response");
 
         assert_eq!(status.as_u16(), 430);
         assert!(data.starts_with(b"430"));
@@ -559,14 +533,12 @@ mod tests {
     async fn test_read_full_response_empty_connection() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         // Server immediately closes
         let mut conn = mock_backend_conn(b"").await;
 
-        let result =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
         assert!(result.is_err(), "Empty connection should be an error");
     }
 
@@ -643,7 +615,7 @@ mod tests {
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut conn: crate::stream::ConnectionStream = ConnectionStream::Plain(stream);
+        let mut conn: crate::stream::ConnectionStream = ConnectionStream::plain(stream);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batch = vec![QueuedRequest {
@@ -651,7 +623,6 @@ mod tests {
             response_tx: tx,
         }];
 
-        let mut leftover = bytes::BytesMut::new();
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
         let success = execute_pipeline_batch(
@@ -660,7 +631,6 @@ mod tests {
             batch,
             &metrics,
             &pool,
-            &mut leftover,
             &mut result_buf,
         )
         .await;
@@ -699,7 +669,7 @@ mod tests {
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut conn = ConnectionStream::Plain(stream);
+        let mut conn = ConnectionStream::plain(stream);
 
         let (tx1, rx1) = tokio::sync::oneshot::channel();
         let (tx2, rx2) = tokio::sync::oneshot::channel();
@@ -714,7 +684,6 @@ mod tests {
             },
         ];
 
-        let mut leftover = bytes::BytesMut::new();
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
         let success = execute_pipeline_batch(
@@ -723,7 +692,6 @@ mod tests {
             batch,
             &metrics,
             &pool,
-            &mut leftover,
             &mut result_buf,
         )
         .await;
@@ -764,7 +732,7 @@ mod tests {
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut conn = ConnectionStream::Plain(stream);
+        let mut conn = ConnectionStream::plain(stream);
 
         let (tx1, rx1) = tokio::sync::oneshot::channel();
         let (tx2, rx2) = tokio::sync::oneshot::channel();
@@ -779,7 +747,6 @@ mod tests {
             },
         ];
 
-        let mut leftover = bytes::BytesMut::new();
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
         let success = execute_pipeline_batch(
@@ -788,7 +755,6 @@ mod tests {
             batch,
             &metrics,
             &pool,
-            &mut leftover,
             &mut result_buf,
         )
         .await;
@@ -824,7 +790,6 @@ mod tests {
 
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         // Create a multiline response that accumulates in result_buf across chunks,
@@ -856,8 +821,7 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(chunks).await;
 
-        let result =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
 
         // Should fail with bounds check error (if TCP delivers enough data in one read)
         assert!(
@@ -877,7 +841,6 @@ mod tests {
 
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut leftover = BytesMut::new();
         let mut result_buf = BytesMut::with_capacity(4096);
 
         // Create a response where leftover is within bounds (< MAX_LEFTOVER_BYTES)
@@ -888,8 +851,7 @@ mod tests {
 
         let mut conn = mock_backend_conn(&normal_data).await;
 
-        let result =
-            read_full_response(&mut buffer, &mut conn, &mut leftover, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
 
         // Should succeed
         assert!(
@@ -897,11 +859,11 @@ mod tests {
             "Should succeed when leftover is within max size"
         );
         assert!(
-            !leftover.is_empty(),
+            conn.has_leftover(),
             "Should have leftover from second response"
         );
         assert!(
-            leftover.len() < MAX_LEFTOVER_BYTES,
+            conn.leftover_len() < MAX_LEFTOVER_BYTES,
             "Leftover should be under limit"
         );
     }

@@ -112,6 +112,10 @@ async fn execute_backend_query(
                 match tail.detect_terminator(&response) {
                     TerminatorStatus::FoundAt(pos) => {
                         // pos is after the terminator (terminator included in [..pos])
+                        if pos < response.len() && conn.stash_leftover(&response[pos..]).is_err() {
+                            crate::pool::remove_from_pool(conn);
+                            return Err(());
+                        }
                         response.truncate(pos);
                     }
                     TerminatorStatus::NotFound => {
@@ -121,6 +125,11 @@ async fn execute_backend_query(
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => match tail.detect_terminator(&buffer[..n]) {
                                     TerminatorStatus::FoundAt(pos) => {
+                                        if pos < n && conn.stash_leftover(&buffer[pos..n]).is_err()
+                                        {
+                                            crate::pool::remove_from_pool(conn);
+                                            return Err(());
+                                        }
                                         response.extend_from_slice(&buffer[..pos]);
                                         break;
                                     }

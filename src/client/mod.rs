@@ -168,13 +168,17 @@ impl NntpClient {
             // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
             // capacity without panicking, returned to pool on drop.
             let mut capture = self.buffer_pool.acquire_capture().await;
-            Self::drain_multiline_into(
+            if let Err(err) = Self::drain_multiline_into(
                 &mut conn,
                 &mut io_buffer,
                 &mut capture,
                 response.bytes_read,
             )
-            .await?;
+            .await
+            {
+                self.conn_pool.remove_with_cooldown(conn);
+                return Err(err);
+            }
             Ok(capture)
         } else {
             Ok(io_buffer)
@@ -186,7 +190,7 @@ impl NntpClient {
     /// `io_buffer` is the scratch buffer for socket reads (fixed size).
     /// `capture` is the accumulator returned to the caller (can grow).
     async fn drain_multiline_into(
-        conn: &mut Object<TcpManager>,
+        conn: &mut crate::stream::ConnectionStream,
         io_buffer: &mut PooledBuffer,
         capture: &mut PooledBuffer,
         first_chunk_size: usize,
@@ -200,6 +204,9 @@ impl NntpClient {
             TerminatorStatus::FoundAt(pos) => {
                 // pos is after the terminator (terminator included in [..pos])
                 capture.extend_from_slice(&first_chunk[..pos]);
+                if pos < first_chunk.len() {
+                    conn.stash_leftover(&first_chunk[pos..])?;
+                }
                 return Ok(());
             }
             TerminatorStatus::NotFound => {
@@ -208,7 +215,7 @@ impl NntpClient {
             }
         }
 
-        while let Ok(n) = io_buffer.read_from(&mut **conn).await {
+        while let Ok(n) = io_buffer.read_from(conn).await {
             if n == 0 {
                 break; // EOF
             }
@@ -221,6 +228,9 @@ impl NntpClient {
                 TerminatorStatus::FoundAt(pos) => {
                     // pos is after the terminator (terminator included in [..pos])
                     capture.extend_from_slice(&io_buffer.as_mut_slice()[..pos]);
+                    if pos < n {
+                        conn.stash_leftover(&io_buffer.as_mut_slice()[pos..n])?;
+                    }
                     break;
                 }
                 TerminatorStatus::NotFound => {

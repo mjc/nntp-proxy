@@ -183,21 +183,20 @@ where
 /// Like `stream_multiline_response`, but captures leftover bytes after the terminator
 /// into `leftover` for use as the start of the next response in the pipeline.
 #[allow(clippy::too_many_arguments)]
-pub async fn stream_multiline_response_pipelined<R, W>(
-    backend_read: &mut R,
+pub async fn stream_multiline_response_pipelined<W>(
+    backend_read: &mut crate::stream::ConnectionStream,
     client_write: &mut W,
     first_chunk: &[u8],
     first_n: usize,
     client_addr: crate::types::ClientAddress,
     backend_id: crate::types::BackendId,
     buffer_pool: &crate::pool::BufferPool,
-    leftover: &mut bytes::BytesMut,
 ) -> Result<u64>
 where
-    R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    stream_multiline_response_impl(
+    let mut leftover = bytes::BytesMut::new();
+    let total = stream_multiline_response_impl(
         backend_read,
         client_write,
         first_chunk,
@@ -206,9 +205,13 @@ where
         backend_id,
         buffer_pool,
         None,
-        Some(leftover),
+        Some(&mut leftover),
     )
-    .await
+    .await?;
+    if !leftover.is_empty() {
+        backend_read.stash_leftover(&leftover)?;
+    }
+    Ok(total)
 }
 
 /// Result of processing a single chunk in the streaming pipeline
@@ -693,7 +696,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             &combined,
@@ -701,7 +704,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 
@@ -729,7 +733,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             first_chunk,
@@ -737,7 +741,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 
@@ -768,7 +773,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             response,
@@ -776,7 +781,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 
@@ -807,7 +813,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             &combined,
@@ -815,7 +821,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 

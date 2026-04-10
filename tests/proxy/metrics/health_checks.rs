@@ -30,7 +30,7 @@ async fn test_tcp_alive_check_healthy_connection() -> Result<()> {
 
     // Connect and check health
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should pass - connection is alive and idle
     let result = check_tcp_alive(&mut conn_stream);
@@ -61,7 +61,7 @@ async fn test_tcp_alive_check_closed_connection() -> Result<()> {
     // Wait for server to close
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should fail - connection is closed
     let result = check_tcp_alive(&mut conn_stream);
@@ -93,7 +93,7 @@ async fn test_tcp_alive_check_unexpected_data() -> Result<()> {
     // Give server time to send data
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should fail - unexpected data in buffer
     let result = check_tcp_alive(&mut conn_stream);
@@ -128,7 +128,7 @@ async fn test_date_health_check_success() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should succeed
     let result = check_date_response(&mut conn_stream).await;
@@ -162,7 +162,7 @@ async fn test_date_health_check_invalid_response() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should fail - wrong response code
     let result = check_date_response(&mut conn_stream).await;
@@ -192,7 +192,7 @@ async fn test_date_health_check_timeout() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should timeout
     let result = timeout(
@@ -225,7 +225,7 @@ async fn test_date_health_check_connection_closed() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should fail - connection closed
     let result = check_date_response(&mut conn_stream).await;
@@ -337,7 +337,7 @@ async fn test_date_command_format() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     let _ = check_date_response(&mut conn_stream).await;
 
@@ -367,7 +367,7 @@ async fn test_multiple_sequential_health_checks() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Multiple checks should all pass
     for i in 0..3 {
@@ -398,7 +398,7 @@ async fn test_date_health_check_partial_response() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Should eventually timeout or fail
     let result = timeout(
@@ -438,7 +438,7 @@ async fn test_date_health_check_malformed_response() -> Result<()> {
         });
 
         let stream = TcpStream::connect(addr).await?;
-        let mut conn_stream = ConnectionStream::Plain(stream);
+        let mut conn_stream = ConnectionStream::plain(stream);
 
         let result = check_date_response(&mut conn_stream).await;
         assert!(result.is_err(), "Malformed response {} should fail", i);
@@ -462,14 +462,14 @@ async fn test_tcp_alive_check_non_destructive() -> Result<()> {
     });
 
     let stream = TcpStream::connect(addr).await?;
-    let mut conn_stream = ConnectionStream::Plain(stream);
+    let mut conn_stream = ConnectionStream::plain(stream);
 
     // Check health
     let result = check_tcp_alive(&mut conn_stream);
     assert!(result.is_ok());
 
     // Try to write data - connection should still work
-    if let ConnectionStream::Plain(ref mut tcp) = conn_stream {
+    if let Some(tcp) = conn_stream.as_tcp_stream_mut() {
         let write_result = tcp.write_all(b"TEST\r\n").await;
         assert!(
             write_result.is_ok(),
