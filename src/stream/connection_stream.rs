@@ -114,7 +114,7 @@ impl ConnectionStream {
     #[must_use]
     pub const fn is_encrypted(&self) -> bool {
         matches!(
-            self.transport,
+            &self.transport,
             ConnectionTransport::Tls(_) | ConnectionTransport::CompressedTls(_)
         )
     }
@@ -124,7 +124,7 @@ impl ConnectionStream {
     #[must_use]
     pub const fn is_unencrypted(&self) -> bool {
         matches!(
-            self.transport,
+            &self.transport,
             ConnectionTransport::Plain(_) | ConnectionTransport::CompressedPlain(_)
         )
     }
@@ -134,7 +134,7 @@ impl ConnectionStream {
     #[must_use]
     pub const fn is_compressed(&self) -> bool {
         matches!(
-            self.transport,
+            &self.transport,
             ConnectionTransport::CompressedPlain(_) | ConnectionTransport::CompressedTls(_)
         )
     }

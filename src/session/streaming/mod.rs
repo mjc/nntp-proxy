@@ -195,8 +195,110 @@ pub async fn stream_multiline_response_pipelined<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut leftover = bytes::BytesMut::new();
-    let total = stream_multiline_response_impl(
+    let mut total_bytes = 0u64;
+    let mut tail = TailBuffer::default();
+
+    let data = &first_chunk[..first_n];
+    match process_chunk(
+        data,
+        first_n,
+        &mut tail,
+        &mut None,
+        client_write,
+        backend_read,
+        &mut total_bytes,
+        client_addr,
+        backend_id,
+        buffer_pool,
+    )
+    .await?
+    {
+        ChunkResult::Done { write_len } => {
+            if write_len < first_n {
+                backend_read.stash_leftover(&first_chunk[write_len..first_n])?;
+            }
+            debug!(
+                "Client {} multiline response complete ({})",
+                client_addr,
+                crate::formatting::format_bytes(total_bytes)
+            );
+            return Ok(total_bytes);
+        }
+        ChunkResult::Continue => {}
+    }
+
+    let mut buffers = [buffer_pool.acquire().await, buffer_pool.acquire().await];
+    let mut idx: usize = 0;
+
+    loop {
+        let n = buffers[idx]
+            .read_from(backend_read)
+            .await
+            .context("Failed to read next chunk from backend")?;
+
+        if n == 0 {
+            debug!(
+                "Client {} multiline streaming complete ({}, EOF)",
+                client_addr,
+                crate::formatting::format_bytes(total_bytes)
+            );
+            break;
+        }
+
+        let data = &buffers[idx][..n];
+        match process_chunk(
+            data,
+            n,
+            &mut tail,
+            &mut None,
+            client_write,
+            backend_read,
+            &mut total_bytes,
+            client_addr,
+            backend_id,
+            buffer_pool,
+        )
+        .await?
+        {
+            ChunkResult::Done { write_len } => {
+                if write_len < n {
+                    backend_read.stash_leftover(&buffers[idx][write_len..n])?;
+                }
+                debug!(
+                    "Client {} multiline response complete ({})",
+                    client_addr,
+                    crate::formatting::format_bytes(total_bytes)
+                );
+                return Ok(total_bytes);
+            }
+            ChunkResult::Continue => {}
+        }
+
+        idx ^= 1;
+    }
+
+    Ok(total_bytes)
+}
+
+/// Stream multiline response from backend to client during pipelined batch execution.
+///
+/// Like `stream_multiline_response`, but captures leftover bytes after the terminator
+/// into `leftover` for use as the start of the next response in the pipeline.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_multiline_response_pipelined_for_test<W>(
+    backend_read: &mut crate::stream::ConnectionStream,
+    client_write: &mut W,
+    first_chunk: &[u8],
+    first_n: usize,
+    client_addr: crate::types::ClientAddress,
+    backend_id: crate::types::BackendId,
+    buffer_pool: &crate::pool::BufferPool,
+    leftover: &mut bytes::BytesMut,
+) -> Result<u64>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    stream_multiline_response_impl(
         backend_read,
         client_write,
         first_chunk,
@@ -205,13 +307,9 @@ where
         backend_id,
         buffer_pool,
         None,
-        Some(&mut leftover),
+        Some(leftover),
     )
-    .await?;
-    if !leftover.is_empty() {
-        backend_read.stash_leftover(&leftover)?;
-    }
-    Ok(total)
+    .await
 }
 
 /// Result of processing a single chunk in the streaming pipeline

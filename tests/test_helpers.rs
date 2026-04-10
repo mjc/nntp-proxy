@@ -125,6 +125,7 @@ impl MockNntpServer {
                     }
 
                     let mut authenticated = !require_auth;
+                    let mut pending = bytes::BytesMut::new();
                     let mut buffer = [0; 1024];
 
                     loop {
@@ -134,56 +135,64 @@ impl MockNntpServer {
                             Err(_) => break,
                         };
 
-                        let cmd_str = String::from_utf8_lossy(&buffer[..n]);
-                        let cmd_upper = cmd_str.trim().to_uppercase();
+                        pending.extend_from_slice(&buffer[..n]);
 
-                        // Handle QUIT
-                        if cmd_upper.starts_with("QUIT") {
-                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        }
+                        while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
+                            let line = pending.split_to(line_end + 2);
+                            let cmd_str = String::from_utf8_lossy(&line);
+                            let cmd_upper = cmd_str.trim().to_uppercase();
 
-                        // Handle authentication
-                        if require_auth {
-                            if cmd_upper.starts_with("AUTHINFO USER") {
-                                if let Some((user, _)) = &credentials
-                                    && cmd_str.contains(user.as_str())
-                                {
-                                    let _ = stream.write_all(b"381 Password required\r\n").await;
-                                    continue;
-                                }
-                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
-                                continue;
-                            } else if cmd_upper.starts_with("AUTHINFO PASS") {
-                                if let Some((_, pass)) = &credentials
-                                    && cmd_str.contains(pass.as_str())
-                                {
-                                    authenticated = true;
+                            // Handle QUIT
+                            if cmd_upper.starts_with("QUIT") {
+                                let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                                return;
+                            }
+
+                            // Handle authentication
+                            if require_auth {
+                                if cmd_upper.starts_with("AUTHINFO USER") {
+                                    if let Some((user, _)) = &credentials
+                                        && cmd_str.contains(user.as_str())
+                                    {
+                                        let _ =
+                                            stream.write_all(b"381 Password required\r\n").await;
+                                        continue;
+                                    }
                                     let _ =
-                                        stream.write_all(b"281 Authentication accepted\r\n").await;
+                                        stream.write_all(b"481 Authentication failed\r\n").await;
+                                    continue;
+                                } else if cmd_upper.starts_with("AUTHINFO PASS") {
+                                    if let Some((_, pass)) = &credentials
+                                        && cmd_str.contains(pass.as_str())
+                                    {
+                                        authenticated = true;
+                                        let _ = stream
+                                            .write_all(b"281 Authentication accepted\r\n")
+                                            .await;
+                                        continue;
+                                    }
+                                    let _ =
+                                        stream.write_all(b"481 Authentication failed\r\n").await;
+                                    continue;
+                                } else if !authenticated {
+                                    let _ =
+                                        stream.write_all(b"480 Authentication required\r\n").await;
                                     continue;
                                 }
-                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
-                                continue;
-                            } else if !authenticated {
-                                let _ = stream.write_all(b"480 Authentication required\r\n").await;
-                                continue;
                             }
-                        }
 
-                        // Check custom command handlers
-                        let mut handled = false;
-                        for (prefix, response) in &handlers {
-                            if cmd_upper.starts_with(prefix) {
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                handled = true;
-                                break;
+                            let mut handled = false;
+                            for (prefix, response) in &handlers {
+                                if cmd_upper.starts_with(prefix) {
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    handled = true;
+                                    break;
+                                }
                             }
-                        }
 
-                        // Default response
-                        if !handled {
-                            let _ = stream.write_all(b"200 OK\r\n").await;
+                            if !handled {
+                                let _ = stream.write_all(b"200 OK\r\n").await;
+                            }
                         }
                     }
                 }));
@@ -780,6 +789,34 @@ mod tests {
         let response = String::from_utf8_lossy(&buffer[..n]);
         assert!(response.contains("211"));
         assert!(response.contains("alt.test"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_server_handles_multiple_commands_in_one_read() {
+        let port = get_available_port().await.unwrap();
+        let _handle = MockNntpServer::new(port)
+            .on_command("DATE", "111 20260410235959\r\n")
+            .on_command("HELP", "100 help follows\r\n.\r\n")
+            .spawn();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        let mut buffer = [0; 1024];
+        let _ = stream.read(&mut buffer).await.unwrap();
+
+        stream.write_all(b"DATE\r\nHELP\r\n").await.unwrap();
+
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("111 20260410235959"));
+
+        let n = stream.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("100 help follows"));
     }
 
     #[tokio::test]

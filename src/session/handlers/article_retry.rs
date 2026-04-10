@@ -201,8 +201,11 @@ impl ClientSession {
                 // For single-line 430, find boundary and save leftover
                 if !is_multiline && let Some(pos) = memchr::memchr(b'\n', chunk) {
                     let end = pos + 1;
-                    if end < n {
-                        conn.stash_leftover(&chunk[end..])?;
+                    if end < n
+                        && let Err(e) = conn.stash_leftover(&chunk[end..])
+                    {
+                        provider.remove_with_cooldown(conn);
+                        return Err(e);
                     }
                 }
 
@@ -289,8 +292,11 @@ impl ClientSession {
                 // Single-line response - find boundary and save leftover
                 let write_len = if let Some(pos) = memchr::memchr(b'\n', chunk) {
                     let end = pos + 1;
-                    if end < n {
-                        conn.stash_leftover(&chunk[end..])?;
+                    if end < n
+                        && let Err(e) = conn.stash_leftover(&chunk[end..])
+                    {
+                        provider.remove_with_cooldown(conn);
+                        return Err(e);
                     }
                     end
                 } else {
