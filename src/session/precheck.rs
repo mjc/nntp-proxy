@@ -122,7 +122,14 @@ async fn execute_backend_query(
                         tail.update(&response);
                         loop {
                             match conn.as_mut().read(buffer.as_mut_slice()).await {
-                                Ok(0) | Err(_) => break,
+                                Ok(0) => {
+                                    crate::pool::remove_from_pool(conn);
+                                    return Err(());
+                                }
+                                Err(_) => {
+                                    crate::pool::remove_from_pool(conn);
+                                    return Err(());
+                                }
                                 Ok(n) => match tail.detect_terminator(&buffer[..n]) {
                                     TerminatorStatus::FoundAt(pos) => {
                                         if pos < n && conn.stash_leftover(&buffer[pos..n]).is_err()
@@ -389,6 +396,8 @@ pub fn spawn_background_precheck(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn summarize_finds_first() {
@@ -421,5 +430,71 @@ mod tests {
         let (found, avail) = summarize(vec![]);
         assert!(found.is_none());
         assert_eq!(avail.checked_bits(), 0);
+    }
+
+    async fn spawn_truncated_precheck_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream
+                            .write_all(b"220 0 <test@example.com>\r\npartial body")
+                            .await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn query_backend_returns_error_on_truncated_multiline_response() {
+        use crate::cache::UnifiedCache;
+        use crate::metrics::MetricsCollector;
+        use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+        use crate::router::BackendSelector;
+        use crate::types::{BackendId, BufferSize, ServerName};
+
+        let addr = spawn_truncated_precheck_server().await;
+
+        let mut selector = BackendSelector::new();
+        let backend_id = BackendId::from_index(0);
+        let provider = DeadpoolConnectionProvider::new(
+            "127.0.0.1".to_string(),
+            addr.port(),
+            "test".to_string(),
+            2,
+            None,
+            None,
+        );
+        selector.add_backend(
+            backend_id,
+            ServerName::try_new("test-server".to_string()).unwrap(),
+            provider,
+            0,
+            None,
+        );
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60), true)),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+            cache_articles: true,
+        };
+
+        let result = query_backend(&deps, backend_id, "ARTICLE <test@example.com>\r\n", true).await;
+        assert_eq!(result, QueryResult::Error(backend_id));
     }
 }

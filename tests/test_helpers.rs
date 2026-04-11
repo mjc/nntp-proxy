@@ -50,6 +50,96 @@ pub struct MockNntpServer {
 }
 
 impl MockNntpServer {
+    async fn run_on_listener(
+        listener: TcpListener,
+        name: String,
+        require_auth: bool,
+        credentials: Option<(String, String)>,
+        command_handlers: HashMap<String, String>,
+    ) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let name = name.clone();
+            let credentials = credentials.clone();
+            let handlers = command_handlers.clone();
+
+            drop(tokio::spawn(async move {
+                let greeting = if require_auth {
+                    format!("200 {} Ready (auth required)\r\n", name)
+                } else {
+                    format!("200 {} Ready\r\n", name)
+                };
+                if stream.write_all(greeting.as_bytes()).await.is_err() {
+                    return;
+                }
+
+                let mut authenticated = !require_auth;
+                let mut pending = bytes::BytesMut::new();
+                let mut buffer = [0; 1024];
+
+                loop {
+                    let n = match stream.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+
+                    pending.extend_from_slice(&buffer[..n]);
+
+                    while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
+                        let line = pending.split_to(line_end + 2);
+                        let cmd_str = String::from_utf8_lossy(&line);
+                        let cmd_upper = cmd_str.trim().to_uppercase();
+
+                        if cmd_upper.starts_with("QUIT") {
+                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                            return;
+                        }
+
+                        if require_auth {
+                            if cmd_upper.starts_with("AUTHINFO USER") {
+                                if let Some((user, _)) = &credentials
+                                    && cmd_str.contains(user.as_str())
+                                {
+                                    let _ = stream.write_all(b"381 Password required\r\n").await;
+                                    continue;
+                                }
+                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
+                                continue;
+                            } else if cmd_upper.starts_with("AUTHINFO PASS") {
+                                if let Some((_, pass)) = &credentials
+                                    && cmd_str.contains(pass.as_str())
+                                {
+                                    authenticated = true;
+                                    let _ =
+                                        stream.write_all(b"281 Authentication accepted\r\n").await;
+                                    continue;
+                                }
+                                let _ = stream.write_all(b"481 Authentication failed\r\n").await;
+                                continue;
+                            } else if !authenticated {
+                                let _ = stream.write_all(b"480 Authentication required\r\n").await;
+                                continue;
+                            }
+                        }
+
+                        let mut handled = false;
+                        for (prefix, response) in &handlers {
+                            if cmd_upper.starts_with(prefix) {
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                handled = true;
+                                break;
+                            }
+                        }
+
+                        if !handled {
+                            let _ = stream.write_all(b"200 OK\r\n").await;
+                        }
+                    }
+                }
+            }));
+        }
+    }
+
     /// Create a new mock server builder on the specified port
     pub fn new(port: u16) -> Self {
         Self {
@@ -83,22 +173,45 @@ impl MockNntpServer {
         self
     }
 
-    /// Spawn the mock server and return a handle to its background task
-    /// Spawn mock server and return AbortHandle for automatic cleanup
-    ///
-    /// When the AbortHandle is dropped, the background task is immediately cancelled.
-    /// This prevents tests from hanging during shutdown waiting for mock servers to exit.
-    pub fn spawn(self) -> AbortHandle {
+    fn spawn_with_listener(self, listener: TcpListener) -> AbortHandle {
         let Self {
-            port,
+            port: _,
             name,
             require_auth,
             credentials,
             command_handlers,
         } = self;
 
+        tokio::spawn(Self::run_on_listener(
+            listener,
+            name,
+            require_auth,
+            credentials,
+            command_handlers,
+        ))
+        .abort_handle()
+    }
+
+    pub fn spawn_on_listener(self, listener: TcpListener) -> AbortHandle {
+        self.spawn_with_listener(listener)
+    }
+
+    /// Spawn the mock server and return a handle to its background task
+    /// Spawn mock server and return AbortHandle for automatic cleanup
+    ///
+    /// When the AbortHandle is dropped, the background task is immediately cancelled.
+    /// This prevents tests from hanging during shutdown waiting for mock servers to exit.
+    pub fn spawn(self) -> AbortHandle {
+        let port = self.port;
+        let Self {
+            port: _,
+            name,
+            require_auth,
+            credentials,
+            command_handlers,
+        } = self;
+        let addr = format!("127.0.0.1:{port}");
         tokio::spawn(async move {
-            let addr = format!("127.0.0.1:{}", port);
             let listener = match TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -106,97 +219,8 @@ impl MockNntpServer {
                     return;
                 }
             };
-
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let name = name.clone();
-                let credentials = credentials.clone();
-                let handlers = command_handlers.clone();
-
-                // Spawn per-connection handler (explicitly drop handle)
-                drop(tokio::spawn(async move {
-                    // Send greeting
-                    let greeting = if require_auth {
-                        format!("200 {} Ready (auth required)\r\n", name)
-                    } else {
-                        format!("200 {} Ready\r\n", name)
-                    };
-                    if stream.write_all(greeting.as_bytes()).await.is_err() {
-                        return;
-                    }
-
-                    let mut authenticated = !require_auth;
-                    let mut pending = bytes::BytesMut::new();
-                    let mut buffer = [0; 1024];
-
-                    loop {
-                        let n = match stream.read(&mut buffer).await {
-                            Ok(0) => break, // Connection closed
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
-
-                        pending.extend_from_slice(&buffer[..n]);
-
-                        while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
-                            let line = pending.split_to(line_end + 2);
-                            let cmd_str = String::from_utf8_lossy(&line);
-                            let cmd_upper = cmd_str.trim().to_uppercase();
-
-                            // Handle QUIT
-                            if cmd_upper.starts_with("QUIT") {
-                                let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                                return;
-                            }
-
-                            // Handle authentication
-                            if require_auth {
-                                if cmd_upper.starts_with("AUTHINFO USER") {
-                                    if let Some((user, _)) = &credentials
-                                        && cmd_str.contains(user.as_str())
-                                    {
-                                        let _ =
-                                            stream.write_all(b"381 Password required\r\n").await;
-                                        continue;
-                                    }
-                                    let _ =
-                                        stream.write_all(b"481 Authentication failed\r\n").await;
-                                    continue;
-                                } else if cmd_upper.starts_with("AUTHINFO PASS") {
-                                    if let Some((_, pass)) = &credentials
-                                        && cmd_str.contains(pass.as_str())
-                                    {
-                                        authenticated = true;
-                                        let _ = stream
-                                            .write_all(b"281 Authentication accepted\r\n")
-                                            .await;
-                                        continue;
-                                    }
-                                    let _ =
-                                        stream.write_all(b"481 Authentication failed\r\n").await;
-                                    continue;
-                                } else if !authenticated {
-                                    let _ =
-                                        stream.write_all(b"480 Authentication required\r\n").await;
-                                    continue;
-                                }
-                            }
-
-                            let mut handled = false;
-                            for (prefix, response) in &handlers {
-                                if cmd_upper.starts_with(prefix) {
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                    handled = true;
-                                    break;
-                                }
-                            }
-
-                            if !handled {
-                                let _ = stream.write_all(b"200 OK\r\n").await;
-                            }
-                        }
-                    }
-                }));
-            }
+            Self::run_on_listener(listener, name, require_auth, credentials, command_handlers)
+                .await;
         })
         .abort_handle()
     }
@@ -681,11 +705,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_basic() {
-        let port = get_available_port().await.unwrap();
-        let _handle = MockNntpServer::new(port).with_name("TestServer").spawn();
-
-        // Give server time to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _handle = MockNntpServer::new(port)
+            .with_name("TestServer")
+            .spawn_on_listener(listener);
 
         // Connect and verify greeting
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -702,10 +726,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_basic() {
-        let port = get_available_port().await.unwrap();
-        let _handle = MockNntpServer::new(port).with_name("BuilderTest").spawn();
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _handle = MockNntpServer::new(port)
+            .with_name("BuilderTest")
+            .spawn_on_listener(listener);
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
@@ -721,12 +746,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_with_auth() {
-        let port = get_available_port().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let _handle = MockNntpServer::new(port)
             .with_auth("testuser", "testpass")
-            .spawn();
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            .spawn_on_listener(listener);
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
@@ -766,13 +790,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_builder_custom_commands() {
-        let port = get_available_port().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let _handle = MockNntpServer::new(port)
             .on_command("LIST", "215 list follows\r\n.\r\n")
             .on_command("GROUP", "211 100 1 100 alt.test\r\n")
-            .spawn();
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            .spawn_on_listener(listener);
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
@@ -799,13 +822,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_server_handles_multiple_commands_in_one_read() {
-        let port = get_available_port().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let _handle = MockNntpServer::new(port)
             .on_command("DATE", "111 20260410235959\r\n")
             .on_command("HELP", "100 help follows\r\n.\r\n")
-            .spawn();
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            .spawn_on_listener(listener);
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
