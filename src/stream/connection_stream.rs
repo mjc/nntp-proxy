@@ -79,7 +79,7 @@ impl ConnectionStream {
     }
 
     /// Wrap the current transport in a decompressor, preserving any read-ahead bytes.
-    pub fn into_compressed(self, level: u32) -> Self {
+    pub(crate) fn into_compressed(self, level: u32) -> Self {
         let transport = match self.transport {
             ConnectionTransport::Plain(tcp) => ConnectionTransport::CompressedPlain(Box::new(
                 DecompressStream::with_level(tcp, level),
