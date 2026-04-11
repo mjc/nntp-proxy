@@ -196,11 +196,13 @@ impl MockNntpServer {
         self.spawn_with_listener(listener)
     }
 
-    /// Spawn the mock server and return a handle to its background task
-    /// Spawn mock server and return AbortHandle for automatic cleanup
+    /// Spawn the mock server and return a handle to its background task.
     ///
-    /// When the AbortHandle is dropped, the background task is immediately cancelled.
-    /// This prevents tests from hanging during shutdown waiting for mock servers to exit.
+    /// The returned [`AbortHandle`] can be used to cancel the background task by
+    /// calling [`AbortHandle::abort`].
+    ///
+    /// Dropping the [`AbortHandle`] does not cancel the task; it only drops the
+    /// caller's ability to abort it later.
     pub fn spawn(self) -> AbortHandle {
         let port = self.port;
         let Self {
