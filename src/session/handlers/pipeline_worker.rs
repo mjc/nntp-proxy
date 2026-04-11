@@ -197,19 +197,23 @@ async fn execute_pipeline_batch(
         }
     }
 
-    // All responses processed successfully — connection healthy
-    //
-    // Health validation: Successful reading of all responses (including
-    // terminators) serves as an implicit health check. If the connection
-    // was in a bad state, read_full_response would have failed. The leftover
-    // buffer bounds are enforced in read_full_response (MAX_LEFTOVER_BYTES),
-    // preventing protocol desync from leaving the connection unusable.
-    //
-    // Explicit health check: Verify leftover is reasonable
+    // All responses processed successfully. Leftover is valid only while there
+    // are more already-sent responses remaining in this borrow. If bytes remain
+    // after the final expected response, returning the connection to the pool
+    // would leak stale backend data into the next borrower.
     debug_assert!(
         conn.leftover_len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
         "Leftover buffer should never exceed MAX_LEFTOVER_BYTES after successful batch"
     );
+
+    if conn.has_leftover() {
+        warn!(
+            backend = ?backend_id,
+            leftover_bytes = conn.leftover_len(),
+            "Pipeline batch ended with buffered bytes; retiring connection to avoid cross-borrow desync"
+        );
+        return false;
+    }
 
     true
 }
@@ -348,6 +352,7 @@ mod tests {
     use crate::pool::BufferPool;
     use crate::stream::ConnectionStream;
     use bytes::BytesMut;
+    use proptest::prelude::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -386,6 +391,78 @@ mod tests {
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         ConnectionStream::plain(stream)
+    }
+
+    async fn run_single_line_pipeline_batch(
+        responses: &[Vec<u8>],
+        extra_tail: &[u8],
+    ) -> (bool, Vec<PipelineResponse>, bool, usize) {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(responses.len());
+        let backend_id = BackendId::from_index(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wire_data = {
+            let mut data = Vec::new();
+            for response in responses {
+                data.extend_from_slice(response);
+            }
+            data.extend_from_slice(extra_tail);
+            data
+        };
+
+        let mut batch = Vec::with_capacity(responses.len());
+        let mut rxs = Vec::with_capacity(responses.len());
+        let mut expected_command_bytes = 0usize;
+        for idx in 0..responses.len() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let command = format!("STAT <msg{idx}@example.com>\r\n");
+            expected_command_bytes += command.len();
+            batch.push(QueuedRequest {
+                command: Arc::from(command),
+                response_tx: tx,
+            });
+            rxs.push(rx);
+        }
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let mut received = 0usize;
+            while received < expected_command_bytes {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => received += n,
+                    Err(_) => break,
+                }
+            }
+            stream.write_all(&wire_data).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+
+        let mut result_buf = bytes::BytesMut::with_capacity(4096);
+        let success = execute_pipeline_batch(
+            backend_id,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        let mut results = Vec::with_capacity(rxs.len());
+        for rx in rxs {
+            results.push(rx.await.unwrap());
+        }
+
+        (success, results, conn.has_leftover(), conn.leftover_len())
     }
 
     // ─── read_full_response unit tests ───────────────────────────────────────
@@ -771,6 +848,171 @@ mod tests {
         match rx2.await.unwrap() {
             PipelineResponse::Error(_) => {} // Expected
             other => panic!("Expected error for second, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_batch_retires_connection_with_leftover_after_final_response() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"223 0 <a@b> status\r\n430 No such article\r\n111 20260411120000\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let batch = vec![
+            QueuedRequest {
+                command: Arc::from("STAT <a@b>\r\n"),
+                response_tx: tx1,
+            },
+            QueuedRequest {
+                command: Arc::from("STAT <c@d>\r\n"),
+                response_tx: tx2,
+            },
+        ];
+
+        let mut result_buf = bytes::BytesMut::with_capacity(4096);
+
+        let success = execute_pipeline_batch(
+            backend_id,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(
+            !success,
+            "leftover after the final expected response should retire the connection"
+        );
+        assert!(
+            conn.has_leftover(),
+            "unexpected extra response bytes should remain buffered until the connection is retired"
+        );
+
+        match rx1.await.unwrap() {
+            PipelineResponse::Success { status_code, .. } => {
+                assert_eq!(status_code.as_u16(), 223);
+            }
+            other => panic!("Expected 223 Success, got {other:?}"),
+        }
+        match rx2.await.unwrap() {
+            PipelineResponse::Success { status_code, .. } => {
+                assert_eq!(status_code.as_u16(), 430);
+            }
+            other => panic!("Expected 430 Success, got {other:?}"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_read_full_response_preserves_intra_batch_single_line_framing(
+            // RFC 3977 command/response model:
+            // - client may pipeline multiple commands on one TCP stream
+            // - server processes them in order and sends responses in that order
+            //   (RFC 3977 §3.5)
+            //
+            // These generated responses are intentionally single-line so the end
+            // of each response is the first CRLF, matching the framing rule we
+            // use before handing any remainder to the next already-sent command.
+            // 223 STAT success and 430/500 errors are all single-line responses
+            // under RFC 3977.
+            codes in prop::collection::vec(prop_oneof![Just(223u16), Just(430u16), Just(500u16)], 1..6),
+            suffix in prop::collection::vec(any::<u8>(), 0..16),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let pool = BufferPool::for_tests();
+                let mut buffer = pool.acquire().await;
+                let mut result_buf = BytesMut::with_capacity(4096);
+
+                let responses: Vec<Vec<u8>> = codes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, code)| format!("{code} resp{idx}\r\n").into_bytes())
+                    .collect();
+
+                let mut wire = Vec::new();
+                for response in &responses {
+                    wire.extend_from_slice(response);
+                }
+                wire.extend_from_slice(&suffix);
+
+                let mut conn = mock_backend_conn(&wire).await;
+
+                for (idx, expected) in responses.iter().enumerate() {
+                    let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+                        .await
+                        .expect("packed single-line response should parse");
+
+                    prop_assert_eq!(&data[..], expected.as_slice());
+                    prop_assert_eq!(status.as_u16(), codes[idx]);
+                }
+
+                prop_assert_eq!(conn.leftover_len(), suffix.len());
+                Ok(())
+            })?;
+        }
+
+        #[test]
+        fn prop_execute_pipeline_batch_reuses_connection_only_when_final_tail_is_empty(
+            // RFC 3977 §3.5 allows pipelining, but the server still only sends
+            // data in response to client commands and must process them in order.
+            // So leftover bytes are valid only while there are more already-sent
+            // commands remaining in the current borrow. After the final expected
+            // response, any buffered bytes must retire the connection instead of
+            // crossing a pool borrow boundary.
+            codes in prop::collection::vec(prop_oneof![Just(223u16), Just(430u16), Just(500u16)], 1..5),
+            extra_tail in prop::collection::vec(any::<u8>(), 0..24),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let responses: Vec<Vec<u8>> = codes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, code)| format!("{code} batch{idx}\r\n").into_bytes())
+                    .collect();
+
+                let (success, results, has_leftover, leftover_len) =
+                    run_single_line_pipeline_batch(&responses, &extra_tail).await;
+
+                prop_assert_eq!(results.len(), responses.len());
+                for (idx, result) in results.into_iter().enumerate() {
+                    match result {
+                        PipelineResponse::Success { status_code, data, .. } => {
+                            prop_assert_eq!(status_code.as_u16(), codes[idx]);
+                            prop_assert_eq!(&data[..], responses[idx].as_slice());
+                        }
+                        other => prop_assert!(false, "expected success response, got {other:?}"),
+                    }
+                }
+
+                let expect_reuse = extra_tail.is_empty();
+                prop_assert_eq!(success, expect_reuse);
+                prop_assert_eq!(has_leftover, !extra_tail.is_empty());
+                prop_assert_eq!(leftover_len, extra_tail.len());
+                Ok(())
+            })?;
         }
     }
 

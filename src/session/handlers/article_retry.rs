@@ -323,6 +323,18 @@ impl ClientSession {
             }
         }
 
+        if conn.has_leftover() {
+            warn!(
+                client = %self.client_addr,
+                backend = ?backend_id,
+                leftover_bytes = conn.leftover_len(),
+                "Batch article execution ended with buffered bytes; retiring connection to avoid cross-borrow desync"
+            );
+            provider.remove_with_cooldown(conn);
+            guard.complete();
+            return Ok(());
+        }
+
         // Connection healthy — conn drops here, returning to pool automatically
         guard.complete();
         Ok(())
