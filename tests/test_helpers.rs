@@ -442,55 +442,12 @@ pub async fn setup_proxy_with_backends(
             "430 No such article\r\n"
         };
 
-        let name = (*name).to_string();
-        let response = response.to_string();
-        let handle = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let name = name.clone();
-                let response = response.clone();
-
-                drop(tokio::spawn(async move {
-                    let greeting = format!("200 {} Ready\r\n", name);
-                    if stream.write_all(greeting.as_bytes()).await.is_err() {
-                        return;
-                    }
-
-                    let mut pending = bytes::BytesMut::new();
-                    let mut buffer = [0; 1024];
-                    loop {
-                        let n = match stream.read(&mut buffer).await {
-                            Ok(0) => break,
-                            Ok(n) => n,
-                            Err(_) => break,
-                        };
-
-                        pending.extend_from_slice(&buffer[..n]);
-
-                        while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
-                            let line = pending.split_to(line_end + 2);
-                            let cmd_str = String::from_utf8_lossy(&line);
-                            let cmd_upper = cmd_str.trim().to_uppercase();
-
-                            if cmd_upper.starts_with("QUIT") {
-                                let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                                return;
-                            }
-
-                            let reply = if cmd_upper.starts_with("DATE") {
-                                "111 20251203120000\r\n"
-                            } else if cmd_upper.starts_with("ARTICLE") {
-                                &response
-                            } else {
-                                "200 OK\r\n"
-                            };
-
-                            let _ = stream.write_all(reply.as_bytes()).await;
-                        }
-                    }
-                }));
-            }
-        })
-        .abort_handle();
+        let handle = MockNntpServer::new(listener.local_addr()?.port())
+            .with_name(*name)
+            .on_command("DATE", "111 20251203120000\r\n")
+            .on_command("QUIT", "205 Goodbye\r\n")
+            .on_command("ARTICLE", response)
+            .spawn_on_listener(listener);
         mock_handles.push(handle);
     }
 

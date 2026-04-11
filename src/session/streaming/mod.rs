@@ -197,13 +197,14 @@ where
 {
     let mut total_bytes = 0u64;
     let mut tail = TailBuffer::default();
+    let mut capture = None;
 
     let data = &first_chunk[..first_n];
     match process_chunk(
         data,
         first_n,
         &mut tail,
-        &mut None,
+        &mut capture,
         client_write,
         backend_read,
         &mut total_bytes,
@@ -250,7 +251,7 @@ where
             data,
             n,
             &mut tail,
-            &mut None,
+            &mut capture,
             client_write,
             backend_read,
             &mut total_bytes,
