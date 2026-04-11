@@ -315,7 +315,7 @@ impl managed::Manager for TcpManager {
 
         if self.negotiate_compression(&mut stream, &mut buffer).await? {
             let level = self.compress_level.unwrap_or(1);
-            stream = stream.into_compressed(level);
+            stream = stream.into_compressed(level)?;
         }
 
         Ok(stream)

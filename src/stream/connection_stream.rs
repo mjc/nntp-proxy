@@ -79,7 +79,10 @@ impl ConnectionStream {
     }
 
     /// Wrap the current transport in a decompressor, preserving any read-ahead bytes.
-    pub(crate) fn into_compressed(self, level: u32) -> Self {
+    ///
+    /// Returns an error if compression is requested for a stream that is already compressed.
+    /// This keeps the state transition explicit instead of panicking on an invalid call.
+    pub(crate) fn into_compressed(self, level: u32) -> io::Result<Self> {
         let transport = match self.transport {
             ConnectionTransport::Plain(tcp) => ConnectionTransport::CompressedPlain(Box::new(
                 DecompressStream::with_level(tcp, level),
@@ -88,14 +91,17 @@ impl ConnectionStream {
                 DecompressStream::with_level(*tls, level),
             )),
             ConnectionTransport::CompressedPlain(_) | ConnectionTransport::CompressedTls(_) => {
-                unreachable!("fresh connections are never already compressed")
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot enable compression on an already-compressed connection",
+                ));
             }
         };
 
-        Self {
+        Ok(Self {
             transport,
             leftover: self.leftover,
-        }
+        })
     }
 
     /// Returns the connection type as a string for logging/debugging
@@ -449,5 +455,50 @@ mod tests {
         let mut conn = ConnectionStream::plain(server_stream);
         let oversized = vec![b'x'; MAX_LEFTOVER_BYTES + 1];
         assert!(conn.stash_leftover(&oversized).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_into_compressed_preserves_leftover() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(b"socket").await.unwrap();
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        conn.stash_leftover(b"left").unwrap();
+
+        let mut conn = conn.into_compressed(1).unwrap();
+        assert!(conn.is_compressed());
+        assert_eq!(conn.leftover_len(), 4);
+
+        let mut buf = [0u8; 4];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"left");
+    }
+
+    #[tokio::test]
+    async fn test_into_compressed_rejects_already_compressed_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let conn = ConnectionStream::compressed_plain(server_stream);
+        let err = conn.into_compressed(1).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "cannot enable compression on an already-compressed connection"
+        );
     }
 }
