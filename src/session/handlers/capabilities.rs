@@ -2,6 +2,14 @@ use crate::pool::BufferPool;
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 
+#[inline]
+fn should_strip_capability(capability: &str) -> bool {
+    let keyword = capability.split_ascii_whitespace().next().unwrap_or("");
+    keyword.eq_ignore_ascii_case("AUTHINFO")
+        || keyword.eq_ignore_ascii_case("SASL")
+        || capability.eq_ignore_ascii_case("MODE-READER")
+}
+
 pub(super) async fn read_response<R>(
     backend_read: &mut R,
     first_chunk: &[u8],
@@ -60,13 +68,7 @@ pub(super) fn rewrite_response(response: &[u8], is_authenticated: bool) -> Vec<u
         }
 
         let capability = line.trim_end_matches("\r\n");
-        let keyword = capability.split_ascii_whitespace().next().unwrap_or("");
-
-        if keyword.eq_ignore_ascii_case("AUTHINFO") || keyword.eq_ignore_ascii_case("SASL") {
-            continue;
-        }
-
-        if capability.eq_ignore_ascii_case("MODE-READER") {
+        if should_strip_capability(capability) {
             continue;
         }
 
