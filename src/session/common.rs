@@ -8,6 +8,14 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
+#[inline]
+fn starts_with_keyword(command: &str, keyword: &str) -> bool {
+    command
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case(keyword))
+}
+
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthResult {
@@ -85,18 +93,12 @@ where
 
 #[inline]
 pub(crate) fn is_capabilities_command(command: &str) -> bool {
-    command
-        .split_ascii_whitespace()
-        .next()
-        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("CAPABILITIES"))
+    starts_with_keyword(command, "CAPABILITIES")
 }
 
 #[inline]
 pub(crate) fn is_authinfo_command(command: &str) -> bool {
-    command
-        .split_ascii_whitespace()
-        .next()
-        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("AUTHINFO"))
+    starts_with_keyword(command, "AUTHINFO")
 }
 
 #[inline]
@@ -104,10 +106,10 @@ pub(crate) fn is_mode_reader_command(command: &str) -> bool {
     let mut parts = command.split_ascii_whitespace();
     parts
         .next()
-        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("MODE"))
+        .is_some_and(|token| token.eq_ignore_ascii_case("MODE"))
         && parts
             .next()
-            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("READER"))
+            .is_some_and(|token| token.eq_ignore_ascii_case("READER"))
 }
 
 /// Handle successful authentication with all side effects
@@ -163,6 +165,22 @@ mod tests {
 
         assert_eq!(quit1, quit2);
         assert_ne!(quit1, cont);
+    }
+
+    #[test]
+    fn test_command_helpers() {
+        assert!(is_capabilities_command("CAPABILITIES\r\n"));
+        assert!(is_capabilities_command(" capabilities "));
+        assert!(!is_capabilities_command("LIST"));
+
+        assert!(is_authinfo_command("AUTHINFO USER user"));
+        assert!(is_authinfo_command("authinfo pass pass"));
+        assert!(!is_authinfo_command("CAPABILITIES"));
+
+        assert!(is_mode_reader_command("MODE READER"));
+        assert!(is_mode_reader_command(" mode \t reader "));
+        assert!(!is_mode_reader_command("MODE STREAM"));
+        assert!(!is_mode_reader_command("READER"));
     }
 
     // =========================================================================
