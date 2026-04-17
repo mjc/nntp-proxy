@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::test_helpers::wait_for_server;
+use crate::test_helpers::{MockNntpServer, wait_for_server};
 
 use nntp_proxy::config::{RoutingMode, UserCredentials};
 
@@ -57,6 +57,25 @@ async fn spawn_proxy_with_auth(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     proxy_addr
+}
+
+async fn read_multiline_response<R>(reader: &mut BufReader<R>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut response = String::new();
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).await.unwrap();
+        assert!(bytes > 0, "unexpected EOF while reading multiline response");
+        response.push_str(&line);
+        if line == ".\r\n" {
+            break;
+        }
+    }
+
+    response
 }
 
 #[tokio::test]
@@ -193,6 +212,110 @@ async fn test_capabilities_allowed_before_auth_in_per_command_mode() {
         line.starts_with("200"),
         "unexpected CAPABILITIES response: {line:?}"
     );
+}
+
+#[tokio::test]
+async fn test_capabilities_advertise_proxy_auth_before_authentication() {
+    for (backend_port, routing_mode) in [
+        (19131, RoutingMode::Stateful),
+        (19132, RoutingMode::PerCommand),
+    ] {
+        let _backend_handle = MockNntpServer::new(backend_port)
+            .with_name("test-backend")
+            .on_command(
+                "CAPABILITIES",
+                "101 Capability list\r\nVERSION 2\r\nREADER\r\nAUTHINFO SASL\r\nSASL PLAIN\r\n.\r\n",
+            )
+            .spawn();
+        wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+            .await
+            .unwrap();
+
+        let proxy_addr = spawn_proxy_with_auth(backend_port, "user", "pass", routing_mode).await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let (reader, mut writer) = client.split();
+        let mut reader = BufReader::new(reader);
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("200"));
+
+        writer.write_all(b"CAPABILITIES\r\n").await.unwrap();
+        let response = read_multiline_response(&mut reader).await;
+
+        assert!(
+            response.contains("\r\nAUTHINFO USER\r\n"),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+        assert!(
+            !response.contains("AUTHINFO SASL"),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+        assert!(
+            !response.contains("\r\nSASL "),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_capabilities_hide_auth_after_successful_authentication() {
+    for (backend_port, routing_mode) in [
+        (19133, RoutingMode::Stateful),
+        (19134, RoutingMode::PerCommand),
+    ] {
+        let _backend_handle = MockNntpServer::new(backend_port)
+            .with_name("test-backend")
+            .on_command(
+                "CAPABILITIES",
+                "101 Capability list\r\nVERSION 2\r\nREADER\r\nMODE-READER\r\nAUTHINFO USER SASL\r\nSASL PLAIN\r\n.\r\n",
+            )
+            .spawn();
+        wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+            .await
+            .unwrap();
+
+        let proxy_addr = spawn_proxy_with_auth(backend_port, "user", "pass", routing_mode).await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let (reader, mut writer) = client.split();
+        let mut reader = BufReader::new(reader);
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("200"));
+
+        writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("381"));
+
+        writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("281"));
+
+        writer.write_all(b"CAPABILITIES\r\n").await.unwrap();
+        let response = read_multiline_response(&mut reader).await;
+
+        assert!(
+            !response.contains("\r\nAUTHINFO"),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+        assert!(
+            !response.contains("\r\nSASL "),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+        assert!(
+            !response.contains("\r\nMODE-READER\r\n"),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+        assert!(
+            response.contains("\r\nREADER\r\n"),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+    }
 }
 
 #[tokio::test]
