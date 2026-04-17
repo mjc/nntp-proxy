@@ -381,10 +381,10 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let config = create_test_config(vec![(mock_port, "TestServer")]);
+    let config = create_test_config_with_auth(vec![mock_port], "testuser", "testpass");
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    spawn_test_proxy(proxy, proxy_port, false).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;

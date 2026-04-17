@@ -46,137 +46,134 @@ impl PartialOrd for LoadRatio {
     }
 }
 
-/// Atomic counter for pending requests on a backend
-#[derive(Debug, Clone, Display, From, AsRef, Deref)]
-#[display("PendingCount({})", "_0.load(Ordering::Relaxed)")]
-pub struct PendingCount(Arc<AtomicUsize>);
-
-// Manual PartialEq because Arc<AtomicUsize> doesn't auto-derive
-impl PartialEq for PendingCount {
-    fn eq(&self, other: &Self) -> bool {
-        self.get() == other.get()
-    }
+#[inline]
+fn new_counter() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
 }
 
-impl PartialEq<usize> for PendingCount {
-    fn eq(&self, other: &usize) -> bool {
-        self.get() == *other
-    }
+#[inline]
+fn counter_value(counter: &Arc<AtomicUsize>) -> usize {
+    counter.load(Ordering::Relaxed)
 }
 
-impl Eq for PendingCount {}
+fn try_acquire_below(counter: &AtomicUsize, max: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= max {
+            return false;
+        }
 
-impl PendingCount {
-    /// Create a new pending count initialized to zero
-    #[inline]
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Arc::new(AtomicUsize::new(0)))
-    }
-
-    /// Increment the pending count
-    #[inline]
-    pub fn increment(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement the pending count
-    #[inline]
-    pub fn decrement(&self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Get the current pending count
-    #[inline]
-    #[must_use]
-    pub fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-impl Default for PendingCount {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Atomic counter for stateful connections on a backend
-#[derive(Debug, Clone, Display, From, AsRef, Deref)]
-#[display("StatefulCount({})", "_0.load(Ordering::Relaxed)")]
-pub struct StatefulCount(Arc<AtomicUsize>);
-
-// Manual PartialEq because Arc<AtomicUsize> doesn't auto-derive
-impl PartialEq for StatefulCount {
-    fn eq(&self, other: &Self) -> bool {
-        self.get() == other.get()
-    }
-}
-
-impl PartialEq<usize> for StatefulCount {
-    fn eq(&self, other: &usize) -> bool {
-        self.get() == *other
-    }
-}
-
-impl Eq for StatefulCount {}
-
-impl StatefulCount {
-    /// Create a new stateful count initialized to zero
-    #[inline]
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Arc::new(AtomicUsize::new(0)))
-    }
-
-    /// Get the current stateful count
-    #[inline]
-    #[must_use]
-    pub fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    /// Try to acquire a stateful slot (compare-exchange loop)
-    ///
-    /// Returns true if successfully incremented below max_stateful limit
-    pub fn try_acquire(&self, max_stateful: usize) -> bool {
-        let mut current = self.0.load(Ordering::Acquire);
-        loop {
-            if current >= max_stateful {
-                return false;
-            }
-
-            match self.0.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
         }
     }
-
-    /// Release a stateful slot (decrement if > 0)
-    ///
-    /// Returns Ok(previous_value) if successfully decremented, Err(0) if already zero
-    pub fn release(&self) -> Result<usize, usize> {
-        self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                if current == 0 {
-                    None
-                } else {
-                    Some(current - 1)
-                }
-            })
-    }
 }
 
-impl Default for StatefulCount {
-    fn default() -> Self {
-        Self::new()
-    }
+fn release_if_nonzero(counter: &AtomicUsize) -> Result<usize, usize> {
+    counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        if current == 0 {
+            None
+        } else {
+            Some(current - 1)
+        }
+    })
 }
+
+macro_rules! atomic_count_type {
+    (
+        $(#[$meta:meta])*
+        $name:ident,
+        $display_name:literal,
+        impl { $($methods:item)* }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Display, From, AsRef, Deref)]
+        #[display("{}({})", $display_name, _0.load(Ordering::Relaxed))]
+        pub struct $name(Arc<AtomicUsize>);
+
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.get() == other.get()
+            }
+        }
+
+        impl PartialEq<usize> for $name {
+            fn eq(&self, other: &usize) -> bool {
+                self.get() == *other
+            }
+        }
+
+        impl Eq for $name {}
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl $name {
+            #[inline]
+            #[must_use]
+            pub fn new() -> Self {
+                Self(new_counter())
+            }
+
+            #[inline]
+            #[must_use]
+            pub fn get(&self) -> usize {
+                counter_value(&self.0)
+            }
+
+            $($methods)*
+        }
+    };
+}
+
+atomic_count_type!(
+    /// Atomic counter for pending requests on a backend
+    PendingCount,
+    "PendingCount",
+    impl {
+        /// Increment the pending count
+        #[inline]
+        pub fn increment(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Decrement the pending count
+        #[inline]
+        pub fn decrement(&self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+);
+
+atomic_count_type!(
+    /// Atomic counter for stateful connections on a backend
+    StatefulCount,
+    "StatefulCount",
+    impl {
+        /// Try to acquire a stateful slot (compare-exchange loop)
+        ///
+        /// Returns true if successfully incremented below max_stateful limit
+        pub fn try_acquire(&self, max_stateful: usize) -> bool {
+            try_acquire_below(&self.0, max_stateful)
+        }
+
+        /// Release a stateful slot (decrement if > 0)
+        ///
+        /// Returns Ok(previous_value) if successfully decremented, Err(0) if already zero
+        pub fn release(&self) -> Result<usize, usize> {
+            release_if_nonzero(&self.0)
+        }
+    }
+);
 
 /// Backend connection information
 #[derive(Debug, Clone)]
@@ -210,5 +207,130 @@ impl BackendInfo {
         } else {
             LoadRatio::MAX
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn make_backend_info(max_size: usize) -> BackendInfo {
+        BackendInfo {
+            id: BackendId::from_index(0),
+            name: ServerName::try_new(format!("backend-{max_size}")).unwrap(),
+            provider: DeadpoolConnectionProvider::new(
+                "localhost".to_string(),
+                119,
+                format!("provider-{max_size}"),
+                max_size,
+                None,
+                None,
+            ),
+            pending_count: PendingCount::new(),
+            stateful_count: StatefulCount::new(),
+            tier: 0,
+            pipeline_queue: None,
+        }
+    }
+
+    #[test]
+    fn load_ratio_orders_as_expected() {
+        let low = LoadRatio::new(0.25);
+        let high = LoadRatio::new(0.75);
+
+        assert_eq!(LoadRatio::MIN.get(), 0.0);
+        assert_eq!(LoadRatio::MAX.get(), f64::MAX);
+        assert!(low < high);
+        assert!(high < LoadRatio::MAX);
+    }
+
+    #[test]
+    fn pending_count_shares_state_across_clones() {
+        let pending = PendingCount::new();
+        let clone = pending.clone();
+
+        pending.increment();
+        pending.increment();
+        assert_eq!(clone.get(), 2);
+        assert_eq!(pending, 2);
+
+        clone.decrement();
+        assert_eq!(pending.get(), 1);
+        assert_eq!(format!("{pending}"), "PendingCount(1)");
+        assert_eq!(pending, clone);
+    }
+
+    #[test]
+    fn pending_count_default_starts_at_zero() {
+        let pending = PendingCount::default();
+        assert_eq!(pending.get(), 0);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn stateful_count_try_acquire_enforces_limit() {
+        let count = StatefulCount::new();
+
+        assert!(count.try_acquire(2));
+        assert!(count.try_acquire(2));
+        assert!(!count.try_acquire(2));
+        assert_eq!(count.get(), 2);
+        assert_eq!(format!("{count}"), "StatefulCount(2)");
+    }
+
+    #[test]
+    fn stateful_count_release_reports_previous_value() {
+        let count = StatefulCount::new();
+        assert_eq!(count.release(), Err(0));
+
+        assert!(count.try_acquire(3));
+        assert!(count.try_acquire(3));
+        assert_eq!(count.release(), Ok(2));
+        assert_eq!(count.get(), 1);
+        assert_eq!(count.release(), Ok(1));
+        assert_eq!(count.release(), Err(0));
+    }
+
+    #[test]
+    fn stateful_count_concurrent_acquire_caps_successes() {
+        let count = Arc::new(StatefulCount::new());
+        let barrier = Arc::new(Barrier::new(8));
+        let mut threads = Vec::new();
+
+        for _ in 0..8 {
+            let count = count.clone();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                count.try_acquire(3)
+            }));
+        }
+
+        let successes = threads
+            .into_iter()
+            .map(|handle| handle.join().unwrap() as usize)
+            .sum::<usize>();
+
+        assert_eq!(successes, 3);
+        assert_eq!(count.get(), 3);
+    }
+
+    #[test]
+    fn backend_info_load_ratio_uses_pending_count_and_capacity() {
+        let backend = make_backend_info(4);
+        backend.pending_count.increment();
+        backend.pending_count.increment();
+
+        assert_eq!(backend.load_ratio(), LoadRatio::new(0.5));
+    }
+
+    #[test]
+    fn backend_info_zero_capacity_reports_max_load_ratio() {
+        let backend = make_backend_info(0);
+        backend.pending_count.increment();
+
+        assert_eq!(backend.load_ratio(), LoadRatio::MAX);
     }
 }
