@@ -224,7 +224,7 @@ async fn test_capabilities_advertise_proxy_auth_before_authentication() {
             .with_name("test-backend")
             .on_command(
                 "CAPABILITIES",
-                "101 Capability list\r\nVERSION 2\r\nREADER\r\nAUTHINFO SASL\r\nSASL PLAIN\r\n.\r\n",
+                "101 Capability list\r\nVERSION 2\r\nREADER\r\nMODE-READER\r\nAUTHINFO SASL\r\nSASL PLAIN\r\n.\r\n",
             )
             .spawn();
         wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
@@ -254,6 +254,10 @@ async fn test_capabilities_advertise_proxy_auth_before_authentication() {
         );
         assert!(
             !response.contains("\r\nSASL "),
+            "routing_mode={routing_mode:?} response={response:?}"
+        );
+        assert!(
+            !response.contains("\r\nMODE-READER\r\n"),
             "routing_mode={routing_mode:?} response={response:?}"
         );
     }
