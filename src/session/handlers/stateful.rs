@@ -2,6 +2,7 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
+use crate::session::handlers::capabilities;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -10,120 +11,6 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
-
-async fn read_capabilities_response<R>(
-    backend_read: &mut R,
-    first_chunk: &[u8],
-    first_chunk_size: usize,
-    is_multiline: bool,
-    buffer_pool: &crate::pool::BufferPool,
-) -> Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut response = Vec::with_capacity(first_chunk_size.saturating_add(128));
-    response.extend_from_slice(&first_chunk[..first_chunk_size]);
-
-    if !is_multiline || crate::protocol::has_multiline_terminator(&response) {
-        return Ok(response);
-    }
-
-    let mut buffer = buffer_pool.acquire().await;
-    loop {
-        let n = buffer.read_from(backend_read).await?;
-        if n == 0 {
-            anyhow::bail!("Backend EOF before CAPABILITIES terminator");
-        }
-
-        response.extend_from_slice(&buffer[..n]);
-        if crate::protocol::has_multiline_terminator(&response) {
-            return Ok(response);
-        }
-    }
-}
-
-fn rewrite_capabilities_response(response: &[u8], is_authenticated: bool) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(response) else {
-        return response.to_vec();
-    };
-
-    let mut lines = text.split_inclusive("\r\n");
-    let Some(status_line) = lines.next() else {
-        return response.to_vec();
-    };
-
-    if !status_line.starts_with("101") {
-        return response.to_vec();
-    }
-
-    let mut rewritten = String::with_capacity(text.len() + 16);
-    rewritten.push_str(status_line);
-
-    for line in lines {
-        if line == ".\r\n" {
-            if !is_authenticated {
-                rewritten.push_str("AUTHINFO USER\r\n");
-            }
-            rewritten.push_str(line);
-            return rewritten.into_bytes();
-        }
-
-        let capability = line.trim_end_matches("\r\n");
-        let keyword = capability.split_ascii_whitespace().next().unwrap_or("");
-
-        if keyword.eq_ignore_ascii_case("AUTHINFO") || keyword.eq_ignore_ascii_case("SASL") {
-            continue;
-        }
-
-        if is_authenticated && capability.eq_ignore_ascii_case("MODE-READER") {
-            continue;
-        }
-
-        rewritten.push_str(line);
-    }
-
-    response.to_vec()
-}
-
-async fn proxy_capabilities_command<BR, BW, CW>(
-    backend_read: &mut BR,
-    backend_write: &mut BW,
-    client_write: &mut CW,
-    command: &str,
-    buffer_pool: &crate::pool::BufferPool,
-    is_authenticated: bool,
-) -> Result<u64>
-where
-    BR: tokio::io::AsyncRead + Unpin,
-    BW: tokio::io::AsyncWrite + Unpin,
-    CW: tokio::io::AsyncWrite + Unpin,
-{
-    backend_write.write_all(command.as_bytes()).await?;
-
-    let mut first_chunk = buffer_pool.acquire().await;
-    let first_n = first_chunk.read_from(backend_read).await?;
-    if first_n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
-
-    let validated = crate::session::backend::validate_backend_response(
-        &first_chunk[..first_n],
-        first_n,
-        crate::protocol::MIN_RESPONSE_LENGTH,
-    );
-    let response = read_capabilities_response(
-        backend_read,
-        &first_chunk[..first_n],
-        first_n,
-        validated.is_multiline,
-        buffer_pool,
-    )
-    .await?;
-    let rewritten = rewrite_capabilities_response(&response, is_authenticated);
-
-    client_write.write_all(&rewritten).await?;
-    Ok(rewritten.len() as u64)
-}
 
 impl ClientSession {
     /// Handle stateful session - acquire backend and proxy bidirectionally
@@ -232,7 +119,7 @@ impl ClientSession {
                                 } else if self.auth_handler.is_enabled()
                                     && common::is_capabilities_command(&line)
                                 {
-                                    let bytes = proxy_capabilities_command(
+                                    let bytes = capabilities::proxy_command(
                                         &mut backend_read,
                                         &mut backend_write,
                                         &mut client_write,
@@ -256,7 +143,7 @@ impl ClientSession {
                                 }
 
                                 if common::is_capabilities_command(&line) {
-                                    let bytes = proxy_capabilities_command(
+                                    let bytes = capabilities::proxy_command(
                                         &mut backend_read,
                                         &mut backend_write,
                                         &mut client_write,

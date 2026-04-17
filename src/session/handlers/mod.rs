@@ -12,6 +12,7 @@
 
 mod article_retry;
 mod cache_operations;
+mod capabilities;
 mod command_execution;
 mod hybrid;
 mod per_command;
