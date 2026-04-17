@@ -1,7 +1,7 @@
 //! Client authentication handling
 
 use crate::command::AuthAction;
-use crate::protocol::{AUTH_ACCEPTED, AUTH_FAILED, AUTH_REQUIRED};
+use crate::protocol::{AUTH_ACCEPTED, AUTH_FAILED, AUTH_REQUIRED, AUTH_SEQUENCE_ERROR};
 use crate::types::{Password, Username, ValidationError};
 use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
@@ -111,12 +111,12 @@ impl AuthHandler {
             }
             AuthAction::ValidateAndRespond { password } => {
                 // Validate credentials
-                let auth_success = if let Some(username) = stored_username {
-                    self.validate_credentials(username, password)
-                } else {
-                    // No username was stored (client sent AUTHINFO PASS without USER)
-                    false
+                let Some(username) = stored_username else {
+                    writer.write_all(AUTH_SEQUENCE_ERROR).await?;
+                    return Ok((AUTH_SEQUENCE_ERROR.len(), false));
                 };
+
+                let auth_success = self.validate_credentials(username, password);
 
                 let response = if auth_success {
                     AUTH_ACCEPTED

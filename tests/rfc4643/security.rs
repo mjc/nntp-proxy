@@ -90,7 +90,7 @@ async fn test_password_without_username_rejected() {
     let handler = create_test_auth_handler();
 
     let mut output = Vec::new();
-    let (_, auth_success) = handler
+    let (bytes, auth_success) = handler
         .handle_auth_command(
             AuthAction::ValidateAndRespond { password: "pass" },
             &mut output,
@@ -101,6 +101,11 @@ async fn test_password_without_username_rejected() {
     assert!(
         !auth_success,
         "Password without username should not authenticate"
+    );
+    assert_eq!(bytes, output.len());
+    assert_eq!(
+        String::from_utf8_lossy(&output),
+        "482 Authentication commands issued out of sequence\r\n"
     );
 }
 

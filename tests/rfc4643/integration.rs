@@ -13,7 +13,51 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::test_helpers::wait_for_server;
 
-use nntp_proxy::config::UserCredentials;
+use nntp_proxy::config::{RoutingMode, UserCredentials};
+
+async fn spawn_proxy_with_auth(
+    backend_port: u16,
+    username: &str,
+    password: &str,
+    routing_mode: RoutingMode,
+) -> std::net::SocketAddr {
+    use crate::test_helpers::create_test_config;
+    use nntp_proxy::config::ClientAuth;
+
+    let mut config = create_test_config(vec![(backend_port, "backend-1")]);
+    config.client_auth = ClientAuth {
+        users: vec![UserCredentials {
+            username: username.to_string(),
+            password: password.to_string(),
+        }],
+        greeting: None,
+    };
+
+    let proxy = Arc::new(
+        nntp_proxy::NntpProxy::new(config, routing_mode)
+            .await
+            .unwrap(),
+    );
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let proxy_clone = proxy.clone();
+    tokio::spawn(async move {
+        if let Ok((stream, addr)) = proxy_listener.accept().await {
+            let _ = match routing_mode {
+                RoutingMode::PerCommand | RoutingMode::Hybrid => {
+                    proxy_clone
+                        .handle_client_per_command_routing(stream, addr.into())
+                        .await
+                }
+                RoutingMode::Stateful => proxy_clone.handle_client(stream, addr.into()).await,
+            };
+        }
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    proxy_addr
+}
 
 #[tokio::test]
 async fn test_auth_flow_complete_with_valid_credentials() {
@@ -93,6 +137,188 @@ async fn test_auth_flow_complete_with_valid_credentials() {
     // Should get response from backend (not auth related)
     assert!(!line.starts_with("381"));
     assert!(!line.starts_with("481"));
+}
+
+#[tokio::test]
+async fn test_capabilities_allowed_before_auth_in_stateful_mode() {
+    let backend_port = 19123;
+    let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::Stateful).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"CAPABILITIES\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        line.starts_with("200"),
+        "unexpected CAPABILITIES response: {line:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_capabilities_allowed_before_auth_in_per_command_mode() {
+    let backend_port = 19126;
+    let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::PerCommand).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"cApAbIlItIeS\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(
+        line.starts_with("200"),
+        "unexpected CAPABILITIES response: {line:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_quit_allowed_before_auth_in_stateful_mode() {
+    let backend_port = 19124;
+    let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::Stateful).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"QUIT\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("205"));
+}
+
+#[tokio::test]
+async fn test_authinfo_rejected_after_successful_authentication() {
+    let backend_port = 19125;
+    let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::Stateful).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("381"));
+
+    writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("281"));
+
+    writer.write_all(b"AuthInfo\tUser user\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("502"));
+}
+
+#[tokio::test]
+async fn test_pass_before_user_returns_sequence_error_in_stateful_mode() {
+    let backend_port = 19127;
+    let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::Stateful).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "482 Authentication commands issued out of sequence\r\n"
+    );
+}
+
+#[tokio::test]
+async fn test_authinfo_rejected_after_successful_authentication_in_per_command_mode() {
+    let backend_port = 19128;
+    let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::PerCommand).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("381"));
+
+    writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("281"));
+
+    writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        line,
+        "502 Authentication commands invalid after authentication\r\n"
+    );
 }
 
 #[tokio::test]

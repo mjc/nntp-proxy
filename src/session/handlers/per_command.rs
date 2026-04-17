@@ -185,6 +185,17 @@ impl ClientSession {
                     auth_succeeded: false,
                 })
             }
+
+            CommandRoutingDecision::RejectAuthSequence => {
+                debug!("Client {} decision: RejectAuthSequence", self.client_addr);
+                use crate::protocol::AUTHINFO_ALREADY_ACCEPTED;
+                client_write.write_all(AUTHINFO_ALREADY_ACCEPTED).await?;
+                *backend_to_client_bytes =
+                    backend_to_client_bytes.add(AUTHINFO_ALREADY_ACCEPTED.len());
+                Ok(CommandResult::Continue {
+                    auth_succeeded: false,
+                })
+            }
         }
     }
 

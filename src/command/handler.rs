@@ -44,28 +44,49 @@ pub enum AuthAction<'a> {
 /// Handler for processing commands and determining actions
 pub struct CommandHandler;
 
+fn auth_argument<'a>(command: &'a str, expected_subcommand: &[u8]) -> &'a str {
+    let trimmed = command.trim();
+    let bytes = trimmed.as_bytes();
+    let Some(command_end) = memchr::memchr2(b' ', b'\t', bytes) else {
+        return "";
+    };
+
+    if !bytes[..command_end].eq_ignore_ascii_case(b"AUTHINFO") {
+        return "";
+    }
+
+    let mut sub_start = command_end;
+    while sub_start < bytes.len() && matches!(bytes[sub_start], b' ' | b'\t') {
+        sub_start += 1;
+    }
+    if sub_start >= bytes.len() {
+        return "";
+    }
+
+    let sub_end = sub_start
+        + memchr::memchr2(b' ', b'\t', &bytes[sub_start..]).unwrap_or(bytes.len() - sub_start);
+    if !bytes[sub_start..sub_end].eq_ignore_ascii_case(expected_subcommand) {
+        return "";
+    }
+
+    let mut arg_start = sub_end;
+    while arg_start < bytes.len() && matches!(bytes[arg_start], b' ' | b'\t') {
+        arg_start += 1;
+    }
+
+    &trimmed[arg_start..]
+}
+
 impl CommandHandler {
     /// Classify a command and return the action to take
     pub fn classify(command: &str) -> CommandAction<'_> {
         match NntpCommand::parse(command) {
             NntpCommand::AuthUser => {
-                // Extract username from "AUTHINFO USER <username>" (zero-allocation)
-                let username = command
-                    .trim()
-                    .strip_prefix("AUTHINFO USER")
-                    .or_else(|| command.trim().strip_prefix("authinfo user"))
-                    .unwrap_or("")
-                    .trim();
+                let username = auth_argument(command, b"USER");
                 CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
             }
             NntpCommand::AuthPass => {
-                // Extract password from "AUTHINFO PASS <password>" (zero-allocation)
-                let password = command
-                    .trim()
-                    .strip_prefix("AUTHINFO PASS")
-                    .or_else(|| command.trim().strip_prefix("authinfo pass"))
-                    .unwrap_or("")
-                    .trim();
+                let password = auth_argument(command, b"PASS");
                 CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
             }
             NntpCommand::Stateful => {
@@ -103,6 +124,21 @@ mod tests {
         assert!(matches!(
             action,
             CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if password == "secret"
+        ));
+    }
+
+    #[test]
+    fn test_mixed_case_and_tab_separated_auth_commands() {
+        let user = CommandHandler::classify("AuthInfo\tUser test");
+        assert!(matches!(
+            user,
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username == "test"
+        ));
+
+        let pass = CommandHandler::classify("aUtHiNfO\tPaSs pass phrase");
+        assert!(matches!(
+            pass,
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if password == "pass phrase"
         ));
     }
 

@@ -83,6 +83,22 @@ where
     }
 }
 
+#[inline]
+pub(crate) fn is_capabilities_command(command: &str) -> bool {
+    command
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("CAPABILITIES"))
+}
+
+#[inline]
+pub(crate) fn is_authinfo_command(command: &str) -> bool {
+    command
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("AUTHINFO"))
+}
+
 /// Handle successful authentication with all side effects
 ///
 /// Sets username, records connection stats, updates metrics

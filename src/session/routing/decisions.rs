@@ -19,6 +19,8 @@ pub(crate) enum CommandRoutingDecision {
     SwitchToStateful,
     /// Reject the command
     Reject,
+    /// Reject AUTHINFO after successful authentication
+    RejectAuthSequence,
 }
 
 /// Determine how to handle a command based on auth state and routing mode
@@ -43,14 +45,19 @@ pub(crate) fn decide_command_routing(
 
     // Classify the command
     let action = CommandHandler::classify(command);
+    let is_capabilities = command
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("CAPABILITIES"));
 
     match action {
-        // Auth commands - ALWAYS intercept
+        InterceptAuth(_) if !auth_enabled => CommandRoutingDecision::Forward,
+        InterceptAuth(_) if is_authenticated => CommandRoutingDecision::RejectAuthSequence,
         InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
 
         // Stateless commands
         ForwardStateless => {
-            if is_authenticated || !auth_enabled {
+            if is_authenticated || !auth_enabled || is_capabilities {
                 CommandRoutingDecision::Forward
             } else {
                 CommandRoutingDecision::RequireAuth
@@ -78,7 +85,7 @@ mod tests {
         // Auth commands should always be intercepted regardless of other flags
         assert_eq!(
             decide_command_routing("AUTHINFO USER test", true, true, RoutingMode::PerCommand),
-            CommandRoutingDecision::InterceptAuth
+            CommandRoutingDecision::RejectAuthSequence
         );
         assert_eq!(
             decide_command_routing("AUTHINFO USER test", false, true, RoutingMode::PerCommand),
@@ -86,7 +93,7 @@ mod tests {
         );
         assert_eq!(
             decide_command_routing("AUTHINFO USER test", false, false, RoutingMode::Stateful),
-            CommandRoutingDecision::InterceptAuth
+            CommandRoutingDecision::Forward
         );
     }
 
@@ -118,6 +125,18 @@ mod tests {
         assert_eq!(
             decide_command_routing("LIST", false, true, RoutingMode::PerCommand),
             CommandRoutingDecision::RequireAuth
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_capabilities_allowed_before_auth() {
+        assert_eq!(
+            decide_command_routing("CAPABILITIES", false, true, RoutingMode::PerCommand),
+            CommandRoutingDecision::Forward
+        );
+        assert_eq!(
+            decide_command_routing("cApAbIlItIeS", false, true, RoutingMode::Stateful),
+            CommandRoutingDecision::Forward
         );
     }
 

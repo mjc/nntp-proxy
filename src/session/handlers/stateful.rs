@@ -108,10 +108,32 @@ impl ClientSession {
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
-                                // Hot path: forward directly
-                                backend_write.write_all(line.as_bytes()).await?;
-                                state.add_client_to_backend(line.len());
+                                if common::is_authinfo_command(&line) && self.auth_handler.is_enabled() {
+                                    client_write
+                                        .write_all(crate::protocol::AUTHINFO_ALREADY_ACCEPTED)
+                                        .await?;
+                                    state.add_backend_to_client(
+                                        crate::protocol::AUTHINFO_ALREADY_ACCEPTED.len() as u64,
+                                    );
+                                } else {
+                                    // Hot path: forward directly
+                                    backend_write.write_all(line.as_bytes()).await?;
+                                    state.add_client_to_backend(line.len());
+                                }
                             } else {
+                                if let common::QuitStatus::Quit(bytes) =
+                                    common::handle_quit_command(&line, &mut client_write).await?
+                                {
+                                    state.add_backend_to_client(bytes.as_u64());
+                                    break;
+                                }
+
+                                if common::is_capabilities_command(&line) {
+                                    backend_write.write_all(line.as_bytes()).await?;
+                                    state.add_client_to_backend(line.len());
+                                    continue;
+                                }
+
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
                                     &line,

@@ -312,8 +312,20 @@ command_cases!(
 /// Uses const generic to support flexible case counts at compile time.
 #[inline(always)]
 pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
-    // Compiler optimizes contains() to unrolled comparisons for small N
-    cases.contains(&cmd)
+    cmd.eq_ignore_ascii_case(cases[0])
+}
+
+#[inline(always)]
+fn command_word_end(bytes: &[u8]) -> usize {
+    memchr::memchr2(b' ', b'\t', bytes).unwrap_or(bytes.len())
+}
+
+#[inline(always)]
+fn skip_horizontal_whitespace(bytes: &[u8], mut idx: usize) -> usize {
+    while idx < bytes.len() && matches!(bytes[idx], b' ' | b'\t') {
+        idx += 1;
+    }
+    idx
 }
 
 /// Check if a command is a large transfer command (ARTICLE or BODY)
@@ -323,7 +335,7 @@ pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
 #[inline(always)]
 #[must_use]
 pub fn is_large_transfer_command(cmd: &[u8]) -> bool {
-    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    let end = command_word_end(cmd);
     end >= 4 && (matches_any(&cmd[..end], ARTICLE_CASES) || matches_any(&cmd[..end], BODY_CASES))
 }
 
@@ -334,7 +346,7 @@ pub fn is_large_transfer_command(cmd: &[u8]) -> bool {
 #[inline(always)]
 #[must_use]
 pub fn is_stat_command(cmd: &[u8]) -> bool {
-    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    let end = command_word_end(cmd);
     end >= 4 && matches_any(&cmd[..end], STAT_CASES)
 }
 
@@ -345,87 +357,8 @@ pub fn is_stat_command(cmd: &[u8]) -> bool {
 #[inline(always)]
 #[must_use]
 pub fn is_head_command(cmd: &[u8]) -> bool {
-    let end = memchr::memchr(b' ', cmd).unwrap_or(cmd.len());
+    let end = command_word_end(cmd);
     end >= 4 && matches_any(&cmd[..end], HEAD_CASES)
-}
-
-/// Ultra-fast detection of article retrieval commands with message-ID
-///
-/// **THE CRITICAL HOT PATH** for NZB downloads and binary retrieval (70%+ of traffic).
-/// Combines command matching AND message-ID detection in a single pass.
-///
-/// Per [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2),
-/// article retrieval commands (ARTICLE/BODY/HEAD/STAT) can take a message-ID
-/// argument in the form `<message-id>`. This function identifies these commands
-/// in one pass without allocations.
-///
-/// ## Performance: 4-6ns per command on modern CPUs
-/// - Compiler auto-vectorizes slice comparisons (uses SIMD when beneficial)
-/// - Branch predictor friendly: UPPERCASE checked first (95% hit rate)
-/// - Direct array indexing (no iterators)
-/// - Zero allocations
-///
-/// ## Detected Commands
-/// - `ARTICLE <msgid>` - [RFC 3977 §6.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.1)
-/// - `BODY <msgid>` - [RFC 3977 §6.2.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.3)
-/// - `HEAD <msgid>` - [RFC 3977 §6.2.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.2)
-/// - `STAT <msgid>` - [RFC 3977 §6.2.4](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.4)
-///
-/// ## Message-ID Format
-/// Per [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2),
-/// message-IDs start with '<' and end with '>', e.g., `<article@example.com>`.
-/// This function only checks for the opening '<' for speed.
-#[inline(always)]
-fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
-    let len = bytes.len();
-
-    // Minimum valid command: "BODY <x>" = 7 bytes
-    if len < 7 {
-        return false;
-    }
-
-    // Fast path for 4-letter commands: BODY, HEAD, STAT (5 bytes + '<')
-    // Compiler will use SIMD (SSE/AVX) for these byte comparisons on x86_64
-    if len >= 6 {
-        // Check UPPERCASE first (95% of real traffic)
-        // Each comparison: compiler may use SIMD pcmpeq or similar
-        if bytes[0..5] == *b"BODY " && bytes[5] == b'<' {
-            return true;
-        }
-        if bytes[0..5] == *b"HEAD " && bytes[5] == b'<' {
-            return true;
-        }
-        if bytes[0..5] == *b"STAT " && bytes[5] == b'<' {
-            return true;
-        }
-
-        // Lowercase/Titlecase (rare, ~5% of traffic)
-        if (bytes[0..5] == *b"body " || bytes[0..5] == *b"Body ") && bytes[5] == b'<' {
-            return true;
-        }
-        if (bytes[0..5] == *b"head " || bytes[0..5] == *b"Head ") && bytes[5] == b'<' {
-            return true;
-        }
-        if (bytes[0..5] == *b"stat " || bytes[0..5] == *b"Stat ") && bytes[5] == b'<' {
-            return true;
-        }
-    }
-
-    // Check for "ARTICLE <" (8 bytes + '<' = 9 bytes minimum)
-    // Compiler will vectorize 8-byte comparison
-    if len >= 9 {
-        // UPPERCASE first
-        if bytes[0..8] == *b"ARTICLE " && bytes[8] == b'<' {
-            return true;
-        }
-
-        // lowercase/Titlecase (rare)
-        if (bytes[0..8] == *b"article " || bytes[0..8] == *b"Article ") && bytes[8] == b'<' {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// NNTP command classification for routing and handling strategy
@@ -544,22 +477,13 @@ impl NntpCommand {
         let bytes = trimmed.as_bytes();
 
         // ═════════════════════════════════════════════════════════════════
-        // CRITICAL HOT PATH: Article retrieval by message-ID (70%+ of traffic)
-        // ═════════════════════════════════════════════════════════════════
-        // Returns in 4-6ns for: ARTICLE <msgid>, BODY <msgid>, HEAD <msgid>, STAT <msgid>
-        // Per [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2)
-        if is_article_cmd_with_msgid(bytes) {
-            return Self::ArticleByMessageId;
-        }
-
-        // ═════════════════════════════════════════════════════════════════
         // Standard path: Parse command word and classify
         // ═════════════════════════════════════════════════════════════════
 
         // Split on first space to separate command from arguments
         // Per [RFC 3977 §3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.1):
         // "Commands consist of a keyword possibly followed by arguments, separated by space"
-        let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+        let cmd_end = command_word_end(bytes);
         let cmd = &bytes[..cmd_end];
 
         // Article retrieval commands WITHOUT message-ID (by number or current article)
@@ -571,7 +495,12 @@ impl NntpCommand {
             || matches_any(cmd, HEAD_CASES)
             || matches_any(cmd, STAT_CASES)
         {
-            return Self::Stateful;
+            let arg_start = skip_horizontal_whitespace(bytes, cmd_end);
+            return if arg_start < bytes.len() && bytes[arg_start] == b'<' {
+                Self::ArticleByMessageId
+            } else {
+                Self::Stateful
+            };
         }
 
         // GROUP - switch newsgroup context (~10% of traffic) → Stateful
@@ -646,20 +575,20 @@ impl NntpCommand {
     /// This function extracts and classifies the subcommand.
     #[inline]
     fn parse_authinfo(bytes: &[u8], cmd_end: usize) -> Self {
-        if cmd_end + 1 >= bytes.len() {
+        let sub_start = skip_horizontal_whitespace(bytes, cmd_end);
+        if sub_start >= bytes.len() {
             return Self::Stateless; // AUTHINFO without args
         }
 
-        let args = &bytes[cmd_end + 1..];
-        if args.len() < 4 {
-            return Self::Stateless; // AUTHINFO with short args
-        }
+        let sub_end = sub_start + command_word_end(&bytes[sub_start..]);
+        let subcommand = &bytes[sub_start..sub_end];
 
-        // Check first 4 bytes of argument
-        match &args[..4] {
-            b"USER" | b"user" | b"User" => Self::AuthUser,
-            b"PASS" | b"pass" | b"Pass" => Self::AuthPass,
-            _ => Self::Stateless, // AUTHINFO with other args
+        if subcommand.eq_ignore_ascii_case(b"USER") {
+            Self::AuthUser
+        } else if subcommand.eq_ignore_ascii_case(b"PASS") {
+            Self::AuthPass
+        } else {
+            Self::Stateless
         }
     }
 }
@@ -734,9 +663,11 @@ mod tests {
         // Commands should be case-insensitive per NNTP spec
         assert_eq!(NntpCommand::parse("list"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("LiSt"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("cApAbIlItIeS"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("QUIT"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("quit"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("group alt.test"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("gRoUp alt.test"), NntpCommand::Stateful);
         assert_eq!(NntpCommand::parse("GROUP alt.test"), NntpCommand::Stateful);
     }
 
@@ -768,6 +699,18 @@ mod tests {
 
         // AUTHINFO PASS without password
         assert_eq!(NntpCommand::parse("AUTHINFO PASS"), NntpCommand::AuthPass);
+    }
+
+    #[test]
+    fn test_authinfo_with_tabs_and_mixed_case() {
+        assert_eq!(
+            NntpCommand::parse("AuthInfo\tUser testuser"),
+            NntpCommand::AuthUser
+        );
+        assert_eq!(
+            NntpCommand::parse("aUtHiNfO\tPaSs secret"),
+            NntpCommand::AuthPass
+        );
     }
 
     #[test]
@@ -837,6 +780,12 @@ mod tests {
 
         // Command with tabs
         assert_eq!(NntpCommand::parse("LIST\tACTIVE"), NntpCommand::Stateless);
+
+        // Article commands should also accept horizontal whitespace before message-ID
+        assert_eq!(
+            NntpCommand::parse("ARTICLE \t <test@example.com>"),
+            NntpCommand::ArticleByMessageId
+        );
     }
 
     #[test]
