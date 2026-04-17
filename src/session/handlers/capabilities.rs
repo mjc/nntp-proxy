@@ -66,7 +66,7 @@ pub(super) fn rewrite_response(response: &[u8], is_authenticated: bool) -> Vec<u
             continue;
         }
 
-        if is_authenticated && capability.eq_ignore_ascii_case("MODE-READER") {
+        if capability.eq_ignore_ascii_case("MODE-READER") {
             continue;
         }
 
@@ -122,14 +122,14 @@ mod tests {
 
     #[test]
     fn test_rewrite_capability_response_before_authentication() {
-        let response =
-            b"101 Capability list\r\nVERSION 2\r\nREADER\r\nAUTHINFO SASL\r\nSASL PLAIN\r\n.\r\n";
+        let response = b"101 Capability list\r\nVERSION 2\r\nREADER\r\nMODE-READER\r\nAUTHINFO SASL\r\nSASL PLAIN\r\n.\r\n";
 
         let rewritten = String::from_utf8(rewrite_response(response, false)).unwrap();
 
         assert!(rewritten.contains("\r\nAUTHINFO USER\r\n"));
         assert!(!rewritten.contains("AUTHINFO SASL"));
         assert!(!rewritten.contains("\r\nSASL "));
+        assert!(!rewritten.contains("\r\nMODE-READER\r\n"));
         assert!(rewritten.contains("\r\nREADER\r\n"));
     }
 
