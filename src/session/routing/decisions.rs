@@ -21,6 +21,8 @@ pub(crate) enum CommandRoutingDecision {
     Reject,
     /// Reject AUTHINFO after successful authentication
     RejectAuthSequence,
+    /// Reject MODE READER after successful authentication
+    RejectModeReaderAfterAuth,
 }
 
 /// Determine how to handle a command based on auth state and routing mode
@@ -49,6 +51,7 @@ pub(crate) fn decide_command_routing(
         .split_ascii_whitespace()
         .next()
         .is_some_and(|keyword| keyword.eq_ignore_ascii_case("CAPABILITIES"));
+    let is_mode_reader = crate::session::common::is_mode_reader_command(command);
 
     match action {
         InterceptAuth(_) if !auth_enabled => CommandRoutingDecision::Forward,
@@ -57,7 +60,9 @@ pub(crate) fn decide_command_routing(
 
         // Stateless commands
         ForwardStateless => {
-            if is_authenticated || !auth_enabled || is_capabilities {
+            if is_authenticated && auth_enabled && is_mode_reader {
+                CommandRoutingDecision::RejectModeReaderAfterAuth
+            } else if is_authenticated || !auth_enabled || is_capabilities {
                 CommandRoutingDecision::Forward
             } else {
                 CommandRoutingDecision::RequireAuth
@@ -136,6 +141,26 @@ mod tests {
         );
         assert_eq!(
             decide_command_routing("cApAbIlItIeS", false, true, RoutingMode::Stateful),
+            CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_mode_reader_rejected_after_authentication() {
+        assert_eq!(
+            decide_command_routing("MODE READER", true, true, RoutingMode::PerCommand),
+            CommandRoutingDecision::RejectModeReaderAfterAuth
+        );
+        assert_eq!(
+            decide_command_routing("mode reader", true, true, RoutingMode::Stateful),
+            CommandRoutingDecision::RejectModeReaderAfterAuth
+        );
+        assert_eq!(
+            decide_command_routing("MODE READER", false, true, RoutingMode::PerCommand),
+            CommandRoutingDecision::RequireAuth
+        );
+        assert_eq!(
+            decide_command_routing("MODE READER", true, false, RoutingMode::PerCommand),
             CommandRoutingDecision::Forward
         );
     }

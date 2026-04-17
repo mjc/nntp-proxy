@@ -99,6 +99,17 @@ pub(crate) fn is_authinfo_command(command: &str) -> bool {
         .is_some_and(|keyword| keyword.eq_ignore_ascii_case("AUTHINFO"))
 }
 
+#[inline]
+pub(crate) fn is_mode_reader_command(command: &str) -> bool {
+    let mut parts = command.split_ascii_whitespace();
+    parts
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("MODE"))
+        && parts
+            .next()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("READER"))
+}
+
 /// Handle successful authentication with all side effects
 ///
 /// Sets username, records connection stats, updates metrics

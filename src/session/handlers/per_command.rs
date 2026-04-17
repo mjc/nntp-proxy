@@ -196,6 +196,22 @@ impl ClientSession {
                     auth_succeeded: false,
                 })
             }
+
+            CommandRoutingDecision::RejectModeReaderAfterAuth => {
+                debug!(
+                    "Client {} decision: RejectModeReaderAfterAuth",
+                    self.client_addr
+                );
+                use crate::protocol::MODE_READER_UNAVAILABLE_AFTER_AUTH;
+                client_write
+                    .write_all(MODE_READER_UNAVAILABLE_AFTER_AUTH)
+                    .await?;
+                *backend_to_client_bytes =
+                    backend_to_client_bytes.add(MODE_READER_UNAVAILABLE_AFTER_AUTH.len());
+                Ok(CommandResult::Continue {
+                    auth_succeeded: false,
+                })
+            }
         }
     }
 

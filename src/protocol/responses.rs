@@ -46,6 +46,10 @@ pub const AUTH_REQUIRED_FOR_COMMAND: &[u8] = b"480 Authentication required\r\n";
 pub const AUTHINFO_ALREADY_ACCEPTED: &[u8] =
     b"502 Authentication commands invalid after authentication\r\n";
 
+/// MODE READER is invalid after successful authentication (502)
+pub const MODE_READER_UNAVAILABLE_AFTER_AUTH: &[u8] =
+    b"502 Command unavailable after authentication\r\n";
+
 // Standard responses
 
 /// Proxy greeting for per-command routing mode (200)
@@ -209,6 +213,10 @@ mod tests {
             AUTHINFO_ALREADY_ACCEPTED,
             b"502 Authentication commands invalid after authentication\r\n"
         );
+        assert_eq!(
+            MODE_READER_UNAVAILABLE_AFTER_AUTH,
+            b"502 Command unavailable after authentication\r\n"
+        );
     }
 
     #[test]
@@ -234,6 +242,7 @@ mod tests {
         assert!(AUTH_SEQUENCE_ERROR.ends_with(CRLF));
         assert!(AUTH_REQUIRED_FOR_COMMAND.ends_with(CRLF));
         assert!(AUTHINFO_ALREADY_ACCEPTED.ends_with(CRLF));
+        assert!(MODE_READER_UNAVAILABLE_AFTER_AUTH.ends_with(CRLF));
         assert!(PROXY_GREETING_PCR.ends_with(CRLF));
         assert!(CONNECTION_CLOSING.ends_with(CRLF));
         assert!(GOODBYE.ends_with(CRLF));

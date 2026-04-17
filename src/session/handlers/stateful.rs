@@ -117,6 +117,15 @@ impl ClientSession {
                                         crate::protocol::AUTHINFO_ALREADY_ACCEPTED.len() as u64,
                                     );
                                 } else if self.auth_handler.is_enabled()
+                                    && common::is_mode_reader_command(&line)
+                                {
+                                    client_write
+                                        .write_all(crate::protocol::MODE_READER_UNAVAILABLE_AFTER_AUTH)
+                                        .await?;
+                                    state.add_backend_to_client(
+                                        crate::protocol::MODE_READER_UNAVAILABLE_AFTER_AUTH.len() as u64,
+                                    );
+                                } else if self.auth_handler.is_enabled()
                                     && common::is_capabilities_command(&line)
                                 {
                                     let bytes = capabilities::proxy_command(
