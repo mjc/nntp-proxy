@@ -319,6 +319,82 @@ async fn test_capabilities_hide_auth_after_successful_authentication() {
 }
 
 #[tokio::test]
+async fn test_mode_reader_rejected_after_successful_authentication_in_stateful_mode() {
+    let backend_port = 19135;
+    let _backend_handle = MockNntpServer::new(backend_port)
+        .with_name("test-backend")
+        .on_command("MODE", "201 Reader mode acknowledged\r\n")
+        .spawn();
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::Stateful).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("381"));
+
+    writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("281"));
+
+    writer.write_all(b"MODE READER\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "502 Command unavailable after authentication\r\n");
+}
+
+#[tokio::test]
+async fn test_mode_reader_rejected_after_successful_authentication_in_per_command_mode() {
+    let backend_port = 19136;
+    let _backend_handle = MockNntpServer::new(backend_port)
+        .with_name("test-backend")
+        .on_command("MODE", "201 Reader mode acknowledged\r\n")
+        .spawn();
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+        .await
+        .unwrap();
+
+    let proxy_addr =
+        spawn_proxy_with_auth(backend_port, "user", "pass", RoutingMode::PerCommand).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let (reader, mut writer) = client.split();
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("200"));
+
+    writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("381"));
+
+    writer.write_all(b"AUTHINFO PASS pass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("281"));
+
+    writer.write_all(b"MODE READER\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "502 Command unavailable after authentication\r\n");
+}
+
+#[tokio::test]
 async fn test_quit_allowed_before_auth_in_stateful_mode() {
     let backend_port = 19124;
     let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
