@@ -420,7 +420,9 @@ impl ClientSession {
         // throughput. These commands fall through to the direct streaming path
         // which gives each client its own pooled connection (~120 MB/s).
         let cmd_bytes = command.as_bytes();
-        let is_large_transfer = is_large_transfer_command(cmd_bytes);
+        let is_large_transfer = is_large_transfer_command(cmd_bytes)
+            || (self.auth_handler.is_enabled()
+                && crate::session::common::is_capabilities_command(command));
 
         // Try pipeline path: if the routed backend has a pipeline queue, enqueue
         // the command and await the response instead of acquiring a direct connection.
