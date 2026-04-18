@@ -286,8 +286,9 @@ mod tests {
 
     #[test]
     fn test_status_code_multiline() {
-        // All 1xx are multiline
-        assert!(StatusCode::new(111).is_multiline());
+        assert!(StatusCode::new(100).is_multiline());
+        assert!(StatusCode::new(101).is_multiline());
+        assert!(!StatusCode::new(111).is_multiline());
         // Specific 2xx multiline codes
         assert!(StatusCode::new(220).is_multiline());
         assert!(!StatusCode::new(200).is_multiline());
@@ -361,6 +362,14 @@ mod tests {
             NntpResponse::parse(b"100 Help\r\n"),
             NntpResponse::MultilineData(_)
         ));
+        assert!(matches!(
+            NntpResponse::parse(b"101 Capability list\r\n"),
+            NntpResponse::MultilineData(_)
+        ));
+        assert!(matches!(
+            NntpResponse::parse(b"111 20251215120000\r\n"),
+            NntpResponse::SingleLine(_)
+        ));
 
         // Single-line
         assert!(matches!(
@@ -391,6 +400,7 @@ mod tests {
     fn test_response_is_multiline() {
         assert!(NntpResponse::parse(b"220 Article\r\n").is_multiline());
         assert!(NntpResponse::parse(b"215 LIST\r\n").is_multiline());
+        assert!(!NntpResponse::parse(b"111 20251215120000\r\n").is_multiline());
         assert!(!NntpResponse::parse(b"200 OK\r\n").is_multiline());
         assert!(!NntpResponse::parse(b"211 Group\r\n").is_multiline());
     }

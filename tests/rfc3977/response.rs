@@ -180,7 +180,7 @@ fn test_response_101_capability_list() {
 fn test_response_111_server_date() {
     let code = StatusCode::new(111);
     assert!(code.is_informational());
-    assert!(code.is_multiline());
+    assert!(!code.is_multiline());
 }
 
 // StatusCode::parse() tests
@@ -329,6 +329,7 @@ fn test_response_auth_required_480() {
 fn test_response_multiline_1xx() {
     assert!(NntpResponse::parse(b"100 Help\r\n").is_multiline());
     assert!(NntpResponse::parse(b"101 Capabilities\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"111 20251215120000\r\n").is_multiline());
 }
 
 #[test]
@@ -419,10 +420,11 @@ fn test_response_status_code_extraction() {
 
 #[test]
 fn test_status_code_multiline_detection() {
-    // All 1xx are multiline
+    // RFC-defined multiline 1xx responses
     assert!(StatusCode::new(100).is_multiline());
-    assert!(StatusCode::new(111).is_multiline());
-    assert!(StatusCode::new(199).is_multiline());
+    assert!(StatusCode::new(101).is_multiline());
+    assert!(!StatusCode::new(111).is_multiline());
+    assert!(!StatusCode::new(199).is_multiline());
 
     // Specific 2xx multiline codes
     assert!(StatusCode::new(220).is_multiline());
@@ -445,4 +447,11 @@ fn test_response_with_multiline_data_parses_code() {
     let response = NntpResponse::parse(data);
     assert!(matches!(response, NntpResponse::MultilineData(_)));
     assert_eq!(response.status_code(), Some(StatusCode::new(220)));
+}
+
+#[test]
+fn test_response_111_server_date_is_single_line() {
+    let response = NntpResponse::parse(b"111 20251215120000\r\n");
+    assert!(!response.is_multiline());
+    assert!(matches!(response, NntpResponse::SingleLine(_)));
 }
