@@ -90,63 +90,46 @@ fn authinfo_subcommand_and_argument(command: &str) -> Option<(&[u8], &str)> {
     Some((&bytes[sub_start..sub_end], &trimmed[arg_start..]))
 }
 
-fn auth_argument<'a>(command: &'a str, expected_subcommand: &[u8]) -> &'a str {
-    let Some((subcommand, argument)) = authinfo_subcommand_and_argument(command) else {
-        return "";
-    };
-
-    if !subcommand.eq_ignore_ascii_case(expected_subcommand) {
-        return "";
-    }
-
-    argument
-}
-
-fn unsupported_authinfo_response(command: &str) -> Option<&'static str> {
+fn classify_authinfo(command: &str) -> Option<CommandAction<'_>> {
     let (subcommand, argument) = authinfo_subcommand_and_argument(command)?;
 
-    if subcommand.is_empty() {
-        return Some(command_syntax_error_response());
-    }
-
-    if subcommand.eq_ignore_ascii_case(b"USER") || subcommand.eq_ignore_ascii_case(b"PASS") {
-        return None;
-    }
-
-    if subcommand.eq_ignore_ascii_case(b"SASL") {
-        return Some(if argument.is_empty() {
+    Some(if subcommand.is_empty() {
+        CommandAction::Reject(command_syntax_error_response())
+    } else if subcommand.eq_ignore_ascii_case(b"USER") {
+        if argument.is_empty() {
+            CommandAction::Reject(command_syntax_error_response())
+        } else {
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(argument))
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"PASS") {
+        if argument.is_empty() {
+            CommandAction::Reject(command_syntax_error_response())
+        } else {
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password: argument })
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"SASL") {
+        CommandAction::Reject(if argument.is_empty() {
             command_syntax_error_response()
         } else {
             authinfo_sasl_mechanism_not_recognized_response()
-        });
-    }
-
-    Some(command_syntax_error_response())
+        })
+    } else {
+        CommandAction::Reject(command_syntax_error_response())
+    })
 }
 
 impl CommandHandler {
     /// Classify a command and return the action to take
     pub fn classify(command: &str) -> CommandAction<'_> {
-        if let Some(response) = unsupported_authinfo_response(command) {
-            return CommandAction::Reject(response);
+        if let Some(action) = classify_authinfo(command) {
+            return action;
         }
 
         match NntpCommand::parse(command) {
-            NntpCommand::AuthUser => {
-                let username = auth_argument(command, b"USER");
-                if username.is_empty() {
-                    CommandAction::Reject(command_syntax_error_response())
-                } else {
-                    CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
-                }
-            }
-            NntpCommand::AuthPass => {
-                let password = auth_argument(command, b"PASS");
-                if password.is_empty() {
-                    CommandAction::Reject(command_syntax_error_response())
-                } else {
-                    CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
-                }
+            NntpCommand::AuthUser | NntpCommand::AuthPass => {
+                unreachable!(
+                    "AUTHINFO USER/PASS commands should be handled before NntpCommand::parse"
+                )
             }
             NntpCommand::Stateful => {
                 // RFC 3977 Section 3.2.1: 502 Command not implemented
