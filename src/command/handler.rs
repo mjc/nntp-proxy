@@ -18,6 +18,7 @@
 //!   Used when a command is recognized but not supported by this server
 
 use super::classifier::NntpCommand;
+use crate::protocol::COMMAND_SYNTAX_ERROR;
 
 /// Action to take in response to a command
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +44,12 @@ pub enum AuthAction<'a> {
 
 /// Handler for processing commands and determining actions
 pub struct CommandHandler;
+
+#[inline]
+fn command_syntax_error_response() -> &'static str {
+    // SAFETY: NNTP protocol response constants are ASCII literals.
+    unsafe { std::str::from_utf8_unchecked(COMMAND_SYNTAX_ERROR) }
+}
 
 fn auth_argument<'a>(command: &'a str, expected_subcommand: &[u8]) -> &'a str {
     let trimmed = command.trim();
@@ -84,7 +91,7 @@ impl CommandHandler {
             NntpCommand::AuthUser => {
                 let username = auth_argument(command, b"USER");
                 if username.is_empty() {
-                    CommandAction::Reject("501 Command syntax error\r\n")
+                    CommandAction::Reject(command_syntax_error_response())
                 } else {
                     CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
                 }
@@ -92,7 +99,7 @@ impl CommandHandler {
             NntpCommand::AuthPass => {
                 let password = auth_argument(command, b"PASS");
                 if password.is_empty() {
-                    CommandAction::Reject("501 Command syntax error\r\n")
+                    CommandAction::Reject(command_syntax_error_response())
                 } else {
                     CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
                 }
@@ -300,14 +307,14 @@ mod tests {
         let action = CommandHandler::classify("AUTHINFO USER");
         assert_eq!(
             action,
-            CommandAction::Reject("501 Command syntax error\r\n")
+            CommandAction::Reject(command_syntax_error_response())
         );
 
         // AUTHINFO PASS without password should be rejected as syntax error
         let action = CommandHandler::classify("AUTHINFO PASS");
         assert_eq!(
             action,
-            CommandAction::Reject("501 Command syntax error\r\n")
+            CommandAction::Reject(command_syntax_error_response())
         );
     }
 
