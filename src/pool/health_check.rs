@@ -328,15 +328,8 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_date_response_success_minimal() {
-        // Minimal valid response (just "111 " prefix)
-        assert!(validate_date_response("111 \r\n").is_ok());
-    }
-
-    #[test]
-    fn test_validate_date_response_success_with_extra() {
-        // Extra data after timestamp is OK
-        assert!(validate_date_response("111 20231215120000 extra info\r\n").is_ok());
+    fn test_validate_date_response_rejects_missing_timestamp() {
+        assert!(validate_date_response("111 \r\n").is_err());
     }
 
     #[test]
@@ -396,15 +389,18 @@ mod tests {
 
     #[test]
     fn test_validate_date_response_case_sensitivity() {
-        // Status codes are numeric, so no case issues, but test weird inputs
-        assert!(validate_date_response("111 lowercase\r\n").is_ok());
-        assert!(validate_date_response("111 UPPERCASE\r\n").is_ok());
+        assert!(validate_date_response("111 lowercase\r\n").is_err());
+        assert!(validate_date_response("111 UPPERCASE\r\n").is_err());
     }
 
     #[test]
     fn test_validate_date_response_unicode() {
-        // Unicode in timestamp portion (unusual but should work if starts with "111 ")
-        assert!(validate_date_response("111 日本語\r\n").is_ok());
+        assert!(validate_date_response("111 日本語\r\n").is_err());
+    }
+
+    #[test]
+    fn test_validate_date_response_rejects_extra_data() {
+        assert!(validate_date_response("111 20231215120000 extra info\r\n").is_err());
     }
 
     #[test]

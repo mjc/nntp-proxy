@@ -422,7 +422,10 @@ async fn test_date_health_check_malformed_response() -> Result<()> {
         b"INVALID\r\n".as_slice(),
         b"200 OK\r\n".as_slice(),
         b"111\r\n".as_slice(), // Missing timestamp
-        b"\r\n".as_slice(),    // Empty
+        b"111 \r\n".as_slice(),
+        b"111 20251112120000 extra\r\n".as_slice(),
+        "111 日本語\r\n".as_bytes(),
+        b"\r\n".as_slice(), // Empty
     ];
 
     for (i, response) in test_cases.iter().enumerate() {
