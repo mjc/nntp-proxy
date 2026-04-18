@@ -66,6 +66,9 @@ pub const GOODBYE: &[u8] = b"205 Goodbye\r\n";
 /// Command not supported response (500)
 pub const COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy\r\n";
 
+/// Command syntax error response (501)
+pub const COMMAND_SYNTAX_ERROR: &[u8] = b"501 Command syntax error\r\n";
+
 /// Backend error response (503)
 pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 
@@ -229,6 +232,7 @@ mod tests {
     #[test]
     fn test_error_constants() {
         assert!(COMMAND_NOT_SUPPORTED.starts_with(b"500"));
+        assert!(COMMAND_SYNTAX_ERROR.starts_with(b"501"));
         assert!(BACKEND_ERROR.starts_with(b"503"));
         assert!(BACKEND_UNAVAILABLE.starts_with(b"400"));
         assert!(COMMAND_NOT_SUPPORTED_STATELESS.starts_with(b"500"));
@@ -247,6 +251,7 @@ mod tests {
         assert!(CONNECTION_CLOSING.ends_with(CRLF));
         assert!(GOODBYE.ends_with(CRLF));
         assert!(COMMAND_NOT_SUPPORTED.ends_with(CRLF));
+        assert!(COMMAND_SYNTAX_ERROR.ends_with(CRLF));
         assert!(BACKEND_ERROR.ends_with(CRLF));
         assert!(BACKEND_UNAVAILABLE.ends_with(CRLF));
         assert!(COMMAND_NOT_SUPPORTED_STATELESS.ends_with(CRLF));

@@ -83,11 +83,19 @@ impl CommandHandler {
         match NntpCommand::parse(command) {
             NntpCommand::AuthUser => {
                 let username = auth_argument(command, b"USER");
-                CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
+                if username.is_empty() {
+                    CommandAction::Reject("501 Command syntax error\r\n")
+                } else {
+                    CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
+                }
             }
             NntpCommand::AuthPass => {
                 let password = auth_argument(command, b"PASS");
-                CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
+                if password.is_empty() {
+                    CommandAction::Reject("501 Command syntax error\r\n")
+                } else {
+                    CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
+                }
             }
             NntpCommand::Stateful => {
                 // RFC 3977 Section 3.2.1: 502 Command not implemented
@@ -288,19 +296,19 @@ mod tests {
 
     #[test]
     fn test_auth_commands_without_arguments() {
-        // AUTHINFO USER without username (still intercept, empty username)
+        // AUTHINFO USER without username should be rejected as syntax error
         let action = CommandHandler::classify("AUTHINFO USER");
-        assert!(matches!(
+        assert_eq!(
             action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username.is_empty()
-        ));
+            CommandAction::Reject("501 Command syntax error\r\n")
+        );
 
-        // AUTHINFO PASS without password (still intercept, empty password)
+        // AUTHINFO PASS without password should be rejected as syntax error
         let action = CommandHandler::classify("AUTHINFO PASS");
-        assert!(matches!(
+        assert_eq!(
             action,
-            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if password.is_empty()
-        ));
+            CommandAction::Reject("501 Command syntax error\r\n")
+        );
     }
 
     #[test]
