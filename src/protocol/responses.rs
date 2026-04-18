@@ -69,6 +69,9 @@ pub const COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this pro
 /// Command syntax error response (501)
 pub const COMMAND_SYNTAX_ERROR: &[u8] = b"501 Command syntax error\r\n";
 
+/// AUTHINFO SASL mechanism not recognized response (503)
+pub const AUTHINFO_SASL_MECHANISM_NOT_RECOGNIZED: &[u8] = b"503 Mechanism not recognized\r\n";
+
 /// Backend error response (503)
 pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 
@@ -219,6 +222,10 @@ mod tests {
         assert_eq!(
             MODE_READER_UNAVAILABLE_AFTER_AUTH,
             b"502 Command unavailable after authentication\r\n"
+        );
+        assert_eq!(
+            AUTHINFO_SASL_MECHANISM_NOT_RECOGNIZED,
+            b"503 Mechanism not recognized\r\n"
         );
     }
 

@@ -18,7 +18,7 @@
 //!   Used when a command is recognized but not supported by this server
 
 use super::classifier::NntpCommand;
-use crate::protocol::COMMAND_SYNTAX_ERROR;
+use crate::protocol::{AUTHINFO_SASL_MECHANISM_NOT_RECOGNIZED, COMMAND_SYNTAX_ERROR};
 
 /// Action to take in response to a command
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,15 +51,25 @@ fn command_syntax_error_response() -> &'static str {
     unsafe { std::str::from_utf8_unchecked(COMMAND_SYNTAX_ERROR) }
 }
 
-fn auth_argument<'a>(command: &'a str, expected_subcommand: &[u8]) -> &'a str {
+#[inline]
+fn authinfo_sasl_mechanism_not_recognized_response() -> &'static str {
+    // SAFETY: NNTP protocol response constants are ASCII literals.
+    unsafe { std::str::from_utf8_unchecked(AUTHINFO_SASL_MECHANISM_NOT_RECOGNIZED) }
+}
+
+#[inline]
+fn authinfo_subcommand_and_argument(command: &str) -> Option<(&[u8], &str)> {
     let trimmed = command.trim();
     let bytes = trimmed.as_bytes();
     let Some(command_end) = memchr::memchr2(b' ', b'\t', bytes) else {
-        return "";
+        if bytes.eq_ignore_ascii_case(b"AUTHINFO") {
+            return Some((&[], ""));
+        }
+        return None;
     };
 
     if !bytes[..command_end].eq_ignore_ascii_case(b"AUTHINFO") {
-        return "";
+        return None;
     }
 
     let mut sub_start = command_end;
@@ -67,26 +77,60 @@ fn auth_argument<'a>(command: &'a str, expected_subcommand: &[u8]) -> &'a str {
         sub_start += 1;
     }
     if sub_start >= bytes.len() {
-        return "";
+        return Some((&[], ""));
     }
 
     let sub_end = sub_start
         + memchr::memchr2(b' ', b'\t', &bytes[sub_start..]).unwrap_or(bytes.len() - sub_start);
-    if !bytes[sub_start..sub_end].eq_ignore_ascii_case(expected_subcommand) {
-        return "";
-    }
-
     let mut arg_start = sub_end;
     while arg_start < bytes.len() && matches!(bytes[arg_start], b' ' | b'\t') {
         arg_start += 1;
     }
 
-    &trimmed[arg_start..]
+    Some((&bytes[sub_start..sub_end], &trimmed[arg_start..]))
+}
+
+fn auth_argument<'a>(command: &'a str, expected_subcommand: &[u8]) -> &'a str {
+    let Some((subcommand, argument)) = authinfo_subcommand_and_argument(command) else {
+        return "";
+    };
+
+    if !subcommand.eq_ignore_ascii_case(expected_subcommand) {
+        return "";
+    }
+
+    argument
+}
+
+fn unsupported_authinfo_response(command: &str) -> Option<&'static str> {
+    let (subcommand, argument) = authinfo_subcommand_and_argument(command)?;
+
+    if subcommand.is_empty() {
+        return Some(command_syntax_error_response());
+    }
+
+    if subcommand.eq_ignore_ascii_case(b"USER") || subcommand.eq_ignore_ascii_case(b"PASS") {
+        return None;
+    }
+
+    if subcommand.eq_ignore_ascii_case(b"SASL") {
+        return Some(if argument.is_empty() {
+            command_syntax_error_response()
+        } else {
+            authinfo_sasl_mechanism_not_recognized_response()
+        });
+    }
+
+    Some(command_syntax_error_response())
 }
 
 impl CommandHandler {
     /// Classify a command and return the action to take
     pub fn classify(command: &str) -> CommandAction<'_> {
+        if let Some(response) = unsupported_authinfo_response(command) {
+            return CommandAction::Reject(response);
+        }
+
         match NntpCommand::parse(command) {
             NntpCommand::AuthUser => {
                 let username = auth_argument(command, b"USER");
@@ -294,11 +338,32 @@ mod tests {
     fn test_malformed_auth_commands() {
         // AUTHINFO without subcommand
         let action = CommandHandler::classify("AUTHINFO");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(
+            action,
+            CommandAction::Reject(command_syntax_error_response())
+        );
 
         // AUTHINFO with unknown subcommand
         let action = CommandHandler::classify("AUTHINFO INVALID");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(
+            action,
+            CommandAction::Reject(command_syntax_error_response())
+        );
+    }
+
+    #[test]
+    fn test_authinfo_sasl_commands() {
+        let action = CommandHandler::classify("AUTHINFO SASL");
+        assert_eq!(
+            action,
+            CommandAction::Reject(command_syntax_error_response())
+        );
+
+        let action = CommandHandler::classify("AUTHINFO SASL EXAMPLE");
+        assert_eq!(
+            action,
+            CommandAction::Reject(authinfo_sasl_mechanism_not_recognized_response())
+        );
     }
 
     #[test]

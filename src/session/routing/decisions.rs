@@ -47,15 +47,23 @@ pub(crate) fn decide_command_routing(
 
     // Classify the command
     let action = CommandHandler::classify(command);
+    let is_authinfo = crate::session::common::is_authinfo_command(command);
     let is_capabilities = command
         .split_ascii_whitespace()
         .next()
         .is_some_and(|keyword| keyword.eq_ignore_ascii_case("CAPABILITIES"));
     let is_mode_reader = crate::session::common::is_mode_reader_command(command);
 
+    if is_authinfo {
+        if !auth_enabled {
+            return CommandRoutingDecision::Forward;
+        }
+        if is_authenticated {
+            return CommandRoutingDecision::RejectAuthSequence;
+        }
+    }
+
     match action {
-        InterceptAuth(_) if !auth_enabled => CommandRoutingDecision::Forward,
-        InterceptAuth(_) if is_authenticated => CommandRoutingDecision::RejectAuthSequence,
         InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
 
         // Stateless commands
@@ -99,6 +107,28 @@ mod tests {
         assert_eq!(
             decide_command_routing("AUTHINFO USER test", false, false, RoutingMode::Stateful),
             CommandRoutingDecision::Forward
+        );
+        assert_eq!(
+            decide_command_routing(
+                "AUTHINFO SASL EXAMPLE",
+                false,
+                false,
+                RoutingMode::PerCommand
+            ),
+            CommandRoutingDecision::Forward
+        );
+        assert_eq!(
+            decide_command_routing("AUTHINFO SASL EXAMPLE", true, true, RoutingMode::PerCommand),
+            CommandRoutingDecision::RejectAuthSequence
+        );
+        assert_eq!(
+            decide_command_routing(
+                "AUTHINFO SASL EXAMPLE",
+                false,
+                true,
+                RoutingMode::PerCommand
+            ),
+            CommandRoutingDecision::Reject
         );
     }
 
