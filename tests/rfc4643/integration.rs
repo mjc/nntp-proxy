@@ -466,6 +466,71 @@ async fn test_authinfo_pass_without_password_rejected_as_syntax_error() {
 }
 
 #[tokio::test]
+async fn test_authinfo_sasl_without_mechanism_rejected_as_syntax_error() {
+    for (backend_port, routing_mode) in [
+        (19141, RoutingMode::Stateful),
+        (19142, RoutingMode::PerCommand),
+    ] {
+        let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+        wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+            .await
+            .unwrap();
+
+        let proxy_addr = spawn_proxy_with_auth(backend_port, "user", "pass", routing_mode).await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let (reader, mut writer) = client.split();
+        let mut reader = BufReader::new(reader);
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("200"));
+
+        writer.write_all(b"AUTHINFO SASL\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            line, "501 Command syntax error\r\n",
+            "routing_mode={routing_mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_authinfo_sasl_with_unsupported_mechanism_rejected_with_503() {
+    for (backend_port, routing_mode) in [
+        (19143, RoutingMode::Stateful),
+        (19144, RoutingMode::PerCommand),
+    ] {
+        let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
+        wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
+            .await
+            .unwrap();
+
+        let proxy_addr = spawn_proxy_with_auth(backend_port, "user", "pass", routing_mode).await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let (reader, mut writer) = client.split();
+        let mut reader = BufReader::new(reader);
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("200"));
+
+        writer
+            .write_all(b"AUTHINFO SASL EXAMPLE\r\n")
+            .await
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            line, "503 Mechanism not recognized\r\n",
+            "routing_mode={routing_mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_quit_allowed_before_auth_in_stateful_mode() {
     let backend_port = 19124;
     let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
