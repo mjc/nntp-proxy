@@ -28,7 +28,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
     let mut authenticated = false;
 
     // First command: GROUP (stateful, will be rejected)
-    let action = CommandHandler::classify("GROUP misc.test\r\n");
+    let action = CommandHandler::classify("GROUP misc.test");
     match action {
         CommandAction::Reject(response) => {
             // Session sends rejection response
@@ -41,7 +41,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
 
     // Second command: LIST (stateless)
     // This should ALSO require authentication, proving no bypass
-    let action = CommandHandler::classify("LIST\r\n");
+    let action = CommandHandler::classify("LIST");
     match action {
         CommandAction::ForwardStateless => {
             // In the actual handler, this branch checks if auth is enabled

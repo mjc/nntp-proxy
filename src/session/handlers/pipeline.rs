@@ -6,7 +6,7 @@
 //!
 //! Single-command batches fall through to the existing sequential path with zero overhead.
 
-use crate::command::NntpCommand;
+use crate::command::{CommandLineError, NntpCommand, ValidatedCommandLine};
 use crate::session::ClientSession;
 use anyhow::Result;
 use tokio::io::AsyncBufReadExt;
@@ -27,8 +27,8 @@ pub(super) struct CommandBatch {
     offsets: smallvec::SmallVec<[usize; 4]>,
     /// Offset range for trailing non-pipelineable command if present
     trailing_range: Option<(usize, usize)>,
-    /// True if the trailing command exceeded the 512-byte RFC 3977 limit
-    trailing_oversized: bool,
+    /// Validation error for the trailing command if present.
+    trailing_error: Option<CommandLineError>,
 }
 
 impl CommandBatch {
@@ -55,9 +55,9 @@ impl CommandBatch {
         self.offsets.len()
     }
 
-    /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
-    pub fn is_trailing_oversized(&self) -> bool {
-        self.trailing_oversized
+    /// Validation error for the trailing command, if any.
+    pub fn trailing_error(&self) -> Option<CommandLineError> {
+        self.trailing_error
     }
 
     /// Extract buffers for reuse in next batch (move out, leaving empty)
@@ -87,7 +87,7 @@ impl ClientSession {
         batch_buf.clear();
         batch_offsets.clear();
         let mut trailing_range: Option<(usize, usize)> = None;
-        let mut trailing_oversized = false;
+        let mut trailing_error = None;
 
         // First command: blocking read (must wait for client)
         command_buf.clear();
@@ -97,22 +97,28 @@ impl ClientSession {
                     buffer: String::new(),
                     offsets: smallvec::SmallVec::new(),
                     trailing_range: None,
-                    trailing_oversized: false,
+                    trailing_error: None,
                 });
             }
-            Ok(_) => {
-                // M4: Reject oversized commands (RFC 3977: 512 byte limit)
-                if command_buf.len() > 512 {
-                    return Err(anyhow::anyhow!(
-                        "Command too long ({} bytes)",
-                        command_buf.len()
-                    ));
-                }
-            }
+            Ok(_) => {}
             Err(e) => return Err(e.into()),
         }
 
-        let parsed = NntpCommand::parse(command_buf);
+        let validated = match ValidatedCommandLine::new(command_buf) {
+            Ok(validated) => validated,
+            Err(err) => {
+                batch_buf.push_str(command_buf);
+                trailing_range = Some((0, batch_buf.len()));
+                trailing_error = Some(err);
+                return Ok(CommandBatch {
+                    buffer: std::mem::take(batch_buf),
+                    offsets: smallvec::SmallVec::new(),
+                    trailing_range,
+                    trailing_error,
+                });
+            }
+        };
+        let parsed = NntpCommand::parse(validated.content());
 
         if !parsed.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
@@ -124,7 +130,7 @@ impl ClientSession {
                 buffer: std::mem::take(batch_buf),
                 offsets: smallvec::SmallVec::new(),
                 trailing_range,
-                trailing_oversized: false,
+                trailing_error: None,
             });
         }
 
@@ -146,17 +152,18 @@ impl ClientSession {
             match reader.read_line(command_buf).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    // M4: Reject oversized commands (end batch on invalid command)
-                    // Mark as oversized so caller sends 500 error instead of forwarding
-                    if command_buf.len() > 512 {
-                        let start = batch_buf.len();
-                        batch_buf.push_str(command_buf);
-                        let end = batch_buf.len();
-                        trailing_range = Some((start, end));
-                        trailing_oversized = true;
-                        break;
-                    }
-                    let parsed = NntpCommand::parse(command_buf);
+                    let validated = match ValidatedCommandLine::new(command_buf) {
+                        Ok(validated) => validated,
+                        Err(err) => {
+                            let start = batch_buf.len();
+                            batch_buf.push_str(command_buf);
+                            let end = batch_buf.len();
+                            trailing_range = Some((start, end));
+                            trailing_error = Some(err);
+                            break;
+                        }
+                    };
+                    let parsed = NntpCommand::parse(validated.content());
                     if !parsed.is_pipelineable() {
                         // Non-pipelineable command ends the batch
                         let start = batch_buf.len();
@@ -176,7 +183,7 @@ impl ClientSession {
             buffer: std::mem::take(batch_buf),
             offsets: std::mem::take(batch_offsets),
             trailing_range,
-            trailing_oversized,
+            trailing_error,
         })
     }
 }

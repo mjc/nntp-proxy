@@ -18,6 +18,7 @@
 //!   Used when a command is recognized but not supported by this server
 
 use super::classifier::NntpCommand;
+use super::validation::ValidatedCommandLine;
 use crate::protocol::{AUTHINFO_SASL_MECHANISM_NOT_RECOGNIZED, COMMAND_SYNTAX_ERROR};
 
 /// Action to take in response to a command
@@ -59,8 +60,7 @@ fn authinfo_sasl_mechanism_not_recognized_response() -> &'static str {
 
 #[inline]
 fn authinfo_subcommand_and_argument(command: &str) -> Option<(&[u8], &str)> {
-    let trimmed = command.trim();
-    let bytes = trimmed.as_bytes();
+    let bytes = command.as_bytes();
     let Some(command_end) = memchr::memchr2(b' ', b'\t', bytes) else {
         if bytes.eq_ignore_ascii_case(b"AUTHINFO") {
             return Some((&[], ""));
@@ -87,7 +87,7 @@ fn authinfo_subcommand_and_argument(command: &str) -> Option<(&[u8], &str)> {
         arg_start += 1;
     }
 
-    Some((&bytes[sub_start..sub_end], &trimmed[arg_start..]))
+    Some((&bytes[sub_start..sub_end], &command[arg_start..]))
 }
 
 fn classify_authinfo(command: &str) -> Option<CommandAction<'_>> {
@@ -145,11 +145,17 @@ impl CommandHandler {
             NntpCommand::Stateless => CommandAction::ForwardStateless,
         }
     }
+
+    #[inline]
+    pub fn classify_validated(command: ValidatedCommandLine<'_>) -> CommandAction<'_> {
+        Self::classify(command.content())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::ValidatedCommandLine;
 
     #[test]
     fn test_auth_user_command() {
@@ -298,23 +304,13 @@ mod tests {
 
     #[test]
     fn test_empty_command() {
-        // Empty command should be treated as stateless (unknown)
-        let action = CommandHandler::classify("");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert!(ValidatedCommandLine::new("\r\n").is_err());
     }
 
     #[test]
     fn test_whitespace_handling() {
-        // Command with leading/trailing whitespace
-        let action = CommandHandler::classify("  LIST  ");
-        assert_eq!(action, CommandAction::ForwardStateless);
-
-        // Auth command with extra whitespace
-        let action = CommandHandler::classify("  AUTHINFO USER test  ");
-        assert!(matches!(
-            action,
-            CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username == "test"
-        ));
+        assert!(ValidatedCommandLine::new("  LIST  \r\n").is_err());
+        assert!(ValidatedCommandLine::new("  AUTHINFO USER test  \r\n").is_err());
     }
 
     #[test]
@@ -368,13 +364,9 @@ mod tests {
 
     #[test]
     fn test_article_commands_with_newlines() {
-        // Command with CRLF
-        let action = CommandHandler::classify("ARTICLE <msg@test.com>\r\n");
+        let action = CommandHandler::classify("ARTICLE <msg@test.com>");
         assert_eq!(action, CommandAction::ForwardStateless);
-
-        // Command with just LF
-        let action = CommandHandler::classify("LIST\n");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert!(ValidatedCommandLine::new("LIST\n").is_err());
     }
 
     #[test]

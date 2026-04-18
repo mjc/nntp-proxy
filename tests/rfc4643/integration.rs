@@ -863,16 +863,16 @@ async fn test_auth_handler_integration() {
     let handler = create_test_auth_handler_with("alice", "secret");
 
     // Test command classification
-    let action = CommandHandler::classify("LIST\r\n");
+    let action = CommandHandler::classify("LIST");
     assert_eq!(action, CommandAction::ForwardStateless);
 
-    let action = CommandHandler::classify("AUTHINFO USER alice\r\n");
+    let action = CommandHandler::classify("AUTHINFO USER alice");
     assert!(matches!(
         action,
         CommandAction::InterceptAuth(AuthAction::RequestPassword(_))
     ));
 
-    let action = CommandHandler::classify("GROUP misc.test\r\n");
+    let action = CommandHandler::classify("GROUP misc.test");
     assert!(matches!(action, CommandAction::Reject(_)));
 
     // Test auth handler responses

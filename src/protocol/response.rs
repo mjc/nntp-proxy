@@ -164,8 +164,7 @@ impl NntpResponse {
             381 | 480 => Self::AuthRequired(code),
 
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
-            // All 1xx are informational multiline
-            100..=199 => Self::MultilineData(code),
+            100 | 101 => Self::MultilineData(code),
             // Specific 2xx multiline responses
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
 
@@ -263,7 +262,7 @@ impl StatusCode {
     #[must_use]
     pub fn is_multiline(&self) -> bool {
         match **self {
-            100..=199 => true, // All 1xx are multiline
+            100 | 101 => true,
             215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
             _ => false,
         }

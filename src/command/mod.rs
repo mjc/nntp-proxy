@@ -6,6 +6,8 @@
 
 pub mod classifier;
 mod handler;
+pub(crate) mod validation;
 
 pub use classifier::NntpCommand;
 pub use handler::{AuthAction, CommandAction, CommandHandler};
+pub(crate) use validation::{CommandLineError, ValidatedCommandLine};

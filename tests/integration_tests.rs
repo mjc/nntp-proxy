@@ -1292,10 +1292,10 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
 }
 
 /// Test that an oversized command (>512 bytes) sent as the second command in a
-/// pipelined batch receives a 500 error response instead of being forwarded.
+/// pipelined batch receives a 501 error response instead of being forwarded.
 /// RFC 3977 §3.1: "command line MUST NOT exceed 512 octets"
 #[tokio::test]
-async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
+async fn test_oversized_pipelined_command_rejected_with_501() -> Result<()> {
     let mock_port = get_available_port().await?;
     let proxy_port = get_available_port().await?;
 
@@ -1344,9 +1344,9 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
         response
     );
 
-    // Read response to the oversized command — should be 500 error, not forwarded
+    // Read response to the oversized command — should be 501 error, not forwarded
     // (may have arrived in the same read above, check that too)
-    let full_response = if response.contains("500") {
+    let full_response = if response.contains("501") {
         response.to_string()
     } else {
         let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
@@ -1354,8 +1354,8 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
     };
 
     assert!(
-        full_response.contains("500"),
-        "Expected 500 error for oversized command, got: {}",
+        full_response.contains("501"),
+        "Expected 501 error for oversized command, got: {}",
         full_response
     );
 

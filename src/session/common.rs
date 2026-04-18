@@ -74,7 +74,7 @@ pub(crate) async fn handle_quit_command<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if command.trim().eq_ignore_ascii_case("QUIT") {
+    if command.eq_ignore_ascii_case("QUIT") {
         use crate::protocol::CONNECTION_CLOSING;
 
         client_write

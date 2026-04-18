@@ -473,8 +473,7 @@ impl NntpCommand {
     /// variations (UPPER/lower/Title) for maximum performance.
     #[inline]
     pub fn parse(command: &str) -> Self {
-        let trimmed = command.trim();
-        let bytes = trimmed.as_bytes();
+        let bytes = command.as_bytes();
 
         // ═════════════════════════════════════════════════════════════════
         // Standard path: Parse command word and classify
@@ -608,11 +607,6 @@ mod tests {
             NntpCommand::parse("AUTHINFO PASS testpass"),
             NntpCommand::AuthPass
         );
-        assert_eq!(
-            NntpCommand::parse("  AUTHINFO USER  whitespace  "),
-            NntpCommand::AuthUser
-        );
-
         // Test stateful commands (should be rejected)
         assert_eq!(NntpCommand::parse("GROUP alt.test"), NntpCommand::Stateful);
         assert_eq!(NntpCommand::parse("NEXT"), NntpCommand::Stateful);
@@ -672,15 +666,9 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_and_whitespace_commands() {
+    fn test_empty_command() {
         // Empty command
         assert_eq!(NntpCommand::parse(""), NntpCommand::Stateless);
-
-        // Only whitespace
-        assert_eq!(NntpCommand::parse("   "), NntpCommand::Stateless);
-
-        // Tabs and spaces
-        assert_eq!(NntpCommand::parse("\t\t  "), NntpCommand::Stateless);
     }
 
     #[test]
@@ -769,15 +757,6 @@ mod tests {
 
     #[test]
     fn test_special_characters_in_commands() {
-        // Command with newlines
-        assert_eq!(NntpCommand::parse("LIST\r\n"), NntpCommand::Stateless);
-
-        // Command with extra whitespace
-        assert_eq!(
-            NntpCommand::parse("  LIST   ACTIVE  "),
-            NntpCommand::Stateless
-        );
-
         // Command with tabs
         assert_eq!(NntpCommand::parse("LIST\tACTIVE"), NntpCommand::Stateless);
 

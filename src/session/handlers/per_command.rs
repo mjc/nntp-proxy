@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use crate::command::classifier::is_large_transfer_command;
-use crate::command::{CommandAction, CommandHandler};
+use crate::command::{CommandAction, CommandHandler, ValidatedCommandLine};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::is_client_disconnect_error;
 use crate::router::BackendSelector;
@@ -44,7 +44,7 @@ enum SingleCommandResult {
 
 /// Parameters for executing a command decision
 struct CommandExecutionParams<'a, 'b> {
-    command: &'a str,
+    command: ValidatedCommandLine<'a>,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
     client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
@@ -55,7 +55,7 @@ struct CommandExecutionParams<'a, 'b> {
 
 /// Parameters for processing a single command (full flow including QUIT handling)
 struct ProcessCommandParams<'a, 'b> {
-    command: &'a str,
+    command: ValidatedCommandLine<'a>,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
     client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
@@ -84,17 +84,17 @@ impl ClientSession {
         } = params;
 
         let decision = decide_command_routing(
-            command,
+            command.content(),
             skip_auth_check,
             self.auth_handler.is_enabled(),
             self.mode_state.routing_mode(),
         );
 
-        let trimmed = command.trim();
+        let trimmed = command.content();
         match decision {
             CommandRoutingDecision::InterceptAuth => {
                 debug!("Client {} decision: InterceptAuth", self.client_addr);
-                let action = CommandHandler::classify(command);
+                let action = CommandHandler::classify_validated(command);
                 let auth_action = match action {
                     CommandAction::InterceptAuth(a) => a,
                     _ => unreachable!("InterceptAuth decision must come from InterceptAuth action"),
@@ -138,7 +138,7 @@ impl ClientSession {
                 let mut c2b_mutable = client_to_backend_bytes;
                 self.route_and_execute_command(
                     router.clone(),
-                    command,
+                    command.raw(),
                     client_write,
                     &mut c2b_mutable,
                     backend_to_client_bytes,
@@ -174,7 +174,7 @@ impl ClientSession {
 
             CommandRoutingDecision::Reject => {
                 debug!("Client {} decision: Reject", self.client_addr);
-                let action = CommandHandler::classify(command);
+                let action = CommandHandler::classify_validated(command);
                 let response = match action {
                     CommandAction::Reject(r) => r,
                     _ => unreachable!("Reject decision must come from Reject action"),
@@ -235,7 +235,7 @@ impl ClientSession {
 
         // Handle QUIT locally
         if let common::QuitStatus::Quit(bytes) =
-            common::handle_quit_command(command, client_write).await?
+            common::handle_quit_command(command.content(), client_write).await?
         {
             *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
             return Ok(SingleCommandResult::Quit);
@@ -243,12 +243,14 @@ impl ClientSession {
 
         // Update last_command buffer (used for switch-to-stateful)
         last_command.clear();
-        last_command.push_str(command);
+        last_command.push_str(command.raw());
 
         // Execute command decision
+        let validated_last = ValidatedCommandLine::new(last_command)
+            .expect("last_command comes from validated input");
         match self
             .execute_command_decision(CommandExecutionParams {
-                command: last_command,
+                command: validated_last,
                 skip_auth_check,
                 router,
                 client_write,
@@ -394,15 +396,16 @@ impl ClientSession {
                 if !batch_handled {
                     // Sequential processing for mixed, single-command, or failed-batch commands
                     for i in 0..batch_size {
-                        let command = batch.command(i);
+                        let command = ValidatedCommandLine::new(batch.command(i))
+                            .expect("pipeline batch commands are prevalidated");
                         debug!(
                             "Client {} received {} bytes: {:?}",
                             self.client_addr,
-                            command.len(),
-                            command.trim()
+                            command.raw().len(),
+                            command.content()
                         );
 
-                        client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+                        client_to_backend_bytes = client_to_backend_bytes.add(command.raw().len());
                         skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
                         match self
@@ -447,24 +450,30 @@ impl ClientSession {
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
             if let Some(trailing_cmd) = batch.trailing() {
-                // Reject oversized commands per RFC 3977 (512-byte limit)
-                if batch.is_trailing_oversized() {
+                if batch.trailing_error().is_some() {
                     warn!(
-                        "Client {} sent oversized command ({} bytes), rejecting",
+                        "Client {} sent malformed command ({} bytes), rejecting",
                         self.client_addr,
                         trailing_cmd.len()
                     );
-                    client_write.write_all(b"500 Command too long\r\n").await?;
+                    use crate::protocol::COMMAND_SYNTAX_ERROR;
+                    client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.len());
+                    client_write.write_all(COMMAND_SYNTAX_ERROR).await?;
+                    backend_to_client_bytes =
+                        backend_to_client_bytes.add(COMMAND_SYNTAX_ERROR.len());
                     continue;
                 }
+
+                let trailing_cmd = ValidatedCommandLine::new(trailing_cmd)
+                    .expect("trailing command is prevalidated when trailing_error is absent");
 
                 debug!(
                     "Client {} trailing non-pipelineable: {:?}",
                     self.client_addr,
-                    trailing_cmd.trim()
+                    trailing_cmd.content()
                 );
 
-                client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.len());
+                client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.raw().len());
                 skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
                 match self

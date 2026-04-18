@@ -1,5 +1,7 @@
 //! RFC 5322 compliant header parsing with zero-copy slicing
 
+use std::borrow::Cow;
+
 use super::error::ParseError;
 
 /// Validated NNTP article headers (zero-copy)
@@ -124,7 +126,7 @@ impl<'a> Headers<'a> {
     ///
     /// # Returns
     /// Header value slice (trimmed leading/trailing whitespace) or None
-    pub fn get(&self, name: &str) -> Option<&'a [u8]> {
+    pub fn get(&self, name: &str) -> Option<Cow<'a, [u8]>> {
         let name_lower = name.to_ascii_lowercase();
         let mut pos = 0;
 
@@ -161,41 +163,7 @@ impl<'a> Headers<'a> {
                 }
 
                 let value = &line[value_start..];
-
-                // Check for folded continuation lines
-                let mut next_pos = line_end + 2;
-                let mut folded_value = Vec::new();
-
-                while next_pos < self.data.len() {
-                    let next_line_end = Self::find_line_end(self.data, next_pos).ok()?;
-                    let next_line = &self.data[next_pos..next_line_end];
-
-                    // Check if this is a continuation
-                    if next_line.is_empty() || (next_line[0] != b' ' && next_line[0] != b'\t') {
-                        break;
-                    }
-
-                    // This is a folded line - append it
-                    if folded_value.is_empty() {
-                        folded_value.extend_from_slice(value);
-                    }
-                    folded_value.push(b' '); // RFC says to replace folding with space
-                    folded_value.extend_from_slice(next_line.trim_ascii_start());
-
-                    next_pos = next_line_end + 2;
-                }
-
-                // If we collected folded lines, return that (allocated)
-                // Otherwise return the original slice (zero-copy)
-                if folded_value.is_empty() {
-                    return Some(value);
-                } else {
-                    // We have to allocate for folded headers
-                    // This is a limitation - we could return Cow<'a, [u8]> instead
-                    // For now, just return the first line
-                    // TODO: Return Cow to handle folding without allocation in non-folded case
-                    return Some(value);
-                }
+                return Some(Self::unfold_value(self.data, line_end + 2, value).ok()?);
             }
 
             pos = line_end + 2;
@@ -225,7 +193,7 @@ pub struct HeaderIter<'a> {
 }
 
 impl<'a> Iterator for HeaderIter<'a> {
-    type Item = (&'a [u8], &'a [u8]); // (name, value)
+    type Item = (&'a [u8], Cow<'a, [u8]>); // (name, value)
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.pos < self.data.len() {
@@ -257,12 +225,72 @@ impl<'a> Iterator for HeaderIter<'a> {
             }
 
             let value = &line[value_start..];
+            let next_pos = line_end + 2;
 
-            self.pos = line_end + 2;
+            self.pos = Headers::next_header_pos(self.data, next_pos).ok()?;
+            let value = Headers::unfold_value(self.data, next_pos, value).ok()?;
             return Some((name, value));
         }
 
         None
+    }
+}
+
+impl<'a> Headers<'a> {
+    fn next_header_pos(data: &'a [u8], mut pos: usize) -> Result<usize, ParseError> {
+        while pos < data.len() {
+            let line_end = Self::find_line_end(data, pos)?;
+            let line = &data[pos..line_end];
+            if line.is_empty() || (line[0] != b' ' && line[0] != b'\t') {
+                return Ok(pos);
+            }
+            pos = line_end + 2;
+        }
+        Ok(pos)
+    }
+
+    fn trim_ascii_horizontal_end(bytes: &[u8]) -> &[u8] {
+        let mut end = bytes.len();
+        while end > 0 && matches!(bytes[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        &bytes[..end]
+    }
+
+    fn unfold_value(
+        data: &'a [u8],
+        mut next_pos: usize,
+        value: &'a [u8],
+    ) -> Result<Cow<'a, [u8]>, ParseError> {
+        let mut unfolded = Vec::new();
+        let mut folded = false;
+
+        while next_pos < data.len() {
+            let next_line_end = Self::find_line_end(data, next_pos)?;
+            let next_line = &data[next_pos..next_line_end];
+
+            if next_line.is_empty() || (next_line[0] != b' ' && next_line[0] != b'\t') {
+                break;
+            }
+
+            if !folded {
+                unfolded.extend_from_slice(Self::trim_ascii_horizontal_end(value));
+                folded = true;
+            } else {
+                while matches!(unfolded.last(), Some(b' ')) {
+                    unfolded.pop();
+                }
+            }
+            unfolded.push(b' ');
+            unfolded.extend_from_slice(next_line.trim_ascii_start());
+            next_pos = next_line_end + 2;
+        }
+
+        if folded {
+            Ok(Cow::Owned(unfolded))
+        } else {
+            Ok(Cow::Borrowed(value))
+        }
     }
 }
 
@@ -274,8 +302,11 @@ mod tests {
     fn test_valid_headers() {
         let data = b"Subject: Test\r\nFrom: test@example.com\r\n";
         let headers = Headers::parse(data).unwrap();
-        assert_eq!(headers.get("Subject"), Some(&b"Test"[..]));
-        assert_eq!(headers.get("From"), Some(&b"test@example.com"[..]));
+        assert_eq!(headers.get("Subject").as_deref(), Some(&b"Test"[..]));
+        assert_eq!(
+            headers.get("From").as_deref(),
+            Some(&b"test@example.com"[..])
+        );
     }
 
     #[test]
@@ -312,6 +343,6 @@ mod tests {
         let items: Vec<_> = headers.iter().collect();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].0, b"Subject");
-        assert_eq!(items[0].1, b"Test");
+        assert_eq!(items[0].1.as_ref(), b"Test");
     }
 }

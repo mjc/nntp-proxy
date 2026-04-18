@@ -580,7 +580,7 @@ proptest! {
             let original_result = headers.get(&name);
 
             // All case variants should return the same value
-            prop_assert_eq!(upper_result, original_result,
+            prop_assert_eq!(upper_result, original_result.clone(),
                 "Upper-case lookup differs for header: {}", name);
             prop_assert_eq!(lower_result, original_result,
                 "Lower-case lookup differs for header: {}", name);

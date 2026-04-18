@@ -124,8 +124,14 @@ fn test_parse_valid_article_text() {
     assert!(article.body.is_some());
 
     let headers = article.headers.unwrap();
-    assert_eq!(headers.get("Subject"), Some(&b"Test Article"[..]));
-    assert_eq!(headers.get("From"), Some(&b"test@example.com"[..]));
+    assert_eq!(
+        headers.get("Subject").as_deref(),
+        Some(&b"Test Article"[..])
+    );
+    assert_eq!(
+        headers.get("From").as_deref(),
+        Some(&b"test@example.com"[..])
+    );
 
     let body = article.body.unwrap();
     assert!(body.starts_with(b"This is the article body."));
@@ -154,7 +160,10 @@ fn test_parse_valid_head() {
     assert!(article.body.is_none()); // HEAD has no body
 
     let headers = article.headers.unwrap();
-    assert_eq!(headers.get("Subject"), Some(&b"Test Article"[..]));
+    assert_eq!(
+        headers.get("Subject").as_deref(),
+        Some(&b"Test Article"[..])
+    );
 }
 
 #[test]
@@ -212,9 +221,11 @@ fn test_folded_header() {
     let headers = article.headers.unwrap();
     // Folded header should parse successfully (validation passes)
     let subject = headers.get("Subject").unwrap();
-    let subject_str = std::str::from_utf8(subject).unwrap();
-    // Currently returns first line only - folding support is TODO
-    assert!(subject_str.contains("This is a long subject"));
+    let subject_str = std::str::from_utf8(subject.as_ref()).unwrap();
+    assert_eq!(
+        subject_str,
+        "This is a long subject that continues on the next line"
+    );
 }
 
 #[test]
@@ -258,7 +269,7 @@ fn test_headers_iteration() {
     for (name, value) in headers.iter() {
         count += 1;
         assert!(!name.is_empty());
-        assert!(!value.is_empty());
+        assert!(!value.as_ref().is_empty());
     }
 
     assert!(count >= 4); // Subject, From, Date, Message-ID
@@ -335,7 +346,7 @@ fn test_multiple_message_ids() {
     let header_msgid = headers.get("Message-ID").unwrap();
 
     // Check if header contains test@example.com
-    let msgid_str = std::str::from_utf8(header_msgid).unwrap();
+    let msgid_str = std::str::from_utf8(header_msgid.as_ref()).unwrap();
     assert!(msgid_str.contains("test@example.com"));
 }
 
@@ -365,8 +376,11 @@ mod headers_tests {
         let header_data = b"Subject: Test\r\nFrom: test@example.com\r\n";
         let headers = Headers::parse(header_data).unwrap();
 
-        assert_eq!(headers.get("Subject"), Some(&b"Test"[..]));
-        assert_eq!(headers.get("From"), Some(&b"test@example.com"[..]));
+        assert_eq!(headers.get("Subject").as_deref(), Some(&b"Test"[..]));
+        assert_eq!(
+            headers.get("From").as_deref(),
+            Some(&b"test@example.com"[..])
+        );
     }
 
     #[test]
@@ -401,7 +415,7 @@ mod headers_tests {
     fn test_headers_empty_value() {
         let valid = b"Subject:\r\n";
         let headers = Headers::parse(valid).unwrap();
-        assert_eq!(headers.get("Subject"), Some(&b""[..]));
+        assert_eq!(headers.get("Subject").as_deref(), Some(&b""[..]));
     }
 
     #[test]
@@ -410,6 +424,6 @@ mod headers_tests {
         let headers = Headers::parse(valid).unwrap();
         let subject = headers.get("Subject").unwrap();
         // Leading whitespace in value should be preserved
-        assert!(subject.starts_with(b" ") || subject.starts_with(b"Test"));
+        assert!(subject.as_ref().starts_with(b" ") || subject.as_ref().starts_with(b"Test"));
     }
 }

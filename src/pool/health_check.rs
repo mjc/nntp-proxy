@@ -156,7 +156,12 @@ pub fn check_tcp_alive(
 /// This is a pure function extracted for testability.
 #[inline]
 pub(crate) fn validate_date_response(response: &str) -> Result<(), HealthCheckError> {
-    if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
+    let bytes = response.as_bytes();
+    if bytes.len() == 20
+        && bytes.starts_with(EXPECTED_DATE_RESPONSE_PREFIX.as_bytes())
+        && bytes[4..18].iter().all(u8::is_ascii_digit)
+        && bytes.ends_with(b"\r\n")
+    {
         Ok(())
     } else {
         Err(HealthCheckError::UnexpectedResponse(response.to_string()))
@@ -249,6 +254,15 @@ mod tests {
     fn test_health_check_metrics_zero_checked() {
         let metrics = HealthCheckMetrics::new();
         assert_eq!(metrics.failure_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_validate_date_response_requires_exact_rfc_shape() {
+        assert!(validate_date_response("111 20251215120000\r\n").is_ok());
+        assert!(validate_date_response("111 \r\n").is_err());
+        assert!(validate_date_response("11120251215120000\r\n").is_err());
+        assert!(validate_date_response("111 20251215120000 extra\r\n").is_err());
+        assert!(validate_date_response("111 日本語\r\n").is_err());
     }
 
     #[test]

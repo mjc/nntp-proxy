@@ -5,6 +5,7 @@
 use crate::session::handlers::capabilities;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
+use crate::{command::ValidatedCommandLine, protocol::COMMAND_SYNTAX_ERROR};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -106,10 +107,24 @@ impl ClientSession {
                     match result {
                         Ok(0) => break, // Client disconnected
                         Ok(_) => {
+                            let validated = match ValidatedCommandLine::new(&line) {
+                                Ok(validated) => validated,
+                                Err(err) => {
+                                    debug!(
+                                        "Client {} sent invalid command line in stateful mode: {}",
+                                        self.client_addr, err
+                                    );
+                                    client_write.write_all(COMMAND_SYNTAX_ERROR).await?;
+                                    state.add_client_to_backend(line.len());
+                                    state.add_backend_to_client(COMMAND_SYNTAX_ERROR.len() as u64);
+                                    continue;
+                                }
+                            };
+
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
-                                if common::is_authinfo_command(&line) && self.auth_handler.is_enabled() {
+                                if common::is_authinfo_command(validated.content()) && self.auth_handler.is_enabled() {
                                     client_write
                                         .write_all(crate::protocol::AUTHINFO_ALREADY_ACCEPTED)
                                         .await?;
@@ -117,7 +132,7 @@ impl ClientSession {
                                         crate::protocol::AUTHINFO_ALREADY_ACCEPTED.len() as u64,
                                     );
                                 } else if self.auth_handler.is_enabled()
-                                    && common::is_mode_reader_command(&line)
+                                    && common::is_mode_reader_command(validated.content())
                                 {
                                     client_write
                                         .write_all(crate::protocol::MODE_READER_UNAVAILABLE_AFTER_AUTH)
@@ -126,13 +141,13 @@ impl ClientSession {
                                         crate::protocol::MODE_READER_UNAVAILABLE_AFTER_AUTH.len() as u64,
                                     );
                                 } else if self.auth_handler.is_enabled()
-                                    && common::is_capabilities_command(&line)
+                                    && common::is_capabilities_command(validated.content())
                                 {
                                     let bytes = capabilities::proxy_command(
                                         &mut backend_read,
                                         &mut backend_write,
                                         &mut client_write,
-                                        &line,
+                                        validated.raw(),
                                         &self.buffer_pool,
                                         true,
                                     ).await?;
@@ -140,23 +155,23 @@ impl ClientSession {
                                     state.add_backend_to_client(bytes);
                                 } else {
                                     // Hot path: forward directly
-                                    backend_write.write_all(line.as_bytes()).await?;
+                                    backend_write.write_all(validated.raw().as_bytes()).await?;
                                     state.add_client_to_backend(line.len());
                                 }
                             } else {
                                 if let common::QuitStatus::Quit(bytes) =
-                                    common::handle_quit_command(&line, &mut client_write).await?
+                                    common::handle_quit_command(validated.content(), &mut client_write).await?
                                 {
                                     state.add_backend_to_client(bytes.as_u64());
                                     break;
                                 }
 
-                                if common::is_capabilities_command(&line) {
+                                if common::is_capabilities_command(validated.content()) {
                                     let bytes = capabilities::proxy_command(
                                         &mut backend_read,
                                         &mut backend_write,
                                         &mut client_write,
-                                        &line,
+                                        validated.raw(),
                                         &self.buffer_pool,
                                         false,
                                     ).await?;
@@ -167,7 +182,7 @@ impl ClientSession {
 
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
-                                    &line,
+                                    validated.content(),
                                     &mut client_write,
                                     &mut state.auth_username,
                                     &self.auth_handler,
