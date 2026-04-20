@@ -58,8 +58,20 @@ fn authinfo_sasl_mechanism_not_recognized_response() -> &'static str {
     unsafe { std::str::from_utf8_unchecked(AUTHINFO_SASL_MECHANISM_NOT_RECOGNIZED) }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedAuthinfo<'a> {
+    User(&'a str),
+    Pass(&'a str),
+    SaslMissingMechanism,
+    SaslUnsupported(&'a str),
+    MissingSubcommand,
+    UnknownSubcommand,
+    MissingUserArg,
+    MissingPassArg,
+}
+
 #[inline]
-fn authinfo_subcommand_and_argument(command: &str) -> Option<(&[u8], &str)> {
+fn authinfo_subcommand_and_argument(command: &str) -> Option<(&[u8], &'_ str)> {
     let bytes = command.as_bytes();
     let Some(command_end) = memchr::memchr2(b' ', b'\t', bytes) else {
         if bytes.eq_ignore_ascii_case(b"AUTHINFO") {
@@ -90,31 +102,50 @@ fn authinfo_subcommand_and_argument(command: &str) -> Option<(&[u8], &str)> {
     Some((&bytes[sub_start..sub_end], &command[arg_start..]))
 }
 
-fn classify_authinfo(command: &str) -> Option<CommandAction<'_>> {
+fn parse_authinfo(command: &str) -> Option<ParsedAuthinfo<'_>> {
     let (subcommand, argument) = authinfo_subcommand_and_argument(command)?;
 
     Some(if subcommand.is_empty() {
-        CommandAction::Reject(command_syntax_error_response())
+        ParsedAuthinfo::MissingSubcommand
     } else if subcommand.eq_ignore_ascii_case(b"USER") {
         if argument.is_empty() {
-            CommandAction::Reject(command_syntax_error_response())
+            ParsedAuthinfo::MissingUserArg
         } else {
-            CommandAction::InterceptAuth(AuthAction::RequestPassword(argument))
+            ParsedAuthinfo::User(argument)
         }
     } else if subcommand.eq_ignore_ascii_case(b"PASS") {
         if argument.is_empty() {
-            CommandAction::Reject(command_syntax_error_response())
+            ParsedAuthinfo::MissingPassArg
         } else {
-            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password: argument })
+            ParsedAuthinfo::Pass(argument)
         }
     } else if subcommand.eq_ignore_ascii_case(b"SASL") {
-        CommandAction::Reject(if argument.is_empty() {
-            command_syntax_error_response()
+        if argument.is_empty() {
+            ParsedAuthinfo::SaslMissingMechanism
         } else {
-            authinfo_sasl_mechanism_not_recognized_response()
-        })
+            ParsedAuthinfo::SaslUnsupported(argument)
+        }
     } else {
-        CommandAction::Reject(command_syntax_error_response())
+        ParsedAuthinfo::UnknownSubcommand
+    })
+}
+
+fn classify_authinfo(command: &str) -> Option<CommandAction<'_>> {
+    Some(match parse_authinfo(command)? {
+        ParsedAuthinfo::User(username) => {
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
+        }
+        ParsedAuthinfo::Pass(password) => {
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
+        }
+        ParsedAuthinfo::SaslUnsupported(_) => {
+            CommandAction::Reject(authinfo_sasl_mechanism_not_recognized_response())
+        }
+        ParsedAuthinfo::SaslMissingMechanism
+        | ParsedAuthinfo::MissingSubcommand
+        | ParsedAuthinfo::UnknownSubcommand
+        | ParsedAuthinfo::MissingUserArg
+        | ParsedAuthinfo::MissingPassArg => CommandAction::Reject(command_syntax_error_response()),
     })
 }
 
