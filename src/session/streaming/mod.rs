@@ -183,7 +183,7 @@ where
 /// Like `stream_multiline_response`, but captures leftover bytes after the terminator
 /// into `leftover` for use as the start of the next response in the pipeline.
 #[allow(clippy::too_many_arguments)]
-pub async fn stream_multiline_response_pipelined<W>(
+pub(crate) async fn stream_multiline_response_pipelined<W>(
     backend_read: &mut crate::stream::ConnectionStream,
     client_write: &mut W,
     first_chunk: &[u8],

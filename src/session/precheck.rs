@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use tokio::io::AsyncReadExt;
-
 use crate::cache::{ArticleAvailability, ArticleEntry, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
@@ -121,7 +119,7 @@ async fn execute_backend_query(
                     TerminatorStatus::NotFound => {
                         tail.update(&response);
                         loop {
-                            match conn.as_mut().read(buffer.as_mut_slice()).await {
+                            match buffer.read_from(conn.as_mut()).await {
                                 Ok(0) => {
                                     crate::pool::remove_from_pool(conn);
                                     return Err(());
