@@ -129,7 +129,7 @@ git clone https://github.com/mjc/nntp-proxy.git
 cd nntp-proxy
 
 # Build release version
-cargo build --release
+nix develop -c cargo build --release
 
 # Binary will be in target/release/nntp-proxy
 ```
@@ -968,9 +968,9 @@ Contributions welcome! Please:
 3. Install git hooks: `./scripts/install-git-hooks.sh`
 4. Make your changes with tests
 5. Ensure all checks pass:
-   - `cargo test` - Run all tests
-   - `cargo clippy --all-targets --all-features` - Run linter
-   - `cargo fmt` - Format code
+   - `nix develop -c cargo test` - Run all tests
+   - `nix develop -c cargo clippy --all-targets --all-features -- -D warnings` - Run linter
+   - `nix develop -c cargo fmt --check` - Verify code formatting
 6. Submit a pull request
 
 ### Development Setup
@@ -981,11 +981,11 @@ After cloning the repository, install git hooks to automatically run code qualit
 ./scripts/install-git-hooks.sh
 ```
 
-The pre-commit hook will automatically run:
+The pre-commit hook will run:
 - `cargo fmt --check` - Verify code formatting
-- `cargo clippy --all-targets --all-features` - Check for lint warnings
+- `cargo clippy --all-targets --all-features -- -D warnings` - Check for lint warnings
 
-To bypass the hook temporarily (not recommended): `git commit --no-verify`
+If local cargo tooling is missing or cannot run the checks, the hook will retry inside `nix develop`.
 
 ## License
 

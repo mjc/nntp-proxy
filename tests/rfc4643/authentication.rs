@@ -445,8 +445,10 @@ async fn test_auth_with_empty_command() {
 
 #[tokio::test]
 async fn test_auth_with_whitespace_only_command() {
-    // Covered by session/integration tests that validate raw command lines.
-    assert!(true);
+    use nntp_proxy::command::CommandHandler;
+
+    let _action = CommandHandler::classify("   ");
+    // Should be handled gracefully, not crash.
 }
 
 #[tokio::test]

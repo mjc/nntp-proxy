@@ -1013,21 +1013,16 @@ mod tests {
         let keep_alive = Arc::new(tokio::sync::Notify::new());
 
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((mut stream, _)) => {
-                        let keep = keep_alive.clone();
-                        // Spawn a handler per connection so they stay alive concurrently
-                        tokio::spawn(async move {
-                            let _ = stream.write_all(b"200 mock\r\n").await;
-                            // Keep alive until test drops the connection.
-                            // Notify::notified() does NOT auto-advance with
-                            // start_paused, unlike sleep().
-                            keep.notified().await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let keep = keep_alive.clone();
+                // Spawn a handler per connection so they stay alive concurrently
+                tokio::spawn(async move {
+                    let _ = stream.write_all(b"200 mock\r\n").await;
+                    // Keep alive until test drops the connection.
+                    // Notify::notified() does NOT auto-advance with
+                    // start_paused, unlike sleep().
+                    keep.notified().await;
+                });
             }
         });
 

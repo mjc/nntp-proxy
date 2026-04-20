@@ -163,7 +163,7 @@ impl<'a> Headers<'a> {
                 }
 
                 let value = &line[value_start..];
-                return Some(Self::unfold_value(self.data, line_end + 2, value).ok()?);
+                return Self::unfold_value(self.data, line_end + 2, value).ok();
             }
 
             pos = line_end + 2;
