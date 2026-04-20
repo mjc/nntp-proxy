@@ -33,6 +33,14 @@
 
 use nutype::nutype;
 
+#[inline]
+const fn is_multiline_status_code(code: u16) -> bool {
+    matches!(
+        code,
+        100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282
+    )
+}
+
 /// Raw NNTP status code (3-digit number)
 ///
 /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
@@ -125,7 +133,7 @@ pub enum NntpResponse {
 
     /// Multiline data response
     /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
-    /// - All 1xx codes (100-199)
+    /// - Specific 1xx codes: 100, 101
     /// - Specific 2xx codes: 215, 220, 221, 222, 224, 225, 230, 231, 282
     MultilineData(StatusCode),
 
@@ -163,12 +171,7 @@ impl NntpResponse {
             // [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
             381 | 480 => Self::AuthRequired(code),
 
-            // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
-            100 | 101 => Self::MultilineData(code),
-            // Specific 2xx multiline responses
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
-
-            // Everything else is a single-line response
+            _ if code.is_multiline() => Self::MultilineData(code),
             _ => Self::SingleLine(code),
         }
     }
@@ -256,16 +259,12 @@ impl StatusCode {
     /// certain status codes indicate multiline data follows.
     ///
     /// # Multiline Response Codes
-    /// - **1xx**: All informational responses (100-199)
+    /// - **1xx**: Specific codes - 100, 101
     /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
     #[inline]
     #[must_use]
     pub fn is_multiline(&self) -> bool {
-        match **self {
-            100 | 101 => true,
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
-            _ => false,
-        }
+        is_multiline_status_code(**self)
     }
 }
 

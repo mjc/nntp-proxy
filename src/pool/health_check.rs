@@ -148,18 +148,19 @@ pub fn check_tcp_alive(
     Ok(())
 }
 
-/// Validate DATE command response
+const DATE_RESPONSE_OCTETS: usize = 20;
+const DATE_TIMESTAMP_RANGE: std::ops::Range<usize> = 4..18;
+
+/// Validate DATE command response.
 ///
-/// Returns Ok(()) if the response starts with "111 " (EXPECTED_DATE_RESPONSE_PREFIX),
-/// otherwise returns an error with the actual response.
-///
-/// This is a pure function extracted for testability.
+/// Accepts exactly `111 SP 14DIGIT CRLF`, otherwise returns an error with the
+/// actual response. This is a pure function extracted for testability.
 #[inline]
 pub(crate) fn validate_date_response(response: &str) -> Result<(), HealthCheckError> {
     let bytes = response.as_bytes();
-    if bytes.len() == 20
+    if bytes.len() == DATE_RESPONSE_OCTETS
         && bytes.starts_with(EXPECTED_DATE_RESPONSE_PREFIX.as_bytes())
-        && bytes[4..18].iter().all(u8::is_ascii_digit)
+        && bytes[DATE_TIMESTAMP_RANGE].iter().all(u8::is_ascii_digit)
         && bytes.ends_with(b"\r\n")
     {
         Ok(())
