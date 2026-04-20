@@ -10,6 +10,7 @@ pub const MAX_COMMAND_LINE_OCTETS: usize = 512;
 pub struct ValidatedCommandLine<'a> {
     raw: &'a str,
     content: &'a str,
+    wire_len: usize,
 }
 
 impl<'a> ValidatedCommandLine<'a> {
@@ -59,19 +60,29 @@ impl<'a> ValidatedCommandLine<'a> {
             return Err(CommandLineError::SurroundingWhitespace);
         }
 
-        Ok(Self { raw, content })
+        Ok(Self {
+            raw,
+            content,
+            wire_len: bytes.len(),
+        })
     }
 
     #[inline]
     #[must_use]
-    pub const fn raw(self) -> &'a str {
+    pub const fn raw(&self) -> &'a str {
         self.raw
     }
 
     #[inline]
     #[must_use]
-    pub const fn content(self) -> &'a str {
+    pub const fn content(&self) -> &'a str {
         self.content
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn wire_len(&self) -> usize {
+        self.wire_len
     }
 }
 
@@ -96,6 +107,15 @@ pub enum CommandLineError {
     SurroundingWhitespace,
 }
 
+impl CommandLineError {
+    /// Client-visible response for all command-line validation failures.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn response(self) -> &'static [u8] {
+        crate::protocol::COMMAND_SYNTAX_ERROR
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +125,7 @@ mod tests {
         let line = ValidatedCommandLine::new("LIST\r\n").unwrap();
         assert_eq!(line.raw(), "LIST\r\n");
         assert_eq!(line.content(), "LIST");
+        assert_eq!(line.wire_len(), "LIST\r\n".len());
     }
 
     #[test]

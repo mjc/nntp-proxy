@@ -2,10 +2,10 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
+use crate::command::ValidatedCommandLine;
 use crate::session::handlers::capabilities;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
-use crate::{command::ValidatedCommandLine, protocol::COMMAND_SYNTAX_ERROR};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -114,9 +114,10 @@ impl ClientSession {
                                         "Client {} sent invalid command line in stateful mode: {}",
                                         self.client_addr, err
                                     );
-                                    client_write.write_all(COMMAND_SYNTAX_ERROR).await?;
+                                    let response = err.response();
+                                    client_write.write_all(response).await?;
                                     state.add_client_to_backend(line.len());
-                                    state.add_backend_to_client(COMMAND_SYNTAX_ERROR.len() as u64);
+                                    state.add_backend_to_client(response.len() as u64);
                                     continue;
                                 }
                             };

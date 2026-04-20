@@ -405,7 +405,7 @@ impl ClientSession {
                             command.content()
                         );
 
-                        client_to_backend_bytes = client_to_backend_bytes.add(command.raw().len());
+                        client_to_backend_bytes = client_to_backend_bytes.add(command.wire_len());
                         skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
                         match self
@@ -450,17 +450,16 @@ impl ClientSession {
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
             if let Some(trailing_cmd) = batch.trailing() {
-                if batch.trailing_error().is_some() {
+                if let Some(err) = batch.trailing_error() {
                     warn!(
                         "Client {} sent malformed command ({} bytes), rejecting",
                         self.client_addr,
                         trailing_cmd.len()
                     );
-                    use crate::protocol::COMMAND_SYNTAX_ERROR;
                     client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.len());
-                    client_write.write_all(COMMAND_SYNTAX_ERROR).await?;
-                    backend_to_client_bytes =
-                        backend_to_client_bytes.add(COMMAND_SYNTAX_ERROR.len());
+                    let response = err.response();
+                    client_write.write_all(response).await?;
+                    backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                     continue;
                 }
 
@@ -473,7 +472,7 @@ impl ClientSession {
                     trailing_cmd.content()
                 );
 
-                client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.raw().len());
+                client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.wire_len());
                 skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
                 match self

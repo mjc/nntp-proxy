@@ -43,18 +43,17 @@ proptest! {
     }
 
     #[test]
-    fn prop_trimming_idempotent(s in ".*") {
+    fn prop_leading_whitespace_is_not_normalized(s in r"[A-Za-z][A-Za-z0-9]*( .*)?") {
         let with_spaces = format!("  {}  ", s);
-        let result1 = NntpCommand::parse(&with_spaces);
-        let result2 = NntpCommand::parse(&s);
+        let padded_result = NntpCommand::parse(&with_spaces);
 
-        // Trimming is idempotent
+        // Command validation rejects leading/trailing whitespace before parse;
+        // the classifier must not trim and reclassify padded command content.
         prop_assert_eq!(
-            std::mem::discriminant(&result1),
-            std::mem::discriminant(&result2),
-            "Trimming changed classification: '{}' vs '{}'",
-            with_spaces,
-            s
+            padded_result,
+            NntpCommand::Stateless,
+            "Padded command content should not be normalized: '{}'",
+            with_spaces
         );
     }
 

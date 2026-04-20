@@ -1363,6 +1363,95 @@ async fn test_oversized_pipelined_command_rejected_with_501() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_first_oversized_command_rejected_with_501_and_session_continues() -> Result<()> {
+    let mock_port = get_available_port().await?;
+    let proxy_port = get_available_port().await?;
+
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("TestServer")
+        .on_command("DATE", "111 20231013120000\r\n")
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = create_test_config(vec![(mock_port, "TestServer")]);
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+
+    spawn_test_proxy(proxy, proxy_port, true).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut buffer = [0; 4096];
+
+    let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+
+    let oversized_cmd = format!("LIST {}\r\n", "x".repeat(512));
+    assert!(oversized_cmd.len() > 512);
+    client.write_all(oversized_cmd.as_bytes()).await?;
+
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    assert_eq!(response, "501 Command syntax error\r\n");
+
+    client.write_all(b"DATE\r\n").await?;
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    assert_eq!(response, "111 20231013120000\r\n");
+
+    client.write_all(b"QUIT\r\n").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stateful_malformed_commands_rejected_with_501_and_session_continues() -> Result<()> {
+    let mock_port = get_available_port().await?;
+    let proxy_port = get_available_port().await?;
+
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("TestServer")
+        .on_command("DATE", "111 20231013120000\r\n")
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = create_test_config(vec![(mock_port, "TestServer")]);
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
+
+    spawn_test_proxy(proxy, proxy_port, false).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut buffer = [0; 4096];
+
+    let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+
+    let oversized_cmd = format!("LIST {}\r\n", "x".repeat(512));
+    let invalid_commands: Vec<Vec<u8>> = vec![
+        b"\r\n".to_vec(),
+        b" \t\r\n".to_vec(),
+        b" LIST\r\n".to_vec(),
+        b"LIST \r\n".to_vec(),
+        b"LIST\n".to_vec(),
+        oversized_cmd.into_bytes(),
+    ];
+
+    for command in invalid_commands {
+        client.write_all(&command).await?;
+        let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert_eq!(response, "501 Command syntax error\r\n");
+    }
+
+    client.write_all(b"DATE\r\n").await?;
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    assert_eq!(response, "111 20231013120000\r\n");
+
+    client.write_all(b"QUIT\r\n").await?;
+    Ok(())
+}
+
 /// Test that a partial command in the BufReader buffer doesn't cause the batch
 /// reader to block waiting for more data from the socket.
 ///
