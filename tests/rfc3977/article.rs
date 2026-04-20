@@ -9,6 +9,8 @@
 //! - yenc validation
 //! - Error cases
 
+use std::borrow::Cow;
+
 use nntp_proxy::protocol::{Article, Headers, ParseError};
 
 /// Valid ARTICLE response with text content
@@ -226,6 +228,38 @@ fn test_folded_header() {
         subject_str,
         "This is a long subject that continues on the next line"
     );
+}
+
+#[test]
+fn test_folded_header_multiple_continuations_and_tabs() {
+    let header_data = b"Subject: first\r\n\tsecond\r\n third\r\nFrom: test@example.com\r\n";
+    let headers = Headers::parse(header_data).unwrap();
+
+    let subject = headers.get("Subject").unwrap();
+    assert!(matches!(subject, Cow::Owned(_)));
+    assert_eq!(subject.as_ref(), b"first second third");
+
+    let iter_subject = headers
+        .iter()
+        .find(|(name, _)| *name == b"Subject")
+        .map(|(_, value)| value)
+        .unwrap();
+    assert_eq!(iter_subject.as_ref(), subject.as_ref());
+}
+
+#[test]
+fn test_non_folded_header_value_is_borrowed() {
+    let header_data = b"Subject: simple value\r\nFrom: test@example.com\r\n";
+    let headers = Headers::parse(header_data).unwrap();
+
+    let subject = headers.get("Subject").unwrap();
+    assert!(matches!(subject, Cow::Borrowed(_)));
+    assert_eq!(subject.as_ref(), b"simple value");
+
+    let mut iter = headers.iter();
+    let (_, value) = iter.next().unwrap();
+    assert!(matches!(value, Cow::Borrowed(_)));
+    assert_eq!(value.as_ref(), b"simple value");
 }
 
 #[test]

@@ -16,6 +16,12 @@ pub struct Headers<'a> {
     data: &'a [u8],
 }
 
+struct LogicalHeader<'a> {
+    name: &'a [u8],
+    value: Cow<'a, [u8]>,
+    next_pos: usize,
+}
+
 impl<'a> Headers<'a> {
     /// Parse and validate header block
     ///
@@ -130,43 +136,11 @@ impl<'a> Headers<'a> {
         let name_lower = name.to_ascii_lowercase();
         let mut pos = 0;
 
-        while pos < self.data.len() {
-            // Find line end
-            let line_end = Self::find_line_end(self.data, pos).ok()?;
-            let line = &self.data[pos..line_end];
-
-            if line.is_empty() {
-                pos = line_end + 2;
-                continue;
+        while let Some(header) = Self::logical_header_at(self.data, pos).ok()? {
+            if header.name.eq_ignore_ascii_case(name_lower.as_bytes()) {
+                return Some(header.value);
             }
-
-            // Skip folded lines (we'll handle them when we find the main header)
-            if line[0] == b' ' || line[0] == b'\t' {
-                pos = line_end + 2;
-                continue;
-            }
-
-            // Find colon
-            let colon_pos = memchr::memchr(b':', line)?;
-            let header_name = &line[..colon_pos];
-
-            // Case-insensitive comparison
-            if header_name.eq_ignore_ascii_case(name_lower.as_bytes()) {
-                // Found it! Get value
-                let mut value_start = colon_pos + 1;
-
-                // Skip leading whitespace in value
-                while value_start < line.len()
-                    && (line[value_start] == b' ' || line[value_start] == b'\t')
-                {
-                    value_start += 1;
-                }
-
-                let value = &line[value_start..];
-                return Self::unfold_value(self.data, line_end + 2, value).ok();
-            }
-
-            pos = line_end + 2;
+            pos = header.next_pos;
         }
 
         None
@@ -196,47 +170,54 @@ impl<'a> Iterator for HeaderIter<'a> {
     type Item = (&'a [u8], Cow<'a, [u8]>); // (name, value)
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.pos < self.data.len() {
-            // Find line end
-            let line_end = Headers::find_line_end(self.data, self.pos).ok()?;
-            let line = &self.data[self.pos..line_end];
-
-            if line.is_empty() {
-                self.pos = line_end + 2;
-                continue;
-            }
-
-            // Skip folded lines (they're part of previous header)
-            if line[0] == b' ' || line[0] == b'\t' {
-                self.pos = line_end + 2;
-                continue;
-            }
-
-            // Find colon
-            let colon_pos = memchr::memchr(b':', line)?;
-            let name = &line[..colon_pos];
-            let mut value_start = colon_pos + 1;
-
-            // Skip leading whitespace
-            while value_start < line.len()
-                && (line[value_start] == b' ' || line[value_start] == b'\t')
-            {
-                value_start += 1;
-            }
-
-            let value = &line[value_start..];
-            let next_pos = line_end + 2;
-
-            self.pos = Headers::next_header_pos(self.data, next_pos).ok()?;
-            let value = Headers::unfold_value(self.data, next_pos, value).ok()?;
-            return Some((name, value));
-        }
-
-        None
+        let header = Headers::logical_header_at(self.data, self.pos).ok()??;
+        self.pos = header.next_pos;
+        Some((header.name, header.value))
     }
 }
 
 impl<'a> Headers<'a> {
+    fn logical_header_at(
+        data: &'a [u8],
+        mut pos: usize,
+    ) -> Result<Option<LogicalHeader<'a>>, ParseError> {
+        while pos < data.len() {
+            let line_end = Self::find_line_end(data, pos)?;
+            let line = &data[pos..line_end];
+
+            if line.is_empty() || line[0] == b' ' || line[0] == b'\t' {
+                pos = line_end + 2;
+                continue;
+            }
+
+            let colon_pos = memchr::memchr(b':', line).ok_or_else(|| {
+                ParseError::InvalidHeader(format!(
+                    "Header missing colon: {}",
+                    String::from_utf8_lossy(line)
+                ))
+            })?;
+            let name = &line[..colon_pos];
+            let mut value_start = colon_pos + 1;
+
+            while value_start < line.len() && matches!(line[value_start], b' ' | b'\t') {
+                value_start += 1;
+            }
+
+            let value = &line[value_start..];
+            let value_pos = line_end + 2;
+            let next_pos = Self::next_header_pos(data, value_pos)?;
+            let value = Self::unfold_value(data, value_pos, value)?;
+
+            return Ok(Some(LogicalHeader {
+                name,
+                value,
+                next_pos,
+            }));
+        }
+
+        Ok(None)
+    }
+
     fn next_header_pos(data: &'a [u8], mut pos: usize) -> Result<usize, ParseError> {
         while pos < data.len() {
             let line_end = Self::find_line_end(data, pos)?;
@@ -255,6 +236,14 @@ impl<'a> Headers<'a> {
             end -= 1;
         }
         &bytes[..end]
+    }
+
+    fn trim_ascii_horizontal_start(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        while start < bytes.len() && matches!(bytes[start], b' ' | b'\t') {
+            start += 1;
+        }
+        &bytes[start..]
     }
 
     fn unfold_value(
@@ -282,7 +271,7 @@ impl<'a> Headers<'a> {
                 }
             }
             unfolded.push(b' ');
-            unfolded.extend_from_slice(next_line.trim_ascii_start());
+            unfolded.extend_from_slice(Self::trim_ascii_horizontal_start(next_line));
             next_pos = next_line_end + 2;
         }
 
