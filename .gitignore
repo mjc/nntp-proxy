@@ -17,6 +17,8 @@ Thumbs.db
 # Local config
 config.local.toml
 config.toml
+entities.json
+mempalace.yaml
 
 # Logs
 *.log
