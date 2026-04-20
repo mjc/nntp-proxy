@@ -232,7 +232,7 @@ mod tests {
         assert!(err.is_client_disconnect());
 
         // Other errors are not disconnects
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        let io_err = std::io::Error::other("other");
         let err = ConnectionError::IoError(io_err);
         assert!(!err.is_client_disconnect());
     }

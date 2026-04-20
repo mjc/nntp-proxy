@@ -126,6 +126,10 @@ impl HealthCheckMetrics {
 pub fn check_tcp_alive(
     conn: &mut ConnectionStream,
 ) -> managed::RecycleResult<crate::connection_error::ConnectionError> {
+    if conn.has_leftover() {
+        return Err(HealthCheckError::UnexpectedData.into());
+    }
+
     let mut peek_buf = [0u8; TCP_PEEK_BUFFER_SIZE];
 
     // Check the underlying TCP stream regardless of TLS/compression layers
@@ -263,6 +267,26 @@ mod tests {
         assert_eq!(metrics.connections_checked(), 50);
         assert_eq!(metrics.connections_failed(), 5);
         assert_eq!(metrics.failure_rate(), 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_alive_check_rejects_buffered_leftover() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        conn.stash_leftover(b"430 stale response\r\n").unwrap();
+
+        let result = check_tcp_alive(&mut conn);
+        assert!(
+            result.is_err(),
+            "connections with buffered leftovers must not recycle"
+        );
     }
 
     #[test]

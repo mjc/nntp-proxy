@@ -238,12 +238,12 @@ where
             .context("Failed to read next chunk from backend")?;
 
         if n == 0 {
-            debug!(
-                "Client {} multiline streaming complete ({}, EOF)",
+            anyhow::bail!(
+                "Backend EOF before multiline terminator while streaming to client {} from backend {:?} (received {})",
                 client_addr,
+                backend_id,
                 crate::formatting::format_bytes(total_bytes)
             );
-            break;
         }
 
         let data = &buffers[idx][..n];
@@ -277,8 +277,6 @@ where
 
         idx ^= 1;
     }
-
-    Ok(total_bytes)
 }
 
 /// Stream multiline response from backend to client during pipelined batch execution.
@@ -456,12 +454,12 @@ where
             .context("Failed to read next chunk from backend")?;
 
         if n == 0 {
-            debug!(
-                "Client {} multiline streaming complete ({}, EOF)",
+            anyhow::bail!(
+                "Backend EOF before multiline terminator while streaming to client {} from backend {:?} (received {})",
                 client_addr,
+                backend_id,
                 crate::formatting::format_bytes(total_bytes)
             );
-            break;
         }
 
         let data = &buffers[idx][..n];
@@ -503,8 +501,6 @@ where
 
         idx ^= 1; // Toggle buffer index
     }
-
-    Ok(total_bytes)
 }
 
 #[cfg(test)]
@@ -686,6 +682,39 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), full_response.len() as u64);
         assert_eq!(&writer[..], &full_response[..]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_multiline_response_errors_on_truncated_response() {
+        use crate::types::BufferSize;
+
+        let first_chunk = b"220 Article follows\r\npartial body\r\n";
+        let mut reader = Cursor::new(b"" as &[u8]);
+        let mut writer = Vec::new();
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+
+        let result = stream_multiline_response(
+            &mut reader,
+            &mut writer,
+            first_chunk,
+            first_chunk.len(),
+            client_addr,
+            backend_id,
+            &buffer_pool,
+        )
+        .await;
+
+        assert!(result.is_err(), "truncated multiline response must fail");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Backend EOF before multiline terminator")
+        );
+        assert_eq!(&writer[..], first_chunk);
     }
 
     #[tokio::test]

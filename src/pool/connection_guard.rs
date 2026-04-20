@@ -433,23 +433,18 @@ mod tests {
         let count = Arc::clone(&accept_count);
         let n = Arc::clone(&notify);
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((mut stream, _)) => {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let wake = Arc::clone(&n);
-                        tokio::spawn(async move {
-                            let _ = stream.write_all(b"200 mock\r\n").await;
-                            // Block until the test signals that pool.get() has returned
-                            // (greeting already consumed) before sending article data
-                            wake.notified().await;
-                            let _ = stream.write_all(data).await;
-                            // Keep alive so recycle's try_read sees WouldBlock (not EOF)
-                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let wake = Arc::clone(&n);
+                tokio::spawn(async move {
+                    let _ = stream.write_all(b"200 mock\r\n").await;
+                    // Block until the test signals that pool.get() has returned
+                    // (greeting already consumed) before sending article data
+                    wake.notified().await;
+                    let _ = stream.write_all(data).await;
+                    // Keep alive so recycle's try_read sees WouldBlock (not EOF)
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
             }
         });
         (addr, accept_count, notify)
