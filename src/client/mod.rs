@@ -362,11 +362,10 @@ mod tests {
             addr.ip().to_string(),
             addr.port(),
             "test".to_string(),
-            None,
-            None,
-            None,
-            Some(false), // disable compression — mock doesn't handle it
-            None,
+            crate::pool::deadpool_connection::TcpManagerOptions {
+                compress: Some(false), // disable compression — mock doesn't handle it
+                ..crate::pool::deadpool_connection::TcpManagerOptions::default()
+            },
         )
         .unwrap();
         crate::pool::deadpool_connection::Pool::builder(manager)

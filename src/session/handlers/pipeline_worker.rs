@@ -471,7 +471,7 @@ mod tests {
         let mut conn = ConnectionStream::plain(stream);
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -919,7 +919,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
