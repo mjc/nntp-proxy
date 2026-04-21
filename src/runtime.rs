@@ -314,10 +314,10 @@ pub fn spawn_shutdown_handler(
         info!("Shutdown signal received");
 
         // Save metrics before shutting down
-        if let Err(e) = proxy.metrics().save_to_disk(&stats_path, &server_names) {
-            warn!("Failed to save metrics on shutdown: {}", e);
-        } else {
-            info!("Metrics saved to {}", stats_path.display());
+        let metrics = proxy.metrics().clone();
+        match save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await {
+            Ok(()) => info!("Metrics saved to {}", stats_path.display()),
+            Err(e) => warn!("Failed to save metrics on shutdown: {}", e),
         }
 
         // Notify listeners
@@ -329,6 +329,19 @@ pub fn spawn_shutdown_handler(
     });
 
     shutdown_rx
+}
+
+/// Save metrics on Tokio's blocking thread pool.
+///
+/// `MetricsCollector::save_to_disk` uses `std::fs`, so callers from async
+/// tasks should delegate here instead of running filesystem work on a runtime
+/// worker.
+pub async fn save_metrics_to_disk_blocking(
+    metrics: crate::metrics::MetricsCollector,
+    stats_path: std::path::PathBuf,
+    server_names: Vec<String>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || metrics.save_to_disk(&stats_path, &server_names)).await?
 }
 
 /// Run the main accept loop for client connections
@@ -470,11 +483,8 @@ pub fn spawn_metrics_saver(
             let path = stats_path.clone();
             let names = server_names.clone();
             let metrics = proxy.metrics().clone();
-            // Use spawn_blocking: save_to_disk uses std::fs blocking I/O
-            match tokio::task::spawn_blocking(move || metrics.save_to_disk(&path, &names)).await {
-                Ok(Err(e)) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
-                Err(e) => warn!("Metrics save task panicked: {}", e),
-                Ok(Ok(())) => {}
+            if let Err(e) = save_metrics_to_disk_blocking(metrics, path, names).await {
+                warn!("Failed to save metrics to {}: {}", stats_path.display(), e);
             }
         }
     });

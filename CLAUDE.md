@@ -88,8 +88,8 @@ loop {
 
     match tail.detect_terminator(chunk) {
         TerminatorStatus::FoundAt(pos) => {
-            // CRITICAL: pos points to '\r' in "\r\n.\r\n"
-            // Do NOT write chunk[pos..] — that's the start of the next response
+            // CRITICAL: pos is the byte offset immediately AFTER "\r\n.\r\n"
+            // chunk[..pos] includes the terminator and no bytes from the next response
             client.write_all(&chunk[..pos]).await?;
             break;
         }

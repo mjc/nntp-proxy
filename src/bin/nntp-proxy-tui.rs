@@ -180,10 +180,12 @@ fn spawn_tui_shutdown_handler(
         let _ = shutdown_tx.send(()).await;
 
         // Save metrics before shutting down
-        if let Err(e) = proxy.metrics().save_to_disk(&stats_path, &server_names) {
-            warn!("Failed to save metrics on shutdown: {}", e);
-        } else {
-            info!("Metrics saved to {}", stats_path.display());
+        let metrics = proxy.metrics().clone();
+        match runtime::save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names)
+            .await
+        {
+            Ok(()) => info!("Metrics saved to {}", stats_path.display()),
+            Err(e) => warn!("Failed to save metrics on shutdown: {}", e),
         }
 
         proxy.graceful_shutdown().await;

@@ -8,7 +8,12 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-process monotonic counter — ensures concurrent saves use distinct temp file names.
 /// Two simultaneous saves will produce e.g. `stats.json.0.tmp` and `stats.json.1.tmp`,
@@ -366,6 +371,10 @@ impl MetricsStore {
 
     /// Save to file atomically (tmp + rename)
     pub fn save(&self, path: &Path, server_names: &[String]) -> Result<()> {
+        let _save_guard = SAVE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("metrics save lock poisoned"))?;
+
         // Build backends list with bounds-safe indexing
         let backends = server_names
             .iter()
@@ -424,21 +433,65 @@ impl MetricsStore {
         fs::write(&tmp_path, json)
             .with_context(|| format!("Failed to write stats to {}", tmp_path.display()))?;
 
-        // Best-effort atomic replace: remove existing file (for Windows compatibility) then rename temp file
-        if path.exists() {
-            fs::remove_file(path).with_context(|| {
-                format!("Failed to remove existing stats file at {}", path.display())
-            })?;
+        if let Err(e) = atomic_replace_file(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
         }
-        fs::rename(&tmp_path, path).with_context(|| {
-            format!(
-                "Failed to rename {} to {}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
 
         tracing::debug!("Saved stats to {}", path.display());
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn atomic_replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp_path, path).with_context(|| {
+        format!(
+            "Failed to atomically replace {} with {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    fn wide_path(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    let tmp_wide = wide_path(tmp_path);
+    let path_wide = wide_path(path);
+
+    // SAFETY: both buffers are valid, null-terminated UTF-16 strings and live
+    // for the duration of the call.
+    let ok = unsafe {
+        MoveFileExW(
+            tmp_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if ok == 0 {
+        Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Failed to atomically replace {} with {}",
+                path.display(),
+                tmp_path.display()
+            )
+        })
+    } else {
         Ok(())
     }
 }
@@ -540,6 +593,48 @@ mod tests {
 
         let bob = loaded.user_metrics.get("bob").unwrap();
         assert_eq!(bob.total_connections, 5);
+    }
+
+    #[test]
+    fn test_metrics_store_concurrent_saves_leave_valid_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let stats_path = temp_dir.path().join("stats.json");
+        let server_names = vec!["backend1".to_string()];
+
+        let handles = (0..8)
+            .map(|value| {
+                let path = stats_path.clone();
+                let names = server_names.clone();
+
+                std::thread::spawn(move || {
+                    let store = MetricsStore::new(1);
+                    store.total_connections.store(value, Ordering::Relaxed);
+                    store.save(&path, &names).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let loaded = MetricsStore::load(&stats_path, &server_names)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.total_connections.load(Ordering::Relaxed) < 8);
+
+        let tmp_files = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(tmp_files, 0);
     }
 
     #[test]
