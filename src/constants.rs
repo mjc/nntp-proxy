@@ -132,6 +132,19 @@ pub mod timeout {
     /// If a backend doesn't respond within this time, treat as 430 (missing)
     /// This prevents slow backends from blocking all client connections
     pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
+
+    /// Timeout for closing the cache during graceful shutdown
+    /// foyer's close() can hang indefinitely if the runtime is winding down
+    pub const CACHE_CLOSE: Duration = Duration::from_secs(3);
+
+    /// Timeout for sending QUIT to an idle backend connection during shutdown
+    /// Half-closed connections can block write_all indefinitely without this
+    pub const SHUTDOWN_QUIT_WRITE: Duration = Duration::from_millis(500);
+
+    /// Timeout for acquiring an idle connection from the pool during shutdown
+    /// Used to drain connections one at a time; should be near-instant if
+    /// the connection is truly idle
+    pub const SHUTDOWN_POOL_GET: Duration = Duration::from_millis(1);
 }
 
 /// Connection pool constants

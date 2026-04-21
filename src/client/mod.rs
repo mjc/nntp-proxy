@@ -12,7 +12,7 @@
 //! use nntp_proxy::client::NntpClient;
 //! use nntp_proxy::pool::{BufferPool, DeadpoolConnectionProvider};
 //! use nntp_proxy::protocol::Article;
-//! use nntp_proxy::types::BufferSize;
+//! use nntp_proxy::types::{BufferSize, MessageId};
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! // One buffer pool shared across all clients
@@ -23,9 +23,9 @@
 //! )?;
 //! let client = NntpClient::new(conn_pool, buffer_pool.clone());
 //!
-//! # let message_ids: Vec<&str> = vec![];
+//! # let message_ids: Vec<MessageId<'static>> = vec![];
 //! for msg_id in message_ids {
-//!     let buffer = client.fetch_body(msg_id).await?;
+//!     let buffer = client.fetch_body(&msg_id).await?;
 //!     let article = Article::parse(&buffer, true)?;
 //!     if let Some(decoded) = article.decode() {
 //!         process(&decoded);
@@ -38,13 +38,12 @@
 //! ```
 
 use anyhow::{Context, Result};
+use deadpool::managed::Object;
 
+use crate::pool::deadpool_connection::TcpManager;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
 use crate::protocol::{article_by_msgid, body_by_msgid, head_by_msgid, stat_by_msgid};
 use crate::session::backend::send_command;
-
-/// NNTP multiline terminator
-const TERMINATOR: &[u8] = b"\r\n.\r\n";
 
 /// Standalone NNTP client for fetching articles
 ///
@@ -148,9 +147,7 @@ impl NntpClient {
 
     /// Get a connection from the pool
     #[inline]
-    async fn get_connection(
-        &self,
-    ) -> Result<impl std::ops::DerefMut<Target = crate::stream::ConnectionStream>> {
+    async fn get_connection(&self) -> Result<Object<TcpManager>> {
         self.conn_pool
             .get_pooled_connection()
             .await
@@ -167,50 +164,86 @@ impl NntpClient {
         // Validate response - early return on errors
         Self::validate_response(&response)?;
 
-        // Handle multiline responses - need to stream remaining data
-        // For single-line responses, io_buffer already has correct initialized count
         if response.is_multiline {
-            self.handle_multiline_response(&mut conn, &mut io_buffer, response.bytes_read)
-                .await?;
+            // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
+            // capacity without panicking, returned to pool on drop.
+            let mut capture = self.buffer_pool.acquire_capture().await;
+            if let Err(err) = Self::drain_multiline_into(
+                &mut conn,
+                &mut io_buffer,
+                &mut capture,
+                response.bytes_read,
+            )
+            .await
+            {
+                self.conn_pool.remove_with_cooldown(conn);
+                return Err(err);
+            }
+            Ok(capture)
+        } else {
+            Ok(io_buffer)
         }
-
-        Ok(io_buffer)
     }
 
-    /// Handle multiline response - stream until terminator, extending io_buffer in-place
-    async fn handle_multiline_response(
-        &self,
+    /// Stream remaining multiline response data into `capture`.
+    ///
+    /// `io_buffer` is the scratch buffer for socket reads (fixed size).
+    /// `capture` is the accumulator returned to the caller (can grow).
+    async fn drain_multiline_into(
         conn: &mut crate::stream::ConnectionStream,
         io_buffer: &mut PooledBuffer,
+        capture: &mut PooledBuffer,
         first_chunk_size: usize,
     ) -> Result<()> {
-        // Early return if first chunk contains terminator
+        use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+
         let first_chunk = &io_buffer.as_mut_slice()[..first_chunk_size];
-        if first_chunk.ends_with(TERMINATOR) {
-            return Ok(());
+        let mut tail = TailBuffer::default();
+
+        match tail.detect_terminator(first_chunk) {
+            TerminatorStatus::FoundAt(pos) => {
+                // pos is after the terminator (terminator included in [..pos])
+                capture.extend_from_slice(&first_chunk[..pos]);
+                if pos < first_chunk.len() {
+                    conn.stash_leftover(&first_chunk[pos..])?;
+                }
+                return Ok(());
+            }
+            TerminatorStatus::NotFound => {
+                tail.update(first_chunk);
+                capture.extend_from_slice(first_chunk);
+            }
         }
 
-        // Stream remaining chunks until terminator
-        // Note: We need to accumulate because io_buffer has fixed capacity
-        // and articles can exceed it. Using Vec for dynamic growth.
-        let mut accumulated = Vec::with_capacity(first_chunk_size * 2);
-        accumulated.extend_from_slice(first_chunk);
-
-        while let Ok(n) = io_buffer.read_from(conn).await {
+        loop {
+            let n = io_buffer
+                .read_from(conn)
+                .await
+                .context("Failed to read multiline response from backend")?;
             if n == 0 {
-                break; // EOF
+                anyhow::bail!("Backend closed connection before multiline terminator");
             }
-
-            accumulated.extend_from_slice(&io_buffer.as_mut_slice()[..n]);
-
-            if accumulated.ends_with(TERMINATOR) {
-                break;
+            // NLL: chunk borrow ends before next read_from call
+            let found_at = {
+                let chunk = &io_buffer.as_mut_slice()[..n];
+                tail.detect_terminator(chunk)
+            };
+            match found_at {
+                TerminatorStatus::FoundAt(pos) => {
+                    // pos is after the terminator (terminator included in [..pos])
+                    capture.extend_from_slice(&io_buffer.as_mut_slice()[..pos]);
+                    if pos < n {
+                        conn.stash_leftover(&io_buffer.as_mut_slice()[pos..n])?;
+                    }
+                    return Ok(());
+                }
+                TerminatorStatus::NotFound => {
+                    let chunk = &io_buffer.as_mut_slice()[..n];
+                    tail.update(chunk);
+                    capture.extend_from_slice(chunk);
+                }
             }
         }
-
-        // Copy accumulated data back to io_buffer (sets initialized count)
-        io_buffer.copy_from_slice(&accumulated);
-        Ok(())
     }
 
     /// Validate NNTP response status code
@@ -231,15 +264,6 @@ impl NntpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_terminator_detection() {
-        let with_term = b"content\r\n.\r\n";
-        let without_term = b"content\r\n";
-
-        assert!(with_term.ends_with(TERMINATOR));
-        assert!(!without_term.ends_with(TERMINATOR));
-    }
 
     #[test]
     fn test_parse_stat_response_success() {
@@ -263,9 +287,180 @@ mod tests {
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400")).is_err());
     }
 
-    #[test]
-    fn test_terminator_constant() {
-        assert_eq!(TERMINATOR, b"\r\n.\r\n");
-        assert_eq!(TERMINATOR.len(), 5);
+    /// Spawn a minimal NNTP server that sends a greeting, then waits for
+    /// `notify` before sending `article_data`. Returns (addr, notify).
+    ///
+    /// The caller calls `pool.get()` first (which consumes only the greeting),
+    /// then fires the notify so the server sends article data into the established
+    /// connection. This prevents `consume_greeting` from inadvertently consuming
+    /// article bytes (both writes arriving in the same TCP segment).
+    async fn spawn_test_server(
+        article_data: &'static [u8],
+    ) -> (std::net::SocketAddr, std::sync::Arc<tokio::sync::Notify>) {
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notify = Arc::new(Notify::new());
+        let n = Arc::clone(&notify);
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let wake = Arc::clone(&n);
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        // Block until the test signals that pool.get() has returned
+                        // (greeting already consumed) before sending article data
+                        wake.notified().await;
+                        let _ = stream.write_all(article_data).await;
+                        // Keep alive so recycle's try_read sees WouldBlock
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    });
+                }
+            }
+        });
+
+        (addr, notify)
+    }
+
+    async fn spawn_truncated_test_server(
+        article_prefix: &'static [u8],
+    ) -> (std::net::SocketAddr, std::sync::Arc<tokio::sync::Notify>) {
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notify = Arc::new(Notify::new());
+        let n = Arc::clone(&notify);
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let wake = Arc::clone(&n);
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        wake.notified().await;
+                        let _ = stream.write_all(article_prefix).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            }
+        });
+
+        (addr, notify)
+    }
+
+    async fn make_test_pool(addr: std::net::SocketAddr) -> crate::pool::deadpool_connection::Pool {
+        let manager = crate::pool::deadpool_connection::TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "test".to_string(),
+            None,
+            None,
+            None,
+            Some(false), // disable compression — mock doesn't handle it
+            None,
+        )
+        .unwrap();
+        crate::pool::deadpool_connection::Pool::builder(manager)
+            .max_size(2)
+            .build()
+            .unwrap()
+    }
+
+    /// Verify drain_multiline_into captures the complete response when it all
+    /// arrives in the first pre-read chunk (first_chunk_size == article length).
+    #[tokio::test]
+    async fn test_drain_multiline_into_single_read() {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+
+        let article = b"220 body follows\r\nHello world\r\n.\r\n";
+        let (addr, notify) = spawn_test_server(article).await;
+        let pool = make_test_pool(addr).await;
+        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+
+        let mut conn = pool.get().await.unwrap();
+        // Signal server to send article data now that the greeting is consumed
+        notify.notify_one();
+
+        let mut io_buffer = buffer_pool.acquire().await;
+        let mut capture = buffer_pool.acquire_capture().await;
+
+        // Simulate send_command pre-reading the full first response chunk
+        let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
+
+        NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
+            .await
+            .unwrap();
+
+        assert_eq!(&capture[..], article as &[u8]);
+    }
+
+    /// Verify drain_multiline_into accumulates correctly across multiple reads,
+    /// including when the NNTP terminator spans a read boundary (3+ reads).
+    ///
+    /// Uses an 8-byte I/O buffer against a 36-byte article, forcing 5 reads.
+    /// Read 4 ends with `\r` and read 5 starts with `\n.\r\n`, so the terminator
+    /// `\r\n.\r\n` spans the boundary — exercising TailBuffer spanning detection.
+    #[tokio::test]
+    async fn test_drain_multiline_into_multi_read_spanning_terminator() {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+
+        // 36 bytes total: 5 × 8-byte reads with 8-byte io_buffer.
+        // Terminator \r\n.\r\n spans read 4 ("\r") → read 5 ("\n.\r\n").
+        let article = b"220 article\r\nLine one\r\nLine two\r\n.\r\n";
+        let (addr, notify) = spawn_test_server(article).await;
+        let pool = make_test_pool(addr).await;
+        // Tiny I/O buffer forces multiple reads and exercises the streaming loop
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 4);
+
+        let mut conn = pool.get().await.unwrap();
+        notify.notify_one();
+
+        let mut io_buffer = buffer_pool.acquire().await;
+        let mut capture = buffer_pool.acquire_capture().await;
+
+        // first_chunk_size = 0: no pre-loaded data, all bytes arrive via the loop
+        NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(&capture[..], article as &[u8]);
+    }
+
+    #[tokio::test]
+    async fn test_drain_multiline_into_errors_on_truncated_response() {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+
+        let article_prefix = b"220 body follows\r\npartial article";
+        let (addr, notify) = spawn_truncated_test_server(article_prefix).await;
+        let pool = make_test_pool(addr).await;
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 4);
+
+        let mut conn = pool.get().await.unwrap();
+        notify.notify_one();
+
+        let mut io_buffer = buffer_pool.acquire().await;
+        let mut capture = buffer_pool.acquire_capture().await;
+
+        let err = NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Backend closed connection before multiline terminator"),
+            "unexpected error: {err:#}"
+        );
     }
 }

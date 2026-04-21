@@ -144,13 +144,25 @@ pub async fn drain_connection_async(
     for _ in 0..MAX_DRAIN_ITERATIONS {
         match tokio::time::timeout(DRAIN_TIMEOUT, buffer.read_from(&mut *conn)).await {
             Ok(Ok(n)) if n > 0 => {
+                use crate::session::streaming::tail_buffer::TerminatorStatus;
                 let data = &buffer[..n];
-                // Check for terminator (handles mid-chunk and cross-boundary spanning)
-                if tail.detect_terminator(data).is_found() {
-                    debug!("Successfully drained connection - returning to pool");
-                    return; // Drop returns connection to pool
+                match tail.detect_terminator(data) {
+                    TerminatorStatus::FoundAt(pos) if pos == n => {
+                        // Terminator at exact end of chunk — no leftover bytes, connection clean
+                        debug!("Successfully drained connection - returning to pool");
+                        return; // Drop returns connection to pool
+                    }
+                    TerminatorStatus::FoundAt(_) => {
+                        // Terminator mid-chunk: leftover bytes already consumed from socket,
+                        // connection is desynchronized and cannot be safely reused
+                        debug!("Leftover bytes after terminator - removing from pool");
+                        remove_from_pool(conn);
+                        return;
+                    }
+                    TerminatorStatus::NotFound => {
+                        tail.update(data);
+                    }
                 }
-                tail.update(data);
             }
             _ => {
                 // Timeout, EOF, or error - connection broken
@@ -331,6 +343,200 @@ mod tests {
                 kind
             );
         }
+    }
+
+    /// Verify that TailBuffer sees pos < n for a mid-chunk terminator.
+    /// This guards the condition checked by drain_connection_async: FoundAt(pos) with
+    /// leftover bytes must remove from pool. The end-to-end pool behavior is verified
+    /// in test_drain_async_mid_chunk_terminator_removes_from_pool.
+    #[test]
+    fn test_tailbuffer_mid_chunk_terminator_pos_less_than_n() {
+        use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+
+        // Chunk contains the terminator mid-way, with extra bytes after it.
+        // Simulates a backend that sent two pipelined responses in one TCP read.
+        let chunk = b"220 Article follows\r\nBody\r\n.\r\nEXTRA DATA FROM NEXT RESPONSE";
+        let n = chunk.len();
+
+        let tail = TailBuffer::default();
+        let status = tail.detect_terminator(chunk);
+
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert!(
+                    pos < n,
+                    "Terminator should be mid-chunk (pos={} < n={})",
+                    pos,
+                    n
+                );
+                // This is the condition that triggers remove_from_pool in
+                // drain_connection_async — connection is desynchronized
+            }
+            other => panic!("Expected FoundAt, got {:?}", other),
+        }
+    }
+
+    /// Verify that TailBuffer sees pos == n for a terminator exactly at chunk end.
+    /// This guards the condition checked by drain_connection_async: FoundAt(pos) with
+    /// no leftover bytes returns the connection to the pool. The end-to-end pool
+    /// behavior is verified in test_drain_async_clean_terminator_returns_to_pool.
+    #[test]
+    fn test_tailbuffer_end_of_chunk_terminator_pos_equals_n() {
+        use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+
+        // Chunk ends exactly with the terminator — no leftover bytes.
+        let chunk = b"220 Article follows\r\nBody\r\n.\r\n";
+        let n = chunk.len();
+
+        let tail = TailBuffer::default();
+        let status = tail.detect_terminator(chunk);
+
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(
+                    pos, n,
+                    "Terminator at end of chunk should have pos == n ({} == {})",
+                    pos, n
+                );
+                // This is the condition that allows returning to pool in
+                // drain_connection_async — connection is clean
+            }
+            other => panic!("Expected FoundAt, got {:?}", other),
+        }
+    }
+
+    /// Spawn a minimal NNTP mock server that sends a greeting, then waits for
+    /// `notify` before sending `data`. Loops to accept multiple connections
+    /// (needed when a broken connection is replaced by `create_new`).
+    ///
+    /// The caller calls `pool.get()` first (which consumes only the greeting),
+    /// then fires the notify so the server sends article data into the established
+    /// connection. This prevents `consume_greeting` from inadvertently consuming
+    /// article bytes (both writes arriving in the same TCP segment).
+    async fn spawn_test_nntp_server(
+        data: &'static [u8],
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+        let count = Arc::clone(&accept_count);
+        let n = Arc::clone(&notify);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let wake = Arc::clone(&n);
+                tokio::spawn(async move {
+                    let _ = stream.write_all(b"200 mock\r\n").await;
+                    // Block until the test signals that pool.get() has returned
+                    // (greeting already consumed) before sending article data
+                    wake.notified().await;
+                    let _ = stream.write_all(data).await;
+                    // Keep alive so recycle's try_read sees WouldBlock (not EOF)
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (addr, accept_count, notify)
+    }
+
+    async fn make_test_pool(addr: std::net::SocketAddr) -> crate::pool::deadpool_connection::Pool {
+        let manager = crate::pool::deadpool_connection::TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "test".to_string(),
+            None,
+            None,
+            None,
+            Some(false), // disable compression — mock doesn't handle it
+            None,
+        )
+        .unwrap();
+        crate::pool::deadpool_connection::Pool::builder(manager)
+            .max_size(2)
+            .build()
+            .unwrap()
+    }
+
+    /// `drain_connection_async` returns the connection to the pool when the
+    /// terminator arrives exactly at the end of a read chunk (pos == n).
+    /// Verifies via pool.status() and that the same server connection is reused.
+    #[tokio::test]
+    async fn test_drain_async_clean_terminator_returns_to_pool() {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+        use std::sync::atomic::Ordering;
+
+        let (addr, accept_count, notify) = spawn_test_nntp_server(b"article body\r\n.\r\n").await;
+        let pool = make_test_pool(addr).await;
+        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+
+        let conn = pool.get().await.unwrap();
+        // Signal server to send article data now that the greeting is consumed
+        notify.notify_one();
+        assert_eq!(pool.status().available, 0);
+
+        drain_connection_async(conn, buffer_pool).await;
+
+        // Object dropped synchronously → returned to ready queue immediately
+        assert_eq!(pool.status().available, 1, "connection must return to pool");
+
+        // Recycle check: try_read sees WouldBlock (server idle) → recycle succeeds
+        // No new server connection should be required
+        let _conn2 = pool.get().await.unwrap();
+        assert_eq!(
+            accept_count.load(Ordering::Relaxed),
+            1,
+            "clean path: same connection recycled, no new server connection"
+        );
+    }
+
+    /// `drain_connection_async` removes the connection from the pool when the
+    /// terminator is found mid-chunk (pos < n), meaning leftover bytes from the
+    /// next response were already consumed from the socket.
+    /// Verifies that the dead connection is detected during recycle and replaced.
+    #[tokio::test]
+    async fn test_drain_async_mid_chunk_terminator_removes_from_pool() {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+        use std::sync::atomic::Ordering;
+
+        let (addr, accept_count, notify) =
+            spawn_test_nntp_server(b"article body\r\n.\r\nEXTRA_BYTES").await;
+        let pool = make_test_pool(addr).await;
+        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+
+        let conn = pool.get().await.unwrap();
+        // Signal server to send article data now that the greeting is consumed
+        notify.notify_one();
+        drain_connection_async(conn, buffer_pool).await;
+
+        // Object is returned to the ready queue (deadpool doesn't know it's broken)
+        assert_eq!(pool.status().available, 1);
+
+        // Yield to let tokio process the pending EPOLLRDHUP event from shutdown(Both).
+        // Without this, check_tcp_alive's try_read sees WouldBlock (readiness not yet
+        // updated) instead of Ok(0) (EOF), causing recycle to succeed incorrectly.
+        tokio::task::yield_now().await;
+
+        // Next get() calls try_recycle → check_tcp_alive on the shutdown socket
+        // sees EOF → recycle fails → create_new → server accepts a second connection
+        let _conn2 = pool.get().await.unwrap();
+        assert_eq!(
+            accept_count.load(Ordering::Relaxed),
+            2,
+            "remove path: broken connection replaced with fresh server connection"
+        );
     }
 
     /// Verify that TailBuffer detects terminators that span chunk boundaries,

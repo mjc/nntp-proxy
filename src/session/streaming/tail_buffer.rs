@@ -38,14 +38,31 @@ pub struct TailBuffer {
 
 impl TailBuffer {
     /// Update tail with the last bytes from a chunk
+    ///
+    /// Maintains the last `TERMINATOR_TAIL_SIZE` bytes of the concatenation of
+    /// all prior chunks. When `chunk` is smaller than `TERMINATOR_TAIL_SIZE`,
+    /// the prior tail bytes are shifted to preserve the rolling window — not
+    /// overwritten — so terminators split across three or more tiny reads
+    /// (e.g. `\r\n`, `.`, `\r\n`) are correctly detected.
     pub fn update(&mut self, chunk: &[u8]) {
         if chunk.len() >= TERMINATOR_TAIL_SIZE {
+            // Chunk alone fills the window — take its last N bytes
             self.data
                 .copy_from_slice(&chunk[chunk.len() - TERMINATOR_TAIL_SIZE..]);
             self.len = TERMINATOR_TAIL_SIZE;
         } else if !chunk.is_empty() {
-            self.data[..chunk.len()].copy_from_slice(chunk);
-            self.len = chunk.len();
+            let combined_len = self.len + chunk.len();
+            if combined_len >= TERMINATOR_TAIL_SIZE {
+                // Shift prior tail left to keep window full, then append chunk
+                let keep = TERMINATOR_TAIL_SIZE - chunk.len();
+                self.data.copy_within(self.len - keep..self.len, 0);
+                self.data[keep..keep + chunk.len()].copy_from_slice(chunk);
+                self.len = TERMINATOR_TAIL_SIZE;
+            } else {
+                // Combined bytes still fit — just append
+                self.data[self.len..self.len + chunk.len()].copy_from_slice(chunk);
+                self.len = combined_len;
+            }
         }
     }
     /// Get the tail data as a slice
@@ -234,6 +251,27 @@ mod tests {
 
         assert_eq!(tail.len(), 3);
         assert_eq!(tail.as_slice(), b".\r\n");
+    }
+
+    /// Regression test: update() with successive small chunks must maintain the
+    /// rolling window — not overwrite it — so terminators split across 3+ reads work.
+    #[test]
+    fn test_tail_buffer_update_successive_small_chunks() {
+        // Terminator "\r\n.\r\n" split as: ["\r\n"] ["."] ["\r\n"]
+        let mut tail = TailBuffer::default();
+
+        tail.update(b"\r\n"); // len=2, tail=['\r','\n']
+        assert_eq!(tail.as_slice(), b"\r\n");
+
+        tail.update(b"."); // len=3, tail=['\r','\n','.']
+        assert_eq!(tail.as_slice(), b"\r\n.");
+
+        // Now detect_terminator on the final chunk should find spanning match
+        let status = tail.detect_terminator(b"\r\n");
+        assert!(
+            status.is_found(),
+            "TailBuffer must detect terminator split across 3 reads"
+        );
     }
 
     #[test]

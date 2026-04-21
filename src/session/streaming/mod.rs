@@ -183,8 +183,110 @@ where
 /// Like `stream_multiline_response`, but captures leftover bytes after the terminator
 /// into `leftover` for use as the start of the next response in the pipeline.
 #[allow(clippy::too_many_arguments)]
-pub async fn stream_multiline_response_pipelined<R, W>(
-    backend_read: &mut R,
+pub(crate) async fn stream_multiline_response_pipelined<W>(
+    backend_read: &mut crate::stream::ConnectionStream,
+    client_write: &mut W,
+    first_chunk: &[u8],
+    first_n: usize,
+    client_addr: crate::types::ClientAddress,
+    backend_id: crate::types::BackendId,
+    buffer_pool: &crate::pool::BufferPool,
+) -> Result<u64>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut total_bytes = 0u64;
+    let mut tail = TailBuffer::default();
+    let mut capture = None;
+
+    let data = &first_chunk[..first_n];
+    match process_chunk(
+        data,
+        first_n,
+        &mut tail,
+        &mut capture,
+        client_write,
+        backend_read,
+        &mut total_bytes,
+        client_addr,
+        backend_id,
+        buffer_pool,
+    )
+    .await?
+    {
+        ChunkResult::Done { write_len } => {
+            if write_len < first_n {
+                backend_read.stash_leftover(&first_chunk[write_len..first_n])?;
+            }
+            debug!(
+                "Client {} multiline response complete ({})",
+                client_addr,
+                crate::formatting::format_bytes(total_bytes)
+            );
+            return Ok(total_bytes);
+        }
+        ChunkResult::Continue => {}
+    }
+
+    let mut buffers = [buffer_pool.acquire().await, buffer_pool.acquire().await];
+    let mut idx: usize = 0;
+
+    loop {
+        let n = buffers[idx]
+            .read_from(backend_read)
+            .await
+            .context("Failed to read next chunk from backend")?;
+
+        if n == 0 {
+            anyhow::bail!(
+                "Backend EOF before multiline terminator while streaming to client {} from backend {:?} (received {})",
+                client_addr,
+                backend_id,
+                crate::formatting::format_bytes(total_bytes)
+            );
+        }
+
+        let data = &buffers[idx][..n];
+        match process_chunk(
+            data,
+            n,
+            &mut tail,
+            &mut capture,
+            client_write,
+            backend_read,
+            &mut total_bytes,
+            client_addr,
+            backend_id,
+            buffer_pool,
+        )
+        .await?
+        {
+            ChunkResult::Done { write_len } => {
+                if write_len < n {
+                    backend_read.stash_leftover(&buffers[idx][write_len..n])?;
+                }
+                debug!(
+                    "Client {} multiline response complete ({})",
+                    client_addr,
+                    crate::formatting::format_bytes(total_bytes)
+                );
+                return Ok(total_bytes);
+            }
+            ChunkResult::Continue => {}
+        }
+
+        idx ^= 1;
+    }
+}
+
+/// Stream multiline response from backend to client during pipelined batch execution.
+///
+/// Like `stream_multiline_response`, but captures leftover bytes after the terminator
+/// into `leftover` for use as the start of the next response in the pipeline.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) async fn stream_multiline_response_pipelined_for_test<W>(
+    backend_read: &mut crate::stream::ConnectionStream,
     client_write: &mut W,
     first_chunk: &[u8],
     first_n: usize,
@@ -194,7 +296,6 @@ pub async fn stream_multiline_response_pipelined<R, W>(
     leftover: &mut bytes::BytesMut,
 ) -> Result<u64>
 where
-    R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     stream_multiline_response_impl(
@@ -353,12 +454,12 @@ where
             .context("Failed to read next chunk from backend")?;
 
         if n == 0 {
-            debug!(
-                "Client {} multiline streaming complete ({}, EOF)",
+            anyhow::bail!(
+                "Backend EOF before multiline terminator while streaming to client {} from backend {:?} (received {})",
                 client_addr,
+                backend_id,
                 crate::formatting::format_bytes(total_bytes)
             );
-            break;
         }
 
         let data = &buffers[idx][..n];
@@ -400,8 +501,6 @@ where
 
         idx ^= 1; // Toggle buffer index
     }
-
-    Ok(total_bytes)
 }
 
 #[cfg(test)]
@@ -586,6 +685,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_multiline_response_errors_on_truncated_response() {
+        use crate::types::BufferSize;
+
+        let first_chunk = b"220 Article follows\r\npartial body\r\n";
+        let mut reader = Cursor::new(b"" as &[u8]);
+        let mut writer = Vec::new();
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let client_addr = crate::types::ClientAddress::from(socket_addr);
+        let backend_id = crate::types::BackendId::from_index(1);
+        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+
+        let result = stream_multiline_response(
+            &mut reader,
+            &mut writer,
+            first_chunk,
+            first_chunk.len(),
+            client_addr,
+            backend_id,
+            &buffer_pool,
+        )
+        .await;
+
+        assert!(result.is_err(), "truncated multiline response must fail");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Backend EOF before multiline terminator")
+        );
+        assert_eq!(&writer[..], first_chunk);
+    }
+
+    #[tokio::test]
     async fn test_handle_client_write_error_complete_chunk() {
         use crate::types::BufferSize;
         // Test that client disconnect after complete chunk logs at debug level
@@ -693,7 +825,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             &combined,
@@ -701,7 +833,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 
@@ -729,7 +862,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             first_chunk,
@@ -737,7 +870,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 
@@ -768,7 +902,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             response,
@@ -776,7 +910,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 
@@ -807,7 +942,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(1);
         let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
 
-        let result = stream_multiline_response_pipelined(
+        let result = stream_multiline_response_impl(
             &mut reader,
             &mut writer,
             &combined,
@@ -815,7 +950,8 @@ mod tests {
             client_addr,
             backend_id,
             &buffer_pool,
-            &mut leftover,
+            None,
+            Some(&mut leftover),
         )
         .await;
 

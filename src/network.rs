@@ -301,7 +301,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let connection_stream = ConnectionStream::Plain(tcp_stream);
+        let connection_stream = ConnectionStream::plain(tcp_stream);
         let optimizer = ConnectionOptimizer::new(&connection_stream);
 
         assert_eq!(optimizer.description(), "Connection-level TCP optimization");
@@ -316,7 +316,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let connection_stream = ConnectionStream::Plain(tcp_stream);
+        let connection_stream = ConnectionStream::plain(tcp_stream);
 
         // Test that ConnectionOptimizer implements NetworkOptimizer trait
         let optimizer: Box<dyn NetworkOptimizer> =
@@ -332,7 +332,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let connection_stream = ConnectionStream::Plain(tcp_stream);
+        let connection_stream = ConnectionStream::plain(tcp_stream);
         let optimizer = ConnectionOptimizer::with_buffer_sizes(&connection_stream, 4096, 8192);
 
         assert_eq!(optimizer.description(), "Connection-level TCP optimization");
@@ -436,7 +436,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let stream = ConnectionStream::Plain(tcp);
+        let stream = ConnectionStream::plain(tcp);
 
         let optimizer = ConnectionOptimizer::new(&stream);
         assert_eq!(optimizer.description(), "Connection-level TCP optimization");
@@ -449,7 +449,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let stream = ConnectionStream::Plain(tcp);
+        let stream = ConnectionStream::plain(tcp);
 
         let optimizer = ConnectionOptimizer::new(&stream);
         assert!(optimizer.recv_buffer_size.is_none());
@@ -461,7 +461,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let stream = ConnectionStream::Plain(tcp);
+        let stream = ConnectionStream::plain(tcp);
 
         let recv = 16384;
         let send = 32768;
@@ -529,7 +529,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let stream = ConnectionStream::Plain(tcp);
+        let stream = ConnectionStream::plain(tcp);
 
         let optimizer = ConnectionOptimizer::new(&stream);
         // Can be used as a trait object

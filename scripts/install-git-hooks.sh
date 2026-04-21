@@ -4,7 +4,7 @@
 
 set -e
 
-HOOKS_DIR=".git/hooks"
+HOOKS_DIR="$(git rev-parse --path-format=absolute --git-path hooks)"
 HOOK_FILE="$HOOKS_DIR/pre-commit"
 
 if [ ! -d "$HOOKS_DIR" ]; then
@@ -17,9 +17,20 @@ echo "Installing pre-commit hook..."
 cat > "$HOOK_FILE" << 'EOF'
 #!/bin/sh
 # Pre-commit hook for nntp-proxy
-# Runs cargo fmt and cargo clippy before allowing commits
+# Runs cargo fmt and cargo clippy before allowing commits.
+# If the repository has a Nix flake, prefer the dev shell for consistent tooling.
 
 set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+if [ -z "${NNTP_PROXY_PRE_COMMIT_IN_NIX:-}" ] \
+    && command -v nix >/dev/null 2>&1 \
+    && [ -f "flake.nix" ]; then
+    echo "Entering Nix development environment for pre-commit checks..."
+    exec nix develop -c env NNTP_PROXY_PRE_COMMIT_IN_NIX=1 "$0" "$@"
+fi
 
 echo "Running cargo fmt..."
 cargo fmt --check
@@ -49,5 +60,6 @@ echo ""
 echo "The hook will run the following checks before each commit:"
 echo "  - cargo fmt --check (code formatting)"
 echo "  - cargo clippy --all-features (linting)"
+echo "  - nix develop -c ... when flake.nix and nix are available"
 echo ""
 echo "To bypass the hook temporarily, use: git commit --no-verify"

@@ -716,12 +716,17 @@ impl DeadpoolConnectionProvider {
 
         // Send QUIT to idle connections with minimal timeout
         let mut timeouts = managed::Timeouts::new();
-        timeouts.wait = Some(std::time::Duration::from_millis(1));
+        timeouts.wait = Some(crate::constants::timeout::SHUTDOWN_POOL_GET);
 
         for _ in 0..status.available {
             if let Ok(conn_obj) = self.pool.timeout_get(&timeouts).await {
                 let mut conn = Object::take(conn_obj);
-                let _ = conn.write_all(b"QUIT\r\n").await;
+                // Timeout the write: a half-closed backend connection can block indefinitely
+                let _ = tokio::time::timeout(
+                    crate::constants::timeout::SHUTDOWN_QUIT_WRITE,
+                    conn.write_all(b"QUIT\r\n"),
+                )
+                .await;
             } else {
                 break;
             }
@@ -1008,21 +1013,16 @@ mod tests {
         let keep_alive = Arc::new(tokio::sync::Notify::new());
 
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((mut stream, _)) => {
-                        let keep = keep_alive.clone();
-                        // Spawn a handler per connection so they stay alive concurrently
-                        tokio::spawn(async move {
-                            let _ = stream.write_all(b"200 mock\r\n").await;
-                            // Keep alive until test drops the connection.
-                            // Notify::notified() does NOT auto-advance with
-                            // start_paused, unlike sleep().
-                            keep.notified().await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let keep = keep_alive.clone();
+                // Spawn a handler per connection so they stay alive concurrently
+                tokio::spawn(async move {
+                    let _ = stream.write_all(b"200 mock\r\n").await;
+                    // Keep alive until test drops the connection.
+                    // Notify::notified() does NOT auto-advance with
+                    // start_paused, unlike sleep().
+                    keep.notified().await;
+                });
             }
         });
 
