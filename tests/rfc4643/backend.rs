@@ -110,7 +110,7 @@ enum AuthScenario {
     NonSuccessGreeting,
 }
 
-/// Test NntpResponse::is_auth_success with valid auth response
+/// Test `NntpResponse::is_auth_success` with valid auth response
 #[test]
 fn test_is_auth_success_valid() {
     let response = b"281 Authentication accepted\r\n";
@@ -120,7 +120,7 @@ fn test_is_auth_success_valid() {
     ));
 }
 
-/// Test NntpResponse::is_auth_success with various valid formats
+/// Test `NntpResponse::is_auth_success` with various valid formats
 #[test]
 fn test_is_auth_success_variations() {
     // Different message text
@@ -138,7 +138,7 @@ fn test_is_auth_success_variations() {
     }
 }
 
-/// Test NntpResponse::is_auth_success rejects non-281 responses
+/// Test `NntpResponse::is_auth_success` rejects non-281 responses
 #[test]
 fn test_is_auth_success_rejects_others() {
     let responses: &[&[u8]] = &[
@@ -156,7 +156,7 @@ fn test_is_auth_success_rejects_others() {
     }
 }
 
-/// Test NntpResponse::is_auth_required with valid response
+/// Test `NntpResponse::is_auth_required` with valid response
 #[test]
 fn test_is_auth_required_valid() {
     let response = b"381 Password required\r\n";
@@ -166,7 +166,7 @@ fn test_is_auth_required_valid() {
     ));
 }
 
-/// Test NntpResponse::is_auth_required with variations
+/// Test `NntpResponse::is_auth_required` with variations
 #[test]
 fn test_is_auth_required_variations() {
     let responses: &[&[u8]] = &[
@@ -183,7 +183,7 @@ fn test_is_auth_required_variations() {
     }
 }
 
-/// Test NntpResponse::is_auth_required rejects non-381
+/// Test `NntpResponse::is_auth_required` rejects non-381
 #[test]
 fn test_is_auth_required_rejects_others() {
     let responses: &[&[u8]] = &[
@@ -200,7 +200,7 @@ fn test_is_auth_required_rejects_others() {
     }
 }
 
-/// Test NntpResponse::is_greeting with 200 response
+/// Test `NntpResponse::is_greeting` with 200 response
 #[test]
 fn test_is_greeting_200() {
     let response = b"200 Welcome to NNTP server\r\n";
@@ -210,7 +210,7 @@ fn test_is_greeting_200() {
     ));
 }
 
-/// Test NntpResponse::is_greeting with 201 response
+/// Test `NntpResponse::is_greeting` with 201 response
 #[test]
 fn test_is_greeting_201() {
     let response = b"201 Service available, posting prohibited\r\n";
@@ -220,7 +220,7 @@ fn test_is_greeting_201() {
     ));
 }
 
-/// Test NntpResponse::is_greeting rejects non-200/201
+/// Test `NntpResponse::is_greeting` rejects non-200/201
 #[test]
 fn test_is_greeting_rejects_others() {
     let responses: &[&[u8]] = &[
@@ -237,14 +237,14 @@ fn test_is_greeting_rejects_others() {
     }
 }
 
-/// Test authinfo_user command formatting
+/// Test `authinfo_user` command formatting
 #[test]
 fn test_authinfo_user_formatting() {
     let command = authinfo_user("testuser");
     assert_eq!(command, "AUTHINFO USER testuser\r\n");
 }
 
-/// Test authinfo_user with various usernames
+/// Test `authinfo_user` with various usernames
 #[test]
 fn test_authinfo_user_variations() {
     let test_cases = [
@@ -259,21 +259,21 @@ fn test_authinfo_user_variations() {
     }
 }
 
-/// Test authinfo_user with empty username
+/// Test `authinfo_user` with empty username
 #[test]
 fn test_authinfo_user_empty() {
     let command = authinfo_user("");
     assert_eq!(command, "AUTHINFO USER \r\n");
 }
 
-/// Test authinfo_pass command formatting
+/// Test `authinfo_pass` command formatting
 #[test]
 fn test_authinfo_pass_formatting() {
     let command = authinfo_pass("testpass");
     assert_eq!(command, "AUTHINFO PASS testpass\r\n");
 }
 
-/// Test authinfo_pass with various passwords
+/// Test `authinfo_pass` with various passwords
 #[test]
 fn test_authinfo_pass_variations() {
     let test_cases = [
@@ -288,7 +288,7 @@ fn test_authinfo_pass_variations() {
     }
 }
 
-/// Test authinfo_pass with empty password
+/// Test `authinfo_pass` with empty password
 #[test]
 fn test_authinfo_pass_empty() {
     let command = authinfo_pass("");

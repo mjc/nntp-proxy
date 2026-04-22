@@ -21,6 +21,11 @@
 //! - **SIMD-friendly**: Compiler auto-vectorizes with SSE2/AVX2
 //! - **Branch prediction**: UPPERCASE checked first (95% hit rate in real traffic)
 
+// All public functions in this module use #[inline(always)] — this is intentional.
+// The classifier is the hot path (70%+ of traffic, 4-6ns target), profiling confirms
+// that inlining these tiny functions avoids measurable call overhead.
+#![allow(clippy::inline_always)]
+
 // =============================================================================
 // Case-insensitive command matching tables
 // =============================================================================
@@ -62,6 +67,7 @@
 macro_rules! command_cases {
     (pub $name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
+        #[allow(clippy::string_lit_as_bytes)]
         pub const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
 
         // Compile-time validation: ensure documentation starts with RFC reference
@@ -74,6 +80,7 @@ macro_rules! command_cases {
     };
     ($name:ident, $upper:literal, $lower:literal, $title:literal, $doc:expr) => {
         #[doc = $doc]
+        #[allow(clippy::string_lit_as_bytes)]
         const $name: &[&[u8]; 3] = &[$upper.as_bytes(), $lower.as_bytes(), $title.as_bytes()];
 
         // Compile-time validation: ensure documentation starts with RFC reference
@@ -311,6 +318,7 @@ command_cases!(
 ///
 /// Uses const generic to support flexible case counts at compile time.
 #[inline(always)]
+#[must_use]
 pub fn matches_any<const N: usize>(cmd: &[u8], cases: &[&[u8]; N]) -> bool {
     // Compiler optimizes contains() to unrolled comparisons for small N
     cases.contains(&cmd)
@@ -435,7 +443,7 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
 ///
 /// ## Classification Categories
 ///
-/// - **ArticleByMessageId**: High-throughput binary retrieval (can be multiplexed)
+/// - **`ArticleByMessageId`**: High-throughput binary retrieval (can be multiplexed)
 ///   - Commands: ARTICLE/BODY/HEAD/STAT with message-ID argument
 ///   - Per [RFC 3977 §6.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2)
 ///   - 70%+ of NZB download traffic
@@ -445,8 +453,8 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
 ///   - Per [RFC 3977 §6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1)
 ///   - Requires dedicated backend connection with maintained state
 ///
-/// - **NonRoutable**: Cannot be safely proxied (POST, IHAVE, etc.)
-///   - Commands: POST, IHAVE, NEWGROUPS, NEWNEWS
+/// - **`NonRoutable`**: Cannot be safely proxied (POST, IHAVE)
+///   - Commands: POST, IHAVE
 ///   - Per [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
 ///   - Typically rejected or require special handling
 ///
@@ -459,7 +467,7 @@ fn is_article_cmd_with_msgid(bytes: &[u8]) -> bool {
 ///   - Commands: AUTHINFO USER, AUTHINFO PASS
 ///   - Per [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
 ///   - Handled by proxy authentication layer
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum NntpCommand {
     /// Authentication: AUTHINFO USER
     /// [RFC 4643 §2.3.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.1)
@@ -473,9 +481,8 @@ pub enum NntpCommand {
     /// [RFC 3977 §6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1)
     Stateful,
 
-    /// Commands that cannot work with multiplexing: POST, IHAVE, NEWGROUPS, NEWNEWS
-    /// [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3),
-    /// [RFC 3977 §7.3-7.4](https://datatracker.ietf.org/doc/html/rfc3977#section-7.3)
+    /// Commands that cannot work with multiplexing: POST, IHAVE
+    /// [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
     NonRoutable,
 
     /// Safe to proxy without state: LIST, DATE, CAPABILITIES, HELP, QUIT, etc.
@@ -539,6 +546,7 @@ impl NntpCommand {
     /// commands are case-insensitive. We match against pre-computed literal
     /// variations (UPPER/lower/Title) for maximum performance.
     #[inline]
+    #[must_use]
     pub fn parse(command: &str) -> Self {
         let trimmed = command.trim();
         let bytes = trimmed.as_bytes();
@@ -623,12 +631,15 @@ impl NntpCommand {
         // Posting/transit commands (very rare in typical proxy usage) → NonRoutable
         // Cannot be safely multiplexed or require special handling
         // [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
-        if matches_any(cmd, POST_CASES)
-            || matches_any(cmd, IHAVE_CASES)
-            || matches_any(cmd, NEWGROUPS_CASES)
-            || matches_any(cmd, NEWNEWS_CASES)
-        {
+        if matches_any(cmd, POST_CASES) || matches_any(cmd, IHAVE_CASES) {
             return Self::NonRoutable;
+        }
+
+        // NEWGROUPS/NEWNEWS are read-only queries that don't require group state.
+        // They return multiline responses (231/230) and can be routed to any backend.
+        // [RFC 3977 §7.3-7.4](https://datatracker.ietf.org/doc/html/rfc3977#section-7.3)
+        if matches_any(cmd, NEWGROUPS_CASES) || matches_any(cmd, NEWNEWS_CASES) {
+            return Self::Stateless;
         }
 
         // Unknown commands: Treat as stateless and let backend handle
@@ -906,17 +917,28 @@ mod tests {
             NntpCommand::parse("IHAVE <test@example.com>"),
             NntpCommand::NonRoutable
         );
+    }
 
-        // NEWGROUPS command - cannot be routed per-command
+    #[test]
+    fn test_newgroups_newnews_are_stateless() {
+        // NEWGROUPS and NEWNEWS are read-only queries per RFC 3977 §7.3-7.4
+        // They don't require group state and can be routed to any backend
         assert_eq!(
             NntpCommand::parse("NEWGROUPS 20240101 000000 GMT"),
-            NntpCommand::NonRoutable
+            NntpCommand::Stateless
         );
-
-        // NEWNEWS command - cannot be routed per-command
         assert_eq!(
             NntpCommand::parse("NEWNEWS * 20240101 000000 GMT"),
-            NntpCommand::NonRoutable
+            NntpCommand::Stateless
+        );
+        // Case variants
+        assert_eq!(
+            NntpCommand::parse("newgroups 20240101 000000"),
+            NntpCommand::Stateless
+        );
+        assert_eq!(
+            NntpCommand::parse("Newnews alt.* 20240101 000000"),
+            NntpCommand::Stateless
         );
     }
 

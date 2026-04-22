@@ -11,87 +11,203 @@ use tracing::{debug, warn};
 pub mod tail_buffer;
 use tail_buffer::TailBuffer;
 
-/// Context for handling client write errors during streaming
-struct ClientWriteErrorContext<'a> {
-    write_len: usize,
-    current_n: usize,
-    total_bytes: u64,
-    partial_data: &'a [u8],
-    terminator_found: bool,
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &'a crate::pool::BufferPool,
+/// Outcome of a streaming operation that ended in error.
+///
+/// Callers use `must_remove_connection()` to decide pool fate — no string
+/// inspection or downcast needed.
+#[derive(Debug)]
+pub(crate) enum StreamingError {
+    /// Client disconnected; backend was drained and connection is clean.
+    /// → Return connection to pool.
+    ClientDisconnect(std::io::Error),
+
+    /// Client disconnected AND backend died before terminator during drain.
+    /// → Remove connection from pool.
+    BackendDirty(anyhow::Error),
+
+    /// Backend closed connection before sending `\r\n.\r\n`.
+    /// → Remove connection from pool.
+    BackendEof {
+        backend_id: crate::types::BackendId,
+        bytes_received: u64,
+    },
+
+    /// Other I/O / protocol error.
+    /// → Remove connection from pool.
+    Io(anyhow::Error),
 }
 
-/// Handle client write error and drain backend if needed
+impl StreamingError {
+    /// True for all variants except `ClientDisconnect`.
+    ///
+    /// Callers should call `provider.remove_with_cooldown(conn)` when this is true,
+    /// and `drop(conn)` (returning to pool) when false.
+    pub(crate) const fn must_remove_connection(&self) -> bool {
+        !matches!(self, Self::ClientDisconnect(_))
+    }
+}
+
+impl std::fmt::Display for StreamingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientDisconnect(e) => write!(f, "client disconnected: {e}"),
+            Self::BackendDirty(e) => write!(f, "backend dirty after client disconnect: {e}"),
+            Self::BackendEof {
+                backend_id,
+                bytes_received,
+            } => write!(
+                f,
+                "backend {backend_id:?} closed connection before multiline terminator \
+                 ({bytes_received} bytes received)"
+            ),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ClientDisconnect(e) => Some(e),
+            Self::BackendDirty(e) | Self::Io(e) => e.source(),
+            Self::BackendEof { .. } => None,
+        }
+    }
+}
+
+impl StreamingError {
+    /// Convert into an `anyhow::Error` for propagation across API boundaries that
+    /// return `anyhow::Result`.
+    ///
+    /// `ClientDisconnect` unwraps to the bare `io::Error`. At top-level
+    /// `anyhow::Result` boundaries, callers can still classify via downcast.
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::ClientDisconnect(io_err) => anyhow::Error::from(io_err),
+            Self::BackendDirty(e) | Self::Io(e) => e,
+            Self::BackendEof {
+                backend_id,
+                bytes_received,
+            } => anyhow::anyhow!(
+                "Backend {backend_id:?} closed connection before multiline terminator \
+                 ({bytes_received} bytes received)"
+            ),
+        }
+    }
+}
+
+/// Classify a client-side write failure into the appropriate `StreamingError` variant.
 ///
-/// When a client disconnects mid-stream, we need to drain the remaining
-/// response from the backend to keep the connection clean for reuse.
+/// Disconnect errors (`BrokenPipe`, `ConnectionReset`) become `ClientDisconnect`
+/// (backend is still clean — connection can be returned to pool). All other
+/// errors become `Io` (treat the connection as suspect).
+pub(crate) fn classify_client_write_err(e: std::io::Error) -> StreamingError {
+    use crate::connection_error::is_disconnect_kind;
+    if is_disconnect_kind(e.kind()) {
+        StreamingError::ClientDisconnect(e)
+    } else {
+        StreamingError::Io(e.into())
+    }
+}
+
+/// Identifies where a streaming operation is happening
+///
+/// Groups the session-level context that is invariant across all chunks
+/// of a streaming response, keeping function signatures concise.
+pub(crate) struct StreamContext<'a> {
+    pub client_addr: crate::types::ClientAddress,
+    pub backend_id: crate::types::BackendId,
+    pub buffer_pool: &'a crate::pool::BufferPool,
+}
+
+/// Context used to drain the backend after a client disconnects mid-stream.
+///
+/// Carries the state needed by `handle_client_write_error` to seed `TailBuffer`
+/// and decide whether a drain is still necessary.
+struct DrainContext<'a> {
+    write_len: usize,
+    chunk_len: usize,
+    total_bytes: u64,
+    /// The slice already written (or attempted) — used to seed `TailBuffer.update()`
+    /// so cross-chunk terminator detection works correctly across the drain boundary.
+    tail_data: &'a [u8],
+    terminator_found: bool,
+    ctx: &'a StreamContext<'a>,
+}
+
+/// Handle client write error and drain backend if needed.
+///
+/// Returns `StreamingError::ClientDisconnect` when the backend was successfully
+/// drained (connection is clean and can be returned to pool).
+/// Returns `StreamingError::BackendDirty` when the backend died during drain
+/// (connection must be removed from pool).
 async fn handle_client_write_error<R>(
     error: std::io::Error,
     backend_read: &mut R,
-    ctx: ClientWriteErrorContext<'_>,
-) -> anyhow::Error
+    ctx: DrainContext<'_>,
+) -> StreamingError
 where
     R: AsyncReadExt + Unpin,
 {
     // Determine if client received all the data before disconnecting
-    let received_complete_chunk = ctx.write_len == ctx.current_n;
+    let received_complete_chunk = ctx.write_len == ctx.chunk_len;
 
     // Log appropriately based on whether disconnect was expected
     if received_complete_chunk {
         debug!(
             "Client {} disconnected after receiving complete data ({} total) → backend {:?}",
-            ctx.client_addr,
+            ctx.ctx.client_addr,
             crate::formatting::format_bytes(ctx.total_bytes),
-            ctx.backend_id
+            ctx.ctx.backend_id
         );
     } else {
         warn!(
             "Client {} disconnected mid-chunk while streaming ({} of {}, total {} so far) → backend {:?}",
-            ctx.client_addr,
+            ctx.ctx.client_addr,
             crate::formatting::format_bytes(ctx.write_len as u64),
-            crate::formatting::format_bytes(ctx.current_n as u64),
+            crate::formatting::format_bytes(ctx.chunk_len as u64),
             crate::formatting::format_bytes(ctx.total_bytes),
-            ctx.backend_id
+            ctx.ctx.backend_id
         );
     }
 
-    // Drain backend if terminator not yet found to keep connection clean
-    if !ctx.terminator_found
-        && let Err(drain_err) = drain_until_terminator(
-            backend_read,
-            ctx.partial_data,
-            ctx.client_addr,
-            ctx.backend_id,
-            ctx.buffer_pool,
-        )
-        .await
-    {
-        warn!(
-            "Client {} failed to drain backend {:?} after disconnect: {}",
-            ctx.client_addr, ctx.backend_id, drain_err
-        );
+    // Drain backend if terminator not yet found to keep connection clean.
+    // tail_data seeds TailBuffer so cross-chunk boundary detection works correctly.
+    if !ctx.terminator_found {
+        match drain_until_terminator(backend_read, ctx.tail_data, ctx.ctx).await {
+            Ok(()) => {} // Drain succeeded — backend is clean
+            Err(drain_err) => {
+                warn!(
+                    "Client {} failed to drain backend {:?} after disconnect: {}",
+                    ctx.ctx.client_addr, ctx.ctx.backend_id, drain_err
+                );
+                // Return drain error (NOT a client disconnect error) so callers know
+                // the backend connection is dirty and must be removed from pool.
+                return StreamingError::BackendDirty(
+                    drain_err.context("Backend connection dirty after client disconnect"),
+                );
+            }
+        }
     }
 
-    error.into()
+    StreamingError::ClientDisconnect(error)
 }
 
-/// Drain remaining response from backend until terminator is found
+/// Drain remaining response from backend until terminator is found.
 ///
 /// This is called when the client disconnects mid-stream to ensure the backend
 /// connection is left in a clean state and can be recycled.
+///
+/// Uses `TailBuffer` for correct cross-chunk terminator detection.
 async fn drain_until_terminator<R>(
     backend_read: &mut R,
     initial_tail: &[u8],
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &crate::pool::BufferPool,
+    ctx: &StreamContext<'_>,
 ) -> Result<()>
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut chunk = buffer_pool.acquire().await;
+    let mut chunk = ctx.buffer_pool.acquire().await;
     let mut tail = TailBuffer::default();
     tail.update(initial_tail);
     loop {
@@ -100,7 +216,7 @@ where
             .await
             .context("Failed to read from backend while draining response")?;
         if n == 0 {
-            break; // EOF
+            anyhow::bail!("Backend closed connection before multiline terminator during drain");
         }
         let data = &chunk[..n];
         if tail.detect_terminator(data).is_found() {
@@ -110,7 +226,7 @@ where
     }
     debug!(
         "Client {} drained remaining response from backend {:?}, connection is clean",
-        client_addr, backend_id
+        ctx.client_addr, ctx.backend_id
     );
     Ok(())
 }
@@ -121,45 +237,27 @@ where
 /// Essential for large article downloads (50MB+) where buffering would kill performance.
 ///
 /// If `capture` is Some, the response will be captured into the Vec for caching.
-pub async fn stream_multiline_response<R, W>(
+pub(crate) async fn stream_multiline_response<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
     first_chunk: &[u8],
-    first_n: usize,
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &crate::pool::BufferPool,
-) -> Result<u64>
+    ctx: &StreamContext<'_>,
+) -> Result<u64, StreamingError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    stream_multiline_response_impl(
-        backend_read,
-        client_write,
-        first_chunk,
-        first_n,
-        client_addr,
-        backend_id,
-        buffer_pool,
-        None,
-        None,
-    )
-    .await
+    stream_multiline_response_impl(backend_read, client_write, first_chunk, ctx, None, None).await
 }
 
 /// Stream multiline response and optionally capture for caching
-#[allow(clippy::too_many_arguments)]
-pub async fn stream_and_capture_multiline_response<R, W>(
+pub(crate) async fn stream_and_capture_multiline_response<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
     first_chunk: &[u8],
-    first_n: usize,
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &crate::pool::BufferPool,
+    ctx: &StreamContext<'_>,
     capture: &mut crate::pool::PooledBuffer,
-) -> Result<u64>
+) -> Result<u64, StreamingError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -168,10 +266,7 @@ where
         backend_read,
         client_write,
         first_chunk,
-        first_n,
-        client_addr,
-        backend_id,
-        buffer_pool,
+        ctx,
         Some(capture),
         None,
     )
@@ -182,130 +277,22 @@ where
 ///
 /// Like `stream_multiline_response`, but captures leftover bytes after the terminator
 /// into `leftover` for use as the start of the next response in the pipeline.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn stream_multiline_response_pipelined<W>(
-    backend_read: &mut crate::stream::ConnectionStream,
+pub(crate) async fn stream_multiline_response_pipelined<R, W>(
+    backend_read: &mut R,
     client_write: &mut W,
     first_chunk: &[u8],
-    first_n: usize,
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &crate::pool::BufferPool,
-) -> Result<u64>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let mut total_bytes = 0u64;
-    let mut tail = TailBuffer::default();
-    let mut capture = None;
-
-    let data = &first_chunk[..first_n];
-    match process_chunk(
-        data,
-        first_n,
-        &mut tail,
-        &mut capture,
-        client_write,
-        backend_read,
-        &mut total_bytes,
-        client_addr,
-        backend_id,
-        buffer_pool,
-    )
-    .await?
-    {
-        ChunkResult::Done { write_len } => {
-            if write_len < first_n {
-                backend_read.stash_leftover(&first_chunk[write_len..first_n])?;
-            }
-            debug!(
-                "Client {} multiline response complete ({})",
-                client_addr,
-                crate::formatting::format_bytes(total_bytes)
-            );
-            return Ok(total_bytes);
-        }
-        ChunkResult::Continue => {}
-    }
-
-    let mut buffers = [buffer_pool.acquire().await, buffer_pool.acquire().await];
-    let mut idx: usize = 0;
-
-    loop {
-        let n = buffers[idx]
-            .read_from(backend_read)
-            .await
-            .context("Failed to read next chunk from backend")?;
-
-        if n == 0 {
-            anyhow::bail!(
-                "Backend EOF before multiline terminator while streaming to client {} from backend {:?} (received {})",
-                client_addr,
-                backend_id,
-                crate::formatting::format_bytes(total_bytes)
-            );
-        }
-
-        let data = &buffers[idx][..n];
-        match process_chunk(
-            data,
-            n,
-            &mut tail,
-            &mut capture,
-            client_write,
-            backend_read,
-            &mut total_bytes,
-            client_addr,
-            backend_id,
-            buffer_pool,
-        )
-        .await?
-        {
-            ChunkResult::Done { write_len } => {
-                if write_len < n {
-                    backend_read.stash_leftover(&buffers[idx][write_len..n])?;
-                }
-                debug!(
-                    "Client {} multiline response complete ({})",
-                    client_addr,
-                    crate::formatting::format_bytes(total_bytes)
-                );
-                return Ok(total_bytes);
-            }
-            ChunkResult::Continue => {}
-        }
-
-        idx ^= 1;
-    }
-}
-
-/// Stream multiline response from backend to client during pipelined batch execution.
-///
-/// Like `stream_multiline_response`, but captures leftover bytes after the terminator
-/// into `leftover` for use as the start of the next response in the pipeline.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments, dead_code)]
-pub(crate) async fn stream_multiline_response_pipelined_for_test<W>(
-    backend_read: &mut crate::stream::ConnectionStream,
-    client_write: &mut W,
-    first_chunk: &[u8],
-    first_n: usize,
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &crate::pool::BufferPool,
+    ctx: &StreamContext<'_>,
     leftover: &mut bytes::BytesMut,
-) -> Result<u64>
+) -> Result<u64, StreamingError>
 where
+    R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     stream_multiline_response_impl(
         backend_read,
         client_write,
         first_chunk,
-        first_n,
-        client_addr,
-        backend_id,
-        buffer_pool,
+        ctx,
         None,
         Some(leftover),
     )
@@ -323,30 +310,28 @@ enum ChunkResult {
 
 /// Process a single chunk: detect terminator, capture, write to client.
 ///
+/// Uses `TailBuffer` for stateful cross-chunk terminator detection.
 /// Returns `ChunkResult::Done` if terminator found, or
 /// `ChunkResult::Continue` to keep streaming. Total bytes are tracked
 /// via the `total_bytes` mutable reference.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::inline_always)] // hot streaming path — profiling confirms inlining beneficial
 #[inline(always)]
 async fn process_chunk<R, W>(
     data: &[u8],
-    current_n: usize,
     tail: &mut TailBuffer,
     capture: &mut Option<&mut crate::pool::PooledBuffer>,
     client_write: &mut W,
     backend_read: &mut R,
     total_bytes: &mut u64,
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &crate::pool::BufferPool,
-) -> Result<ChunkResult>
+    ctx: &StreamContext<'_>,
+) -> Result<ChunkResult, StreamingError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     // Detect terminator location: within chunk or spanning boundary
     let status = tail.detect_terminator(data);
-    let write_len = status.write_len(current_n);
+    let write_len = status.write_len(data.len());
 
     // Capture data if requested (for caching)
     if let Some(cap) = capture {
@@ -358,15 +343,13 @@ where
         return Err(handle_client_write_error(
             e,
             backend_read,
-            ClientWriteErrorContext {
+            DrainContext {
                 write_len,
-                current_n,
+                chunk_len: data.len(),
                 total_bytes: *total_bytes,
-                partial_data: &data[..write_len],
+                tail_data: &data[..write_len],
                 terminator_found: status.is_found(),
-                client_addr,
-                backend_id,
-                buffer_pool,
+                ctx,
             },
         )
         .await);
@@ -384,20 +367,19 @@ where
 
 /// Internal implementation that optionally captures while streaming.
 ///
-/// Phase 1: Process first_chunk directly (zero-copy, no pooled buffer needed).
+/// Phase 1: Process `first_chunk` directly (zero-copy, no pooled buffer needed).
 /// Phase 2: For multi-chunk responses, acquire two pooled buffers and double-buffer.
-#[allow(clippy::too_many_arguments)]
+///
+/// All terminator detection is delegated to `TailBuffer` — one instance spans
+/// the entire response to handle terminators that arrive split across chunk boundaries.
 async fn stream_multiline_response_impl<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
     first_chunk: &[u8],
-    first_n: usize,
-    client_addr: crate::types::ClientAddress,
-    backend_id: crate::types::BackendId,
-    buffer_pool: &crate::pool::BufferPool,
+    ctx: &StreamContext<'_>,
     mut capture: Option<&mut crate::pool::PooledBuffer>,
     mut leftover_out: Option<&mut bytes::BytesMut>,
-) -> Result<u64>
+) -> Result<u64, StreamingError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -406,36 +388,33 @@ where
     let mut tail = TailBuffer::default();
 
     // Phase 1: Process first chunk directly — no copy into pooled buffer
-    let data = &first_chunk[..first_n];
     match process_chunk(
-        data,
-        first_n,
+        first_chunk,
         &mut tail,
         &mut capture,
         client_write,
         backend_read,
         &mut total_bytes,
-        client_addr,
-        backend_id,
-        buffer_pool,
+        ctx,
     )
     .await?
     {
         ChunkResult::Done { write_len } => {
             if let Some(leftover) = leftover_out.as_mut()
-                && write_len < first_n
+                && write_len < first_chunk.len()
             {
-                let remainder = &first_chunk[write_len..first_n];
-                anyhow::ensure!(
-                    remainder.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
-                    "Leftover exceeds maximum ({} bytes)",
-                    remainder.len()
-                );
+                let remainder = &first_chunk[write_len..];
+                if remainder.len() > crate::constants::buffer::MAX_LEFTOVER_BYTES {
+                    return Err(StreamingError::Io(anyhow::anyhow!(
+                        "Leftover exceeds maximum ({} bytes)",
+                        remainder.len()
+                    )));
+                }
                 leftover.extend_from_slice(remainder);
             }
             debug!(
                 "Client {} multiline response complete ({})",
-                client_addr,
+                ctx.client_addr,
                 crate::formatting::format_bytes(total_bytes)
             );
             return Ok(total_bytes);
@@ -444,36 +423,50 @@ where
     }
 
     // Phase 2: Multi-chunk response — acquire pooled buffers for double-buffering
-    let mut buffers = [buffer_pool.acquire().await, buffer_pool.acquire().await];
+    debug!(
+        client = %ctx.client_addr,
+        backend = ?ctx.backend_id,
+        first_chunk_bytes = first_chunk.len(),
+        pipelined = leftover_out.is_some(),
+        "Multiline Phase 2: first chunk incomplete, streaming remaining chunks"
+    );
+    let mut buffers = [
+        ctx.buffer_pool.acquire().await,
+        ctx.buffer_pool.acquire().await,
+    ];
     let mut idx: usize = 0;
 
     loop {
-        let n = buffers[idx]
-            .read_from(backend_read)
-            .await
-            .context("Failed to read next chunk from backend")?;
+        let n = buffers[idx].read_from(backend_read).await.map_err(|e| {
+            StreamingError::Io(
+                anyhow::Error::from(e).context("Failed to read next chunk from backend"),
+            )
+        })?;
 
         if n == 0 {
-            anyhow::bail!(
-                "Backend EOF before multiline terminator while streaming to client {} from backend {:?} (received {})",
-                client_addr,
-                backend_id,
-                crate::formatting::format_bytes(total_bytes)
+            warn!(
+                client = %ctx.client_addr,
+                backend = ?ctx.backend_id,
+                bytes_before_eof = total_bytes,
+                first_chunk_bytes = first_chunk.len(),
+                pipelined = leftover_out.is_some(),
+                "Backend EOF before multiline terminator"
             );
+            return Err(StreamingError::BackendEof {
+                backend_id: ctx.backend_id,
+                bytes_received: total_bytes,
+            });
         }
 
         let data = &buffers[idx][..n];
         match process_chunk(
             data,
-            n,
             &mut tail,
             &mut capture,
             client_write,
             backend_read,
             &mut total_bytes,
-            client_addr,
-            backend_id,
-            buffer_pool,
+            ctx,
         )
         .await?
         {
@@ -482,16 +475,17 @@ where
                     && write_len < n
                 {
                     let remainder = &buffers[idx][write_len..n];
-                    anyhow::ensure!(
-                        remainder.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
-                        "Leftover exceeds maximum ({} bytes)",
-                        remainder.len()
-                    );
+                    if remainder.len() > crate::constants::buffer::MAX_LEFTOVER_BYTES {
+                        return Err(StreamingError::Io(anyhow::anyhow!(
+                            "Leftover exceeds maximum ({} bytes)",
+                            remainder.len()
+                        )));
+                    }
                     leftover.extend_from_slice(remainder);
                 }
                 debug!(
                     "Client {} multiline response complete ({})",
-                    client_addr,
+                    ctx.client_addr,
                     crate::formatting::format_bytes(total_bytes)
                 );
                 return Ok(total_bytes);
@@ -508,78 +502,120 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[cfg(test)]
+    mod test_helpers {
+        use super::super::*;
+        use crate::types::BufferSize;
+
+        pub(super) fn make_pool() -> crate::pool::BufferPool {
+            crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2)
+        }
+
+        pub(super) fn make_ctx(pool: &crate::pool::BufferPool) -> StreamContext<'_> {
+            let addr = "127.0.0.1:8000".parse::<std::net::SocketAddr>().unwrap();
+            StreamContext {
+                client_addr: crate::types::ClientAddress::from(addr),
+                backend_id: crate::types::BackendId::from_index(1),
+                buffer_pool: pool,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_drain_until_terminator_immediate() {
-        use crate::types::BufferSize;
         // Response with terminator already present
         let data = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
         let mut reader = Cursor::new(data);
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result =
-            drain_until_terminator(&mut reader, b"", client_addr, backend_id, &buffer_pool).await;
+        let result = drain_until_terminator(&mut reader, b"", &ctx).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_drain_until_terminator_spanning() {
-        use crate::types::BufferSize;
         // Response where terminator spans chunks
         let data = b"220 Article follows\r\nLine 1\r\n.\r\n";
         let mut reader = Cursor::new(data);
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
         // Start with tail that could span
-        let result =
-            drain_until_terminator(&mut reader, b"\r\n", client_addr, backend_id, &buffer_pool)
-                .await;
+        let result = drain_until_terminator(&mut reader, b"\r\n", &ctx).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_drain_until_terminator_eof() {
-        use crate::types::BufferSize;
         // Response without terminator (EOF)
         let data = b"220 Article follows\r\nLine 1\r\nLine 2\r\n";
         let mut reader = Cursor::new(data);
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result =
-            drain_until_terminator(&mut reader, b"", client_addr, backend_id, &buffer_pool).await;
-        assert!(result.is_ok());
+        let result = drain_until_terminator(&mut reader, b"", &ctx).await;
+        assert!(result.is_err(), "EOF before terminator must be an error");
+    }
+
+    #[tokio::test]
+    async fn test_stream_multiline_response_backend_eof_before_terminator() {
+        // Backend sends partial response (no terminator) then closes connection.
+        // Phase 1 processes `partial` (no terminator found), Phase 2 reads EOF immediately.
+        let partial = b"220 Article follows\r\nIncomplete body\r\n";
+        let mut reader = Cursor::new(&[] as &[u8]);
+        let mut writer = Vec::new();
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
+
+        let result = stream_multiline_response(&mut reader, &mut writer, partial, &ctx).await;
+        assert!(
+            matches!(result, Err(StreamingError::BackendEof { .. })),
+            "EOF before terminator must be BackendEof, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_write_error_dirty_drain() {
+        // Client disconnects AND backend also dies before sending terminator.
+        // drain_until_terminator returns Err (EOF without terminator).
+        // handle_client_write_error must return BackendDirty so callers know
+        // the backend connection is dirty and must be removed from pool.
+        let mut backend = Cursor::new(b"partial data without terminator" as &[u8]);
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let pool = test_helpers::make_pool();
+        let stream_ctx = test_helpers::make_ctx(&pool);
+
+        let ctx = DrainContext {
+            write_len: 10,
+            chunk_len: 10,
+            total_bytes: 10,
+            tail_data: b"",
+            terminator_found: false, // Must drain
+            ctx: &stream_ctx,
+        };
+
+        let result = handle_client_write_error(error, &mut backend, ctx).await;
+        assert!(
+            matches!(result, StreamingError::BackendDirty(_)),
+            "Should return BackendDirty when drain fails, got: {result:?}"
+        );
+        assert!(
+            result.must_remove_connection(),
+            "BackendDirty must remove connection"
+        );
     }
 
     #[tokio::test]
     async fn test_stream_multiline_response_simple() {
-        use crate::types::BufferSize;
         // Simple multiline response
         let response = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
         let mut reader = Cursor::new(response);
         let mut writer = Vec::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result = stream_multiline_response(
-            &mut reader,
-            &mut writer,
-            response,
-            response.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-        )
-        .await;
+        let result = stream_multiline_response(&mut reader, &mut writer, response, &ctx).await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), response.len() as u64);
@@ -588,28 +624,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_multiline_response_terminator_in_middle() {
-        use crate::types::BufferSize;
         // Response with terminator not at end of chunk
         let response = b"220 Article\r\nData\r\n.\r\nExtra";
         let mut reader = Cursor::new(&response[22..]); // Everything after terminator
         let mut writer = Vec::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
         // First chunk includes terminator and extra data
         let first_chunk = &response[..27]; // All data including extra
-        let result = stream_multiline_response(
-            &mut reader,
-            &mut writer,
-            first_chunk,
-            first_chunk.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-        )
-        .await;
+        let result = stream_multiline_response(&mut reader, &mut writer, first_chunk, &ctx).await;
 
         assert!(result.is_ok());
         // Should only write up to and including terminator (position 22)
@@ -619,26 +643,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_multiline_response_empty_body() {
-        use crate::types::BufferSize;
         // Response with just status and terminator
         let response = b"220 0 Article follows\r\n.\r\n";
         let mut reader = Cursor::new(b"");
         let mut writer = Vec::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result = stream_multiline_response(
-            &mut reader,
-            &mut writer,
-            response,
-            response.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-        )
-        .await;
+        let result = stream_multiline_response(&mut reader, &mut writer, response, &ctx).await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), response.len() as u64);
@@ -647,12 +659,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_multiline_response_large_article() {
-        use crate::types::BufferSize;
         // Simulate a large article that spans multiple chunks
         let header = b"220 Article follows\r\n";
         let mut body = Vec::new();
         for i in 0..1000 {
-            body.extend_from_slice(format!("Line {}\r\n", i).as_bytes());
+            body.extend_from_slice(format!("Line {i}\r\n").as_bytes());
         }
         let terminator = b".\r\n";
 
@@ -663,21 +674,10 @@ mod tests {
 
         let mut reader = Cursor::new(&full_response[header.len()..]);
         let mut writer = Vec::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result = stream_multiline_response(
-            &mut reader,
-            &mut writer,
-            header,
-            header.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-        )
-        .await;
+        let result = stream_multiline_response(&mut reader, &mut writer, header, &ctx).await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), full_response.len() as u64);
@@ -685,116 +685,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_multiline_response_errors_on_truncated_response() {
-        use crate::types::BufferSize;
-
-        let first_chunk = b"220 Article follows\r\npartial body\r\n";
-        let mut reader = Cursor::new(b"" as &[u8]);
-        let mut writer = Vec::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
-
-        let result = stream_multiline_response(
-            &mut reader,
-            &mut writer,
-            first_chunk,
-            first_chunk.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-        )
-        .await;
-
-        assert!(result.is_err(), "truncated multiline response must fail");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Backend EOF before multiline terminator")
-        );
-        assert_eq!(&writer[..], first_chunk);
-    }
-
-    #[tokio::test]
     async fn test_handle_client_write_error_complete_chunk() {
-        use crate::types::BufferSize;
-        // Test that client disconnect after complete chunk logs at debug level
+        // Test that client disconnect after complete chunk returns ClientDisconnect
         let mut backend = Cursor::new(b"");
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let stream_ctx = test_helpers::make_ctx(&pool);
 
-        let ctx = ClientWriteErrorContext {
+        let ctx = DrainContext {
             write_len: 100,
-            current_n: 100, // Same as write_len = complete chunk
+            chunk_len: 100, // Same as write_len = complete chunk
             total_bytes: 100,
-            partial_data: b"test",
+            tail_data: b"test",
             terminator_found: true,
-            client_addr,
-            backend_id,
-            buffer_pool: &buffer_pool,
+            ctx: &stream_ctx,
         };
 
         let result = handle_client_write_error(error, &mut backend, ctx).await;
-        // Should return the error
-        assert!(result.to_string().contains("broken pipe"));
+        assert!(
+            matches!(result, StreamingError::ClientDisconnect(_)),
+            "Should return ClientDisconnect, got: {result:?}"
+        );
+        assert!(!result.must_remove_connection());
     }
 
     #[tokio::test]
     async fn test_handle_client_write_error_incomplete_chunk() {
-        use crate::types::BufferSize;
-        // Test that client disconnect mid-chunk logs at warn level
+        // Test that client disconnect mid-chunk with successful drain returns ClientDisconnect
         let mut backend = Cursor::new(b"remaining data\r\n.\r\n");
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let stream_ctx = test_helpers::make_ctx(&pool);
 
-        let ctx = ClientWriteErrorContext {
+        let ctx = DrainContext {
             write_len: 50,
-            current_n: 100, // Different from write_len = incomplete
+            chunk_len: 100, // Different from write_len = incomplete
             total_bytes: 500,
-            partial_data: b"",
+            tail_data: b"",
             terminator_found: false, // Need to drain
-            client_addr,
-            backend_id,
-            buffer_pool: &buffer_pool,
+            ctx: &stream_ctx,
         };
 
         let result = handle_client_write_error(error, &mut backend, ctx).await;
-        assert!(result.to_string().contains("broken pipe"));
+        assert!(
+            matches!(result, StreamingError::ClientDisconnect(_)),
+            "Should return ClientDisconnect after successful drain, got: {result:?}"
+        );
+        assert!(!result.must_remove_connection());
     }
 
     #[tokio::test]
     async fn test_handle_client_write_error_with_draining() {
-        use crate::types::BufferSize;
         // Test that backend is drained when terminator not found
         let remaining_data = b"more data\r\neven more\r\n.\r\n";
         let mut backend = Cursor::new(remaining_data);
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let stream_ctx = test_helpers::make_ctx(&pool);
 
-        let ctx = ClientWriteErrorContext {
+        let ctx = DrainContext {
             write_len: 10,
-            current_n: 10,
+            chunk_len: 10,
             total_bytes: 10,
-            partial_data: b"",
+            tail_data: b"",
             terminator_found: false,
-            client_addr,
-            backend_id,
-            buffer_pool: &buffer_pool,
+            ctx: &stream_ctx,
         };
 
         let result = handle_client_write_error(error, &mut backend, ctx).await;
-        assert!(result.to_string().contains("broken pipe"));
+        assert!(
+            matches!(result, StreamingError::ClientDisconnect(_)),
+            "Should return ClientDisconnect after successful drain, got: {result:?}"
+        );
 
         // Verify backend was drained (cursor should be at or near end)
         let pos = backend.position();
@@ -807,7 +769,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_pipelined_leftover_in_first_chunk() {
-        use crate::types::BufferSize;
         // Two pipelined multiline responses in one buffer.
         // First response ends at terminator, second response starts right after.
         let response1 = b"220 Article follows\r\nBody1\r\n.\r\n";
@@ -820,21 +781,15 @@ mod tests {
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
         let mut leftover = bytes::BytesMut::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result = stream_multiline_response_impl(
+        let result = stream_multiline_response_pipelined(
             &mut reader,
             &mut writer,
             &combined,
-            combined.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-            None,
-            Some(&mut leftover),
+            &ctx,
+            &mut leftover,
         )
         .await;
 
@@ -848,7 +803,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_pipelined_leftover_in_later_chunk() {
-        use crate::types::BufferSize;
         // First chunk is just the header (no terminator).
         // Backend read returns terminator + start of next response.
         let first_chunk = b"220 Article follows\r\nLong body content here";
@@ -857,21 +811,15 @@ mod tests {
         let mut reader = Cursor::new(second_read.as_slice());
         let mut writer = Vec::new();
         let mut leftover = bytes::BytesMut::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result = stream_multiline_response_impl(
+        let result = stream_multiline_response_pipelined(
             &mut reader,
             &mut writer,
             first_chunk,
-            first_chunk.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-            None,
-            Some(&mut leftover),
+            &ctx,
+            &mut leftover,
         )
         .await;
 
@@ -891,27 +839,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_pipelined_no_leftover() {
-        use crate::types::BufferSize;
         // Terminator at exact end of chunk — no leftover bytes
         let response = b"220 Article follows\r\nBody\r\n.\r\n";
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
         let mut leftover = bytes::BytesMut::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result = stream_multiline_response_impl(
+        let result = stream_multiline_response_pipelined(
             &mut reader,
             &mut writer,
             response,
-            response.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-            None,
-            Some(&mut leftover),
+            &ctx,
+            &mut leftover,
         )
         .await;
 
@@ -925,7 +866,6 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_leftover_exceeds_max_size() {
         use crate::constants::buffer::MAX_LEFTOVER_BYTES;
-        use crate::types::BufferSize;
 
         // Create a response where leftover after terminator exceeds MAX_LEFTOVER_BYTES
         let response = b"220 Article follows\r\nBody\r\n.\r\n";
@@ -937,28 +877,22 @@ mod tests {
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
         let mut leftover = bytes::BytesMut::new();
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let client_addr = crate::types::ClientAddress::from(socket_addr);
-        let backend_id = crate::types::BackendId::from_index(1);
-        let buffer_pool = crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
 
-        let result = stream_multiline_response_impl(
+        let result = stream_multiline_response_pipelined(
             &mut reader,
             &mut writer,
             &combined,
-            combined.len(),
-            client_addr,
-            backend_id,
-            &buffer_pool,
-            None,
-            Some(&mut leftover),
+            &ctx,
+            &mut leftover,
         )
         .await;
 
-        // Should fail with bounds check error
+        // Should fail with Io variant containing the bounds check error
         assert!(
-            result.is_err(),
-            "Should error when leftover exceeds max size"
+            matches!(result, Err(StreamingError::Io(_))),
+            "Should return Io error when leftover exceeds max size, got: {result:?}"
         );
         let err = result.unwrap_err().to_string();
         assert!(

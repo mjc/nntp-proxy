@@ -19,7 +19,7 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         provider: &crate::pool::DeadpoolConnectionProvider,
         server_name: &str,
-    ) -> Result<TransferMetrics> {
+    ) -> Result<TransferMetrics, crate::session::SessionError> {
         use crate::protocol::BACKEND_UNAVAILABLE;
 
         // Acquire backend connection
@@ -30,17 +30,18 @@ impl ClientSession {
             }
             Err(e) => {
                 error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
-                client_stream.write_all(BACKEND_UNAVAILABLE).await?;
-                anyhow::bail!(
-                    "Failed to get pooled connection for '{}': {}",
-                    server_name,
-                    e
-                );
+                client_stream
+                    .write_all(BACKEND_UNAVAILABLE)
+                    .await
+                    .map_err(|ie| crate::session::SessionError::Backend(ie.into()))?;
+                return Err(crate::session::SessionError::Backend(anyhow::anyhow!(
+                    "Failed to get pooled connection for '{server_name}': {e}"
+                )));
             }
         };
 
         // Wrap in guard — removes from pool on any error
-        let mut conn_guard = crate::pool::ConnectionGuard::new(backend_conn);
+        let mut conn_guard = crate::pool::ConnectionGuard::new(backend_conn, provider.clone());
 
         // Split streams
         let (client_read, client_write) = client_stream.split();
@@ -60,14 +61,11 @@ impl ClientSession {
             .await;
 
         // H2: Only return connection to pool on success
-        match &result {
-            Ok(_) => {
-                let _conn = conn_guard.success();
-            }
-            Err(_) => { /* guard drops → removes broken connection */ }
-        }
+        if result.is_ok() {
+            let _conn = conn_guard.release();
+        } // else: guard drops → removes broken connection
 
-        result
+        result.map_err(crate::session::SessionError::from)
     }
 
     /// Core bidirectional proxy loop
@@ -117,11 +115,13 @@ impl ClientSession {
                                     &line,
                                     &mut client_write,
                                     &mut state.auth_username,
-                                    &self.auth_handler,
-                                    &self.auth_state,
-                                    &crate::config::RoutingMode::Stateful,
-                                    &self.metrics,
-                                    self.connection_stats(),
+                                    &common::AuthCheckContext {
+                                        auth_handler: &self.auth_handler,
+                                        auth_state: &self.auth_state,
+                                        routing_mode: &crate::config::RoutingMode::Stateful,
+                                        metrics: &self.metrics,
+                                        connection_stats: self.connection_stats(),
+                                    },
                                     self.client_addr,
                                     |username| self.set_username(username),
                                 ).await?;

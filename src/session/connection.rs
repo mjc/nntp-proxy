@@ -20,15 +20,13 @@ pub enum ForwardResult {
 
 /// Bidirectional forwarding between client and backend in stateful mode
 ///
-/// Uses tokio::select! to forward data in both directions until either side disconnects.
-/// Returns ForwardResult indicating whether connection should be removed from pool.
-#[allow(clippy::too_many_arguments)]
+/// Uses `tokio::select`! to forward data in both directions until either side disconnects.
+/// Returns `ForwardResult` indicating whether connection should be removed from pool.
 pub async fn bidirectional_forward<R, W, B>(
     client_reader: &mut R,
     client_write: &mut W,
     pooled_conn: &mut B,
     buffer_pool: &BufferPool,
-    _client_addr: impl std::fmt::Display,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: BackendToClientBytes,
 ) -> Result<ForwardResult>
@@ -51,8 +49,7 @@ where
                     Ok(0) => break,
                     Ok(n) => {
                         if let Err(e) = pooled_conn.write_all(command.as_bytes()).await {
-                            let err: anyhow::Error = e.into();
-                            if crate::pool::is_connection_error(&err) {
+                            if crate::connection_error::is_connection_error_kind(e.kind()) {
                                 return Ok(ForwardResult::BackendError(
                                     TransferMetrics {
                                         client_to_backend: c2b,
@@ -84,8 +81,7 @@ where
                         b2c = b2c.add(n);
                     }
                     Err(e) => {
-                        let err: anyhow::Error = e.into();
-                        if crate::pool::is_connection_error(&err) {
+                        if crate::connection_error::is_connection_error_kind(e.kind()) {
                             return Ok(ForwardResult::BackendError(
                                 TransferMetrics {
                                     client_to_backend: c2b,
@@ -262,7 +258,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 ClientToBackendBytes::zero(),
                 BackendToClientBytes::zero(),
             ),
@@ -307,7 +302,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 ClientToBackendBytes::zero(),
                 BackendToClientBytes::zero(),
             ),
@@ -372,7 +366,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 initial_c2b,
                 initial_b2c,
             ),
@@ -444,7 +437,6 @@ mod tests {
                 &mut client_writer,
                 &mut proxy_backend_end,
                 &pool,
-                "test-client",
                 ClientToBackendBytes::zero(),
                 BackendToClientBytes::zero(),
             ),

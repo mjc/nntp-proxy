@@ -79,13 +79,11 @@ fn test_least_loaded_unequal_capacity() {
     // (ratio should favor the larger backend significantly)
     assert!(
         counts[1] > counts[0],
-        "Large backend should get more requests: {:?}",
-        counts
+        "Large backend should get more requests: {counts:?}"
     );
     assert!(
         counts[1] >= 10,
-        "Large backend should get most requests: {:?}",
-        counts
+        "Large backend should get most requests: {counts:?}"
     );
 }
 
@@ -169,8 +167,8 @@ fn test_least_loaded_load_balancing_fairness() {
     for i in 0..3 {
         selector.add_backend(
             BackendId::from_index(i),
-            ServerName::try_new(format!("backend-{}", i)).unwrap(),
-            create_backend(&format!("backend-{}", i), 10),
+            ServerName::try_new(format!("backend-{i}")).unwrap(),
+            create_backend(&format!("backend-{i}"), 10),
             0, // tier
             None,
         );
@@ -185,10 +183,5 @@ fn test_least_loaded_load_balancing_fairness() {
 
     // With equal capacity and no completions, should distribute evenly
     // Each backend should get exactly 10 requests (30 / 3 = 10)
-    assert_eq!(
-        counts,
-        [10, 10, 10],
-        "Should distribute evenly: {:?}",
-        counts
-    );
+    assert_eq!(counts, [10, 10, 10], "Should distribute evenly: {counts:?}");
 }

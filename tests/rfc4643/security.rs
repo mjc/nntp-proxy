@@ -180,7 +180,7 @@ async fn test_empty_credentials_rejected() {
     assert!(!auth_success, "Empty password should not authenticate");
 }
 
-/// Test that auth_success=false is returned for all failure cases
+/// Test that `auth_success=false` is returned for all failure cases
 #[tokio::test]
 async fn test_auth_success_flag_reliability() {
     let test_cases = vec![
@@ -219,13 +219,12 @@ async fn test_auth_success_flag_reliability() {
 
         assert_eq!(
             auth_success, expected_success,
-            "auth_success flag mismatch for username='{}', password='{}'",
-            username, password
+            "auth_success flag mismatch for username='{username}', password='{password}'"
         );
     }
 }
 
-/// Test that RequestPassword never returns auth_success=true
+/// Test that `RequestPassword` never returns `auth_success=true`
 #[tokio::test]
 async fn test_request_password_never_authenticates() {
     use crate::test_helpers::create_test_auth_handler;
@@ -266,7 +265,7 @@ async fn test_disabled_auth_accepts_all() {
     assert!(auth_success, "Disabled auth should accept any credentials");
 }
 
-/// Test that validate() method matches handle_auth_command behavior
+/// Test that `validate()` method matches `handle_auth_command` behavior
 #[tokio::test]
 async fn test_validate_matches_handle_auth_command() {
     use crate::test_helpers::create_test_auth_handler;
@@ -297,18 +296,15 @@ async fn test_validate_matches_handle_auth_command() {
 
         assert_eq!(
             validate_result, expected,
-            "validate() mismatch for {}/{}",
-            username, password
+            "validate() mismatch for {username}/{password}"
         );
         assert_eq!(
             auth_success, expected,
-            "handle_auth_command mismatch for {}/{}",
-            username, password
+            "handle_auth_command mismatch for {username}/{password}"
         );
         assert_eq!(
             validate_result, auth_success,
-            "validate() and handle_auth_command disagree for {}/{}",
-            username, password
+            "validate() and handle_auth_command disagree for {username}/{password}"
         );
     }
 }
@@ -354,7 +350,7 @@ async fn test_special_characters_in_credentials() {
     assert!(!auth_success, "Partial match should fail");
 }
 
-/// Property: auth_success=true MUST mean valid credentials
+/// Property: `auth_success=true` MUST mean valid credentials
 #[tokio::test]
 async fn property_auth_success_implies_valid_credentials() {
     let handler = Arc::new(
@@ -383,7 +379,7 @@ async fn property_auth_success_implies_valid_credentials() {
     }
 }
 
-/// Property: invalid credentials MUST result in auth_success=false
+/// Property: invalid credentials MUST result in `auth_success=false`
 #[tokio::test]
 async fn property_invalid_credentials_implies_no_auth_success() {
     let handler = Arc::new(
@@ -418,8 +414,7 @@ async fn property_invalid_credentials_implies_no_auth_success() {
 
         assert!(
             !auth_success,
-            "Invalid credentials {}/{} resulted in auth_success=true",
-            username, password
+            "Invalid credentials {username}/{password} resulted in auth_success=true"
         );
     }
 }

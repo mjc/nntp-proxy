@@ -36,7 +36,7 @@ pub struct NntpProxy {
     pub(super) connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     pub(super) buffer_pool: BufferPool,
-    /// Routing mode (Standard, PerCommand, or Hybrid)
+    /// Routing mode (Standard, `PerCommand`, or Hybrid)
     pub(super) routing_mode: RoutingMode,
     /// Authentication handler for client auth interception
     pub(super) auth_handler: Arc<AuthHandler>,
@@ -57,29 +57,6 @@ pub struct NntpProxy {
     pub(super) active_clients: Arc<AtomicUsize>,
     /// Reference instant for converting nanos to duration
     pub(super) start_instant: Instant,
-}
-
-/// Classify an error as a client disconnect (broken pipe/connection reset)
-///
-/// Returns true for errors that indicate the client disconnected normally,
-/// which should be logged at DEBUG level rather than WARN.
-///
-/// # Examples
-///
-/// ```
-/// use std::io::{Error, ErrorKind};
-/// use nntp_proxy::is_client_disconnect_error;
-///
-/// let broken_pipe = Error::from(ErrorKind::BrokenPipe);
-/// let wrapped = anyhow::Error::from(broken_pipe);
-/// assert!(is_client_disconnect_error(&wrapped));
-///
-/// let other_error = anyhow::anyhow!("some other error");
-/// assert!(!is_client_disconnect_error(&other_error));
-/// ```
-#[inline]
-pub fn is_client_disconnect_error(e: &anyhow::Error) -> bool {
-    crate::session::error_classification::ErrorClassifier::is_client_disconnect(e)
 }
 
 impl NntpProxy {
@@ -148,7 +125,7 @@ impl NntpProxy {
     /// # }
     /// ```
     #[must_use]
-    pub fn builder(config: crate::config::Config) -> NntpProxyBuilder {
+    pub const fn builder(config: crate::config::Config) -> NntpProxyBuilder {
         NntpProxyBuilder::new(config)
     }
 
@@ -194,7 +171,7 @@ impl NntpProxy {
     /// Get the router
     #[must_use]
     #[inline]
-    pub fn router(&self) -> &Arc<router::BackendSelector> {
+    pub const fn router(&self) -> &Arc<router::BackendSelector> {
         &self.router
     }
 
@@ -208,34 +185,34 @@ impl NntpProxy {
     /// Get the buffer pool
     #[must_use]
     #[inline]
-    pub fn buffer_pool(&self) -> &BufferPool {
+    pub const fn buffer_pool(&self) -> &BufferPool {
         &self.buffer_pool
     }
 
     /// Get the article cache (always present - capacity 0 if not configured)
     #[must_use]
     #[inline]
-    pub fn cache(&self) -> &Arc<UnifiedCache> {
+    pub const fn cache(&self) -> &Arc<UnifiedCache> {
         &self.cache
     }
 
     /// Get the metrics collector
     #[must_use]
     #[inline]
-    pub fn metrics(&self) -> &MetricsCollector {
+    pub const fn metrics(&self) -> &MetricsCollector {
         &self.metrics
     }
 
     /// Get connection stats aggregator
     #[must_use]
     #[inline]
-    pub fn connection_stats(&self) -> &ConnectionStatsAggregator {
+    pub const fn connection_stats(&self) -> &ConnectionStatsAggregator {
         &self.connection_stats
     }
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub mod tests {
     use super::*;
     use crate::config::{Config, Server};
     use crate::types::{MaxConnections, Port};
@@ -311,87 +288,5 @@ pub(super) mod tests {
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.router.backend_count(), 3);
-    }
-
-    // Tests for is_client_disconnect_error function
-    mod error_classification {
-        use super::*;
-        use std::io::{Error, ErrorKind};
-
-        #[test]
-        fn test_broken_pipe_is_client_disconnect() {
-            let io_err = Error::from(ErrorKind::BrokenPipe);
-            let err = anyhow::Error::from(io_err);
-            assert!(is_client_disconnect_error(&err));
-        }
-
-        #[test]
-        fn test_connection_reset_is_client_disconnect() {
-            let io_err = Error::from(ErrorKind::ConnectionReset);
-            let err = anyhow::Error::from(io_err);
-            assert!(is_client_disconnect_error(&err));
-        }
-
-        #[test]
-        fn test_other_io_errors_not_client_disconnect() {
-            let error_kinds = vec![
-                ErrorKind::NotFound,
-                ErrorKind::PermissionDenied,
-                ErrorKind::ConnectionRefused,
-                ErrorKind::ConnectionAborted,
-                ErrorKind::AddrInUse,
-                ErrorKind::AddrNotAvailable,
-                ErrorKind::TimedOut,
-                ErrorKind::Interrupted,
-                ErrorKind::UnexpectedEof,
-                ErrorKind::WouldBlock,
-            ];
-
-            for kind in error_kinds {
-                let io_err = Error::from(kind);
-                let err = anyhow::Error::from(io_err);
-                assert!(
-                    !is_client_disconnect_error(&err),
-                    "{:?} should not be classified as client disconnect",
-                    kind
-                );
-            }
-        }
-
-        #[test]
-        fn test_non_io_error_not_client_disconnect() {
-            let err = anyhow::anyhow!("generic error message");
-            assert!(!is_client_disconnect_error(&err));
-        }
-
-        #[test]
-        fn test_wrapped_broken_pipe_error() {
-            let io_err = Error::from(ErrorKind::BrokenPipe);
-            let err = anyhow::Error::from(io_err).context("failed to write to client");
-            assert!(is_client_disconnect_error(&err));
-        }
-
-        #[test]
-        fn test_wrapped_connection_reset_error() {
-            let io_err = Error::from(ErrorKind::ConnectionReset);
-            let err = anyhow::Error::from(io_err).context("failed to read from client");
-            assert!(is_client_disconnect_error(&err));
-        }
-
-        #[test]
-        fn test_deeply_wrapped_error() {
-            let io_err = Error::from(ErrorKind::BrokenPipe);
-            let err = anyhow::Error::from(io_err)
-                .context("inner context")
-                .context("outer context");
-            assert!(is_client_disconnect_error(&err));
-        }
-
-        #[test]
-        fn test_custom_io_error_message() {
-            let io_err = Error::new(ErrorKind::BrokenPipe, "custom broken pipe");
-            let err = anyhow::Error::from(io_err);
-            assert!(is_client_disconnect_error(&err));
-        }
     }
 }

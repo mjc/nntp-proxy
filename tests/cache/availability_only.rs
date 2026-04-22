@@ -1,4 +1,4 @@
-//! Tests for availability-only mode (cache_articles = false)
+//! Tests for availability-only mode (`cache_articles` = false)
 //!
 //! This test suite verifies that the cache works in availability-only mode,
 //! storing only backend availability bitsets without headers/body data.
@@ -29,8 +29,7 @@ async fn test_availability_only_mode_tracks_backend_availability() -> Result<()>
     let (status1, body1) = send_article_read_full_response(&mut client, msgid).await?;
     assert!(
         status1.starts_with("220"),
-        "First request should succeed: {}",
-        status1
+        "First request should succeed: {status1}"
     );
     assert!(!body1.is_empty());
 
@@ -87,9 +86,9 @@ async fn test_availability_only_mode_learns_from_requests() -> Result<()> {
 
     // Request multiple articles - cache should learn Backend2 has them
     for i in 0..5 {
-        let msgid = format!("<article-{}@example.com>", i);
+        let msgid = format!("<article-{i}@example.com>");
         let (status, body) = send_article_read_full_response(&mut client, &msgid).await?;
-        assert!(status.starts_with("220"), "Article {} should succeed", i);
+        assert!(status.starts_with("220"), "Article {i} should succeed");
         assert!(!body.is_empty());
     }
 
@@ -113,13 +112,12 @@ async fn test_availability_only_mode_mixed_availability() -> Result<()> {
 
     // Request multiple articles - some on each backend
     for i in 0..10 {
-        let msgid = format!("<mixed-article-{}@example.com>", i);
+        let msgid = format!("<mixed-article-{i}@example.com>");
         let (status, _body) = send_article_read_full_response(&mut client, &msgid).await?;
         // May get 220 or 430 depending on backend availability
         assert!(
             status.starts_with("220") || status.starts_with("430"),
-            "Valid response for article {}",
-            i
+            "Valid response for article {i}"
         );
     }
 

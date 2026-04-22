@@ -13,13 +13,13 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-/// SO_LINGER timeout - prevents indefinite blocking on socket close
+/// `SO_LINGER` timeout - prevents indefinite blocking on socket close
 const LINGER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// TCP_USER_TIMEOUT - faster dead connection detection on Linux
+/// `TCP_USER_TIMEOUT` - faster dead connection detection on Linux
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// IP_TOS value for throughput optimization
+/// `IP_TOS` value for throughput optimization
 const TOS_THROUGHPUT: u32 = 0x08;
 
 /// Trait for network optimization strategies
@@ -94,7 +94,7 @@ pub struct TcpOptimizer<'a> {
 
 impl<'a> TcpOptimizer<'a> {
     /// Create a new TCP optimizer with default high-throughput settings
-    pub fn new(stream: &'a TcpStream) -> Self {
+    pub const fn new(stream: &'a TcpStream) -> Self {
         Self {
             stream,
             recv_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER,
@@ -116,7 +116,7 @@ impl<'a> TcpOptimizer<'a> {
     }
 }
 
-impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
+impl NetworkOptimizer for TcpOptimizer<'_> {
     fn optimize(&self) -> Result<()> {
         let sock_ref = SockRef::from(self.stream);
 
@@ -144,7 +144,7 @@ impl<'a> NetworkOptimizer for TcpOptimizer<'a> {
     }
 }
 
-/// High-level optimizer that works with ConnectionStream
+/// High-level optimizer that works with `ConnectionStream`
 pub struct ConnectionOptimizer<'a> {
     stream: &'a ConnectionStream,
     recv_buffer_size: Option<usize>,
@@ -153,7 +153,7 @@ pub struct ConnectionOptimizer<'a> {
 
 impl<'a> ConnectionOptimizer<'a> {
     /// Create a new connection optimizer with default buffer sizes
-    pub fn new(stream: &'a ConnectionStream) -> Self {
+    pub const fn new(stream: &'a ConnectionStream) -> Self {
         Self {
             stream,
             recv_buffer_size: None,
@@ -162,7 +162,7 @@ impl<'a> ConnectionOptimizer<'a> {
     }
 
     /// Create a connection optimizer with custom buffer sizes
-    pub fn with_buffer_sizes(
+    pub const fn with_buffer_sizes(
         stream: &'a ConnectionStream,
         recv_size: usize,
         send_size: usize,
@@ -175,7 +175,7 @@ impl<'a> ConnectionOptimizer<'a> {
     }
 }
 
-impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
+impl NetworkOptimizer for ConnectionOptimizer<'_> {
     fn optimize(&self) -> Result<()> {
         // Use functional pattern matching to create and optimize in one step
         let optimize_fn = |desc: &str, result: Result<()>| {
@@ -185,26 +185,23 @@ impl<'a> NetworkOptimizer for ConnectionOptimizer<'a> {
 
         // Get the underlying TCP stream for optimization regardless of compression layer
         let tcp = self.stream.underlying_tcp_stream();
-        match (self.recv_buffer_size, self.send_buffer_size) {
-            (Some(recv), Some(send)) => {
-                let desc = if self.stream.is_encrypted() {
-                    "TLS optimization via underlying TCP stream with custom buffers"
-                } else {
-                    "TCP high-throughput optimization with custom buffers"
-                };
-                optimize_fn(
-                    desc,
-                    TcpOptimizer::with_buffer_sizes(tcp, recv, send).optimize(),
-                )
-            }
-            _ => {
-                let desc = if self.stream.is_encrypted() {
-                    "TLS optimization via underlying TCP stream"
-                } else {
-                    "TCP high-throughput optimization"
-                };
-                optimize_fn(desc, TcpOptimizer::new(tcp).optimize())
-            }
+        if let (Some(recv), Some(send)) = (self.recv_buffer_size, self.send_buffer_size) {
+            let desc = if self.stream.is_encrypted() {
+                "TLS optimization via underlying TCP stream with custom buffers"
+            } else {
+                "TCP high-throughput optimization with custom buffers"
+            };
+            optimize_fn(
+                desc,
+                TcpOptimizer::with_buffer_sizes(tcp, recv, send).optimize(),
+            )
+        } else {
+            let desc = if self.stream.is_encrypted() {
+                "TLS optimization via underlying TCP stream"
+            } else {
+                "TCP high-throughput optimization"
+            };
+            optimize_fn(desc, TcpOptimizer::new(tcp).optimize())
         }
     }
 
@@ -521,7 +518,7 @@ mod tests {
 
         let optimizer = TcpOptimizer::new(&stream);
         // Can be used as a trait object
-        let _trait_obj: &dyn NetworkOptimizer = &optimizer;
+        let _: &dyn NetworkOptimizer = &optimizer;
     }
 
     #[tokio::test]
@@ -533,7 +530,7 @@ mod tests {
 
         let optimizer = ConnectionOptimizer::new(&stream);
         // Can be used as a trait object
-        let _trait_obj: &dyn NetworkOptimizer = &optimizer;
+        let _: &dyn NetworkOptimizer = &optimizer;
     }
 
     // Constants tests

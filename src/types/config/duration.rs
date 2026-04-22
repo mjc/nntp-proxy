@@ -8,7 +8,7 @@ use std::time::Duration;
 /// TOML/JSON configs typically specify durations in seconds, so we need
 /// custom serde to convert from u64 seconds to Duration
 pub mod duration_serde {
-    use super::*;
+    use super::{Deserialize, Deserializer, Duration, Serializer};
 
     pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -28,7 +28,7 @@ pub mod duration_serde {
 
 /// Helper for deserializing `Option<Duration>` from seconds
 pub mod option_duration_serde {
-    use super::*;
+    use super::{Deserialize, Deserializer, Duration, Serializer};
 
     pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -70,7 +70,7 @@ mod tests {
     proptest! {
         /// Property: Duration serialization round-trips correctly for any valid second value
         #[test]
-        fn prop_duration_serde_roundtrip(secs in 0u64..100000) {
+        fn prop_duration_serde_roundtrip(secs in 0u64..100_000) {
             let original = TestDuration {
                 timeout: Duration::from_secs(secs),
             };
@@ -81,18 +81,18 @@ mod tests {
 
         /// Property: Duration JSON format is always `{"timeout":N}`
         #[test]
-        fn prop_duration_json_format(secs in 0u64..100000) {
+        fn prop_duration_json_format(secs in 0u64..100_000) {
             let test = TestDuration {
                 timeout: Duration::from_secs(secs),
             };
             let json = serde_json::to_string(&test).unwrap();
-            let expected = format!(r#"{{"timeout":{}}}"#, secs);
+            let expected = format!(r#"{{"timeout":{secs}}}"#);
             prop_assert_eq!(json, expected);
         }
 
         /// Property: Option<Duration> with Some serializes to number
         #[test]
-        fn prop_option_duration_some_roundtrip(secs in 0u64..100000) {
+        fn prop_option_duration_some_roundtrip(secs in 0u64..100_000) {
             let original = TestOptionDuration {
                 timeout: Some(Duration::from_secs(secs)),
             };
@@ -103,7 +103,7 @@ mod tests {
 
         /// Property: TOML serialization round-trips correctly
         #[test]
-        fn prop_duration_toml_roundtrip(secs in 0u64..100000) {
+        fn prop_duration_toml_roundtrip(secs in 0u64..100_000) {
             let original = TestDuration {
                 timeout: Duration::from_secs(secs),
             };
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_option_duration_deserialize_missing_field() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let result: Result<TestOptionDuration, _> = serde_json::from_str(json);
         // serde will error on missing required field
         assert!(result.is_err());

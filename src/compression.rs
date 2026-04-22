@@ -96,7 +96,7 @@ fn try_decompress(
     let before_in = decompressor.total_in();
     let before_out = decompressor.total_out();
 
-    let status = decompressor
+    let decompress_status = decompressor
         .decompress(input, out_slice, flate2::FlushDecompress::None)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -110,7 +110,7 @@ fn try_decompress(
 
     Ok((
         consumed,
-        produced > 0 || matches!(status, flate2::Status::StreamEnd),
+        produced > 0 || matches!(decompress_status, flate2::Status::StreamEnd),
     ))
 }
 
@@ -172,23 +172,24 @@ impl<S> DecompressStream<S> {
 
     /// Get a reference to the inner stream.
     #[inline]
-    pub fn get_ref(&self) -> &S {
+    pub const fn get_ref(&self) -> &S {
         &self.inner
     }
 
     /// Get a mutable reference to the inner stream.
     #[inline]
-    pub fn get_mut(&mut self) -> &mut S {
+    pub const fn get_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 
     /// Get bandwidth stats: (compressed bytes read from network, decompressed bytes delivered).
     #[inline]
-    pub fn bandwidth_stats(&self) -> (u64, u64) {
+    pub const fn bandwidth_stats(&self) -> (u64, u64) {
         (self.bytes_compressed_in, self.bytes_decompressed_out)
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)] // pin_project generates hidden fields that can't be included
 impl<S: fmt::Debug> fmt::Debug for DecompressStream<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DecompressStream")
@@ -272,9 +273,8 @@ impl<S: AsyncWrite> AsyncWrite for DecompressStream<S> {
                 len: produced,
             };
             match poll_drain_buf(this.inner.as_mut(), cx, this.write_buf, this.write_drain) {
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(())) | Poll::Pending => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
             }
         }
 
@@ -397,7 +397,7 @@ mod tests {
         let mut original = Vec::with_capacity(1024 * 1024);
         for i in 0..1024 * 64 {
             original.extend_from_slice(
-                format!("Line {}: Some NNTP article content here\r\n", i).as_bytes(),
+                format!("Line {i}: Some NNTP article content here\r\n").as_bytes(),
             );
         }
 
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn test_debug_impl() {
         let stream = DecompressStream::new(std::io::Cursor::new(Vec::<u8>::new()));
-        let debug_str = format!("{:?}", stream);
+        let debug_str = format!("{stream:?}");
         assert!(debug_str.contains("DecompressStream"));
         assert!(debug_str.contains("compressed_pos"));
         assert!(debug_str.contains("bytes_compressed_in"));

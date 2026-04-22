@@ -28,12 +28,14 @@ impl Default for CacheCapacity {
 impl CacheCapacity {
     /// Get capacity in bytes
     #[inline]
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.into_inner()
     }
 
     /// Get capacity as u64 for moka
     #[inline]
+    #[must_use]
     pub fn as_u64(&self) -> u64 {
         self.into_inner()
     }
@@ -54,7 +56,7 @@ impl std::str::FromStr for CacheCapacity {
         // Fallback to plain number (bytes)
         match s.parse::<u64>() {
             Ok(bytes) => Self::try_new(bytes).map_err(|e| e.to_string()),
-            Err(_) => Err(format!("Invalid cache capacity: {}", s)),
+            Err(_) => Err(format!("Invalid cache capacity: {s}")),
         }
     }
 }

@@ -60,7 +60,7 @@ pub struct ValidatedResponse {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// ValidatedResponse with parsed response and any warnings
+/// `ValidatedResponse` with parsed response and any warnings
 #[must_use]
 pub fn validate_backend_response(
     chunk: &[u8],
@@ -99,6 +99,32 @@ pub fn validate_backend_response(
     }
 }
 
+/// Format a hex preview of response bytes for debugging Invalid responses
+///
+/// # Arguments
+/// * `data` - Raw response bytes
+/// * `max_bytes` - Maximum number of bytes to include in preview
+///
+/// # Returns
+/// Hex string with space-separated bytes (e.g., "41 42 43" for "ABC")
+///
+/// # Examples
+/// ```
+/// # use nntp_proxy::session::backend::format_hex_preview;
+/// let data = b"430 No such article\r\n";
+/// let hex = format_hex_preview(data, 256);
+/// assert!(hex.starts_with("34 33 30 20")); // "430 "
+/// ```
+#[must_use]
+pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
+    let preview = &data[..data.len().min(max_bytes)];
+    preview
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // ─── Command execution ──────────────────────────────────────────────────────
 
 /// Result of sending a command to a backend
@@ -115,16 +141,9 @@ pub struct CommandResponse {
 }
 
 impl CommandResponse {
-    /// Check if response is 430 (article not found)
-    #[inline]
-    pub fn is_430(&self) -> bool {
-        self.response
-            .status_code()
-            .is_some_and(|code| code.as_u16() == 430)
-    }
-
     /// Get status code if valid
     #[inline]
+    #[must_use]
     pub fn status_code(&self) -> Option<crate::protocol::StatusCode> {
         self.response.status_code()
     }
@@ -141,31 +160,37 @@ impl CommandResponse {
         for warning in &self.warnings {
             match warning {
                 ResponseWarning::ShortResponse { bytes, min } => {
+                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
                         "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
                         client_addr,
                         backend_id,
                         bytes,
                         min,
-                        &buffer[..self.bytes_read]
+                        &buffer[..clamped_len]
                     );
                 }
                 ResponseWarning::InvalidResponse => {
+                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
-                        "Client {} got invalid response from backend {:?} ({} bytes): {:?}",
-                        client_addr,
-                        backend_id,
-                        self.bytes_read,
-                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                        client = %client_addr,
+                        backend = ?backend_id,
+                        bytes_read = self.bytes_read,
+                        first_bytes_hex = %format_hex_preview(&buffer[..clamped_len], 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..clamped_len.min(256)]),
+                        "Backend returned invalid response"
                     );
                 }
                 ResponseWarning::UnusualStatusCode(code) => {
+                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
-                        "Client {} got unusual status code {} from backend {:?}: {:?}",
-                        client_addr,
-                        code,
-                        backend_id,
-                        String::from_utf8_lossy(&buffer[..self.bytes_read.min(50)])
+                        client = %client_addr,
+                        backend = ?backend_id,
+                        status_code = code,
+                        bytes_read = self.bytes_read,
+                        first_bytes_hex = %format_hex_preview(&buffer[..clamped_len], 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..clamped_len.min(256)]),
+                        "Backend returned unusual status code"
                     );
                 }
             }
@@ -180,7 +205,7 @@ impl CommandResponse {
 /// stream the rest.
 ///
 /// # Arguments
-/// * `conn` - Backend connection (anything implementing AsyncRead + AsyncWrite)
+/// * `conn` - Backend connection (anything implementing `AsyncRead` + `AsyncWrite`)
 /// * `command` - NNTP command to send (should include \r\n)
 /// * `buffer` - Buffer to read response into
 ///
@@ -207,7 +232,7 @@ where
 /// Like `send_command` but also returns timing information for metrics.
 ///
 /// # Returns
-/// Tuple of (CommandResponse, ttfb_micros, send_micros, recv_micros)
+/// Tuple of (`CommandResponse`, `ttfb_micros`, `send_micros`, `recv_micros`)
 pub async fn send_command_timed<C>(
     conn: &mut C,
     command: &str,
@@ -231,17 +256,33 @@ where
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
     }
+
+    // H5: If first read returned fewer bytes than needed to parse a status code,
+    // accumulate more data. This handles the rare case where a TCP segment
+    // boundary splits the 3-digit status code across reads.
+    let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
+    if n < min_len {
+        loop {
+            let more = buffer.read_more(conn).await?;
+            if more == 0 {
+                break; // EOF — validate what we have
+            }
+            if buffer.initialized() >= min_len {
+                break; // Enough data to validate
+            }
+        }
+    }
+    let total = buffer.initialized();
     let recv_elapsed = recv_start.elapsed();
 
     // Validate response
-    let validated =
-        validate_backend_response(&buffer[..n], n, crate::protocol::MIN_RESPONSE_LENGTH);
+    let validated = validate_backend_response(&buffer[..total], total, min_len);
 
     let elapsed = start.elapsed();
 
     Ok((
         CommandResponse {
-            bytes_read: n,
+            bytes_read: total,
             response: validated.response,
             is_multiline: validated.is_multiline,
             warnings: validated.warnings,
@@ -255,6 +296,103 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Mock stream that returns data in configurable chunks
+    struct ChunkedStream {
+        chunks: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl ChunkedStream {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ChunkedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                let len = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..len]);
+                if len < chunk.len() {
+                    // Put remainder back
+                    self.chunks.push_front(chunk[len..].to_vec());
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ChunkedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_command_partial_read_accumulates() {
+        // Simulate a backend that sends "200 OK\r\n" in two chunks:
+        // first read returns "20", second returns "0 OK\r\n"
+        let mut stream = ChunkedStream::new(vec![b"20".to_vec(), b"0 OK\r\n".to_vec()]);
+
+        let pool = crate::pool::BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+
+        let result = send_command(&mut stream, "DATE\r\n", &mut buffer).await;
+        assert!(result.is_ok(), "send_command should handle partial reads");
+        let resp = result.unwrap();
+        assert!(
+            matches!(resp.response, NntpResponse::Greeting(_)),
+            "Expected 200 greeting, got {:?}",
+            resp.response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_command_single_byte_reads() {
+        // Extreme case: each byte comes separately
+        let data = b"211 Group\r\n";
+        let chunks: Vec<Vec<u8>> = data.iter().map(|&b| vec![b]).collect();
+        let mut stream = ChunkedStream::new(chunks);
+
+        let pool = crate::pool::BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+
+        let result = send_command(&mut stream, "GROUP alt.test\r\n", &mut buffer).await;
+        assert!(
+            result.is_ok(),
+            "send_command should handle single-byte reads"
+        );
+        let resp = result.unwrap();
+        assert!(
+            matches!(resp.response, NntpResponse::SingleLine(_)),
+            "Expected 211 single-line, got {:?}",
+            resp.response
+        );
+    }
 
     // ─── Command response tests ─────────────────────────────────────────────
 
@@ -267,7 +405,7 @@ mod tests {
             is_multiline: false,
             warnings: SmallVec::new(),
         };
-        assert!(response.is_430());
+        assert!(response.response.is_430());
 
         // Create a 220 response
         let response = CommandResponse {
@@ -276,7 +414,7 @@ mod tests {
             is_multiline: true,
             warnings: SmallVec::new(),
         };
-        assert!(!response.is_430());
+        assert!(!response.response.is_430());
     }
 
     #[test]
@@ -412,5 +550,61 @@ mod tests {
         let w1 = ResponseWarning::UnusualStatusCode(999);
         let w2 = w1.clone();
         assert_eq!(w1, w2);
+    }
+
+    // ─── Hex preview tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_hex_preview_empty() {
+        let data = b"";
+        let result = format_hex_preview(data, 256);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_format_hex_preview_small() {
+        let data = b"ABC";
+        let result = format_hex_preview(data, 256);
+        // A=41, B=42, C=43
+        assert_eq!(result, "41 42 43");
+    }
+
+    #[test]
+    fn test_format_hex_preview_respects_max_bytes() {
+        let data = b"ABCDEFGH";
+        let result = format_hex_preview(data, 4);
+        // Only first 4 bytes: A=41, B=42, C=43, D=44
+        assert_eq!(result, "41 42 43 44");
+    }
+
+    #[test]
+    fn test_format_hex_preview_full_response() {
+        let data = b"430 No such article\r\n";
+        let result = format_hex_preview(data, 256);
+        // Should show full response in hex
+        assert!(result.starts_with("34 33 30 20")); // "430 "
+        assert!(result.ends_with("0d 0a")); // \r\n
+        assert_eq!(result.split_whitespace().count(), data.len());
+    }
+
+    #[test]
+    fn test_format_hex_preview_non_ascii() {
+        let data = &[0xFF, 0xFE, 0x00, 0x01];
+        let result = format_hex_preview(data, 256);
+        assert_eq!(result, "ff fe 00 01");
+    }
+
+    #[test]
+    fn test_format_hex_preview_256_bytes() {
+        // Create 300 byte array
+        let data: Vec<u8> = (0..=255).chain(0..44).collect();
+        assert_eq!(data.len(), 300);
+
+        let result = format_hex_preview(&data, 256);
+        // Should only include first 256 bytes
+        assert_eq!(result.split_whitespace().count(), 256);
+
+        // Verify last hex is "ff" (byte 255)
+        assert!(result.ends_with("ff"));
     }
 }

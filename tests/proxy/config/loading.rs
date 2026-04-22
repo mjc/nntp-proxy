@@ -60,7 +60,7 @@ fn test_missing_file_returns_error() {
     assert!(result.unwrap_err().to_string().contains("Failed to read"));
 }
 
-/// Test create_default_config generates valid config
+/// Test `create_default_config` generates valid config
 #[test]
 fn test_create_default_config() {
     let config = create_default_config();
@@ -71,7 +71,7 @@ fn test_create_default_config() {
     assert!(!config.servers[0].use_tls);
 }
 
-/// Test ConfigSource descriptions
+/// Test `ConfigSource` descriptions
 #[test]
 fn test_config_source_descriptions() {
     assert_eq!(ConfigSource::File.description(), "configuration file");
@@ -85,7 +85,7 @@ fn test_config_source_descriptions() {
     );
 }
 
-/// Test load_config_with_fallback: file exists
+/// Test `load_config_with_fallback`: file exists
 #[test]
 fn test_fallback_uses_existing_file() -> Result<()> {
     let mut temp_file = NamedTempFile::new()?;

@@ -33,6 +33,7 @@ impl MaxConnections {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> usize {
         self.into_inner()
     }
@@ -66,6 +67,7 @@ impl MaxErrors {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> u32 {
         self.into_inner()
     }
@@ -83,7 +85,7 @@ impl ThreadCount {
     /// Default thread count (single-threaded)
     pub const DEFAULT: Self = Self(NonZeroUsize::new(1).unwrap());
 
-    /// Create a new ThreadCount
+    /// Create a new `ThreadCount`
     ///
     /// - If value is 0, returns the number of CPU cores
     /// - Otherwise returns the specified value
@@ -103,7 +105,7 @@ impl ThreadCount {
         }
     }
 
-    /// Create a new ThreadCount from a value
+    /// Create a new `ThreadCount` from a value
     ///
     /// - If value is 0, returns the number of CPU cores
     /// - Otherwise returns the specified value
@@ -127,7 +129,7 @@ impl ThreadCount {
     /// Get the number of available CPU cores (private helper)
     fn num_cpus() -> Self {
         let count = std::thread::available_parallelism()
-            .map(|p| p.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(1);
         // SAFETY: available_parallelism always returns at least 1
         Self(NonZeroUsize::new(count).unwrap())

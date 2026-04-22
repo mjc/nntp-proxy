@@ -20,8 +20,8 @@ use tracing::{debug, info, warn};
 use crate::command::classifier::is_large_transfer_command;
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
-use crate::is_client_disconnect_error;
 use crate::router::BackendSelector;
+use crate::session::SessionError;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 /// Result of executing a routing decision
@@ -36,7 +36,7 @@ enum CommandResult {
 enum SingleCommandResult {
     /// Continue processing commands
     Continue { auth_succeeded: bool },
-    /// Client sent QUIT command (bytes already added to backend_to_client_bytes)
+    /// Client sent QUIT command (bytes already added to `backend_to_client_bytes`)
     Quit,
     /// Switch to stateful mode (early return from loop)
     SwitchToStateful,
@@ -95,9 +95,8 @@ impl ClientSession {
             CommandRoutingDecision::InterceptAuth => {
                 debug!("Client {} decision: InterceptAuth", self.client_addr);
                 let action = CommandHandler::classify(command);
-                let auth_action = match action {
-                    CommandAction::InterceptAuth(a) => a,
-                    _ => unreachable!("InterceptAuth decision must come from InterceptAuth action"),
+                let CommandAction::InterceptAuth(auth_action) = action else {
+                    unreachable!("InterceptAuth decision must come from InterceptAuth action")
                 };
 
                 let auth_succeeded = match common::handle_auth_command(
@@ -113,7 +112,7 @@ impl ClientSession {
                         common::on_authentication_success(
                             self.client_addr,
                             auth_username.clone(),
-                            &self.mode_state.routing_mode(),
+                            self.mode_state.routing_mode(),
                             &self.metrics,
                             self.connection_stats(),
                             |username| self.set_username(username),
@@ -175,9 +174,8 @@ impl ClientSession {
             CommandRoutingDecision::Reject => {
                 debug!("Client {} decision: Reject", self.client_addr);
                 let action = CommandHandler::classify(command);
-                let response = match action {
-                    CommandAction::Reject(r) => r,
-                    _ => unreachable!("Reject decision must come from Reject action"),
+                let CommandAction::Reject(response) = action else {
+                    unreachable!("Reject decision must come from Reject action")
                 };
                 client_write.write_all(response.as_bytes()).await?;
                 *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
@@ -190,7 +188,7 @@ impl ClientSession {
 
     /// Process a single command (handles QUIT, auth, routing decision)
     ///
-    /// Returns SingleCommandResult indicating whether to continue, quit, or switch to stateful mode.
+    /// Returns `SingleCommandResult` indicating whether to continue, quit, or switch to stateful mode.
     async fn process_single_command(
         &self,
         params: ProcessCommandParams<'_, '_>,
@@ -243,11 +241,13 @@ impl ClientSession {
     pub async fn handle_per_command_routing(
         &self,
         mut client_stream: TcpStream,
-    ) -> Result<TransferMetrics> {
+    ) -> Result<TransferMetrics, SessionError> {
         use tokio::io::BufReader;
 
         let Some(router) = self.router.as_ref() else {
-            anyhow::bail!("Per-command routing mode requires a router");
+            return Err(SessionError::Backend(anyhow::anyhow!(
+                "Per-command routing mode requires a router"
+            )));
         };
 
         let (client_read, mut client_write) = client_stream.split();
@@ -277,6 +277,10 @@ impl ClientSession {
         // Accumulator buffers for zero-alloc batching (hoisted to session scope, reused across batches)
         let mut batch_buf = String::with_capacity(512 * 4); // ~2KB for typical 4-command batch
         let mut batch_offsets: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
+
+        // Pipelining buffers reused across batch_execute_articles calls
+        let mut batch_leftover = bytes::BytesMut::new();
+        let mut batch_chunk_data = bytes::BytesMut::new();
 
         // Process commands in batches (single commands fall through with zero overhead)
         'command_batch_loop: loop {
@@ -334,22 +338,22 @@ impl ClientSession {
                 // Try batch pipelining for all-ARTICLE/BODY batches;
                 // fall through to individual processing on failure.
                 let batch_handled = if all_large_transfer {
-                    // Create temporary slice vector for batch_execute_articles
-                    // (TODO: refactor batch_execute_articles to take CommandBatch directly)
-                    let commands_vec: Vec<&str> =
-                        (0..batch_size).map(|i| batch.command(i)).collect();
                     match self
                         .batch_execute_articles(
                             router,
-                            &commands_vec,
+                            &batch,
                             &mut client_write,
-                            &mut client_to_backend_bytes,
-                            &mut backend_to_client_bytes,
+                            crate::session::handlers::article_retry::BatchPipelineState {
+                                client_to_backend_bytes: &mut client_to_backend_bytes,
+                                backend_to_client_bytes: &mut backend_to_client_bytes,
+                                leftover: &mut batch_leftover,
+                                chunk_data: &mut batch_chunk_data,
+                            },
                         )
                         .await
                     {
                         Ok(()) => true,
-                        Err(e) if is_client_disconnect_error(&e) => {
+                        Err(e @ SessionError::ClientDisconnect(_)) => {
                             return Err(e);
                         }
                         Err(e) => {
@@ -427,7 +431,10 @@ impl ClientSession {
                         self.client_addr,
                         trailing_cmd.len()
                     );
-                    client_write.write_all(b"500 Command too long\r\n").await?;
+                    client_write
+                        .write_all(b"500 Command too long\r\n")
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     continue;
                 }
 
@@ -499,7 +506,10 @@ mod tests {
         let broken_pipe = std::io::Error::new(ErrorKind::BrokenPipe, "broken pipe");
         let err: anyhow::Error = broken_pipe.into();
         assert!(
-            crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            matches!(
+                crate::session::SessionError::from(err),
+                crate::session::SessionError::ClientDisconnect(_)
+            ),
             "BrokenPipe should be classified as client disconnect"
         );
 
@@ -507,7 +517,10 @@ mod tests {
         let timeout = std::io::Error::new(ErrorKind::TimedOut, "timed out");
         let err: anyhow::Error = timeout.into();
         assert!(
-            !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            matches!(
+                crate::session::SessionError::from(err),
+                crate::session::SessionError::Backend(_)
+            ),
             "TimedOut should NOT be classified as client disconnect"
         );
 
@@ -515,7 +528,10 @@ mod tests {
         let other = std::io::Error::other("other error");
         let err: anyhow::Error = other.into();
         assert!(
-            !crate::session::error_classification::ErrorClassifier::is_client_disconnect(&err),
+            matches!(
+                crate::session::SessionError::from(err),
+                crate::session::SessionError::Backend(_)
+            ),
             "Other errors should NOT be classified as client disconnect"
         );
     }

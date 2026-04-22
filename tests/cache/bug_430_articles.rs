@@ -1,15 +1,15 @@
-//! Test for the cache_articles=true 430 bug
+//! Test for the `cache_articles=true` 430 bug
 //!
-//! BUG: When cache_articles=true, the proxy returns 430 for articles that backends
+//! BUG: When `cache_articles=true`, the proxy returns 430 for articles that backends
 //! actually have. This is caused by a race condition:
 //!
-//! 1. spawn_cache_upsert() is fire-and-forget (async)
-//! 2. sync_availability() runs immediately after success
-//! 3. If upsert hasn't completed, sync_availability creates a 430 stub
+//! 1. `spawn_cache_upsert()` is fire-and-forget (async)
+//! 2. `sync_availability()` runs immediately after success
+//! 3. If upsert hasn't completed, `sync_availability` creates a 430 stub
 //! 4. The 430 stub overwrites the real article when upsert finally runs
 //!    OR the 430 stub is served on the next request before upsert completes
 //!
-//! This test verifies the fix: sync_availability should not create 430 stubs
+//! This test verifies the fix: `sync_availability` should not create 430 stubs
 //! when the availability shows a backend HAS the article.
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
-/// Test that sync_availability does NOT create a 430 stub when a backend has the article
+/// Test that `sync_availability` does NOT create a 430 stub when a backend has the article
 #[tokio::test]
 async fn test_sync_availability_does_not_create_430_stub_when_backend_has_article() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
@@ -140,7 +140,7 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
 // Additional thorough tests for ArticleAvailability
 // ============================================================================
 
-/// Test the new any_backend_has_article() method
+/// Test the new `any_backend_has_article()` method
 #[test]
 fn test_any_backend_has_article_basic() {
     let mut availability = ArticleAvailability::new();
@@ -166,7 +166,7 @@ fn test_any_backend_has_article_basic() {
     );
 }
 
-/// Test any_backend_has_article with multiple backends
+/// Test `any_backend_has_article` with multiple backends
 #[test]
 fn test_any_backend_has_article_multiple_backends() {
     let mut availability = ArticleAvailability::new();
@@ -205,7 +205,7 @@ fn test_record_has_clears_missing() {
     assert!(availability.any_backend_has_article());
 }
 
-/// Test sync_availability with mixed availability (some have, some missing)
+/// Test `sync_availability` with mixed availability (some have, some missing)
 #[tokio::test]
 async fn test_sync_availability_mixed_results() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
@@ -231,7 +231,7 @@ async fn test_sync_availability_mixed_results() -> Result<()> {
     Ok(())
 }
 
-/// Test sync_availability creates 430 stub only when ALL backends are missing
+/// Test `sync_availability` creates 430 stub only when ALL backends are missing
 #[tokio::test]
 async fn test_sync_availability_creates_430_when_all_missing() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
@@ -265,7 +265,7 @@ async fn test_sync_availability_creates_430_when_all_missing() -> Result<()> {
     Ok(())
 }
 
-/// Test that all_exhausted works correctly
+/// Test that `all_exhausted` works correctly
 #[test]
 fn test_all_exhausted_with_backend_count() {
     let mut availability = ArticleAvailability::new();
@@ -285,7 +285,7 @@ fn test_all_exhausted_with_backend_count() {
     assert!(!availability.all_exhausted(BackendCount::new(3)));
 }
 
-/// Test that try_serve_from_cache doesn't serve 430 stubs when cache_articles=true
+/// Test that `try_serve_from_cache` doesn't serve 430 stubs when `cache_articles=true`
 ///
 /// This is a critical edge case: if a 430 stub is in the cache, we should NOT
 /// serve it directly - we should fall through to backend routing.
@@ -312,7 +312,7 @@ async fn test_430_stub_not_served_directly() -> Result<()> {
     Ok(())
 }
 
-/// Test concurrent upsert and sync_availability (simulating the race)
+/// Test concurrent upsert and `sync_availability` (simulating the race)
 #[tokio::test]
 async fn test_concurrent_upsert_and_sync() -> Result<()> {
     use std::sync::Arc;
@@ -355,8 +355,8 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
     sync_task.await?;
 
     // Regardless of order, we should NOT have a 430 stub
-    let cached = cache.get(&msg_id).await;
-    if let Some(entry) = cached {
+    let article = cache.get(&msg_id).await;
+    if let Some(entry) = article {
         assert!(
             entry.status_code().map(|s| s.as_u16()) != Some(430),
             "Concurrent operations should not result in 430 stub when backend has article"
@@ -370,7 +370,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
 // Tests for is_complete_article() - preventing stub serving
 // ============================================================================
 
-/// Test that is_complete_article returns false for stubs
+/// Test that `is_complete_article` returns false for stubs
 #[test]
 fn test_is_complete_article_rejects_stubs() {
     use nntp_proxy::cache::ArticleEntry;
@@ -404,7 +404,7 @@ fn test_is_complete_article_rejects_stubs() {
     );
 }
 
-/// Test that is_complete_article returns true for real articles
+/// Test that `is_complete_article` returns true for real articles
 #[test]
 fn test_is_complete_article_accepts_real_articles() {
     use nntp_proxy::cache::ArticleEntry;
@@ -428,7 +428,7 @@ fn test_is_complete_article_accepts_real_articles() {
     );
 }
 
-/// Test that is_complete_article requires 220 status code
+/// Test that `is_complete_article` requires 220 status code
 #[test]
 fn test_is_complete_article_accepts_220_and_222() {
     use nntp_proxy::cache::ArticleEntry;
@@ -467,7 +467,7 @@ fn test_is_complete_article_accepts_220_and_222() {
     );
 }
 
-/// Test that stubs don't get served when cache_articles=true
+/// Test that stubs don't get served when `cache_articles=true`
 #[tokio::test]
 async fn test_stub_not_served_as_article() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);

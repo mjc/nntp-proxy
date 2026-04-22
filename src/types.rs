@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 /// Unique identifier for a client connection
 ///
-/// Uses UUIDv4 for guaranteed uniqueness across sessions.
+/// Uses `UUIDv4` for guaranteed uniqueness across sessions.
 /// Useful for request tracing and debugging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(Uuid);
@@ -44,6 +44,7 @@ pub struct ClientId(Uuid);
 impl ClientId {
     /// Generate a new random client ID
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -70,12 +71,25 @@ impl fmt::Display for ClientId {
 }
 
 /// Unique identifier for a backend server
-#[nutype(derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, From))]
+#[nutype(derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    From,
+    Serialize,
+    Deserialize
+))]
 pub struct BackendId(usize);
 
 impl BackendId {
     /// Create a backend ID from an index
     #[inline]
+    #[must_use]
     pub fn from_index(index: usize) -> Self {
         Self::new(index)
     }
@@ -123,7 +137,7 @@ mod tests {
     #[test]
     fn test_client_id_display() {
         let id = ClientId::new();
-        let display = format!("{}", id);
+        let display = format!("{id}");
         assert!(!display.is_empty());
         // UUID format: 8-4-4-4-12 hex characters
         assert_eq!(display.len(), 36);
@@ -133,7 +147,7 @@ mod tests {
     #[test]
     fn test_client_id_debug() {
         let id = ClientId::new();
-        let debug = format!("{:?}", id);
+        let debug = format!("{id:?}");
         assert!(debug.contains("ClientId"));
     }
 
@@ -210,15 +224,15 @@ mod tests {
     #[test]
     fn test_backend_id_display() {
         let id = BackendId::from_index(5);
-        assert_eq!(format!("{}", id), "Backend(5)");
+        assert_eq!(format!("{id}"), "Backend(5)");
     }
 
     #[test]
     fn test_backend_id_debug() {
         let id = BackendId::from_index(7);
-        let debug = format!("{:?}", id);
+        let debug = format!("{id:?}");
         assert!(debug.contains("BackendId"));
-        assert!(debug.contains("7"));
+        assert!(debug.contains('7'));
     }
 
     #[test]
@@ -283,7 +297,7 @@ mod tests {
         let client_id = ClientId::new();
         let backend_id = BackendId::from_index(5);
 
-        assert!(!format!("{}", client_id).is_empty());
-        assert_eq!(format!("{}", backend_id), "Backend(5)");
+        assert!(!format!("{client_id}").is_empty());
+        assert_eq!(format!("{backend_id}"), "Backend(5)");
     }
 }

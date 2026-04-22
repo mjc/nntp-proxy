@@ -45,9 +45,8 @@ impl SessionMode {
     #[inline]
     const fn from_u8(value: u8) -> Self {
         match value {
-            0 => Self::PerCommand,
             1 => Self::Stateful,
-            _ => Self::PerCommand, // Safe default
+            _ => Self::PerCommand, // 0 or any unknown value
         }
     }
 }
@@ -60,12 +59,12 @@ impl SessionMode {
 /// # Design
 ///
 /// - **Current Mode**: `AtomicU8` for lock-free concurrent reads/writes
-/// - **Routing Mode**: Immutable configuration (Stateful, PerCommand, or Hybrid)
+/// - **Routing Mode**: Immutable configuration (Stateful, `PerCommand`, or Hybrid)
 /// - Mode transitions are only allowed in Hybrid mode
 ///
 /// # One-Way Transition Invariant
 ///
-/// **CRITICAL**: In Hybrid mode, the transition from PerCommand → Stateful is
+/// **CRITICAL**: In Hybrid mode, the transition from `PerCommand` → Stateful is
 /// **permanent and irreversible** for the lifetime of the connection:
 ///
 /// ```text
@@ -78,7 +77,7 @@ impl SessionMode {
 /// - Connection acquires a dedicated backend
 /// - All subsequent commands use that backend
 /// - Connection stays stateful until client disconnects
-/// - New client connection starts fresh in PerCommand mode (if Hybrid)
+/// - New client connection starts fresh in `PerCommand` mode (if Hybrid)
 ///
 /// # Examples
 ///
@@ -128,7 +127,7 @@ impl ModeState {
     /// ```
     #[inline]
     #[must_use]
-    pub fn new(initial_mode: SessionMode, routing_mode: RoutingMode) -> Self {
+    pub const fn new(initial_mode: SessionMode, routing_mode: RoutingMode) -> Self {
         Self {
             mode: AtomicU8::new(initial_mode.to_u8()),
             routing_mode,
@@ -267,7 +266,7 @@ impl ModeState {
 
     /// Check if this session is using per-command routing
     ///
-    /// Returns true if routing_mode is PerCommand or Hybrid.
+    /// Returns true if `routing_mode` is `PerCommand` or Hybrid.
     ///
     /// # Examples
     ///

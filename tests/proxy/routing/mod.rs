@@ -33,7 +33,7 @@ fn create_test_provider() -> DeadpoolConnectionProvider {
     )
 }
 
-/// Helper to create a test backend with specified max_connections
+/// Helper to create a test backend with specified `max_connections`
 fn create_backend(name: &str, max_connections: usize) -> DeadpoolConnectionProvider {
     DeadpoolConnectionProvider::builder("localhost", 119)
         .name(name)

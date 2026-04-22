@@ -1,8 +1,10 @@
 //! Mock hybrid cache for testing
 //!
-//! Provides a simple in-memory implementation that mimics HybridArticleCache
+//! Provides a simple in-memory implementation that mimics `HybridArticleCache`
 //! behavior without foyer's complexity. Used in tests to avoid foyer's
 //! runtime issues.
+// Methods are async to match the HybridArticleCache trait interface; no internal awaits needed.
+#![allow(clippy::unused_async)]
 
 use super::{ArticleAvailability, HybridArticleEntry, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
@@ -20,6 +22,7 @@ pub struct MockHybridCache {
 }
 
 impl MockHybridCache {
+    #[must_use]
     pub fn new(_memory_capacity: u64) -> Self {
         Self {
             storage: Arc::new(Mutex::new(HashMap::new())),
@@ -29,7 +32,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<HybridArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
         let key = message_id.without_brackets().to_string();
         let storage = self.storage.lock().unwrap();
 
@@ -42,12 +45,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn upsert<'a>(
-        &self,
-        message_id: MessageId<'a>,
-        buffer: Vec<u8>,
-        backend_id: BackendId,
-    ) {
+    pub async fn upsert(&self, message_id: MessageId<'_>, buffer: Vec<u8>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
@@ -68,29 +66,26 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn record_missing<'a>(&self, message_id: MessageId<'a>, backend_id: BackendId) {
+    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
-        let entry = match storage.get(&key) {
-            Some(existing) => {
-                let mut updated = existing.clone();
-                updated.record_backend_missing(backend_id);
-                updated
-            }
-            None => {
-                let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is valid");
-                entry.record_backend_missing(backend_id);
-                entry
-            }
+        let entry = if let Some(existing) = storage.get(&key) {
+            let mut updated = existing.clone();
+            updated.record_backend_missing(backend_id);
+            updated
+        } else {
+            let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is valid");
+            entry.record_backend_missing(backend_id);
+            entry
         };
 
         storage.insert(key, entry);
     }
 
-    pub async fn sync_availability<'a>(
+    pub async fn sync_availability(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
         if availability.checked_bits() == 0 {
@@ -138,6 +133,7 @@ impl MockHybridCache {
         }
     }
 
+    #[must_use]
     pub fn stats(&self) -> HybridCacheStats {
         HybridCacheStats {
             hits: self.hits.load(Ordering::Relaxed),

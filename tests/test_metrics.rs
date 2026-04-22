@@ -1,4 +1,6 @@
 //! Comprehensive tests for metrics module
+// assert_eq! on f64 rate values is correct here — comparing computed rates that should be exact.
+#![allow(clippy::float_cmp)]
 
 use nntp_proxy::metrics::*;
 use nntp_proxy::types::{
@@ -169,13 +171,13 @@ fn test_backend_stats_with_realistic_values() {
     stats.errors_4xx = ErrorCount::new(7);
     stats.errors_5xx = ErrorCount::new(3);
     stats.bytes_sent = BytesSent::new(50000);
-    stats.bytes_received = BytesReceived::new(1000000);
+    stats.bytes_received = BytesReceived::new(1_000_000);
     stats.article_count = ArticleCount::new(50);
-    stats.article_bytes_total = ArticleBytesTotal::new(1000000);
-    stats.ttfb_micros_total = TtfbMicros::new(500000);
+    stats.article_bytes_total = ArticleBytesTotal::new(1_000_000);
+    stats.ttfb_micros_total = TtfbMicros::new(500_000);
     stats.ttfb_count = TimingMeasurementCount::new(1000);
     stats.send_micros_total = SendMicros::new(50000);
-    stats.recv_micros_total = RecvMicros::new(400000);
+    stats.recv_micros_total = RecvMicros::new(400_000);
     stats.connection_failures = FailureCount::new(2);
     stats.health_status = BackendHealthStatus::Healthy;
 

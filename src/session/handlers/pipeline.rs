@@ -19,7 +19,7 @@ const MAX_PIPELINE_DEPTH: usize = 16;
 /// Uses an accumulator buffer pattern to avoid per-command allocations:
 /// - All commands stored contiguously in a single String buffer
 /// - Offsets track command boundaries (end position of each command)
-/// - SmallVec keeps offsets on stack for common case (≤4 commands)
+/// - `SmallVec` keeps offsets on stack for common case (≤4 commands)
 pub(super) struct CommandBatch {
     /// All commands accumulated in a single buffer
     buffer: String,
@@ -56,7 +56,7 @@ impl CommandBatch {
     }
 
     /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
-    pub fn is_trailing_oversized(&self) -> bool {
+    pub const fn is_trailing_oversized(&self) -> bool {
         self.trailing_oversized
     }
 
@@ -70,7 +70,7 @@ impl ClientSession {
     /// Read a batch of commands from the client's buffered reader.
     ///
     /// The first command always blocks (waiting for client input). Subsequent
-    /// commands are read non-blocking from the BufReader's userspace buffer —
+    /// commands are read non-blocking from the `BufReader`'s userspace buffer —
     /// if data is already available, it's consumed; otherwise the batch ends.
     ///
     /// Returns empty batch on client disconnect.
@@ -144,7 +144,7 @@ impl ClientSession {
 
             command_buf.clear();
             match reader.read_line(command_buf).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
@@ -168,7 +168,6 @@ impl ClientSession {
                     batch_buf.push_str(command_buf);
                     batch_offsets.push(batch_buf.len());
                 }
-                Err(_) => break,
             }
         }
 

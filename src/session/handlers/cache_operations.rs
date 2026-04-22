@@ -35,13 +35,13 @@ impl ClientSession {
     /// wasn't servable (carries availability to avoid a redundant lookup), or `Miss`.
     pub(super) async fn try_serve_from_cache(
         &self,
-        msg_id: &Option<crate::types::MessageId<'_>>,
+        msg_id: Option<&crate::types::MessageId<'_>>,
         command: &str,
         router: &Arc<BackendSelector>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CacheLookupResult> {
-        let Some(msg_id_ref) = msg_id.as_ref() else {
+        let Some(msg_id_ref) = msg_id else {
             return Ok(CacheLookupResult::Miss);
         };
 
@@ -106,7 +106,7 @@ impl ClientSession {
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
         if !cached.matches_command_type_verb(cmd_verb) {
-            let status_code = cached.status_code().map(|c| c.as_u16()).unwrap_or(0);
+            let status_code = cached.status_code().map_or(0, |c| c.as_u16());
             debug!(
                 "Client {} cached response (code={}) can't serve '{}' command",
                 self.client_addr, status_code, cmd_verb
@@ -123,7 +123,7 @@ impl ClientSession {
         } else {
             // Validate before serving
             if !cached.is_valid_response() {
-                let status_code = cached.status_code().map(|c| c.as_u16()).unwrap_or(0);
+                let status_code = cached.status_code().map_or(0, |c| c.as_u16());
                 tracing::warn!(
                     code = status_code,
                     len = cached.buffer().len(),
@@ -175,7 +175,7 @@ impl ClientSession {
     }
 
     /// Create precheck dependencies
-    pub(super) fn precheck_deps<'a>(
+    pub(super) const fn precheck_deps<'a>(
         &'a self,
         router: &'a Arc<BackendSelector>,
     ) -> precheck::PrecheckDeps<'a> {

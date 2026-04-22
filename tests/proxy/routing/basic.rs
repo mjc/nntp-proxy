@@ -34,7 +34,7 @@ fn test_add_multiple_backends() {
         let provider = create_test_provider();
         router.add_backend(
             backend_id,
-            ServerName::try_new(format!("backend-{}", i)).unwrap(),
+            ServerName::try_new(format!("backend-{i}")).unwrap(),
             provider,
             0, // tier
             None,

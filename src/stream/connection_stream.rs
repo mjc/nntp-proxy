@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 /// Trait for async streams that can be used for NNTP connections
 ///
 /// This trait is automatically implemented for any type that implements
-/// AsyncRead + AsyncWrite + Unpin + Send, making it easy to support
+/// `AsyncRead` + `AsyncWrite` + Unpin + Send, making it easy to support
 /// different connection types (TCP, TLS, etc.).
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -106,7 +106,7 @@ impl ConnectionStream {
 
     /// Returns the connection type as a string for logging/debugging
     #[must_use]
-    pub fn connection_type(&self) -> &'static str {
+    pub const fn connection_type(&self) -> &'static str {
         match &self.transport {
             ConnectionTransport::Plain(_) => "TCP",
             ConnectionTransport::Tls(_) => "TLS",
@@ -150,7 +150,7 @@ impl ConnectionStream {
     /// Returns None for TLS or compressed streams.
     /// Useful for socket optimization that requires direct TCP access.
     #[must_use]
-    pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
+    pub const fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match &self.transport {
             ConnectionTransport::Plain(tcp) => Some(tcp),
             _ => None,
@@ -158,7 +158,7 @@ impl ConnectionStream {
     }
 
     /// Get a mutable reference to the underlying TCP stream (if plain, uncompressed TCP)
-    pub fn as_tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
+    pub const fn as_tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
         match &mut self.transport {
             ConnectionTransport::Plain(tcp) => Some(tcp),
             _ => None,
@@ -499,6 +499,24 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "cannot enable compression on an already-compressed connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plain_connection_debug_format() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let conn = ConnectionStream::plain(server_stream);
+        // Test Debug implementation
+        let debug_str = format!("{conn:?}");
+        assert!(
+            debug_str.contains("Plain"),
+            "Debug output should indicate Plain TCP"
         );
     }
 }

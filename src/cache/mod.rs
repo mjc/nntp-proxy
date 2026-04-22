@@ -115,6 +115,7 @@ pub enum UnifiedCache {
 
 impl UnifiedCache {
     /// Create a memory-only cache
+    #[must_use]
     pub fn memory(capacity: u64, ttl: std::time::Duration, cache_articles: bool) -> Self {
         Self::Memory(ArticleCache::new(capacity, ttl, cache_articles))
     }
@@ -125,7 +126,7 @@ impl UnifiedCache {
     }
 
     /// Get an article from the cache
-    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<ArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<ArticleEntry> {
         match self {
             Self::Memory(cache) => cache.get(message_id).await,
             Self::Hybrid(cache) => {
@@ -147,9 +148,9 @@ impl UnifiedCache {
     /// Upsert (insert or update) an article in the cache
     ///
     /// The tier is used for tier-aware TTL calculation (higher tier = longer TTL).
-    pub async fn upsert<'a>(
+    pub async fn upsert(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         buffer: Vec<u8>,
         backend_id: BackendId,
         tier: u8,
@@ -161,11 +162,7 @@ impl UnifiedCache {
     }
 
     /// Record that a backend returned 430 for this article
-    pub async fn record_backend_missing<'a>(
-        &self,
-        message_id: MessageId<'a>,
-        backend_id: BackendId,
-    ) {
+    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         match self {
             Self::Memory(cache) => cache.record_backend_missing(message_id, backend_id).await,
             Self::Hybrid(cache) => cache.record_missing(message_id, backend_id).await,
@@ -173,9 +170,9 @@ impl UnifiedCache {
     }
 
     /// Sync availability information for an article
-    pub async fn sync_availability<'a>(
+    pub async fn sync_availability(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
         match self {
@@ -222,7 +219,7 @@ impl UnifiedCache {
 
     /// Check if this is a hybrid cache (has disk tier)
     #[must_use]
-    pub fn is_hybrid(&self) -> bool {
+    pub const fn is_hybrid(&self) -> bool {
         matches!(self, Self::Hybrid(_))
     }
 

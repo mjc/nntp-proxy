@@ -14,11 +14,15 @@ pub mod layout {
     pub const SUMMARY_HEIGHT: u16 = 6; // 3 columns with 4 lines each
     pub const FOOTER_HEIGHT: u16 = 3;
     pub const MIN_CHART_HEIGHT: u16 = 8; // Reduced to fit cache stats in summary
+    /// Minimum terminal height (lines) before the log panel is shown
+    pub const MIN_HEIGHT_FOR_LOGS: u16 = 40;
+    /// Number of log lines visible in the log panel
+    pub const LOG_WINDOW_HEIGHT: u16 = 10;
 
     pub const BACKEND_LIST_WIDTH_PCT: u16 = 50;
     pub const CHART_WIDTH_PCT: u16 = 50;
 
-    pub fn main_sections() -> [Constraint; 4] {
+    pub const fn main_sections() -> [Constraint; 4] {
         [
             Constraint::Length(TITLE_HEIGHT),
             Constraint::Length(SUMMARY_HEIGHT),
@@ -27,7 +31,7 @@ pub mod layout {
         ]
     }
 
-    pub fn backend_columns() -> [Constraint; 3] {
+    pub const fn backend_columns() -> [Constraint; 3] {
         [
             Constraint::Percentage(BACKEND_LIST_WIDTH_PCT),
             Constraint::Percentage(CHART_WIDTH_PCT),

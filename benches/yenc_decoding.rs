@@ -2,6 +2,7 @@
 //!
 //! Now that we use the yenc crate, these benchmarks just verify
 //! we're getting expected performance from it.
+#![allow(clippy::cast_possible_truncation)]
 
 use divan::{Bencher, black_box};
 
@@ -39,7 +40,7 @@ fn generate_yenc_with_escapes(length: usize, escape_freq: usize) -> Vec<u8> {
 }
 
 mod yenc_crate_benches {
-    use super::*;
+    use super::{Bencher, black_box, generate_yenc_data, generate_yenc_with_escapes};
 
     #[divan::bench(sample_count = 1000)]
     fn yenc_decode_128_bytes(bencher: Bencher) {
@@ -97,25 +98,25 @@ mod yenc_crate_benches {
 
     #[divan::bench(sample_count = 200)]
     fn yenc_decode_128k_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(131072);
+        let data = generate_yenc_data(131_072);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 200)]
     fn yenc_decode_256k_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(262144);
+        let data = generate_yenc_data(262_144);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 100)]
     fn yenc_decode_512k_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(524288);
+        let data = generate_yenc_data(524_288);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 
     #[divan::bench(sample_count = 50)]
     fn yenc_decode_1mb_bytes(bencher: Bencher) {
-        let data = generate_yenc_data(1048576);
+        let data = generate_yenc_data(1_048_576);
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(&data)).unwrap()));
     }
 

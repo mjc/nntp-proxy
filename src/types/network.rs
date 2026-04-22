@@ -129,17 +129,14 @@ mod tests {
     fn test_display() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 12345);
         let client_addr = ClientAddress::from(addr);
-        assert_eq!(format!("{}", client_addr), "192.168.1.100:12345");
+        assert_eq!(format!("{client_addr}"), "192.168.1.100:12345");
     }
 
     #[test]
     fn test_debug() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8119);
         let client_addr = ClientAddress::from(addr);
-        assert_eq!(
-            format!("{:?}", client_addr),
-            "ClientAddress(127.0.0.1:8119)"
-        );
+        assert_eq!(format!("{client_addr:?}"), "ClientAddress(127.0.0.1:8119)");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Tests for connection counting to prevent double-counting bug regression
 //!
 //! Bug: Standard mode was double-counting authenticated connections:
-//! 1. Once in on_authentication_success() after AUTHINFO PASS succeeds
+//! 1. Once in `on_authentication_success()` after AUTHINFO PASS succeeds
 //! 2. Again in proxy.rs after the session completes
 //!
 //! Fix: Only count during authentication, skip if already authenticated.

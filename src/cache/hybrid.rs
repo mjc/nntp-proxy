@@ -207,7 +207,7 @@ impl HybridArticleCache {
                         config.disk_capacity / (1024 * 1024 * 1024)
                     )
                 } else {
-                    anyhow::anyhow!("Failed to initialize disk cache: {}", e)
+                    anyhow::anyhow!("Failed to initialize disk cache: {e}")
                 }
             })?;
 
@@ -228,7 +228,7 @@ impl HybridArticleCache {
             .thread_name("foyer-disk-io")
             .enable_all()
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create foyer runtime: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create foyer runtime: {e}"))?;
 
         let mut builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
@@ -276,7 +276,7 @@ impl HybridArticleCache {
                     config.disk_capacity / (1024 * 1024 * 1024)
                 )
             } else {
-                anyhow::anyhow!("Failed to build hybrid cache: {}", e)
+                anyhow::anyhow!("Failed to build hybrid cache: {e}")
             }
         })?;
 
@@ -303,7 +303,7 @@ impl HybridArticleCache {
     ///
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
-    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<HybridArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
         let key = message_id.without_brackets().to_string();
         let result = self.cache.get(&key).await;
 
@@ -343,16 +343,16 @@ impl HybridArticleCache {
 
     /// Insert or update an article in the cache
     ///
-    /// With WriteOnInsertion policy, articles are written to disk immediately
+    /// With `WriteOnInsertion` policy, articles are written to disk immediately
     /// in a background task (non-blocking).
     ///
     /// **UPSERT SEMANTICS**: Never overwrites a larger buffer with a smaller one.
     /// A cached full article (220/222 response) must not be replaced by a STAT stub.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert<'a>(
+    pub async fn upsert(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         buffer: Vec<u8>,
         backend_id: BackendId,
         tier: u8,
@@ -410,24 +410,21 @@ impl HybridArticleCache {
     }
 
     /// Record that a backend doesn't have an article (430 response)
-    pub async fn record_missing<'a>(&self, message_id: MessageId<'a>, backend_id: BackendId) {
+    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
 
         // Get existing entry or create a minimal stub
-        let entry = match self.cache.get(&key).await {
-            Ok(Some(existing)) => {
-                let mut updated = existing.value().clone();
-                updated.record_backend_missing(backend_id);
-                updated
-            }
-            _ => {
-                // Create stub entry for availability tracking
-                // SAFETY: "430\r\n" is a valid NNTP response
-                let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec())
-                    .expect("430 is a valid status code");
-                entry.record_backend_missing(backend_id);
-                entry
-            }
+        let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
+            let mut updated = existing.value().clone();
+            updated.record_backend_missing(backend_id);
+            updated
+        } else {
+            // Create stub entry for availability tracking
+            // SAFETY: "430\r\n" is a valid NNTP response
+            let mut entry =
+                HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is a valid status code");
+            entry.record_backend_missing(backend_id);
+            entry
         };
 
         self.cache.insert(key, entry);
@@ -437,14 +434,14 @@ impl HybridArticleCache {
     ///
     /// This is called ONCE at the end of a retry loop to persist all the
     /// backends that returned 430 during this request. Much more efficient
-    /// than calling record_missing for each backend individually.
+    /// than calling `record_missing` for each backend individually.
     ///
     /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
     /// (the actual article will be cached via upsert, which may race with this call).
-    pub async fn sync_availability<'a>(
+    pub async fn sync_availability(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
         // Only sync if we actually tried some backends
@@ -524,7 +521,7 @@ impl HybridArticleCache {
         self.cache
             .close()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to close cache: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to close cache: {e}"))
     }
 }
 
@@ -548,6 +545,7 @@ pub struct HybridCacheStats {
 
 impl HybridCacheStats {
     /// Calculate hit rate as a percentage
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -558,6 +556,7 @@ impl HybridCacheStats {
     }
 
     /// Calculate disk hit rate (hits from disk vs total hits)
+    #[must_use]
     pub fn disk_hit_rate(&self) -> f64 {
         if self.hits == 0 {
             0.0
@@ -570,7 +569,7 @@ impl HybridCacheStats {
 /// Create a memory-only hybrid cache (for testing without disk I/O)
 ///
 /// This uses foyer's Noop device to avoid any disk setup, making tests fast
-/// and avoiding io_uring initialization issues.
+/// and avoiding `io_uring` initialization issues.
 #[cfg(test)]
 impl HybridArticleCache {
     /// Create a memory-only cache for testing
@@ -634,14 +633,14 @@ impl HybridArticleCache {
 //   cargo test --features hybrid-cache cache::hybrid -- --ignored
 #[cfg(test)]
 mod tests {
-    //! Cache-level integration tests for HybridArticleCache
+    //! Cache-level integration tests for `HybridArticleCache`
     //!
     //! NOTE: These tests are marked as #[ignore] due to foyer runtime issues in test context.
-    //! Entry-level tests (HybridArticleEntry, CacheableStatusCode, Code encode/decode)
+    //! Entry-level tests (`HybridArticleEntry`, `CacheableStatusCode`, Code encode/decode)
     //! are in the `hybrid_codec` module.
     //!
     //! To run these ignored tests manually:
-    //!   cargo test --package nntp-proxy --lib cache::hybrid::tests -- --ignored --nocapture
+    //!   cargo test --package nntp-proxy --lib `cache::hybrid::tests` -- --ignored --nocapture
 
     use super::*;
 

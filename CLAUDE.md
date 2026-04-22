@@ -6,22 +6,7 @@
 
 ---
 
-## Table of Contents
-
-1. [Architectural Overview](#architectural-overview)
-2. [Mandatory Patterns](#mandatory-patterns)
-3. [Routing & Session Management](#routing--session-management)
-4. [Performance Patterns](#performance-patterns)
-5. [Error Handling](#error-handling)
-6. [Testing & Benchmarking](#testing--benchmarking)
-7. [Code Style & Idioms](#code-style--idioms)
-8. [Anti-Patterns (Don't Do This)](#anti-patterns-dont-do-this)
-
----
-
 ## Architectural Overview
-
-### Core Components
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -43,30 +28,21 @@
            │    └─> Disk cache: foyer hybrid (psync I/O)
            │
            ├──> Buffer Management
-           │    ├─> BufferPool: zero-alloc I/O scratch buffers
-           │    └─> PooledBuffer: single-read scratch (not accumulator)
+           │    ├─> PooledBuffer [acquire()]: single-read I/O scratch (724KB, pre-faulted)
+           │    └─> PooledBuffer [acquire_capture()]: accumulator for caching (768KB, pre-faulted)
            │
-           └──> Pipeline Engine (feature/tcp-command-pipelining)
+           └──> Pipeline Engine
                 ├─> BackendQueue: batched ARTICLE/BODY requests
                 └─> Batching: 4-16 commands per round-trip
 ```
 
 ### Routing Modes
 
-1. **Stateful** (1:1 client↔backend mapping)
-   - Full NNTP protocol support
-   - Dedicated backend connection per client
-   - Used for: GROUP, XOVER, article-by-number commands
+1. **Stateful** (1:1 client↔backend mapping) — GROUP, XOVER, article-by-number commands
+2. **PerCommand** (stateless, shared pool) — message-ID based operations only
+3. **Hybrid** (default) — starts PerCommand, auto-switches to Stateful on GROUP/XOVER/etc.
 
-2. **PerCommand** (pure stateless routing)
-   - Each command routes to any available backend
-   - Only supports message-ID based operations
-   - Most resource-efficient (shared pool)
-
-3. **Hybrid** (default, intelligent auto-switching)
-   - Starts in PerCommand mode
-   - Auto-switches to Stateful when client issues GROUP/XOVER/etc.
-   - Best of both: efficiency + compatibility
+**Important:** `run_stateful_proxy_loop` takes generic `W: AsyncWrite + Unpin` — **MUST** call `.flush().await?` after auth responses and backend writes. `handle_per_command_routing` uses concrete `WriteHalf<'_>` — changing to generic cascades through many signatures.
 
 ---
 
@@ -74,76 +50,120 @@
 
 ### 1. Terminator Detection
 
-**✅ ALWAYS use `TailBuffer::detect_terminator()`** for NNTP multiline terminator detection (`\r\n.\r\n`).
+**`TailBuffer` is the ONE AND ONLY place terminator detection can exist in this codebase. There must never be any other implementation anywhere.**
 
-**❌ NEVER write:**
+An NNTP multiline response ends with `\r\n.\r\n` (5 bytes). Detecting this correctly across async chunk reads is subtle and easy to get wrong. Getting it wrong causes **connection pool collapse**.
+
+#### Forbidden Patterns — Never Write These
+
 ```rust
-// BAD: Misses mid-chunk terminators
-fn has_terminator(data: &[u8]) -> bool {
-    data.ends_with(b"\r\n.\r\n")
+// ❌ ends_with check on accumulated buffer
+if data.ends_with(b"\r\n.\r\n") { ... }
+if data.ends_with(b".\r\n") { ... }
+
+// ❌ Any helper wrapping ends_with
+fn has_terminator(data: &[u8]) -> bool { data.ends_with(b"\r\n.\r\n") }
+
+// ❌ Constant replicated outside tail_buffer.rs
+const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n";
+
+// ❌ Accumulate-then-check loop (the worst pattern)
+let mut accumulated = Vec::new();
+loop {
+    accumulated.extend_from_slice(&buf[..n]);
+    if accumulated.ends_with(b"\r\n.\r\n") { break; } // WRONG
 }
 ```
 
-**✅ DO write:**
+#### Correct: Streaming (most common case)
+
 ```rust
 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 
 let mut tail = TailBuffer::default();
-let status = tail.detect_terminator(chunk);
-match status {
-    TerminatorStatus::FoundAt(pos) => {
-        let write_len = pos + 5; // Include terminator
-        result.extend_from_slice(&chunk[..write_len]);
-        // chunk[write_len..] is leftover for next response
+loop {
+    let n = stream.read(buffer.as_mut_slice()).await?;
+    if n == 0 { break; }
+    let chunk = &buffer[..n];
+
+    match tail.detect_terminator(chunk) {
+        TerminatorStatus::FoundAt(pos) => {
+            // CRITICAL: pos is the byte offset immediately AFTER "\r\n.\r\n"
+            // chunk[..pos] includes the terminator and no bytes from the next response
+            client.write_all(&chunk[..pos]).await?;
+            break;
+        }
+        TerminatorStatus::NotFound => {
+            client.write_all(chunk).await?;
+            tail.update(chunk);
+        }
     }
-    _ => { /* continue reading */ }
 }
 ```
 
-**Why:**
-- `ends_with()` only checks the **end** of a buffer — misses terminators in the **middle** (pipelined responses)
-- `TailBuffer` handles: mid-chunk terminators, cross-boundary spanning, SIMD-accelerated scanning
-- **Location:** `src/session/streaming/tail_buffer.rs` (30+ tests, production-proven)
+#### Correct: Complete-buffer validation
 
-**Pattern usage:**
-- Streaming responses: `stream_multiline_response_impl`
-- Pipeline worker: `read_full_response` (after commit 1)
-- Cache validation: check if cached data is complete
+```rust
+// TailBuffer with no prior state, checking a fully-accumulated buffer
+TailBuffer::default().detect_terminator(&buffer).is_found()
+```
+
+#### Why `ends_with()` Causes Connection Pool Collapse
+
+This caused a production bug (20 connections removed in rapid succession, pool exhausted):
+
+1. Backend sends article body + start of next pipelined response in the same TCP segment
+2. `read()` returns `[...article data...\r\n.\r\n200 Article follows\r\n...]`
+3. `ends_with(b"\r\n.\r\n")` returns **false** — buffer ends with `...200 Article follows\r\n...`
+4. Loop continues, consuming the `220 0 <next-msg-id>\r\n` for the next pipelined command
+5. Next handler reads garbage → `Invalid` → `remove_with_cooldown()` → cascade to zero
+
+`TailBuffer::detect_terminator()` returns `FoundAt(pos)` at the correct boundary — pipelined bytes are never consumed from the wrong context.
+
+**Location:** `src/session/streaming/tail_buffer.rs` (30+ tests, production-proven)
 
 ---
 
 ### 2. I/O Buffer Management
 
-**✅ ALWAYS use `BufferPool::acquire()`** for read scratch buffers in hot paths.
+`BufferPool` has **two distinct modes**. Using the wrong one causes silent reallocation and/or corrupted data.
 
-**❌ NEVER write:**
+#### Mode 1: Scratch buffers — `acquire()`
+
+Pre-allocated fixed-size `Vec<u8>` with `len == capacity` (724KB, page-faulted). For single read operations.
+
 ```rust
-// BAD: Allocates per request
-let mut scratch = vec![0u8; 8192];
-stream.read(&mut scratch).await?;
-```
-
-**✅ DO write:**
-```rust
-use crate::pool::buffer::BufferPool;
-
-let buffer_pool = BufferPool::default(); // or get from context
+// ✅ ALWAYS use for socket reads:
 let mut buffer = buffer_pool.acquire().await;
 let n = buffer.read_from(stream).await?;
-let chunk = &buffer[..n];
-// buffer automatically returned to pool on drop
+let chunk = &buffer[..n]; // Only initialized portion
+
+// ❌ NEVER extend_from_slice — buffer is len=724KB already; extend grows beyond capacity,
+// causes realloc, and breaks the pool debug_assert on return
+buf.extend_from_slice(data); // WRONG
+
+// ❌ NEVER allocate scratch in hot paths:
+let mut scratch = vec![0u8; 8192]; // WRONG: 1 allocation per request
 ```
 
-**Why:**
-- Eliminates per-request allocations (hot path optimization)
-- Pool reuses 8KB buffers across requests
-- **PooledBuffer is a single-read scratch buffer** — not an accumulator
-- Use `read_from()` per chunk, don't try to accumulate multiple reads in one buffer
+#### Mode 2: Capture buffers — `acquire_capture()`
 
-**Pattern usage:**
-- Streaming: `stream_multiline_response_impl`
-- Pipeline: `read_full_response`
-- Any socket read in hot path
+Pre-faulted empty `Vec<u8>` with `len == 0, capacity == 768KB`. For accumulating full streaming responses (caching path only).
+
+```rust
+// ✅ ONLY use under CacheAction::CaptureArticle:
+let mut captured = self.buffer_pool.acquire_capture().await;
+streaming::stream_and_capture_multiline_response(backend, client, first_chunk, ..., &mut captured).await?;
+self.maybe_cache_upsert(msg_id, &captured, backend_id);
+
+// ❌ NEVER use acquire_capture() for single reads:
+let n = buf.read_from(stream).await?; // WRONG MODE
+```
+
+| Need | Method | Buffer state | `extend_from_slice`? |
+|---|---|---|---|
+| Socket read | `acquire()` | len=724KB | ❌ Never |
+| Cache accumulate | `acquire_capture()` | len=0, cap=768KB | ✅ Correct |
 
 **Location:** `src/pool/buffer.rs`
 
@@ -151,88 +171,65 @@ let chunk = &buffer[..n];
 
 ### 3. Error Classification
 
-**✅ ALWAYS use centralized error kind constants** from `connection_error.rs`.
+**✅ ALWAYS use `SessionError` in handler code** — client disconnects are encoded as an enum variant, not detected via downcast.
 
-**❌ NEVER inline:**
 ```rust
-// BAD: Will diverge across the codebase
-use std::io::ErrorKind;
+// ❌ NEVER inline — will diverge across call sites:
 match e.kind() {
     ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => true,
     _ => false,
 }
-```
 
-**✅ DO write:**
-```rust
-use crate::connection_error::{is_disconnect_kind, is_connection_error_kind};
-
-// For raw io::Error
+// ✅ For raw io::Error:
+use crate::connection_error::is_disconnect_kind;
 if is_disconnect_kind(e.kind()) { /* client gone */ }
 
-// For wrapped anyhow::Error (common in handlers)
-use crate::is_client_disconnect_error; // Re-exported from proxy/mod.rs
-if is_client_disconnect_error(&e) { /* client disconnected */ }
+// ✅ In handler functions (return type is Result<_, SessionError>):
+match result {
+    Ok(v) => { /* success */ }
+    Err(SessionError::ClientDisconnect(_)) => { /* normal, don't log */ }
+    Err(SessionError::Backend(e)) => { warn!("{e}"); }
+}
+
+// ✅ For match guards:
+Err(e @ SessionError::ClientDisconnect(_)) => return Err(e),
+
+// ✅ For io::Error inside From<anyhow::Error> impls only:
+use crate::connection_error::is_disconnect_kind;
+if is_disconnect_kind(e.kind()) { /* classify */ }
 ```
 
-**Canonical definitions** (`src/connection_error.rs`):
-```rust
-/// Errors indicating client disconnected (don't log as backend failures)
-pub const DISCONNECT_KINDS: &[ErrorKind] = &[
-    ErrorKind::BrokenPipe,
-    ErrorKind::ConnectionReset,
-];
+**`SessionError`** (`src/session/session_error.rs`): The typed error threaded through the entire handler stack.
+- `ClientDisconnect(io::Error)` — client closed connection; **don't log, don't retry**
+- `Backend(anyhow::Error)` — all other errors; **log, maybe retry**
+- `From<anyhow::Error>`: classifies by downcasting to `io::Error`/`ConnectionError`
+- `From<StreamingError>`: preserves the disconnect signal directly
 
-/// Errors indicating connection is broken (don't return to pool)
-pub const CONNECTION_ERROR_KINDS: &[ErrorKind] = &[
-    ErrorKind::BrokenPipe,
-    ErrorKind::ConnectionReset,
-    ErrorKind::ConnectionAborted,
-    ErrorKind::UnexpectedEof,
-];
-```
+**`StreamingError`** (`src/session/streaming/mod.rs`): Typed return from streaming functions.
+- `ClientDisconnect(io::Error)` — backend cleanly drained; **release connection to pool**
+- `BackendDirty(anyhow::Error)` — drain failed; **ConnectionGuard removes from pool**
+- `BackendEof { .. }` — backend closed before terminator; **ConnectionGuard removes from pool**
+- `Io(anyhow::Error)` — other error; **ConnectionGuard removes from pool**
+- Use `e.must_remove_connection()` to decide pool fate in `command_execution.rs`
 
-**Why:**
-- Three separate inline checks diverged: one missing `ConnectionReset`, different sets used
-- Centralized constants = compile-time guarantee they stay in sync
-- Semantic clarity: `is_disconnect_kind()` vs raw match
-
-**Location:**
-- Constants: `src/connection_error.rs`
-- Re-export for handlers: `src/proxy/mod.rs`
+**Canonical disconnect kinds** (`src/connection_error.rs`):
+- `DISCONNECT_KINDS`: `[BrokenPipe, ConnectionReset]` — client gone, don't log as backend failure
+- `CONNECTION_ERROR_KINDS`: `[BrokenPipe, ConnectionReset, ConnectionAborted, UnexpectedEof]` — don't return to pool
 
 ---
 
 ### 4. Status Code Checks
 
-**✅ ALWAYS use pre-parsed `status_code` fields or `StatusCode::parse()`**.
+**✅ ALWAYS use pre-parsed `status_code` fields or `StatusCode::parse()`.**
 
-**❌ NEVER write:**
 ```rust
-// BAD: Fragile byte-prefix checks
-if response.data.starts_with(b"430") { /* no such article */ }
+// ❌ NEVER — fragile, false-positives on "4300", "430 text", etc.:
+if response.data.starts_with(b"430") { ... }
+
+// ✅ Use typed status codes:
+if response.status_code == 430 { ... }
+if cmd_response.response.is_430() { ... }
 ```
-
-**✅ DO write:**
-```rust
-// Use typed status codes
-if response.status_code == 430 { /* no such article */ }
-
-// Or parse from raw response
-use crate::protocol::responses::StatusCode;
-let status = StatusCode::parse(response_bytes)?;
-if status.code() == 430 { /* ... */ }
-```
-
-**Why:**
-- `starts_with(b"430")` false-positives on `4300`, `430 ignored text`, etc.
-- Pre-parsed fields (added in pipeline refactoring) eliminate fragility
-- Typos like `b"430"` vs `b"430 "` become impossible
-
-**Pattern usage:**
-- Pipeline responses carry `status_code: u16` field
-- Cache key classification
-- Metrics recording (which code to count)
 
 ---
 
@@ -240,232 +237,72 @@ if status.code() == 430 { /* ... */ }
 
 **✅ ALWAYS use classifier helpers** from `src/command/classifier.rs`.
 
-**❌ NEVER inline:**
 ```rust
-// BAD: Duplicated memchr + matches_any pattern
-use memchr::memchr;
+// ❌ NEVER inline — the memchr + matches_any pattern was duplicated 4 times:
 let end = memchr(b' ', cmd).unwrap_or(cmd.len());
-if end >= 4 && matches_any(&cmd[..end], ARTICLE_CASES) { /* ... */ }
+if end >= 4 && matches_any(&cmd[..end], ARTICLE_CASES) { ... }
+
+// ✅ Use the helpers (all #[inline(always)]):
+use crate::command::classifier::{is_large_transfer_command, is_stat_command, is_head_command};
+if is_large_transfer_command(cmd) { /* ARTICLE/BODY — route to batch pipeline */ }
 ```
-
-**✅ DO write:**
-```rust
-use crate::command::classifier::{
-    is_large_transfer_command,
-    is_stat_command,
-    is_head_command,
-};
-
-if is_large_transfer_command(cmd) {
-    // Route to pipeline queue for batching
-}
-```
-
-**Available helpers:**
-- `is_large_transfer_command()` — ARTICLE/BODY (multi-line responses)
-- `is_stat_command()` — STAT (single-line, no body)
-- `is_head_command()` — HEAD (headers only)
-
-**Why:**
-- The `memchr + matches_any` pattern was duplicated 4 times
-- When command detection logic changes, update once (not 4 places)
-- All helpers are `#[inline(always)]` — zero overhead
-
-**Location:** `src/command/classifier.rs`
 
 ---
 
 ### 6. Metrics Recording
 
-**✅ ALWAYS use `record_response_metrics()`** for the determine_metrics_action pattern.
-
-**❌ NEVER inline:**
-```rust
-// BAD: Duplicates the match block
-match self.determine_metrics_action(&command, &response) {
-    Some(MetricsAction::RecordHit) => { /* ... */ }
-    Some(MetricsAction::RecordMiss) => { /* ... */ }
-    None => {}
-}
-```
-
-**✅ DO write:**
-```rust
-self.record_response_metrics(&command, &response);
-```
-
-**Why:**
-- The metrics recording pattern appears identically in multiple handlers
-- When metrics logic changes (e.g., new status codes tracked), update once
-- Centralized in `command_execution.rs:378-406`
+**✅ ALWAYS use `record_response_metrics()`** for the `determine_metrics_action` pattern — never inline the match block. Centralized in `src/session/handlers/command_execution.rs`.
 
 ---
 
 ### 7. Protocol Constants
 
-**✅ ALWAYS use constants from `src/protocol/responses.rs`** for protocol literals.
+**Available in `src/protocol/responses.rs`:** `CRLF`, `TERMINATOR_TAIL_SIZE`
 
-**Available:**
-```rust
-pub const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n"; // 5 bytes
-pub const LINE_ENDING: &[u8] = b"\r\n";
-
-/// Check if data ends with NNTP multiline terminator
-#[inline]
-pub fn has_multiline_terminator(data: &[u8]) -> bool {
-    data.len() >= 5 && data.ends_with(MULTILINE_TERMINATOR)
-}
-```
-
-**Note:** The 3-byte `.\r\n` check (without leading `\r\n`) is for **line-based readers** only — different semantics from the 5-byte terminator used for **chunk-based detection**.
-
-**Why:**
-- Magic bytes scattered across codebase will diverge
-- Semantics documented at definition site
-- Easy to grep for usage
+**Do not add `MULTILINE_TERMINATOR` or `has_multiline_terminator()`** — these were deleted because they encouraged bypassing `TailBuffer`, causing pool collapse. Use `TailBuffer` (see Pattern #1).
 
 ---
 
-## Routing & Session Management
-
-### Stateful vs PerCommand Patterns
-
-**Stateful mode** (1:1 client→backend mapping):
-```rust
-// Takes generic W: AsyncWrite + Unpin
-pub async fn run_stateful_proxy_loop<W>(
-    client_writer: W,
-    backend: BackendConnection,
-    // ...
-) -> Result<ProxyLoopResult>
-```
-- **Can** wrap `client_writer` in `BufWriter` for batching
-- **MUST** call `.flush().await?` after auth responses and backend writes
-- Used for: GROUP, XOVER, article-by-number commands
-
-**PerCommand mode** (stateless, shared pool):
-```rust
-// Uses concrete WriteHalf<'_> (no generic)
-pub async fn handle_per_command_routing(
-    client_writer: &mut WriteHalf<'_>,
-    // ...
-)
-```
-- Changing to generic cascades through many signatures
-- Each command acquires connection from pool, releases after response
-
-**Hybrid mode detection:**
-- Starts in PerCommand
-- Commands like GROUP/XOVER trigger `SwitchToStateful` result
-- Main loop acquires dedicated backend and calls `run_stateful_proxy_loop`
-
----
-
-### Connection Pool Patterns
-
-**Backend reservation:**
-```rust
-let mut backend = self.pool.get_stateful_reservation().await?;
-// Connection locked to this session, not returned to pool
-```
-
-**One-shot command (PerCommand):**
-```rust
-let conn = self.pool.get().await?;
-let response = execute_command(&conn, cmd).await?;
-// Connection automatically returned to pool
-```
-
-**Prewarming:**
-- Pool pre-authenticates connections on startup (faster first request)
-- Configured via `prewarm_connections` in config
-
----
-
-## Performance Patterns
-
-### Hot Path Optimization
-
-**1. Double-buffering with `tokio::join!`**
-```rust
-// Overlap read-from-backend + write-to-client
-tokio::select! {
-    read_result = backend.read(&mut buffer) => { /* ... */ }
-    write_result = client.write_all(&prev_chunk) => { /* ... */ }
-}
-```
-- Reduces syscall latency (sendto/recvfrom overlap)
-- Used in `stream_multiline_response_impl`
-
-**2. SIMD-accelerated scanning**
-- `TailBuffer` uses `memchr` crate (SIMD on x86-64)
-- Faster than byte-by-byte scan for terminator detection
-
-**3. Zero-copy streaming**
-- Stream backend→client without full buffering in proxy memory
-- Only accumulate when caching (separate code path)
-
-**4. Inline hints**
-- Aggressive `#[inline(always)]` on hot path functions
-- **Note:** No benchmark data comparing with/without hints (potential cargo-cult optimization)
-- Used extensively (378 attributes across 54 files)
-
----
-
-### Memory Allocation
-
-**Avoid allocations in hot paths:**
-- ✅ Use `BufferPool` for I/O scratch
-- ✅ Reuse `Vec` with `clear()` instead of allocating new
-- ✅ Pre-allocate with capacity hints when size known
-
-**When to allocate:**
-- Cache entries (long-lived, one-time cost)
-- Error paths (rare, acceptable overhead)
-- Initial setup (connection handshake, auth)
-
----
-
-### Caching Strategy
+## Caching
 
 **Two-tier cache:**
-1. **Memory cache** (hot data):
-   - moka (LRU) or foyer-memory
-   - Configured via `memory_cache_capacity` (bytes or item count)
+- Memory: moka (LRU) or foyer-memory, configured via `memory_cache_capacity`
+- Disk: foyer hybrid with **psync I/O engine** — ❌ **DO NOT use io_uring** (53% idle CPU bug from tight `try_recv` loop)
 
-2. **Disk cache** (warm data):
-   - foyer hybrid cache with **psync I/O engine**
-   - ❌ **DO NOT use io_uring engine** — has busy-poll bug (53% idle CPU in tight try_recv loop)
-   - Configured via `disk_cache_path` + `disk_cache_capacity`
+**Cache key:** Message-ID; STAT/HEAD/ARTICLE/BODY variants cached separately.
 
-**Cache key:**
-- Message-ID (article content)
-- STAT/HEAD/ARTICLE/BODY variants cached separately (same message-ID, different response)
-
-**Cache invalidation:**
-- TTL-based (configurable per cache)
-- No active invalidation (Usenet articles immutable once posted)
+**foyer disk cache tests** hang in the test harness — mark `#[ignore]`, test manually.
 
 ---
 
-### Thread Configuration
+## Metrics Persistence
 
-**ThreadCount pattern:**
-```rust
-use crate::config::ThreadCount;
+**Why:** TUI dashboard metrics reset on proxy restart. `MetricsStore` persists cumulative counters to JSON (30-second interval + on shutdown), restored on startup.
 
-// Auto-detect CPU count (0 → runtime detection)
-let threads = ThreadCount::from_value(0); // Returns Some(N)
+**Architecture:**
+```
+MetricsCollector
+└── inner: Arc<MetricsInner>
+    ├── store: MetricsStore         ← persisted (save/load JSON)
+    │   ├── total_connections: AtomicU64
+    │   ├── backend_stores: Vec<BackendStore>
+    │   ├── pipeline_*: AtomicU64
+    │   └── user_metrics: DashMap<String, UserMetrics>
+    ├── active_connections: AtomicUsize  ← live gauge, NOT persisted
+    ├── stateful_sessions: AtomicUsize   ← live gauge, NOT persisted
+    └── start_time: Instant              ← NOT persisted
 
-// Explicit count
-let threads = ThreadCount::new(4); // Some(4)
-
-// Note: ThreadCount::new(0) → None (const limitation, can't detect at compile time)
+BackendMetrics
+├── (no store field — writes go directly to MetricsStore.backend_stores[idx])
+├── active_connections: AtomicUsize  ← live gauge
+└── health_status: BackendHealthStatus  ← live gauge
 ```
 
-**Why the split:**
-- `from_value(0)` calls `num_cpus::get()` at runtime
-- `new(0)` is const-compatible but can't do runtime detection
+**File format** (`stats.json`): versioned JSON with `"version": 1`. `MetricsStore::load()` handles migration. Add new fields in v2 with zero defaults.
+
+**Integration:** Both binaries call `load_metrics_from_disk()` at startup, `save_to_disk()` on interval and shutdown. Config: `stats_file` in `[proxy]` section (defaults to `stats.json` alongside config).
+
+**Tests:** `src/metrics/store.rs` — roundtrip, name-mapping, missing file, corruption, backend mismatch.
 
 ---
 
@@ -473,707 +310,162 @@ let threads = ThreadCount::new(4); // Some(4)
 
 ### Error Types
 
-**1. ConnectionError** (`src/connection_error.rs`):
-- Wraps I/O errors, TLS errors, protocol violations
-- Implements `is_client_disconnect()` using centralized kind checks
+- **`ConnectionError`** (`src/connection_error.rs`): wraps I/O/TLS errors, protocol violations
+- **`SessionError`** (`src/session/session_error.rs`): typed error for the entire handler stack; match on variants directly (see Pattern #3)
+- **`StreamingError`** (`src/session/streaming/mod.rs`): typed outcome of streaming operations; use `must_remove_connection()` to decide pool fate
+- **Protocol errors**: return NNTP error response to client, don't terminate unless fatal
 
-**2. anyhow::Error** (handlers):
-- Used for general error propagation in session handlers
-- Check with `is_client_disconnect_error()` (re-exported from `proxy/mod.rs`)
+### Connection Pool Discipline
 
-**3. Protocol errors** (RFC 3977 violations):
-- Return NNTP error responses to client (e.g., `502 Command not permitted`)
-- Don't terminate connection unless fatal
+On streaming error, the pool fate depends on whether the backend was cleanly drained:
+- `SessionError::ClientDisconnect` → `conn.release()` (backend clean, return to pool)
+- `SessionError::Backend` from streaming → `ConnectionGuard` drops automatically, calling `remove_with_cooldown`
 
----
-
-### Error Classification Strategy
-
-**Client disconnects** (don't log as backend failures):
-- `BrokenPipe`, `ConnectionReset`
-- Expected during normal operation (client closes connection)
-
-**Connection errors** (don't return to pool):
-- `BrokenPipe`, `ConnectionReset`, `ConnectionAborted`, `UnexpectedEof`
-- Mark backend connection as unusable
-
-**Backend failures** (log, attempt failover):
-- TLS handshake failures
-- Authentication failures
-- Unexpected protocol responses
-
----
+`ConnectionGuard` RAII handles removal on all error paths — explicitly call `guard.release()` only on success.
+Always add a comment at each `remove_with_cooldown` call site (inside `ConnectionGuard::drop`) explaining why.
 
 ### Panic Safety
 
-**Unsafe code locations:**
-- `src/pool/buffer.rs` — buffer pool uses `MaybeUninit` for performance
-- Carefully audited, no other unsafe blocks
-
-**UTF-8 handling:**
-- ❌ **NEVER slice strings at byte offsets** without checking boundaries
-- ✅ **Use `chars().take(N).collect()`** for character-based truncation (see `format_username` in TUI)
+- `src/pool/buffer.rs` uses `MaybeUninit` — no other unsafe blocks
+- **Never slice strings at byte offsets**: use `chars().take(N).collect()` for truncation
 
 ---
 
-## Testing & Benchmarking
+## Testing
 
-### Test Organization
+### Key Patterns
 
-**By feature:**
-```
-tests/
-├── auth/                   # AUTHINFO tests
-├── cache/                  # Cache hit/miss scenarios
-├── proxy/
-│   ├── routing/            # Routing mode tests
-│   └── pipeline/           # TCP pipelining tests
-└── test_helpers.rs         # Shared utilities
-```
-
-**Test count:** ~2057 tests (run with `cargo nextest run`)
-
-**Shared helpers:**
-- Use `tests/test_helpers.rs` for common setup
-- ❌ **NEVER duplicate helper functions** per test file
-
----
-
-### Test Patterns
-
-**1. Use `Server::builder()` in tests**
-
-**❌ BAD:**
+**Use `Server::builder()` — never hardcode struct literals:**
 ```rust
-// 17-field manual construction, hardcodes wrong defaults
-let server = Server {
-    port: 8119,
-    host: "127.0.0.1".to_string(),
-    pipeline_batch_size: 16, // Wrong: production default is 4
-    // ... 14 more fields ...
-};
+// ❌ BAD: hardcodes defaults, breaks on new fields
+let server = Server { port: 8119, pipeline_batch_size: 16, /* ... 15 more */ };
+
+// ✅ GOOD: tracks production defaults automatically
+let server = Server::builder().port(8119).build();
 ```
 
-**✅ GOOD:**
+**Use `..Default::default()` for large structs:**
 ```rust
-let server = Server::builder()
-    .port(8119)
-    .host("127.0.0.1")
-    .build();
-// Automatically gets correct production defaults
+let snapshot = MetricsSnapshot { cache_hits: 10, ..Default::default() };
 ```
 
-**Why:**
-- Tests track production defaults automatically
-- When new fields added, tests get correct defaults (not struct literal compile errors)
+**BufWriter + auth tests:** When wrapping writers in `BufWriter`, **MUST** call `.flush().await?` after auth responses AND backend→client writes, or integration tests timeout.
 
-**2. Use `..Default::default()` for large structs**
+**Shared test helpers:** Use `tests/test_helpers.rs` — never duplicate helper functions per test file.
 
-**❌ BAD:**
+### Benchmarks
+
+**Never define local reimplementations — always import production functions:**
 ```rust
-// Hardcodes all zero/empty values
-let snapshot = MetricsSnapshot {
-    cache_hits: 0,
-    cache_misses: 0,
-    // ... 20 more zero fields ...
-};
-```
+// ❌ BAD: benchmark measures wrong code
+fn find_terminator_new(data: &[u8]) -> Option<usize> { ... }
 
-**✅ GOOD:**
-```rust
-let snapshot = MetricsSnapshot {
-    cache_hits: 10,
-    ..Default::default()
-};
-```
-
----
-
-### Benchmarking Rules
-
-**❌ NEVER define local reimplementations in benchmarks:**
-```rust
-// BAD: Benchmark measures wrong code, can diverge
-fn find_terminator_new(data: &[u8]) -> Option<usize> {
-    // Local copy of production logic
-}
-```
-
-**✅ ALWAYS import production functions:**
-```rust
+// ✅ GOOD:
 use nntp_proxy::session::streaming::tail_buffer::find_terminator_end;
-
-#[divan::bench]
-fn bench_terminator_detection() {
-    divan::black_box(find_terminator_end(data));
-}
 ```
 
-**Why:**
-- Benchmark must measure **actual production code**
-- Local copies diverge (benchmark passes, production has bug)
+**Performance testing:** Run `cargo bench` before and after performance-sensitive changes; accept no regressions.
 
-**Baseline comparators:**
-- If benchmarking old vs new implementation, name explicitly: `find_terminator_old` vs `find_terminator_new`
-- Keep old implementation as historical reference, not as production code
+**Profiling scripts:** `scripts/parse_perfdata` (hotspot analysis) and `scripts/parse_flamegraph` (SVG flamegraph). Usage: `perf script 2>/dev/null | ./scripts/parse_perfdata`.
 
 ---
 
-### Performance Testing
+## Code Style
 
-**Before performance-sensitive changes:**
-1. Run `cargo bench` and save baseline
-2. Make changes
-3. Run `cargo bench` again and compare
-
-**Relevant benchmarks:**
-- `cargo bench --bench command_parsing` — command classification
-- `cargo bench --bench response_parsing` — terminator detection
-- `cargo bench --bench router_selection` — routing logic
-
-**Acceptance criteria:** Identical or faster (no regressions).
-
----
-
-### Profiling Analysis
-
-**Custom profiling scripts** in `scripts/` directory provide structured analysis of `perf.data`:
-
-#### parse_perfdata
-
-Analyzes `perf script` output to show hotspots, thread distribution, and timeline analysis.
-
-**Usage:**
-```bash
-# Generate perf.data first
-perf record -g ./target/release/nntp-proxy-tui
-
-# Analyze with parse_perfdata
-perf script 2>/dev/null | ./scripts/parse_perfdata
-```
-
-**Output sections:**
-- **Thread Breakdown**: Shows CPU distribution across threads (tokio workers, foyer-disk-io, etc.)
-- **Top Functions (self time)**: Functions consuming most CPU (excludes child functions)
-- **Top Functions Per Thread**: Per-thread hotspot analysis
-- **Caller → Callee Edges**: Call graph showing where time flows
-- **Timeline**: Sample distribution over time (cold vs hot phase)
-- **Category Summary**: Time grouped by category (Network I/O, TLS/Crypto, Cache, etc.)
-
-**Key insights:**
-- **Self time** shows actual work in function (not including callees)
-- **Timeline** shows if performance degrades over time (hot phase worse = overhead)
-- **Category summary** identifies system-level bottlenecks
-
-**Example output interpretation:**
-```
-Top Functions (self time):
-  8.07%  __memmove_avx_unaligned_erms  ← Memory copy hotspot
-  4.80%  aes_gcm_dec_update            ← TLS decryption
-  2.24%  Checksummer::checksum64       ← Cache overhead
-```
-
-Timeline showing hot phase worse:
-```
-First half:  7.44% memmove  (cold/startup)
-Second half: 8.88% memmove  (hot/cached) ← Cache adds overhead!
-```
-
-#### parse_flamegraph
-
-Generates SVG flamegraph from `perf script` output.
-
-**Usage:**
-```bash
-# Generate flamegraph
-perf script 2>/dev/null | ./scripts/parse_flamegraph > flamegraph.svg
-
-# View in browser
-firefox flamegraph.svg
-```
-
-**Flamegraph interpretation:**
-- **Width**: Time spent in function (wider = more CPU)
-- **Height**: Stack depth (nesting level)
-- **Click function**: Zoom to subtree
-- **Search (Ctrl+F)**: Highlight specific functions
-
-**Tips:**
-- Look for wide blocks at any height (not just top)
-- Repetitive patterns indicate functions called many times
-- Compare flamegraphs before/after changes
-
-#### Profiling Workflow
-
-**1. Baseline profile:**
-```bash
-# Start proxy
-./target/release/nntp-proxy-tui &
-
-# Run workload (e.g., sabnzbd download)
-# ...
-
-# Capture profile
-perf record -g -p $(pgrep nntp-proxy-tui)
-# Let run for 30-60 seconds, then Ctrl+C
-
-# Analyze
-perf script 2>/dev/null | ./scripts/parse_perfdata > baseline.txt
-```
-
-**2. After optimization:**
-```bash
-# Repeat profiling with same workload
-perf script 2>/dev/null | ./scripts/parse_perfdata > optimized.txt
-
-# Compare
-diff baseline.txt optimized.txt
-```
-
-**3. Identify next target:**
-- Look for functions with high self time (>2%)
-- Check timeline for degradation (hot phase worse than cold)
-- Category summary shows system-level bottlenecks
-- Caller→Callee edges show where time flows
-
-**Common optimization targets:**
-- High memmove % → Look for unnecessary allocations or copies
-- Cache category high → Cache overhead may exceed benefit
-- Locks/Futex high → Contention, consider lock-free structures
-- TLS/Crypto high → Expected, but verify hardware acceleration enabled
-
----
-
-### Special Test Cases
-
-**Cache tests with foyer HybridCache:**
+**Enums over booleans for state** — compiler enforces exhaustive matching, self-documenting:
 ```rust
-#[ignore] // Hangs in test context
-#[tokio::test]
-async fn test_hybrid_cache() { /* ... */ }
-```
-- foyer disk cache doesn't work in test harness (tempfile cleanup issues)
-- Mark as `#[ignore]`, test manually in integration environment
-
-**Auth tests with BufWriter:**
-- When wrapping writers in `BufWriter`, **MUST** call `.flush().await?` after:
-  - Auth responses (AUTHINFO responses)
-  - Backend→client writes
-- Without flush, responses buffered and tests timeout waiting
-
----
-
-## Code Style & Idioms
-
-### Rust Idioms
-
-**1. Enums over booleans for state**
-
-**❌ BAD:**
-```rust
-let batch_handled = false;
-// ... later ...
-if !batch_handled {
-    // Process single command
-}
+// ❌ BAD: bool flags
+// ✅ GOOD:
+enum SingleCommandResult { Continue { auth_succeeded: bool }, Quit(u64), SwitchToStateful }
 ```
 
-**✅ GOOD:**
-```rust
-enum SingleCommandResult {
-    Continue { auth_succeeded: bool },
-    Quit(u64),
-    SwitchToStateful,
-}
+**Extract methods for repeated 5+ line blocks** — when you see the same logic twice, extract it.
 
-match result {
-    SingleCommandResult::Continue { auth_succeeded } => { /* ... */ }
-    SingleCommandResult::Quit(bytes) => return Ok(bytes),
-    SingleCommandResult::SwitchToStateful => { /* ... */ }
-}
-```
+**Context structs over many arguments** — use a struct to group related parameters instead of `#[allow(clippy::too_many_arguments)]`.
 
-**Why:**
-- Compiler enforces exhaustive matching
-- Self-documenting (what does `false` mean? vs explicit enum variant)
+**Remove unused parameters** — don't use `_param` prefix; just remove them. Compiler enforces no future accidental use.
 
----
-
-**2. Prefer `while let` over indexed loops**
-
-**❌ BAD:**
-```rust
-for i in 0..batch_len {
-    let req = batch_iter.next().unwrap();
-    // Manual index tracking + iterator — redundant
-}
-```
-
-**✅ GOOD:**
-```rust
-let mut batch_iter = batch.into_iter().enumerate();
-while let Some((i, req)) = batch_iter.next() {
-    // Iterator drives the loop naturally
-}
-```
-
----
-
-**3. Extract method for repeated patterns**
-
-**When you see the same 5+ line block twice, extract a method:**
-```rust
-// Pattern appears at lines 137-143 and 331-337
-fn record_article_missing(&self, msg_id: &str, backend_id: BackendId, router: &Router) {
-    if let Some(avail) = router.load_availability() {
-        avail.record_missing_article(msg_id, backend_id);
-        router.sync_availability(&avail);
-    }
-}
-```
-
----
-
-### Function Signatures
-
-**1. Avoid `clippy::too_many_arguments` with context structs**
-
-**❌ BAD:**
-```rust
-#[allow(clippy::too_many_arguments)]
-fn stream_impl<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    buffer_pool: &BufferPool,
-    cache: &Cache,
-    metrics: &Metrics,
-    msg_id: &str,
-    backend_id: BackendId,
-    capture: bool,
-) -> Result<()>
-```
-
-**✅ GOOD:**
-```rust
-struct StreamContext<'a, R, W> {
-    reader: &'a mut R,
-    writer: &'a mut W,
-    buffer_pool: &'a BufferPool,
-    cache: &'a Cache,
-    metrics: &'a Metrics,
-    msg_id: &'a str,
-    backend_id: BackendId,
-}
-
-fn stream_impl<R, W>(ctx: StreamContext<'_, R, W>, capture: bool) -> Result<()>
-```
-
-**Why:**
-- Groups related parameters
-- Easier to add new fields (append to struct, not function signature)
-- Zero-cost (inlined, passed by reference)
-
----
-
-**2. Remove unused parameters (compiler-checked dead code)**
-
-**❌ BAD:**
-```rust
-fn execute_command(
-    _client_reader: &ClientReader, // Destructured as unused
-    client_writer: &mut ClientWriter,
-) {
-    // Never uses client_reader
-}
-```
-
-**✅ GOOD:**
-```rust
-fn execute_command(
-    client_writer: &mut ClientWriter,
-) {
-    // Removed unused parameter
-}
-```
-
-**Why:**
-- Compile error if code later tries to use the removed parameter → safe refactoring
-- Documents actual dependencies
-
----
-
-### Documentation
-
-**Doc comments on public items:**
-- Explain **why**, not **what** (code shows what)
-- Link to RFCs when implementing protocol features
-- Example usage for non-obvious APIs
-
-**Inline comments:**
-- Only where logic isn't self-evident
-- Explain protocol quirks (e.g., "NNTP requires CRLF, LF alone is invalid")
-- Avoid stating the obvious (e.g., `// Increment counter` before `count += 1`)
+**Doc comments:** explain *why*, not *what*. Link to RFCs for protocol features. Inline comments only where logic isn't self-evident.
 
 ---
 
 ## Anti-Patterns (Don't Do This)
 
-### ❌ 1. Reimplementing Terminator Detection
+### ❌ 1. Any Terminator Detection Outside TailBuffer
 
-**Never write your own `has_terminator()` or `find_terminator()`:**
-- Use `TailBuffer::detect_terminator()` (SIMD-optimized, 30+ tests)
-- Handles all edge cases (mid-chunk, spanning boundaries)
+Any occurrence of the following anywhere outside `tail_buffer.rs` is a bug:
+- `ends_with(b"\r\n.\r\n")` or `ends_with(b".\r\n")`
+- `MULTILINE_TERMINATOR` or `TERMINATOR` constants
+- `has_multiline_terminator()` or similar helper functions
+- Any manual byte loop scanning for `'.'` or `'\r'` to find the terminator
+- Accumulate-into-Vec + ends_with loop pattern
 
-**Location of duplicates found during refactoring:**
-- `pipeline_worker.rs:has_terminator()` — deleted
-- `fullduplex_worker.rs` (untracked, didn't compile) — deleted
-- `benches/response_parsing.rs:find_terminator_new()` — replaced with import
+This caused real connection pool collapse in production. See Pattern #1 for the full explanation.
 
----
+### ❌ 2. Inline Error Kind Checks or Helper Predicate Methods
 
-### ❌ 2. Inline Error Kind Checks
-
-**Never match on `ErrorKind` directly:**
 ```rust
-// BAD: Will diverge across 10+ call sites
-match e.kind() {
-    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => { /* disconnect */ }
-    _ => { /* other error */ }
-}
-```
+// BAD: inline io::ErrorKind check
+match e.kind() { ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => ... }
 
-**Use centralized helpers:**
-```rust
+// BAD: predicate helper method that duplicates enum variant info
+if session_err.is_client_disconnect() { ... }   // removed — use pattern matching
+if conn_err.is_client_disconnect() { ... }       // removed — use pattern matching
+
+// GOOD: direct enum pattern matching in handler code
+if let SessionError::ClientDisconnect(_) = &e { ... }
+Err(e @ SessionError::ClientDisconnect(_)) => return Err(e),
+
+// GOOD: is_disconnect_kind only inside From<anyhow::Error> impls
 use crate::connection_error::is_disconnect_kind;
-if is_disconnect_kind(e.kind()) { /* ... */ }
+if is_disconnect_kind(e.kind()) { /* inside SessionError::from() only */ }
 ```
-
----
 
 ### ❌ 3. Raw Byte Status Code Checks
 
-**Never check status codes with `starts_with()`:**
 ```rust
-if response.starts_with(b"430") { /* fragile */ }
+if response.starts_with(b"430") { ... }  // BAD: fragile
+if response.status_code == 430 { ... }   // GOOD: type-safe
 ```
 
-**Use parsed status codes:**
+### ❌ 4. Wrong Buffer Pool Usage
+
 ```rust
-if response.status_code == 430 { /* type-safe */ }
+let mut buf = buffer_pool.acquire().await;
+buf.extend_from_slice(data);              // BAD: wrong mode, causes realloc
+let mut buf = vec![0u8; 8192];           // BAD: allocates per request
+
+let mut buf = buffer_pool.acquire_capture().await;
+let n = buf.read_from(stream).await?;    // BAD: wrong mode for I/O scratch
 ```
-
----
-
-### ❌ 4. Allocating I/O Scratch Buffers
-
-**Never allocate scratch buffers in hot paths:**
-```rust
-// BAD: 1 allocation per request
-let mut buf = vec![0u8; 8192];
-stream.read(&mut buf).await?;
-```
-
-**Use buffer pool:**
-```rust
-let mut buffer = buffer_pool.acquire().await;
-let n = buffer.read_from(stream).await?;
-```
-
----
 
 ### ❌ 5. Duplicating Metrics Recording
 
-**Never inline the `determine_metrics_action` match block:**
-- Use `record_response_metrics()` (single source of truth)
-
----
+Never inline the `determine_metrics_action` match block. Use `record_response_metrics()`.
 
 ### ❌ 6. Manual Struct Construction in Tests
 
-**Never hardcode 17-field Server structs:**
 ```rust
-// BAD: Hardcodes defaults, breaks on new fields
-let server = Server { port: 8119, /* ... 16 more fields */ };
+let server = Server { port: 8119, /* ... 16 more fields */ }; // BAD
+let server = Server::builder().port(8119).build();             // GOOD
 ```
 
-**Use builder pattern:**
+### ❌ 7. String Slicing at Byte Offsets
+
 ```rust
-let server = Server::builder().port(8119).build();
+let truncated = &username[..9];                         // BAD: panics on multi-byte chars
+let truncated: String = username.chars().take(9).collect(); // GOOD
 ```
-
----
-
-### ❌ 7. String Slicing Without UTF-8 Checks
-
-**Never slice strings at byte offsets:**
-```rust
-// BAD: Panics on multi-byte chars
-let truncated = &username[..9]; // Byte offset 9 might be mid-character
-```
-
-**Use character-based truncation:**
-```rust
-let truncated: String = username.chars().take(9).collect();
-```
-
----
 
 ### ❌ 8. Benchmarks With Local Code Copies
 
-**Never reimplement production functions in benchmarks:**
-- Import the actual function
-- Benchmark measures production code, not a copy
-
----
-
-## Configuration Patterns
-
-### CLI + Config File Pattern
-
-**Precedence:** CLI args > config file > defaults
-
-**ThreadCount example:**
-```rust
-let threads = args.threads
-    .or(config.threads)
-    .unwrap_or_else(|| ThreadCount::from_value(0).unwrap()); // Auto-detect
-```
-
----
-
-### Feature Flags
-
-**Routing mode:**
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoutingMode {
-    Stateful,      // --routing-mode stateful
-    PerCommand,    // --routing-mode per-command
-    Hybrid,        // Default
-}
-```
-
-**Cache backend:**
-```rust
-pub enum CacheBackend {
-    Memory,        // moka LRU
-    Disk,          // foyer hybrid (psync I/O)
-    Both,          // 2-tier (memory + disk)
-    None,          // Caching disabled
-}
-```
-
----
-
-## File Organization
-
-```
-src/
-├── bin/
-│   ├── nntp-proxy.rs          # Main proxy binary
-│   └── nntp-cache-proxy.rs    # Caching proxy binary
-├── cache/                      # Cache implementations (moka, foyer)
-├── command/                    # Command parsing + classification
-├── config/                     # TOML config + CLI args
-├── connection_error.rs         # Error types + classification
-├── health/                     # Backend health checking
-├── metrics/                    # Metrics recording + aggregation
-├── pool/                       # Connection pool (deadpool wrapper)
-│   ├── buffer.rs               # BufferPool (zero-alloc I/O)
-│   ├── connection_guard.rs     # Pooled connection wrapper
-│   └── prewarming.rs           # Pre-auth on startup
-├── protocol/                   # RFC 3977 protocol types
-│   ├── responses.rs            # Status codes + constants
-│   └── validation.rs           # Response validation
-├── proxy/                      # Main server loop + builder
-├── router/                     # Routing logic (3 modes)
-│   ├── backend_queue.rs        # Pipeline batching queue
-│   └── backend_selector.rs     # Round-robin + health-aware selection
-├── session/                    # Per-client session handling
-│   ├── handlers/               # Command handlers (stateful, per-command, pipeline)
-│   │   ├── article_retry.rs    # 430 retry logic
-│   │   ├── command_execution.rs # Command dispatch
-│   │   ├── per_command.rs      # PerCommand mode handler
-│   │   ├── pipeline_worker.rs  # TCP pipelining worker
-│   │   └── stateful.rs         # Stateful mode handler
-│   ├── streaming/              # Response streaming
-│   │   ├── tail_buffer.rs      # Terminator detection (SIMD)
-│   │   └── mod.rs              # stream_multiline_response_impl
-│   └── error_classification.rs # Error kind helpers
-└── tui/                        # Terminal UI (ratatui)
-
-tests/
-├── auth/                       # Authentication tests
-├── cache/                      # Cache behavior tests
-├── proxy/
-│   ├── routing/                # Routing mode tests
-│   └── pipeline/               # TCP pipelining tests
-└── test_helpers.rs             # Shared test utilities
-
-benches/
-├── command_parsing.rs          # Command classification benches
-├── response_parsing.rs         # Terminator detection benches
-└── router_selection.rs         # Routing logic benches
-```
-
----
-
-## Dependencies Worth Noting
-
-**Core runtime:**
-- `tokio` — async runtime (enables: `full`)
-- `tikv-jemallocator` — allocator (better than system malloc for this workload)
-
-**Protocol + I/O:**
-- `rustls` + `tokio-rustls` — TLS (no OpenSSL dependency)
-- `memchr` — SIMD-accelerated byte scanning (used in `TailBuffer`)
-
-**Caching:**
-- `moka` — async LRU memory cache
-- `foyer` v0.22 — hybrid (memory + disk) cache
-  - **Use psync I/O engine** (not io_uring, which has busy-poll bug)
-
-**Connection pooling:**
-- `deadpool` — async connection pool (wraps our backend connections)
-
-**Concurrency primitives:**
-- `crossbeam` — lock-free queue (used in `BackendQueue`)
-- `parking_lot` — faster RwLock/Mutex (used in availability tracking)
-
-**Metrics + observability:**
-- `tracing` + `tracing-subscriber` — structured logging
-- Custom `Metrics` type (lock-free counters)
-
-**TUI:**
-- `ratatui` + `crossterm` — terminal UI for monitoring
-
----
-
-## Performance Notes from Profiling
-
-**Hot path (62.7% CPU):**
-- `stream_multiline_response_impl` — main streaming loop
-
-**TLS overhead (30.64% CPU):**
-- Backend reads (rustls decryption)
-
-**Client writes (22.81% CPU):**
-- Tokio socket writes to client
-
-**Optimization techniques:**
-- Double-buffering with `tokio::join!` to overlap read/write syscalls
-- SIMD in terminator detection (memchr crate)
-- Zero-copy streaming (no full buffering in proxy)
-
-**Idle CPU bug (foyer io_uring):**
-- io_uring engine spins at 53% CPU when idle (tight `try_recv` loop)
-- **Solution:** Use psync I/O engine (default in foyer 0.22)
+Never reimplement production functions in benchmarks — import them directly.
 
 ---
 
 ## Summary Checklist
 
-Before submitting code, verify:
+Before submitting code:
 
 - [ ] No duplicate terminator detection (use `TailBuffer`)
 - [ ] No scratch buffer allocations (use `BufferPool`)
@@ -1183,30 +475,7 @@ Before submitting code, verify:
 - [ ] No duplicate metrics recording (use `record_response_metrics()`)
 - [ ] Tests use `Server::builder()` (not manual struct construction)
 - [ ] Benchmarks import production functions (no local copies)
-- [ ] `cargo nextest run` passes (~2057 tests)
+- [ ] `cargo nextest run` passes
 - [ ] `cargo clippy` clean
 - [ ] `cargo fmt --check` clean
-- [ ] For `[PERF]` changes: `cargo bench` shows no regression
-
----
-
-## Questions or Clarifications?
-
-**For architectural decisions not covered here:**
-1. Check existing code in the relevant module
-2. Look for similar patterns elsewhere in the codebase
-3. Prefer reusing existing abstractions over creating new ones
-
-**For protocol questions:**
-- Consult `docs/RFC3977_RESPONSE_CODES.md`
-- Check RFC 3977 specification
-
-**For performance questions:**
-- Profile with `cargo flamegraph` or `perf`
-- Benchmark before/after with `cargo bench`
-- Check `DEEP_DIVE_ANALYSIS.md` for past optimization notes
-
----
-
-**Document version:** 2026-02-08
-**Last updated:** Feature branch `feature/tcp-command-pipelining` refactoring
+- [ ] For performance changes: `cargo bench` shows no regression

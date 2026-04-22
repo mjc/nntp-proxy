@@ -1,6 +1,6 @@
 //! Integration tests for different routing modes
 //!
-//! Tests the three routing modes: Standard, PerCommand, and Hybrid
+//! Tests the three routing modes: Standard, `PerCommand`, and Hybrid
 //! These tests exercise the session handler code paths that have low coverage.
 
 use anyhow::Result;
@@ -67,7 +67,7 @@ async fn setup_proxy_with_mode(
 async fn test_stateful_mode_basic() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Stateful).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting
     let mut buffer = vec![0u8; 4096];
@@ -94,7 +94,7 @@ async fn test_stateful_mode_basic() -> Result<()> {
 async fn test_stateful_mode_group_command() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Stateful).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting
     let mut buffer = vec![0u8; 4096];
@@ -113,7 +113,7 @@ async fn test_stateful_mode_group_command() -> Result<()> {
 async fn test_per_command_mode_basic() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::PerCommand).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting
     let mut buffer = vec![0u8; 4096];
@@ -140,7 +140,7 @@ async fn test_per_command_mode_basic() -> Result<()> {
 async fn test_per_command_mode_multiple_commands() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::PerCommand).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting
     let mut buffer = vec![0u8; 4096];
@@ -166,7 +166,7 @@ async fn test_per_command_mode_multiple_commands() -> Result<()> {
 async fn test_hybrid_mode_starts_per_command() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Hybrid).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting
     let mut buffer = vec![0u8; 4096];
@@ -192,7 +192,7 @@ async fn test_hybrid_mode_starts_per_command() -> Result<()> {
 async fn test_hybrid_mode_switches_to_stateful() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Hybrid).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     // Read greeting
     let mut buffer = vec![0u8; 4096];
@@ -222,8 +222,8 @@ async fn test_multiple_clients_stateful() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Stateful).await?;
 
     // Connect multiple clients simultaneously
-    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
-    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer1 = vec![0u8; 4096];
     let mut buffer2 = vec![0u8; 4096];
@@ -253,8 +253,8 @@ async fn test_multiple_clients_per_command() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::PerCommand).await?;
 
     // Connect multiple clients simultaneously
-    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
-    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer1 = vec![0u8; 4096];
     let mut buffer2 = vec![0u8; 4096];
@@ -280,7 +280,7 @@ async fn test_multiple_clients_per_command() -> Result<()> {
 async fn test_quit_command_closes_connection() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Hybrid).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer = vec![0u8; 4096];
     let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
@@ -305,7 +305,7 @@ async fn test_quit_command_closes_connection() -> Result<()> {
 async fn test_sequential_commands_stateful() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Stateful).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer = vec![0u8; 4096];
     let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
@@ -326,7 +326,7 @@ async fn test_sequential_commands_stateful() -> Result<()> {
 async fn test_connection_error_handling() -> Result<()> {
     let (proxy_port, _, _mock) = setup_proxy_with_mode(RoutingMode::Hybrid).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
     let mut buffer = vec![0u8; 4096];
     let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
@@ -342,7 +342,7 @@ async fn test_connection_error_handling() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Should be able to connect a new client
-    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let n = timeout(Duration::from_secs(1), client2.read(&mut buffer)).await??;
     assert!(n > 0);
 

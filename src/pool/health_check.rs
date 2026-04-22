@@ -55,7 +55,7 @@ pub enum HealthCheckError {
 
 impl From<HealthCheckError> for managed::RecycleError<crate::connection_error::ConnectionError> {
     fn from(err: HealthCheckError) -> Self {
-        managed::RecycleError::Message(err.to_string().into())
+        Self::Message(err.to_string().into())
     }
 }
 
@@ -72,6 +72,7 @@ pub struct HealthCheckMetrics {
 
 impl HealthCheckMetrics {
     /// Create a new metrics instance
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -154,7 +155,7 @@ pub fn check_tcp_alive(
 
 /// Validate DATE command response
 ///
-/// Returns Ok(()) if the response starts with "111 " (EXPECTED_DATE_RESPONSE_PREFIX),
+/// Returns Ok(()) if the response starts with "111 " (`EXPECTED_DATE_RESPONSE_PREFIX`),
 /// otherwise returns an error with the actual response.
 ///
 /// This is a pure function extracted for testability.

@@ -15,7 +15,7 @@ const MAX_RECOMMENDED_KEEPALIVE: Duration = Duration::from_secs(MAX_RECOMMENDED_
 impl Config {
     /// Validate configuration for correctness
     ///
-    /// Most validations are now enforced by type system (NonZero types, validated strings, etc.)
+    /// Most validations are now enforced by type system (`NonZero` types, validated strings, etc.)
     /// This checks remaining semantic constraints:
     /// - At least one server configured
     /// - Maximum 8 servers (bitset limitation for article availability tracking)
@@ -36,7 +36,7 @@ impl Config {
         }
 
         for server in &self.servers {
-            validate_server(server)?;
+            validate_server(server);
         }
 
         Ok(())
@@ -44,7 +44,7 @@ impl Config {
 }
 
 /// Validate a single server configuration
-fn validate_server(server: &Server) -> Result<()> {
+fn validate_server(server: &Server) {
     // Name, host, port, max_connections validations now enforced by types:
     // - HostName/ServerName cannot be empty (validated at construction)
     // - Port cannot be 0 (NonZeroU16)
@@ -72,8 +72,6 @@ fn validate_server(server: &Server) -> Result<()> {
             );
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -113,7 +111,7 @@ mod tests {
     fn test_validate_eight_servers_succeeds() {
         let config = Config {
             servers: (0..8)
-                .map(|i| create_test_server(&format!("server{}", i), None))
+                .map(|i| create_test_server(&format!("server{i}"), None))
                 .collect(),
             ..Default::default()
         };
@@ -124,7 +122,7 @@ mod tests {
     fn test_validate_nine_servers_fails() {
         let config = Config {
             servers: (0..9)
-                .map(|i| create_test_server(&format!("server{}", i), None))
+                .map(|i| create_test_server(&format!("server{i}"), None))
                 .collect(),
             ..Default::default()
         };
@@ -153,38 +151,38 @@ mod tests {
     #[test]
     fn test_validate_server_with_recommended_keepalive() {
         let server = create_test_server("test", Some(Duration::from_secs(60)));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_with_low_keepalive_warns() {
         // This should warn but not fail
         let server = create_test_server("test", Some(Duration::from_secs(5)));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_with_high_keepalive_warns() {
         // This should warn but not fail
         let server = create_test_server("test", Some(Duration::from_secs(600)));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_with_no_keepalive() {
         let server = create_test_server("test", None);
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_at_min_boundary() {
         let server = create_test_server("test", Some(MIN_RECOMMENDED_KEEPALIVE));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 
     #[test]
     fn test_validate_server_at_max_boundary() {
         let server = create_test_server("test", Some(MAX_RECOMMENDED_KEEPALIVE));
-        assert!(validate_server(&server).is_ok());
+        validate_server(&server);
     }
 }

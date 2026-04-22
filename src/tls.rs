@@ -43,7 +43,7 @@ impl Default for TlsConfig {
 }
 
 impl TlsConfig {
-    /// Create a builder for TlsConfig
+    /// Create a builder for `TlsConfig`
     ///
     /// # Example
     /// ```
@@ -54,6 +54,7 @@ impl TlsConfig {
     ///     .verify_cert(true)
     ///     .build();
     /// ```
+    #[must_use]
     pub fn builder() -> TlsConfigBuilder {
         TlsConfigBuilder::default()
     }
@@ -116,7 +117,8 @@ impl TlsConfigBuilder {
     /// Enable or disable TLS
     ///
     /// Default: `false`
-    pub fn enabled(mut self, use_tls: bool) -> Self {
+    #[must_use]
+    pub const fn enabled(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
         self
     }
@@ -127,7 +129,8 @@ impl TlsConfigBuilder {
     /// be used for testing or with trusted private networks.
     ///
     /// Default: `true`
-    pub fn verify_cert(mut self, verify: bool) -> Self {
+    #[must_use]
+    pub const fn verify_cert(mut self, verify: bool) -> Self {
         self.tls_verify_cert = verify;
         self
     }
@@ -135,12 +138,14 @@ impl TlsConfigBuilder {
     /// Set path to custom CA certificate file
     ///
     /// The certificate should be in PEM format.
+    #[must_use]
     pub fn cert_path<S: Into<String>>(mut self, path: S) -> Self {
         self.tls_cert_path = Some(path.into());
         self
     }
 
-    /// Build the TlsConfig
+    /// Build the `TlsConfig`
+    #[must_use]
     pub fn build(self) -> TlsConfig {
         TlsConfig {
             use_tls: self.use_tls,
@@ -153,7 +158,10 @@ impl TlsConfigBuilder {
 // Certificate handling and custom verifiers
 
 mod rustls_backend {
-    use super::*;
+    use super::{
+        CertificateDer, DigitallySignedStruct, HandshakeSignatureValid, RootCertStore, RustlsError,
+        ServerCertVerified, ServerCertVerifier, ServerName, SignatureScheme, UnixTime,
+    };
 
     /// Certificate loading results
     #[derive(Debug)]
@@ -352,7 +360,7 @@ impl TlsManager {
         use anyhow::Context;
 
         let cert_data = std::fs::read(cert_path)
-            .with_context(|| format!("Failed to read TLS certificate from {}", cert_path))?;
+            .with_context(|| format!("Failed to read TLS certificate from {cert_path}"))?;
 
         let certs = rustls_pemfile::certs(&mut cert_data.as_slice())
             .collect::<Result<Vec<_>, _>>()
@@ -368,6 +376,7 @@ impl TlsManager {
     }
 
     /// Load system certificates, returning count of successfully loaded certificates
+    #[allow(clippy::unnecessary_wraps)] // Errors logged as warnings; always returns Ok(count)
     fn load_system_certificates_sync(
         root_store: &mut RootCertStore,
     ) -> Result<usize, anyhow::Error> {
@@ -560,7 +569,7 @@ mod tests {
     fn test_tls_manager_debug() {
         let config = TlsConfig::default();
         let manager = TlsManager::new(config).unwrap();
-        let debug_str = format!("{:?}", manager);
+        let debug_str = format!("{manager:?}");
 
         assert!(debug_str.contains("TlsManager"));
         assert!(debug_str.contains("<TlsConnector>"));
@@ -657,7 +666,7 @@ mod tests {
             .cert_path("/test")
             .build();
 
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         assert!(debug_str.contains("TlsConfig"));
         assert!(debug_str.contains("use_tls"));
@@ -668,7 +677,7 @@ mod tests {
     fn test_tls_config_builder_debug_format() {
         let builder = TlsConfig::builder().enabled(true).verify_cert(false);
 
-        let debug_str = format!("{:?}", builder);
+        let debug_str = format!("{builder:?}");
 
         assert!(debug_str.contains("TlsConfigBuilder"));
     }
@@ -678,7 +687,7 @@ mod tests {
         use rustls_backend::NoVerifier;
 
         let verifier = NoVerifier;
-        let debug_str = format!("{:?}", verifier);
+        let debug_str = format!("{verifier:?}");
 
         assert!(debug_str.contains("NoVerifier"));
     }
@@ -688,7 +697,7 @@ mod tests {
         let config = TlsConfig::default();
         let result = TlsManager::load_certificates_sync(&config).unwrap();
 
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
 
         assert!(debug_str.contains("CertificateLoadResult"));
         assert!(debug_str.contains("root_store"));
@@ -724,11 +733,11 @@ mod tests {
             .build();
 
         let manager1 = TlsManager::new(config.clone()).unwrap();
-        let manager2 = TlsManager::new(config.clone()).unwrap();
+        let manager2 = TlsManager::new(config).unwrap();
 
         // Both should successfully initialize
-        let debug1 = format!("{:?}", manager1);
-        let debug2 = format!("{:?}", manager2);
+        let debug1 = format!("{manager1:?}");
+        let debug2 = format!("{manager2:?}");
 
         assert!(debug1.contains("TlsManager"));
         assert!(debug2.contains("TlsManager"));

@@ -144,10 +144,10 @@ impl NntpResponse {
     ///
     /// **Optimization**: Direct byte-to-digit conversion avoids UTF-8 overhead.
     #[inline]
+    #[must_use]
     pub fn parse(data: &[u8]) -> Self {
-        let code = match StatusCode::parse(data) {
-            Some(c) => c,
-            None => return Self::Invalid,
+        let Some(code) = StatusCode::parse(data) else {
+            return Self::Invalid;
         };
 
         match code.as_u16() {
@@ -164,10 +164,12 @@ impl NntpResponse {
             381 | 480 => Self::AuthRequired(code),
 
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
-            // All 1xx are informational multiline
-            100..=199 => Self::MultilineData(code),
-            // Specific 2xx multiline responses
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => Self::MultilineData(code),
+            // All 1xx are informational multiline; specific 2xx multiline responses:
+            // 215=LIST, 220=ARTICLE, 221=HEAD, 222=BODY, 224=XOVER/XHDR,
+            // 225=HEADERS, 230=NEWNEWS, 231=NEWGROUPS, 282=XZHDR/XZVER, 288=XFEATURE COMPRESS GZIP
+            100..=199 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => {
+                Self::MultilineData(code)
+            }
 
             // Everything else is a single-line response
             _ => Self::SingleLine(code),
@@ -230,6 +232,7 @@ impl StatusCode {
     /// **Optimization**: Direct byte-to-digit conversion without UTF-8 validation.
     /// Status codes are guaranteed to be ASCII digits per the RFC.
     #[inline]
+    #[must_use]
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 3 {
             return None;
@@ -247,7 +250,7 @@ impl StatusCode {
         }
 
         // Combine into u16: d0*100 + d1*10 + d2
-        let code = (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16);
+        let code = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
         Some(Self::new(code))
     }
 
@@ -258,15 +261,15 @@ impl StatusCode {
     ///
     /// # Multiline Response Codes
     /// - **1xx**: All informational responses (100-199)
-    /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282
+    /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282, 288
     #[inline]
     #[must_use]
     pub fn is_multiline(&self) -> bool {
-        match **self {
-            100..=199 => true, // All 1xx are multiline
-            215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 => true, // Specific 2xx codes
-            _ => false,
-        }
+        // All 1xx are multiline; specific 2xx multiline codes
+        matches!(
+            **self,
+            100..=199 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
+        )
     }
 }
 
@@ -292,6 +295,17 @@ mod tests {
         assert!(StatusCode::new(220).is_multiline());
         assert!(!StatusCode::new(200).is_multiline());
         assert!(!StatusCode::new(400).is_multiline());
+    }
+
+    #[test]
+    fn test_288_xfeature_compress_gzip_is_multiline() {
+        // 288 is returned by XFEATURE COMPRESS GZIP — enables compression.
+        // The response is multiline (compressed data stream follows).
+        assert!(StatusCode::new(288).is_multiline());
+        assert!(matches!(
+            NntpResponse::parse(b"288 XFEATURE COMPRESS GZIP\r\n"),
+            NntpResponse::MultilineData(_)
+        ));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Strategy for selecting backends based on weighted round-robin
 ///
-/// Uses the pool size (max_connections) as the weight to ensure backends
+/// Uses the pool size (`max_connections`) as the weight to ensure backends
 /// with larger pools receive proportionally more requests.
 ///
 /// Algorithm: Map counter to weighted position, then find which backend owns that slot.
@@ -16,14 +16,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct WeightedRoundRobin {
     /// Current counter for round-robin selection
     counter: AtomicUsize,
-    /// Total weight across all backends (sum of all max_connections)
+    /// Total weight across all backends (sum of all `max_connections`)
     total_weight: usize,
 }
 
 impl WeightedRoundRobin {
     /// Create a new weighted round-robin strategy
     #[must_use]
-    pub fn new(total_weight: usize) -> Self {
+    pub const fn new(total_weight: usize) -> Self {
         Self {
             counter: AtomicUsize::new(0),
             total_weight,
@@ -31,7 +31,7 @@ impl WeightedRoundRobin {
     }
 
     /// Update total weight when backends are added
-    pub fn set_total_weight(&mut self, total_weight: usize) {
+    pub const fn set_total_weight(&mut self, total_weight: usize) {
         self.total_weight = total_weight;
     }
 
@@ -55,7 +55,7 @@ impl WeightedRoundRobin {
 
     /// Get total weight
     #[must_use]
-    pub fn total_weight(&self) -> usize {
+    pub const fn total_weight(&self) -> usize {
         self.total_weight
     }
 }
@@ -63,9 +63,9 @@ impl WeightedRoundRobin {
 /// Strategy for selecting backends based on current load
 ///
 /// Routes requests to the backend with the fewest pending requests,
-/// accounting for backend capacity (max_connections).
+/// accounting for backend capacity (`max_connections`).
 ///
-/// Algorithm: Calculate load_ratio = pending / max_connections for each backend,
+/// Algorithm: Calculate `load_ratio` = pending / `max_connections` for each backend,
 /// select the one with lowest ratio. Breaks ties by choosing first occurrence.
 #[derive(Debug)]
 pub struct LeastLoaded;
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn test_weighted_round_robin_debug_format() {
         let strategy = WeightedRoundRobin::new(10);
-        let debug_str = format!("{:?}", strategy);
+        let debug_str = format!("{strategy:?}");
 
         assert!(debug_str.contains("WeightedRoundRobin"));
     }

@@ -2,6 +2,7 @@
 
 /// Format bytes in human-readable format (KB, MB, GB)
 #[inline]
+#[must_use]
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -14,12 +15,13 @@ pub fn format_bytes(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
 /// Shorten UUID to first 8 characters for log readability
 #[inline]
+#[must_use]
 pub fn short_id(uuid: &uuid::Uuid) -> String {
     uuid.to_string()[..8].to_string()
 }
@@ -34,9 +36,9 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1048576), "1.00 MB");
-        assert_eq!(format_bytes(29312178), "27.95 MB");
-        assert_eq!(format_bytes(1073741824), "1.00 GB");
+        assert_eq!(format_bytes(1_048_576), "1.00 MB");
+        assert_eq!(format_bytes(29_312_178), "27.95 MB");
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
     }
 
     #[test]

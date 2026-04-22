@@ -21,7 +21,7 @@ impl<'a> Headers<'a> {
     /// * `data` - Raw header bytes (should NOT include the trailing blank line)
     ///
     /// # Returns
-    /// Validated Headers or ParseError
+    /// Validated Headers or `ParseError`
     pub fn parse(data: &'a [u8]) -> Result<Self, ParseError> {
         Self::validate_headers(data)?;
         Ok(Headers { data })
@@ -92,11 +92,10 @@ impl<'a> Headers<'a> {
                 // Check if preceded by \r
                 if i > 0 && data[i - 1] == b'\r' {
                     return Ok(i - 1); // Return position of \r
-                } else {
-                    return Err(ParseError::InvalidHeader(
-                        "LF not preceded by CR".to_string(),
-                    ));
                 }
+                return Err(ParseError::InvalidHeader(
+                    "LF not preceded by CR".to_string(),
+                ));
             }
             if data[i] == b'\r' {
                 // Check for \n following \r
@@ -105,11 +104,10 @@ impl<'a> Headers<'a> {
                 } else if i + 1 >= data.len() {
                     // CR at end of buffer - might be incomplete
                     return Ok(i);
-                } else {
-                    return Err(ParseError::InvalidHeader(
-                        "CR not followed by LF".to_string(),
-                    ));
                 }
+                return Err(ParseError::InvalidHeader(
+                    "CR not followed by LF".to_string(),
+                ));
             }
         }
 
@@ -124,6 +122,7 @@ impl<'a> Headers<'a> {
     ///
     /// # Returns
     /// Header value slice (trimmed leading/trailing whitespace) or None
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&'a [u8]> {
         let name_lower = name.to_ascii_lowercase();
         let mut pos = 0;
@@ -189,13 +188,12 @@ impl<'a> Headers<'a> {
                 // Otherwise return the original slice (zero-copy)
                 if folded_value.is_empty() {
                     return Some(value);
-                } else {
-                    // We have to allocate for folded headers
-                    // This is a limitation - we could return Cow<'a, [u8]> instead
-                    // For now, just return the first line
-                    // TODO: Return Cow to handle folding without allocation in non-folded case
-                    return Some(value);
                 }
+                // We have to allocate for folded headers
+                // This is a limitation - we could return Cow<'a, [u8]> instead
+                // For now, just return the first line
+                // TODO: Return Cow to handle folding without allocation in non-folded case
+                return Some(value);
             }
 
             pos = line_end + 2;
@@ -205,7 +203,9 @@ impl<'a> Headers<'a> {
     }
 
     /// Iterate over all headers (zero-copy)
-    pub fn iter(&self) -> HeaderIter<'a> {
+    #[must_use]
+    #[allow(clippy::iter_without_into_iter)] // IntoIterator impl would require a wrapper type
+    pub const fn iter(&self) -> HeaderIter<'a> {
         HeaderIter {
             data: self.data,
             pos: 0,
@@ -213,7 +213,8 @@ impl<'a> Headers<'a> {
     }
 
     /// Get raw header bytes
-    pub fn as_bytes(&self) -> &'a [u8] {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
         self.data
     }
 }

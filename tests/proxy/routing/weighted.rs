@@ -1,7 +1,7 @@
 //! Weighted round-robin tests
 //!
 //! Tests for the weighted round-robin algorithm that distributes requests
-//! proportionally based on backend pool sizes (max_connections).
+//! proportionally based on backend pool sizes (`max_connections`).
 
 use super::*;
 
@@ -313,20 +313,16 @@ fn test_weighted_consistency_across_runs() {
         }
 
         // Each run should produce ~30% and ~70% distribution
-        let ratio_0 = counts[0] as f64 / 1000.0;
-        let ratio_1 = counts[1] as f64 / 1000.0;
+        let ratio_0 = f64::from(counts[0]) / 1000.0;
+        let ratio_1 = f64::from(counts[1]) / 1000.0;
 
         assert!(
             (ratio_0 - 0.30).abs() < 0.05,
-            "Run {}: Backend 0 ratio {:.2} not close to 0.30",
-            run,
-            ratio_0
+            "Run {run}: Backend 0 ratio {ratio_0:.2} not close to 0.30"
         );
         assert!(
             (ratio_1 - 0.70).abs() < 0.05,
-            "Run {}: Backend 1 ratio {:.2} not close to 0.70",
-            run,
-            ratio_1
+            "Run {run}: Backend 1 ratio {ratio_1:.2} not close to 0.70"
         );
     }
 }
@@ -390,8 +386,8 @@ fn test_weighted_with_varying_pool_sizes() {
     for (i, &size) in pool_sizes.iter().enumerate() {
         selector.add_backend(
             BackendId::from_index(i),
-            ServerName::try_new(format!("backend-{}", i)).unwrap(),
-            create_backend(&format!("backend-{}", i), size),
+            ServerName::try_new(format!("backend-{i}")).unwrap(),
+            create_backend(&format!("backend-{i}"), size),
             0, // tier
             None,
         );
@@ -414,13 +410,13 @@ fn test_weighted_with_varying_pool_sizes() {
         let tolerance = expected * 0.10; // 10% tolerance
 
         assert!(
-            (counts[i] as f64 - expected).abs() < tolerance,
+            (f64::from(counts[i]) - expected).abs() < tolerance,
             "Backend {} (size {}) expected ~{:.0}, got {} (diff: {:.0})",
             i,
             size,
             expected,
             counts[i],
-            (counts[i] as f64 - expected).abs()
+            (f64::from(counts[i]) - expected).abs()
         );
     }
 }

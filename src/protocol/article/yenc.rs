@@ -16,6 +16,7 @@ use std::io::{BufRead, BufReader};
 ///
 /// Delegates to yenc crate which is faster and handles all edge cases correctly
 #[inline]
+#[must_use]
 pub fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
     // yenc crate returns Result but decoding never actually fails
     // (it just returns empty/partial on malformed input)
@@ -55,13 +56,12 @@ impl YencHeader {
         footer
             .size
             .filter(|&size| size != self.expected_size)
-            .map(|size| {
+            .map_or(Ok(()), |size| {
                 Err(ParseError::InvalidYenc(format!(
                     "Size mismatch: header={}, footer={}",
                     self.expected_size, size
                 )))
             })
-            .unwrap_or(Ok(()))
     }
 }
 
@@ -75,6 +75,7 @@ struct YencFooter {
 impl YencFooter {
     /// Parse from line bytes
     #[inline]
+    #[allow(clippy::unnecessary_wraps)] // Result is forward-compatible; consistent with other parse fns
     fn parse(line: &[u8], is_multipart: bool) -> Result<Self, ParseError> {
         let line_str = String::from_utf8_lossy(line);
 
@@ -92,14 +93,13 @@ impl YencFooter {
     fn validate_checksum(&self, checksum: &crc32fast::Hasher) -> Result<(), ParseError> {
         self.crc32
             .filter(|&expected| checksum.clone().finalize() != expected)
-            .map(|expected| {
+            .map_or(Ok(()), |expected| {
                 Err(ParseError::InvalidYenc(format!(
                     "CRC mismatch: expected={:08x}, actual={:08x}",
                     expected,
                     checksum.clone().finalize()
                 )))
             })
-            .unwrap_or(Ok(()))
     }
 }
 
@@ -125,7 +125,7 @@ impl YencLine {
     }
 }
 
-/// Iterator adapter for reading lines from BufReader
+/// Iterator adapter for reading lines from `BufReader`
 struct YencLines<'a> {
     reader: &'a mut BufReader<&'a [u8]>,
     line_buf: Vec<u8>,
@@ -133,7 +133,7 @@ struct YencLines<'a> {
 
 impl<'a> YencLines<'a> {
     #[inline]
-    fn new(reader: &'a mut BufReader<&'a [u8]>) -> Self {
+    const fn new(reader: &'a mut BufReader<&'a [u8]>) -> Self {
         Self {
             reader,
             line_buf: Vec::new(),
@@ -149,7 +149,7 @@ impl Iterator for YencLines<'_> {
         match self
             .reader
             .read_until(b'\n', &mut self.line_buf)
-            .map_err(|e| ParseError::InvalidYenc(format!("Failed to read yenc: {}", e)))
+            .map_err(|e| ParseError::InvalidYenc(format!("Failed to read yenc: {e}")))
         {
             Ok(0) => None,
             Ok(_) => Some(Ok(self.line_buf.clone())),
@@ -210,6 +210,7 @@ pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
 
 /// Decode a yenc data line and update checksum
 #[inline]
+#[allow(clippy::unnecessary_wraps)] // Result for consistency; decode_yenc_line may fail in future
 fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> Result<(), ParseError> {
     let decoded = line
         .strip_suffix(b"\r\n")
@@ -224,7 +225,7 @@ fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> Result<
 /// Extract a parameter value from a yenc metadata line
 #[inline]
 fn extract_param<'a>(line: &'a str, param: &str) -> Option<&'a str> {
-    line.find(&format!("{}=", param))
+    line.find(&format!("{param}="))
         .map(|start| &line[start + param.len() + 1..])
         .and_then(|rest| rest.split_whitespace().next())
 }

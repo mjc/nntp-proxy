@@ -8,7 +8,7 @@ use crate::config::RoutingMode;
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommandRoutingDecision {
+pub enum CommandRoutingDecision {
     /// Intercept and handle authentication locally
     InterceptAuth,
     /// Forward command to backend (authenticated or auth disabled)
@@ -29,17 +29,17 @@ pub(crate) enum CommandRoutingDecision {
 /// * `command` - The raw NNTP command string
 /// * `is_authenticated` - Whether the client has authenticated
 /// * `auth_enabled` - Whether authentication is required
-/// * `routing_mode` - Current routing mode (PerCommand, Stateful, Hybrid)
+/// * `routing_mode` - Current routing mode (`PerCommand`, Stateful, Hybrid)
 ///
 /// # Returns
 /// A `CommandRoutingDecision` indicating what action to take
-pub(crate) fn decide_command_routing(
+pub fn decide_command_routing(
     command: &str,
     is_authenticated: bool,
     auth_enabled: bool,
     routing_mode: RoutingMode,
 ) -> CommandRoutingDecision {
-    use CommandAction::*;
+    use CommandAction::{ForwardStateless, InterceptAuth, Reject};
 
     // Classify the command
     let action = CommandHandler::classify(command);
@@ -181,24 +181,21 @@ mod tests {
             assert_eq!(
                 decide_command_routing(cmd, true, false, RoutingMode::Hybrid),
                 CommandRoutingDecision::SwitchToStateful,
-                "Failed for command: {}",
-                cmd
+                "Failed for command: {cmd}"
             );
 
             // Per-command mode: reject
             assert_eq!(
                 decide_command_routing(cmd, true, false, RoutingMode::PerCommand),
                 CommandRoutingDecision::Reject,
-                "Failed for command: {}",
-                cmd
+                "Failed for command: {cmd}"
             );
 
             // Stateful mode: reject (though shouldn't reach this in practice)
             assert_eq!(
                 decide_command_routing(cmd, true, false, RoutingMode::Stateful),
                 CommandRoutingDecision::Reject,
-                "Failed for command: {}",
-                cmd
+                "Failed for command: {cmd}"
             );
         }
     }

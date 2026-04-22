@@ -58,23 +58,23 @@ fn test_stateful_connection_concurrent_access() {
     );
 
     // Simulate concurrent access with multiple threads
+    // Collect handles first so all threads spawn before any are joined (parallel execution)
     let router_arc = Arc::new(router);
-    let handles: Vec<_> = (0..10)
-        .map(|_| {
-            let router_clone = Arc::clone(&router_arc);
-            std::thread::spawn(move || {
-                // Try to acquire and immediately release
-                if router_clone.try_acquire_stateful(backend_id) {
-                    // Simulate some work
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    router_clone.release_stateful(backend_id);
-                    1
-                } else {
-                    0
-                }
-            })
-        })
-        .collect();
+    let mut handles = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let router_clone = Arc::clone(&router_arc);
+        handles.push(std::thread::spawn(move || {
+            // Try to acquire and immediately release
+            if router_clone.try_acquire_stateful(backend_id) {
+                // Simulate some work
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                router_clone.release_stateful(backend_id);
+                1
+            } else {
+                0
+            }
+        }));
+    }
 
     let total_acquired: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
 

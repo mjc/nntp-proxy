@@ -25,7 +25,7 @@ impl RuntimeConfig {
     /// Single-threaded runtime is used if threads == 1.
     #[must_use]
     pub fn from_args(threads: Option<ThreadCount>) -> Self {
-        let worker_threads = threads.map(|t| t.get()).unwrap_or(1);
+        let worker_threads = threads.map_or(1, |t| t.get());
 
         Self {
             worker_threads,
@@ -35,7 +35,7 @@ impl RuntimeConfig {
 
     /// Disable CPU pinning
     #[must_use]
-    pub fn without_cpu_pinning(mut self) -> Self {
+    pub const fn without_cpu_pinning(mut self) -> Self {
         self.enable_cpu_pinning = false;
         self
     }
@@ -67,7 +67,7 @@ impl RuntimeConfig {
                 .build()?
         } else {
             let num_cpus = std::thread::available_parallelism()
-                .map(|p| p.get())
+                .map(std::num::NonZero::get)
                 .unwrap_or(1);
             tracing::info!(
                 "Starting NNTP proxy with {} worker threads (detected {} CPUs)",
@@ -99,8 +99,9 @@ impl Default for RuntimeConfig {
 /// This is a best-effort operation - failures are logged but not fatal.
 ///
 /// # Arguments
-/// * `num_cores` - Number of CPU cores to pin to (0..num_cores)
+/// * `num_cores` - Number of CPU cores to pin to (`0..num_cores`)
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)] // Non-fatal: errors are logged as warnings, always returns Ok
 fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
     use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
@@ -156,8 +157,8 @@ pub async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {},
+        () = terminate => {},
     }
 }
 
@@ -197,9 +198,7 @@ pub fn resolve_listen_address(
     port_arg: Option<crate::types::Port>,
     config: &crate::config::Config,
 ) -> (String, crate::types::Port) {
-    let host = host_arg
-        .map(String::from)
-        .unwrap_or_else(|| config.proxy.host.clone());
+    let host = host_arg.map_or_else(|| config.proxy.host.clone(), String::from);
     let port = port_arg.unwrap_or(config.proxy.port);
     (host, port)
 }
@@ -295,15 +294,17 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 ///
 /// Waits for shutdown signal, then:
 /// 1. Sends shutdown notification via channel
-/// 2. Calls graceful_shutdown() on proxy
+/// 2. Calls `graceful_shutdown()` on proxy
 ///
 /// Returns the shutdown receiver channel.
 #[must_use]
 pub fn spawn_shutdown_handler(
     proxy: &std::sync::Arc<crate::NntpProxy>,
+    stats_path: std::path::PathBuf,
+    server_names: Vec<String>,
 ) -> tokio::sync::mpsc::Receiver<()> {
     use std::sync::Arc;
-    use tracing::info;
+    use tracing::{info, warn};
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let proxy = Arc::clone(proxy);
@@ -311,6 +312,13 @@ pub fn spawn_shutdown_handler(
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("Shutdown signal received");
+
+        // Save metrics before shutting down
+        let metrics = proxy.metrics().clone();
+        match save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await {
+            Ok(()) => info!("Metrics saved to {}", stats_path.display()),
+            Err(e) => warn!("Failed to save metrics on shutdown: {}", e),
+        }
 
         // Notify listeners
         let _ = shutdown_tx.send(()).await;
@@ -323,13 +331,26 @@ pub fn spawn_shutdown_handler(
     shutdown_rx
 }
 
+/// Save metrics on Tokio's blocking thread pool.
+///
+/// `MetricsCollector::save_to_disk` uses `std::fs`, so callers from async
+/// tasks should delegate here instead of running filesystem work on a runtime
+/// worker.
+pub async fn save_metrics_to_disk_blocking(
+    metrics: crate::metrics::MetricsCollector,
+    stats_path: std::path::PathBuf,
+    server_names: Vec<String>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || metrics.save_to_disk(&stats_path, &server_names)).await?
+}
+
 /// Run the main accept loop for client connections
 ///
 /// Accepts connections and spawns a task for each based on routing mode.
 /// Exits when shutdown signal is received.
 ///
 /// # Errors
-/// Returns error if listener.accept() fails
+/// Returns error if `listener.accept()` fails
 pub async fn run_accept_loop(
     proxy: std::sync::Arc<crate::NntpProxy>,
     listener: tokio::net::TcpListener,
@@ -358,10 +379,10 @@ pub async fn run_accept_loop(
                         proxy.handle_client(stream, addr.into()).await
                     };
 
-                    if let Err(e) = result {
-                        // Only log non-client-disconnect errors (avoid duplicate logging)
-                        // Client disconnects are already handled gracefully in session handlers
-                        if !crate::is_client_disconnect_error(&e) {
+                    match result {
+                        // Normal completion or client disconnect — no action needed
+                        Ok(()) | Err(crate::session::SessionError::ClientDisconnect(_)) => {}
+                        Err(crate::session::SessionError::Backend(e)) => {
                             error!("Error handling client {}: {:?}", addr, e);
                         }
                     }
@@ -374,6 +395,126 @@ pub async fn run_accept_loop(
     info!("Proxy shutdown complete");
 
     Ok(())
+}
+
+// ============================================================================
+// Metrics Persistence Utilities
+// ============================================================================
+
+/// Resolve the metrics stats file path
+///
+/// If `stats_file` is configured, use it; otherwise default to "stats.json" alongside config file.
+///
+/// # Arguments
+/// * `config_path` - Path to the configuration file
+/// * `configured_path` - Optional configured path from config file
+#[must_use]
+pub fn resolve_stats_file_path(
+    config_path: &str,
+    configured_path: Option<&std::path::PathBuf>,
+) -> std::path::PathBuf {
+    use std::path::Path;
+
+    if let Some(path) = configured_path {
+        path.clone()
+    } else {
+        // Default to stats.json alongside config file
+        let config_dir = Path::new(config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        config_dir.join("stats.json")
+    }
+}
+
+/// Load metrics from disk if the stats file exists
+///
+/// Returns None if file doesn't exist, is empty, or can't be parsed.
+/// Errors are logged but not fatal.
+///
+/// # Arguments
+/// * `stats_path` - Path to the stats JSON file
+/// * `server_names` - Current backend server names (for matching restored data)
+pub fn load_metrics_from_disk(
+    stats_path: &std::path::Path,
+    server_names: &[String],
+) -> Option<crate::metrics::MetricsStore> {
+    use tracing::{info, warn};
+
+    match crate::metrics::MetricsStore::load(stats_path, server_names) {
+        Ok(Some(store)) => {
+            info!("Restored metrics from {}", stats_path.display());
+            Some(store)
+        }
+        Ok(None) => {
+            info!(
+                "Stats file {} is empty or doesn't exist, starting fresh",
+                stats_path.display()
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load stats from {}: {}, starting fresh",
+                stats_path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Spawn background task to periodically save metrics to disk
+///
+/// Saves every 30 seconds. Logs errors but doesn't fail.
+pub fn spawn_metrics_saver(
+    proxy: &std::sync::Arc<crate::NntpProxy>,
+    stats_path: std::path::PathBuf,
+    server_names: Vec<String>,
+) {
+    use std::sync::Arc;
+    use tracing::warn;
+
+    let proxy = Arc::clone(proxy);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let path = stats_path.clone();
+            let names = server_names.clone();
+            let metrics = proxy.metrics().clone();
+            if let Err(e) = save_metrics_to_disk_blocking(metrics, path, names).await {
+                warn!("Failed to save metrics to {}: {}", stats_path.display(), e);
+            }
+        }
+    });
+}
+
+/// Spawn background task that periodically checks for and clears idle backend connections.
+///
+/// Runs every 60 seconds and delegates to [`NntpProxy::check_and_clear_stale_pools`],
+/// which checks each backend independently against its configured `backend_idle_timeout`.
+///
+/// This prevents zombie connections from accumulating during extended idle periods,
+/// which was causing connection limit cascades in the observed 6-day failure.
+pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let proxy = Arc::clone(proxy);
+
+    /// How often to check for idle backends
+    const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            proxy.check_and_clear_stale_pools();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -474,7 +615,7 @@ mod tests {
     #[test]
     fn test_runtime_config_debug() {
         let config = RuntimeConfig::from_args(Some(ThreadCount::new(2).unwrap()));
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         assert!(debug_str.contains("RuntimeConfig"));
         assert!(debug_str.contains("worker_threads"));
@@ -626,5 +767,46 @@ mod tests {
             RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap())).without_cpu_pinning();
         assert!(!config.is_single_threaded());
         assert!(!config.enable_cpu_pinning);
+    }
+
+    // ========================================================================
+    // Metrics Persistence Tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_stats_file_path_with_configured() {
+        use std::path::PathBuf;
+
+        let configured = PathBuf::from("/custom/path/stats.json");
+        let result = resolve_stats_file_path("config.toml", Some(&configured));
+
+        assert_eq!(result, configured);
+    }
+
+    #[test]
+    fn test_resolve_stats_file_path_default() {
+        let result = resolve_stats_file_path("/etc/nntp-proxy/config.toml", None);
+
+        // Should be /etc/nntp-proxy/stats.json
+        assert_eq!(result.file_name().unwrap(), "stats.json");
+        assert!(result.to_string_lossy().contains("nntp-proxy"));
+    }
+
+    #[test]
+    fn test_resolve_stats_file_path_bare_filename() {
+        let result = resolve_stats_file_path("config.toml", None);
+
+        // Bare filename should resolve to ./stats.json
+        assert_eq!(result.file_name().unwrap(), "stats.json");
+    }
+
+    #[test]
+    fn test_load_metrics_from_disk_missing_file() {
+        use std::path::Path;
+
+        let nonexistent_path = Path::new("/tmp/this-does-not-exist-12345.json");
+        let result = load_metrics_from_disk(nonexistent_path, &[]);
+
+        assert!(result.is_none(), "Missing file should return None");
     }
 }

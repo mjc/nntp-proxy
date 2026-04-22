@@ -28,6 +28,7 @@ impl WindowSize {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.into_inner()
     }
@@ -68,21 +69,25 @@ impl BufferSize {
 
     /// Get the inner value
     #[inline]
+    #[must_use]
     pub fn get(&self) -> usize {
         self.into_inner()
     }
 
     /// Create command buffer size instance
+    #[must_use]
     pub fn command() -> Self {
         Self::try_new(Self::COMMAND).unwrap()
     }
 
     /// Create medium buffer size instance
+    #[must_use]
     pub fn medium() -> Self {
         Self::try_new(Self::MEDIUM).unwrap()
     }
 
     /// Create large buffer size instance
+    #[must_use]
     pub fn large() -> Self {
         Self::try_new(Self::LARGE).unwrap()
     }
@@ -104,14 +109,14 @@ mod tests {
         #[test]
         fn buffer_size_display_shows_value(size in 1usize..10_000_000usize) {
             let buffer = BufferSize::try_new(size).unwrap();
-            let display = format!("{}", buffer);
+            let display = format!("{buffer}");
             prop_assert!(display.contains(&size.to_string()));
         }
 
         #[test]
         fn buffer_size_debug_shows_value(size in 1usize..10_000_000usize) {
             let buffer = BufferSize::try_new(size).unwrap();
-            let debug = format!("{:?}", buffer);
+            let debug = format!("{buffer:?}");
             prop_assert!(debug.contains("BufferSize"));
             prop_assert!(debug.contains(&size.to_string()));
         }
@@ -151,7 +156,7 @@ mod tests {
         #[test]
         fn window_size_display_shows_value(size in 1u64..100_000u64) {
             let window = WindowSize::try_new(size).unwrap();
-            let display = format!("{}", window);
+            let display = format!("{window}");
             prop_assert!(display.contains(&size.to_string()));
         }
 

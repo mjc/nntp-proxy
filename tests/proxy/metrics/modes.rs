@@ -244,7 +244,7 @@ fn test_all_modes_show_meaningful_metrics() {
         let provider = DeadpoolConnectionProvider::new(
             "localhost".to_string(),
             119,
-            format!("{} Backend", mode_name),
+            format!("{mode_name} Backend"),
             10,
             None,
             None,
@@ -274,14 +274,12 @@ fn test_all_modes_show_meaningful_metrics() {
         assert_eq!(
             snapshot.backend_stats[0].bytes_sent,
             BytesSent::new(1000),
-            "{} should track bytes sent",
-            mode_name
+            "{mode_name} should track bytes sent"
         );
         assert_eq!(
             snapshot.backend_stats[0].bytes_received,
             BytesReceived::new(5000),
-            "{} should track bytes received",
-            mode_name
+            "{mode_name} should track bytes received"
         );
 
         // 2. Pool utilization (active connections)
@@ -293,8 +291,7 @@ fn test_all_modes_show_meaningful_metrics() {
         assert_eq!(
             snapshot.backend_stats[0].active_connections,
             nntp_proxy::metrics::ActiveConnections::new(expected_active),
-            "{} should show pool utilization",
-            mode_name
+            "{mode_name} should show pool utilization"
         );
 
         // 3. Commands (per-command and hybrid only)

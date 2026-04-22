@@ -136,14 +136,13 @@ async fn test_availability_different_per_article() -> Result<()> {
 
     // Request multiple articles - each might be on different backends
     for i in 0..5 {
-        let msgid = format!("<article-{}@example.com>", i);
+        let msgid = format!("<article-{i}@example.com>");
         let (status, _) = send_article_read_full_response(&mut client, &msgid).await?;
 
         // Each article should either succeed or fail (no partial state)
         assert!(
             status.starts_with("220") || status.starts_with("430"),
-            "Article {} should have valid status",
-            i
+            "Article {i} should have valid status"
         );
     }
 

@@ -48,7 +48,7 @@ pub fn create_sparkline(value: u64, max_value: u64) -> String {
 /// 2. Folds over history points to build point vectors and track max
 /// 3. Accumulates results with global max tracking
 ///
-/// Returns (chart_data, global_max_throughput)
+/// Returns (`chart_data`, `global_max_throughput`)
 pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64) {
     /// Extract data from a single throughput point
     #[inline]
@@ -93,8 +93,8 @@ pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64)
             BackendChartData::new(
                 server.name.as_str().to_string(),
                 backend_color(index),
-                sent_points,
-                recv_points,
+                &sent_points,
+                &recv_points,
             ),
             backend_max.get(),
         )
@@ -158,7 +158,7 @@ pub fn format_throughput_label(value: f64) -> String {
     } else if value >= throughput::ONE_KB {
         format!("{:.0} KB/s", value / throughput::ONE_KB)
     } else {
-        format!("{:.0} B/s", value)
+        format!("{value:.0} B/s")
     }
 }
 
@@ -168,6 +168,7 @@ pub fn format_throughput_label(value: f64) -> String {
 
 /// Format throughput strings for summary display
 #[must_use]
+#[allow(clippy::map_unwrap_or)] // map_or_else reverses closure order, making multi-line form less readable
 pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) -> (String, String) {
     use super::constants::text;
 
@@ -207,8 +208,8 @@ pub const fn health_indicator(
 #[must_use]
 pub fn format_error_rate(rate: f64) -> String {
     match rate {
-        r if r > 5.0 => format!(" ⚠ {:.1}%", r),
-        r if r > 0.0 => format!(" {:.1}%", r),
+        r if r > 5.0 => format!(" ⚠ {r:.1}%"),
+        r if r > 0.0 => format!(" {r:.1}%"),
         _ => String::new(),
     }
 }
@@ -366,10 +367,10 @@ mod tests {
         // Add 8 backends (at SmallVec capacity)
         for i in 0..8 {
             chart_data.push(BackendChartData::new(
-                format!("Server {}", i),
+                format!("Server {i}"),
                 backend_color(i),
-                PointVec::new(),
-                PointVec::new(),
+                &PointVec::new(),
+                &PointVec::new(),
             ));
         }
 
@@ -383,8 +384,8 @@ mod tests {
         let data = BackendChartData::new(
             "Test Server".to_string(),
             backend_color(0),
-            PointVec::new(),
-            PointVec::new(),
+            &PointVec::new(),
+            &PointVec::new(),
         );
 
         assert_eq!(data.name, "Test Server");

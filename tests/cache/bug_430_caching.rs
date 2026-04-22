@@ -1,13 +1,13 @@
 //! Integration tests for the critical 430 caching bug fix
 //!
-//! BUG: ArticleCache::record_backend_missing was silently doing nothing when
+//! BUG: `ArticleCache::record_backend_missing` was silently doing nothing when
 //! an article wasn't already cached. This caused:
 //! 1. Missing articles to be queried from ALL backends EVERY request
-//! 2. SABnzbd reporting "gigabytes of missing articles"
+//! 2. `SABnzbd` reporting "gigabytes of missing articles"
 //! 3. 4xx error metrics not incrementing properly
 //! 4. Only 5 cache entries instead of hundreds
 //!
-//! FIX: record_backend_missing now creates cache entries for 430 responses,
+//! FIX: `record_backend_missing` now creates cache entries for 430 responses,
 //! preventing repeated queries to backends that don't have the article.
 
 use nntp_proxy::cache::ArticleCache;
@@ -106,6 +106,7 @@ async fn test_430_increments_4xx_metrics() {
 
 /// Test cache growth with missing articles
 #[tokio::test]
+#[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_cache_grows_with_430_responses() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes
@@ -113,14 +114,14 @@ async fn test_cache_grows_with_430_responses() {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
 
     // Initial stats
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert_eq!(stats.entry_count, 0);
 
     // Record 100 different missing articles
     // Keep the strings alive to prevent early eviction
     let mut msg_ids = Vec::new();
     for i in 0..100 {
-        let msg_id_str = format!("<missing{}@example.com>", i);
+        let msg_id_str = format!("<missing{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_id_str).unwrap();
 
         cache
@@ -133,7 +134,7 @@ async fn test_cache_grows_with_430_responses() {
     cache.sync().await;
 
     // Cache should have 100 entries now
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert!(
         stats.entry_count >= 100,
         "Cache should have at least 100 entries, got {}",
@@ -143,6 +144,7 @@ async fn test_cache_grows_with_430_responses() {
 
 /// Regression test: Verify bug symptoms are fixed
 #[tokio::test]
+#[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_regression_bug_symptoms_fixed() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes
@@ -154,7 +156,7 @@ async fn test_regression_bug_symptoms_fixed() {
     // Keep strings alive
     let mut msg_ids = Vec::new();
     for i in 0..500 {
-        let msg_id_str = format!("<missing{}@example.com>", i);
+        let msg_id_str = format!("<missing{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_id_str).unwrap();
 
         // Both backends return 430
@@ -171,7 +173,7 @@ async fn test_regression_bug_symptoms_fixed() {
     cache.sync().await;
 
     // BUG SYMPTOM 1: Cache should have hundreds of entries, not just 5
-    let stats = cache.stats().await;
+    let stats = cache.stats();
     assert!(
         stats.entry_count >= 500,
         "Cache should have 500+ entries (was 5 before fix), got {}",
@@ -183,8 +185,7 @@ async fn test_regression_bug_symptoms_fixed() {
     for (idx, backend_stats) in snapshot.backend_stats.iter().enumerate() {
         assert!(
             backend_stats.errors_4xx.get() > 0,
-            "Backend {} 4xx errors should be counted (was 0 before fix)",
-            idx
+            "Backend {idx} 4xx errors should be counted (was 0 before fix)"
         );
         assert_eq!(
             backend_stats.errors_4xx.get(),
@@ -198,8 +199,7 @@ async fn test_regression_bug_symptoms_fixed() {
         assert_eq!(
             backend_stats.errors.get(),
             backend_stats.errors_4xx.get(),
-            "Backend {} total errors should equal 4xx errors for this test",
-            idx
+            "Backend {idx} total errors should equal 4xx errors for this test"
         );
     }
 }

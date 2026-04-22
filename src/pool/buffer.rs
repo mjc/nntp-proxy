@@ -30,18 +30,18 @@ impl PooledBuffer {
     /// Get the full capacity of the buffer
     #[must_use]
     #[inline]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.buffer.len()
     }
 
     /// Get the number of initialized bytes
     #[must_use]
     #[inline]
-    pub fn initialized(&self) -> usize {
+    pub const fn initialized(&self) -> usize {
         self.initialized
     }
 
-    /// Read from an AsyncRead source, automatically tracking initialized bytes
+    /// Read from an `AsyncRead` source, automatically tracking initialized bytes
     pub async fn read_from<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
         R: tokio::io::AsyncReadExt + Unpin,
@@ -51,10 +51,27 @@ impl PooledBuffer {
         Ok(n)
     }
 
+    /// Read more data at the current initialized offset, accumulating bytes.
+    ///
+    /// Unlike `read_from` which resets the buffer, this appends to existing data.
+    /// Used when a partial response needs more data (e.g., status code split
+    /// across TCP segments).
+    ///
+    /// Returns the number of NEW bytes read (not total).
+    pub async fn read_more<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
+    where
+        R: tokio::io::AsyncReadExt + Unpin,
+    {
+        let offset = self.initialized;
+        let n = reader.read(&mut self.buffer[offset..]).await?;
+        self.initialized += n;
+        Ok(n)
+    }
+
     /// Copy data into buffer and mark as initialized
     ///
     /// # Panics
-    /// Panics if data.len() > capacity
+    /// Panics if `data.len()` > capacity
     #[inline]
     pub fn copy_from_slice(&mut self, data: &[u8]) {
         assert!(
@@ -90,8 +107,8 @@ impl PooledBuffer {
 
     /// Append data to the buffer (accumulator mode)
     ///
-    /// Used when PooledBuffer is acquired from capture pool for accumulating
-    /// streaming data. Unlike copy_from_slice which overwrites, this extends.
+    /// Used when `PooledBuffer` is acquired from capture pool for accumulating
+    /// streaming data. Unlike `copy_from_slice` which overwrites, this extends.
     ///
     /// # Performance
     ///
@@ -169,7 +186,7 @@ impl Drop for PooledBuffer {
 }
 
 /// Lock-free buffer pool for reusing large I/O buffers
-/// Uses crossbeam's SegQueue for lock-free operations
+/// Uses crossbeam's `SegQueue` for lock-free operations
 #[derive(Debug, Clone)]
 pub struct BufferPool {
     pool: Arc<SegQueue<Vec<u8>>>,
@@ -186,7 +203,7 @@ pub struct BufferPool {
 impl BufferPool {
     /// Create a page-aligned buffer for optimal DMA performance
     ///
-    /// Returns a raw Vec<u8> that will be wrapped in PooledBuffer by acquire().
+    /// Returns a raw Vec<u8> that will be wrapped in `PooledBuffer` by `acquire()`.
     /// The buffer is NOT zero-initialized for performance.
     ///
     /// # Safety
@@ -202,23 +219,17 @@ impl BufferPool {
     ///
     /// The public API (`acquire()`) returns a `PooledBuffer` which is a safe wrapper that
     /// enforces this contract through the type system and usage patterns.
-    #[allow(clippy::uninit_vec)]
     fn create_aligned_buffer(size: usize) -> Vec<u8> {
         // Align to page boundaries (4KB) for better memory performance
         let page_size = 4096;
         let aligned_size = size.div_ceil(page_size) * page_size;
 
-        // Use aligned allocation for better cache performance
+        // Pre-allocate with page-aligned capacity, then zero-initialize to `size`.
+        // prefault_pages then touches every page up to `capacity` (including alignment
+        // padding) to force physical page allocation upfront, eliminating page-fault
+        // latency during I/O.
         let mut buffer = Vec::with_capacity(aligned_size);
-        // SAFETY: We're setting the length without initializing the data.
-        // This is safe because:
-        // 1. The Vec is wrapped in PooledBuffer which derefs to &[u8]
-        // 2. PooledBuffer is immediately used with AsyncRead which writes into it
-        // 3. Callers only access &buffer[..n] where n is the bytes actually read
-        // 4. Unwritten/uninitialized bytes are never accessed
-        unsafe {
-            buffer.set_len(size);
-        }
+        buffer.resize(size, 0u8);
         Self::prefault_pages(&mut buffer);
         buffer
     }
@@ -264,7 +275,7 @@ impl BufferPool {
     /// - **Runtime**: Zero allocations in hot path (acquire/release from pool)
     /// - **Per-connection**: Buffers are borrowed and returned, never owned
     ///
-    /// **IMPORTANT**: Do NOT create a BufferPool per-client, per-connection, or
+    /// **IMPORTANT**: Do NOT create a `BufferPool` per-client, per-connection, or
     /// per-request. Create ONE pool at application startup and share it across
     /// all operations via Arc or static reference.
     ///
@@ -339,7 +350,7 @@ impl BufferPool {
     /// Create a buffer pool suitable for testing
     ///
     /// Uses sensible defaults (8KB buffers, pool of 4) that work for most tests.
-    /// Prefer this over manually constructing BufferPool in tests.
+    /// Prefer this over manually constructing `BufferPool` in tests.
     #[cfg(test)]
     #[must_use]
     pub fn for_tests() -> Self {
@@ -368,7 +379,7 @@ impl BufferPool {
 
     /// Get a buffer from the pool or create a new one (lock-free)
     ///
-    /// Returns a PooledBuffer that automatically returns to the pool when dropped.
+    /// Returns a `PooledBuffer` that automatically returns to the pool when dropped.
     ///
     /// # Performance: Zero-Allocation Hot Path
     ///
@@ -382,9 +393,10 @@ impl BufferPool {
     /// # Safety Notes
     ///
     /// The buffer may contain old data, but this is safe because:
-    /// - Callers use AsyncRead which writes into the buffer
+    /// - Callers use `AsyncRead` which writes into the buffer
     /// - They get back `n` bytes written and access only `&buf[..n]`
     /// - Stale data beyond `n` is never accessed
+    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
     pub async fn acquire(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
@@ -412,11 +424,12 @@ impl BufferPool {
 
     /// Get a capture buffer from the capture pool
     ///
-    /// Returns a PooledBuffer backed by a pre-faulted capture buffer.
+    /// Returns a `PooledBuffer` backed by a pre-faulted capture buffer.
     /// Used for accumulating streaming data (e.g., caching articles).
     ///
     /// Pages are pre-faulted to eliminate soft page faults during streaming,
     /// which profiling showed accounted for 96.75% of memmove time.
+    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
     pub async fn acquire_capture(&self) -> PooledBuffer {
         let buffer = if let Some(mut buffer) = self.capture_pool.pop() {
             self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
@@ -607,7 +620,7 @@ mod tests {
     #[test]
     fn test_buffer_pool_clone() {
         let pool1 = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
-        let _pool2 = pool1.clone();
+        let _pool2 = pool1;
 
         // Both should share the same underlying pool
         // (Arc ensures shared ownership)
@@ -733,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_pool_debug() {
         let pool = BufferPool::new(BufferSize::try_new(2048).unwrap(), 5);
-        let debug_str = format!("{:?}", pool);
+        let debug_str = format!("{pool:?}");
         assert!(debug_str.contains("BufferPool"));
     }
 

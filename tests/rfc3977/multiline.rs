@@ -7,7 +7,8 @@
 //!
 //! Adapted from nntp-rs RFC 3977 multiline.rs tests.
 
-use nntp_proxy::protocol::{CRLF, MULTILINE_TERMINATOR};
+use nntp_proxy::protocol::CRLF;
+use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
 
 /// Helper function to simulate byte-stuffing removal (dot-unstuffing)
 ///
@@ -304,12 +305,10 @@ fn test_bare_lf_handling() {
     let raw = "Line1\nLine2\n.\n";
 
     // CRLF split treats this as one long line
-    let crlf_lines: Vec<&str> = raw.split("\r\n").filter(|s| !s.is_empty()).collect();
-    assert_eq!(crlf_lines.len(), 1);
+    assert_eq!(raw.split("\r\n").filter(|s| !s.is_empty()).count(), 1);
 
     // LF split would produce multiple lines
-    let lf_lines: Vec<&str> = raw.split('\n').filter(|s| !s.is_empty()).collect();
-    assert_eq!(lf_lines.len(), 3);
+    assert_eq!(raw.split('\n').filter(|s| !s.is_empty()).count(), 3);
 }
 
 #[test]
@@ -317,11 +316,8 @@ fn test_bare_cr_handling() {
     // RFC 3977 requires \r\n; bare \r is not compliant
     let raw = "Line1\rLine2\r.\r";
 
-    let crlf_lines: Vec<&str> = raw.split("\r\n").filter(|s| !s.is_empty()).collect();
-    assert_eq!(crlf_lines.len(), 1);
-
-    let cr_lines: Vec<&str> = raw.split('\r').filter(|s| !s.is_empty()).collect();
-    assert_eq!(cr_lines.len(), 3);
+    assert_eq!(raw.split("\r\n").filter(|s| !s.is_empty()).count(), 1);
+    assert_eq!(raw.split('\r').filter(|s| !s.is_empty()).count(), 3);
 }
 
 #[test]
@@ -338,8 +334,9 @@ fn test_mixed_line_endings() {
 
 #[test]
 fn test_multiline_terminator_constant() {
-    assert_eq!(MULTILINE_TERMINATOR, b"\r\n.\r\n");
-    assert_eq!(MULTILINE_TERMINATOR.len(), 5);
+    // The NNTP multiline terminator is \r\n.\r\n (5 bytes)
+    let terminator = b"\r\n.\r\n";
+    assert_eq!(terminator.len(), 5);
 }
 
 #[test]
@@ -353,22 +350,20 @@ fn test_crlf_constant() {
 #[test]
 fn test_terminator_in_raw_bytes() {
     let response = b"220 Article follows\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
-
-    // The response should end with the multiline terminator
-    assert!(response.ends_with(MULTILINE_TERMINATOR));
+    assert!(TailBuffer::default().detect_terminator(response).is_found());
 }
 
 #[test]
 fn test_no_terminator_in_partial_response() {
     let partial = b"220 Article follows\r\nSubject: Test\r\n";
-    assert!(!partial.ends_with(MULTILINE_TERMINATOR));
+    assert!(!TailBuffer::default().detect_terminator(partial).is_found());
 }
 
 #[test]
 fn test_terminator_detection_with_dot_content() {
     // A line that's ".." followed by terminator should not confuse detection
     let response = b"222 Body\r\n..Content starting with dot\r\n.\r\n";
-    assert!(response.ends_with(MULTILINE_TERMINATOR));
+    assert!(TailBuffer::default().detect_terminator(response).is_found());
 
     // Verify the ".." is content, not terminator
     let body_start = b"222 Body\r\n".len();

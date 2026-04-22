@@ -31,6 +31,32 @@
 //! - **Per-command routing mode**: Each command is routed to a backend (round-robin),
 //!   but commands are still processed serially (NNTP is synchronous)
 
+// Nursery lint that often produces less readable code with multi-line closures.
+#![allow(clippy::option_if_let_else)]
+// Doc coverage requirements — adding Errors/Panics sections to 63+31 functions is
+// mechanical noise; the codebase uses anyhow::Error pervasively and panics are rare.
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+// f64 comparisons in chart/metrics code — comparing against 0.0 and similar
+// exact values is intentional here; using approx comparisons would be wrong.
+#![allow(clippy::float_cmp)]
+// Casting u64/usize to f64 for chart coordinates is intentional: precision loss
+// at large values is acceptable for display purposes (52-bit mantissa covers
+// all realistic throughput values accurately).
+#![allow(clippy::cast_precision_loss)]
+// `use` items declared inside function bodies are idiomatic for localizing imports;
+// this lint treats them as confusing, but they improve locality in long functions.
+#![allow(clippy::items_after_statements)]
+// Numeric cast warnings: all conversions in this codebase are intentional.
+// u128→u64 timestamps: safe (u64 holds ~584 years of nanoseconds).
+// u64/usize→usize/u32: safe at realistic article/connection counts.
+// f64→u64: display-only, values are bounded and non-negative.
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+// Long functions in complex handlers are necessary; splitting would obscure the
+// control flow. Document with comments instead of splitting arbitrarily.
+#![allow(clippy::too_many_lines)]
+
 // Module declarations
 pub mod args;
 pub mod auth;
@@ -64,19 +90,8 @@ pub use config::{
     Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
     load_config, load_config_from_env, load_config_with_fallback,
 };
-pub use proxy::{NntpProxy, NntpProxyBuilder, is_client_disconnect_error};
+pub use proxy::{NntpProxy, NntpProxyBuilder};
 pub use runtime::{RuntimeConfig, shutdown_signal};
-
-// Re-export streaming utilities for standalone client use
-pub mod streaming {
-    //! Streaming utilities for reading NNTP multiline responses
-    //!
-    //! These are useful when building standalone NNTP clients that need to
-    //! fetch articles directly from servers.
-    pub use crate::session::streaming::{
-        stream_and_capture_multiline_response, stream_multiline_response,
-    };
-}
 
 // Re-export backend command utilities for standalone client use
 pub mod backend {

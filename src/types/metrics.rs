@@ -2,7 +2,7 @@
 //!
 //! Uses phantom types to provide zero-cost newtype wrappers with compile-time direction tracking.
 //! All byte counter types share the same implementation via `ByteCounter<D>` where `D` is a
-//! direction marker type (ClientToBackend, BackendToClient, etc.).
+//! direction marker type (`ClientToBackend`, `BackendToClient`, etc.).
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -13,23 +13,78 @@ use std::ops::{Add, AddAssign};
 // ============================================================================
 
 /// Marker: Client → Backend traffic
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ClientToBackend;
 
 /// Marker: Backend → Client traffic
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BackendToClient;
 
 /// Marker: Generic client traffic
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Client;
 
 /// Marker: Bytes sent
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Sent;
 
 /// Marker: Bytes received
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Received;
 
 // ============================================================================
@@ -41,7 +96,18 @@ pub struct Received;
 /// This zero-cost abstraction provides type-safe byte counting where the direction
 /// is encoded in the type system. The `PhantomData<D>` has zero size at runtime.
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ByteCounter<D> {
     bytes: u64,
     _direction: PhantomData<D>,
@@ -91,6 +157,7 @@ impl<D> ByteCounter<D> {
 
     #[must_use]
     #[inline]
+    #[allow(clippy::needless_pass_by_value)] // Copy type; by-value is idiomatic like u64::saturating_sub
     pub const fn saturating_sub(self, other: Self) -> Self {
         Self {
             bytes: self.bytes.saturating_sub(other.bytes),
@@ -157,7 +224,7 @@ pub type BytesSent = ByteCounter<Sent>;
 pub type BytesReceived = ByteCounter<Received>;
 
 /// Transfer statistics for a session
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransferMetrics {
     pub client_to_backend: ClientToBackendBytes,
     pub backend_to_client: BackendToClientBytes,
@@ -182,13 +249,13 @@ impl TransferMetrics {
 
     #[must_use]
     #[inline]
-    pub fn total(&self) -> u64 {
+    pub const fn total(&self) -> u64 {
         self.client_to_backend.as_u64() + self.backend_to_client.as_u64()
     }
 
     #[must_use]
     #[inline]
-    pub fn as_tuple(&self) -> (u64, u64) {
+    pub const fn as_tuple(&self) -> (u64, u64) {
         (
             self.client_to_backend.as_u64(),
             self.backend_to_client.as_u64(),
@@ -197,7 +264,7 @@ impl TransferMetrics {
 
     /// Saturating subtraction of two transfer metrics
     #[must_use]
-    pub fn saturating_sub(self, other: Self) -> Self {
+    pub const fn saturating_sub(self, other: Self) -> Self {
         Self {
             client_to_backend: self
                 .client_to_backend
@@ -237,7 +304,7 @@ mod tests {
     proptest! {
         /// Property: ByteCounter arithmetic works correctly across all direction types
         #[test]
-        fn prop_byte_counter_arithmetic(initial in 0u64..1000000, increment in 0usize..1000000, b in 0u64..1000000) {
+        fn prop_byte_counter_arithmetic(initial in 0u64..1_000_000, increment in 0usize..1_000_000, b in 0u64..1_000_000) {
             // Test add() method
             let c2b = ClientToBackendBytes::new(initial).add(increment);
             let b2c = BackendToClientBytes::new(initial).add(increment);
@@ -285,14 +352,14 @@ mod tests {
     proptest! {
         /// Property: total() equals sum of components
         #[test]
-        fn prop_transfer_metrics_total(c2b in 0u64..1000000, b2c in 0u64..1000000) {
+        fn prop_transfer_metrics_total(c2b in 0u64..1_000_000, b2c in 0u64..1_000_000) {
             let metrics = TransferMetrics::new(c2b, b2c);
             prop_assert_eq!(metrics.total(), c2b + b2c);
         }
 
         /// Property: saturating_sub works on TransferMetrics
         #[test]
-        fn prop_transfer_metrics_saturating_sub(a1 in 0u64..1000000, a2 in 0u64..1000000, b1 in 0u64..1000000, b2 in 0u64..1000000) {
+        fn prop_transfer_metrics_saturating_sub(a1 in 0u64..1_000_000, a2 in 0u64..1_000_000, b1 in 0u64..1_000_000, b2 in 0u64..1_000_000) {
             let metrics1 = TransferMetrics::new(a1, a2);
             let metrics2 = TransferMetrics::new(b1, b2);
             let diff = metrics1.saturating_sub(metrics2);
@@ -309,44 +376,44 @@ mod tests {
     #[test]
     fn test_counter_display_with_unit() {
         let c = TotalConnections::new(42);
-        assert_eq!(format!("{}", c), "42 connections");
+        assert_eq!(format!("{c}"), "42 connections");
     }
 
     #[test]
     fn test_counter_display_with_unit_zero() {
         let c = TotalConnections::new(0);
-        assert_eq!(format!("{}", c), "0 connections");
+        assert_eq!(format!("{c}"), "0 connections");
     }
 
     #[test]
     fn test_counter_display_bytes_per_second() {
         let c = BytesPerSecondRate::new(1500);
-        assert_eq!(format!("{}", c), "1500 B/s");
+        assert_eq!(format!("{c}"), "1500 B/s");
     }
 
     #[test]
     fn test_counter_display_article_bytes() {
-        let c = ArticleBytesTotal::new(999999);
-        assert_eq!(format!("{}", c), "999999 bytes");
+        let c = ArticleBytesTotal::new(999_999);
+        assert_eq!(format!("{c}"), "999999 bytes");
     }
 
     #[test]
     fn test_counter_display_empty_unit() {
         // TimingMeasurementCount uses empty unit — should NOT have trailing space
         let c = TimingMeasurementCount::new(7);
-        assert_eq!(format!("{}", c), "7");
+        assert_eq!(format!("{c}"), "7");
     }
 
     #[test]
     fn test_counter_display_empty_unit_zero() {
         let c = TimingMeasurementCount::new(0);
-        assert_eq!(format!("{}", c), "0");
+        assert_eq!(format!("{c}"), "0");
     }
 
     #[test]
     fn test_counter_display_empty_unit_large() {
         let c = TimingMeasurementCount::new(u64::MAX);
-        assert_eq!(format!("{}", c), format!("{}", u64::MAX));
+        assert_eq!(format!("{c}"), format!("{}", u64::MAX));
     }
 
     #[test]
@@ -400,7 +467,7 @@ mod tests {
     #[test]
     fn test_timing_measurement_count_debug() {
         let c = TimingMeasurementCount::new(99);
-        let dbg = format!("{:?}", c);
+        let dbg = format!("{c:?}");
         assert!(dbg.contains("99"));
     }
 
@@ -427,7 +494,18 @@ mod tests {
 macro_rules! define_counter {
     ($name:ident, $unit:expr) => {
         #[repr(transparent)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Default,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(u64);
 
         impl $name {

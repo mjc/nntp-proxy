@@ -119,7 +119,7 @@ impl ThroughputHistory {
 
     /// Get all points
     #[must_use]
-    fn points(&self) -> &VecDeque<ThroughputPoint> {
+    const fn points(&self) -> &VecDeque<ThroughputPoint> {
         &self.points
     }
 
@@ -132,8 +132,8 @@ impl ThroughputHistory {
 
 /// TUI application builder
 ///
-/// Provides a fluent API for constructing TuiApp instances with optional configuration.
-/// This replaces the multiple constructor pattern (new, with_log_buffer, with_history_size)
+/// Provides a fluent API for constructing `TuiApp` instances with optional configuration.
+/// This replaces the multiple constructor pattern (new, `with_log_buffer`, `with_history_size`)
 /// with a single, flexible builder.
 ///
 /// # Examples
@@ -167,7 +167,7 @@ pub struct TuiAppBuilder {
 impl TuiAppBuilder {
     /// Create a new TUI app builder
     #[must_use]
-    pub fn new(
+    pub const fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
         servers: Arc<Vec<Server>>,
@@ -206,12 +206,12 @@ impl TuiAppBuilder {
 
     /// Set custom history size (default is 60 points)
     #[must_use]
-    pub fn with_history_size(mut self, history_size: HistorySize) -> Self {
+    pub const fn with_history_size(mut self, history_size: HistorySize) -> Self {
         self.history_size = history_size;
         self
     }
 
-    /// Build the TuiApp
+    /// Build the `TuiApp`
     #[must_use]
     pub fn build(self) -> TuiApp {
         use crate::tui::SystemMonitor;
@@ -239,7 +239,7 @@ impl TuiAppBuilder {
             view_mode: ViewMode::default(),
             show_details: false,
             system_monitor: SystemMonitor::new(),
-            system_stats: Default::default(),
+            system_stats: crate::tui::SystemStats::default(),
         }
     }
 }
@@ -315,7 +315,6 @@ impl TuiApp {
     /// Calculate per-user rates from deltas
     #[inline]
     fn calculate_user_rates(
-        &self,
         current: &crate::metrics::UserStats,
         prev_snapshot: &crate::metrics::MetricsSnapshot,
         time_delta: f64,
@@ -326,19 +325,21 @@ impl TuiApp {
             .user_stats
             .iter()
             .find(|u| u.username == current.username)
-            .map(|prev| {
-                let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
-                let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
-                (
-                    BytesPerSecondRate::new(
-                        Self::calculate_rate(sent_delta.into(), time_delta).get() as u64,
-                    ),
-                    BytesPerSecondRate::new(
-                        Self::calculate_rate(recv_delta.into(), time_delta).get() as u64,
-                    ),
-                )
-            })
-            .unwrap_or((BytesPerSecondRate::ZERO, BytesPerSecondRate::ZERO));
+            .map_or(
+                (BytesPerSecondRate::ZERO, BytesPerSecondRate::ZERO),
+                |prev| {
+                    let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
+                    let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
+                    (
+                        BytesPerSecondRate::new(
+                            Self::calculate_rate(sent_delta.into(), time_delta).get() as u64,
+                        ),
+                        BytesPerSecondRate::new(
+                            Self::calculate_rate(recv_delta.into(), time_delta).get() as u64,
+                        ),
+                    )
+                },
+            );
 
         crate::metrics::UserStats {
             username: current.username.clone(),
@@ -410,7 +411,7 @@ impl TuiApp {
             let user_stats = new_snapshot
                 .user_stats
                 .iter()
-                .map(|stats| self.calculate_user_rates(stats, prev, time_delta))
+                .map(|stats| Self::calculate_user_rates(stats, prev, time_delta))
                 .collect();
 
             // Build enriched snapshot (shares backend_stats via Arc)
@@ -443,7 +444,7 @@ impl TuiApp {
 
     /// Get client throughput history (global)
     #[must_use]
-    pub fn client_throughput_history(&self) -> &VecDeque<ThroughputPoint> {
+    pub const fn client_throughput_history(&self) -> &VecDeque<ThroughputPoint> {
         self.client_history.points()
     }
 
@@ -459,11 +460,10 @@ impl TuiApp {
         use crate::types::BackendId;
         self.router
             .backend_load(BackendId::from_index(backend_idx))
-            .map(|pending| pending.get())
-            .unwrap_or(0)
+            .map_or(0, |pending| pending.get())
     }
 
-    /// Get load ratio for a backend (pending / max_connections)
+    /// Get load ratio for a backend (pending / `max_connections`)
     #[must_use]
     pub fn backend_load_ratio(&self, backend_idx: usize) -> Option<f64> {
         use crate::types::BackendId;
@@ -478,8 +478,7 @@ impl TuiApp {
         use crate::types::BackendId;
         self.router
             .stateful_count(BackendId::from_index(backend_idx))
-            .map(|count| count.get())
-            .unwrap_or(0)
+            .map_or(0, |count| count.get())
     }
 
     /// Get traffic share percentage for a backend
@@ -507,7 +506,7 @@ impl TuiApp {
 
     /// Get log buffer for displaying recent log messages
     #[must_use]
-    pub fn log_buffer(&self) -> &Arc<LogBuffer> {
+    pub const fn log_buffer(&self) -> &Arc<LogBuffer> {
         &self.log_buffer
     }
 
@@ -518,7 +517,7 @@ impl TuiApp {
     }
 
     /// Toggle between normal and log fullscreen view
-    pub fn toggle_log_fullscreen(&mut self) {
+    pub const fn toggle_log_fullscreen(&mut self) {
         self.view_mode = match self.view_mode {
             ViewMode::Normal => ViewMode::LogFullscreen,
             ViewMode::LogFullscreen => ViewMode::Normal,
@@ -526,13 +525,13 @@ impl TuiApp {
     }
 
     /// Toggle detailed metrics display
-    pub fn toggle_details(&mut self) {
+    pub const fn toggle_details(&mut self) {
         self.show_details = !self.show_details;
     }
 
     /// Get current details display state
     #[must_use]
-    pub fn show_details(&self) -> bool {
+    pub const fn show_details(&self) -> bool {
         self.show_details
     }
 
@@ -544,7 +543,7 @@ impl TuiApp {
 
     /// Get buffer pool (optional - for monitoring buffer stats)
     #[must_use]
-    pub fn buffer_pool(&self) -> Option<&crate::pool::BufferPool> {
+    pub const fn buffer_pool(&self) -> Option<&crate::pool::BufferPool> {
         self.buffer_pool.as_ref()
     }
 }
@@ -565,10 +564,10 @@ mod tests {
             (0..count)
                 .map(|i| {
                     Server::builder(
-                        format!("backend{}.example.com", i),
+                        format!("backend{i}.example.com"),
                         Port::try_new(119).unwrap(),
                     )
-                    .name(format!("Backend {}", i))
+                    .name(format!("Backend {i}"))
                     .build()
                     .unwrap()
                 })
@@ -576,7 +575,7 @@ mod tests {
         )
     }
 
-    /// Helper to create test TuiApp
+    /// Helper to create test `TuiApp`
     fn create_test_app(backend_count: usize) -> TuiApp {
         let metrics = MetricsCollector::new(backend_count);
         let router = Arc::new(BackendSelector::new());
@@ -584,12 +583,12 @@ mod tests {
         TuiApp::new(metrics, router, servers)
     }
 
-    /// Test for the bug where previous_snapshot was set to self.snapshot instead of new_snapshot.
+    /// Test for the bug where `previous_snapshot` was set to self.snapshot instead of `new_snapshot`.
     /// This caused the TUI to skip every other snapshot, calculating deltas over 2x the time period
     /// and showing 2x the actual throughput.
     ///
-    /// The bug: previous_snapshot = Some(self.snapshot.clone())  // OLD snapshot
-    /// The fix: previous_snapshot = Some(new_snapshot.clone())   // NEW snapshot (just used)
+    /// The bug: `previous_snapshot` = Some(self.snapshot.clone())  // OLD snapshot
+    /// The fix: `previous_snapshot` = `Some(new_snapshot.clone())`   // NEW snapshot (just used)
     #[test]
     fn test_previous_snapshot_uses_new_snapshot_not_old() {
         let metrics = MetricsCollector::new(1);
@@ -746,9 +745,7 @@ mod tests {
             let len = app.client_throughput_history().len();
             assert!(
                 len <= 5,
-                "History at iteration {} should be <= 5, got {}",
-                i,
-                len
+                "History at iteration {i} should be <= 5, got {len}"
             );
         }
 
@@ -842,7 +839,7 @@ mod tests {
         let servers = create_test_servers(1);
 
         let app = TuiAppBuilder::new(metrics, router, servers)
-            .with_log_buffer(log_buffer.clone())
+            .with_log_buffer(log_buffer)
             .build();
 
         // Should have access to log buffer
@@ -887,7 +884,7 @@ mod tests {
             Throughput::new(100.0),
             Throughput::new(200.0),
         );
-        history.push(point1.clone());
+        history.push(point1);
 
         assert!(history.latest().is_some());
         assert_eq!(history.latest().unwrap().sent_per_sec().get(), 100.0);
@@ -897,7 +894,7 @@ mod tests {
             Throughput::new(300.0),
             Throughput::new(400.0),
         );
-        history.push(point2.clone());
+        history.push(point2);
 
         // Latest should be point2
         assert_eq!(history.latest().unwrap().sent_per_sec().get(), 300.0);
@@ -928,7 +925,7 @@ mod tests {
         let servers = create_test_servers(1);
 
         let app = TuiAppBuilder::new(metrics, router, servers)
-            .with_log_buffer(log_buffer.clone())
+            .with_log_buffer(log_buffer)
             .build();
 
         let logs = app.log_buffer().recent_lines(1);

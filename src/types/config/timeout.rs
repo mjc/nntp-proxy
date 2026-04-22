@@ -150,7 +150,7 @@ mod tests {
         #[test]
         fn timeout_debug_contains_name(secs in 0u64..100u64) {
             let timeout = BackendReadTimeout::new(Duration::from_secs(secs));
-            let debug_str = format!("{:?}", timeout);
+            let debug_str = format!("{timeout:?}");
             prop_assert!(debug_str.contains("BackendReadTimeout"));
         }
     }

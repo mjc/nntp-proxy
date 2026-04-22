@@ -22,8 +22,8 @@ use super::ttl;
 pub struct ArticleEntry {
     /// Backend availability bitset (2 bytes)
     ///
-    /// No mutex needed: moka clones entries on get(), and updates go through
-    /// cache.insert() which replaces the whole entry atomically.
+    /// No mutex needed: moka clones entries on `get()`, and updates go through
+    /// `cache.insert()` which replaces the whole entry atomically.
     backend_availability: ArticleAvailability,
 
     /// Complete response buffer (Arc for cheap cloning)
@@ -48,6 +48,7 @@ impl ArticleEntry {
     ///
     /// Backend availability starts with assumption all backends have the article.
     /// Tier defaults to 0, timestamp is set to now.
+    #[must_use]
     pub fn new(buffer: Vec<u8>) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -60,6 +61,7 @@ impl ArticleEntry {
     /// Create from response buffer with a specific tier
     ///
     /// Used when caching articles from backends with known tier.
+    #[must_use]
     pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -72,6 +74,7 @@ impl ArticleEntry {
     /// Create from pre-wrapped Arc buffer
     ///
     /// Use this when the buffer is already wrapped in Arc to avoid double wrapping.
+    #[must_use]
     pub fn from_arc(buffer: Arc<Vec<u8>>) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -82,6 +85,7 @@ impl ArticleEntry {
     }
 
     /// Create from pre-wrapped Arc buffer with a specific tier
+    #[must_use]
     pub fn from_arc_with_tier(buffer: Arc<Vec<u8>>, tier: u8) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
@@ -95,25 +99,28 @@ impl ArticleEntry {
     ///
     /// See [`super::ttl`] for the TTL formula.
     #[inline]
+    #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
         ttl::is_expired(self.inserted_at, base_ttl_millis, self.tier)
     }
 
     /// Get the tier of the backend that provided this article
     #[inline]
-    pub fn tier(&self) -> u8 {
+    #[must_use]
+    pub const fn tier(&self) -> u8 {
         self.tier
     }
 
     /// Set the tier (used when updating entry)
     #[inline]
-    pub fn set_tier(&mut self, tier: u8) {
+    pub const fn set_tier(&mut self, tier: u8) {
         self.tier = tier;
     }
 
     /// Get raw buffer for serving to client
     #[inline]
-    pub fn buffer(&self) -> &Arc<Vec<u8>> {
+    #[must_use]
+    pub const fn buffer(&self) -> &Arc<Vec<u8>> {
         &self.buffer
     }
 
@@ -122,6 +129,7 @@ impl ArticleEntry {
     /// Parses the first 3 bytes as the status code.
     /// Returns None if buffer is too short or invalid.
     #[inline]
+    #[must_use]
     pub fn status_code(&self) -> Option<StatusCode> {
         StatusCode::parse(&self.buffer)
     }
@@ -130,6 +138,7 @@ impl ArticleEntry {
     ///
     /// Returns false if backend is known to not have this article (returned 430 before).
     #[inline]
+    #[must_use]
     pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
         self.backend_availability.should_try(backend_id)
     }
@@ -145,16 +154,18 @@ impl ArticleEntry {
     }
 
     /// Set backend availability (used for hydrating from hybrid cache)
-    pub fn set_availability(&mut self, availability: ArticleAvailability) {
+    pub const fn set_availability(&mut self, availability: ArticleAvailability) {
         self.backend_availability = availability;
     }
 
     /// Check if all backends have been tried and none have the article
+    #[must_use]
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
         self.backend_availability.all_exhausted(total_backends)
     }
 
     /// Get backends that might have this article
+    #[must_use]
     pub fn available_backends(&self, total_backends: BackendCount) -> Vec<BackendId> {
         self.backend_availability
             .available_backends(total_backends)
@@ -165,7 +176,8 @@ impl ArticleEntry {
     ///
     /// This provides the same interface as the old CachedArticle.response field.
     #[inline]
-    pub fn response(&self) -> &Arc<Vec<u8>> {
+    #[must_use]
+    pub const fn response(&self) -> &Arc<Vec<u8>> {
         &self.buffer
     }
 
@@ -175,7 +187,8 @@ impl ArticleEntry {
     /// If false, we haven't tried any backends yet and should run precheck instead of
     /// serving from cache.
     #[inline]
-    pub fn has_availability_info(&self) -> bool {
+    #[must_use]
+    pub const fn has_availability_info(&self) -> bool {
         self.backend_availability.has_availability_info()
     }
 
@@ -191,6 +204,7 @@ impl ArticleEntry {
     /// This is used when `cache_articles=true` to determine if we can serve
     /// directly from cache or need to fetch additional data.
     #[inline]
+    #[must_use]
     pub fn is_complete_article(&self) -> bool {
         let Some(code) = self.status_code() else {
             return false;
@@ -205,6 +219,7 @@ impl ArticleEntry {
     /// 2. Have CRLF somewhere (line terminator)
     /// 3. End with `\r\n.\r\n` for multiline responses (220/221/222)
     #[inline]
+    #[must_use]
     pub fn is_valid_response(&self) -> bool {
         super::entry_helpers::is_valid_response(&self.buffer)
     }
@@ -219,6 +234,7 @@ impl ArticleEntry {
     ///
     /// Returns `None` if cached response can't serve this command type or if
     /// the cached buffer fails validation.
+    #[must_use]
     pub fn response_for_command(
         &self,
         cmd_verb: &str,
@@ -232,6 +248,7 @@ impl ArticleEntry {
     ///
     /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
+    #[must_use]
     pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
         let Some(code) = self.status_code() else {
             return false;
@@ -241,7 +258,7 @@ impl ArticleEntry {
 
     /// Initialize availability tracker from this cached entry
     ///
-    /// Creates a fresh ArticleAvailability with backends marked missing based on
+    /// Creates a fresh `ArticleAvailability` with backends marked missing based on
     /// cached knowledge (backends that previously returned 430).
     pub fn to_availability(&self, total_backends: BackendCount) -> ArticleAvailability {
         let mut availability = ArticleAvailability::new();
@@ -282,6 +299,7 @@ impl ArticleCache {
     /// * `max_capacity` - Maximum cache size in bytes (uses weighted entries)
     /// * `ttl` - Time-to-live for cached articles
     /// * `cache_articles` - Whether to cache full article bodies (true) or just availability (false)
+    #[must_use]
     pub fn new(max_capacity: u64, ttl: Duration, cache_articles: bool) -> Self {
         // Build cache with byte-based capacity using weigher
         // max_capacity is total bytes allowed
@@ -373,7 +391,7 @@ impl ArticleCache {
 
     /// Get an article from the cache
     ///
-    /// Accepts any lifetime MessageId and uses the string content (without brackets) as key.
+    /// Accepts any lifetime `MessageId` and uses the string content (without brackets) as key.
     ///
     /// **Zero-allocation**: `without_brackets()` returns `&str`, which moka accepts directly
     /// for `Arc<str>` keys via the `Borrow<str>` trait. This avoids allocating a new `Arc<str>`
@@ -381,7 +399,7 @@ impl ArticleCache {
     ///
     /// **Tier-aware TTL**: Even if moka hasn't expired the entry yet, we check if the entry
     /// is expired based on tier-aware TTL. Higher tier entries get longer TTLs.
-    pub async fn get<'a>(&self, message_id: &MessageId<'a>) -> Option<ArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<ArticleEntry> {
         // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
         // This is zero-allocation: no Arc<str> is created for the lookup
         let result = self.cache.get(message_id.without_brackets()).await;
@@ -409,7 +427,7 @@ impl ArticleCache {
     /// Upsert cache entry (insert or update) - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
-    /// This eliminates the race condition of separate get() + insert() calls
+    /// This eliminates the race condition of separate `get()` + `insert()` calls
     /// and provides key-level locking for concurrent operations.
     ///
     /// If entry exists: updates the entry and marks backend as having the article
@@ -421,9 +439,9 @@ impl ArticleCache {
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
     /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
-    pub async fn upsert<'a>(
+    pub async fn upsert(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         buffer: Vec<u8>,
         backend_id: BackendId,
         tier: u8,
@@ -435,7 +453,7 @@ impl ArticleCache {
         let new_buffer = if cache_articles {
             buffer
         } else {
-            self.create_minimal_stub(&buffer)
+            Self::create_minimal_stub(&buffer)
         };
 
         // Wrap in Arc so we can efficiently share/move into closure without clone.
@@ -452,13 +470,15 @@ impl ArticleCache {
 
                     // Decide whether to update buffer based on completeness
                     let existing_complete = entry.is_complete_article();
-                    let new_complete = new_buffer.len() >= 30 && new_buffer.ends_with(b".\r\n");
+                    let new_complete = new_buffer.len() >= 30
+                        && crate::session::streaming::tail_buffer::TailBuffer::default()
+                            .detect_terminator(&new_buffer)
+                            .is_found();
 
                     let should_replace = match (existing_complete, new_complete) {
                         (false, true) => true,  // Stub → Complete: Always replace
                         (true, false) => false, // Complete → Stub: Never replace
-                        (true, true) => new_buffer.len() > entry.buffer.len(), // Both complete: larger wins
-                        (false, false) => new_buffer.len() > entry.buffer.len(), // Both stubs: larger wins
+                        (true, true) | (false, false) => new_buffer.len() > entry.buffer.len(), // Same type: larger wins
                     };
 
                     if should_replace {
@@ -495,7 +515,7 @@ impl ArticleCache {
     ///
     /// Extracts the status code from the first line and creates a minimal stub.
     /// Falls back to "200\r\n" if parsing fails.
-    fn create_minimal_stub(&self, buffer: &[u8]) -> Vec<u8> {
+    fn create_minimal_stub(buffer: &[u8]) -> Vec<u8> {
         // Find first line (status code line)
         if let Some(end) = buffer.iter().position(|&b| b == b'\n') {
             // Extract status code (first 3 digits)
@@ -514,7 +534,7 @@ impl ArticleCache {
     /// Record that a backend returned 430 for this article - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
-    /// This eliminates the race condition of separate get() + insert() calls
+    /// This eliminates the race condition of separate `get()` + `insert()` calls
     /// and provides key-level locking for concurrent operations.
     ///
     /// If the article is already cached, updates the availability bitset.
@@ -524,11 +544,7 @@ impl ArticleCache {
     /// Note: We don't store the actual backend 430 response because:
     /// 1. We always send a standardized 430 to clients, never the backend's response
     /// 2. The only info we need is the availability bitset (which backends returned 430)
-    pub async fn record_backend_missing<'a>(
-        &self,
-        message_id: MessageId<'a>,
-        backend_id: BackendId,
-    ) {
+    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key: Arc<str> = message_id.without_brackets().into();
         let misses = &self.misses;
 
@@ -561,19 +577,19 @@ impl ArticleCache {
     /// Sync availability state from local tracker to cache - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_compute_with()` for atomic get-modify-store.
-    /// This eliminates the race condition of separate get() + insert() calls
+    /// This eliminates the race condition of separate `get()` + `insert()` calls
     /// and provides key-level locking for concurrent operations.
     ///
     /// This is called ONCE at the end of a retry loop to persist all the
     /// backends that returned 430 during this request. Much more efficient
-    /// than calling record_backend_missing for each backend individually.
+    /// than calling `record_backend_missing` for each backend individually.
     ///
     /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
     /// (the actual article will be cached via upsert, which may race with this call).
-    pub async fn sync_availability<'a>(
+    pub async fn sync_availability(
         &self,
-        message_id: MessageId<'a>,
+        message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
         use moka::ops::compute::Op;
@@ -622,7 +638,8 @@ impl ArticleCache {
     }
 
     /// Get cache statistics
-    pub async fn stats(&self) -> CacheStats {
+    #[must_use]
+    pub fn stats(&self) -> CacheStats {
         CacheStats {
             entry_count: self.cache.entry_count(),
             weighted_size: self.cache.weighted_size(),
@@ -634,31 +651,35 @@ impl ArticleCache {
     /// This is a low-level method that bypasses the usual upsert logic.
     /// Only use this in tests where you need precise control over cache state.
     #[cfg(test)]
-    pub async fn insert<'a>(&self, message_id: MessageId<'a>, entry: ArticleEntry) {
+    pub async fn insert(&self, message_id: MessageId<'_>, entry: ArticleEntry) {
         let key: Arc<str> = message_id.without_brackets().into();
         self.cache.insert(key, entry).await;
     }
 
     /// Get maximum cache capacity
     #[inline]
-    pub fn capacity(&self) -> u64 {
+    #[must_use]
+    pub const fn capacity(&self) -> u64 {
         self.capacity
     }
 
     /// Get current number of cached entries (synchronous)
     #[inline]
+    #[must_use]
     pub fn entry_count(&self) -> u64 {
         self.cache.entry_count()
     }
 
     /// Get current weighted size in bytes (synchronous)
     #[inline]
+    #[must_use]
     pub fn weighted_size(&self) -> u64 {
         self.cache.weighted_size()
     }
 
     /// Get cache hit rate as percentage (0.0 to 100.0)
     #[inline]
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
@@ -694,7 +715,7 @@ mod tests {
     use std::time::Duration;
 
     fn create_test_article(msgid: &str) -> ArticleEntry {
-        let buffer = format!("220 0 {}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n", msgid).into_bytes();
+        let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
         ArticleEntry::new(buffer)
     }
 
@@ -891,14 +912,14 @@ mod tests {
         assert!(!retrieved.should_try_backend(BackendId::from_index(1)));
     }
 
-    /// CRITICAL BUG FIX TEST: record_backend_missing must create cache entries
+    /// CRITICAL BUG FIX TEST: `record_backend_missing` must create cache entries
     /// for articles that don't exist anywhere (all backends return 430).
     ///
-    /// Bug: Previously, if an article wasn't cached, record_backend_missing
+    /// Bug: Previously, if an article wasn't cached, `record_backend_missing`
     /// would silently do nothing. This caused repeated queries to all backends
     /// for missing articles, resulting in:
     /// - Massive bandwidth waste
-    /// - SABnzbd reporting "gigabytes of missing articles"
+    /// - `SABnzbd` reporting "gigabytes of missing articles"
     /// - 4xx/5xx error counts not increasing (metrics bug)
     #[tokio::test]
     async fn test_record_backend_missing_creates_new_entry() {
@@ -963,7 +984,7 @@ mod tests {
         let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true); // 1MB
 
         // Initial stats
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         assert_eq!(stats.entry_count, 0);
 
         // Insert one article
@@ -975,7 +996,7 @@ mod tests {
         cache.sync().await;
 
         // Check stats again
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         assert_eq!(stats.entry_count, 1);
     }
 
@@ -1017,16 +1038,10 @@ mod tests {
         let stub_size = retrieved.buffer().len();
 
         // Stub should be much smaller than full article (just "220\r\n")
-        assert!(
-            stub_size < 10,
-            "Stub size {} should be < 10 bytes",
-            stub_size
-        );
+        assert!(stub_size < 10, "Stub size {stub_size} should be < 10 bytes");
         assert!(
             stub_size < full_size,
-            "Stub {} should be smaller than full {}",
-            stub_size,
-            full_size
+            "Stub {stub_size} should be smaller than full {full_size}"
         );
 
         // Test with cache_articles=true - should store full article
@@ -1053,7 +1068,7 @@ mod tests {
 
         // Insert 3 articles (exceeds capacity)
         for i in 1..=3 {
-            let msgid_str = format!("<article{}@example.com>", i);
+            let msgid_str = format!("<article{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let article = create_test_article(msgid.as_ref());
             cache.insert(msgid, article).await;
@@ -1064,7 +1079,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         cache.sync().await;
 
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         assert!(
             stats.entry_count <= 3,
             "Cache should have at most 3 entries with 500 byte capacity"
@@ -1120,7 +1135,7 @@ mod tests {
 
         // Insert 12 more articles (13 total)
         for i in 2..=13 {
-            let msgid_str = format!("<article{}@example.com>", i);
+            let msgid_str = format!("<article{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let response = format!(
                 "222 0 {}\r\n{}\r\n.\r\n",
@@ -1135,7 +1150,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         cache.sync().await;
 
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         // With actual size (no multiplier), should fit 11-13 large articles
         assert!(
             stats.entry_count >= 11,
@@ -1165,7 +1180,7 @@ mod tests {
 
         // Insert many small stubs
         for i in 2..=200 {
-            let msgid_str = format!("<stub{}@example.com>", i);
+            let msgid_str = format!("<stub{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let stub = format!("223 0 {}\r\n", msgid.as_str());
             let article = ArticleEntry::new(stub.as_bytes().to_vec());
@@ -1176,7 +1191,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         cache.sync().await;
 
-        let stats = cache.stats().await;
+        let stats = cache.stats();
         // Should be able to fit ~150-185 small stubs in 1MB
         assert!(
             stats.entry_count >= 100,

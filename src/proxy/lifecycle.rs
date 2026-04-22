@@ -3,7 +3,7 @@
 //! Contains the private helper methods on `NntpProxy` for managing
 //! session setup, finalization, metrics recording, and idle pool cleanup.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -18,13 +18,12 @@ use crate::router;
 use crate::session::ClientSession;
 use crate::types::{self, ClientAddress, TransferMetrics};
 
-use super::{NntpProxy, is_client_disconnect_error};
+use crate::session::SessionError;
+
+use super::NntpProxy;
 
 impl NntpProxy {
     // Helper methods for session management
-
-    /// Idle timeout after which pools are cleared when a new client connects (5 minutes)
-    pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
     #[inline]
     pub(super) fn record_connection_opened(&self) {
@@ -40,7 +39,7 @@ impl NntpProxy {
     ///
     /// Call this when a new client connection is accepted.
     #[inline]
-    pub(super) fn increment_active_clients(&self) {
+    pub fn increment_active_clients(&self) {
         self.active_clients.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -48,7 +47,7 @@ impl NntpProxy {
     ///
     /// Call this when a client connection closes.
     #[inline]
-    pub(super) fn decrement_active_clients(&self) {
+    pub fn decrement_active_clients(&self) {
         let prev = self.active_clients.fetch_sub(1, Ordering::Relaxed);
 
         // When last client disconnects, record the timestamp
@@ -58,15 +57,16 @@ impl NntpProxy {
         }
     }
 
-    /// Check if pools should be cleared due to idle timeout
+    /// Check if any backend pools should be cleared due to idle timeout.
     ///
-    /// Returns true if pools were cleared.
-    /// Pools are cleared when:
+    /// Returns true if any pools were cleared.
+    /// Each backend is checked independently against its configured `backend_idle_timeout`.
+    /// A backend's pool is cleared when:
     /// 1. No clients are currently active
-    /// 2. The last activity was more than IDLE_TIMEOUT ago
+    /// 2. The last activity was more than that backend's `backend_idle_timeout` ago
     ///
     /// This prevents stale connections from accumulating during overnight idle periods.
-    pub(super) fn check_and_clear_stale_pools(&self) -> bool {
+    pub(crate) fn check_and_clear_stale_pools(&self) -> bool {
         // Fast path: if there are active clients, pools are in use
         if self.active_clients.load(Ordering::Relaxed) > 0 {
             return false;
@@ -83,21 +83,21 @@ impl NntpProxy {
         let now = self.start_instant.elapsed();
         let idle_duration = now.saturating_sub(last_activity);
 
-        if idle_duration > Self::IDLE_TIMEOUT {
-            info!(
-                idle_secs = idle_duration.as_secs(),
-                pool_count = self.connection_providers.len(),
-                "Clearing stale pool connections after idle timeout"
-            );
-
-            for provider in &self.connection_providers {
+        let mut any_cleared = false;
+        for (server, provider) in self.servers.iter().zip(&self.connection_providers) {
+            if idle_duration > server.backend_idle_timeout {
+                info!(
+                    backend = server.name.as_ref(),
+                    idle_secs = idle_duration.as_secs(),
+                    timeout_secs = server.backend_idle_timeout.as_secs(),
+                    "Clearing idle backend connections"
+                );
                 provider.clear_idle_connections();
+                any_cleared = true;
             }
-
-            true
-        } else {
-            false
         }
+
+        any_cleared
     }
 
     /// Build a session with standard configuration (conditionally enables metrics)
@@ -153,6 +153,7 @@ impl NntpProxy {
 
     /// Log backend routing selection
     #[inline]
+    #[allow(clippy::unused_self)]
     pub(super) fn log_routing_selection(
         &self,
         client_addr: ClientAddress,
@@ -222,6 +223,7 @@ impl NntpProxy {
 
     /// Generate short session ID for logging
     #[inline]
+    #[allow(clippy::unused_self)]
     pub(super) fn generate_session_id(&self, session: &ClientSession) -> String {
         crate::formatting::short_id(session.client_id().as_uuid())
     }
@@ -238,6 +240,7 @@ impl NntpProxy {
 
     /// Apply TCP optimizations to client socket
     #[inline]
+    #[allow(clippy::unused_self)]
     pub(super) fn apply_tcp_optimizations(&self, client_stream: &TcpStream) {
         use crate::network::TcpOptimizer;
         TcpOptimizer::new(client_stream)
@@ -259,12 +262,12 @@ impl NntpProxy {
     /// Finalize stateful session with metrics and cleanup
     pub(super) fn finalize_stateful_session(
         &self,
-        metrics: Result<TransferMetrics>,
+        metrics: Result<TransferMetrics, SessionError>,
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
         backend_id: crate::types::BackendId,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         self.record_connection_if_unauthenticated(session);
         self.router.complete_command(backend_id);
         self.record_session_metrics(metrics, client_addr, session_id, session, Some(backend_id))?;
@@ -275,11 +278,11 @@ impl NntpProxy {
     /// Finalize per-command session with logging and cleanup
     pub(super) fn finalize_per_command_session(
         &self,
-        metrics: Result<TransferMetrics>,
+        metrics: Result<TransferMetrics, SessionError>,
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         self.record_session_metrics(metrics, client_addr, session_id, session, None)?;
         self.record_connection_closed();
         Ok(())
@@ -298,12 +301,12 @@ impl NntpProxy {
     /// Record session metrics and log completion or errors
     pub(super) fn record_session_metrics(
         &self,
-        metrics: Result<TransferMetrics>,
+        metrics: Result<TransferMetrics, SessionError>,
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
         backend_id: Option<crate::types::BackendId>,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         match metrics {
             Ok(m) => {
                 self.log_session_completion(
@@ -327,9 +330,9 @@ impl NntpProxy {
                     self.metrics.record_error(bid);
                 }
 
-                // Only log non-client-disconnect errors (avoid spam from normal disconnects)
-                if !is_client_disconnect_error(&e) {
-                    warn!("Session error for client {}: {:?}", client_addr, e);
+                // Only log backend errors — client disconnects are normal operation
+                if let SessionError::Backend(ref inner) = e {
+                    warn!("Session error for client {}: {:?}", client_addr, inner);
                 }
                 Err(e)
             }
@@ -338,7 +341,7 @@ impl NntpProxy {
 
     /// Get session mode label for logging
     #[inline]
-    pub(super) fn session_mode_label(
+    pub(super) const fn session_mode_label(
         &self,
         session_mode: crate::session::SessionMode,
     ) -> &'static str {
@@ -355,17 +358,18 @@ impl NntpProxy {
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         debug!("New client connection from {}", client_addr);
 
         // Check for stale pools before handling (lazy recreation after idle)
         self.check_and_clear_stale_pools();
         self.increment_active_clients();
 
-        let result = async {
+        let result: Result<(), SessionError> = async {
             let backend_id = self
                 .prepare_stateful_connection(&mut client_stream, client_addr)
-                .await?;
+                .await
+                .map_err(SessionError::Backend)?;
             let server_idx = backend_id.as_index();
 
             let session = self.create_session(client_addr, None);
@@ -398,7 +402,7 @@ impl NntpProxy {
         &self,
         client_stream: TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         // Check for stale pools before handling (lazy recreation after idle)
         self.check_and_clear_stale_pools();
         self.increment_active_clients();
@@ -416,7 +420,7 @@ impl NntpProxy {
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<()> {
+    ) -> Result<(), SessionError> {
         let mode_label = self.routing_mode_display_name();
         debug!(
             "New {} routing client connection from {}",
@@ -424,20 +428,13 @@ impl NntpProxy {
         );
 
         self.prepare_per_command_connection(&mut client_stream, client_addr)
-            .await?;
+            .await
+            .map_err(SessionError::Backend)?;
 
         let session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = self.generate_session_id(&session);
 
-        let metrics = session
-            .handle_per_command_routing(client_stream)
-            .await
-            .with_context(|| {
-                format!(
-                    "{} routing session failed for {} [{}]",
-                    mode_label, client_addr, session_id
-                )
-            });
+        let metrics = session.handle_per_command_routing(client_stream).await;
 
         self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
     }
@@ -590,7 +587,7 @@ mod tests {
         let session_id = proxy.generate_session_id(&session);
 
         let result = proxy.record_session_metrics(
-            Err(anyhow::anyhow!("test error")),
+            Err(SessionError::Backend(anyhow::anyhow!("test error"))),
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
             &session_id,
             &session,
@@ -742,7 +739,7 @@ mod tests {
         let backend_id = crate::types::BackendId::from_index(0);
 
         let result = proxy.finalize_stateful_session(
-            Err(anyhow::anyhow!("connection error")),
+            Err(SessionError::Backend(anyhow::anyhow!("connection error"))),
             client_addr,
             &session_id,
             &session,
@@ -784,7 +781,7 @@ mod tests {
         let session_id = proxy.generate_session_id(&session);
 
         let result = proxy.finalize_per_command_session(
-            Err(anyhow::anyhow!("session failed")),
+            Err(SessionError::Backend(anyhow::anyhow!("session failed"))),
             client_addr,
             &session_id,
             &session,
@@ -836,9 +833,19 @@ mod tests {
     // Idle tracking tests
 
     #[test]
-    fn test_idle_timeout_constant() {
-        // Ensure the idle timeout is 5 minutes
-        assert_eq!(NntpProxy::IDLE_TIMEOUT, Duration::from_secs(5 * 60));
+    fn test_per_backend_idle_timeout_defaults() {
+        let config = create_test_config();
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+
+        // All test servers should have the default backend_idle_timeout (10 minutes)
+        for server in proxy.servers() {
+            assert_eq!(
+                server.backend_idle_timeout,
+                Duration::from_secs(10 * 60),
+                "Server '{}' should have default 10-minute backend_idle_timeout",
+                server.name.as_ref(),
+            );
+        }
     }
 
     #[test]
@@ -918,5 +925,119 @@ mod tests {
         // Should not clear - just disconnected (within timeout)
         let cleared = proxy.check_and_clear_stale_pools();
         assert!(!cleared);
+    }
+
+    #[test]
+    fn test_check_and_clear_clears_when_timeout_exceeded() {
+        use crate::config::{Config, Server};
+        use crate::types::{MaxConnections, Port};
+
+        let config = Config {
+            servers: vec![
+                Server::builder("server1.example.com", Port::try_new(119).unwrap())
+                    .name("Fast Timeout Server")
+                    .max_connections(MaxConnections::try_new(2).unwrap())
+                    .backend_idle_timeout(Duration::from_nanos(1)) // Expires immediately
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+
+        // Store a very old last_activity (1ns from proxy start)
+        // Any subsequent check will see idle_duration >> 1ns timeout
+        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
+
+        // Give the clock at least 1ms to advance past the 1ns timeout
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let cleared = proxy.check_and_clear_stale_pools();
+        assert!(cleared, "Should clear pools when idle timeout exceeded");
+    }
+
+    #[test]
+    fn test_check_and_clear_per_backend_independent_short_timeout() {
+        use crate::config::{Config, Server};
+        use crate::types::{MaxConnections, Port};
+
+        // Only one backend with a short timeout — should clear
+        let config = Config {
+            servers: vec![
+                Server::builder("server1.example.com", Port::try_new(119).unwrap())
+                    .name("Short Timeout")
+                    .max_connections(MaxConnections::try_new(2).unwrap())
+                    .backend_idle_timeout(Duration::from_nanos(1))
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(proxy.check_and_clear_stale_pools());
+    }
+
+    #[test]
+    fn test_check_and_clear_per_backend_independent_long_timeout() {
+        use crate::config::{Config, Server};
+        use crate::types::{MaxConnections, Port};
+
+        // Only one backend with a very long timeout — should NOT clear
+        let config = Config {
+            servers: vec![
+                Server::builder("server2.example.com", Port::try_new(119).unwrap())
+                    .name("Long Timeout")
+                    .max_connections(MaxConnections::try_new(2).unwrap())
+                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60)) // 24h
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
+
+        // Even though activity was long ago, the 24h timeout hasn't passed
+        let cleared = proxy.check_and_clear_stale_pools();
+        assert!(
+            !cleared,
+            "Should NOT clear pools when timeout not yet exceeded"
+        );
+    }
+
+    #[test]
+    fn test_check_and_clear_mixed_timeouts_returns_true_when_any_cleared() {
+        use crate::config::{Config, Server};
+        use crate::types::{MaxConnections, Port};
+
+        // Two backends: one exceeded, one not — returns true (something was cleared)
+        let config = Config {
+            servers: vec![
+                Server::builder("server1.example.com", Port::try_new(119).unwrap())
+                    .name("Short Timeout")
+                    .max_connections(MaxConnections::try_new(2).unwrap())
+                    .backend_idle_timeout(Duration::from_nanos(1))
+                    .build()
+                    .unwrap(),
+                Server::builder("server2.example.com", Port::try_new(119).unwrap())
+                    .name("Long Timeout")
+                    .max_connections(MaxConnections::try_new(2).unwrap())
+                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60))
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let cleared = proxy.check_and_clear_stale_pools();
+        assert!(
+            cleared,
+            "Should return true when at least one backend exceeded its timeout"
+        );
     }
 }

@@ -31,6 +31,6 @@ pub enum ParseError {
 // Allow conversion from ValidationError to ParseError
 impl From<crate::types::validated::ValidationError> for ParseError {
     fn from(err: crate::types::validated::ValidationError) -> Self {
-        ParseError::InvalidMessageId(err.to_string())
+        Self::InvalidMessageId(err.to_string())
     }
 }

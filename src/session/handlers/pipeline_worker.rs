@@ -53,10 +53,11 @@ pub async fn backend_pipeline_worker(
 
     // Hoist buffers to worker lifetime (reused across batches)
     let mut result_buf = bytes::BytesMut::with_capacity(4096);
+    let mut batch = Vec::with_capacity(config.batch_size);
 
     loop {
         // Wait for at least one request, then grab up to batch_size
-        let batch = queue.dequeue_batch(config.batch_size).await;
+        batch = queue.dequeue_batch(config.batch_size, batch).await;
         let batch_len = batch.len();
 
         debug!(
@@ -68,7 +69,7 @@ pub async fn backend_pipeline_worker(
         result_buf.clear();
 
         // Acquire a connection from the pool
-        let mut conn = match provider.get_pooled_connection().await {
+        let conn_raw = match provider.get_pooled_connection().await {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -76,13 +77,15 @@ pub async fn backend_pipeline_worker(
                     backend_id, e
                 );
                 metrics.record_connection_failure(backend_id);
-                fail_batch(batch, &format!("connection error: {e}"));
+                batch = fail_batch(batch, &format!("connection error: {e}"));
                 continue;
             }
         };
+        let mut conn = crate::pool::ConnectionGuard::new(conn_raw, (*provider).clone());
 
         // Execute the batch: write all commands, then read all responses
-        let success = execute_pipeline_batch(
+        let success;
+        (success, batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -92,10 +95,13 @@ pub async fn backend_pipeline_worker(
         )
         .await;
 
-        if !success {
-            // Connection is likely broken; remove from pool so it's not reused
-            provider.remove_with_cooldown(conn);
+        if success {
+            let _ = conn.release(); // batch healthy; return connection to pool
         }
+        // !success: conn drops here → ConnectionGuard::remove_with_cooldown
+        // Unconditional: !success means a backend write, flush, or read failed.
+        // Client disconnects only close the oneshot response channel; they do
+        // not affect the backend connection and cannot cause !success here.
 
         // Record pipeline batch metrics
         if batch_len > 1 {
@@ -106,15 +112,17 @@ pub async fn backend_pipeline_worker(
 
 /// Execute a batch of commands on a single connection using write-write-read-read pipelining.
 ///
-/// Returns `true` if the connection is still healthy, `false` if it should be removed from pool.
+/// Returns `(healthy, batch)` — whether the connection is still healthy, plus the
+/// (now-drained) batch Vec for allocation reuse.
+#[allow(clippy::iter_with_drain)] // batch returned to caller for reuse; drain preserves allocation
 async fn execute_pipeline_batch(
     backend_id: BackendId,
     conn: &mut crate::stream::ConnectionStream,
-    batch: Vec<QueuedRequest>,
+    mut batch: Vec<QueuedRequest>,
     metrics: &MetricsCollector,
     buffer_pool: &BufferPool,
     result_buf: &mut bytes::BytesMut,
-) -> bool {
+) -> (bool, Vec<QueuedRequest>) {
     let batch_len = batch.len();
 
     // Phase 1: Write all commands
@@ -130,8 +138,8 @@ async fn execute_pipeline_batch(
             // We wrote commands 0..i successfully but can't read responses
             // because the connection is broken. Fail everything and return early.
             let err_msg = format!("write failed at command {}/{}", i + 1, batch_len);
-            fail_batch(batch, &err_msg);
-            return false;
+            let batch = fail_batch(batch, &err_msg);
+            return (false, batch);
         }
     }
     // All writes succeeded, continue to flush
@@ -142,15 +150,15 @@ async fn execute_pipeline_batch(
             "Pipeline worker backend {:?}: flush failed: {}",
             backend_id, e
         );
-        fail_batch(batch, &format!("flush failed: {e}"));
-        return false;
+        let batch = fail_batch(batch, &format!("flush failed: {e}"));
+        return (false, batch);
     }
 
-    // Phase 2: Read responses in order (with shared buffer + leftover tracking)
+    // Phase 2: Read responses in order (with shared buffer + connection-stashed leftovers)
     let mut buffer = buffer_pool.acquire().await;
-    // leftover and result_buf are now passed in as parameters (hoisted to worker loop)
+    // result_buf is passed in as a parameter (hoisted to worker loop)
 
-    let mut batch_iter = batch.into_iter().enumerate();
+    let mut batch_iter = batch.drain(..).enumerate();
     while let Some((i, req)) = batch_iter.next() {
         // Read the response for this command
         match read_full_response(&mut buffer, conn, result_buf).await {
@@ -192,10 +200,12 @@ async fn execute_pipeline_batch(
                 }
 
                 // Connection broken — return false immediately
-                return false;
+                return (false, batch);
             }
         }
     }
+    // Release the drain iterator's mutable borrow before returning batch
+    drop(batch_iter);
 
     // All responses processed successfully. Leftover is valid only while there
     // are more already-sent responses remaining in this borrow. If bytes remain
@@ -212,10 +222,10 @@ async fn execute_pipeline_batch(
             leftover_bytes = conn.leftover_len(),
             "Pipeline batch ended with buffered bytes; retiring connection to avoid cross-borrow desync"
         );
-        return false;
+        return (false, batch);
     }
 
-    true
+    (true, batch)
 }
 
 /// Read a complete NNTP response (status line + multiline body if applicable).
@@ -233,7 +243,9 @@ async fn read_full_response(
     let mut tail = TailBuffer::default();
     result_buf.clear(); // Reuse buffer from previous response
 
-    // Get first data directly into result_buf (no intermediate Vec)
+    // Get first data directly into result_buf (no intermediate Vec). ConnectionStream
+    // serves any stashed leftover bytes before polling the socket.
+    let from_leftover = conn.has_leftover();
     let n = buffer.read_from(conn).await?;
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
@@ -258,10 +270,17 @@ async fn read_full_response(
         result_buf.len(),
         crate::protocol::MIN_RESPONSE_LENGTH,
     );
-    let status_code = validated
-        .response
-        .status_code()
-        .ok_or_else(|| anyhow::anyhow!("Invalid status code in pipeline response"))?;
+    let status_code = validated.response.status_code().ok_or_else(|| {
+        // Log Invalid response with detailed context
+        tracing::warn!(
+            bytes_read = result_buf.len(),
+            first_bytes_hex = %crate::session::backend::format_hex_preview(result_buf, 256),
+            first_bytes_utf8 = %String::from_utf8_lossy(&result_buf[..result_buf.len().min(256)]),
+            source = if from_leftover { "leftover" } else { "fresh_read" },
+            "Invalid status code in pipeline response"
+        );
+        anyhow::anyhow!("Invalid status code in pipeline response")
+    })?;
 
     if !validated.is_multiline {
         // Single-line response: split at \r\n boundary to save leftover
@@ -337,13 +356,18 @@ async fn read_full_response(
     Ok((result_buf.split().freeze(), status_code))
 }
 
-/// Send error responses to all requests in a batch
-fn fail_batch(batch: Vec<QueuedRequest>, error_msg: &str) {
-    for req in batch {
+/// Send error responses to all requests in a batch.
+///
+/// Takes ownership of the Vec, drains it, and returns the empty Vec
+/// so the caller can reuse the allocation.
+#[allow(clippy::iter_with_drain)] // drain used intentionally; empty Vec returned for allocation reuse
+fn fail_batch(mut batch: Vec<QueuedRequest>, error_msg: &str) -> Vec<QueuedRequest> {
+    for req in batch.drain(..) {
         let _ = req
             .response_tx
             .send(PipelineResponse::Error(error_msg.to_string()));
     }
+    batch
 }
 
 #[cfg(test)]
@@ -357,7 +381,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     /// Helper: create a TCP pair where the server writes `data` then optionally closes.
-    /// Returns a ConnectionStream connected to the mock server.
+    /// Returns a `ConnectionStream` connected to the mock server.
     async fn mock_backend_conn(data: &[u8]) -> ConnectionStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -374,7 +398,7 @@ mod tests {
     }
 
     /// Helper: create a TCP pair where the server writes `chunks` with delays.
-    /// Returns a ConnectionStream connected to the mock server.
+    /// Returns a `ConnectionStream` connected to the mock server.
     async fn mock_backend_conn_chunked(chunks: Vec<Vec<u8>>) -> ConnectionStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -447,7 +471,7 @@ mod tests {
         let mut conn = ConnectionStream::plain(stream);
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -702,7 +726,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -717,7 +741,7 @@ mod tests {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 430);
             }
-            other => panic!("Expected Success, got {other:?}"),
+            other @ PipelineResponse::Error(_) => panic!("Expected Success, got {other:?}"),
         }
     }
 
@@ -763,7 +787,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -778,13 +802,13 @@ mod tests {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 223);
             }
-            other => panic!("Expected 223 Success, got {other:?}"),
+            other @ PipelineResponse::Error(_) => panic!("Expected 223 Success, got {other:?}"),
         }
         match rx2.await.unwrap() {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 430);
             }
-            other => panic!("Expected 430 Success, got {other:?}"),
+            other @ PipelineResponse::Error(_) => panic!("Expected 430 Success, got {other:?}"),
         }
     }
 
@@ -826,7 +850,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -842,12 +866,16 @@ mod tests {
             PipelineResponse::Success { status_code, .. } => {
                 assert_eq!(status_code.as_u16(), 223);
             }
-            other => panic!("Expected first to succeed, got {other:?}"),
+            other @ PipelineResponse::Error(_) => {
+                panic!("Expected first to succeed, got {other:?}")
+            }
         }
         // Second response should be error
         match rx2.await.unwrap() {
             PipelineResponse::Error(_) => {} // Expected
-            other => panic!("Expected error for second, got {other:?}"),
+            other @ PipelineResponse::Success { .. } => {
+                panic!("Expected error for second, got {other:?}")
+            }
         }
     }
 
@@ -891,7 +919,7 @@ mod tests {
 
         let mut result_buf = bytes::BytesMut::with_capacity(4096);
 
-        let success = execute_pipeline_batch(
+        let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
             batch,
@@ -1025,7 +1053,7 @@ mod tests {
     //
     // The check still provides defense-in-depth against protocol desync, even though
     // it's hard to test. In practice, normal leftover is < 8KB, so 128KB is generous.
-    #[ignore]
+    #[ignore = "flaky: TCP read sizes are unpredictable; leftover check requires single read > 128KB"]
     #[tokio::test]
     async fn test_leftover_exceeds_max_size() {
         use crate::constants::buffer::MAX_LEFTOVER_BYTES;
@@ -1043,23 +1071,23 @@ mod tests {
 
         let mut chunks = Vec::new();
 
-        // Chunk 1: Response header + body start (no terminator yet)
-        let mut chunk1 = Vec::new();
-        chunk1.extend_from_slice(b"220 0 <id> article\r\n");
-        chunk1.extend_from_slice(&vec![b'B'; 50000]); // 50KB of body
-        chunks.push(chunk1);
+        // Part 1: Response header + body start (no terminator yet)
+        let mut part1 = Vec::new();
+        part1.extend_from_slice(b"220 0 <id> article\r\n");
+        part1.extend_from_slice(&vec![b'B'; 50000]); // 50KB of body
+        chunks.push(part1);
 
-        // Chunk 2: More body (no terminator yet)
-        let mut chunk2 = Vec::new();
-        chunk2.extend_from_slice(&vec![b'O'; 50000]); // Another 50KB
-        chunks.push(chunk2);
+        // Part 2: More body (no terminator yet)
+        let mut part2 = Vec::new();
+        part2.extend_from_slice(&vec![b'O'; 50000]); // Another 50KB
+        chunks.push(part2);
 
-        // Chunk 3: Terminator + oversized leftover
-        let mut chunk3 = Vec::new();
-        chunk3.extend_from_slice(&vec![b'D'; 10000]); // 10KB more body
-        chunk3.extend_from_slice(b"\r\n.\r\n"); // Terminator
-        chunk3.extend_from_slice(&vec![b'X'; MAX_LEFTOVER_BYTES + 1000]); // Oversized leftover
-        chunks.push(chunk3);
+        // Part 3: Terminator + oversized leftover
+        let mut part3 = Vec::new();
+        part3.extend_from_slice(&vec![b'D'; 10000]); // 10KB more body
+        part3.extend_from_slice(b"\r\n.\r\n"); // Terminator
+        part3.extend_from_slice(&vec![b'X'; MAX_LEFTOVER_BYTES + 1000]); // Oversized leftover
+        chunks.push(part3);
 
         let mut conn = mock_backend_conn_chunked(chunks).await;
 

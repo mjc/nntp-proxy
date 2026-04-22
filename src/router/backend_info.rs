@@ -14,7 +14,7 @@ use crate::types::{BackendId, ServerName};
 
 /// Load ratio (pending requests / max connections)
 ///
-/// Lower ratios indicate less loaded backends. Range: 0.0 (empty) to f64::MAX (no capacity).
+/// Lower ratios indicate less loaded backends. Range: 0.0 (empty) to `f64::MAX` (no capacity).
 #[derive(Debug, Clone, Copy, PartialEq, Display, From, AsRef, Deref)]
 pub struct LoadRatio(f64);
 
@@ -137,7 +137,8 @@ impl StatefulCount {
 
     /// Try to acquire a stateful slot (compare-exchange loop)
     ///
-    /// Returns true if successfully incremented below max_stateful limit
+    /// Returns true if successfully incremented below `max_stateful` limit
+    #[must_use]
     pub fn try_acquire(&self, max_stateful: usize) -> bool {
         let mut current = self.0.load(Ordering::Acquire);
         loop {
@@ -159,7 +160,7 @@ impl StatefulCount {
 
     /// Release a stateful slot (decrement if > 0)
     ///
-    /// Returns Ok(previous_value) if successfully decremented, Err(0) if already zero
+    /// Returns `Ok(previous_value)` if successfully decremented, Err(0) if already zero
     pub fn release(&self) -> Result<usize, usize> {
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {

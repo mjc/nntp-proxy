@@ -52,7 +52,7 @@ impl BackendQueryCounter {
 }
 
 /// Spawn mock server that counts queries
-async fn spawn_counting_mock_server(
+fn spawn_counting_mock_server(
     port: u16,
     name: &str,
     counter: BackendQueryCounter,
@@ -60,7 +60,7 @@ async fn spawn_counting_mock_server(
 ) -> tokio::task::AbortHandle {
     let name = name.to_string();
     let task = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
 
@@ -72,7 +72,7 @@ async fn spawn_counting_mock_server(
             tokio::spawn(async move {
                 // Send greeting
                 stream
-                    .write_all(format!("200 {} Ready\r\n", name).as_bytes())
+                    .write_all(format!("200 {name} Ready\r\n").as_bytes())
                     .await
                     .ok();
 
@@ -181,8 +181,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     let counter = BackendQueryCounter::new();
 
     // Spawn counting mock server (has article)
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Create proxy config with caching and adaptive precheck
@@ -205,7 +204,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     let proxy = nntp_proxy::NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let _proxy_handle = tokio::spawn(async move {
@@ -219,7 +218,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Connect client
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let (read_half, mut write_half) = client.split();
@@ -239,7 +238,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("223"), "Should get 223 response: {}", line);
+    assert!(line.starts_with("223"), "Should get 223 response: {line}");
 
     // Wait for prechecking to complete and cache to populate
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -247,8 +246,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     let first_queries = counter.get();
     assert!(
         first_queries >= 1,
-        "First STAT should query backend at least once, got {} queries",
-        first_queries
+        "First STAT should query backend at least once, got {first_queries} queries"
     );
 
     // Reset counter
@@ -261,7 +259,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("223"), "Should get 223 response: {}", line);
+    assert!(line.starts_with("223"), "Should get 223 response: {line}");
 
     // Wait a bit to ensure no background queries happened
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -272,9 +270,8 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     // Background recheck is allowed but should be minimal
     assert!(
         second_queries <= 1,
-        "CRITICAL BUG: Cache hit triggered {} backend queries! Should be 0 (or 1 for background recheck). \
-         This means cache check is happening AFTER adaptive prechecking.",
-        second_queries
+        "CRITICAL BUG: Cache hit triggered {second_queries} backend queries! Should be 0 (or 1 for background recheck). \
+         This means cache check is happening AFTER adaptive prechecking."
     );
 
     // Clean up
@@ -288,8 +285,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
     let backend_port = get_available_port().await.unwrap();
 
     let counter = BackendQueryCounter::new();
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -310,7 +306,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
     let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let _proxy_handle = tokio::spawn(async move {
@@ -323,7 +319,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let (read_half, mut write_half) = client.split();
@@ -341,7 +337,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("221"), "Should get 221 response: {}", line);
+    assert!(line.starts_with("221"), "Should get 221 response: {line}");
 
     // Read multiline response
     loop {
@@ -365,7 +361,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("221"), "Should get 221 response: {}", line);
+    assert!(line.starts_with("221"), "Should get 221 response: {line}");
 
     // Read multiline response
     loop {
@@ -381,8 +377,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
 
     assert!(
         second_queries <= 1,
-        "CRITICAL BUG: HEAD cache hit triggered {} backend queries! Should be 0 (or 1 for background recheck)",
-        second_queries
+        "CRITICAL BUG: HEAD cache hit triggered {second_queries} backend queries! Should be 0 (or 1 for background recheck)"
     );
 
     write_half.write_all(b"QUIT\r\n").await.unwrap();
@@ -395,8 +390,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
     let backend_port = get_available_port().await.unwrap();
 
     let counter = BackendQueryCounter::new();
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -417,7 +411,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
     let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let _proxy_handle = tokio::spawn(async move {
@@ -430,7 +424,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let (read_half, mut write_half) = client.split();
@@ -448,7 +442,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("220"), "Should get 220 response: {}", line);
+    assert!(line.starts_with("220"), "Should get 220 response: {line}");
 
     // Read multiline response
     loop {
@@ -471,7 +465,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("220"), "Should get 220 response: {}", line);
+    assert!(line.starts_with("220"), "Should get 220 response: {line}");
 
     // Read multiline response
     loop {
@@ -486,9 +480,8 @@ async fn test_article_cache_hit_zero_backend_queries() {
 
     assert!(
         second_queries <= 1,
-        "CRITICAL BUG: ARTICLE cache hit triggered {} backend queries! Should be 0 (or 1 for background recheck). \
-         Cache check must happen BEFORE backend queries.",
-        second_queries
+        "CRITICAL BUG: ARTICLE cache hit triggered {second_queries} backend queries! Should be 0 (or 1 for background recheck). \
+         Cache check must happen BEFORE backend queries."
     );
 
     write_half.write_all(b"QUIT\r\n").await.unwrap();
@@ -502,8 +495,7 @@ async fn test_cached_430_zero_backend_queries() {
 
     let counter = BackendQueryCounter::new();
     // Server doesn't have article (returns 430)
-    let _mock =
-        spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), false).await;
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), false);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -524,7 +516,7 @@ async fn test_cached_430_zero_backend_queries() {
     let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let _proxy_handle = tokio::spawn(async move {
@@ -537,7 +529,7 @@ async fn test_cached_430_zero_backend_queries() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
         .await
         .unwrap();
     let (read_half, mut write_half) = client.split();
@@ -555,7 +547,7 @@ async fn test_cached_430_zero_backend_queries() {
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("430"), "Should get 430 response: {}", line);
+    assert!(line.starts_with("430"), "Should get 430 response: {line}");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let first_queries = counter.get();
@@ -572,8 +564,7 @@ async fn test_cached_430_zero_backend_queries() {
     reader.read_line(&mut line).await.unwrap();
     assert!(
         line.starts_with("430"),
-        "Should still get 430 response: {}",
-        line
+        "Should still get 430 response: {line}"
     );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -581,9 +572,8 @@ async fn test_cached_430_zero_backend_queries() {
 
     assert!(
         second_queries <= 1,
-        "CRITICAL BUG: Cached 430 triggered {} backend queries! Should be 0 (or 1 for background recheck). \
-         430 responses MUST be cached and served instantly.",
-        second_queries
+        "CRITICAL BUG: Cached 430 triggered {second_queries} backend queries! Should be 0 (or 1 for background recheck). \
+         430 responses MUST be cached and served instantly."
     );
 
     write_half.write_all(b"QUIT\r\n").await.unwrap();

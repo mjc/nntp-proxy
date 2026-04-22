@@ -48,7 +48,7 @@ fn test_anonymous_connections() {
 /// Test that authenticated connections are counted exactly once, not double-counted
 ///
 /// This test verifies the fix for a bug where standard mode would count connections twice:
-/// 1. Once in on_authentication_success() after AUTHINFO PASS succeeds
+/// 1. Once in `on_authentication_success()` after AUTHINFO PASS succeeds
 /// 2. Again in proxy.rs after the session completes
 ///
 /// The correct behavior is to count only once, during authentication.

@@ -18,48 +18,54 @@ pub const DATE: &[u8] = b"DATE\r\n";
 ///
 /// Returns a properly formatted AUTHINFO USER command with CRLF termination.
 #[inline]
+#[must_use]
 pub fn authinfo_user(username: &str) -> String {
-    format!("AUTHINFO USER {}\r\n", username)
+    format!("AUTHINFO USER {username}\r\n")
 }
 
 /// Construct AUTHINFO PASS command (RFC 4643 Section 2.4)
 ///
 /// Returns a properly formatted AUTHINFO PASS command with CRLF termination.
 #[inline]
+#[must_use]
 pub fn authinfo_pass(password: &str) -> String {
-    format!("AUTHINFO PASS {}\r\n", password)
+    format!("AUTHINFO PASS {password}\r\n")
 }
 
 /// Construct ARTICLE command with message-ID (RFC 3977 Section 6.2.1)
 ///
 /// Returns a properly formatted ARTICLE command for retrieving an article by message-ID.
 #[inline]
+#[must_use]
 pub fn article_by_msgid(msgid: &str) -> String {
-    format!("ARTICLE {}\r\n", msgid)
+    format!("ARTICLE {msgid}\r\n")
 }
 
 /// Construct BODY command with message-ID (RFC 3977 Section 6.2.3)
 ///
 /// Returns a properly formatted BODY command for retrieving article body by message-ID.
 #[inline]
+#[must_use]
 pub fn body_by_msgid(msgid: &str) -> String {
-    format!("BODY {}\r\n", msgid)
+    format!("BODY {msgid}\r\n")
 }
 
 /// Construct HEAD command with message-ID (RFC 3977 Section 6.2.2)
 ///
 /// Returns a properly formatted HEAD command for retrieving article headers by message-ID.
 #[inline]
+#[must_use]
 pub fn head_by_msgid(msgid: &str) -> String {
-    format!("HEAD {}\r\n", msgid)
+    format!("HEAD {msgid}\r\n")
 }
 
 /// Construct STAT command with message-ID (RFC 3977 Section 6.2.4)
 ///
 /// Returns a properly formatted STAT command for checking article existence by message-ID.
 #[inline]
+#[must_use]
 pub fn stat_by_msgid(msgid: &str) -> String {
-    format!("STAT {}\r\n", msgid)
+    format!("STAT {msgid}\r\n")
 }
 
 #[cfg(test)]

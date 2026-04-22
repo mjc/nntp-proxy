@@ -1,8 +1,9 @@
 //! Metrics snapshot type and methods
 //!
-//! Contains the immutable MetricsSnapshot struct with functional methods
+//! Contains the immutable `MetricsSnapshot` struct with functional methods
 //! for querying and aggregating metrics across backends.
 
+#[allow(clippy::wildcard_imports)] // imports many metric types from types module
 use super::types::*;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::sync::Arc;
@@ -24,20 +25,27 @@ use super::UserStats;
 /// `backend_stats` is Arc-wrapped to avoid cloning the entire Vec when
 /// calculating user rates every TUI frame (4 Hz). This reduces allocations
 /// from O(backends) to O(1) per update.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSnapshot {
     pub total_connections: u64,
+    #[serde(skip, default)]
     pub active_connections: usize,
+    #[serde(skip, default)]
     pub stateful_sessions: usize,
     pub client_to_backend_bytes: ClientToBackendBytes,
     pub backend_to_client_bytes: BackendToClientBytes,
+    #[serde(skip, default)]
     pub uptime: Duration,
     pub backend_stats: Arc<Vec<BackendStats>>,
     pub user_stats: Vec<UserStats>,
+    #[serde(skip, default)]
     pub cache_entries: u64,
+    #[serde(skip, default)]
     pub cache_size_bytes: u64,
+    #[serde(skip, default)]
     pub cache_hit_rate: f64,
     /// Disk cache statistics (only present when using hybrid cache)
+    #[serde(skip, default)]
     pub disk_cache: Option<DiskCacheStats>,
     /// Number of pipelined batches (batches with >1 command)
     pub pipeline_batches: u64,
@@ -50,7 +58,7 @@ pub struct MetricsSnapshot {
 }
 
 /// Disk cache statistics for hybrid cache mode
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiskCacheStats {
     /// Number of cache hits from disk tier
     pub disk_hits: u64,
@@ -72,7 +80,7 @@ impl MetricsSnapshot {
     /// Update backend active connections from pool status
     ///
     /// Populates `active_connections` for each backend by querying the connection pool.
-    /// Active connections = max_size - available connections.
+    /// Active connections = `max_size` - available connections.
     ///
     /// This is a fluent method for functional composition: `snapshot.with_pool_status(router)`
     #[must_use]
@@ -105,11 +113,11 @@ impl MetricsSnapshot {
         let seconds = secs % 60;
 
         if hours > 0 {
-            format!("{}h {}m {}s", hours, minutes, seconds)
+            format!("{hours}h {minutes}m {seconds}s")
         } else if minutes > 0 {
-            format!("{}m {}s", minutes, seconds)
+            format!("{minutes}m {seconds}s")
         } else {
-            format!("{}s", seconds)
+            format!("{seconds}s")
         }
     }
 
@@ -118,7 +126,7 @@ impl MetricsSnapshot {
     /// This is a pure calculation method - no side effects.
     #[must_use]
     #[inline]
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.client_to_backend_bytes.as_u64() + self.backend_to_client_bytes.as_u64()
     }
 
@@ -195,7 +203,7 @@ impl MetricsSnapshot {
 
     /// Get backend statistics by ID
     ///
-    /// Returns None if backend_id is out of range.
+    /// Returns None if `backend_id` is out of range.
     #[must_use]
     pub fn backend(&self, backend_id: BackendId) -> Option<&BackendStats> {
         self.backend_stats.get(backend_id.as_index())
@@ -400,8 +408,7 @@ mod tests {
     #[test]
     fn test_high_error_backends_empty() {
         let snapshot = MetricsSnapshot::default();
-        let high_error: Vec<_> = snapshot.high_error_backends().collect();
-        assert_eq!(high_error.len(), 0);
+        assert_eq!(snapshot.high_error_backends().count(), 0);
     }
 
     #[test]
@@ -424,8 +431,7 @@ mod tests {
             ..Default::default()
         };
 
-        let healthy: Vec<_> = snapshot.healthy_backends().collect();
-        assert_eq!(healthy.len(), 0);
+        assert_eq!(snapshot.healthy_backends().count(), 0);
     }
 
     #[test]

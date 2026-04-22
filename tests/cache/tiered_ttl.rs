@@ -49,8 +49,8 @@ fn test_effective_ttl_formula() {
     assert_eq!(effective_ttl(base_ttl, 4), 16000); // tier 4: 16x
     assert_eq!(effective_ttl(base_ttl, 5), 32000); // tier 5: 32x
     assert_eq!(effective_ttl(base_ttl, 6), 64000); // tier 6: 64x
-    assert_eq!(effective_ttl(base_ttl, 7), 128000); // tier 7: 128x
-    assert_eq!(effective_ttl(base_ttl, 10), 1024000); // tier 10: 1024x
+    assert_eq!(effective_ttl(base_ttl, 7), 128_000); // tier 7: 128x
+    assert_eq!(effective_ttl(base_ttl, 10), 1_024_000); // tier 10: 1024x
 }
 
 #[test]
@@ -269,8 +269,7 @@ async fn test_cache_higher_tier_longer_ttl() {
     let entry = cache.get(&msg_id).await;
     assert!(
         entry.is_some(),
-        "Tier 1 should survive past base TTL (waited 250ms, tier 1 TTL is 400ms, stored tier was {})",
-        stored_tier
+        "Tier 1 should survive past base TTL (waited 250ms, tier 1 TTL is 400ms, stored tier was {stored_tier})"
     );
 
     // Wait another 200ms (total 450ms) - should now be expired

@@ -6,7 +6,7 @@ use nntp_proxy::constants::user::ANONYMOUS;
 use nntp_proxy::metrics::{BackendHealthStatus, MetricsCollector};
 use nntp_proxy::types::{BackendId, MetricsBytes, Unrecorded};
 
-/// Test MetricsCollector creation
+/// Test `MetricsCollector` creation
 #[test]
 fn test_metrics_collector_new() {
     let collector = MetricsCollector::new(3);
@@ -134,7 +134,7 @@ fn test_type_safe_byte_recording() {
     // This would fail to compile: collector.record_client_to_backend(_sent_recorded);
 }
 
-/// Test record_command_execution convenience method
+/// Test `record_command_execution` convenience method
 #[test]
 fn test_record_command_execution() {
     let collector = MetricsCollector::new(1);
@@ -561,7 +561,7 @@ fn test_concurrent_metric_updates() {
     assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1000);
 }
 
-/// Test MetricsCollector is Send + Sync
+/// Test `MetricsCollector` is Send + Sync
 #[test]
 fn test_metrics_collector_is_send_sync() {
     fn assert_send<T: Send>() {}

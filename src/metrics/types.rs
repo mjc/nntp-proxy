@@ -20,7 +20,18 @@ use std::num::NonZeroU64;
 /// For display-oriented types with unit strings, see `types::metrics::define_counter!`.
 macro_rules! counter_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Default,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(u64);
 
         impl $name {
@@ -35,10 +46,11 @@ macro_rules! counter_type {
             }
 
             #[inline]
-            pub fn increment(&mut self) {
+            pub const fn increment(&mut self) {
                 self.0 += 1;
             }
 
+            #[must_use]
             #[inline]
             pub const fn saturating_sub(self, other: Self) -> Self {
                 Self(self.0.saturating_sub(other.0))
@@ -56,7 +68,18 @@ macro_rules! counter_type {
 /// Define a microseconds-based timing newtype that can average to milliseconds
 macro_rules! timing_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Default,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(u64);
 
         impl $name {
@@ -71,7 +94,7 @@ macro_rules! timing_type {
             }
 
             #[inline]
-            pub fn add(&mut self, other: Self) {
+            pub const fn add(&mut self, other: Self) {
                 self.0 += other.0;
             }
 
@@ -87,7 +110,7 @@ macro_rules! timing_type {
 /// Define a f64-based rate/measurement newtype
 macro_rules! f64_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+        #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, serde::Serialize, serde::Deserialize)]
         pub struct $name(f64);
 
         impl $name {
@@ -108,13 +131,14 @@ macro_rules! f64_type {
 // Backend Health Status (for metrics display)
 // ============================================================================
 
-/// Backend health status for metrics display (distinct from health::HealthStatus)
+/// Backend health status for metrics display (distinct from `health::HealthStatus`)
 ///
 /// This 3-state enum is used for UI/metrics purposes, while `health::HealthStatus`
 /// is a binary Healthy/Unhealthy used for actual health checking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BackendHealthStatus {
     /// Backend is healthy and responding normally
+    #[default]
     Healthy,
     /// Backend is degraded (high error rate or slow)
     Degraded,
@@ -125,7 +149,6 @@ pub enum BackendHealthStatus {
 impl From<u8> for BackendHealthStatus {
     fn from(value: u8) -> Self {
         match value {
-            0 => Self::Healthy,
             1 => Self::Degraded,
             2 => Self::Down,
             _ => Self::Healthy,
@@ -151,30 +174,44 @@ counter_type!(CommandCount);
 counter_type!(FailureCount);
 
 /// Number of errors encountered
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ErrorCount(u64);
 
 impl ErrorCount {
     #[inline]
+    #[must_use]
     pub const fn new(count: u64) -> Self {
         Self(count)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
     #[inline]
-    pub fn increment(&mut self) {
+    pub const fn increment(&mut self) {
         self.0 += 1;
     }
 
     #[inline]
-    pub fn add(&mut self, other: ErrorCount) {
+    pub const fn add(&mut self, other: Self) {
         self.0 += other.0;
     }
 
+    #[must_use]
     #[inline]
     pub const fn saturating_sub(self, other: Self) -> Self {
         Self(self.0.saturating_sub(other.0))
@@ -194,28 +231,41 @@ impl std::fmt::Display for ErrorCount {
 }
 
 /// Number of articles retrieved
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ArticleCount(u64);
 
 impl ArticleCount {
     #[inline]
+    #[must_use]
     pub const fn new(count: u64) -> Self {
         Self(count)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
     #[inline]
-    pub fn increment(&mut self) {
+    pub const fn increment(&mut self) {
         self.0 += 1;
     }
 
     /// Calculate average bytes per article
     #[must_use]
-    pub fn average_bytes(self, total_bytes: u64) -> Option<u64> {
+    pub const fn average_bytes(self, total_bytes: u64) -> Option<u64> {
         if self.0 > 0 {
             Some(total_bytes / self.0)
         } else {
@@ -231,16 +281,29 @@ impl std::fmt::Display for ArticleCount {
 }
 
 /// Number of active connections (non-zero validated)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ActiveConnections(usize);
 
 impl ActiveConnections {
     #[inline]
+    #[must_use]
     pub const fn new(count: usize) -> Self {
         Self(count)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> usize {
         self.0
     }
@@ -261,22 +324,35 @@ timing_type!(SendMicros);
 timing_type!(RecvMicros);
 
 /// Time in microseconds (for precision timing)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Microseconds(u64);
 
 impl Microseconds {
     #[inline]
+    #[must_use]
     pub const fn new(micros: u64) -> Self {
         Self(micros)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
     #[inline]
-    pub fn add(&mut self, other: Microseconds) {
+    pub const fn add(&mut self, other: Self) {
         self.0 += other.0;
     }
 
@@ -291,6 +367,7 @@ f64_type!(Milliseconds);
 
 impl Milliseconds {
     #[inline]
+    #[must_use]
     pub fn from_micros(micros: f64) -> Self {
         Self(micros / 1000.0)
     }
@@ -311,16 +388,20 @@ impl OverheadMillis {
 // ============================================================================
 
 /// Bytes per second transfer rate
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Default, serde::Serialize, serde::Deserialize,
+)]
 pub struct BytesPerSecond(u64);
 
 impl BytesPerSecond {
     #[inline]
+    #[must_use]
     pub const fn new(bps: u64) -> Self {
         Self(bps)
     }
 
     #[inline]
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -418,7 +499,7 @@ mod tests {
     #[test]
     fn test_command_count_display() {
         let count = CommandCount::new(1234);
-        assert_eq!(format!("{}", count), "1234");
+        assert_eq!(format!("{count}"), "1234");
     }
 
     // ErrorCount tests
@@ -496,7 +577,7 @@ mod tests {
     #[test]
     fn test_active_connections_display() {
         let active = ActiveConnections::new(42);
-        assert_eq!(format!("{}", active), "42");
+        assert_eq!(format!("{active}"), "42");
     }
 
     // Timing types tests

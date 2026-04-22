@@ -1,8 +1,8 @@
 //! Test for duplicate greeting bug fix
 //!
 //! This test verifies that per-command routing mode only sends ONE greeting,
-//! not two. The bug was that both setup_client_connection() and
-//! handle_per_command_routing() were sending greetings.
+//! not two. The bug was that both `setup_client_connection()` and
+//! `handle_per_command_routing()` were sending greetings.
 
 use anyhow::Result;
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
@@ -19,14 +19,11 @@ fn test_single_greeting_per_command_mode() -> Result<()> {
     // This test is meant to be run manually with a running proxy
     let addr = "127.0.0.1:8121";
 
-    let mut stream =
-        match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2)) {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("Skipping test - proxy not running on {}", addr);
-                return Ok(());
-            }
-        };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2))
+    else {
+        eprintln!("Skipping test - proxy not running on {addr}");
+        return Ok(());
+    };
 
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
 
@@ -121,7 +118,7 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect to proxy
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).await?;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
 

@@ -11,7 +11,7 @@ use nntp_proxy::{Config, NntpProxy, RoutingMode};
 use crate::test_helpers::*;
 
 /// Test that hybrid mode handles long-running sessions and triggers metrics flushing
-/// This test sends >100 commands to trigger the METRICS_FLUSH_INTERVAL code path
+/// This test sends >100 commands to trigger the `METRICS_FLUSH_INTERVAL` code path
 #[tokio::test]
 async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
     let mock_port = get_available_port()
@@ -47,7 +47,7 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
         .build()
         .await?;
 
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
@@ -89,14 +89,14 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
         buffer = [0; 1024];
         let n = timeout(Duration::from_millis(1000), client.read(&mut buffer))
             .await
-            .map_err(|_| anyhow::anyhow!("Timeout on command {}", i))?
-            .map_err(|e| anyhow::anyhow!("Read error on command {}: {}", i, e))?;
+            .map_err(|_| anyhow::anyhow!("Timeout on command {i}"))?
+            .map_err(|e| anyhow::anyhow!("Read error on command {i}: {e}"))?;
 
-        assert!(n > 0, "Empty response on command {}", i);
+        assert!(n > 0, "Empty response on command {i}");
 
         // Every 50 commands, log progress
         if i % 50 == 0 {
-            println!("Completed {} commands", i);
+            println!("Completed {i} commands");
         }
     }
 
@@ -120,7 +120,7 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
     // Create a mock server that will close connection after GROUP to simulate backend error
     let mock_port_clone = mock_port;
     tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", mock_port_clone))
+        let listener = TcpListener::bind(format!("127.0.0.1:{mock_port_clone}"))
             .await
             .unwrap();
 
@@ -171,7 +171,7 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {

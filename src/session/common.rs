@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthResult {
+pub enum AuthResult {
     /// Authentication succeeded
     Authenticated(BackendToClientBytes),
     /// Authentication failed or not required yet
@@ -19,7 +19,7 @@ pub(crate) enum AuthResult {
 
 /// Result of checking for QUIT command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuitStatus {
+pub enum QuitStatus {
     /// QUIT command was detected and response sent (contains bytes written)
     Quit(BackendToClientBytes),
     /// Not a QUIT command
@@ -27,7 +27,7 @@ pub(crate) enum QuitStatus {
 }
 
 /// Handle AUTHINFO command and update auth state
-pub(crate) async fn handle_auth_command<W>(
+pub async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction<'_>,
     client_write: &mut W,
@@ -59,10 +59,7 @@ where
 }
 
 /// Check if command is QUIT and send closing response
-pub(crate) async fn handle_quit_command<W>(
-    command: &str,
-    client_write: &mut W,
-) -> Result<QuitStatus>
+pub async fn handle_quit_command<W>(command: &str, client_write: &mut W) -> Result<QuitStatus>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -86,10 +83,11 @@ where
 /// Handle successful authentication with all side effects
 ///
 /// Sets username, records connection stats, updates metrics
-pub(crate) fn on_authentication_success(
+#[allow(clippy::needless_pass_by_value)]
+pub fn on_authentication_success(
     client_addr: impl std::fmt::Display,
     username: Option<String>,
-    routing_mode: &crate::config::RoutingMode,
+    routing_mode: crate::config::RoutingMode,
     metrics: &crate::metrics::MetricsCollector,
     connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
     set_username_fn: impl FnOnce(Option<String>),
@@ -221,22 +219,29 @@ impl AuthHandlerResult {
     }
 }
 
+/// Context for stateful authentication checks
+///
+/// Groups the session-level references needed by [`handle_stateful_auth_check`]
+/// to keep its parameter list concise.
+pub struct AuthCheckContext<'a> {
+    pub auth_handler: &'a std::sync::Arc<crate::auth::AuthHandler>,
+    pub auth_state: &'a crate::session::AuthState,
+    pub routing_mode: &'a crate::config::RoutingMode,
+    pub metrics: &'a crate::metrics::MetricsCollector,
+    pub connection_stats: Option<&'a crate::metrics::ConnectionStatsAggregator>,
+}
+
 /// Handle authentication logic for a command in a stateful session
 ///
 /// This encapsulates the common pattern of:
 /// 1. Checking if authenticated
 /// 2. Handling auth commands
 /// 3. Rejecting non-auth commands when not authenticated
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_stateful_auth_check<W>(
     command: &str,
     client_write: &mut W,
     auth_username: &mut Option<String>,
-    auth_handler: &std::sync::Arc<crate::auth::AuthHandler>,
-    auth_state: &crate::session::AuthState,
-    routing_mode: &crate::config::RoutingMode,
-    metrics: &crate::metrics::MetricsCollector,
-    connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
+    ctx: &AuthCheckContext<'_>,
     client_addr: impl std::fmt::Display + Clone,
     set_username_fn: impl FnOnce(Option<String>),
 ) -> anyhow::Result<AuthHandlerResult>
@@ -257,11 +262,11 @@ where
         }
         CommandAction::InterceptAuth(auth_action) => {
             let result = handle_auth_command(
-                auth_handler,
+                ctx.auth_handler,
                 auth_action,
                 client_write,
                 auth_username,
-                auth_state,
+                ctx.auth_state,
             )
             .await?;
 
@@ -270,9 +275,9 @@ where
                     on_authentication_success(
                         client_addr,
                         auth_username.clone(),
-                        routing_mode,
-                        metrics,
-                        connection_stats,
+                        *ctx.routing_mode,
+                        ctx.metrics,
+                        ctx.connection_stats,
                         set_username_fn,
                     );
 

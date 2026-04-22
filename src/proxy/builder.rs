@@ -63,6 +63,7 @@ pub struct NntpProxyBuilder {
     routing_mode: RoutingMode,
     buffer_size: Option<usize>,
     buffer_count: Option<usize>,
+    metrics_store: Option<crate::metrics::MetricsStore>,
 }
 
 impl NntpProxyBuilder {
@@ -70,12 +71,13 @@ impl NntpProxyBuilder {
     ///
     /// The routing mode defaults to `Stateful` (1:1) mode.
     #[must_use]
-    pub fn new(config: Config) -> Self {
+    pub const fn new(config: Config) -> Self {
         Self {
             config,
             routing_mode: RoutingMode::Stateful,
             buffer_size: None,
             buffer_count: None,
+            metrics_store: None,
         }
     }
 
@@ -86,7 +88,7 @@ impl NntpProxyBuilder {
     /// - `PerCommand`: Each command routes to a different backend
     /// - `Hybrid`: Starts in per-command mode, switches to stateful when needed
     #[must_use]
-    pub fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
+    pub const fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
         self.routing_mode = mode;
         self
     }
@@ -96,7 +98,7 @@ impl NntpProxyBuilder {
     /// This affects the size of each buffer in the pool. Larger buffers
     /// can improve throughput for large article transfers but use more memory.
     #[must_use]
-    pub fn with_buffer_pool_size(mut self, size: usize) -> Self {
+    pub const fn with_buffer_pool_size(mut self, size: usize) -> Self {
         self.buffer_size = Some(size);
         self
     }
@@ -106,8 +108,18 @@ impl NntpProxyBuilder {
     /// This affects how many buffers are pre-allocated. Should roughly match
     /// the expected number of concurrent connections.
     #[must_use]
-    pub fn with_buffer_pool_count(mut self, count: usize) -> Self {
+    pub const fn with_buffer_pool_count(mut self, count: usize) -> Self {
         self.buffer_count = Some(count);
+        self
+    }
+
+    /// Restore metrics from a previously-saved store
+    ///
+    /// If provided, the builder will initialize the `MetricsCollector` with this store,
+    /// allowing metrics to persist across proxy restarts.
+    #[must_use]
+    pub fn with_metrics_store(mut self, store: crate::metrics::MetricsStore) -> Self {
+        self.metrics_store = Some(store);
         self
     }
 
@@ -148,14 +160,16 @@ impl NntpProxyBuilder {
         )
         .with_capture_pool(CAPTURE, self.config.proxy.capture_pool_count);
 
-        let metrics = MetricsCollector::new(self.config.servers.len());
+        let metrics = match self.metrics_store {
+            Some(store) => MetricsCollector::with_store(store),
+            None => MetricsCollector::new(self.config.servers.len()),
+        };
 
         let adaptive_precheck = self
             .config
             .cache
             .as_ref()
-            .map(|c| c.adaptive_precheck)
-            .unwrap_or(false);
+            .is_some_and(|c| c.adaptive_precheck);
 
         let backend_strategy = self.config.proxy.backend_selection;
         let cache_config = self.config.cache;

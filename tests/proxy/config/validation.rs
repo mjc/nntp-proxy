@@ -6,7 +6,7 @@
 use anyhow::Result;
 use nntp_proxy::config::Config;
 
-/// Test that connection_keepalive field name works (not connection_keepalive_secs)
+/// Test that `connection_keepalive` field name works (not `connection_keepalive_secs`)
 /// Regression test for issue #31
 #[test]
 fn test_connection_keepalive_field_name() -> Result<()> {
@@ -28,7 +28,7 @@ connection_keepalive = 60
     Ok(())
 }
 
-/// Test that old incorrect field name connection_keepalive_secs is rejected
+/// Test that old incorrect field name `connection_keepalive_secs` is rejected
 /// This ensures we catch config errors early
 #[test]
 fn test_connection_keepalive_secs_rejected() {
@@ -56,7 +56,7 @@ connection_keepalive_secs = 60
     // If it fails, that's also acceptable behavior
 }
 
-/// Test that omitting connection_keepalive works (it's optional)
+/// Test that omitting `connection_keepalive` works (it's optional)
 #[test]
 fn test_connection_keepalive_optional() -> Result<()> {
     let toml = r#"
@@ -73,7 +73,7 @@ name = "Test Server"
     Ok(())
 }
 
-/// Test that health check uses interval and timeout (not interval_secs/timeout_secs)
+/// Test that health check uses interval and timeout (not `interval_secs/timeout_secs`)
 /// Regression test for issue #31
 #[test]
 fn test_health_check_field_names() -> Result<()> {
@@ -99,7 +99,7 @@ unhealthy_threshold = 3
     Ok(())
 }
 
-/// Test that old incorrect field names interval_secs/timeout_secs are rejected
+/// Test that old incorrect field names `interval_secs/timeout_secs` are rejected
 #[test]
 fn test_health_check_old_field_names_rejected() {
     let toml = r#"
@@ -152,7 +152,7 @@ name = "Test Server"
     Ok(())
 }
 
-/// Test that client_auth section is completely optional
+/// Test that `client_auth` section is completely optional
 /// Regression test for issue #33
 #[test]
 fn test_client_auth_optional() -> Result<()> {
@@ -174,7 +174,7 @@ name = "Test Server"
     Ok(())
 }
 
-/// Test that client_auth with user credentials is enabled
+/// Test that `client_auth` with user credentials is enabled
 #[test]
 fn test_client_auth_enabled_with_credentials() -> Result<()> {
     let toml = r#"
@@ -365,7 +365,7 @@ password = "backend_pass"
     Ok(())
 }
 
-/// Test max_connections field
+/// Test `max_connections` field
 #[test]
 fn test_max_connections_field() -> Result<()> {
     let toml = r#"
@@ -384,7 +384,7 @@ max_connections = 20
     Ok(())
 }
 
-/// Test max_connections default value
+/// Test `max_connections` default value
 #[test]
 fn test_max_connections_default() -> Result<()> {
     let toml = r#"
@@ -489,7 +489,7 @@ name = "Test Server"
     assert!(result.is_err(), "Port 0 should be rejected");
 }
 
-/// Test that validation catches invalid max_connections
+/// Test that validation catches invalid `max_connections`
 #[test]
 fn test_invalid_max_connections_rejected() {
     let toml = r#"

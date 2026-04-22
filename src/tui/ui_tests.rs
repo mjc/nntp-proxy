@@ -14,27 +14,15 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[allow(clippy::assertions_on_constants)]
     fn test_min_height_for_logs_constant() {
-        const MIN_HEIGHT_FOR_LOGS: u16 = 40;
-
-        // Verify the constant matches what render_ui uses
-        // This ensures logs appear at reasonable terminal sizes
-        assert_eq!(MIN_HEIGHT_FOR_LOGS, 40);
-
-        // Should be larger than minimum viable terminal
-        assert!(MIN_HEIGHT_FOR_LOGS > 24, "Should work in larger terminals");
+        // Verify constraints on the log panel threshold
+        const { assert!(layout::MIN_HEIGHT_FOR_LOGS > 24) };
     }
 
     #[test]
-    #[allow(clippy::assertions_on_constants)]
     fn test_log_window_height_reasonable() {
-        const LOG_WINDOW_HEIGHT: u16 = 10;
-
-        // Should show useful number of log lines
-        assert_eq!(LOG_WINDOW_HEIGHT, 10);
-        assert!(LOG_WINDOW_HEIGHT >= 5, "Should show multiple log lines");
-        assert!(LOG_WINDOW_HEIGHT <= 15, "Shouldn't dominate screen");
+        const { assert!(layout::LOG_WINDOW_HEIGHT >= 5) };
+        const { assert!(layout::LOG_WINDOW_HEIGHT <= 15) };
     }
 
     #[test]
@@ -54,22 +42,19 @@ mod tests {
 
     #[test]
     fn test_layout_with_logs_reasonable() {
-        const MIN_HEIGHT_FOR_LOGS: u16 = 40;
-        const LOG_WINDOW_HEIGHT: u16 = 10;
-
         let total = layout::TITLE_HEIGHT
             + layout::SUMMARY_HEIGHT
             + layout::MIN_CHART_HEIGHT
-            + LOG_WINDOW_HEIGHT
+            + layout::LOG_WINDOW_HEIGHT
             + layout::FOOTER_HEIGHT
             + 2; // margins
 
         // Should fit comfortably in the minimum height
         assert!(
-            total <= MIN_HEIGHT_FOR_LOGS,
+            total <= layout::MIN_HEIGHT_FOR_LOGS,
             "Layout should fit when logs are shown (total={}, min={})",
             total,
-            MIN_HEIGHT_FOR_LOGS
+            layout::MIN_HEIGHT_FOR_LOGS,
         );
     }
 

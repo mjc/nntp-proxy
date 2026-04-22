@@ -114,6 +114,7 @@
       buildInputs = with pkgs; [
         openssl
         zlib
+        bashInteractive
       ];
 
       # Map system to Rust target triple env var prefix

@@ -1,12 +1,12 @@
-//! Integration tests for HybridArticleCache
+//! Integration tests for `HybridArticleCache`
 //!
 //! These tests verify critical hybrid cache functionality:
-//! - WriteOnInsertion policy (data persistence)
-//! - cache.close() flushes pending writes
+//! - `WriteOnInsertion` policy (data persistence)
+//! - `cache.close()` flushes pending writes
 //! - Memory → disk eviction
 //! - Racing precheck integration
 //!
-//! Uses MockHybridCache to avoid foyer runtime issues in tests.
+//! Uses `MockHybridCache` to avoid foyer runtime issues in tests.
 
 use anyhow::Result;
 use nntp_proxy::cache::mock_hybrid::MockHybridCache;

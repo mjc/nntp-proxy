@@ -133,10 +133,9 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            let addr = format!("127.0.0.1:{}", port);
-            let listener = match TcpListener::bind(&addr).await {
-                Ok(l) => l,
-                Err(_) => return,
+            let addr = format!("127.0.0.1:{port}");
+            let Ok(listener) = TcpListener::bind(&addr).await else {
+                return;
             };
 
             while let Ok((mut stream, _)) = listener.accept().await {

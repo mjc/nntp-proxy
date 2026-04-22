@@ -35,13 +35,14 @@ pub mod buffer {
     /// Larger than POOL to handle 99th percentile articles
     pub const CAPTURE: usize = 768 * 1024;
 
-    /// Default number of capture buffers in the pool
-    /// Sized for 16 concurrent caching operations
-    /// Total memory: 16 × 768KB ≈ 12MB
-    /// This is a conservative default; increase via config for higher caching throughput
+    /// Default number of capture buffers in the pool.
+    ///
+    /// Sized for 16 concurrent caching operations.
+    /// Total memory: 16 × 768KB ≈ 12MB.
+    /// This is a conservative default; increase via config for higher caching throughput.
     pub const CAPTURE_COUNT: usize = 16;
 
-    /// BufReader capacity for client command parsing (64KB)
+    /// `BufReader` capacity for client command parsing (64KB)
     /// Large enough to handle any NNTP command line without multiple reads
     /// Sized for efficient line-based reading with minimal syscalls
     pub const READER_CAPACITY: usize = 64 * 1024;
@@ -68,6 +69,7 @@ pub mod buffer {
     pub const STREAM_CHUNK: usize = 724 * 1024;
 
     /// Maximum leftover bytes between pipelined responses.
+    ///
     /// Leftover is a suffix of one TCP read, so normally bounded by buffer
     /// capacity. This limit catches protocol desync where a backend sends
     /// unexpected extra data after terminators. 128KB is generous — normal
@@ -165,7 +167,8 @@ pub mod pool {
     pub const TCP_PEEK_BUFFER_SIZE: usize = 1;
 
     /// Health check timeout - how long to wait for DATE command response
-    pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+    /// CRITICAL: Must be < `MAX_CONNECTION_SALVAGE_MS` (1000ms) to prevent pool starvation
+    pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// Buffer size for reading health check responses
     pub const HEALTH_CHECK_BUFFER_SIZE: usize = 512;
@@ -217,7 +220,7 @@ pub mod session {
 pub mod user {
     /// Display name for anonymous/unauthenticated users
     ///
-    /// Used as HashMap key and display value for users who haven't authenticated.
+    /// Used as `HashMap` key and display value for users who haven't authenticated.
     /// The `<anonymous>` format is chosen to:
     /// - Sort first in alphabetical listings (< comes before letters)
     /// - Be clearly distinguished from actual usernames
@@ -225,66 +228,55 @@ pub mod user {
     pub const ANONYMOUS: &str = "<anonymous>";
 }
 
+// Compile-time invariant checks — these fail the build if constants are inconsistent
+const _: () = {
+    // Buffer alignment (4KB page boundaries)
+    assert!(
+        buffer::POOL.is_multiple_of(4096),
+        "POOL must be page-aligned"
+    );
+    assert!(
+        buffer::STREAM_CHUNK.is_multiple_of(4096),
+        "STREAM_CHUNK must be page-aligned"
+    );
+    assert!(
+        buffer::POOL == buffer::STREAM_CHUNK,
+        "POOL and STREAM_CHUNK should match"
+    );
+
+    // Buffer size relationships
+    assert!(buffer::POOL == 724 * 1024);
+    assert!(buffer::READER_CAPACITY >= buffer::COMMAND);
+    assert!(buffer::READER_CAPACITY == 64 * 1024);
+    assert!(buffer::RESPONSE_MAX > buffer::POOL);
+    assert!(buffer::RESPONSE_INITIAL >= buffer::COMMAND);
+    assert!(buffer::RESPONSE_MAX > buffer::RESPONSE_INITIAL);
+    assert!(buffer::POOL >= buffer::STREAM_CHUNK);
+
+    // Socket buffer ratios (~10x streaming chunk)
+    assert!(socket::POOL_RECV_BUFFER >= buffer::STREAM_CHUNK * 10);
+    assert!(socket::POOL_SEND_BUFFER >= buffer::STREAM_CHUNK * 10);
+    assert!(socket::HIGH_THROUGHPUT_RECV_BUFFER > socket::POOL_RECV_BUFFER);
+    assert!(socket::HIGH_THROUGHPUT_SEND_BUFFER > socket::POOL_SEND_BUFFER);
+    assert!(socket::HIGH_THROUGHPUT_RECV_BUFFER == socket::HIGH_THROUGHPUT_SEND_BUFFER);
+
+    // Health check constraints
+    assert!(pool::MIN_RECOMMENDED_KEEPALIVE_SECS > 0);
+    assert!(pool::MAX_RECOMMENDED_KEEPALIVE_SECS > pool::MIN_RECOMMENDED_KEEPALIVE_SECS);
+    assert!(
+        pool::HEALTH_CHECK_POOL_TIMEOUT_MS < 1000,
+        "Health check timeout should be < 1s"
+    );
+    assert!(pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE > 0);
+    assert!(
+        pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE <= 10,
+        "Should not check too many at once"
+    );
+};
+
 #[cfg(test)]
-#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_buffer_alignment() {
-        // Pool buffer should be page-aligned (4KB boundaries)
-        assert_eq!(buffer::POOL % 4096, 0, "POOL must be page-aligned");
-
-        // Stream chunk should be page-aligned
-        assert_eq!(
-            buffer::STREAM_CHUNK % 4096,
-            0,
-            "STREAM_CHUNK must be page-aligned"
-        );
-
-        // Pool and chunk should match for single-read optimization
-        assert_eq!(
-            buffer::POOL,
-            buffer::STREAM_CHUNK,
-            "POOL and STREAM_CHUNK should match"
-        );
-    }
-
-    #[test]
-    fn test_buffer_sizes() {
-        // Pool buffer should be 724KB (optimal for 725KB average articles)
-        assert_eq!(buffer::POOL, 724 * 1024);
-
-        // Reader capacity should be large enough for any command
-        assert!(buffer::READER_CAPACITY >= buffer::COMMAND);
-        assert_eq!(buffer::READER_CAPACITY, 64 * 1024);
-
-        // Response max should be larger than pool for safety margin
-        assert!(buffer::RESPONSE_MAX > buffer::POOL);
-
-        // Basic size relationships
-        assert!(buffer::RESPONSE_INITIAL >= buffer::COMMAND);
-        assert!(buffer::RESPONSE_MAX > buffer::RESPONSE_INITIAL);
-        assert!(buffer::POOL >= buffer::STREAM_CHUNK);
-    }
-
-    #[test]
-    fn test_socket_buffer_ratios() {
-        // Socket buffers should be ~10x the streaming chunk size for optimal throughput
-        let expected_min_buffer = buffer::STREAM_CHUNK * 10;
-        assert!(socket::POOL_RECV_BUFFER >= expected_min_buffer);
-        assert!(socket::POOL_SEND_BUFFER >= expected_min_buffer);
-
-        // High-throughput buffers should be larger than pool buffers
-        assert!(socket::HIGH_THROUGHPUT_RECV_BUFFER > socket::POOL_RECV_BUFFER);
-        assert!(socket::HIGH_THROUGHPUT_SEND_BUFFER > socket::POOL_SEND_BUFFER);
-
-        // Buffers should be symmetric (send == receive)
-        assert_eq!(
-            socket::HIGH_THROUGHPUT_RECV_BUFFER,
-            socket::HIGH_THROUGHPUT_SEND_BUFFER
-        );
-    }
 
     #[test]
     fn test_pool_memory_footprint() {
@@ -297,9 +289,7 @@ mod tests {
 
         assert!(
             actual_mb >= expected_mb - 1 && actual_mb <= expected_mb + 1,
-            "Pool memory should be ~{}MB, got {}MB",
-            expected_mb,
-            actual_mb
+            "Pool memory should be ~{expected_mb}MB, got {actual_mb}MB"
         );
     }
 
@@ -313,25 +303,5 @@ mod tests {
 
         // All timeouts should be non-zero
         assert!(timeout::BACKEND_READ.as_secs() > 0);
-    }
-
-    #[test]
-    fn test_health_check_constraints() {
-        // Keepalive interval should be within recommended bounds
-        assert!(pool::MIN_RECOMMENDED_KEEPALIVE_SECS > 0);
-        assert!(pool::MAX_RECOMMENDED_KEEPALIVE_SECS > pool::MIN_RECOMMENDED_KEEPALIVE_SECS);
-
-        // Health check pool timeout should be short
-        assert!(
-            pool::HEALTH_CHECK_POOL_TIMEOUT_MS < 1000,
-            "Health check timeout should be < 1s"
-        );
-
-        // Connection health check cycle limit should be reasonable
-        assert!(pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE > 0);
-        assert!(
-            pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE <= 10,
-            "Should not check too many at once"
-        );
     }
 }

@@ -1,11 +1,11 @@
-//! Tests for UnifiedCache and related cache functionality
+//! Tests for `UnifiedCache` and related cache functionality
 //!
 //! This test suite covers:
-//! - UnifiedCache enum dispatch (memory vs hybrid)
-//! - CacheStatsProvider trait implementations
-//! - ArticleEntry::response_for_command() including STAT synthesis
-//! - ArticleAvailability::from_bits() and ArticleEntry::set_availability()
-//! - DiskCache configuration defaults and validation
+//! - `UnifiedCache` enum dispatch (memory vs hybrid)
+//! - `CacheStatsProvider` trait implementations
+//! - `ArticleEntry::response_for_command()` including STAT synthesis
+//! - `ArticleAvailability::from_bits()` and `ArticleEntry::set_availability()`
+//! - `DiskCache` configuration defaults and validation
 
 use nntp_proxy::cache::{
     ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, UnifiedCache,
@@ -340,7 +340,7 @@ fn test_availability_from_bits_some_missing() {
     // checked=0b00000011, missing=0b00000001 means:
     // - backend 0: checked and missing (430)
     // - backend 1: checked and has article
-    let avail = ArticleAvailability::from_bits(0b00000011, 0b00000001);
+    let avail = ArticleAvailability::from_bits(0b0000_0011, 0b0000_0001);
 
     assert!(avail.has_availability_info());
     assert_eq!(
@@ -847,7 +847,7 @@ fn test_hybrid_entry_serialization_roundtrip() {
     use std::io::Cursor;
 
     let buffer = make_valid_article_buffer();
-    let mut entry = HybridArticleEntry::new(buffer.clone()).unwrap();
+    let mut entry = HybridArticleEntry::new(buffer).unwrap();
 
     // Add some availability info
     entry.record_backend_missing(BackendId::from_index(0));

@@ -4,9 +4,10 @@ use crate::metrics::types::{CommandCount, ErrorCount};
 use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
 
 /// Statistics for a single user (snapshot)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserStats {
     pub username: String,
+    #[serde(skip, default)]
     pub active_connections: usize,
     pub total_connections: TotalConnections,
     pub bytes_sent: BytesSent,
@@ -14,7 +15,9 @@ pub struct UserStats {
     pub total_commands: CommandCount,
     pub errors: ErrorCount,
     /// Transfer rates (bytes/sec) - populated by TUI from deltas, 0 in raw snapshots
+    #[serde(skip, default)]
     pub bytes_sent_per_sec: BytesPerSecondRate,
+    #[serde(skip, default)]
     pub bytes_received_per_sec: BytesPerSecondRate,
 }
 
@@ -31,7 +34,7 @@ impl UserStats {
     /// Get total bytes transferred (sent + received)
     #[must_use]
     #[inline]
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.bytes_sent
             .as_u64()
             .saturating_add(self.bytes_received.as_u64())
@@ -40,7 +43,7 @@ impl UserStats {
     /// Get total transfer rate (sent + received) in bytes/sec
     #[must_use]
     #[inline]
-    pub fn total_bytes_per_sec(&self) -> u64 {
+    pub const fn total_bytes_per_sec(&self) -> u64 {
         self.bytes_sent_per_sec
             .get()
             .saturating_add(self.bytes_received_per_sec.get())
@@ -60,14 +63,14 @@ impl UserStats {
     /// Check if user has any activity
     #[must_use]
     #[inline]
-    pub fn has_activity(&self) -> bool {
+    pub const fn has_activity(&self) -> bool {
         self.total_commands.get() > 0 || self.total_connections.get() > 0
     }
 
     /// Check if user is currently connected
     #[must_use]
     #[inline]
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         self.active_connections > 0
     }
 }

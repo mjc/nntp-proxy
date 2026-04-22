@@ -1,12 +1,13 @@
 //! Benchmarks for backend selection and routing
+#![allow(clippy::cast_possible_truncation)]
 //!
 //! Measures hot-path router operations:
-//! - route_command with weighted round-robin strategy
-//! - route_command with least-loaded strategy
-//! - route_command_with_availability (partially exhausted)
-//! - complete_command throughput
+//! - `route_command` with weighted round-robin strategy
+//! - `route_command` with least-loaded strategy
+//! - `route_command_with_availability` (partially exhausted)
+//! - `complete_command` throughput
 //!
-//! Run with: cargo bench --bench router_selection
+//! Run with: cargo bench --bench `router_selection`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::config::BackendSelectionStrategy;
@@ -50,7 +51,7 @@ fn make_router(strategy: BackendSelectionStrategy, num_backends: usize) -> Arc<B
 // =============================================================================
 
 mod weighted_round_robin {
-    use super::*;
+    use super::{BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn route_2_backends(bencher: Bencher) {
@@ -97,7 +98,7 @@ mod weighted_round_robin {
 // =============================================================================
 
 mod least_loaded {
-    use super::*;
+    use super::{BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn route_2_backends(bencher: Bencher) {
@@ -131,7 +132,7 @@ mod least_loaded {
 // =============================================================================
 
 mod availability_routing {
-    use super::*;
+    use super::{BackendId, BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
     use nntp_proxy::cache::ArticleAvailability;
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
@@ -179,7 +180,7 @@ mod availability_routing {
 // =============================================================================
 
 mod complete_command {
-    use super::*;
+    use super::{BackendId, BackendSelectionStrategy, Bencher, black_box, make_router};
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn complete_single(bencher: Bencher) {
@@ -199,7 +200,7 @@ mod complete_command {
 // =============================================================================
 
 mod contention {
-    use super::*;
+    use super::{BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
 
     #[divan::bench(sample_count = 100, sample_size = 100, threads = [1, 2, 4, 8])]
     fn route_and_complete(bencher: Bencher) {

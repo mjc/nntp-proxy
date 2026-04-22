@@ -8,7 +8,7 @@
 //! - Graceful shutdown with QUIT commands
 
 use super::connection_trait::ConnectionProvider;
-use super::deadpool_connection::{Pool, TcpManager};
+use super::deadpool_connection::{Pool, TcpManager, TcpManagerOptions};
 use super::health_check::{HealthCheckMetrics, check_date_response};
 use crate::pool::PoolStatus;
 use crate::tls::TlsConfig;
@@ -109,7 +109,7 @@ impl Builder {
 
     /// Set the maximum number of concurrent connections in the pool
     #[must_use]
-    pub fn max_connections(mut self, max_size: usize) -> Self {
+    pub const fn max_connections(mut self, max_size: usize) -> Self {
         self.max_size = max_size;
         self
     }
@@ -149,11 +149,12 @@ impl Builder {
             self.host,
             self.port,
             name.clone(),
-            self.username,
-            self.password,
-            self.tls_config,
-            None,
-            None,
+            TcpManagerOptions {
+                username: self.username,
+                password: self.password,
+                tls_config: self.tls_config,
+                ..TcpManagerOptions::default()
+            },
         )?;
 
         Ok(DeadpoolConnectionProvider::from_manager(
@@ -281,6 +282,7 @@ impl DeadpoolConnectionProvider {
     /// Create a new connection provider (plain TCP, no TLS)
     ///
     /// For TLS support, use `new_with_tls()` or the builder API.
+    #[must_use]
     pub fn new(
         host: String,
         port: u16,
@@ -295,11 +297,11 @@ impl DeadpoolConnectionProvider {
                 host,
                 port,
                 name.clone(),
-                username,
-                password,
-                None,
-                None,
-                None,
+                TcpManagerOptions {
+                    username,
+                    password,
+                    ..TcpManagerOptions::default()
+                },
             )
             .expect("Plain TCP TcpManager creation cannot fail"),
             name,
@@ -321,16 +323,17 @@ impl DeadpoolConnectionProvider {
             host,
             port,
             name.clone(),
-            username,
-            password,
-            Some(tls_config),
-            None,
-            None,
+            TcpManagerOptions {
+                username,
+                password,
+                tls_config: Some(tls_config),
+                ..TcpManagerOptions::default()
+            },
         )?;
         Ok(Self::from_manager(manager, name, max_size))
     }
 
-    /// Construct a provider from a pre-built TcpManager
+    /// Construct a provider from a pre-built `TcpManager`
     fn from_manager(manager: TcpManager, name: String, max_size: usize) -> Self {
         let pool = Pool::builder(manager)
             .max_size(max_size)
@@ -369,11 +372,13 @@ impl DeadpoolConnectionProvider {
             server.host.to_string(),
             server.port.get(),
             server.name.to_string(),
-            server.username.clone(),
-            server.password.clone(),
-            Some(tls_config),
-            server.compress,
-            server.compress_level,
+            TcpManagerOptions {
+                username: server.username.clone(),
+                password: server.password.clone(),
+                tls_config: Some(tls_config),
+                compress: server.compress,
+                compress_level: server.compress_level,
+            },
         )?;
         let max_size = server.max_connections.get();
         let pool = Pool::builder(manager)
@@ -480,7 +485,7 @@ impl DeadpoolConnectionProvider {
     /// deadpool creates a replacement. Prevents connection count from
     /// exceeding the backend's limit during high churn.
     ///
-    /// If replacement_cooldown is None or Duration::ZERO (disabled), immediately drops
+    /// If `replacement_cooldown` is None or `Duration::ZERO` (disabled), immediately drops
     /// the connection without cooldown (behaves like normal pool removal).
     ///
     /// CRITICAL: When cooldown is active, we resize the pool BEFORE dropping the
@@ -495,7 +500,9 @@ impl DeadpoolConnectionProvider {
     pub fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
         // If cooldown is disabled (None or zero duration), just shut down and drop
         let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
-            shutdown_and_drop(conn);
+            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
+                .shutdown(std::net::Shutdown::Both);
+            drop(conn);
             return;
         };
 
@@ -507,7 +514,9 @@ impl DeadpoolConnectionProvider {
         let current = self.active_cooldowns.load(Ordering::Acquire);
         if current >= max_reduction {
             // Already at max reduction — just shut down and drop without further cooldown
-            shutdown_and_drop(conn);
+            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
+                .shutdown(std::net::Shutdown::Both);
+            drop(conn);
             return;
         }
 
@@ -592,6 +601,7 @@ impl DeadpoolConnectionProvider {
     }
 
     /// Get a reference to the health check metrics
+    #[must_use]
     pub fn health_check_metrics(&self) -> &HealthCheckMetrics {
         &self.health_check_metrics
     }
@@ -609,7 +619,7 @@ impl DeadpoolConnectionProvider {
     /// Run periodic health checks on idle connections
     ///
     /// This task runs in the background checking a limited number of idle connections
-    /// each cycle. It can be gracefully shut down via the shutdown_rx channel.
+    /// each cycle. It can be gracefully shut down via the `shutdown_rx` channel.
     /// Health check metrics are recorded in the provided metrics object.
     async fn run_periodic_health_checks(
         pool: Pool,
@@ -631,7 +641,7 @@ impl DeadpoolConnectionProvider {
 
         loop {
             tokio::select! {
-                _ = sleep(interval) => {
+                () = sleep(interval) => {
                     // Time to run health check
                 }
                 _ = shutdown_rx.recv() => {
@@ -676,12 +686,9 @@ impl DeadpoolConnectionProvider {
                         // Shut down the raw TCP socket so recycle reliably detects it as dead
                         let _ = socket2::SockRef::from(conn_obj.underlying_tcp_stream())
                             .shutdown(std::net::Shutdown::Both);
-                        // Return to pool normally — deadpool drops it before creating a replacement
-                        drop(conn_obj);
-                    } else {
-                        // Connection is healthy, return to pool automatically via Drop
-                        drop(conn_obj);
                     }
+                    // Return to pool normally — deadpool drops it before creating a replacement
+                    drop(conn_obj);
                 } else {
                     break;
                 }
@@ -734,14 +741,6 @@ impl DeadpoolConnectionProvider {
 
         self.pool.close();
     }
-}
-
-/// Shut down TCP socket and drop a pooled connection.
-///
-/// Takes ownership so the caller cannot drop `conn` at a different point.
-fn shutdown_and_drop(conn: managed::Object<TcpManager>) {
-    let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
-    drop(conn);
 }
 
 /// Resize pool max THEN shut down and drop the connection.
@@ -815,7 +814,7 @@ mod tests {
     #[test]
     fn test_builder_with_tls_config() {
         let tls_config = TlsConfig::builder().enabled(true).build();
-        let builder = Builder::new("example.com", 563).tls_config(tls_config.clone());
+        let builder = Builder::new("example.com", 563).tls_config(tls_config);
         assert!(builder.tls_config.is_some());
     }
 
@@ -1030,7 +1029,7 @@ mod tests {
     }
 
     /// Helper: create a provider with cooldown for testing
-    async fn provider_with_cooldown(
+    fn provider_with_cooldown(
         addr: std::net::SocketAddr,
         max_size: usize,
         cooldown: Option<std::time::Duration>,
@@ -1039,11 +1038,10 @@ mod tests {
             addr.ip().to_string(),
             addr.port(),
             format!("test-{}", addr.port()),
-            None,
-            None,
-            None,
-            Some(false), // Disable compression — mock doesn't handle it
-            None,
+            TcpManagerOptions {
+                compress: Some(false), // Disable compression — mock doesn't handle it
+                ..TcpManagerOptions::default()
+            },
         )
         .unwrap();
 
@@ -1060,15 +1058,15 @@ mod tests {
         }
     }
 
-    /// Verify that remove_with_cooldown reduces pool max_size BEFORE releasing
+    /// Verify that `remove_with_cooldown` reduces pool `max_size` BEFORE releasing
     /// the connection. This is the fix for the race where waiters would see
-    /// size < max_size and create a replacement connection.
+    /// size < `max_size` and create a replacement connection.
     #[tokio::test]
     async fn test_remove_with_cooldown_resize_before_drop() {
         let addr = spawn_mock_nntp_server().await;
         let cooldown = std::time::Duration::from_secs(10);
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         let conn = provider.get_pooled_connection().await.unwrap();
         assert_eq!(provider.pool.status().max_size, max_size);
@@ -1094,7 +1092,7 @@ mod tests {
         let addr = spawn_mock_nntp_server().await;
         let cooldown = std::time::Duration::from_secs(10);
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         // max_reduction = 4 / 2 = 2, so after 2 cooldowns it should stop reducing
         let conn1 = provider.get_pooled_connection().await.unwrap();
@@ -1121,7 +1119,7 @@ mod tests {
     async fn test_remove_with_cooldown_disabled() {
         let addr = spawn_mock_nntp_server().await;
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, None).await;
+        let provider = provider_with_cooldown(addr, max_size, None);
 
         let conn = provider.get_pooled_connection().await.unwrap();
         provider.remove_with_cooldown(conn);
@@ -1142,7 +1140,7 @@ mod tests {
         let addr = spawn_mock_nntp_server().await;
         let cooldown = std::time::Duration::from_millis(100);
         let max_size = 4;
-        let provider = provider_with_cooldown(addr, max_size, Some(cooldown)).await;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         let conn = provider.get_pooled_connection().await.unwrap();
         provider.remove_with_cooldown(conn);

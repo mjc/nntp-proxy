@@ -22,7 +22,7 @@ impl ChartX {
     /// Get raw value
     #[must_use]
     #[inline]
-    pub const fn get(&self) -> f64 {
+    pub const fn get(self) -> f64 {
         self.0
     }
 }
@@ -54,14 +54,14 @@ impl ChartY {
     /// Get raw value
     #[must_use]
     #[inline]
-    pub const fn get(&self) -> f64 {
+    pub const fn get(self) -> f64 {
         self.0
     }
 
     /// Get maximum of two values
     #[must_use]
     #[inline]
-    pub fn max(self, other: Self) -> Self {
+    pub const fn max(self, other: Self) -> Self {
         Self::new(self.0.max(other.0))
     }
 }
@@ -132,9 +132,14 @@ pub struct BackendChartData {
 impl BackendChartData {
     /// Create new chart data with pre-computed tuples
     #[must_use]
-    pub fn new(name: String, color: Color, sent_points: PointVec, recv_points: PointVec) -> Self {
-        let sent_tuples = sent_points.iter().map(|p| p.as_tuple()).collect();
-        let recv_tuples = recv_points.iter().map(|p| p.as_tuple()).collect();
+    pub fn new(
+        name: String,
+        color: Color,
+        sent_points: &[ChartPoint],
+        recv_points: &[ChartPoint],
+    ) -> Self {
+        let sent_tuples = sent_points.iter().map(ChartPoint::as_tuple).collect();
+        let recv_tuples = recv_points.iter().map(ChartPoint::as_tuple).collect();
         Self {
             name,
             color,
@@ -218,8 +223,8 @@ mod tests {
         let data = BackendChartData::new(
             "Test".to_string(),
             Color::Green,
-            sent_points,
-            PointVec::new(),
+            &sent_points,
+            &PointVec::new(),
         );
 
         let tuples = data.sent_points_as_tuples();

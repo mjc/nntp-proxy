@@ -2,10 +2,12 @@
 //!
 //! This module provides reusable test utilities to reduce duplication
 //! in integration tests.
+// Test helpers don't need exhaustive doc coverage.
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 use anyhow::Result;
 use nntp_proxy::NntpProxy;
-use nntp_proxy::config::{Config, Server};
+use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy, Server};
 use nntp_proxy::types::{MaxConnections, Port};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -141,6 +143,7 @@ impl MockNntpServer {
     }
 
     /// Create a new mock server builder on the specified port
+    #[must_use]
     pub fn new(port: u16) -> Self {
         Self {
             port,
@@ -152,12 +155,14 @@ impl MockNntpServer {
     }
 
     /// Set the server name that appears in the greeting
+    #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
     /// Require authentication with the given credentials
+    #[must_use]
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.require_auth = true;
         self.credentials = Some((username.into(), password.into()));
@@ -167,6 +172,7 @@ impl MockNntpServer {
     /// Add a custom handler for a specific command prefix
     ///
     /// When a command starting with `cmd` is received, respond with `response`.
+    #[must_use]
     pub fn on_command(mut self, cmd: impl Into<String>, response: impl Into<String>) -> Self {
         self.command_handlers
             .insert(cmd.into().to_uppercase(), response.into());
@@ -217,7 +223,7 @@ impl MockNntpServer {
             let listener = match TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("Failed to bind mock server on {}: {}", addr, e);
+                    eprintln!("Failed to bind mock server on {addr}: {e}");
                     return;
                 }
             };
@@ -237,6 +243,7 @@ impl MockNntpServer {
 /// * `port` - Port to listen on
 /// * `server_name` - Name to include in greeting message
 #[allow(dead_code)]
+#[must_use]
 pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
     MockNntpServer::new(port).with_name(server_name).spawn()
 }
@@ -288,6 +295,7 @@ pub async fn get_available_port() -> Result<u16> {
 }
 
 /// Create a test configuration with servers on the given ports
+#[must_use]
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     use nntp_proxy::types::{MaxConnections, Port};
     Config {
@@ -301,10 +309,10 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
                     .unwrap()
             })
             .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
-        cache: Default::default(),
-        client_auth: Default::default(),
+        proxy: Proxy::default(),
+        health_check: HealthCheck::default(),
+        cache: None,
+        client_auth: ClientAuth::default(),
     }
 }
 
@@ -353,6 +361,7 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
 /// let pool = create_test_buffer_pool();
 /// let session = ClientSession::new(addr.into(), pool, auth_handler);
 /// ```
+#[must_use]
 pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
     use nntp_proxy::pool::BufferPool;
     use nntp_proxy::types::BufferSize;
@@ -361,11 +370,13 @@ pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
 }
 
 /// Create a test auth handler with standard credentials (user/pass)
+#[must_use]
 pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     create_test_auth_handler_with("user", "pass")
 }
 
 /// Create a test auth handler with custom credentials
+#[must_use]
 pub fn create_test_auth_handler_with(
     username: &str,
     password: &str,
@@ -377,11 +388,13 @@ pub fn create_test_auth_handler_with(
 }
 
 /// Create a disabled (no-auth) test auth handler
+#[must_use]
 pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     std::sync::Arc::new(nntp_proxy::auth::AuthHandler::new(None, None).unwrap())
 }
 
 /// Create a test backend selector (router)
+#[must_use]
 pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelector> {
     std::sync::Arc::new(nntp_proxy::router::BackendSelector::new())
 }
@@ -395,6 +408,7 @@ pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelecto
 /// let addr = create_test_addr();
 /// let session = ClientSession::new(addr.into(), pool, auth);
 /// ```
+#[must_use]
 pub fn create_test_addr() -> std::net::SocketAddr {
     "127.0.0.1:9999".parse().unwrap()
 }
@@ -561,6 +575,7 @@ pub async fn send_article_read_full_response(
 
 /// Create a basic server configuration for testing (no TLS)
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
     Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
@@ -571,6 +586,7 @@ pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
 
 /// Create a server configuration with authentication
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config_with_auth(
     host: &str,
     port: u16,
@@ -589,6 +605,7 @@ pub fn create_test_server_config_with_auth(
 
 /// Create a TLS-enabled server configuration
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config_with_tls(
     host: &str,
     port: u16,
@@ -611,6 +628,7 @@ pub fn create_test_server_config_with_tls(
 
 /// Create a server configuration with custom max_connections
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_server_config_with_max_connections(
     host: &str,
     port: u16,
@@ -626,6 +644,7 @@ pub fn create_test_server_config_with_max_connections(
 
 /// Create a full Config with client authentication enabled
 #[allow(dead_code)]
+#[must_use]
 pub fn create_test_config_with_auth(
     backend_ports: Vec<u16>,
     username: &str,
@@ -636,10 +655,10 @@ pub fn create_test_config_with_auth(
     Config {
         servers: backend_ports
             .into_iter()
-            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{}", port)))
+            .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{port}")))
             .collect(),
-        proxy: Default::default(),
-        health_check: Default::default(),
+        proxy: Proxy::default(),
+        health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth {
             users: vec![UserCredentials {

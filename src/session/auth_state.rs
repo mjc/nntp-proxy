@@ -210,7 +210,7 @@ mod tests {
     fn test_mark_authenticated_with_arc() {
         let state = AuthState::new();
         let username: Arc<str> = Arc::from("arcuser");
-        state.mark_authenticated(username.clone());
+        state.mark_authenticated(username);
 
         assert!(state.is_authenticated());
         assert_eq!(state.username().unwrap(), "arcuser");

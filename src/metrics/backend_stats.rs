@@ -1,14 +1,18 @@
 //! Backend statistics snapshot type
 
-use super::types::*;
+use super::types::{
+    ActiveConnections, ArticleCount, BackendHealthStatus, CommandCount, ErrorCount,
+    ErrorRatePercent, FailureCount, OverheadMillis, RecvMicros, SendMicros, TtfbMicros,
+};
 use crate::types::{
     ArticleBytesTotal, BackendId, BytesReceived, BytesSent, TimingMeasurementCount,
 };
 
 /// Statistics for a single backend (cloneable snapshot)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackendStats {
     pub backend_id: BackendId,
+    #[serde(skip, default)]
     pub active_connections: ActiveConnections,
     pub total_commands: CommandCount,
     pub bytes_sent: BytesSent,
@@ -23,6 +27,7 @@ pub struct BackendStats {
     pub send_micros_total: SendMicros,
     pub recv_micros_total: RecvMicros,
     pub connection_failures: FailureCount,
+    #[serde(skip, default)]
     pub health_status: BackendHealthStatus,
 }
 
@@ -53,7 +58,7 @@ impl BackendStats {
     /// Calculate average article size
     #[must_use]
     #[inline]
-    pub fn average_article_size(&self) -> Option<u64> {
+    pub const fn average_article_size(&self) -> Option<u64> {
         self.article_count
             .average_bytes(self.article_bytes_total.get())
     }
@@ -132,7 +137,7 @@ impl BackendStats {
     /// Get total bytes transferred
     #[must_use]
     #[inline]
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.bytes_sent
             .as_u64()
             .saturating_add(self.bytes_received.as_u64())
@@ -141,7 +146,7 @@ impl BackendStats {
     /// Check if backend has any activity
     #[must_use]
     #[inline]
-    pub fn has_activity(&self) -> bool {
+    pub const fn has_activity(&self) -> bool {
         self.total_commands.get() > 0
     }
 }

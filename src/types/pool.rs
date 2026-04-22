@@ -51,6 +51,7 @@ pool_count_type!(
 impl InUseConnections {
     /// Calculate from pool capacity and availability
     #[inline]
+    #[must_use]
     pub fn from_pool_stats(max: MaxPoolSize, available: AvailableConnections) -> Self {
         Self::new(max.get().saturating_sub(available.get()))
     }
@@ -58,7 +59,7 @@ impl InUseConnections {
 
 /// Pool utilization as a percentage (0-100)
 ///
-/// Calculated as: (in_use / max_size) * 100
+/// Calculated as: (`in_use` / `max_size`) * 100
 /// Useful for monitoring pool health and load.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PoolUtilization(f64);
@@ -69,17 +70,18 @@ impl PoolUtilization {
     /// # Panics
     /// Panics if percentage is not in range [0.0, 100.0]
     #[inline]
+    #[must_use]
     pub fn new(percentage: f64) -> Self {
         assert!(
             (0.0..=100.0).contains(&percentage),
-            "Utilization must be 0-100%, got {}",
-            percentage
+            "Utilization must be 0-100%, got {percentage}"
         );
         Self(percentage)
     }
 
     /// Calculate utilization from pool stats
     #[inline]
+    #[must_use]
     pub fn from_pool_stats(max: MaxPoolSize, available: AvailableConnections) -> Self {
         let max_size = max.get();
         if max_size == 0 {
@@ -93,7 +95,7 @@ impl PoolUtilization {
 
     #[inline]
     #[must_use]
-    pub fn as_percentage(self) -> f64 {
+    pub const fn as_percentage(self) -> f64 {
         self.0
     }
 
@@ -130,7 +132,7 @@ mod tests {
     fn test_available_connections() {
         let available = AvailableConnections::new(5);
         assert_eq!(available.get(), 5);
-        assert_eq!(format!("{}", available), "5");
+        assert_eq!(format!("{available}"), "5");
 
         let zero = AvailableConnections::zero();
         assert_eq!(zero.get(), 0);
@@ -140,14 +142,14 @@ mod tests {
     fn test_max_pool_size() {
         let max = MaxPoolSize::new(10);
         assert_eq!(max.get(), 10);
-        assert_eq!(format!("{}", max), "10");
+        assert_eq!(format!("{max}"), "10");
     }
 
     #[test]
     fn test_created_connections() {
         let created = CreatedConnections::new(25);
         assert_eq!(created.get(), 25);
-        assert_eq!(format!("{}", created), "25");
+        assert_eq!(format!("{created}"), "25");
 
         let zero = CreatedConnections::zero();
         assert_eq!(zero.get(), 0);
@@ -175,7 +177,7 @@ mod tests {
         let available = AvailableConnections::new(3);
         let utilization = PoolUtilization::from_pool_stats(max, available);
         assert_eq!(utilization.as_percentage(), 70.0);
-        assert_eq!(format!("{}", utilization), "70.0%");
+        assert_eq!(format!("{utilization}"), "70.0%");
     }
 
     #[test]
@@ -218,7 +220,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Utilization must be 0-100%")]
     fn test_pool_utilization_invalid() {
-        PoolUtilization::new(150.0);
+        let _ = PoolUtilization::new(150.0);
     }
 
     #[test]

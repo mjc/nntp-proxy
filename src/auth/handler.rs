@@ -46,8 +46,8 @@ impl AuthHandler {
 
         if let (Some(u), Some(p)) = (username, password) {
             // Both provided - validate they're non-empty
-            let username = Username::try_new(u.clone())?; // Returns Err if empty
-            let password = Password::try_new(p.clone())?; // Returns Err if empty
+            let username = Username::try_new(u)?; // Returns Err if empty
+            let password = Password::try_new(p)?; // Returns Err if empty
             users.insert(username.as_str().to_string(), password.as_str().to_string());
         }
 
@@ -73,6 +73,7 @@ impl AuthHandler {
 
     /// Check if authentication is enabled
     #[inline]
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.users.is_empty()
     }
@@ -80,6 +81,7 @@ impl AuthHandler {
     /// Validate client credentials
     ///
     /// If auth is disabled (no users configured), returns true for all credentials
+    #[must_use]
     pub fn validate_credentials(&self, username: &str, password: &str) -> bool {
         if self.users.is_empty() {
             // Auth disabled - allow all
@@ -92,7 +94,7 @@ impl AuthHandler {
         }
     }
 
-    /// Handle an auth command - writes response to client and returns (bytes_written, auth_success)
+    /// Handle an auth command - writes response to client and returns (`bytes_written`, `auth_success`)
     /// This is the ONE place where auth interception happens
     pub async fn handle_auth_command<W>(
         &self,
@@ -131,12 +133,14 @@ impl AuthHandler {
 
     /// Get the AUTHINFO USER response
     #[inline]
+    #[must_use]
     pub const fn user_response(&self) -> &'static [u8] {
         AUTH_REQUIRED
     }
 
     /// Get the AUTHINFO PASS response
     #[inline]
+    #[must_use]
     pub const fn pass_response(&self) -> &'static [u8] {
         AUTH_ACCEPTED
     }
@@ -212,7 +216,7 @@ mod tests {
         fn test_with_users_rejects_empty_username() {
             let users = vec![
                 ("alice".to_string(), "pass1".to_string()),
-                ("".to_string(), "pass2".to_string()), // Empty username
+                (String::new(), "pass2".to_string()), // Empty username
             ];
             let result = AuthHandler::with_users(users);
             assert!(result.is_err());
@@ -222,7 +226,7 @@ mod tests {
         fn test_with_users_rejects_empty_password() {
             let users = vec![
                 ("alice".to_string(), "pass1".to_string()),
-                ("bob".to_string(), "".to_string()), // Empty password
+                ("bob".to_string(), String::new()), // Empty password
             ];
             let result = AuthHandler::with_users(users);
             assert!(result.is_err());
@@ -230,13 +234,13 @@ mod tests {
 
         #[test]
         fn test_new_with_empty_username_fails() {
-            let result = AuthHandler::new(Some("".to_string()), Some("pass".to_string()));
+            let result = AuthHandler::new(Some(String::new()), Some("pass".to_string()));
             assert!(result.is_err(), "Empty username should return error");
         }
 
         #[test]
         fn test_new_with_empty_password_fails() {
-            let result = AuthHandler::new(Some("user".to_string()), Some("".to_string()));
+            let result = AuthHandler::new(Some("user".to_string()), Some(String::new()));
             assert!(result.is_err(), "Empty password should return error");
         }
 
@@ -372,21 +376,21 @@ mod tests {
     #[test]
     fn test_security_empty_credentials_rejected() {
         // SECURITY: Empty username must fail
-        let result = AuthHandler::new(Some("".to_string()), Some("pass".to_string()));
+        let result = AuthHandler::new(Some(String::new()), Some("pass".to_string()));
         assert!(
             result.is_err(),
             "Empty username should be rejected to prevent silent auth bypass"
         );
 
         // SECURITY: Empty password must fail
-        let result = AuthHandler::new(Some("user".to_string()), Some("".to_string()));
+        let result = AuthHandler::new(Some("user".to_string()), Some(String::new()));
         assert!(
             result.is_err(),
             "Empty password should be rejected to prevent silent auth bypass"
         );
 
         // SECURITY: Both empty must fail
-        let result = AuthHandler::new(Some("".to_string()), Some("".to_string()));
+        let result = AuthHandler::new(Some(String::new()), Some(String::new()));
         assert!(
             result.is_err(),
             "Both empty should be rejected to prevent silent auth bypass"
@@ -420,7 +424,7 @@ mod tests {
         // After fix: Empty credentials = proxy refuses to start = SAFE
 
         // Simulate someone setting credentials in config
-        let username_from_config = Some("".to_string()); // Typo or misconfiguration
+        let username_from_config = Some(String::new()); // Typo or misconfiguration
         let password_from_config = Some("secret".to_string());
 
         let result = AuthHandler::new(username_from_config, password_from_config);

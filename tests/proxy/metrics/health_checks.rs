@@ -183,10 +183,10 @@ async fn test_date_health_check_timeout() -> Result<()> {
 
     // Server that never responds
     let server_handle = tokio::spawn(async move {
-        let (mut _stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
         // Read command but never respond
         let mut buf = [0u8; 64];
-        let _ = _stream.read(&mut buf).await;
+        let _ = stream.read(&mut buf).await;
         // Sleep longer than health check timeout
         tokio::time::sleep(Duration::from_secs(10)).await;
     });
@@ -441,7 +441,7 @@ async fn test_date_health_check_malformed_response() -> Result<()> {
         let mut conn_stream = ConnectionStream::plain(stream);
 
         let result = check_date_response(&mut conn_stream).await;
-        assert!(result.is_err(), "Malformed response {} should fail", i);
+        assert!(result.is_err(), "Malformed response {i} should fail");
 
         server_handle.abort();
     }

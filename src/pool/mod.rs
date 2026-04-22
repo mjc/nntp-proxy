@@ -11,10 +11,7 @@ pub mod prewarming;
 pub mod provider;
 
 pub use buffer::{BufferPool, PooledBuffer};
-pub use connection_guard::{
-    ConnectionGuard, drain_connection_async, execute_with_guard, is_connection_error,
-    remove_from_pool,
-};
+pub use connection_guard::{ConnectionGuard, salvage_with_health_check};
 pub use connection_trait::{ConnectionProvider, PoolStatus};
 pub use health_check::{HealthCheckError, HealthCheckMetrics};
 pub use prewarming::prewarm_pools;

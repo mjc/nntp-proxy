@@ -31,7 +31,7 @@ struct UserConnectionStats {
 
 impl UserConnectionStats {
     /// Create new stats for a single event
-    fn new(routing_mode: &'static str, timestamp: Instant) -> Self {
+    const fn new(routing_mode: &'static str, timestamp: Instant) -> Self {
         Self {
             count: AtomicU64::new(1),
             routing_mode,
@@ -51,11 +51,9 @@ impl UserConnectionStats {
     /// Duration between first and last event
     #[inline]
     fn duration_secs(&self) -> f64 {
-        self.last_seen
-            .lock()
-            .ok()
-            .map(|last| last.duration_since(self.first_seen).as_secs_f64())
-            .unwrap_or(0.0)
+        self.last_seen.lock().ok().map_or(0.0, |last| {
+            last.duration_since(self.first_seen).as_secs_f64()
+        })
     }
 
     /// Get current count
@@ -198,6 +196,7 @@ impl Default for ConnectionStatsAggregator {
 
 impl ConnectionStatsAggregator {
     /// Get connection count for a user (primarily for testing)
+    #[must_use]
     pub fn connection_count(&self, username: &str) -> Option<u64> {
         self.connection_stats
             .get(username)
@@ -205,6 +204,7 @@ impl ConnectionStatsAggregator {
     }
 
     /// Get number of tracked users (primarily for testing)
+    #[must_use]
     pub fn user_count(&self) -> usize {
         self.connection_stats.len()
     }
@@ -347,7 +347,7 @@ mod tests {
 
         aggregator.record_connection(Some("alice"), "per-command");
 
-        let cloned = aggregator.clone();
+        let cloned = aggregator;
 
         // Clone shares the same underlying data (Arc)
         assert_eq!(cloned.user_count(), 1);

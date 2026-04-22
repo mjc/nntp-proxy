@@ -41,6 +41,7 @@ pub enum CacheableStatusCode {
 impl CacheableStatusCode {
     /// Get the raw u16 value
     #[inline]
+    #[must_use]
     pub const fn as_u16(self) -> u16 {
         self as u16
     }
@@ -128,7 +129,7 @@ impl Code for HybridArticleEntry {
         let status_code = CacheableStatusCode::try_from(raw_code).map_err(|code| {
             foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid cached status code: {}", code),
+                format!("Invalid cached status code: {code}"),
             ))
         })?;
 
@@ -164,17 +165,14 @@ impl Code for HybridArticleEntry {
         if len > MAX_BUFFER_SIZE {
             return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "Cached article too large: {} bytes (max {} bytes)",
-                    len, MAX_BUFFER_SIZE
-                ),
+                format!("Cached article too large: {len} bytes (max {MAX_BUFFER_SIZE} bytes)"),
             )));
         }
 
-        // Read exactly len bytes without pre-zeroing (idiomatic, safe).
+        // Read exactly len bytes with pre-allocated capacity (avoids reallocation).
         // Use take() to limit reads to len bytes, then collect into Vec.
         use std::io::Read;
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(len);
         reader
             .take(len as u64)
             .read_to_end(&mut buffer)
@@ -205,6 +203,7 @@ impl HybridArticleEntry {
     ///
     /// This is the ONLY way to create an entry. Invalid buffers are rejected.
     /// Tier defaults to 0.
+    #[must_use]
     pub fn new(buffer: Vec<u8>) -> Option<Self> {
         Self::with_tier(buffer, 0)
     }
@@ -212,6 +211,7 @@ impl HybridArticleEntry {
     /// Create from response buffer with specified tier
     ///
     /// Returns None if buffer has invalid or non-cacheable status code.
+    #[must_use]
     pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Option<Self> {
         let raw_code = StatusCode::parse(&buffer)?.as_u16();
         let status_code = CacheableStatusCode::try_from(raw_code).ok()?;
@@ -227,12 +227,14 @@ impl HybridArticleEntry {
 
     /// Get raw buffer for serving to client
     #[inline]
+    #[must_use]
     pub fn buffer(&self) -> &[u8] {
         &self.buffer
     }
 
     /// Get buffer as shared Arc (O(1) clone for sending to client)
     #[inline]
+    #[must_use]
     pub fn into_buffer(self) -> Arc<Vec<u8>> {
         self.buffer
     }
@@ -240,8 +242,9 @@ impl HybridArticleEntry {
     /// Get the validated status code
     ///
     /// This always returns a valid code because entries cannot be created
-    /// with invalid status codes. Returns Option for API consistency with ArticleEntry.
+    /// with invalid status codes. Returns Option for API consistency with `ArticleEntry`.
     #[inline]
+    #[must_use]
     pub fn status_code(&self) -> Option<StatusCode> {
         // SAFETY: Invariant enforced by new() and decode()
         Some(StatusCode::new(self.status_code.as_u16()))
@@ -249,6 +252,7 @@ impl HybridArticleEntry {
 
     /// Check if we should try fetching from this backend
     #[inline]
+    #[must_use]
     pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
         self.availability.should_try(backend_id)
     }
@@ -264,18 +268,21 @@ impl HybridArticleEntry {
     }
 
     /// Check if all backends have been tried and none have the article
+    #[must_use]
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
         self.availability.all_exhausted(total_backends)
     }
 
     /// Check if this cache entry contains a complete article (220) or body (222)
     #[inline]
+    #[must_use]
     pub fn is_complete_article(&self) -> bool {
         super::entry_helpers::is_complete_article(&self.buffer, self.status_code.as_u16())
     }
 
     /// Check if buffer contains a valid NNTP multiline response
     #[inline]
+    #[must_use]
     pub fn is_valid_response(&self) -> bool {
         super::entry_helpers::is_valid_response(&self.buffer)
     }
@@ -289,6 +296,7 @@ impl HybridArticleEntry {
     /// - STAT → synthesizes "223 0 <msg-id>\r\n" (we know article exists)
     ///
     /// Returns `None` if cached response can't serve this command type.
+    #[must_use]
     pub fn response_for_command(
         &self,
         cmd_verb: &str,
@@ -306,13 +314,15 @@ impl HybridArticleEntry {
     ///
     /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
-    pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
+    #[must_use]
+    pub const fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
         super::entry_helpers::matches_command_type_verb(self.status_code.as_u16(), cmd_verb)
     }
 
-    /// Get backend availability as ArticleAvailability struct
+    /// Get backend availability as `ArticleAvailability` struct
     #[inline]
-    pub fn availability(&self) -> ArticleAvailability {
+    #[must_use]
+    pub const fn availability(&self) -> ArticleAvailability {
         self.availability
     }
 
@@ -321,27 +331,29 @@ impl HybridArticleEntry {
     /// Returns true if at least one backend has been checked.
     /// Wrapper around `ArticleAvailability::has_availability_info()` for convenience.
     #[inline]
-    pub fn has_availability_info(&self) -> bool {
+    #[must_use]
+    pub const fn has_availability_info(&self) -> bool {
         self.availability.has_availability_info()
     }
 
-    /// Check if availability information is stale (older than ttl_millis)
+    /// Check if availability information is stale (older than `ttl_millis`)
     ///
-    /// HybridArticleEntry stores timestamps for tier-aware TTL, but foyer's cache
+    /// `HybridArticleEntry` stores timestamps for tier-aware TTL, but foyer's cache
     /// handles eviction based on insertion time. This method is kept for compatibility
     /// and always returns false since the cache layer manages staleness.
     #[inline]
-    pub fn is_availability_stale(&self, _ttl_millis: u64) -> bool {
+    #[must_use]
+    pub const fn is_availability_stale(&self, _ttl_millis: u64) -> bool {
         // Foyer cache handles TTL-based eviction separately
         false
     }
 
     /// Clear stale availability information
     ///
-    /// HybridArticleEntry now tracks timestamps via `timestamp` field for tier-aware TTL,
+    /// `HybridArticleEntry` now tracks timestamps via `timestamp` field for tier-aware TTL,
     /// but foyer handles eviction separately. This method is a no-op for compatibility.
     #[inline]
-    pub fn clear_stale_availability(&mut self, _ttl_millis: u64) {
+    pub const fn clear_stale_availability(&mut self, _ttl_millis: u64) {
         // Foyer cache handles TTL-based eviction, no need to clear here
     }
 
@@ -349,13 +361,15 @@ impl HybridArticleEntry {
     ///
     /// See [`super::ttl`] for the TTL formula.
     #[inline]
+    #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
         ttl::is_expired(self.timestamp, base_ttl_millis, self.tier)
     }
 
     /// Get the tier of the backend that provided this article
     #[inline]
-    pub fn tier(&self) -> u8 {
+    #[must_use]
+    pub const fn tier(&self) -> u8 {
         self.tier
     }
 }
@@ -563,7 +577,7 @@ mod tests {
         ];
         for (buf, expected) in cases {
             let entry = HybridArticleEntry::new(buf.to_vec())
-                .unwrap_or_else(|| panic!("should accept code {}", expected));
+                .unwrap_or_else(|| panic!("should accept code {expected}"));
             assert_eq!(entry.status_code().unwrap().as_u16(), *expected);
         }
     }
@@ -571,11 +585,10 @@ mod tests {
     #[test]
     fn test_entry_rejects_non_cacheable_nntp_codes() {
         for code in [200, 201, 211, 411, 480, 500, 502] {
-            let buf = format!("{} response\r\n", code).into_bytes();
+            let buf = format!("{code} response\r\n").into_bytes();
             assert!(
                 HybridArticleEntry::new(buf).is_none(),
-                "code {} should be rejected",
-                code
+                "code {code} should be rejected"
             );
         }
     }

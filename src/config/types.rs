@@ -75,7 +75,7 @@ impl std::fmt::Display for RoutingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendSelectionStrategy {
-    /// Weighted round-robin - distributes requests proportionally to max_connections
+    /// Weighted round-robin - distributes requests proportionally to `max_connections`
     WeightedRoundRobin,
     /// Least-loaded - routes to backend with fewest pending requests
     LeastLoaded,
@@ -106,7 +106,7 @@ impl std::fmt::Display for BackendSelectionStrategy {
 }
 
 /// Main proxy configuration
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
@@ -126,7 +126,7 @@ pub struct Config {
 }
 
 /// Proxy server settings
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Proxy {
     /// Host/IP to bind to (default: 0.0.0.0)
@@ -155,6 +155,11 @@ pub struct Proxy {
     /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
     #[serde(default = "super::defaults::log_file_level")]
     pub log_file_level: String,
+    /// Path to stats file for metric persistence (optional)
+    /// When set, metrics are persisted to this file every 30 seconds and on shutdown
+    /// Defaults to "stats.json" alongside the config file if not specified
+    #[serde(default)]
+    pub stats_file: Option<std::path::PathBuf>,
 }
 
 impl Proxy {
@@ -174,12 +179,13 @@ impl Default for Proxy {
             buffer_pool_count: defaults::buffer_pool_count(),
             capture_pool_count: defaults::capture_pool_count(),
             log_file_level: defaults::log_file_level(),
+            stats_file: None,
         }
     }
 }
 
 /// Cache configuration for article caching
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cache {
     /// Maximum cache size in bytes (memory tier for hybrid cache)
     ///
@@ -212,7 +218,7 @@ pub struct Cache {
     /// - Returns optimistic response to client immediately (assumes article exists)
     /// - Updates availability cache in background based on actual backend responses
     /// - Improves future routing decisions by learning which backends have articles
-    /// - For HEAD with cache_articles=true, also caches the headers
+    /// - For HEAD with `cache_articles=true`, also caches the headers
     ///
     /// When false:
     /// - STAT/HEAD commands use normal routing (single backend check)
@@ -265,12 +271,12 @@ impl std::fmt::Display for CompressionCodec {
 /// - Cold articles on disk (slower, larger capacity)
 ///
 /// Requires the `hybrid-cache` feature to be enabled.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskCache {
     /// Path to disk cache directory
     ///
     /// Directory will be created if it doesn't exist.
-    /// Recommended: Use a fast SSD or NVMe drive.
+    /// Recommended: Use a fast SSD or `NVMe` drive.
     #[serde(default = "super::defaults::disk_cache_path")]
     pub path: std::path::PathBuf,
 
@@ -327,7 +333,7 @@ impl Default for Cache {
 }
 
 /// Health check configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthCheck {
     /// Interval between health checks
     #[serde(
@@ -357,7 +363,7 @@ impl Default for HealthCheck {
 }
 
 /// Client authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ClientAuth {
     /// Optional custom greeting message
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,7 +374,7 @@ pub struct ClientAuth {
 }
 
 /// Individual user credentials
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserCredentials {
     pub username: String,
     pub password: String,
@@ -376,11 +382,13 @@ pub struct UserCredentials {
 
 impl ClientAuth {
     /// Check if authentication is enabled
-    pub fn is_enabled(&self) -> bool {
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
         !self.users.is_empty()
     }
 
     /// Get all users
+    #[must_use]
     pub fn all_users(&self) -> Vec<(&str, &str)> {
         self.users
             .iter()
@@ -390,7 +398,7 @@ impl ClientAuth {
 }
 
 /// Configuration for a single backend server
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Server {
     pub host: HostName,
     pub port: Port,
@@ -452,6 +460,15 @@ pub struct Server {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compress_level: Option<u32>,
 
+    /// Duration of proxy-wide inactivity after which this backend's idle connections are cleared.
+    /// Prevents stale connections from accumulating during overnight idle periods.
+    /// Default: 600 seconds (10 minutes). Set to 0 to disable.
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::backend_idle_timeout"
+    )]
+    pub backend_idle_timeout: Duration,
+
     /// Enable backend pipelining (request multiplexing) for this server
     /// When enabled, client requests are queued and batched onto shared connections
     /// Default: true
@@ -510,6 +527,7 @@ pub struct ServerBuilder {
     tier: u8,
     compress: Option<bool>,
     compress_level: Option<u32>,
+    backend_idle_timeout: Option<Duration>,
     enable_pipelining: bool,
     pipeline_queue_depth: Option<usize>,
     pipeline_batch_size: Option<usize>,
@@ -540,6 +558,7 @@ impl ServerBuilder {
             tier: 0,
             compress: None,
             compress_level: None,
+            backend_idle_timeout: None,
             enable_pipelining: true,
             pipeline_queue_depth: None,
             pipeline_batch_size: None,
@@ -569,21 +588,21 @@ impl ServerBuilder {
 
     /// Set maximum number of concurrent connections
     #[must_use]
-    pub fn max_connections(mut self, max: MaxConnections) -> Self {
+    pub const fn max_connections(mut self, max: MaxConnections) -> Self {
         self.max_connections = Some(max);
         self
     }
 
     /// Enable TLS/SSL for this backend connection
     #[must_use]
-    pub fn use_tls(mut self, enabled: bool) -> Self {
+    pub const fn use_tls(mut self, enabled: bool) -> Self {
         self.use_tls = enabled;
         self
     }
 
     /// Set whether to verify TLS certificates
     #[must_use]
-    pub fn tls_verify_cert(mut self, verify: bool) -> Self {
+    pub const fn tls_verify_cert(mut self, verify: bool) -> Self {
         self.tls_verify_cert = verify;
         self
     }
@@ -597,42 +616,42 @@ impl ServerBuilder {
 
     /// Set keep-alive interval for idle connections
     #[must_use]
-    pub fn connection_keepalive(mut self, interval: Duration) -> Self {
+    pub const fn connection_keepalive(mut self, interval: Duration) -> Self {
         self.connection_keepalive = Some(interval);
         self
     }
 
     /// Set connection replacement cooldown duration
     #[must_use]
-    pub fn replacement_cooldown(mut self, cooldown: Duration) -> Self {
+    pub const fn replacement_cooldown(mut self, cooldown: Duration) -> Self {
         self.replacement_cooldown = Some(cooldown);
         self
     }
 
     /// Set maximum connections to check per health check cycle
     #[must_use]
-    pub fn health_check_max_per_cycle(mut self, max: usize) -> Self {
+    pub const fn health_check_max_per_cycle(mut self, max: usize) -> Self {
         self.health_check_max_per_cycle = Some(max);
         self
     }
 
     /// Set timeout for acquiring connections during health checks
     #[must_use]
-    pub fn health_check_pool_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn health_check_pool_timeout(mut self, timeout: Duration) -> Self {
         self.health_check_pool_timeout = Some(timeout);
         self
     }
 
     /// Set server tier for prioritization (lower = higher priority)
     #[must_use]
-    pub fn tier(mut self, tier: u8) -> Self {
+    pub const fn tier(mut self, tier: u8) -> Self {
         self.tier = tier;
         self
     }
 
     /// Set wire compression mode (RFC 8054 COMPRESS DEFLATE)
     #[must_use]
-    pub fn compress(mut self, compress: Option<bool>) -> Self {
+    pub const fn compress(mut self, compress: Option<bool>) -> Self {
         self.compress = compress;
         self
     }
@@ -649,23 +668,33 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the backend idle timeout duration
+    ///
+    /// Connections to this backend are cleared after this duration of proxy-wide inactivity.
+    /// Default: 10 minutes.
+    #[must_use]
+    pub const fn backend_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.backend_idle_timeout = Some(timeout);
+        self
+    }
+
     /// Enable or disable backend pipelining (request multiplexing)
     #[must_use]
-    pub fn enable_pipelining(mut self, enabled: bool) -> Self {
+    pub const fn enable_pipelining(mut self, enabled: bool) -> Self {
         self.enable_pipelining = enabled;
         self
     }
 
     /// Set pipeline queue depth
     #[must_use]
-    pub fn pipeline_queue_depth(mut self, depth: usize) -> Self {
+    pub const fn pipeline_queue_depth(mut self, depth: usize) -> Self {
         self.pipeline_queue_depth = Some(depth);
         self
     }
 
     /// Set pipeline batch size
     #[must_use]
-    pub fn pipeline_batch_size(mut self, size: usize) -> Self {
+    pub const fn pipeline_batch_size(mut self, size: usize) -> Self {
         self.pipeline_batch_size = Some(size);
         self
     }
@@ -728,6 +757,9 @@ impl ServerBuilder {
             tier: self.tier,
             compress: self.compress,
             compress_level: self.compress_level,
+            backend_idle_timeout: self
+                .backend_idle_timeout
+                .unwrap_or_else(super::defaults::backend_idle_timeout),
             enable_pipelining: self.enable_pipelining,
             pipeline_queue_depth,
             pipeline_batch_size,

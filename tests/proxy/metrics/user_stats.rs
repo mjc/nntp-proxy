@@ -1,4 +1,4 @@
-//! Comprehensive tests for UserStats type and methods
+//! Comprehensive tests for `UserStats` type and methods
 
 use nntp_proxy::metrics::UserStats;
 use nntp_proxy::metrics::types::{CommandCount, ErrorCount};
