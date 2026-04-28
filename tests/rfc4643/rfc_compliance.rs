@@ -69,7 +69,7 @@ async fn test_authinfo_pass_without_user_returns_482() {
     reader.read_line(&mut line).await.unwrap();
     assert!(
         line.starts_with("201"),
-        "Expected 200 greeting, got: {line}"
+        "Expected 201 greeting, got: {line}"
     );
 
     // Send AUTHINFO PASS without a preceding AUTHINFO USER
@@ -106,7 +106,7 @@ async fn test_authinfo_pass_without_user_returns_482_stateful() {
     reader.read_line(&mut line).await.unwrap();
     assert!(
         line.starts_with("201"),
-        "Expected 200 greeting, got: {line}"
+        "Expected 201 greeting, got: {line}"
     );
 
     writer
