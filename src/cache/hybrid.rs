@@ -585,6 +585,19 @@ impl HybridArticleCache {
         // Create minimal noop device - 64KB is minimum for block engine
         let device = NoopDeviceBuilder::new(64 * 1024).build()?;
 
+        // Foyer spawns internal background tasks (flushers, reclaimers) that must run on
+        // their own dedicated runtime.  Without this, tests using #[tokio::test] (which
+        // creates a single-threaded runtime) deadlock: the test runtime waits on
+        // cache.close(), which tries to join the background tasks, but those tasks are
+        // also scheduled on the same single-threaded runtime and can never make progress.
+        // The production code uses the same pattern (see HybridArticleCache::new).
+        let foyer_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("foyer-test-io")
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create foyer test runtime: {e}"))?;
+
         let builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-test")
             .with_policy(HybridCachePolicy::WriteOnEviction)
@@ -597,7 +610,8 @@ impl HybridArticleCache {
             .storage()
             .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>)
             .with_engine_config(BlockEngineConfig::new(device))
-            .with_recover_mode(RecoverMode::Quiet);
+            .with_recover_mode(RecoverMode::Quiet)
+            .with_spawner(Spawner::from(foyer_runtime));
 
         let cache = builder.build().await?;
 
