@@ -25,8 +25,8 @@ mod article_retry;
 ///
 /// [`TailBuffer`]: crate::session::streaming::tail_buffer::TailBuffer
 pub(super) fn split_single_line_response(
-    response: &mut bytes::BytesMut,
-    leftover: &mut bytes::BytesMut,
+    response: &mut crate::pool::PooledBuffer,
+    leftover: &mut crate::pool::PooledBuffer,
 ) {
     if let Some(pos) = memchr::memchr(b'\n', response) {
         let end = pos + 1;

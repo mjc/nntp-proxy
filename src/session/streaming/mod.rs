@@ -478,7 +478,7 @@ pub(crate) async fn stream_multiline_response_pipelined<R, W>(
     client_write: &mut W,
     first_chunk: &[u8],
     ctx: &StreamContext<'_>,
-    leftover: &mut bytes::BytesMut,
+    leftover: &mut crate::pool::PooledBuffer,
 ) -> Result<u64, StreamingError>
 where
     R: AsyncReadExt + Unpin,
@@ -574,7 +574,7 @@ async fn stream_multiline_response_impl<R, W>(
     first_chunk: &[u8],
     ctx: &StreamContext<'_>,
     mut capture: Option<&mut crate::pool::PooledBuffer>,
-    mut leftover_out: Option<&mut bytes::BytesMut>,
+    mut leftover_out: Option<&mut crate::pool::PooledBuffer>,
 ) -> Result<u64, StreamingError>
 where
     R: AsyncReadExt + Unpin,
@@ -1024,8 +1024,8 @@ mod tests {
         // No backend reads needed — everything is in first chunk
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
-        let mut leftover = bytes::BytesMut::new();
         let pool = test_helpers::make_pool();
+        let mut leftover = pool.acquire().await;
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(
@@ -1054,8 +1054,8 @@ mod tests {
 
         let mut reader = Cursor::new(second_read.as_slice());
         let mut writer = Vec::new();
-        let mut leftover = bytes::BytesMut::new();
         let pool = test_helpers::make_pool();
+        let mut leftover = pool.acquire().await;
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(
@@ -1087,8 +1087,8 @@ mod tests {
         let response = b"220 Article follows\r\nBody\r\n.\r\n";
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
-        let mut leftover = bytes::BytesMut::new();
         let pool = test_helpers::make_pool();
+        let mut leftover = pool.acquire().await;
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(
@@ -1120,8 +1120,8 @@ mod tests {
 
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
-        let mut leftover = bytes::BytesMut::new();
         let pool = test_helpers::make_pool();
+        let mut leftover = pool.acquire().await;
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(

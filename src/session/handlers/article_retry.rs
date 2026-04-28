@@ -23,8 +23,8 @@ use crate::session::precheck;
 pub(super) struct BatchPipelineState<'a> {
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub backend_to_client_bytes: &'a mut BackendToClientBytes,
-    pub leftover: &'a mut bytes::BytesMut,
-    pub chunk_data: &'a mut bytes::BytesMut,
+    pub leftover: &'a mut crate::pool::PooledBuffer,
+    pub chunk_data: &'a mut crate::pool::PooledBuffer,
 }
 
 /// Backend connection context for `process_batch_response`
