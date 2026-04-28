@@ -50,6 +50,22 @@ struct ResponseStreamParams<'a> {
     first_chunk: &'a [u8],
 }
 
+/// Once multiline streaming has started, any backend-side failure means the client may
+/// already have received a partial response. Retrying on another backend would splice a
+/// second response onto that partial stream, corrupting the protocol.
+const fn must_close_client_after_streaming_error(
+    error: &StreamingError,
+    is_multiline: bool,
+) -> bool {
+    is_multiline
+        && matches!(
+            error,
+            StreamingError::BackendEof { .. }
+                | StreamingError::BackendDirty(_)
+                | StreamingError::Io(_)
+        )
+}
+
 impl ClientSession {
     /// Try executing command on next available backend
     ///
@@ -198,15 +214,10 @@ impl ClientSession {
                     // Client disconnect — backend was cleanly drained. Return to pool.
                     let _ = conn.release();
                 }
-                // BackendEof and BackendDirty mean Phase 1 already wrote the status line +
-                // partial body to the client. Retrying on the next backend would concatenate
-                // a second full article onto the partial first one, corrupting the stream.
-                // Signal ClientDisconnect so the session ends cleanly; nzbget/sabnzbd will
-                // retry the segment on their end.
-                if matches!(
-                    e,
-                    StreamingError::BackendEof { .. } | StreamingError::BackendDirty(_)
-                ) {
+                // Once multiline streaming starts, backend-side errors mean the client may
+                // already have a partial article. Retrying another backend would corrupt the
+                // stream, so close the client session and let the downloader retry cleanly.
+                if must_close_client_after_streaming_error(&e, cmd_response.is_multiline) {
                     warn!(
                         client = %self.client_addr,
                         backend = backend_id.as_index(),
@@ -485,5 +496,32 @@ impl ClientSession {
         self.metrics.user_bytes_sent(self.username(), cmd_bytes);
         self.metrics
             .user_bytes_received(self.username(), resp_bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::must_close_client_after_streaming_error;
+    use crate::session::streaming::StreamingError;
+
+    #[test]
+    fn multiline_backend_io_error_closes_client() {
+        let err = StreamingError::Io(anyhow::anyhow!("backend read failed mid-stream"));
+        assert!(must_close_client_after_streaming_error(&err, true));
+    }
+
+    #[test]
+    fn single_line_io_error_does_not_trigger_partial_stream_protection() {
+        let err = StreamingError::Io(anyhow::anyhow!("single-line client write failure"));
+        assert!(!must_close_client_after_streaming_error(&err, false));
+    }
+
+    #[test]
+    fn client_disconnect_never_uses_partial_stream_protection() {
+        let err = StreamingError::ClientDisconnect(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        assert!(!must_close_client_after_streaming_error(&err, true));
     }
 }
