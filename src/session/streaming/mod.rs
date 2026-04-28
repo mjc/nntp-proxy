@@ -4,6 +4,7 @@
 //! Uses a single pooled buffer for sequential read-write I/O on large transfers.
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
@@ -252,6 +253,7 @@ where
 }
 
 /// Stream multiline response and optionally capture for caching
+#[allow(dead_code)]
 pub(crate) async fn stream_and_capture_multiline_response<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
@@ -274,22 +276,201 @@ where
     .await
 }
 
-/// Read and validate a full multiline response into memory before returning it.
+trait ResponseAccumulator {
+    fn len(&self) -> usize;
+    fn extend_from_slice(&mut self, data: &[u8]);
+    fn truncate(&mut self, len: usize);
+    fn as_slice(&self) -> &[u8];
+}
+
+impl ResponseAccumulator for crate::pool::PooledBuffer {
+    fn len(&self) -> usize {
+        self.initialized()
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        crate::pool::PooledBuffer::extend_from_slice(self, data);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        crate::pool::PooledBuffer::truncate(self, len);
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+fn stash_leftover(
+    conn: &mut crate::stream::ConnectionStream,
+    remainder: &[u8],
+) -> Result<(), StreamingError> {
+    if remainder.len() > crate::constants::buffer::MAX_LEFTOVER_BYTES {
+        return Err(StreamingError::Io(anyhow::anyhow!(
+            "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
+            crate::constants::buffer::MAX_LEFTOVER_BYTES,
+            remainder.len()
+        )));
+    }
+    conn.stash_leftover(remainder).map_err(StreamingError::Io)?;
+    Ok(())
+}
+
+async fn finish_read_full_response<A>(
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    response: &mut A,
+    backend_id: crate::types::BackendId,
+    source: &'static str,
+) -> Result<crate::protocol::StatusCode, StreamingError>
+where
+    A: ResponseAccumulator,
+{
+    if response.len() < crate::protocol::MIN_RESPONSE_LENGTH {
+        loop {
+            let n = io_buffer.read_from(conn).await.map_err(|e| {
+                StreamingError::Io(
+                    anyhow::Error::from(e).context("Failed to read partial status line"),
+                )
+            })?;
+            if n == 0 {
+                return Err(StreamingError::Io(anyhow::anyhow!(
+                    "Backend EOF with partial status line ({} bytes)",
+                    response.len()
+                )));
+            }
+            response.extend_from_slice(&io_buffer[..n]);
+            if response.len() >= crate::protocol::MIN_RESPONSE_LENGTH {
+                break;
+            }
+        }
+    }
+
+    let validated = crate::session::backend::validate_backend_response(
+        response.as_slice(),
+        response.len(),
+        crate::protocol::MIN_RESPONSE_LENGTH,
+    );
+    let status_code = validated.response.status_code().ok_or_else(|| {
+        warn!(
+            bytes_read = response.len(),
+            first_bytes_hex = %crate::session::backend::format_hex_preview(response.as_slice(), 256),
+            first_bytes_utf8 = %String::from_utf8_lossy(
+                &response.as_slice()[..response.len().min(256)]
+            ),
+            source = source,
+            "Invalid status code in response"
+        );
+        StreamingError::Io(anyhow::anyhow!("Invalid status code in response"))
+    })?;
+
+    if !validated.is_multiline {
+        if let Some(pos) = memchr::memchr(b'\n', response.as_slice()) {
+            let end = pos + 1;
+            if end < response.len() {
+                let remainder = response.as_slice()[end..].to_vec();
+                stash_leftover(conn, &remainder)?;
+                response.truncate(end);
+            }
+        }
+        return Ok(status_code);
+    }
+
+    let mut tail = TailBuffer::default();
+    let status = tail.detect_terminator(response.as_slice());
+    let write_len = status.write_len(response.len());
+
+    if write_len < response.len() {
+        let remainder = response.as_slice()[write_len..].to_vec();
+        stash_leftover(conn, &remainder)?;
+        response.truncate(write_len);
+    }
+
+    if !status.is_found() {
+        tail.update(response.as_slice());
+
+        loop {
+            let n = io_buffer.read_from(conn).await.map_err(|e| {
+                StreamingError::Io(
+                    anyhow::Error::from(e).context("Failed to read remaining response body"),
+                )
+            })?;
+            if n == 0 {
+                return Err(StreamingError::BackendEof {
+                    backend_id,
+                    bytes_received: response.len() as u64,
+                });
+            }
+            let chunk = &io_buffer[..n];
+            let status = tail.detect_terminator(chunk);
+            let write_len = status.write_len(n);
+            response.extend_from_slice(&chunk[..write_len]);
+
+            if status.is_found() {
+                if write_len < n {
+                    stash_leftover(conn, &chunk[write_len..n])?;
+                }
+                break;
+            }
+            tail.update(&chunk[..write_len]);
+        }
+    }
+
+    Ok(status_code)
+}
+
+/// Read a complete NNTP response from a connection into a reusable accumulator.
 ///
-/// This is used by per-command paths that want to verify the full backend
-/// response before writing anything to the client.
-pub(crate) async fn buffer_multiline_response<R>(
-    backend_read: &mut R,
+/// This is the shared non-streaming response reader used by the pipeline worker.
+pub(crate) async fn read_full_response(
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    result_buf: &mut crate::pool::PooledBuffer,
+    backend_id: crate::types::BackendId,
+) -> Result<(Bytes, crate::protocol::StatusCode), StreamingError> {
+    result_buf.clear();
+
+    let source = if conn.has_leftover() {
+        "leftover"
+    } else {
+        "fresh_read"
+    };
+    let n = io_buffer.read_from(conn).await.map_err(|e| {
+        StreamingError::Io(anyhow::Error::from(e).context("Failed to read response from backend"))
+    })?;
+    if n == 0 {
+        return Err(StreamingError::Io(anyhow::anyhow!(
+            "Backend connection closed unexpectedly"
+        )));
+    }
+    result_buf.extend_from_slice(&io_buffer[..n]);
+
+    let status_code =
+        finish_read_full_response(io_buffer, conn, result_buf, backend_id, source).await?;
+    Ok((Bytes::copy_from_slice(result_buf.as_ref()), status_code))
+}
+
+/// Read and validate a full response after the first chunk has already been prefetched.
+///
+/// Used by the direct per-command path, which performs the initial command send/read
+/// before deciding how to route the response.
+pub(crate) async fn buffer_multiline_response(
+    conn: &mut crate::stream::ConnectionStream,
     first_chunk: &[u8],
     ctx: &StreamContext<'_>,
-) -> Result<crate::pool::PooledBuffer, StreamingError>
-where
-    R: AsyncReadExt + Unpin,
-{
+) -> Result<crate::pool::PooledBuffer, StreamingError> {
+    let mut io_buffer = ctx.buffer_pool.acquire().await;
     let mut captured = ctx.buffer_pool.acquire_capture().await;
-    let mut sink = tokio::io::sink();
-    stream_and_capture_multiline_response(backend_read, &mut sink, first_chunk, ctx, &mut captured)
-        .await?;
+    captured.clear();
+    captured.extend_from_slice(first_chunk);
+    let _status_code = finish_read_full_response(
+        &mut io_buffer,
+        conn,
+        &mut captured,
+        ctx.backend_id,
+        "prefetched",
+    )
+    .await?;
     Ok(captured)
 }
 
@@ -526,6 +707,8 @@ mod tests {
     mod test_helpers {
         use super::super::*;
         use crate::types::BufferSize;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
 
         pub(super) fn make_pool() -> crate::pool::BufferPool {
             crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2)
@@ -538,6 +721,24 @@ mod tests {
                 backend_id: crate::types::BackendId::from_index(1),
                 buffer_pool: pool,
             }
+        }
+
+        pub(super) async fn mock_backend_conn(
+            chunks: Vec<Vec<u8>>,
+        ) -> crate::stream::ConnectionStream {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                for chunk in chunks {
+                    stream.write_all(&chunk).await.unwrap();
+                }
+                stream.shutdown().await.unwrap();
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            crate::stream::ConnectionStream::plain(stream)
         }
     }
 
@@ -707,11 +908,11 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_multiline_response_returns_complete_response() {
         let response = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
-        let mut reader = Cursor::new(b"");
         let pool = test_helpers::make_pool();
         let ctx = test_helpers::make_ctx(&pool);
+        let mut conn = test_helpers::mock_backend_conn(vec![]).await;
 
-        let captured = buffer_multiline_response(&mut reader, response, &ctx)
+        let captured = buffer_multiline_response(&mut conn, response, &ctx)
             .await
             .unwrap();
 
@@ -721,11 +922,11 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_multiline_response_errors_on_truncated_backend() {
         let partial = b"220 Article follows\r\nIncomplete body\r\n";
-        let mut reader = Cursor::new(&[] as &[u8]);
         let pool = test_helpers::make_pool();
         let ctx = test_helpers::make_ctx(&pool);
+        let mut conn = test_helpers::mock_backend_conn(vec![]).await;
 
-        let result = buffer_multiline_response(&mut reader, partial, &ctx).await;
+        let result = buffer_multiline_response(&mut conn, partial, &ctx).await;
         assert!(
             matches!(result, Err(StreamingError::BackendEof { .. })),
             "EOF before terminator must be BackendEof"

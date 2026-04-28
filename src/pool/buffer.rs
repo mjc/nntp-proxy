@@ -74,12 +74,45 @@ impl PooledBuffer {
     /// Panics if `data.len()` > capacity
     #[inline]
     pub fn copy_from_slice(&mut self, data: &[u8]) {
-        assert!(
-            data.len() <= self.buffer.len(),
-            "data exceeds buffer capacity"
-        );
+        if self.buffer.is_empty() {
+            assert!(
+                data.len() <= self.buffer.capacity(),
+                "data exceeds buffer capacity"
+            );
+            if self.buffer.len() < data.len() {
+                self.buffer.resize(data.len(), 0);
+            }
+        } else {
+            assert!(
+                data.len() <= self.buffer.len(),
+                "data exceeds buffer capacity"
+            );
+        }
         self.buffer[..data.len()].copy_from_slice(data);
         self.initialized = data.len();
+    }
+
+    /// Reset the logical contents of the buffer without changing its backing allocation.
+    ///
+    /// This is safe for both fixed-size I/O buffers and accumulator-style capture buffers:
+    /// callers see an empty initialized slice afterwards, while the underlying allocation
+    /// stays available for reuse.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.initialized = 0;
+    }
+
+    /// Shorten the logical initialized length without changing the backing allocation.
+    ///
+    /// Used by response framing helpers when a read contains bytes beyond the current
+    /// response boundary and the remainder is stashed as leftover for the next response.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        assert!(
+            len <= self.initialized,
+            "truncate length exceeds initialized bytes"
+        );
+        self.initialized = len;
     }
 
     /// Get mutable access to the full buffer capacity
@@ -125,18 +158,21 @@ impl PooledBuffer {
     /// After calling this, `.len()` (via Deref) returns the total accumulated length.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
+        let needed = self.initialized + data.len();
         // Warn if we need to grow beyond pre-allocated capacity (rare for typical articles)
-        if self.buffer.len() + data.len() > self.buffer.capacity() {
+        if needed > self.buffer.capacity() {
             tracing::warn!(
                 "Capture buffer growing: {} + {} > {} capacity (will allocate)",
-                self.buffer.len(),
+                self.initialized,
                 data.len(),
                 self.buffer.capacity()
             );
         }
-        // Always extend - never truncate to prevent caching partial/corrupt data
-        self.buffer.extend_from_slice(data);
-        self.initialized = self.buffer.len();
+        if self.buffer.len() < needed {
+            self.buffer.resize(needed, 0);
+        }
+        self.buffer[self.initialized..needed].copy_from_slice(data);
+        self.initialized = needed;
     }
 }
 

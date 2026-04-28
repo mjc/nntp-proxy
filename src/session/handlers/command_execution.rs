@@ -324,12 +324,9 @@ impl ClientSession {
 
         match (params.is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let captured = streaming::buffer_multiline_response(
-                    &mut **pooled_conn,
-                    params.first_chunk,
-                    ctx,
-                )
-                .await?;
+                let captured =
+                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
+                        .await?;
                 client_write
                     .write_all(&captured)
                     .await
@@ -346,12 +343,9 @@ impl ClientSession {
                 Ok(captured.len() as u64)
             }
             (true, CacheAction::TrackAvailability) => {
-                let captured = streaming::buffer_multiline_response(
-                    &mut **pooled_conn,
-                    params.first_chunk,
-                    ctx,
-                )
-                .await?;
+                let captured =
+                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
+                        .await?;
                 client_write
                     .write_all(&captured)
                     .await
@@ -368,12 +362,9 @@ impl ClientSession {
                 // Multiline responses are fully buffered before any client write in
                 // per-command mode so the full terminator-validated response is known
                 // before forwarding.
-                let captured = streaming::buffer_multiline_response(
-                    &mut **pooled_conn,
-                    params.first_chunk,
-                    ctx,
-                )
-                .await?;
+                let captured =
+                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
+                        .await?;
                 client_write
                     .write_all(&captured)
                     .await
