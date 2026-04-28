@@ -50,22 +50,6 @@ struct ResponseStreamParams<'a> {
     first_chunk: &'a [u8],
 }
 
-/// Once multiline streaming has started, any backend-side failure means the client may
-/// already have received a partial response. Retrying on another backend would splice a
-/// second response onto that partial stream, corrupting the protocol.
-const fn must_close_client_after_streaming_error(
-    error: &StreamingError,
-    is_multiline: bool,
-) -> bool {
-    is_multiline
-        && matches!(
-            error,
-            StreamingError::BackendEof { .. }
-                | StreamingError::BackendDirty(_)
-                | StreamingError::Io(_)
-        )
-}
-
 impl ClientSession {
     /// Try executing command on next available backend
     ///
@@ -214,22 +198,6 @@ impl ClientSession {
                     // Client disconnect — backend was cleanly drained. Return to pool.
                     let _ = conn.release();
                 }
-                // Once multiline streaming starts, backend-side errors mean the client may
-                // already have a partial article. Retrying another backend would corrupt the
-                // stream, so close the client session and let the downloader retry cleanly.
-                if must_close_client_after_streaming_error(&e, cmd_response.is_multiline) {
-                    warn!(
-                        client = %self.client_addr,
-                        backend = backend_id.as_index(),
-                        command = %command.trim(),
-                        "Backend died mid-stream after partial data sent to client; \
-                         closing client connection to prevent protocol corruption"
-                    );
-                    return Err(SessionError::ClientDisconnect(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "backend closed mid-stream; partial article already sent",
-                    )));
-                }
                 // SessionError::from(StreamingError) preserves ClientDisconnect signal.
                 return Err(SessionError::from(e));
             }
@@ -356,16 +324,16 @@ impl ClientSession {
 
         match (params.is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let mut captured = self.buffer_pool.acquire_capture().await;
-                let bytes = streaming::stream_and_capture_multiline_response(
+                let captured = streaming::buffer_multiline_response(
                     &mut **pooled_conn,
-                    client_write,
                     params.first_chunk,
                     ctx,
-                    &mut captured,
                 )
                 .await?;
-
+                client_write
+                    .write_all(&captured)
+                    .await
+                    .map_err(classify_client_write_err)?;
                 if let Some(msg_id_ref) = params.msg_id {
                     debug!(
                         "Client {} caching full article for {} ({} bytes captured)",
@@ -375,35 +343,42 @@ impl ClientSession {
                     );
                 }
                 self.maybe_cache_upsert(params.msg_id, &captured, ctx.backend_id);
-                Ok(bytes)
+                Ok(captured.len() as u64)
             }
             (true, CacheAction::TrackAvailability) => {
-                let bytes = streaming::stream_multiline_response(
+                let captured = streaming::buffer_multiline_response(
                     &mut **pooled_conn,
-                    client_write,
                     params.first_chunk,
                     ctx,
                 )
                 .await?;
+                client_write
+                    .write_all(&captured)
+                    .await
+                    .map_err(classify_client_write_err)?;
 
                 // Extract first status line (~30-80 bytes) instead of copying
-                // full first_chunk (8-64KB). The cache only needs the status
+                // full response. The cache only needs the status
                 // code to build an availability stub.
-                // SmallVec keeps small status lines on stack, avoiding heap allocation
-                // until the spawn boundary where .to_vec() happens inside spawn_cache_upsert.
-                let stub = crate::cache::extract_status_line(params.first_chunk);
+                let stub = crate::cache::extract_status_line(&captured);
                 self.maybe_cache_upsert(params.msg_id, &stub, ctx.backend_id);
-                Ok(bytes)
+                Ok(captured.len() as u64)
             }
             (true, _) => {
-                // Multiline but no caching
-                streaming::stream_multiline_response(
+                // Multiline responses are fully buffered before any client write in
+                // per-command mode so the full terminator-validated response is known
+                // before forwarding.
+                let captured = streaming::buffer_multiline_response(
                     &mut **pooled_conn,
-                    client_write,
                     params.first_chunk,
                     ctx,
                 )
-                .await
+                .await?;
+                client_write
+                    .write_all(&captured)
+                    .await
+                    .map_err(classify_client_write_err)?;
+                Ok(captured.len() as u64)
             }
             (false, CacheAction::TrackStat) => {
                 // Single-line: backend already has complete response in first_chunk,
@@ -496,32 +471,5 @@ impl ClientSession {
         self.metrics.user_bytes_sent(self.username(), cmd_bytes);
         self.metrics
             .user_bytes_received(self.username(), resp_bytes);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::must_close_client_after_streaming_error;
-    use crate::session::streaming::StreamingError;
-
-    #[test]
-    fn multiline_backend_io_error_closes_client() {
-        let err = StreamingError::Io(anyhow::anyhow!("backend read failed mid-stream"));
-        assert!(must_close_client_after_streaming_error(&err, true));
-    }
-
-    #[test]
-    fn single_line_io_error_does_not_trigger_partial_stream_protection() {
-        let err = StreamingError::Io(anyhow::anyhow!("single-line client write failure"));
-        assert!(!must_close_client_after_streaming_error(&err, false));
-    }
-
-    #[test]
-    fn client_disconnect_never_uses_partial_stream_protection() {
-        let err = StreamingError::ClientDisconnect(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "broken pipe",
-        ));
-        assert!(!must_close_client_after_streaming_error(&err, true));
     }
 }

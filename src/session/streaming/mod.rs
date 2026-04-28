@@ -237,6 +237,7 @@ where
 /// Essential for large article downloads (50MB+) where buffering would kill performance.
 ///
 /// If `capture` is Some, the response will be captured into the Vec for caching.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn stream_multiline_response<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
@@ -271,6 +272,25 @@ where
         None,
     )
     .await
+}
+
+/// Read and validate a full multiline response into memory before returning it.
+///
+/// This is used by per-command paths that want to verify the full backend
+/// response before writing anything to the client.
+pub(crate) async fn buffer_multiline_response<R>(
+    backend_read: &mut R,
+    first_chunk: &[u8],
+    ctx: &StreamContext<'_>,
+) -> Result<crate::pool::PooledBuffer, StreamingError>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut captured = ctx.buffer_pool.acquire_capture().await;
+    let mut sink = tokio::io::sink();
+    stream_and_capture_multiline_response(backend_read, &mut sink, first_chunk, ctx, &mut captured)
+        .await?;
+    Ok(captured)
 }
 
 /// Stream multiline response from backend to client during pipelined batch execution.
@@ -682,6 +702,34 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), full_response.len() as u64);
         assert_eq!(&writer[..], &full_response[..]);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_multiline_response_returns_complete_response() {
+        let response = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
+        let mut reader = Cursor::new(b"");
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
+
+        let captured = buffer_multiline_response(&mut reader, response, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(&captured[..], response);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_multiline_response_errors_on_truncated_backend() {
+        let partial = b"220 Article follows\r\nIncomplete body\r\n";
+        let mut reader = Cursor::new(&[] as &[u8]);
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
+
+        let result = buffer_multiline_response(&mut reader, partial, &ctx).await;
+        assert!(
+            matches!(result, Err(StreamingError::BackendEof { .. })),
+            "EOF before terminator must be BackendEof"
+        );
     }
 
     #[tokio::test]
