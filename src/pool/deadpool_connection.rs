@@ -19,7 +19,7 @@ pub type Pool = managed::Pool<TcpManager>;
 ///
 /// Groups optional parameters (credentials, TLS, compression) to keep
 /// the `TcpManager::new()` signature concise.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TcpManagerOptions {
     pub username: Option<String>,
     pub password: Option<String>,
@@ -28,6 +28,24 @@ pub struct TcpManagerOptions {
     pub compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1).
     pub compress_level: Option<u32>,
+    /// Send MODE READER to the backend after authentication.
+    ///
+    /// RFC 3977 §5.3: MODE READER switches a transit server to reading mode.
+    /// Defaults to `true` — required for reader-capable backends.
+    pub send_mode_reader: bool,
+}
+
+impl Default for TcpManagerOptions {
+    fn default() -> Self {
+        Self {
+            username: None,
+            password: None,
+            tls_config: None,
+            compress: None,
+            compress_level: None,
+            send_mode_reader: true,
+        }
+    }
 }
 
 /// TCP connection manager for deadpool with cached TLS config
@@ -45,6 +63,8 @@ pub struct TcpManager {
     pub(crate) compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1).
     pub(crate) compress_level: Option<u32>,
+    /// Whether to send MODE READER after authentication (RFC 3977 §5.3)
+    pub(crate) send_mode_reader: bool,
 }
 
 impl TcpManager {
@@ -83,6 +103,7 @@ impl TcpManager {
             tls_manager,
             compress: options.compress,
             compress_level: options.compress_level,
+            send_mode_reader: options.send_mode_reader,
         })
     }
 
@@ -172,6 +193,40 @@ impl TcpManager {
         }
 
         Ok(())
+    }
+
+    /// Send MODE READER to the backend after authentication.
+    ///
+    /// RFC 3977 §5.3: MODE READER switches the server into reader mode.
+    /// Valid responses are 200 (posting allowed) or 201 (posting not permitted).
+    /// Any other response indicates the service is unavailable for reading.
+    async fn negotiate_mode_reader(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<(), ConnectionError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        stream.write_all(b"MODE READER\r\n").await?;
+        stream.flush().await?;
+
+        let n = stream.read(buffer).await?;
+        let response = &buffer[..n];
+
+        // RFC 3977 §5.3: 200 = reader mode + posting allowed, 201 = reader mode + posting not permitted
+        if response.len() >= 3 && (response.starts_with(b"200") || response.starts_with(b"201")) {
+            tracing::debug!(
+                backend = %self.name,
+                response = %String::from_utf8_lossy(&response[..n]).trim(),
+                "MODE READER accepted"
+            );
+            return Ok(());
+        }
+
+        Err(ConnectionError::InvalidGreeting {
+            backend: self.name.clone(),
+            greeting: String::from_utf8_lossy(response).trim().to_string(),
+        })
     }
 
     /// Negotiate COMPRESS DEFLATE (RFC 8054) with the backend server.
@@ -321,6 +376,10 @@ impl managed::Manager for TcpManager {
 
         self.consume_greeting(&mut stream, &mut buffer).await?;
         self.negotiate_auth(&mut stream, &mut buffer).await?;
+
+        if self.send_mode_reader {
+            self.negotiate_mode_reader(&mut stream, &mut buffer).await?;
+        }
 
         if self.negotiate_compression(&mut stream, &mut buffer).await? {
             let level = self.compress_level.unwrap_or(1);

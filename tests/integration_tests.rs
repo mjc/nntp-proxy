@@ -84,7 +84,7 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     let mut buffer = [0; 1024];
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let welcome = String::from_utf8_lossy(&buffer[..n]);
-    assert!(welcome.contains("200 NNTP Proxy Ready"));
+    assert!(welcome.contains("201 NNTP Proxy Ready"));
 
     // Send a test command
     client.write_all(b"HELP\r\n").await?;
@@ -180,7 +180,7 @@ async fn test_round_robin_distribution() -> Result<()> {
         let response = String::from_utf8_lossy(&buffer[..n]);
 
         // Should receive proxy greeting
-        assert!(response.contains("200 NNTP Proxy Ready"));
+        assert!(response.contains("201 NNTP Proxy Ready"));
 
         // Send QUIT to close connection
         let _ = client.write_all(b"QUIT\r\n").await;
@@ -268,7 +268,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        greeting.contains("200"),
+        greeting.contains("201"),
         "Expected greeting, got: {greeting:?}"
     );
 
@@ -323,7 +323,7 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
 
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        greeting.contains("200"),
+        greeting.contains("201"),
         "Expected greeting, got: {greeting}"
     );
 
@@ -392,7 +392,7 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to read greeting: {e}"))?;
 
     let greeting = String::from_utf8_lossy(&buffer[..n]);
-    assert!(greeting.contains("200"));
+    assert!(greeting.contains("201"));
 
     // Test authentication interception (handled locally by proxy)
     client.write_all(b"AUTHINFO USER testuser\r\n").await?;
@@ -570,7 +570,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     let mut buffer = [0; 1024];
     let n = client.read(&mut buffer).await?;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
-    assert!(greeting.contains("200"));
+    assert!(greeting.contains("201"));
 
     // Send multiple stateless commands - should distribute across backends
     let stateless_commands = vec![
@@ -657,7 +657,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     let mut buffer = [0; 1024];
     let n = client.read(&mut buffer).await?;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
-    assert!(greeting.contains("200"));
+    assert!(greeting.contains("201"));
 
     // Start with stateless commands
     client.write_all(b"LIST\r\n").await?;
@@ -891,7 +891,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
     let n = client.read(&mut buffer).await?;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        greeting.starts_with("200"),
+        greeting.starts_with("201"),
         "Expected greeting, got: {greeting}"
     );
 
@@ -1052,7 +1052,7 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
     let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        greeting.starts_with("200"),
+        greeting.starts_with("201"),
         "Expected greeting, got: {greeting}"
     );
 
@@ -1210,7 +1210,7 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
     let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        greeting.starts_with("200"),
+        greeting.starts_with("201"),
         "Expected greeting, got: {greeting}"
     );
 

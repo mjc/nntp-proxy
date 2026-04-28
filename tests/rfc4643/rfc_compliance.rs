@@ -68,7 +68,7 @@ async fn test_authinfo_pass_without_user_returns_482() {
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
     assert!(
-        line.starts_with("200"),
+        line.starts_with("201"),
         "Expected 200 greeting, got: {line}"
     );
 
@@ -105,7 +105,7 @@ async fn test_authinfo_pass_without_user_returns_482_stateful() {
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
     assert!(
-        line.starts_with("200"),
+        line.starts_with("201"),
         "Expected 200 greeting, got: {line}"
     );
 
@@ -146,7 +146,7 @@ async fn test_authinfo_after_auth_returns_502_per_command() {
 
     // Greeting
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("200"), "Expected 200, got: {line}");
+    assert!(line.starts_with("201"), "Expected 200, got: {line}");
 
     // Authenticate successfully
     writer.write_all(b"AUTHINFO USER alice\r\n").await.unwrap();
@@ -195,7 +195,7 @@ async fn test_authinfo_after_auth_returns_502_stateful() {
 
     // Greeting
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("200"), "Expected 200, got: {line}");
+    assert!(line.starts_with("201"), "Expected 200, got: {line}");
 
     // Authenticate successfully
     writer.write_all(b"AUTHINFO USER alice\r\n").await.unwrap();
@@ -251,7 +251,7 @@ async fn test_authinfo_unknown_subcommand_returns_502_when_authenticated() {
 
     // Authenticate first
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
 
     writer.write_all(b"AUTHINFO USER alice\r\n").await.unwrap();
     line.clear();
@@ -299,7 +299,7 @@ async fn test_authinfo_unknown_subcommand_returns_501_unauthenticated() {
     let mut line = String::new();
 
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
 
     // Send AUTHINFO with an unknown subcommand before authenticating
     writer

@@ -46,8 +46,8 @@ pub const AUTH_UNKNOWN_SUBCOMMAND: &[u8] = b"501 Syntax error in command\r\n";
 
 // Standard responses
 
-/// Proxy greeting for per-command routing mode (200)
-pub const PROXY_GREETING_PCR: &[u8] = b"200 NNTP Proxy Ready (Per-Command Routing)\r\n";
+/// Proxy greeting for per-command routing mode (201 = posting not permitted)
+pub const PROXY_GREETING_PCR: &[u8] = b"201 NNTP Proxy Ready (Per-Command Routing)\r\n";
 
 /// Connection closing response (205)
 pub const CONNECTION_CLOSING: &[u8] = b"205 Connection closing\r\n";
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_standard_responses() {
-        assert!(PROXY_GREETING_PCR.starts_with(b"200"));
+        assert!(PROXY_GREETING_PCR.starts_with(b"201"));
         assert!(CONNECTION_CLOSING.starts_with(b"205"));
         assert!(GOODBYE.starts_with(b"205"));
     }

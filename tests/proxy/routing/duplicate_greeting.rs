@@ -6,77 +6,70 @@
 
 use anyhow::Result;
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 use crate::test_helpers::*;
 
-/// Test that per-command routing mode sends exactly one greeting
-#[test]
-fn test_single_greeting_per_command_mode() -> Result<()> {
-    // Connect to the proxy (assumes it's running on port 8121)
-    // This test is meant to be run manually with a running proxy
-    let addr = "127.0.0.1:8121";
+/// Test that per-command routing mode sends exactly one greeting.
+///
+/// Spins up its own mock backend + proxy on random ports so the test is
+/// self-contained and never races with other tests.
+#[tokio::test]
+async fn test_single_greeting_per_command_mode() -> Result<()> {
+    // Start a minimal mock backend
+    let mock_port = get_available_port().await?;
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("MockBackend")
+        .spawn();
 
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2))
-    else {
-        eprintln!("Skipping test - proxy not running on {addr}");
-        return Ok(());
+    // Start the proxy
+    let proxy_port = get_available_port().await?;
+    let config = Config {
+        servers: vec![create_test_server_config("127.0.0.1", mock_port, "Mock")],
+        ..Default::default()
     };
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+    spawn_test_proxy(proxy, proxy_port, true).await;
 
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    // Give server+proxy time to be ready
+    wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut greeting_count = 0;
+    let stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let (reader_half, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader_half);
+
+    // Read the greeting — must arrive within 2s
     let mut first_line = String::new();
+    timeout(Duration::from_secs(2), reader.read_line(&mut first_line))
+        .await
+        .expect("timed out waiting for greeting")?;
 
-    // Read the greeting(s)
-    // In the bug, we'd get two 200 lines
-    // After fix, we should only get one
-    reader.read_line(&mut first_line)?;
-
-    if first_line.starts_with("200") {
-        greeting_count += 1;
-
-        // Check if there's a second greeting (the bug)
-        let mut second_line = String::new();
-        // Use a very short timeout to check if more data is immediately available
-        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        match reader.read_line(&mut second_line) {
-            Ok(_) if second_line.starts_with("200") => {
-                greeting_count += 1;
-                eprintln!("BUG: Received second greeting: {}", second_line.trim());
-            }
-            _ => {
-                // No second greeting, or it's not a 200 - this is good
-            }
-        }
-    }
-
-    // Send a test command to verify the connection works
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    writeln!(stream, "HELP")?;
-    stream.flush()?;
-
-    // We should get exactly 1 greeting
-    assert_eq!(
-        greeting_count,
-        1,
-        "Expected exactly 1 greeting, got {}. First line: {}",
-        greeting_count,
-        first_line.trim()
-    );
-
-    // Verify it's the per-command routing greeting
     assert!(
-        first_line.contains("Per-Command Routing") || first_line.starts_with("200"),
-        "Expected greeting to be '200 NNTP Proxy Ready (Per-Command Routing)', got: {}",
-        first_line.trim()
+        first_line.starts_with("200") || first_line.starts_with("201"),
+        "Expected 200/201 greeting, got: {first_line:?}"
     );
 
-    // Clean up
-    let _ = writeln!(stream, "QUIT");
+    // A second read immediately after the greeting must NOT produce another
+    // greeting line.  We send a QUIT first so the proxy has something to
+    // respond to; then we verify the *first* response line is not a greeting.
+    writer.write_all(b"QUIT\r\n").await?;
+
+    let mut response = String::new();
+    timeout(Duration::from_secs(2), reader.read_line(&mut response))
+        .await
+        .expect("timed out waiting for QUIT response")?;
+
+    assert!(
+        !response.starts_with("200") && !response.starts_with("201"),
+        "Got a duplicate greeting instead of QUIT response: {response:?}"
+    );
+    assert!(
+        response.starts_with("205"),
+        "Expected 205 goodbye after QUIT, got: {response:?}"
+    );
 
     Ok(())
 }
@@ -84,13 +77,8 @@ fn test_single_greeting_per_command_mode() -> Result<()> {
 /// Test that we can fetch an article without corruption
 #[tokio::test]
 async fn test_article_fetch_no_corruption() -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
-
     // Start a mock backend server
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
+    let mock_port = get_available_port().await?;
     let _mock = MockNntpServer::new(mock_port)
         .with_name("Mock Server")
         .on_command(
@@ -99,12 +87,8 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
         )
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     // Start proxy
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
+    let proxy_port = get_available_port().await?;
     let config = Config {
         servers: vec![create_test_server_config(
             "127.0.0.1",
@@ -115,19 +99,21 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
     };
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     spawn_test_proxy(proxy, proxy_port, true).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
     // Connect to proxy
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
-    let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
+    let stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let (reader_half, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader_half);
 
     // Read greeting
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    timeout(Duration::from_secs(2), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for greeting")?;
     assert!(
-        line.starts_with("200"),
-        "Expected 200 greeting, got: {}",
+        line.starts_with("200") || line.starts_with("201"),
+        "Expected 200/201 greeting, got: {}",
         line.trim()
     );
 
@@ -137,11 +123,13 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
 
     // Read response - should be 220 (article follows)
     line.clear();
-    reader.read_line(&mut line).await?;
+    timeout(Duration::from_secs(2), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for ARTICLE response")?;
 
-    // Verify we don't get a stray 200 in the article response
+    // Verify we don't get a stray greeting in the article response
     assert!(
-        !line.contains("200 NNTP Proxy Ready"),
+        !line.contains("NNTP Proxy Ready"),
         "Article response contains greeting text - corruption detected! Line: {}",
         line.trim()
     );

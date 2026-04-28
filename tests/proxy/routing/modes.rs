@@ -73,7 +73,7 @@ async fn test_stateful_mode_basic() -> Result<()> {
     let mut buffer = vec![0u8; 4096];
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
-    assert!(greeting.contains("200"));
+    assert!(greeting.contains("201"));
 
     // Send HELP command
     client.write_all(b"HELP\r\n").await?;
@@ -119,7 +119,7 @@ async fn test_per_command_mode_basic() -> Result<()> {
     let mut buffer = vec![0u8; 4096];
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
-    assert!(greeting.contains("200"));
+    assert!(greeting.contains("201"));
 
     // Send HELP command (stateless)
     client.write_all(b"HELP\r\n").await?;
@@ -172,7 +172,7 @@ async fn test_hybrid_mode_starts_per_command() -> Result<()> {
     let mut buffer = vec![0u8; 4096];
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
-    assert!(greeting.contains("200"));
+    assert!(greeting.contains("201"));
 
     // Should handle stateless commands in per-command mode initially
     client.write_all(b"HELP\r\n").await?;

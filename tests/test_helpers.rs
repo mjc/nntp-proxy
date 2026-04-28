@@ -520,7 +520,7 @@ pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::Tc
     let mut line = String::new();
 
     reader.read_line(&mut line).await?;
-    if !line.starts_with("200") {
+    if !line.starts_with("201") {
         anyhow::bail!("Expected 200 greeting, got: {}", line);
     }
 

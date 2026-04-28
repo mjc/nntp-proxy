@@ -312,10 +312,22 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let wake = Arc::clone(&n);
                     tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
                         let _ = stream.write_all(b"200 mock\r\n").await;
-                        // Block until the test signals that pool.get() has returned
-                        // (greeting already consumed) before sending article data
-                        wake.notified().await;
+                        // Respond to negotiation commands (MODE READER, etc.) while
+                        // waiting for the test to signal that pool.get() has returned.
+                        let mut cmd_buf = vec![0u8; 256];
+                        loop {
+                            tokio::select! {
+                                _ = wake.notified() => break,
+                                result = stream.read(&mut cmd_buf) => {
+                                    match result {
+                                        Ok(n) if n > 0 => { let _ = stream.write_all(b"200 OK\r\n").await; }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                        }
                         let _ = stream.write_all(article_data).await;
                         // Keep alive so recycle's try_read sees WouldBlock
                         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -345,8 +357,22 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let wake = Arc::clone(&n);
                     tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
                         let _ = stream.write_all(b"200 mock\r\n").await;
-                        wake.notified().await;
+                        // Respond to negotiation commands (MODE READER, etc.) while
+                        // waiting for the test to signal that pool.get() has returned.
+                        let mut cmd_buf = vec![0u8; 256];
+                        loop {
+                            tokio::select! {
+                                _ = wake.notified() => break,
+                                result = stream.read(&mut cmd_buf) => {
+                                    match result {
+                                        Ok(n) if n > 0 => { let _ = stream.write_all(b"200 OK\r\n").await; }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                        }
                         let _ = stream.write_all(article_prefix).await;
                         let _ = stream.shutdown().await;
                     });

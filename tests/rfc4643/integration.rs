@@ -66,7 +66,7 @@ async fn test_auth_flow_complete_with_valid_credentials() {
     // Read proxy greeting
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
 
     // Send AUTHINFO USER
     writer
@@ -138,7 +138,7 @@ async fn test_auth_disabled_allows_immediate_commands() {
     // Read greeting
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
 
     // Send command immediately (no AUTHINFO needed)
     writer.write_all(b"CAPABILITIES\r\n").await.unwrap();
@@ -268,7 +268,7 @@ async fn test_multiple_clients_with_auth() {
 
             // Read greeting
             reader.read_line(&mut line).await.unwrap();
-            assert!(line.starts_with("200"), "Client {i} got greeting");
+            assert!(line.starts_with("201"), "Client {i} got greeting");
 
             // Auth
             writer.write_all(b"AUTHINFO USER user\r\n").await.unwrap();

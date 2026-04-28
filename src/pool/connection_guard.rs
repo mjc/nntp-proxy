@@ -283,18 +283,25 @@ mod tests {
                     }
 
                     // Handle TcpManager setup commands, then keep alive.
-                    // TcpManager::create() sends COMPRESS DEFLATE (auto-detect mode);
-                    // we reject it so create() completes and proceeds without compression.
                     let mut line = String::new();
                     loop {
                         line.clear();
                         match reader.read_line(&mut line).await {
                             Ok(0) | Err(_) => break, // Client closed connection
                             Ok(_) => {
-                                if line.trim().eq_ignore_ascii_case("COMPRESS DEFLATE") {
+                                let cmd = line.trim().to_ascii_uppercase();
+                                if cmd == "COMPRESS DEFLATE" {
                                     let _ = write_half.write_all(b"500 Not supported\r\n").await;
+                                } else if cmd.starts_with("MODE") {
+                                    let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
+                                } else if cmd.starts_with("QUIT") {
+                                    let _ = write_half.write_all(b"205 Goodbye\r\n").await;
+                                    break;
+                                } else if cmd.starts_with("DATE") {
+                                    let _ = write_half.write_all(b"111 20240101000000\r\n").await;
+                                } else {
+                                    let _ = write_half.write_all(b"200 OK\r\n").await;
                                 }
-                                // Other commands: stay alive, don't respond
                             }
                         }
                     }

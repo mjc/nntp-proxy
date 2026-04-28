@@ -36,14 +36,14 @@ pub use responses::{
 
 /// Send NNTP proxy greeting to a client
 ///
-/// Sends the standard "200 NNTP Proxy Ready" greeting message.
+/// Sends the "201 NNTP Proxy Ready" greeting message.
 /// The greeting is flushed immediately to ensure the client receives it
 /// before we start processing commands.
 pub async fn send_proxy_greeting(
     client_stream: &mut TcpStream,
     client_addr: impl std::fmt::Display,
 ) -> Result<()> {
-    let proxy_greeting = b"200 NNTP Proxy Ready\r\n";
+    let proxy_greeting = b"201 NNTP Proxy Ready\r\n";
     client_stream.write_all(proxy_greeting).await?;
     client_stream.flush().await?;
     debug!("Sent and flushed proxy greeting to client {}", client_addr);

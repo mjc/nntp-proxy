@@ -145,7 +145,7 @@ async fn test_compression_disabled_skips_negotiation() -> Result<()> {
 
     // Read greeting
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
     line.clear();
 
     // Send a command to trigger backend connection
@@ -206,7 +206,7 @@ async fn test_compression_auto_fallback_on_unsupported() -> Result<()> {
     let mut line = String::new();
 
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
     line.clear();
 
     // Command should still work even though compression was rejected
@@ -266,7 +266,7 @@ async fn test_compression_required_fails_on_unsupported() -> Result<()> {
     let mut line = String::new();
 
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
     line.clear();
 
     // Command should fail because backend connection can't be established without compression

@@ -89,6 +89,16 @@ impl StaleConnectionServer {
                             let _ = stream.write_all(b"500 Not supported\r\n").await;
                             continue;
                         }
+                        // Handle MODE READER (connection setup, don't count)
+                        else if cmd_upper.starts_with("MODE") {
+                            let _ = stream.write_all(b"200 Posting allowed\r\n").await;
+                            continue;
+                        }
+                        // Handle AUTHINFO (connection setup, don't count)
+                        else if cmd_upper.starts_with("AUTHINFO") {
+                            let _ = stream.write_all(b"281 Authentication accepted\r\n").await;
+                            continue;
+                        }
                         // Handle DATE (health check)
                         else if cmd_upper.starts_with("DATE") {
                             let _ = stream.write_all(b"111 20251219120000\r\n").await;
@@ -270,7 +280,7 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
 
     // Read greeting
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("200"), "Expected greeting, got: {line}");
+    assert!(line.starts_with("201"), "Expected greeting, got: {line}");
     line.clear();
 
     // First STAT command - should work (fresh connection)
@@ -365,7 +375,7 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
 
     // Read greeting
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
     line.clear();
 
     // First command
@@ -438,7 +448,7 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
 
     // Read greeting
     reader.read_line(&mut line).await?;
-    assert!(line.starts_with("200"));
+    assert!(line.starts_with("201"));
     line.clear();
 
     // Try command - first 2 connections fail, third should work

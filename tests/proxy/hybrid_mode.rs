@@ -130,10 +130,20 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
             // Send greeting
             stream.write_all(b"200 Mock Server\r\n").await.unwrap();
 
-            // Read GROUP command
+            // Handle negotiation commands (MODE READER, etc.) before the real commands
             let mut buf = [0; 1024];
-            let n = stream.read(&mut buf).await.unwrap();
-            let cmd = std::str::from_utf8(&buf[..n]).unwrap();
+            let cmd = loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break String::new();
+                }
+                let cmd = std::str::from_utf8(&buf[..n]).unwrap().to_string();
+                if cmd.contains("GROUP") || cmd.contains("ARTICLE") || cmd.contains("QUIT") {
+                    break cmd;
+                }
+                // Respond to negotiation commands (MODE READER, etc.)
+                stream.write_all(b"200 OK\r\n").await.unwrap();
+            };
 
             if cmd.contains("GROUP") {
                 // Send GROUP response

@@ -378,6 +378,7 @@ impl DeadpoolConnectionProvider {
                 tls_config: Some(tls_config),
                 compress: server.compress,
                 compress_level: server.compress_level,
+                ..TcpManagerOptions::default()
             },
         )?;
         let max_size = server.max_connections.get();
@@ -1000,27 +1001,42 @@ mod tests {
     /// Helper: spawn a mock NNTP server that greets each connection and keeps it alive.
     /// Returns the address to connect to.
     async fn spawn_mock_nntp_server() -> std::net::SocketAddr {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Use a Notify that is never notified to keep connections alive
-        // indefinitely. Unlike sleep(), this won't auto-advance under
-        // start_paused = true.
-        let keep_alive = Arc::new(tokio::sync::Notify::new());
-
         tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let keep = keep_alive.clone();
-                // Spawn a handler per connection so they stay alive concurrently
+            while let Ok((stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    let _ = stream.write_all(b"200 mock\r\n").await;
-                    // Keep alive until test drops the connection.
-                    // Notify::notified() does NOT auto-advance with
-                    // start_paused, unlike sleep().
-                    keep.notified().await;
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+
+                    let _ = write_half.write_all(b"200 mock\r\n").await;
+
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let cmd = line.trim().to_ascii_uppercase();
+                                if cmd == "COMPRESS DEFLATE" {
+                                    let _ = write_half.write_all(b"500 Not supported\r\n").await;
+                                } else if cmd.starts_with("MODE") {
+                                    let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
+                                } else if cmd.starts_with("QUIT") {
+                                    let _ = write_half.write_all(b"205 Goodbye\r\n").await;
+                                    break;
+                                } else if cmd.starts_with("DATE") {
+                                    let _ = write_half.write_all(b"111 20240101000000\r\n").await;
+                                } else {
+                                    let _ = write_half.write_all(b"200 OK\r\n").await;
+                                }
+                            }
+                        }
+                    }
                 });
             }
         });

@@ -70,7 +70,7 @@ async fn test_overlong_first_command_returns_501_and_continues() -> Result<()> {
     let n = timeout(Duration::from_secs(2), client.read(&mut buf)).await??;
     let greeting = String::from_utf8_lossy(&buf[..n]);
     assert!(
-        greeting.starts_with("200"),
+        greeting.starts_with("201"),
         "Expected 200 greeting, got: {greeting}"
     );
 
@@ -142,7 +142,7 @@ async fn test_overlong_command_uses_501_not_500() -> Result<()> {
     let n = timeout(Duration::from_secs(2), client.read(&mut buf)).await??;
     let greeting = String::from_utf8_lossy(&buf[..n]);
     assert!(
-        greeting.starts_with("200"),
+        greeting.starts_with("201"),
         "Expected 200 greeting: {greeting}"
     );
 

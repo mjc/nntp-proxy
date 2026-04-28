@@ -13,9 +13,9 @@
 //!
 //! - `480` Authentication required
 //!   <https://www.rfc-editor.org/rfc/rfc4643.html#section-2.4.1>
-//! - `502` Command not implemented\
+//! - `503` Feature not supported\
 //!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
-//!   Used when a command is recognized but not supported by this server
+//!   Used when a feature (e.g. stateful commands in per-command mode) is not supported
 
 use super::classifier::NntpCommand;
 
@@ -85,18 +85,20 @@ impl CommandHandler {
                 CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
             }
             NntpCommand::Stateful => {
-                // RFC 3977 Section 3.2.1: 502 Command not implemented
+                // RFC 3977 §3.2.1: 503 = "Feature not supported" — correct for commands the
+                // proxy structurally cannot support in stateless mode (GROUP, NEXT, etc.)
                 // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
-                CommandAction::Reject("502 Command not implemented in stateless proxy mode\r\n")
+                CommandAction::Reject("503 Feature not supported in stateless proxy mode\r\n")
             }
             NntpCommand::Post => {
                 // RFC 3977 §6.3.1: servers that do not permit posting MUST return 440
                 CommandAction::Reject("440 Posting not permitted\r\n")
             }
             NntpCommand::NonRoutable => {
-                // RFC 3977 Section 3.2.1: 502 Command not implemented
+                // RFC 3977 §3.2.1: 503 = "Feature not supported" — correct for transit-only
+                // commands the proxy cannot route per-command (IHAVE, STARTTLS, etc.)
                 // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
-                CommandAction::Reject("502 Command not implemented in per-command routing mode\r\n")
+                CommandAction::Reject("503 Feature not supported in per-command routing mode\r\n")
             }
             NntpCommand::Capabilities => {
                 // RFC 3977 §5.2 + RFC 4643 §3.1: proxy must return its own capability list,
@@ -446,7 +448,7 @@ mod tests {
             CommandHandler::classify("POST")
         );
 
-        // IHAVE should be rejected with 502 (not implemented)
+        // IHAVE should be rejected with 503 (feature not supported)
         assert!(
             matches!(
                 CommandHandler::classify("IHAVE <test@example.com>"),
@@ -569,19 +571,18 @@ mod tests {
     }
 
     #[test]
-    fn test_502_status_code_usage() {
-        // RFC 3977 Section 3.2.1: 502 is "Command not implemented"
-        // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
-        // "The command is not presently implemented by the server, although
-        //  it may be implemented in the future."
+    fn test_503_status_code_usage() {
+        // RFC 3977 §3.2.1: 503 is "Feature not supported"
+        // Correct for commands the proxy structurally cannot support
+        // (e.g. stateful GROUP in per-command mode, or transit-only IHAVE)
 
-        // Stateful commands in stateless mode use 502
+        // Stateful commands in stateless mode use 503
         let CommandAction::Reject(response) = CommandHandler::classify("GROUP alt.test") else {
             panic!("Expected Reject");
         };
         assert!(
-            response.starts_with("502 "),
-            "Stateful commands should return 502, got: {response}"
+            response.starts_with("503 "),
+            "Stateful commands should return 503, got: {response}"
         );
 
         // POST uses 440 per RFC 3977 §6.3.1 (posting not permitted)
@@ -593,13 +594,13 @@ mod tests {
             "POST must return 440 (posting not permitted), got: {response}"
         );
 
-        // IHAVE uses 502 (transit command not implemented)
+        // IHAVE uses 503 (transit feature not supported in reader proxy)
         let CommandAction::Reject(response) = CommandHandler::classify("IHAVE <x@y>") else {
             panic!("Expected Reject");
         };
         assert!(
-            response.starts_with("502 "),
-            "IHAVE should return 502, got: {response}"
+            response.starts_with("503 "),
+            "IHAVE should return 503, got: {response}"
         );
     }
 

@@ -1,0 +1,9 @@
+# nextest configuration for nntp-proxy
+#
+# Per-test hard timeout: if any test takes longer than 30 seconds, nextest
+# kills it and marks it as failed.  This makes test hangs impossible —
+# a test that would have hung indefinitely is now a fast (30 s) failure with
+# a clear "timed out" message in the output.
+
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 1 }
