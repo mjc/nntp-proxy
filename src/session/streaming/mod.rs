@@ -4,7 +4,6 @@
 //! Uses a single pooled buffer for sequential read-write I/O on large transfers.
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
@@ -368,8 +367,7 @@ where
         if let Some(pos) = memchr::memchr(b'\n', response.as_slice()) {
             let end = pos + 1;
             if end < response.len() {
-                let remainder = response.as_slice()[end..].to_vec();
-                stash_leftover(conn, &remainder)?;
+                stash_leftover(conn, &response.as_slice()[end..])?;
                 response.truncate(end);
             }
         }
@@ -381,8 +379,7 @@ where
     let write_len = status.write_len(response.len());
 
     if write_len < response.len() {
-        let remainder = response.as_slice()[write_len..].to_vec();
-        stash_leftover(conn, &remainder)?;
+        stash_leftover(conn, &response.as_slice()[write_len..])?;
         response.truncate(write_len);
     }
 
@@ -427,7 +424,7 @@ pub(crate) async fn read_full_response(
     conn: &mut crate::stream::ConnectionStream,
     result_buf: &mut crate::pool::PooledBuffer,
     backend_id: crate::types::BackendId,
-) -> Result<(Bytes, crate::protocol::StatusCode), StreamingError> {
+) -> Result<crate::protocol::StatusCode, StreamingError> {
     result_buf.clear();
 
     let source = if conn.has_leftover() {
@@ -445,9 +442,7 @@ pub(crate) async fn read_full_response(
     }
     result_buf.extend_from_slice(&io_buffer[..n]);
 
-    let status_code =
-        finish_read_full_response(io_buffer, conn, result_buf, backend_id, source).await?;
-    Ok((Bytes::copy_from_slice(result_buf.as_ref()), status_code))
+    finish_read_full_response(io_buffer, conn, result_buf, backend_id, source).await
 }
 
 /// Read and validate a full response after the first chunk has already been prefetched.

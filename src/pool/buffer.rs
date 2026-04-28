@@ -26,6 +26,15 @@ pub struct PooledBuffer {
     max_pool_size: usize,
 }
 
+impl std::fmt::Debug for PooledBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledBuffer")
+            .field("initialized", &self.initialized)
+            .field("capacity", &self.buffer.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
 impl PooledBuffer {
     /// Get the full capacity of the buffer
     #[must_use]

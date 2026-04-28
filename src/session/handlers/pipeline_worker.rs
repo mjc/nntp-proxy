@@ -172,7 +172,8 @@ async fn execute_pipeline_batch(
         .await
         .map_err(crate::session::streaming::StreamingError::into_anyhow)
         {
-            Ok((data, status_code)) => {
+            Ok(status_code) => {
+                let data = std::mem::replace(result_buf, buffer_pool.acquire_capture().await);
                 metrics.record_command(backend_id);
                 let data_len = data.len();
                 metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
@@ -240,7 +241,7 @@ async fn execute_pipeline_batch(
 
 /// Read a complete NNTP response (status line + multiline body if applicable).
 ///
-/// Returns the full response as `Bytes` and the parsed status code.
+/// Fills `result_buf` with the full response bytes and returns the parsed status code.
 ///
 /// `result_buf` is cleared and reused for each response to avoid per-response allocations.
 #[cfg(test)]
@@ -248,7 +249,7 @@ async fn read_full_response(
     buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
     result_buf: &mut crate::pool::PooledBuffer,
-) -> Result<(bytes::Bytes, crate::protocol::StatusCode)> {
+) -> Result<crate::protocol::StatusCode> {
     crate::session::streaming::read_full_response(
         buffer,
         conn,
@@ -401,12 +402,12 @@ mod tests {
 
         let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf)
             .await
             .expect("should parse single-line response");
 
         assert_eq!(status.as_u16(), 430);
-        assert_eq!(&data[..], b"430 No such article\r\n");
+        assert_eq!(&result_buf[..], b"430 No such article\r\n");
         assert!(!conn.has_leftover());
     }
 
@@ -419,12 +420,12 @@ mod tests {
         let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
         let mut conn = mock_backend_conn(response).await;
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf)
             .await
             .expect("should parse multiline response");
 
         assert_eq!(status.as_u16(), 220);
-        assert_eq!(&data[..], &response[..]);
+        assert_eq!(&result_buf[..], &response[..]);
         assert!(!conn.has_leftover());
     }
 
@@ -440,13 +441,13 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf)
             .await
             .expect("should detect terminator across chunks");
 
         assert_eq!(status.as_u16(), 220);
         assert!(
-            data.ends_with(b"\r\n.\r\n"),
+            result_buf.ends_with(b"\r\n.\r\n"),
             "response should end with terminator"
         );
         assert!(!conn.has_leftover());
@@ -463,24 +464,24 @@ mod tests {
         let mut conn = mock_backend_conn(packed).await;
 
         // First read should get the multiline response and save leftover
-        let (data1, status1) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status1 = read_full_response(&mut buffer, &mut conn, &mut result_buf)
             .await
             .expect("should parse first response");
 
         assert_eq!(status1.as_u16(), 220);
-        assert!(data1.ends_with(b"\r\n.\r\n"));
+        assert!(result_buf.ends_with(b"\r\n.\r\n"));
         assert!(
             conn.has_leftover(),
             "should have leftover from second response"
         );
 
         // Second read should consume leftover and return the 430
-        let (data2, status2) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status2 = read_full_response(&mut buffer, &mut conn, &mut result_buf)
             .await
             .expect("should parse second response from leftover");
 
         assert_eq!(status2.as_u16(), 430);
-        assert_eq!(&data2[..], b"430 No such article\r\n");
+        assert_eq!(&result_buf[..], b"430 No such article\r\n");
     }
 
     #[tokio::test]
@@ -524,12 +525,12 @@ mod tests {
         // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
         conn.stash_leftover(b"43").unwrap();
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf)
             .await
             .expect("short leftover + read should produce valid response");
 
         assert_eq!(status.as_u16(), 430);
-        assert!(data.starts_with(b"430"));
+        assert!(result_buf.starts_with(b"430"));
     }
 
     #[tokio::test]
@@ -891,11 +892,11 @@ mod tests {
                 let mut conn = mock_backend_conn(&wire).await;
 
                 for (idx, expected) in responses.iter().enumerate() {
-                    let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+                    let status = read_full_response(&mut buffer, &mut conn, &mut result_buf)
                         .await
                         .expect("packed single-line response should parse");
 
-                    prop_assert_eq!(&data[..], expected.as_slice());
+                    prop_assert_eq!(&result_buf[..], expected.as_slice());
                     prop_assert_eq!(status.as_u16(), codes[idx]);
                 }
 
