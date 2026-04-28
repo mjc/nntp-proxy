@@ -9,7 +9,7 @@ use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
 };
-use crate::session::streaming::{StreamingError, classify_client_write_err};
+use crate::session::streaming::StreamingError;
 use crate::session::{ClientSession, backend, streaming};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -48,6 +48,15 @@ struct ResponseStreamParams<'a> {
     response_code: &'a crate::protocol::NntpResponse,
     is_multiline: bool,
     first_chunk: &'a [u8],
+}
+
+/// Any client write failure after the full backend response is already buffered is terminal.
+///
+/// The backend connection is already clean at this point, but the client may have received a
+/// partial prefix of the response. Retrying another backend on the same client socket would
+/// splice responses together and corrupt NNTP framing.
+fn classify_buffered_response_write_err(e: std::io::Error) -> StreamingError {
+    StreamingError::ClientDisconnect(e)
 }
 
 impl ClientSession {
@@ -195,8 +204,20 @@ impl ClientSession {
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username());
                 } else {
-                    // Client disconnect — backend was cleanly drained. Return to pool.
-                    let _ = conn.release();
+                    // Client disconnect after a fully buffered response keeps the backend
+                    // clean, but unexpected trailing bytes still make this pooled borrow
+                    // unsafe to reuse across sessions.
+                    if conn.has_leftover() {
+                        warn!(
+                            client = %self.client_addr,
+                            backend = backend_id.as_index(),
+                            command = %command.trim(),
+                            leftover_bytes = conn.leftover_len(),
+                            "Buffered direct-path response ended with trailing backend bytes; retiring connection"
+                        );
+                    } else {
+                        let _ = conn.release();
+                    }
                 }
                 // SessionError::from(StreamingError) preserves ClientDisconnect signal.
                 return Err(SessionError::from(e));
@@ -220,7 +241,17 @@ impl ClientSession {
 
         // Explicitly complete the guard on the success path
         guard.complete();
-        let _ = conn.release(); // streaming completed; connection healthy, return to pool
+        if conn.has_leftover() {
+            warn!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command = %command.trim(),
+                leftover_bytes = conn.leftover_len(),
+                "Direct per-command response left trailing backend bytes; retiring connection"
+            );
+        } else {
+            let _ = conn.release(); // streaming completed; connection healthy, return to pool
+        }
 
         Ok(BackendAttemptResult::Success {
             backend_id,
@@ -330,7 +361,7 @@ impl ClientSession {
                 client_write
                     .write_all(&captured)
                     .await
-                    .map_err(classify_client_write_err)?;
+                    .map_err(classify_buffered_response_write_err)?;
                 if let Some(msg_id_ref) = params.msg_id {
                     debug!(
                         "Client {} caching full article for {} ({} bytes captured)",
@@ -349,7 +380,7 @@ impl ClientSession {
                 client_write
                     .write_all(&captured)
                     .await
-                    .map_err(classify_client_write_err)?;
+                    .map_err(classify_buffered_response_write_err)?;
 
                 // Extract first status line (~30-80 bytes) instead of copying
                 // full response. The cache only needs the status
@@ -368,7 +399,7 @@ impl ClientSession {
                 client_write
                     .write_all(&captured)
                     .await
-                    .map_err(classify_client_write_err)?;
+                    .map_err(classify_buffered_response_write_err)?;
                 Ok(captured.len() as u64)
             }
             (false, CacheAction::TrackStat) => {
@@ -377,7 +408,7 @@ impl ClientSession {
                 client_write
                     .write_all(params.first_chunk)
                     .await
-                    .map_err(classify_client_write_err)?;
+                    .map_err(classify_buffered_response_write_err)?;
                 self.maybe_cache_upsert(params.msg_id, b"223\r\n", ctx.backend_id);
                 Ok(params.first_chunk.len() as u64)
             }
@@ -387,7 +418,7 @@ impl ClientSession {
                 client_write
                     .write_all(params.first_chunk)
                     .await
-                    .map_err(classify_client_write_err)?;
+                    .map_err(classify_buffered_response_write_err)?;
                 Ok(params.first_chunk.len() as u64)
             }
         }
@@ -462,5 +493,30 @@ impl ClientSession {
         self.metrics.user_bytes_sent(self.username(), cmd_bytes);
         self.metrics
             .user_bytes_received(self.username(), resp_bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_buffered_response_write_err;
+
+    #[test]
+    fn buffered_response_timeout_is_terminal_client_disconnect() {
+        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let classified = classify_buffered_response_write_err(err);
+        assert!(matches!(
+            classified,
+            crate::session::streaming::StreamingError::ClientDisconnect(_)
+        ));
+    }
+
+    #[test]
+    fn buffered_response_abort_is_terminal_client_disconnect() {
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "aborted");
+        let classified = classify_buffered_response_write_err(err);
+        assert!(matches!(
+            classified,
+            crate::session::streaming::StreamingError::ClientDisconnect(_)
+        ));
     }
 }

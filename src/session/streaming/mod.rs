@@ -96,20 +96,6 @@ impl StreamingError {
     }
 }
 
-/// Classify a client-side write failure into the appropriate `StreamingError` variant.
-///
-/// Disconnect errors (`BrokenPipe`, `ConnectionReset`) become `ClientDisconnect`
-/// (backend is still clean — connection can be returned to pool). All other
-/// errors become `Io` (treat the connection as suspect).
-pub(crate) fn classify_client_write_err(e: std::io::Error) -> StreamingError {
-    use crate::connection_error::is_disconnect_kind;
-    if is_disconnect_kind(e.kind()) {
-        StreamingError::ClientDisconnect(e)
-    } else {
-        StreamingError::Io(e.into())
-    }
-}
-
 /// Identifies where a streaming operation is happening
 ///
 /// Groups the session-level context that is invariant across all chunks
