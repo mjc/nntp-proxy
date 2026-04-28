@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
-use crate::test_helpers::{MockNntpServer, create_test_server_config, get_available_port};
+use crate::test_helpers::{MockNntpServer, create_test_server_config};
 use nntp_proxy::NntpProxy;
 use nntp_proxy::config::{Config, RoutingMode};
 
@@ -22,12 +22,13 @@ use nntp_proxy::config::{Config, RoutingMode};
 /// misleads clients into believing they can post.
 #[tokio::test]
 async fn test_proxy_sends_201_readonly_greeting() -> Result<()> {
-    let backend_port = get_available_port().await.expect("port");
+    // Bind the backend listener before spawning so the port is guaranteed
+    // to be ready — no sleep needed to wait for the mock server to bind.
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
     let _backend = MockNntpServer::new(backend_port)
         .with_name("TestBackend")
-        .spawn();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
+        .spawn_on_listener(backend_listener);
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
@@ -48,8 +49,9 @@ async fn test_proxy_sends_201_readonly_greeting() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
+    // proxy_listener is already bound above; the kernel accepts the TCP SYN
+    // into the backlog before accept() is called, so we can connect immediately
+    // and wait for the greeting without any sleep.
     let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let mut buffer = vec![0u8; 256];
     let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
@@ -120,16 +122,26 @@ async fn test_mode_reader_sent_to_backend() -> Result<()> {
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     proxy.prewarm_connections().await.ok();
 
-    // Allow time for the prewarm connection to complete the handshake
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let mut received = Vec::new();
-    while let Ok(cmd) = rx.try_recv() {
-        received.push(cmd);
-    }
+    // prewarm_connections().await returns after pool connections are established,
+    // which includes the full handshake (greeting → auth → MODE READER).
+    // The backend task sends each command through the channel asynchronously,
+    // so we drive the receiver until MODE READER arrives rather than sleeping.
+    let (mode_reader_seen, received) = timeout(Duration::from_secs(5), async move {
+        let mut cmds = Vec::new();
+        while let Some(cmd) = rx.recv().await {
+            let found = cmd.starts_with("MODE READER");
+            cmds.push(cmd);
+            if found {
+                return (true, cmds);
+            }
+        }
+        (false, cmds)
+    })
+    .await
+    .unwrap_or((false, vec![]));
 
     assert!(
-        received.iter().any(|c| c.starts_with("MODE READER")),
+        mode_reader_seen,
         "RFC 3977 §5.3: proxy must send MODE READER to backend during connection setup, \
          commands received by backend: {:?}",
         received
