@@ -29,6 +29,8 @@ pub enum CommandAction<'a> {
     Reject(&'static str),
     /// Forward the command to backend (stateless)
     ForwardStateless,
+    /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list
+    InterceptCapabilities,
 }
 
 /// Specific authentication action
@@ -39,6 +41,8 @@ pub enum AuthAction<'a> {
     RequestPassword(&'a str),
     /// Validate credentials and send appropriate response
     ValidateAndRespond { password: &'a str },
+    /// AUTHINFO with an unrecognized subcommand — reject with 501 per RFC 4643 §2.3.1
+    UnknownSubcommand,
 }
 
 /// Handler for processing commands and determining actions
@@ -50,34 +54,54 @@ impl CommandHandler {
     pub fn classify(command: &str) -> CommandAction<'_> {
         match NntpCommand::parse(command) {
             NntpCommand::AuthUser => {
-                // Extract username from "AUTHINFO USER <username>" (zero-allocation)
-                let username = command
-                    .trim()
-                    .strip_prefix("AUTHINFO USER")
-                    .or_else(|| command.trim().strip_prefix("authinfo user"))
-                    .unwrap_or("")
-                    .trim();
+                // Extract username from "AUTHINFO USER <username>" — case-insensitive per RFC 3977 §3.1
+                let trimmed = command.trim();
+                const USER_PREFIX: &str = "AUTHINFO USER";
+                let username = if trimmed.len() >= USER_PREFIX.len()
+                    && trimmed[..USER_PREFIX.len()].eq_ignore_ascii_case(USER_PREFIX)
+                {
+                    trimmed[USER_PREFIX.len()..].trim()
+                } else {
+                    ""
+                };
                 CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
             }
             NntpCommand::AuthPass => {
-                // Extract password from "AUTHINFO PASS <password>" (zero-allocation)
-                let password = command
-                    .trim()
-                    .strip_prefix("AUTHINFO PASS")
-                    .or_else(|| command.trim().strip_prefix("authinfo pass"))
-                    .unwrap_or("")
-                    .trim();
+                // Extract password from "AUTHINFO PASS <password>" — case-insensitive per RFC 3977 §3.1
+                let trimmed = command.trim();
+                const PASS_PREFIX: &str = "AUTHINFO PASS";
+                let password = if trimmed.len() >= PASS_PREFIX.len()
+                    && trimmed[..PASS_PREFIX.len()].eq_ignore_ascii_case(PASS_PREFIX)
+                {
+                    trimmed[PASS_PREFIX.len()..].trim()
+                } else {
+                    ""
+                };
                 CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
+            }
+            NntpCommand::AuthUnknown => {
+                // RFC 4643 §2.3.1: route through InterceptAuth so auth state is checked first.
+                // common::handle_auth_command returns 502 if already authenticated, else 501.
+                CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
             }
             NntpCommand::Stateful => {
                 // RFC 3977 Section 3.2.1: 502 Command not implemented
                 // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
                 CommandAction::Reject("502 Command not implemented in stateless proxy mode\r\n")
             }
+            NntpCommand::Post => {
+                // RFC 3977 §6.3.1: servers that do not permit posting MUST return 440
+                CommandAction::Reject("440 Posting not permitted\r\n")
+            }
             NntpCommand::NonRoutable => {
                 // RFC 3977 Section 3.2.1: 502 Command not implemented
                 // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
                 CommandAction::Reject("502 Command not implemented in per-command routing mode\r\n")
+            }
+            NntpCommand::Capabilities => {
+                // RFC 3977 §5.2 + RFC 4643 §3.1: proxy must return its own capability list,
+                // not forward the backend's. Accessible before and after authentication.
+                CommandAction::InterceptCapabilities
             }
             NntpCommand::ArticleByMessageId | NntpCommand::Stateless => {
                 CommandAction::ForwardStateless
@@ -184,7 +208,6 @@ mod tests {
             "LIST ACTIVE",
             "LIST NEWSGROUPS",
             "DATE",
-            "CAPABILITIES",
             "QUIT",
         ];
 
@@ -195,6 +218,72 @@ mod tests {
                 "Command '{cmd}' should be stateless"
             );
         }
+    }
+
+    #[test]
+    fn test_capabilities_intercepted_not_forwarded() {
+        // RFC 3977 §5.2 + RFC 4643 §3.1: CAPABILITIES must be intercepted by the proxy
+        // to return an accurate capability list, not forwarded to the backend.
+        assert_eq!(
+            CommandHandler::classify("CAPABILITIES"),
+            CommandAction::InterceptCapabilities,
+        );
+        assert_eq!(
+            CommandHandler::classify("capabilities"),
+            CommandAction::InterceptCapabilities,
+        );
+        assert_eq!(
+            CommandHandler::classify("Capabilities"),
+            CommandAction::InterceptCapabilities,
+        );
+    }
+
+    /// Bug 2 regression test: RFC 4643 §2.3.1 — AUTHINFO is case-insensitive.
+    ///
+    /// Before fix: the username/password extractor only stripped exact "AUTHINFO USER" or
+    /// "authinfo user" prefixes, so mixed-case commands (e.g. "Authinfo User foo") classified
+    /// correctly but returned an empty username.
+    #[test]
+    fn test_mixed_case_authinfo_extraction() {
+        // "Authinfo User" — Titlecase keyword, Titlecase subcommand
+        let action = CommandHandler::classify("Authinfo User testuser");
+        assert!(
+            matches!(
+                action,
+                CommandAction::InterceptAuth(AuthAction::RequestPassword(u)) if u == "testuser"
+            ),
+            "Expected username 'testuser', got: {action:?}"
+        );
+
+        // "AUTHINFO user" — uppercase keyword, lowercase subcommand
+        let action = CommandHandler::classify("AUTHINFO user anotheruser");
+        assert!(
+            matches!(
+                action,
+                CommandAction::InterceptAuth(AuthAction::RequestPassword(u)) if u == "anotheruser"
+            ),
+            "Expected username 'anotheruser', got: {action:?}"
+        );
+
+        // "aUtHiNfO pAsS" — fully mixed case
+        let action = CommandHandler::classify("aUtHiNfO pAsS mypassword");
+        assert!(
+            matches!(
+                action,
+                CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password: p }) if p == "mypassword"
+            ),
+            "Expected password 'mypassword', got: {action:?}"
+        );
+
+        // "Authinfo Pass" — Titlecase keyword + Titlecase subcommand
+        let action = CommandHandler::classify("Authinfo Pass s3cr3t");
+        assert!(
+            matches!(
+                action,
+                CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password: p }) if p == "s3cr3t"
+            ),
+            "Expected password 's3cr3t', got: {action:?}"
+        );
     }
 
     #[test]
@@ -245,9 +334,16 @@ mod tests {
         let action = CommandHandler::classify("AUTHINFO");
         assert_eq!(action, CommandAction::ForwardStateless);
 
-        // AUTHINFO with unknown subcommand
+        // AUTHINFO with unknown subcommand — intercepted so auth state can be checked first.
+        // Returns 501 if not authenticated, 502 if already authenticated (RFC 4643 §2.3.1/§2.2).
         let action = CommandHandler::classify("AUTHINFO INVALID");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert!(
+            matches!(
+                action,
+                CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
+            ),
+            "Unknown AUTHINFO subcommand must produce InterceptAuth(UnknownSubcommand), got: {action:?}"
+        );
     }
 
     #[test]
@@ -340,16 +436,17 @@ mod tests {
 
     #[test]
     fn test_non_routable_commands_rejected() {
-        // POST should be rejected
+        // POST must return 440 per RFC 3977 §6.3.1 (posting not permitted)
         assert!(
             matches!(
                 CommandHandler::classify("POST"),
-                CommandAction::Reject(msg) if msg.contains("routing")
+                CommandAction::Reject(msg) if msg.starts_with("440")
             ),
-            "Expected Reject for POST"
+            "POST must return 440 (Posting not permitted), got: {:?}",
+            CommandHandler::classify("POST")
         );
 
-        // IHAVE should be rejected
+        // IHAVE should be rejected with 502 (not implemented)
         assert!(
             matches!(
                 CommandHandler::classify("IHAVE <test@example.com>"),
@@ -379,14 +476,28 @@ mod tests {
             panic!("Expected Reject")
         };
 
-        let CommandAction::Reject(routing_reject) = CommandHandler::classify("POST") else {
+        let CommandAction::Reject(post_reject) = CommandHandler::classify("POST") else {
             panic!("Expected Reject")
         };
 
-        // They should have different messages
+        let CommandAction::Reject(ihave_reject) = CommandHandler::classify("IHAVE <x@y>") else {
+            panic!("Expected Reject")
+        };
+
+        // Stateful commands rejected with stateless-mode message
         assert!(stateful_reject.contains("stateless"));
-        assert!(routing_reject.contains("routing"));
-        assert_ne!(stateful_reject, routing_reject);
+        // POST rejected with RFC 3977 §6.3.1 440 response
+        assert!(post_reject.starts_with("440"));
+        assert!(
+            post_reject.to_lowercase().contains("posting")
+                || post_reject.to_lowercase().contains("permitted")
+        );
+        // IHAVE rejected with routing-mode message
+        assert!(ihave_reject.contains("routing"));
+        // All rejections are distinct
+        assert_ne!(stateful_reject, post_reject);
+        assert_ne!(stateful_reject, ihave_reject);
+        assert_ne!(post_reject, ihave_reject);
     }
 
     #[test]
@@ -463,7 +574,7 @@ mod tests {
         // "The command is not presently implemented by the server, although
         //  it may be implemented in the future."
 
-        // Stateful commands in stateless mode
+        // Stateful commands in stateless mode use 502
         let CommandAction::Reject(response) = CommandHandler::classify("GROUP alt.test") else {
             panic!("Expected Reject");
         };
@@ -472,13 +583,22 @@ mod tests {
             "Stateful commands should return 502, got: {response}"
         );
 
-        // Non-routable commands in routing mode
+        // POST uses 440 per RFC 3977 §6.3.1 (posting not permitted)
         let CommandAction::Reject(response) = CommandHandler::classify("POST") else {
             panic!("Expected Reject");
         };
         assert!(
+            response.starts_with("440 "),
+            "POST must return 440 (posting not permitted), got: {response}"
+        );
+
+        // IHAVE uses 502 (transit command not implemented)
+        let CommandAction::Reject(response) = CommandHandler::classify("IHAVE <x@y>") else {
+            panic!("Expected Reject");
+        };
+        assert!(
             response.starts_with("502 "),
-            "Non-routable commands should return 502, got: {response}"
+            "IHAVE should return 502, got: {response}"
         );
     }
 
@@ -494,12 +614,12 @@ mod tests {
             "Should explain stateless mode restriction: {stateful}"
         );
 
-        let CommandAction::Reject(routing) = CommandHandler::classify("POST") else {
+        let CommandAction::Reject(post) = CommandHandler::classify("POST") else {
             panic!("Expected Reject");
         };
         assert!(
-            routing.to_lowercase().contains("routing") || routing.to_lowercase().contains("mode"),
-            "Should explain routing mode restriction: {routing}"
+            post.to_lowercase().contains("posting") || post.to_lowercase().contains("permitted"),
+            "POST rejection should mention posting or permitted: {post}"
         );
     }
 }

@@ -266,11 +266,7 @@ impl ArticleCount {
     /// Calculate average bytes per article
     #[must_use]
     pub const fn average_bytes(self, total_bytes: u64) -> Option<u64> {
-        if self.0 > 0 {
-            Some(total_bytes / self.0)
-        } else {
-            None
-        }
+        total_bytes.checked_div(self.0)
     }
 }
 

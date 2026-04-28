@@ -2,6 +2,7 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
+use crate::command::classifier::NntpCommand;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -106,9 +107,24 @@ impl ClientSession {
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
-                                // Hot path: forward directly
-                                backend_write.write_all(line.as_bytes()).await?;
-                                state.add_client_to_backend(line.len());
+                                // RFC 4643 §2.2: After successful authentication, reject any
+                                // further AUTHINFO commands with 502 — but only when auth is
+                                // enabled. When auth is disabled skip_auth_check is true from
+                                // the start, and AUTHINFO should be forwarded to the backend.
+                                if self.auth_handler.is_enabled()
+                                    && NntpCommand::parse(line.trim()).is_authinfo()
+                                {
+                                    use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
+                                    client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
+                                    client_write.flush().await?;
+                                    state.add_backend_to_client(
+                                        AUTH_ALREADY_AUTHENTICATED.len() as u64,
+                                    );
+                                } else {
+                                    // Hot path: forward directly
+                                    backend_write.write_all(line.as_bytes()).await?;
+                                    state.add_client_to_backend(line.len());
+                                }
                             } else {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(

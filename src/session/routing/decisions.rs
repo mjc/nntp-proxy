@@ -11,6 +11,8 @@ use crate::config::RoutingMode;
 pub enum CommandRoutingDecision {
     /// Intercept and handle authentication locally
     InterceptAuth,
+    /// Return a synthetic proxy-accurate CAPABILITIES list
+    InterceptCapabilities,
     /// Forward command to backend (authenticated or auth disabled)
     Forward,
     /// Require authentication first
@@ -39,7 +41,7 @@ pub fn decide_command_routing(
     auth_enabled: bool,
     routing_mode: RoutingMode,
 ) -> CommandRoutingDecision {
-    use CommandAction::{ForwardStateless, InterceptAuth, Reject};
+    use CommandAction::{ForwardStateless, InterceptAuth, InterceptCapabilities, Reject};
 
     // Classify the command
     let action = CommandHandler::classify(command);
@@ -47,6 +49,10 @@ pub fn decide_command_routing(
     match action {
         // Auth commands - ALWAYS intercept
         InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
+
+        // CAPABILITIES - ALWAYS intercept to return proxy-accurate list
+        // Per RFC 4643 §3.1, CAPABILITIES must be accessible before authentication.
+        InterceptCapabilities => CommandRoutingDecision::InterceptCapabilities,
 
         // Stateless commands
         ForwardStateless => {
@@ -151,6 +157,32 @@ mod tests {
         assert_eq!(
             decide_command_routing("POST", true, false, RoutingMode::Stateful),
             CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_capabilities_always_intercepted() {
+        // RFC 4643 §3.1: CAPABILITIES must be accessible before authentication,
+        // so it must always be intercepted regardless of auth state or routing mode.
+        assert_eq!(
+            decide_command_routing("CAPABILITIES", false, true, RoutingMode::PerCommand),
+            CommandRoutingDecision::InterceptCapabilities,
+            "CAPABILITIES should be intercepted even when auth required"
+        );
+        assert_eq!(
+            decide_command_routing("CAPABILITIES", true, true, RoutingMode::PerCommand),
+            CommandRoutingDecision::InterceptCapabilities,
+            "CAPABILITIES should be intercepted when authenticated"
+        );
+        assert_eq!(
+            decide_command_routing("CAPABILITIES", false, false, RoutingMode::Hybrid),
+            CommandRoutingDecision::InterceptCapabilities,
+            "CAPABILITIES should be intercepted in hybrid mode"
+        );
+        assert_eq!(
+            decide_command_routing("CAPABILITIES", true, false, RoutingMode::Stateful),
+            CommandRoutingDecision::InterceptCapabilities,
+            "CAPABILITIES should be intercepted in stateful mode"
         );
     }
 

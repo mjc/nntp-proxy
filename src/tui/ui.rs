@@ -213,7 +213,10 @@ fn create_app_summary(
 
     /// Color for buffer pool utilization
     const fn buffer_color(in_use: usize, total: usize) -> Color {
-        let percent = if total > 0 { (in_use * 100) / total } else { 0 };
+        let percent = match (in_use * 100).checked_div(total) {
+            Some(v) => v,
+            None => 0,
+        };
         if percent > 80 {
             Color::Red
         } else if percent > 60 {

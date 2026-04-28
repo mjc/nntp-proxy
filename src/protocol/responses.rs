@@ -26,6 +26,24 @@ pub const AUTH_FAILED: &[u8] = b"481 Authentication failed\r\n";
 /// Authentication required for this command (480)
 pub const AUTH_REQUIRED_FOR_COMMAND: &[u8] = b"480 Authentication required\r\n";
 
+/// Authentication commands issued out of sequence (482)
+///
+/// Per [RFC 4643 §2.3.2](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.2),
+/// AUTHINFO PASS without a prior AUTHINFO USER must return 482.
+pub const AUTH_OUT_OF_SEQUENCE: &[u8] = b"482 Authentication commands issued out of sequence\r\n";
+
+/// Already authenticated (502)
+///
+/// Per [RFC 4643 §2.2](https://datatracker.ietf.org/doc/html/rfc4643#section-2.2),
+/// any AUTHINFO command after successful authentication must return 502.
+pub const AUTH_ALREADY_AUTHENTICATED: &[u8] = b"502 Already authenticated\r\n";
+
+/// Unrecognized AUTHINFO subcommand (501)
+///
+/// Per [RFC 4643 §2.3.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.1),
+/// AUTHINFO with a subcommand the server does not support must return 501.
+pub const AUTH_UNKNOWN_SUBCOMMAND: &[u8] = b"501 Syntax error in command\r\n";
+
 // Standard responses
 
 /// Proxy greeting for per-command routing mode (200)
@@ -39,8 +57,11 @@ pub const GOODBYE: &[u8] = b"205 Goodbye\r\n";
 
 // Error responses
 
-/// Command not supported response (500)
-pub const COMMAND_NOT_SUPPORTED: &[u8] = b"500 Command not supported by this proxy\r\n";
+/// Posting not permitted (440)
+///
+/// Per [RFC 3977 §6.3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.1),
+/// servers that do not permit posting MUST return 440.
+pub const POSTING_NOT_PERMITTED: &[u8] = b"440 Posting not permitted\r\n";
 
 /// Backend error response (503)
 pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
@@ -51,9 +72,21 @@ pub const BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
 /// No such article response (430)
 pub const NO_SUCH_ARTICLE: &[u8] = b"430 No such article\r\n";
 
-/// Command not supported in stateless proxy mode (500)
-pub const COMMAND_NOT_SUPPORTED_STATELESS: &[u8] =
-    b"500 Command not supported by this proxy (stateless proxy mode)\r\n";
+// Capabilities responses (RFC 3977 §5.2 + RFC 4643 §3.2)
+
+/// Synthetic CAPABILITIES response without AUTHINFO (authenticated or auth disabled)
+///
+/// Per [RFC 4643 §3.2](https://datatracker.ietf.org/doc/html/rfc4643#section-3.2),
+/// AUTHINFO MUST NOT be advertised after successful authentication.
+pub const CAPABILITIES_WITHOUT_AUTHINFO: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nOVER\r\nHDR\r\n.\r\n";
+
+/// Synthetic CAPABILITIES response with AUTHINFO (auth required, not yet authenticated)
+///
+/// Per [RFC 4643 §3.2](https://datatracker.ietf.org/doc/html/rfc4643#section-3.2),
+/// AUTHINFO SHOULD be advertised before authentication when the server provides it.
+pub const CAPABILITIES_WITH_AUTHINFO: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER PASS\r\nOVER\r\nHDR\r\n.\r\n";
 
 // Response construction helpers
 
@@ -178,10 +211,28 @@ mod tests {
 
     #[test]
     fn test_error_constants() {
-        assert!(COMMAND_NOT_SUPPORTED.starts_with(b"500"));
+        assert!(POSTING_NOT_PERMITTED.starts_with(b"440"));
         assert!(BACKEND_ERROR.starts_with(b"503"));
         assert!(BACKEND_UNAVAILABLE.starts_with(b"400"));
-        assert!(COMMAND_NOT_SUPPORTED_STATELESS.starts_with(b"500"));
+    }
+
+    #[test]
+    fn test_capabilities_constants() {
+        assert!(CAPABILITIES_WITHOUT_AUTHINFO.starts_with(b"101"));
+        assert!(CAPABILITIES_WITH_AUTHINFO.starts_with(b"101"));
+        // AUTHINFO present only in the pre-auth variant
+        assert!(
+            CAPABILITIES_WITH_AUTHINFO
+                .windows(8)
+                .any(|w| w == b"AUTHINFO")
+        );
+        assert!(
+            !CAPABILITIES_WITHOUT_AUTHINFO
+                .windows(8)
+                .any(|w| w == b"AUTHINFO")
+        );
+        assert!(CAPABILITIES_WITH_AUTHINFO.ends_with(b".\r\n"));
+        assert!(CAPABILITIES_WITHOUT_AUTHINFO.ends_with(b".\r\n"));
     }
 
     #[test]
@@ -193,9 +244,8 @@ mod tests {
         assert!(PROXY_GREETING_PCR.ends_with(CRLF));
         assert!(CONNECTION_CLOSING.ends_with(CRLF));
         assert!(GOODBYE.ends_with(CRLF));
-        assert!(COMMAND_NOT_SUPPORTED.ends_with(CRLF));
+        assert!(POSTING_NOT_PERMITTED.ends_with(CRLF));
         assert!(BACKEND_ERROR.ends_with(CRLF));
         assert!(BACKEND_UNAVAILABLE.ends_with(CRLF));
-        assert!(COMMAND_NOT_SUPPORTED_STATELESS.ends_with(CRLF));
     }
 }

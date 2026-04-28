@@ -234,7 +234,7 @@ fn test_classify_stateless_commands() {
     assert!(matches!(NntpCommand::parse("HELP"), NntpCommand::Stateless));
     assert!(matches!(
         NntpCommand::parse("CAPABILITIES"),
-        NntpCommand::Stateless
+        NntpCommand::Capabilities
     ));
 }
 
@@ -254,10 +254,8 @@ fn test_classify_stateful_commands() {
 
 #[test]
 fn test_classify_non_routable_commands() {
-    assert!(matches!(
-        NntpCommand::parse("POST"),
-        NntpCommand::NonRoutable
-    ));
+    // POST — RFC 3977 §6.3.1: posting not permitted → dedicated Post variant
+    assert!(matches!(NntpCommand::parse("POST"), NntpCommand::Post));
     assert!(matches!(
         NntpCommand::parse("IHAVE <msgid@example>"),
         NntpCommand::NonRoutable
@@ -324,10 +322,8 @@ fn test_classify_case_insensitive_stateful() {
 
 #[test]
 fn test_classify_case_insensitive_non_routable() {
-    assert!(matches!(
-        NntpCommand::parse("post"),
-        NntpCommand::NonRoutable
-    ));
+    // POST — RFC 3977 §6.3.1: dedicated Post variant, case-insensitive
+    assert!(matches!(NntpCommand::parse("post"), NntpCommand::Post));
     assert!(matches!(
         NntpCommand::parse("ihave <msgid@example>"),
         NntpCommand::NonRoutable

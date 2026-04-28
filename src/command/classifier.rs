@@ -245,7 +245,7 @@ command_cases!(
     "NEXT",
     "next",
     "Next",
-    "[RFC 3977 §6.1.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.3) - NEXT command\n\
+    "[RFC 3977 §6.1.4](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.4) - NEXT command\n\
      Advance to next article in current group"
 );
 
@@ -254,7 +254,7 @@ command_cases!(
     "LAST",
     "last",
     "Last",
-    "[RFC 3977 §6.1.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.2) - LAST command\n\
+    "[RFC 3977 §6.1.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1.3) - LAST command\n\
      Move to previous article in current group"
 );
 
@@ -477,15 +477,30 @@ pub enum NntpCommand {
     /// [RFC 4643 §2.3.2](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.2)
     AuthPass,
 
+    /// Authentication: AUTHINFO with an unrecognized subcommand
+    ///
+    /// Per [RFC 4643 §2.3.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3.1),
+    /// unrecognized AUTHINFO subcommands must return 501 (syntax error).
+    AuthUnknown,
+
     /// Commands requiring GROUP context: article-by-number, NEXT, LAST, XOVER, etc.
     /// [RFC 3977 §6.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.1)
     Stateful,
 
-    /// Commands that cannot work with multiplexing: POST, IHAVE
-    /// [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
+    /// Posting not permitted by this proxy.
+    /// [RFC 3977 §6.3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.1)
+    Post,
+
+    /// Commands that cannot work with multiplexing: IHAVE
+    /// [RFC 3977 §6.3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.2)
     NonRoutable,
 
-    /// Safe to proxy without state: LIST, DATE, CAPABILITIES, HELP, QUIT, etc.
+    /// Intercepted by proxy: returns a synthetic proxy-accurate capability list.
+    /// [RFC 3977 §5.2](https://datatracker.ietf.org/doc/html/rfc3977#section-5.2)
+    /// [RFC 4643 §3.1](https://datatracker.ietf.org/doc/html/rfc4643#section-3.1)
+    Capabilities,
+
+    /// Safe to proxy without state: LIST, DATE, HELP, QUIT, etc.
     /// [RFC 3977 §7](https://datatracker.ietf.org/doc/html/rfc3977#section-7)
     Stateless,
 
@@ -568,7 +583,18 @@ impl NntpCommand {
         // Per [RFC 3977 §3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.1):
         // "Commands consist of a keyword possibly followed by arguments, separated by space"
         let cmd_end = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-        let cmd = &bytes[..cmd_end];
+
+        // RFC 3977 §3.1: commands are case-insensitive — normalize keyword to uppercase
+        // on a small stack buffer so mixed-case like "gRoUp" matches correctly.
+        // Max valid NNTP keyword is "CAPABILITIES" (12 bytes); 16 is safe headroom.
+        let mut cmd_upper_buf = [0u8; 16];
+        let cmd: &[u8] = if cmd_end <= 16 {
+            cmd_upper_buf[..cmd_end].copy_from_slice(&bytes[..cmd_end]);
+            cmd_upper_buf[..cmd_end].make_ascii_uppercase();
+            &cmd_upper_buf[..cmd_end]
+        } else {
+            &bytes[..cmd_end] // Longer than any valid NNTP keyword; falls through to Stateless
+        };
 
         // Article retrieval commands WITHOUT message-ID (by number or current article)
         // These require GROUP context → Stateful
@@ -599,12 +625,19 @@ impl NntpCommand {
         // These don't require or modify session state
         if matches_any(cmd, LIST_CASES)
             || matches_any(cmd, DATE_CASES)
-            || matches_any(cmd, CAPABILITIES_CASES)
             || matches_any(cmd, MODE_CASES)
             || matches_any(cmd, HELP_CASES)
             || matches_any(cmd, QUIT_CASES)
         {
             return Self::Stateless;
+        }
+
+        // CAPABILITIES - intercepted by proxy; never forwarded to backend
+        // Per [RFC 3977 §5.2](https://datatracker.ietf.org/doc/html/rfc3977#section-5.2) +
+        // [RFC 4643 §3.1](https://datatracker.ietf.org/doc/html/rfc4643#section-3.1):
+        // response must reflect the proxy's own capabilities, not the backend's.
+        if matches_any(cmd, CAPABILITIES_CASES) {
+            return Self::Capabilities;
         }
 
         // Header/overview retrieval (~5% of traffic) → Stateful
@@ -628,10 +661,17 @@ impl NntpCommand {
             return Self::Stateful;
         }
 
-        // Posting/transit commands (very rare in typical proxy usage) → NonRoutable
-        // Cannot be safely multiplexed or require special handling
-        // [RFC 3977 §6.3](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3)
-        if matches_any(cmd, POST_CASES) || matches_any(cmd, IHAVE_CASES) {
+        // POST - posting not permitted (very rare in typical proxy usage)
+        // Per [RFC 3977 §6.3.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.1):
+        // servers that do not permit posting MUST return 440 (not 502).
+        if matches_any(cmd, POST_CASES) {
+            return Self::Post;
+        }
+
+        // IHAVE - transit posting command → NonRoutable
+        // Cannot be safely multiplexed; requires special peering handling
+        // [RFC 3977 §6.3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-6.3.2)
+        if matches_any(cmd, IHAVE_CASES) {
             return Self::NonRoutable;
         }
 
@@ -666,12 +706,23 @@ impl NntpCommand {
             return Self::Stateless; // AUTHINFO with short args
         }
 
-        // Check first 4 bytes of argument
-        match &args[..4] {
-            b"USER" | b"user" | b"User" => Self::AuthUser,
-            b"PASS" | b"pass" | b"Pass" => Self::AuthPass,
-            _ => Self::Stateless, // AUTHINFO with other args
+        // Check first 4 bytes of argument — normalize to uppercase for case-insensitivity
+        let mut sub = [0u8; 4];
+        sub.copy_from_slice(&args[..4]);
+        sub.make_ascii_uppercase();
+        match &sub {
+            b"USER" => Self::AuthUser,
+            b"PASS" => Self::AuthPass,
+            // RFC 4643 §2.3.1: unrecognized subcommands must be rejected with 501
+            _ => Self::AuthUnknown,
         }
+    }
+
+    /// Returns true if this is any AUTHINFO variant (USER, PASS, or unknown subcommand)
+    #[inline]
+    #[must_use]
+    pub fn is_authinfo(self) -> bool {
+        matches!(self, Self::AuthUser | Self::AuthPass | Self::AuthUnknown)
     }
 }
 
@@ -731,7 +782,10 @@ mod tests {
         assert_eq!(NntpCommand::parse("HELP"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("LIST"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("DATE"), NntpCommand::Stateless);
-        assert_eq!(NntpCommand::parse("CAPABILITIES"), NntpCommand::Stateless);
+        assert_eq!(
+            NntpCommand::parse("CAPABILITIES"),
+            NntpCommand::Capabilities
+        );
         assert_eq!(NntpCommand::parse("QUIT"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("LIST ACTIVE"), NntpCommand::Stateless);
         assert_eq!(
@@ -768,10 +822,10 @@ mod tests {
         // AUTHINFO without USER or PASS
         assert_eq!(NntpCommand::parse("AUTHINFO"), NntpCommand::Stateless);
 
-        // AUTHINFO with unknown subcommand
+        // AUTHINFO with unknown subcommand must now return AuthUnknown (RFC 4643 §2.3.1)
         assert_eq!(
             NntpCommand::parse("AUTHINFO INVALID"),
-            NntpCommand::Stateless
+            NntpCommand::AuthUnknown
         );
 
         // AUTHINFO USER without username
@@ -909,10 +963,10 @@ mod tests {
 
     #[test]
     fn test_non_routable_commands() {
-        // POST command - cannot be routed per-command
-        assert_eq!(NntpCommand::parse("POST"), NntpCommand::NonRoutable);
+        // POST — RFC 3977 §6.3.1: posting not permitted → dedicated Post variant
+        assert_eq!(NntpCommand::parse("POST"), NntpCommand::Post);
 
-        // IHAVE command - cannot be routed per-command
+        // IHAVE command - transit posting, cannot be routed per-command
         assert_eq!(
             NntpCommand::parse("IHAVE <test@example.com>"),
             NntpCommand::NonRoutable
@@ -944,12 +998,11 @@ mod tests {
 
     #[test]
     fn test_non_routable_case_insensitive() {
-        assert_eq!(NntpCommand::parse("post"), NntpCommand::NonRoutable);
-
-        assert_eq!(NntpCommand::parse("Post"), NntpCommand::NonRoutable);
+        // POST — RFC 3977 §6.3.1: dedicated Post variant, case-insensitive
+        assert_eq!(NntpCommand::parse("post"), NntpCommand::Post);
+        assert_eq!(NntpCommand::parse("Post"), NntpCommand::Post);
 
         assert_eq!(NntpCommand::parse("IHAVE <msg>"), NntpCommand::NonRoutable);
-
         assert_eq!(NntpCommand::parse("ihave <msg>"), NntpCommand::NonRoutable);
     }
 
@@ -983,6 +1036,7 @@ mod tests {
 
         // NonRoutable commands are NOT pipelineable
         assert!(!NntpCommand::NonRoutable.is_pipelineable());
+        assert!(!NntpCommand::Post.is_pipelineable());
         assert!(!NntpCommand::parse("POST").is_pipelineable());
         assert!(!NntpCommand::parse("IHAVE <msg>").is_pipelineable());
     }
@@ -1104,6 +1158,51 @@ mod tests {
         assert!(!NntpCommand::parse("ihave <test@test.com>").is_stateful());
     }
 
+    /// Bug 1 regression test: RFC 3977 §3.2 — commands MUST be recognized case-insensitively.
+    ///
+    /// Before fix: arbitrary mixed-case commands like "gRoUp" fell through to `Stateless`
+    /// because the three pre-computed case variants (UPPER/lower/Title) didn't cover them.
+    #[test]
+    fn test_mixed_case_commands_classified_correctly() {
+        // Stateful commands in arbitrary mixed case must still be Stateful
+        assert_eq!(
+            NntpCommand::parse("gRoUp alt.test"),
+            NntpCommand::Stateful,
+            "gRoUp must classify as Stateful (RFC 3977 §3.2)"
+        );
+        assert_eq!(NntpCommand::parse("nExT"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("lAsT"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("xOver 1-100"), NntpCommand::Stateful);
+        assert_eq!(NntpCommand::parse("oVeR 1-100"), NntpCommand::Stateful);
+        assert_eq!(
+            NntpCommand::parse("lIsTgRoUp alt.test"),
+            NntpCommand::Stateful
+        );
+        assert_eq!(NntpCommand::parse("aRtIcLe 123"), NntpCommand::Stateful);
+
+        // NonRoutable commands in mixed case
+        assert_eq!(
+            NntpCommand::parse("pOsT"),
+            NntpCommand::Post,
+            "pOsT must classify as Post (RFC 3977 §6.3.1)"
+        );
+        assert_eq!(
+            NntpCommand::parse("iHaVe <test@example.com>"),
+            NntpCommand::NonRoutable
+        );
+
+        // Auth commands in mixed case
+        assert_eq!(
+            NntpCommand::parse("aUtHiNfO uSeR testuser"),
+            NntpCommand::AuthUser,
+            "aUtHiNfO uSeR must classify as AuthUser (RFC 4643 §2.3.1)"
+        );
+        assert_eq!(
+            NntpCommand::parse("Authinfo Pass testpass"),
+            NntpCommand::AuthPass
+        );
+    }
+
     #[test]
     fn test_edge_cases_for_stateful_detection() {
         // Empty article number should still be stateful (current article)
@@ -1117,10 +1216,11 @@ mod tests {
         assert!(NntpCommand::parse("XOVER   1-100").is_stateful());
         assert!(!NntpCommand::parse("LIST  ACTIVE").is_stateful());
 
-        // Mixed case commands - classifier may not support all permutations
-        // Only test the explicitly supported case variants
+        // Mixed case commands — all permutations must work (RFC 3977 §3.2)
         assert!(NntpCommand::parse("Group alt.test").is_stateful());
+        assert!(NntpCommand::parse("gRoUp alt.test").is_stateful());
         assert!(NntpCommand::parse("Xover 1-100").is_stateful());
+        assert!(NntpCommand::parse("xOver 1-100").is_stateful());
         assert!(!NntpCommand::parse("List").is_stateful());
 
         // Article commands - distinguish by argument format

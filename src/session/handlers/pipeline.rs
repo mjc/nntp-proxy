@@ -29,6 +29,9 @@ pub(super) struct CommandBatch {
     trailing_range: Option<(usize, usize)>,
     /// True if the trailing command exceeded the 512-byte RFC 3977 limit
     trailing_oversized: bool,
+    /// True if the first (blocking) command exceeded the 512-byte RFC 3977 limit.
+    /// The batch is otherwise empty; caller must send 501 and continue.
+    first_oversized: bool,
 }
 
 impl CommandBatch {
@@ -58,6 +61,12 @@ impl CommandBatch {
     /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
     pub const fn is_trailing_oversized(&self) -> bool {
         self.trailing_oversized
+    }
+
+    /// Whether the *first* command (blocking read) exceeded the 512-byte limit.
+    /// When true, the batch is otherwise empty — caller should send 501 and continue.
+    pub const fn is_first_oversized(&self) -> bool {
+        self.first_oversized
     }
 
     /// Extract buffers for reuse in next batch (move out, leaving empty)
@@ -98,15 +107,19 @@ impl ClientSession {
                     offsets: smallvec::SmallVec::new(),
                     trailing_range: None,
                     trailing_oversized: false,
+                    first_oversized: false,
                 });
             }
             Ok(_) => {
-                // M4: Reject oversized commands (RFC 3977: 512 byte limit)
+                // RFC 3977 §3.1: 512-byte command limit — return 501 and keep session alive
                 if command_buf.len() > 512 {
-                    return Err(anyhow::anyhow!(
-                        "Command too long ({} bytes)",
-                        command_buf.len()
-                    ));
+                    return Ok(CommandBatch {
+                        buffer: String::new(),
+                        offsets: smallvec::SmallVec::new(),
+                        trailing_range: None,
+                        trailing_oversized: false,
+                        first_oversized: true,
+                    });
                 }
             }
             Err(e) => return Err(e.into()),
@@ -125,6 +138,7 @@ impl ClientSession {
                 offsets: smallvec::SmallVec::new(),
                 trailing_range,
                 trailing_oversized: false,
+                first_oversized: false,
             });
         }
 
@@ -176,6 +190,7 @@ impl ClientSession {
             offsets: std::mem::take(batch_offsets),
             trailing_range,
             trailing_oversized,
+            first_oversized: false,
         })
     }
 }

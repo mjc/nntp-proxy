@@ -1,7 +1,7 @@
 //! Client authentication handling
 
 use crate::command::AuthAction;
-use crate::protocol::{AUTH_ACCEPTED, AUTH_FAILED, AUTH_REQUIRED};
+use crate::protocol::{AUTH_ACCEPTED, AUTH_FAILED, AUTH_OUT_OF_SEQUENCE, AUTH_REQUIRED};
 use crate::types::{Password, Username, ValidationError};
 use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
@@ -112,11 +112,17 @@ impl AuthHandler {
                 Ok((AUTH_REQUIRED.len(), false))
             }
             AuthAction::ValidateAndRespond { password } => {
+                // RFC 4643 §2.3.2: AUTHINFO PASS without a prior AUTHINFO USER
+                // must return 482 (commands issued out of sequence).
+                if stored_username.is_none() {
+                    writer.write_all(AUTH_OUT_OF_SEQUENCE).await?;
+                    return Ok((AUTH_OUT_OF_SEQUENCE.len(), false));
+                }
+
                 // Validate credentials
                 let auth_success = if let Some(username) = stored_username {
                     self.validate_credentials(username, password)
                 } else {
-                    // No username was stored (client sent AUTHINFO PASS without USER)
                     false
                 };
 
@@ -127,6 +133,14 @@ impl AuthHandler {
                 };
                 writer.write_all(response).await?;
                 Ok((response.len(), auth_success))
+            }
+            AuthAction::UnknownSubcommand => {
+                // RFC 4643 §2.3.1: unrecognized AUTHINFO subcommands must return 501.
+                // Note: if the client is already authenticated, common::handle_auth_command
+                // returns 502 before reaching here.
+                use crate::protocol::AUTH_UNKNOWN_SUBCOMMAND;
+                writer.write_all(AUTH_UNKNOWN_SUBCOMMAND).await?;
+                Ok((AUTH_UNKNOWN_SUBCOMMAND.len(), false))
             }
         }
     }

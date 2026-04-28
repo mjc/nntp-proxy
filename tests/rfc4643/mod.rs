@@ -8,4 +8,5 @@ pub mod backend;
 pub mod bypass_prevention;
 pub mod integration;
 pub mod review_claims;
+pub mod rfc_compliance;
 pub mod security;

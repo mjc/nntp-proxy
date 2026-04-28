@@ -37,6 +37,15 @@ pub async fn handle_auth_command<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    // RFC 4643 §2.2: Once a client has successfully authenticated, any subsequent
+    // AUTHINFO command must be rejected with 502.
+    if auth_state.is_authenticated() {
+        use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
+        client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
+        let bytes = BackendToClientBytes::new(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+        return Ok(AuthResult::NotAuthenticated(bytes));
+    }
+
     if let AuthAction::RequestPassword(username) = auth_action {
         *auth_username = Some(username.to_string());
     }
@@ -258,6 +267,15 @@ where
             client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
             Ok(AuthHandlerResult::Rejected {
                 bytes_written: AUTH_REQUIRED_FOR_COMMAND.len() as u64,
+            })
+        }
+        CommandAction::InterceptCapabilities => {
+            // RFC 4643 §3.1: CAPABILITIES must be accessible before authentication.
+            // Auth is enabled and client is not yet authenticated → include AUTHINFO.
+            use crate::protocol::CAPABILITIES_WITH_AUTHINFO;
+            client_write.write_all(CAPABILITIES_WITH_AUTHINFO).await?;
+            Ok(AuthHandlerResult::Rejected {
+                bytes_written: CAPABILITIES_WITH_AUTHINFO.len() as u64,
             })
         }
         CommandAction::InterceptAuth(auth_action) => {

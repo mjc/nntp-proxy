@@ -183,6 +183,28 @@ impl ClientSession {
                     auth_succeeded: false,
                 })
             }
+
+            CommandRoutingDecision::InterceptCapabilities => {
+                debug!(
+                    "Client {} decision: InterceptCapabilities",
+                    self.client_addr
+                );
+                // Build a synthetic capability list that reflects the proxy's own capabilities.
+                // Per RFC 4643 §3.2: include AUTHINFO only when auth is required and not yet
+                // authenticated; omit it once the client is authenticated.
+                let capabilities = if skip_auth_check {
+                    // skip_auth_check == true means auth disabled OR already authenticated
+                    crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO
+                } else {
+                    // skip_auth_check == false means auth enabled AND not yet authenticated
+                    crate::protocol::CAPABILITIES_WITH_AUTHINFO
+                };
+                client_write.write_all(capabilities).await?;
+                *backend_to_client_bytes = backend_to_client_bytes.add(capabilities.len());
+                Ok(CommandResult::Continue {
+                    auth_succeeded: false,
+                })
+            }
         }
     }
 
@@ -313,6 +335,19 @@ impl ClientSession {
                 }
             };
 
+            // RFC 3977 §3.2.1: oversized first command → 501 Syntax Error, keep session alive
+            if batch.is_first_oversized() {
+                warn!(
+                    "Client {} sent oversized first command, rejecting with 501",
+                    self.client_addr
+                );
+                client_write
+                    .write_all(b"501 Command too long\r\n")
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                continue;
+            }
+
             if batch.is_empty() {
                 debug!("Client {} disconnected", self.client_addr);
                 break;
@@ -432,7 +467,7 @@ impl ClientSession {
                         trailing_cmd.len()
                     );
                     client_write
-                        .write_all(b"500 Command too long\r\n")
+                        .write_all(b"501 Command too long\r\n")
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     continue;
