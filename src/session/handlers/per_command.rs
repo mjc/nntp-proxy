@@ -301,8 +301,8 @@ impl ClientSession {
         let mut batch_offsets: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
 
         // Pipelining buffers reused across batch_execute_articles calls
-        let mut batch_leftover = self.buffer_pool.acquire().await;
-        let mut batch_chunk_data = self.buffer_pool.acquire().await;
+        let mut batch_leftover = self.buffer_pool.acquire_capture().await;
+        let mut batch_chunk_data = self.buffer_pool.acquire_capture().await;
 
         // Process commands in batches (single commands fall through with zero overhead)
         'command_batch_loop: loop {
