@@ -10,3 +10,4 @@ pub mod errors;
 pub mod multiline;
 pub mod response;
 pub mod session;
+pub mod session_state;

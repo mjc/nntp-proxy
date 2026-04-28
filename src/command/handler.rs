@@ -523,11 +523,12 @@ mod tests {
         // Must end with CRLF
         assert!(response.ends_with("\r\n"), "Response must end with CRLF");
 
-        // Status code must be 502 (Command not implemented)
-        // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
+        // Status code must be 503 (Feature not supported)
+        // RFC 3977 §3.2.1: 503 = "Feature not supported" is correct for commands the
+        // proxy structurally cannot support (e.g. stateful commands in per-command mode)
         assert!(
-            response.starts_with("502 "),
-            "Expected 502 status code, got: {response}"
+            response.starts_with("503 "),
+            "Expected 503 status code, got: {response}"
         );
     }
 
