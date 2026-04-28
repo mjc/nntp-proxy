@@ -566,38 +566,22 @@ impl HybridCacheStats {
     }
 }
 
-/// Create a memory-only hybrid cache (for testing without disk I/O)
-///
-/// This uses foyer's Noop device to avoid any disk setup, making tests fast
-/// and avoiding `io_uring` initialization issues.
 #[cfg(test)]
 impl HybridArticleCache {
-    /// Create a memory-only cache for testing
+    /// Create a memory-only cache for testing.
     ///
-    /// Uses a very small noop device to minimize initialization time.
+    /// Uses `NoopIoEngineConfig` without a block engine config so foyer falls back
+    /// to `NoopEngineConfig` — a trivially synchronous engine that spawns zero
+    /// background tasks. Safe with any tokio runtime flavor.
     pub async fn new_memory_only(memory_capacity: u64) -> anyhow::Result<Self> {
-        use foyer::{NoopDeviceBuilder, NoopIoEngineConfig};
+        use foyer::NoopIoEngineConfig;
 
         let memory_capacity_usize: usize = memory_capacity
             .try_into()
             .map_err(|_| anyhow::anyhow!("Memory capacity too large for platform"))?;
 
-        // Create minimal noop device - 64KB is minimum for block engine
-        let device = NoopDeviceBuilder::new(64 * 1024).build()?;
-
-        // Foyer spawns internal background tasks (flushers, reclaimers) that must run on
-        // their own dedicated runtime.  Without this, tests using #[tokio::test] (which
-        // creates a single-threaded runtime) deadlock: the test runtime waits on
-        // cache.close(), which tries to join the background tasks, but those tasks are
-        // also scheduled on the same single-threaded runtime and can never make progress.
-        // The production code uses the same pattern (see HybridArticleCache::new).
-        let foyer_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("foyer-test-io")
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create foyer test runtime: {e}"))?;
-
+        // NoopIoEngineConfig + no with_engine_config() call → foyer uses NoopEngineConfig,
+        // which is completely synchronous and never spawns background flusher/reclaimer tasks.
         let builder = HybridCacheBuilder::new()
             .with_name("nntp-article-cache-test")
             .with_policy(HybridCachePolicy::WriteOnEviction)
@@ -608,10 +592,7 @@ impl HybridArticleCache {
             })
             .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
             .storage()
-            .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>)
-            .with_engine_config(BlockEngineConfig::new(device))
-            .with_recover_mode(RecoverMode::Quiet)
-            .with_spawner(Spawner::from(foyer_runtime));
+            .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>);
 
         let cache = builder.build().await?;
 
@@ -636,30 +617,13 @@ impl HybridArticleCache {
     }
 }
 
-// NOTE: These tests are disabled because foyer's HybridCache requires special runtime setup
-// that conflicts with nextest's test isolation. They hang indefinitely even with noop devices.
-// To test foyer integration, use the nntp-hybrid-cache-proxy binary directly.
-//
-// The issue is likely that foyer spawns internal background tasks that don't complete
-// in the test context. This is a known pattern with async caches that need cleanup.
-//
-// Run manual tests with:
-//   cargo test --features hybrid-cache cache::hybrid -- --ignored
 #[cfg(test)]
 mod tests {
     //! Cache-level integration tests for `HybridArticleCache`
     //!
-    //! NOTE: These tests are marked as #[ignore] due to foyer runtime issues in test context.
-    //! Entry-level tests (`HybridArticleEntry`, `CacheableStatusCode`, Code encode/decode)
-    //! are in the `hybrid_codec` module.
-    //!
-    //! To run these ignored tests manually:
-    //!   cargo test --package nntp-proxy --lib `cache::hybrid::tests` -- --ignored --nocapture
-
     use super::*;
 
     #[tokio::test]
-    #[ignore = "foyer HybridCache hangs in test context - run manually with --ignored"]
     async fn test_hybrid_cache_basic() {
         let cache = HybridArticleCache::new_memory_only(1024 * 1024)
             .await
@@ -687,7 +651,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "foyer HybridCache hangs in test context - run manually with --ignored"]
     async fn test_hybrid_cache_availability_tracking() {
         let cache = HybridArticleCache::new_memory_only(1024 * 1024)
             .await
