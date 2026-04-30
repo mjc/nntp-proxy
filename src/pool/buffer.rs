@@ -1,5 +1,6 @@
 use crate::types::BufferSize;
 use crossbeam::queue::SegQueue;
+use smallvec::SmallVec;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -337,12 +338,31 @@ impl ChunkedResponse {
         self.chunks.first().map(AsRef::as_ref)
     }
 
+    /// Iterate buffered chunks without flattening.
+    pub fn iter_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().map(AsRef::as_ref)
+    }
+
+    /// Copy up to `len` bytes from the front of the response into a small stack-backed buffer.
+    pub fn copy_prefix_into(&self, len: usize, out: &mut SmallVec<[u8; 128]>) {
+        out.clear();
+        let mut remaining = len.min(self.len);
+        for chunk in self.iter_chunks() {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(chunk.len());
+            out.extend_from_slice(&chunk[..take]);
+            remaining -= take;
+        }
+    }
+
     /// Copy the buffered response into a contiguous `Vec<u8>`.
     #[must_use]
     pub fn to_vec(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len);
-        for chunk in &self.chunks {
-            out.extend_from_slice(chunk.as_ref());
+        for chunk in self.iter_chunks() {
+            out.extend_from_slice(chunk);
         }
         out
     }
@@ -378,8 +398,22 @@ impl ChunkedResponse {
             return false;
         }
 
-        let tail = self.to_vec();
-        tail.ends_with(suffix)
+        let mut remaining = suffix.len();
+        for chunk in self.chunks.iter().rev() {
+            if remaining == 0 {
+                return true;
+            }
+            let data = chunk.as_ref();
+            let take = remaining.min(data.len());
+            let suffix_start = remaining - take;
+            let data_start = data.len() - take;
+            if data[data_start..] != suffix[suffix_start..remaining] {
+                return false;
+            }
+            remaining -= take;
+        }
+
+        remaining == 0
     }
 
     /// Write all buffered chunks to a sink in order.
@@ -387,8 +421,8 @@ impl ChunkedResponse {
     where
         W: AsyncWriteExt + Unpin,
     {
-        for chunk in &self.chunks {
-            writer.write_all(chunk.as_ref()).await?;
+        for chunk in self.iter_chunks() {
+            writer.write_all(chunk).await?;
         }
         Ok(())
     }
@@ -751,6 +785,34 @@ mod tests {
 
         let capture2 = pool.acquire_capture().await;
         assert_eq!(capture2.capacity(), 8192);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_helpers_without_flattening() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"220 0 <id>\r\nBody\r\n.\r\n");
+
+        let chunks: Vec<&[u8]> = response.iter_chunks().collect();
+        assert!(chunks.len() > 1, "test requires multi-chunk buffering");
+        assert_eq!(chunks.concat(), b"220 0 <id>\r\nBody\r\n.\r\n");
+        assert!(response.starts_with(b"220 0 "));
+        assert!(response.ends_with(b"\r\n.\r\n"));
+
+        let mut prefix = SmallVec::<[u8; 128]>::new();
+        response.copy_prefix_into(12, &mut prefix);
+        assert_eq!(&prefix[..], b"220 0 <id>\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_copy_prefix_clamps_to_length() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"430\r\n");
+
+        let mut prefix = SmallVec::<[u8; 128]>::new();
+        response.copy_prefix_into(64, &mut prefix);
+        assert_eq!(&prefix[..], b"430\r\n");
     }
 
     #[tokio::test]

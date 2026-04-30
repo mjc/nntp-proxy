@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-use crate::router::backend_queue::{BackendQueue, PipelineResponse, QueuedRequest};
+use crate::router::backend_queue::{BackendQueue, PipelineError, PipelineResponse, QueuedRequest};
 #[cfg(test)]
 use crate::session::backend::validate_backend_response;
 use crate::types::BackendId;
@@ -79,7 +79,7 @@ pub async fn backend_pipeline_worker(
                     backend_id, e
                 );
                 metrics.record_connection_failure(backend_id);
-                batch = fail_batch(batch, &format!("connection error: {e}"));
+                batch = fail_batch(batch, PipelineError::ConnectionAcquire);
                 continue;
             }
         };
@@ -139,8 +139,13 @@ async fn execute_pipeline_batch(
             );
             // We wrote commands 0..i successfully but can't read responses
             // because the connection is broken. Fail everything and return early.
-            let err_msg = format!("write failed at command {}/{}", i + 1, batch_len);
-            let batch = fail_batch(batch, &err_msg);
+            let batch = fail_batch(
+                batch,
+                PipelineError::WriteFailed {
+                    index: i + 1,
+                    batch_len,
+                },
+            );
             return (false, batch);
         }
     }
@@ -152,7 +157,7 @@ async fn execute_pipeline_batch(
             "Pipeline worker backend {:?}: flush failed: {}",
             backend_id, e
         );
-        let batch = fail_batch(batch, &format!("flush failed: {e}"));
+        let batch = fail_batch(batch, PipelineError::FlushFailed);
         return (false, batch);
     }
 
@@ -192,7 +197,7 @@ async fn execute_pipeline_batch(
                     backend = ?backend_id,
                     response_index = i + 1,
                     batch_size = batch_len,
-                    command = %req.command.trim(),
+                    command = %req.command.as_str().trim(),
                     error = %e,
                     leftover_bytes = conn.leftover_len(),
                     "Pipeline worker read failed"
@@ -201,14 +206,17 @@ async fn execute_pipeline_batch(
                 // Fail this request
                 let _ = req
                     .response_tx
-                    .send(PipelineResponse::Error(format!("read error: {e}")));
+                    .send(PipelineResponse::Error(PipelineError::ReadFailed));
 
                 // Fail remaining requests (no Vec allocation - iterate directly)
-                let error_msg = format!("connection lost after response {}/{}", i + 1, batch_len);
+                let error_msg = PipelineError::ConnectionLost {
+                    completed: i + 1,
+                    batch_len,
+                };
                 for (_, remaining_req) in batch_iter {
                     let _ = remaining_req
                         .response_tx
-                        .send(PipelineResponse::Error(error_msg.clone()));
+                        .send(PipelineResponse::Error(error_msg));
                 }
 
                 // Connection broken — return false immediately
@@ -268,11 +276,9 @@ async fn read_full_response(
 /// Takes ownership of the Vec, drains it, and returns the empty Vec
 /// so the caller can reuse the allocation.
 #[allow(clippy::iter_with_drain)] // drain used intentionally; empty Vec returned for allocation reuse
-fn fail_batch(mut batch: Vec<QueuedRequest>, error_msg: &str) -> Vec<QueuedRequest> {
+fn fail_batch(mut batch: Vec<QueuedRequest>, error: PipelineError) -> Vec<QueuedRequest> {
     for req in batch.drain(..) {
-        let _ = req
-            .response_tx
-            .send(PipelineResponse::Error(error_msg.to_string()));
+        let _ = req.response_tx.send(PipelineResponse::Error(error));
     }
     batch
 }
@@ -281,10 +287,34 @@ fn fail_batch(mut batch: Vec<QueuedRequest>, error_msg: &str) -> Vec<QueuedReque
 mod tests {
     use super::*;
     use crate::pool::BufferPool;
+    use crate::router::backend_queue::QueuedCommand;
     use crate::stream::ConnectionStream;
     use proptest::prelude::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn queued_request(
+        command: &str,
+    ) -> (
+        QueuedRequest,
+        tokio::sync::oneshot::Receiver<PipelineResponse>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            QueuedRequest {
+                command: QueuedCommand::from_command(command),
+                response_tx: tx,
+            },
+            rx,
+        )
+    }
+
+    fn expect_success_status(response: PipelineResponse) -> u16 {
+        match response {
+            PipelineResponse::Success { status_code, .. } => status_code.as_u16(),
+            other @ PipelineResponse::Error(_) => panic!("Expected Success, got {other:?}"),
+        }
+    }
 
     /// Helper: create a TCP pair where the server writes `data` then optionally closes.
     /// Returns a `ConnectionStream` connected to the mock server.
@@ -348,13 +378,10 @@ mod tests {
         let mut rxs = Vec::with_capacity(responses.len());
         let mut expected_command_bytes = 0usize;
         for idx in 0..responses.len() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
             let command = format!("STAT <msg{idx}@example.com>\r\n");
             expected_command_bytes += command.len();
-            batch.push(QueuedRequest {
-                command: Arc::from(command),
-                response_tx: tx,
-            });
+            let (request, rx) = queued_request(&command);
+            batch.push(request);
             rxs.push(rx);
         }
 
@@ -624,11 +651,8 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn: crate::stream::ConnectionStream = ConnectionStream::plain(stream);
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch = vec![QueuedRequest {
-            command: Arc::from("STAT <test@msg.id>\r\n"),
-            response_tx: tx,
-        }];
+        let (request, rx) = queued_request("STAT <test@msg.id>\r\n");
+        let batch = vec![request];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -643,12 +667,7 @@ mod tests {
         .await;
 
         assert!(success, "single 430 should not mark connection as broken");
-        match rx.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 430);
-            }
-            other @ PipelineResponse::Error(_) => panic!("Expected Success, got {other:?}"),
-        }
+        assert_eq!(expect_success_status(rx.await.unwrap()), 430);
     }
 
     #[tokio::test]
@@ -678,18 +697,9 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedRequest {
-                command: Arc::from("STAT <a@b>\r\n"),
-                response_tx: tx1,
-            },
-            QueuedRequest {
-                command: Arc::from("STAT <c@d>\r\n"),
-                response_tx: tx2,
-            },
-        ];
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -704,18 +714,8 @@ mod tests {
         .await;
         assert!(success);
 
-        match rx1.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 223);
-            }
-            other @ PipelineResponse::Error(_) => panic!("Expected 223 Success, got {other:?}"),
-        }
-        match rx2.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 430);
-            }
-            other @ PipelineResponse::Error(_) => panic!("Expected 430 Success, got {other:?}"),
-        }
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
     }
 
     #[tokio::test]
@@ -741,18 +741,9 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedRequest {
-                command: Arc::from("STAT <a@b>\r\n"),
-                response_tx: tx1,
-            },
-            QueuedRequest {
-                command: Arc::from("STAT <c@d>\r\n"),
-                response_tx: tx2,
-            },
-        ];
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -768,14 +759,7 @@ mod tests {
         assert!(!success, "server disconnect should mark connection broken");
 
         // First response should succeed
-        match rx1.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 223);
-            }
-            other @ PipelineResponse::Error(_) => {
-                panic!("Expected first to succeed, got {other:?}")
-            }
-        }
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
         // Second response should be error
         match rx2.await.unwrap() {
             PipelineResponse::Error(_) => {} // Expected
@@ -810,18 +794,9 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedRequest {
-                command: Arc::from("STAT <a@b>\r\n"),
-                response_tx: tx1,
-            },
-            QueuedRequest {
-                command: Arc::from("STAT <c@d>\r\n"),
-                response_tx: tx2,
-            },
-        ];
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -844,18 +819,30 @@ mod tests {
             "unexpected extra response bytes should remain buffered until the connection is retired"
         );
 
-        match rx1.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 223);
-            }
-            other => panic!("Expected 223 Success, got {other:?}"),
-        }
-        match rx2.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 430);
-            }
-            other => panic!("Expected 430 Success, got {other:?}"),
-        }
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
+    }
+
+    #[test]
+    fn test_fail_batch_sends_same_error_to_all_requests() {
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let error = PipelineError::ConnectionLost {
+            completed: 1,
+            batch_len: 2,
+        };
+
+        let reused = fail_batch(vec![req1, req2], error);
+
+        assert!(
+            reused.is_empty(),
+            "drained batch should be returned empty for reuse"
+        );
+        [rx1.blocking_recv().unwrap(), rx2.blocking_recv().unwrap()]
+            .into_iter()
+            .for_each(|response| {
+                assert!(matches!(response, PipelineResponse::Error(e) if e == error))
+            });
     }
 
     proptest! {

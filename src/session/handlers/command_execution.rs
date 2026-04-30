@@ -370,8 +370,9 @@ impl ClientSession {
                         captured.len()
                     );
                 }
-                self.maybe_cache_upsert_owned(params.msg_id, captured.to_vec(), ctx.backend_id);
-                Ok(captured.len() as u64)
+                let captured_len = captured.len();
+                self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+                Ok(captured_len as u64)
             }
             (true, CacheAction::TrackAvailability) => {
                 let captured =
@@ -385,8 +386,8 @@ impl ClientSession {
                 // Extract first status line (~30-80 bytes) instead of copying
                 // full response. The cache only needs the status
                 // code to build an availability stub.
-                let stub = crate::cache::extract_status_line(captured.first_chunk().unwrap_or(&[]));
-                self.maybe_cache_upsert(params.msg_id, &stub, ctx.backend_id);
+                let stub = crate::cache::extract_chunked_status_line(&captured);
+                self.maybe_cache_upsert_buffer(params.msg_id, stub.into(), ctx.backend_id);
                 Ok(captured.len() as u64)
             }
             (true, _) => {
@@ -464,17 +465,16 @@ impl ClientSession {
             self.spawn_cache_upsert(msg_id_ref, data, backend_id, tier);
         }
     }
-
     #[inline]
-    fn maybe_cache_upsert_owned(
+    fn maybe_cache_upsert_buffer(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        data: Vec<u8>,
+        data: crate::cache::CacheBuffer,
         backend_id: BackendId,
     ) {
         if let Some(msg_id_ref) = msg_id {
             let tier = self.tier_for_backend(backend_id);
-            self.spawn_cache_upsert_owned(msg_id_ref, data, backend_id, tier);
+            self.spawn_cache_upsert_buffer(msg_id_ref, data, backend_id, tier);
         }
     }
 

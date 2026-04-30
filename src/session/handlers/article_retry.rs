@@ -3,7 +3,7 @@
 //! Handles routing article commands across backends, using `ArticleAvailability`
 //! to skip backends that have already returned 430 for a given article.
 
-use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
+use crate::router::backend_queue::{PipelineResponse, QueuedCommand, QueuedRequest};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::SessionError;
@@ -615,7 +615,7 @@ impl ClientSession {
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let request = QueuedRequest {
-                    command: std::sync::Arc::from(command),
+                    command: QueuedCommand::from_command(command),
                     response_tx: tx,
                 };
 
