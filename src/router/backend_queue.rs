@@ -21,7 +21,7 @@ pub enum PipelineResponse {
     /// Command executed successfully; `data` is the complete response bytes
     Success {
         /// Complete response data (status line + multiline body if applicable)
-        data: crate::pool::PooledBuffer,
+        data: crate::pool::ChunkedResponse,
         /// Parsed status code from the response
         status_code: crate::protocol::StatusCode,
         /// Which backend handled this request

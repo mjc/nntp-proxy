@@ -3,6 +3,7 @@ use crossbeam::queue::SegQueue;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
@@ -245,6 +246,154 @@ impl Drop for PooledBuffer {
     }
 }
 
+/// Buffered response assembled from one or more pooled capture buffers.
+///
+/// This avoids reallocating or growing a single `Vec` on the hot path when
+/// a multiline response is larger than the typical capture size.
+#[derive(Debug, Default)]
+pub struct ChunkedResponse {
+    chunks: Vec<PooledBuffer>,
+    len: usize,
+}
+
+impl ChunkedResponse {
+    /// Total buffered length across all chunks.
+    #[must_use]
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true when no bytes are buffered.
+    #[must_use]
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Remove all buffered data, returning chunks to the pool on drop.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.len = 0;
+    }
+
+    /// Append bytes using one or more pooled capture buffers.
+    pub fn extend_from_slice(&mut self, pool: &BufferPool, mut data: &[u8]) {
+        while !data.is_empty() {
+            let need_new_chunk = self
+                .chunks
+                .last()
+                .is_none_or(|chunk| chunk.initialized() == chunk.capacity());
+
+            if need_new_chunk {
+                self.chunks.push(pool.acquire_capture_now());
+            }
+
+            let chunk = self
+                .chunks
+                .last_mut()
+                .expect("chunk just pushed or already existed");
+            let available = chunk.capacity().saturating_sub(chunk.initialized());
+            debug_assert!(available > 0, "chunk must have space after allocation");
+
+            let take = available.min(data.len());
+            chunk.extend_from_slice(&data[..take]);
+            self.len += take;
+            data = &data[take..];
+        }
+    }
+
+    /// Truncate the buffered response to the given absolute length.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len, "truncate length exceeds buffered bytes");
+        if len == self.len {
+            return;
+        }
+
+        let mut remaining = len;
+        let mut keep_chunks = 0;
+
+        for chunk in &mut self.chunks {
+            let chunk_len = chunk.initialized();
+            if remaining >= chunk_len {
+                remaining -= chunk_len;
+                keep_chunks += 1;
+                continue;
+            }
+
+            chunk.truncate(remaining);
+            keep_chunks += 1;
+            break;
+        }
+
+        self.chunks.truncate(keep_chunks);
+        self.len = len;
+    }
+
+    /// First chunk of buffered data, if any.
+    #[must_use]
+    pub fn first_chunk(&self) -> Option<&[u8]> {
+        self.chunks.first().map(AsRef::as_ref)
+    }
+
+    /// Copy the buffered response into a contiguous `Vec<u8>`.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len);
+        for chunk in &self.chunks {
+            out.extend_from_slice(chunk.as_ref());
+        }
+        out
+    }
+
+    /// Returns true if buffered bytes begin with `prefix`.
+    #[must_use]
+    pub fn starts_with(&self, prefix: &[u8]) -> bool {
+        if prefix.len() > self.len {
+            return false;
+        }
+
+        let mut remaining = prefix;
+        for chunk in &self.chunks {
+            if remaining.is_empty() {
+                return true;
+            }
+
+            let data = chunk.as_ref();
+            let take = data.len().min(remaining.len());
+            if data[..take] != remaining[..take] {
+                return false;
+            }
+            remaining = &remaining[take..];
+        }
+
+        remaining.is_empty()
+    }
+
+    /// Returns true if buffered bytes end with `suffix`.
+    #[must_use]
+    pub fn ends_with(&self, suffix: &[u8]) -> bool {
+        if suffix.len() > self.len {
+            return false;
+        }
+
+        let tail = self.to_vec();
+        tail.ends_with(suffix)
+    }
+
+    /// Write all buffered chunks to a sink in order.
+    pub async fn write_all_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        for chunk in &self.chunks {
+            writer.write_all(chunk.as_ref()).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Lock-free buffer pool for reusing large I/O buffers
 /// Uses crossbeam's `SegQueue` for lock-free operations
 #[derive(Debug, Clone)]
@@ -456,8 +605,7 @@ impl BufferPool {
     /// - Callers use `AsyncRead` which writes into the buffer
     /// - They get back `n` bytes written and access only `&buf[..n]`
     /// - Stale data beyond `n` is never accessed
-    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
-    pub async fn acquire(&self) -> PooledBuffer {
+    fn acquire_now(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
             // Buffer from pool is already the correct size (enforced on return)
@@ -484,6 +632,11 @@ impl BufferPool {
         }
     }
 
+    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
+    pub async fn acquire(&self) -> PooledBuffer {
+        self.acquire_now()
+    }
+
     /// Get a capture buffer from the capture pool
     ///
     /// Returns a `PooledBuffer` backed by a pre-faulted capture buffer.
@@ -491,8 +644,7 @@ impl BufferPool {
     ///
     /// Pages are pre-faulted to eliminate soft page faults during streaming,
     /// which profiling showed accounted for 96.75% of memmove time.
-    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
-    pub async fn acquire_capture(&self) -> PooledBuffer {
+    pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
         let buffer = if let Some(mut buffer) = self.capture_pool.pop() {
             self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
             // Clear but keep capacity (pages stay mapped)
@@ -507,7 +659,12 @@ impl BufferPool {
                 "Capture pool exhausted (allocating beyond pool size). In use: {}/{}",
                 in_use, self.max_capture_pool_size
             );
-            let mut buffer = Vec::with_capacity(self.capture_capacity);
+            let capacity = if self.capture_capacity > 0 {
+                self.capture_capacity
+            } else {
+                self.buffer_size.get()
+            };
+            let mut buffer = Vec::with_capacity(capacity);
             Self::prefault_pages(&mut buffer);
             buffer
         };
@@ -521,6 +678,11 @@ impl BufferPool {
             max_pool_size: self.max_capture_pool_size,
             reset_len: 0,
         }
+    }
+
+    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
+    pub async fn acquire_capture(&self) -> PooledBuffer {
+        self.acquire_capture_now()
     }
 }
 

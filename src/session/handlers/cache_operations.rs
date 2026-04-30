@@ -166,6 +166,23 @@ impl ClientSession {
         });
     }
 
+    /// Spawn async cache upsert task with an owned buffer.
+    pub(super) fn spawn_cache_upsert_owned(
+        &self,
+        msg_id: &crate::types::MessageId<'_>,
+        buffer: Vec<u8>,
+        backend_id: crate::types::BackendId,
+        tier: u8,
+    ) {
+        let cache_clone = self.cache.clone();
+        let msg_id_owned = msg_id.to_owned();
+        tokio::spawn(async move {
+            cache_clone
+                .upsert(msg_id_owned, buffer, backend_id, tier)
+                .await;
+        });
+    }
+
     /// Get the tier for a backend, defaulting to 0 if router or backend not found.
     pub(super) fn tier_for_backend(&self, backend_id: BackendId) -> u8 {
         self.router

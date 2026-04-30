@@ -632,8 +632,7 @@ impl ClientSession {
                                 backend_id,
                             }) if status_code.as_u16() != 430 => {
                                 // Success - article found, return immediately
-                                client_write
-                                    .write_all(&data)
+                                data.write_all_to(client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                                 *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
