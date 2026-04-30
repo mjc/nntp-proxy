@@ -24,6 +24,8 @@ pub struct PooledBuffer {
     pool: Arc<SegQueue<Vec<u8>>>,
     pool_size: Arc<AtomicUsize>,
     max_pool_size: usize,
+    expected_capacity: usize,
+    reset_len: usize,
 }
 
 impl std::fmt::Debug for PooledBuffer {
@@ -36,11 +38,11 @@ impl std::fmt::Debug for PooledBuffer {
 }
 
 impl PooledBuffer {
-    /// Get the full capacity of the buffer
+    /// Get the backing allocation capacity of the buffer.
     #[must_use]
     #[inline]
     pub const fn capacity(&self) -> usize {
-        self.buffer.len()
+        self.buffer.capacity()
     }
 
     /// Get the number of initialized bytes
@@ -207,6 +209,19 @@ impl AsRef<[u8]> for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
+        if self.buffer.capacity() != self.expected_capacity {
+            debug!(
+                "Dropping resized pooled buffer instead of returning it to the pool (capacity {} != expected {})",
+                self.buffer.capacity(),
+                self.expected_capacity
+            );
+            return;
+        }
+
+        if self.buffer.len() != self.reset_len {
+            self.buffer.resize(self.reset_len, 0);
+        }
+
         // Atomically return buffer to pool if pool is not full
         let mut current_size = self.pool_size.load(Ordering::Relaxed);
         while current_size < self.max_pool_size {
@@ -459,11 +474,13 @@ impl BufferPool {
         };
 
         PooledBuffer {
+            expected_capacity: buffer.capacity(),
             buffer,
             initialized: 0, // Start with 0 bytes safe to read
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
+            reset_len: self.buffer_size.get(),
         }
     }
 
@@ -496,11 +513,13 @@ impl BufferPool {
         };
 
         PooledBuffer {
+            expected_capacity: buffer.capacity(),
             buffer,
             initialized: 0,
             pool: Arc::clone(&self.capture_pool),
             pool_size: Arc::clone(&self.capture_pool_size),
             max_pool_size: self.max_capture_pool_size,
+            reset_len: 0,
         }
     }
 }
@@ -550,12 +569,26 @@ mod tests {
 
         // Pool is exhausted, should create new buffer
         let buf3 = pool.acquire().await;
-        assert_eq!(buf3.capacity(), 1024);
+        assert_eq!(buf3.capacity(), 4096);
 
         // Drop buffers (automatically returned)
         drop(buf1);
         drop(buf2);
         drop(buf3);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_capture_buffer_is_not_reused() {
+        let pool =
+            BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);
+
+        let mut capture = pool.acquire_capture().await;
+        capture.extend_from_slice(&vec![b'X'; 8193]);
+        assert!(capture.capacity() > 8192);
+        drop(capture);
+
+        let capture2 = pool.acquire_capture().await;
+        assert_eq!(capture2.capacity(), 8192);
     }
 
     #[tokio::test]
@@ -569,7 +602,7 @@ mod tests {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
                 let buffer = pool_clone.acquire().await;
-                assert_eq!(buffer.capacity(), 2048);
+                assert_eq!(buffer.capacity(), 4096);
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
             });
@@ -609,7 +642,7 @@ mod tests {
 
         // Get it again - may contain old data (performance optimization)
         let buffer2 = pool.acquire().await;
-        assert_eq!(buffer2.capacity(), 1024);
+        assert_eq!(buffer2.capacity(), 4096);
         // Note: buffer may contain previous data - callers must use &buf[..n] pattern
     }
 
@@ -640,7 +673,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         let buffer = pool.acquire().await;
-        assert_eq!(buffer.capacity(), 1024);
+        assert_eq!(buffer.capacity(), 4096);
 
         // PooledBuffer auto-returns on drop with correct size enforcement in Drop impl
         drop(buffer);
@@ -681,7 +714,7 @@ mod tests {
         let medium_buf = medium_pool.acquire().await;
         let large_buf = large_pool.acquire().await;
 
-        assert_eq!(small_buf.capacity(), 1024);
+        assert_eq!(small_buf.capacity(), 4096);
         assert_eq!(medium_buf.capacity(), 8192);
         assert_eq!(large_buf.capacity(), 65536);
 
@@ -854,12 +887,12 @@ mod tests {
         {
             let mut buffer = pool.acquire().await;
             buffer.copy_from_slice(b"test");
-            assert_eq!(buffer.capacity(), 2048);
+            assert_eq!(buffer.capacity(), 4096);
         } // Drop returns to pool
 
         let buffer2 = pool.acquire().await;
         // Should have same capacity when reused
-        assert_eq!(buffer2.capacity(), 2048);
+        assert_eq!(buffer2.capacity(), 4096);
     }
 
     #[test]
