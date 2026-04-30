@@ -13,9 +13,9 @@ use crate::session::backend;
 use crate::types::{BackendId, MessageId};
 
 /// Result of querying a backend for an article.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum QueryResult {
-    Found(BackendId, Vec<u8>),
+    Found(BackendId, crate::cache::CacheBuffer),
     Missing(BackendId),
     Error(BackendId),
 }
@@ -102,21 +102,25 @@ async fn execute_backend_query(
                 return Err(());
             };
 
-            // For multiline responses, read remaining data until we have the full terminator
-            let mut response = buffer[..cmd_response.bytes_read].to_vec();
-            if multiline && cmd_response.is_multiline {
+            let response = if multiline && cmd_response.is_multiline {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+                let mut response = crate::pool::ChunkedResponse::default();
+                response.extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);
                 let mut tail = TailBuffer::default();
-                match tail.detect_terminator(&response) {
+                match tail.detect_terminator(buffer.as_ref()) {
                     TerminatorStatus::FoundAt(pos) => {
                         // pos is after the terminator (terminator included in [..pos])
-                        if pos < response.len() && conn.stash_leftover(&response[pos..]).is_err() {
+                        if pos < cmd_response.bytes_read
+                            && conn
+                                .stash_leftover(&buffer[pos..cmd_response.bytes_read])
+                                .is_err()
+                        {
                             return Err(());
                         }
                         response.truncate(pos);
                     }
                     TerminatorStatus::NotFound => {
-                        tail.update(&response);
+                        tail.update(buffer.as_ref());
                         loop {
                             match buffer.read_from(conn.as_mut()).await {
                                 Ok(0) | Err(_) => return Err(()),
@@ -126,19 +130,31 @@ async fn execute_backend_query(
                                         {
                                             return Err(());
                                         }
-                                        response.extend_from_slice(&buffer[..pos]);
+                                        response
+                                            .extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
                                         break;
                                     }
                                     TerminatorStatus::NotFound => {
                                         tail.update(&buffer[..n]);
-                                        response.extend_from_slice(&buffer[..n]);
+                                        response.extend_from_slice(&deps.buffer_pool, &buffer[..n]);
                                     }
                                 },
                             }
                         }
                     }
                 }
-            }
+                if deps.cache_articles {
+                    crate::cache::CacheBuffer::Chunked(response)
+                } else {
+                    crate::cache::CacheBuffer::Small(crate::cache::extract_chunked_status_line(
+                        &response,
+                    ))
+                }
+            } else {
+                let mut response = Vec::with_capacity(cmd_response.bytes_read);
+                response.extend_from_slice(&buffer[..cmd_response.bytes_read]);
+                crate::cache::CacheBuffer::Vec(response)
+            };
 
             let result = match status_code.as_u16() {
                 220..=223 => {
@@ -151,12 +167,7 @@ async fn execute_backend_query(
                     deps.metrics.record_command(backend_id);
                     deps.metrics.record_ttfb_micros(backend_id, ttfb);
                     deps.metrics.record_send_recv_micros(backend_id, send, recv);
-                    let data = if deps.cache_articles || !multiline {
-                        response
-                    } else {
-                        format!("{status_code}\r\n").into_bytes()
-                    };
-                    QueryResult::Found(backend_id, data)
+                    QueryResult::Found(backend_id, response)
                 }
                 430 => {
                     deps.metrics.record_command(backend_id);
@@ -207,7 +218,7 @@ async fn query_all_backends_racing(
     command: &str,
     msg_id: &MessageId<'_>,
     multiline: bool,
-) -> Option<(BackendId, Vec<u8>)> {
+) -> Option<(BackendId, crate::cache::CacheBuffer)> {
     use futures::StreamExt;
 
     let tasks: Vec<_> = (0..deps.router.backend_count().get())
@@ -231,11 +242,10 @@ async fn query_all_backends_racing(
     let mut first_found = None;
 
     // Collect results until we find a success
-    while let Some(mut result) = pending.next().await {
-        match &mut result {
+    while let Some(result) = pending.next().await {
+        match result {
             QueryResult::Found(id, response) if first_found.is_none() => {
-                first_found = Some((*id, std::mem::take(response)));
-                results.push(result);
+                first_found = Some((id, response));
 
                 // Spawn background task to complete remaining backends and update cache
                 let cache = deps.cache.clone();
@@ -247,7 +257,8 @@ async fn query_all_backends_racing(
                         results.push(result);
                     }
                     // Build availability from all results and sync to cache
-                    let (_, availability) = summarize(results);
+                    let (_, mut availability) = summarize(results);
+                    availability.record_has(id);
                     cache.sync_availability(msg_id_owned, &availability).await;
                 });
 
@@ -278,7 +289,12 @@ async fn query_all_backends_racing(
 /// # NNTP Semantics
 /// 430 responses are authoritative (never false negatives), 2xx are not.
 /// See `crate::cache::article` module docs for full explanation.
-fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, Vec<u8>)>, ArticleAvailability) {
+fn summarize(
+    results: Vec<QueryResult>,
+) -> (
+    Option<(BackendId, crate::cache::CacheBuffer)>,
+    ArticleAvailability,
+) {
     let mut availability = ArticleAvailability::new();
     let mut found = None;
 
@@ -393,11 +409,17 @@ mod tests {
     fn summarize_finds_first() {
         let results = vec![
             QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Found(BackendId::from_index(1), b"first".to_vec()),
-            QueryResult::Found(BackendId::from_index(2), b"second".to_vec()),
+            QueryResult::Found(BackendId::from_index(1), b"first".to_vec().into()),
+            QueryResult::Found(BackendId::from_index(2), b"second".to_vec().into()),
         ];
         let (found, avail) = summarize(results);
-        assert_eq!(found, Some((BackendId::from_index(1), b"first".to_vec())));
+        assert_eq!(
+            found,
+            Some((
+                BackendId::from_index(1),
+                crate::cache::CacheBuffer::Vec(b"first".to_vec())
+            ))
+        );
         assert!(avail.is_missing(BackendId::from_index(0)));
         assert!(!avail.is_missing(BackendId::from_index(1)));
         assert!(!avail.is_missing(BackendId::from_index(2)));

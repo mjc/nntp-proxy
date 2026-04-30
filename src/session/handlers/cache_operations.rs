@@ -117,8 +117,8 @@ impl ClientSession {
         // STAT: synthesize a small response (no buffer copy needed)
         // Direct serve: write directly from the Arc-backed buffer (zero-copy)
         let bytes_written = if cmd_verb.eq_ignore_ascii_case("STAT") {
-            let stat_response = format!("223 0 {}\r\n", msg_id_ref.as_str());
-            client_write.write_all(stat_response.as_bytes()).await?;
+            let stat_response = crate::cache::build_stat_response(msg_id_ref.as_str());
+            client_write.write_all(&stat_response).await?;
             stat_response.len()
         } else {
             // Validate before serving
@@ -156,16 +156,25 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         tier: u8,
     ) {
+        self.spawn_cache_upsert_buffer(msg_id, buffer.to_vec().into(), backend_id, tier);
+    }
+
+    /// Spawn async cache upsert task with owned hot-path storage.
+    pub(super) fn spawn_cache_upsert_buffer(
+        &self,
+        msg_id: &crate::types::MessageId<'_>,
+        buffer: crate::cache::CacheBuffer,
+        backend_id: crate::types::BackendId,
+        tier: u8,
+    ) {
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
-        let buffer_owned = buffer.to_vec();
         tokio::spawn(async move {
             cache_clone
-                .upsert(msg_id_owned, buffer_owned, backend_id, tier)
+                .upsert(msg_id_owned, buffer, backend_id, tier)
                 .await;
         });
     }
-
     /// Get the tier for a backend, defaulting to 0 if router or backend not found.
     pub(super) fn tier_for_backend(&self, backend_id: BackendId) -> u8 {
         self.router

@@ -1,8 +1,10 @@
 use crate::types::BufferSize;
 use crossbeam::queue::SegQueue;
+use smallvec::SmallVec;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
@@ -24,14 +26,25 @@ pub struct PooledBuffer {
     pool: Arc<SegQueue<Vec<u8>>>,
     pool_size: Arc<AtomicUsize>,
     max_pool_size: usize,
+    expected_capacity: usize,
+    reset_len: usize,
+}
+
+impl std::fmt::Debug for PooledBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledBuffer")
+            .field("initialized", &self.initialized)
+            .field("capacity", &self.buffer.capacity())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PooledBuffer {
-    /// Get the full capacity of the buffer
+    /// Get the backing allocation capacity of the buffer.
     #[must_use]
     #[inline]
     pub const fn capacity(&self) -> usize {
-        self.buffer.len()
+        self.buffer.capacity()
     }
 
     /// Get the number of initialized bytes
@@ -74,12 +87,45 @@ impl PooledBuffer {
     /// Panics if `data.len()` > capacity
     #[inline]
     pub fn copy_from_slice(&mut self, data: &[u8]) {
-        assert!(
-            data.len() <= self.buffer.len(),
-            "data exceeds buffer capacity"
-        );
+        if self.buffer.is_empty() {
+            assert!(
+                data.len() <= self.buffer.capacity(),
+                "data exceeds buffer capacity"
+            );
+            if self.buffer.len() < data.len() {
+                self.buffer.resize(data.len(), 0);
+            }
+        } else {
+            assert!(
+                data.len() <= self.buffer.len(),
+                "data exceeds buffer capacity"
+            );
+        }
         self.buffer[..data.len()].copy_from_slice(data);
         self.initialized = data.len();
+    }
+
+    /// Reset the logical contents of the buffer without changing its backing allocation.
+    ///
+    /// This is safe for both fixed-size I/O buffers and accumulator-style capture buffers:
+    /// callers see an empty initialized slice afterwards, while the underlying allocation
+    /// stays available for reuse.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.initialized = 0;
+    }
+
+    /// Shorten the logical initialized length without changing the backing allocation.
+    ///
+    /// Used by response framing helpers when a read contains bytes beyond the current
+    /// response boundary and the remainder is stashed as leftover for the next response.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        assert!(
+            len <= self.initialized,
+            "truncate length exceeds initialized bytes"
+        );
+        self.initialized = len;
     }
 
     /// Get mutable access to the full buffer capacity
@@ -125,18 +171,21 @@ impl PooledBuffer {
     /// After calling this, `.len()` (via Deref) returns the total accumulated length.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
+        let needed = self.initialized + data.len();
         // Warn if we need to grow beyond pre-allocated capacity (rare for typical articles)
-        if self.buffer.len() + data.len() > self.buffer.capacity() {
+        if needed > self.buffer.capacity() {
             tracing::warn!(
                 "Capture buffer growing: {} + {} > {} capacity (will allocate)",
-                self.buffer.len(),
+                self.initialized,
                 data.len(),
                 self.buffer.capacity()
             );
         }
-        // Always extend - never truncate to prevent caching partial/corrupt data
-        self.buffer.extend_from_slice(data);
-        self.initialized = self.buffer.len();
+        if self.buffer.len() < needed {
+            self.buffer.resize(needed, 0);
+        }
+        self.buffer[self.initialized..needed].copy_from_slice(data);
+        self.initialized = needed;
     }
 }
 
@@ -162,6 +211,19 @@ impl AsRef<[u8]> for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
+        if self.buffer.capacity() != self.expected_capacity {
+            debug!(
+                "Dropping resized pooled buffer instead of returning it to the pool (capacity {} != expected {})",
+                self.buffer.capacity(),
+                self.expected_capacity
+            );
+            return;
+        }
+
+        if self.buffer.len() != self.reset_len {
+            self.buffer.resize(self.reset_len, 0);
+        }
+
         // Atomically return buffer to pool if pool is not full
         let mut current_size = self.pool_size.load(Ordering::Relaxed);
         while current_size < self.max_pool_size {
@@ -182,6 +244,187 @@ impl Drop for PooledBuffer {
             }
         }
         // If pool is full, buffer is dropped
+    }
+}
+
+/// Buffered response assembled from one or more pooled capture buffers.
+///
+/// This avoids reallocating or growing a single `Vec` on the hot path when
+/// a multiline response is larger than the typical capture size.
+#[derive(Debug, Default)]
+pub struct ChunkedResponse {
+    chunks: Vec<PooledBuffer>,
+    len: usize,
+}
+
+impl ChunkedResponse {
+    /// Total buffered length across all chunks.
+    #[must_use]
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true when no bytes are buffered.
+    #[must_use]
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Remove all buffered data, returning chunks to the pool on drop.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.len = 0;
+    }
+
+    /// Append bytes using one or more pooled capture buffers.
+    pub fn extend_from_slice(&mut self, pool: &BufferPool, mut data: &[u8]) {
+        while !data.is_empty() {
+            let need_new_chunk = self
+                .chunks
+                .last()
+                .is_none_or(|chunk| chunk.initialized() == chunk.capacity());
+
+            if need_new_chunk {
+                self.chunks.push(pool.acquire_capture_now());
+            }
+
+            let chunk = self
+                .chunks
+                .last_mut()
+                .expect("chunk just pushed or already existed");
+            let available = chunk.capacity().saturating_sub(chunk.initialized());
+            debug_assert!(available > 0, "chunk must have space after allocation");
+
+            let take = available.min(data.len());
+            chunk.extend_from_slice(&data[..take]);
+            self.len += take;
+            data = &data[take..];
+        }
+    }
+
+    /// Truncate the buffered response to the given absolute length.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len, "truncate length exceeds buffered bytes");
+        if len == self.len {
+            return;
+        }
+
+        let mut remaining = len;
+        let mut keep_chunks = 0;
+
+        for chunk in &mut self.chunks {
+            let chunk_len = chunk.initialized();
+            if remaining >= chunk_len {
+                remaining -= chunk_len;
+                keep_chunks += 1;
+                continue;
+            }
+
+            chunk.truncate(remaining);
+            keep_chunks += 1;
+            break;
+        }
+
+        self.chunks.truncate(keep_chunks);
+        self.len = len;
+    }
+
+    /// First chunk of buffered data, if any.
+    #[must_use]
+    pub fn first_chunk(&self) -> Option<&[u8]> {
+        self.chunks.first().map(AsRef::as_ref)
+    }
+
+    /// Iterate buffered chunks without flattening.
+    pub fn iter_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().map(AsRef::as_ref)
+    }
+
+    /// Copy up to `len` bytes from the front of the response into a small stack-backed buffer.
+    pub fn copy_prefix_into(&self, len: usize, out: &mut SmallVec<[u8; 128]>) {
+        out.clear();
+        let mut remaining = len.min(self.len);
+        for chunk in self.iter_chunks() {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(chunk.len());
+            out.extend_from_slice(&chunk[..take]);
+            remaining -= take;
+        }
+    }
+
+    /// Copy the buffered response into a contiguous `Vec<u8>`.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len);
+        for chunk in self.iter_chunks() {
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    /// Returns true if buffered bytes begin with `prefix`.
+    #[must_use]
+    pub fn starts_with(&self, prefix: &[u8]) -> bool {
+        if prefix.len() > self.len {
+            return false;
+        }
+
+        let mut remaining = prefix;
+        for chunk in &self.chunks {
+            if remaining.is_empty() {
+                return true;
+            }
+
+            let data = chunk.as_ref();
+            let take = data.len().min(remaining.len());
+            if data[..take] != remaining[..take] {
+                return false;
+            }
+            remaining = &remaining[take..];
+        }
+
+        remaining.is_empty()
+    }
+
+    /// Returns true if buffered bytes end with `suffix`.
+    #[must_use]
+    pub fn ends_with(&self, suffix: &[u8]) -> bool {
+        if suffix.len() > self.len {
+            return false;
+        }
+
+        let mut remaining = suffix.len();
+        for chunk in self.chunks.iter().rev() {
+            if remaining == 0 {
+                return true;
+            }
+            let data = chunk.as_ref();
+            let take = remaining.min(data.len());
+            let suffix_start = remaining - take;
+            let data_start = data.len() - take;
+            if data[data_start..] != suffix[suffix_start..remaining] {
+                return false;
+            }
+            remaining -= take;
+        }
+
+        remaining == 0
+    }
+
+    /// Write all buffered chunks to a sink in order.
+    pub async fn write_all_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        for chunk in self.iter_chunks() {
+            writer.write_all(chunk).await?;
+        }
+        Ok(())
     }
 }
 
@@ -396,8 +639,7 @@ impl BufferPool {
     /// - Callers use `AsyncRead` which writes into the buffer
     /// - They get back `n` bytes written and access only `&buf[..n]`
     /// - Stale data beyond `n` is never accessed
-    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
-    pub async fn acquire(&self) -> PooledBuffer {
+    fn acquire_now(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
             // Buffer from pool is already the correct size (enforced on return)
@@ -414,12 +656,19 @@ impl BufferPool {
         };
 
         PooledBuffer {
+            expected_capacity: buffer.capacity(),
             buffer,
             initialized: 0, // Start with 0 bytes safe to read
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
+            reset_len: self.buffer_size.get(),
         }
+    }
+
+    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
+    pub async fn acquire(&self) -> PooledBuffer {
+        self.acquire_now()
     }
 
     /// Get a capture buffer from the capture pool
@@ -429,8 +678,7 @@ impl BufferPool {
     ///
     /// Pages are pre-faulted to eliminate soft page faults during streaming,
     /// which profiling showed accounted for 96.75% of memmove time.
-    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
-    pub async fn acquire_capture(&self) -> PooledBuffer {
+    pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
         let buffer = if let Some(mut buffer) = self.capture_pool.pop() {
             self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
             // Clear but keep capacity (pages stay mapped)
@@ -445,18 +693,30 @@ impl BufferPool {
                 "Capture pool exhausted (allocating beyond pool size). In use: {}/{}",
                 in_use, self.max_capture_pool_size
             );
-            let mut buffer = Vec::with_capacity(self.capture_capacity);
+            let capacity = if self.capture_capacity > 0 {
+                self.capture_capacity
+            } else {
+                self.buffer_size.get()
+            };
+            let mut buffer = Vec::with_capacity(capacity);
             Self::prefault_pages(&mut buffer);
             buffer
         };
 
         PooledBuffer {
+            expected_capacity: buffer.capacity(),
             buffer,
             initialized: 0,
             pool: Arc::clone(&self.capture_pool),
             pool_size: Arc::clone(&self.capture_pool_size),
             max_pool_size: self.max_capture_pool_size,
+            reset_len: 0,
         }
+    }
+
+    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
+    pub async fn acquire_capture(&self) -> PooledBuffer {
+        self.acquire_capture_now()
     }
 }
 
@@ -505,12 +765,54 @@ mod tests {
 
         // Pool is exhausted, should create new buffer
         let buf3 = pool.acquire().await;
-        assert_eq!(buf3.capacity(), 1024);
+        assert_eq!(buf3.capacity(), 4096);
 
         // Drop buffers (automatically returned)
         drop(buf1);
         drop(buf2);
         drop(buf3);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_capture_buffer_is_not_reused() {
+        let pool =
+            BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);
+
+        let mut capture = pool.acquire_capture().await;
+        capture.extend_from_slice(&vec![b'X'; 8193]);
+        assert!(capture.capacity() > 8192);
+        drop(capture);
+
+        let capture2 = pool.acquire_capture().await;
+        assert_eq!(capture2.capacity(), 8192);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_helpers_without_flattening() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"220 0 <id>\r\nBody\r\n.\r\n");
+
+        let chunks: Vec<&[u8]> = response.iter_chunks().collect();
+        assert!(chunks.len() > 1, "test requires multi-chunk buffering");
+        assert_eq!(chunks.concat(), b"220 0 <id>\r\nBody\r\n.\r\n");
+        assert!(response.starts_with(b"220 0 "));
+        assert!(response.ends_with(b"\r\n.\r\n"));
+
+        let mut prefix = SmallVec::<[u8; 128]>::new();
+        response.copy_prefix_into(12, &mut prefix);
+        assert_eq!(&prefix[..], b"220 0 <id>\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_copy_prefix_clamps_to_length() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"430\r\n");
+
+        let mut prefix = SmallVec::<[u8; 128]>::new();
+        response.copy_prefix_into(64, &mut prefix);
+        assert_eq!(&prefix[..], b"430\r\n");
     }
 
     #[tokio::test]
@@ -524,7 +826,7 @@ mod tests {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
                 let buffer = pool_clone.acquire().await;
-                assert_eq!(buffer.capacity(), 2048);
+                assert_eq!(buffer.capacity(), 4096);
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
             });
@@ -564,7 +866,7 @@ mod tests {
 
         // Get it again - may contain old data (performance optimization)
         let buffer2 = pool.acquire().await;
-        assert_eq!(buffer2.capacity(), 1024);
+        assert_eq!(buffer2.capacity(), 4096);
         // Note: buffer may contain previous data - callers must use &buf[..n] pattern
     }
 
@@ -595,7 +897,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         let buffer = pool.acquire().await;
-        assert_eq!(buffer.capacity(), 1024);
+        assert_eq!(buffer.capacity(), 4096);
 
         // PooledBuffer auto-returns on drop with correct size enforcement in Drop impl
         drop(buffer);
@@ -636,7 +938,7 @@ mod tests {
         let medium_buf = medium_pool.acquire().await;
         let large_buf = large_pool.acquire().await;
 
-        assert_eq!(small_buf.capacity(), 1024);
+        assert_eq!(small_buf.capacity(), 4096);
         assert_eq!(medium_buf.capacity(), 8192);
         assert_eq!(large_buf.capacity(), 65536);
 
@@ -809,12 +1111,12 @@ mod tests {
         {
             let mut buffer = pool.acquire().await;
             buffer.copy_from_slice(b"test");
-            assert_eq!(buffer.capacity(), 2048);
+            assert_eq!(buffer.capacity(), 4096);
         } // Drop returns to pool
 
         let buffer2 = pool.acquire().await;
         // Should have same capacity when reused
-        assert_eq!(buffer2.capacity(), 2048);
+        assert_eq!(buffer2.capacity(), 4096);
     }
 
     #[test]

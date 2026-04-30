@@ -350,15 +350,19 @@ impl HybridArticleCache {
     /// A cached full article (220/222 response) must not be replaced by a STAT stub.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert(
+    pub async fn upsert<B>(
         &self,
         message_id: MessageId<'_>,
-        buffer: Vec<u8>,
+        buffer: B,
         backend_id: BackendId,
         tier: u8,
-    ) {
+    ) where
+        B: Into<super::CacheBuffer>,
+    {
+        let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
         let buffer_len = buffer.len();
+        let buffer = buffer.into_vec();
 
         // Check for existing entry - don't overwrite larger buffers with smaller ones
         if let Ok(Some(existing)) = self.cache.get(&key).await {
@@ -484,17 +488,7 @@ impl HybridArticleCache {
 
     /// Create a minimal stub from a response buffer (for availability-only mode)
     fn create_stub(buffer: &[u8]) -> Vec<u8> {
-        // Extract just the status code line
-        if let Some(pos) = buffer.iter().position(|&b| b == b'\r') {
-            buffer[..pos + 2].to_vec() // Include \r\n
-        } else if buffer.len() >= 3 {
-            // Just the status code
-            let mut stub = buffer[..3].to_vec();
-            stub.extend_from_slice(b"\r\n");
-            stub
-        } else {
-            buffer.to_vec()
-        }
+        super::entry_helpers::extract_status_line(buffer).into_vec()
     }
 
     /// Get cache statistics

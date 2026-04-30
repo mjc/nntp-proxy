@@ -9,7 +9,7 @@ use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
 };
-use crate::session::streaming::{StreamingError, classify_client_write_err};
+use crate::session::streaming::StreamingError;
 use crate::session::{ClientSession, backend, streaming};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -48,6 +48,15 @@ struct ResponseStreamParams<'a> {
     response_code: &'a crate::protocol::NntpResponse,
     is_multiline: bool,
     first_chunk: &'a [u8],
+}
+
+/// Any client write failure after the full backend response is already buffered is terminal.
+///
+/// The backend connection is already clean at this point, but the client may have received a
+/// partial prefix of the response. Retrying another backend on the same client socket would
+/// splice responses together and corrupt NNTP framing.
+fn classify_buffered_response_write_err(e: std::io::Error) -> StreamingError {
+    StreamingError::ClientDisconnect(e)
 }
 
 impl ClientSession {
@@ -195,29 +204,20 @@ impl ClientSession {
                     self.metrics.record_error(backend_id);
                     self.metrics.user_error(self.username());
                 } else {
-                    // Client disconnect — backend was cleanly drained. Return to pool.
-                    let _ = conn.release();
-                }
-                // BackendEof and BackendDirty mean Phase 1 already wrote the status line +
-                // partial body to the client. Retrying on the next backend would concatenate
-                // a second full article onto the partial first one, corrupting the stream.
-                // Signal ClientDisconnect so the session ends cleanly; nzbget/sabnzbd will
-                // retry the segment on their end.
-                if matches!(
-                    e,
-                    StreamingError::BackendEof { .. } | StreamingError::BackendDirty(_)
-                ) {
-                    warn!(
-                        client = %self.client_addr,
-                        backend = backend_id.as_index(),
-                        command = %command.trim(),
-                        "Backend died mid-stream after partial data sent to client; \
-                         closing client connection to prevent protocol corruption"
-                    );
-                    return Err(SessionError::ClientDisconnect(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "backend closed mid-stream; partial article already sent",
-                    )));
+                    // Client disconnect after a fully buffered response keeps the backend
+                    // clean, but unexpected trailing bytes still make this pooled borrow
+                    // unsafe to reuse across sessions.
+                    if conn.has_leftover() {
+                        warn!(
+                            client = %self.client_addr,
+                            backend = backend_id.as_index(),
+                            command = %command.trim(),
+                            leftover_bytes = conn.leftover_len(),
+                            "Buffered direct-path response ended with trailing backend bytes; retiring connection"
+                        );
+                    } else {
+                        let _ = conn.release();
+                    }
                 }
                 // SessionError::from(StreamingError) preserves ClientDisconnect signal.
                 return Err(SessionError::from(e));
@@ -241,7 +241,17 @@ impl ClientSession {
 
         // Explicitly complete the guard on the success path
         guard.complete();
-        let _ = conn.release(); // streaming completed; connection healthy, return to pool
+        if conn.has_leftover() {
+            warn!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command = %command.trim(),
+                leftover_bytes = conn.leftover_len(),
+                "Direct per-command response left trailing backend bytes; retiring connection"
+            );
+        } else {
+            let _ = conn.release(); // streaming completed; connection healthy, return to pool
+        }
 
         Ok(BackendAttemptResult::Success {
             backend_id,
@@ -345,16 +355,13 @@ impl ClientSession {
 
         match (params.is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let mut captured = self.buffer_pool.acquire_capture().await;
-                let bytes = streaming::stream_and_capture_multiline_response(
-                    &mut **pooled_conn,
-                    client_write,
-                    params.first_chunk,
-                    ctx,
-                    &mut captured,
-                )
-                .await?;
-
+                let captured =
+                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
+                        .await?;
+                captured
+                    .write_all_to(client_write)
+                    .await
+                    .map_err(classify_buffered_response_write_err)?;
                 if let Some(msg_id_ref) = params.msg_id {
                     debug!(
                         "Client {} caching full article for {} ({} bytes captured)",
@@ -363,36 +370,38 @@ impl ClientSession {
                         captured.len()
                     );
                 }
-                self.maybe_cache_upsert(params.msg_id, &captured, ctx.backend_id);
-                Ok(bytes)
+                let captured_len = captured.len();
+                self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+                Ok(captured_len as u64)
             }
             (true, CacheAction::TrackAvailability) => {
-                let bytes = streaming::stream_multiline_response(
-                    &mut **pooled_conn,
-                    client_write,
-                    params.first_chunk,
-                    ctx,
-                )
-                .await?;
+                let captured =
+                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
+                        .await?;
+                captured
+                    .write_all_to(client_write)
+                    .await
+                    .map_err(classify_buffered_response_write_err)?;
 
                 // Extract first status line (~30-80 bytes) instead of copying
-                // full first_chunk (8-64KB). The cache only needs the status
+                // full response. The cache only needs the status
                 // code to build an availability stub.
-                // SmallVec keeps small status lines on stack, avoiding heap allocation
-                // until the spawn boundary where .to_vec() happens inside spawn_cache_upsert.
-                let stub = crate::cache::extract_status_line(params.first_chunk);
-                self.maybe_cache_upsert(params.msg_id, &stub, ctx.backend_id);
-                Ok(bytes)
+                let stub = crate::cache::extract_chunked_status_line(&captured);
+                self.maybe_cache_upsert_buffer(params.msg_id, stub.into(), ctx.backend_id);
+                Ok(captured.len() as u64)
             }
             (true, _) => {
-                // Multiline but no caching
-                streaming::stream_multiline_response(
-                    &mut **pooled_conn,
-                    client_write,
-                    params.first_chunk,
-                    ctx,
-                )
-                .await
+                // Multiline responses are fully buffered before any client write in
+                // per-command mode so the full terminator-validated response is known
+                // before forwarding.
+                let captured =
+                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
+                        .await?;
+                captured
+                    .write_all_to(client_write)
+                    .await
+                    .map_err(classify_buffered_response_write_err)?;
+                Ok(captured.len() as u64)
             }
             (false, CacheAction::TrackStat) => {
                 // Single-line: backend already has complete response in first_chunk,
@@ -400,7 +409,7 @@ impl ClientSession {
                 client_write
                     .write_all(params.first_chunk)
                     .await
-                    .map_err(classify_client_write_err)?;
+                    .map_err(classify_buffered_response_write_err)?;
                 self.maybe_cache_upsert(params.msg_id, b"223\r\n", ctx.backend_id);
                 Ok(params.first_chunk.len() as u64)
             }
@@ -410,7 +419,7 @@ impl ClientSession {
                 client_write
                     .write_all(params.first_chunk)
                     .await
-                    .map_err(classify_client_write_err)?;
+                    .map_err(classify_buffered_response_write_err)?;
                 Ok(params.first_chunk.len() as u64)
             }
         }
@@ -456,6 +465,18 @@ impl ClientSession {
             self.spawn_cache_upsert(msg_id_ref, data, backend_id, tier);
         }
     }
+    #[inline]
+    fn maybe_cache_upsert_buffer(
+        &self,
+        msg_id: Option<&crate::types::MessageId<'_>>,
+        data: crate::cache::CacheBuffer,
+        backend_id: BackendId,
+    ) {
+        if let Some(msg_id_ref) = msg_id {
+            let tier = self.tier_for_backend(backend_id);
+            self.spawn_cache_upsert_buffer(msg_id_ref, data, backend_id, tier);
+        }
+    }
 
     /// Record response metrics (errors, article sizes, command execution)
     fn record_response_metrics(
@@ -485,5 +506,30 @@ impl ClientSession {
         self.metrics.user_bytes_sent(self.username(), cmd_bytes);
         self.metrics
             .user_bytes_received(self.username(), resp_bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_buffered_response_write_err;
+
+    #[test]
+    fn buffered_response_timeout_is_terminal_client_disconnect() {
+        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let classified = classify_buffered_response_write_err(err);
+        assert!(matches!(
+            classified,
+            crate::session::streaming::StreamingError::ClientDisconnect(_)
+        ));
+    }
+
+    #[test]
+    fn buffered_response_abort_is_terminal_client_disconnect() {
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "aborted");
+        let classified = classify_buffered_response_write_err(err);
+        assert!(matches!(
+            classified,
+            crate::session::streaming::StreamingError::ClientDisconnect(_)
+        ));
     }
 }

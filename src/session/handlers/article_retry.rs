@@ -3,7 +3,7 @@
 //! Handles routing article commands across backends, using `ArticleAvailability`
 //! to skip backends that have already returned 430 for a given article.
 
-use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
+use crate::router::backend_queue::{PipelineResponse, QueuedCommand, QueuedRequest};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::SessionError;
@@ -23,8 +23,8 @@ use crate::session::precheck;
 pub(super) struct BatchPipelineState<'a> {
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub backend_to_client_bytes: &'a mut BackendToClientBytes,
-    pub leftover: &'a mut bytes::BytesMut,
-    pub chunk_data: &'a mut bytes::BytesMut,
+    pub leftover: &'a mut crate::pool::PooledBuffer,
+    pub chunk_data: &'a mut crate::pool::PooledBuffer,
 }
 
 /// Backend connection context for `process_batch_response`
@@ -615,7 +615,7 @@ impl ClientSession {
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let request = QueuedRequest {
-                    command: std::sync::Arc::from(command),
+                    command: QueuedCommand::from_command(command),
                     response_tx: tx,
                 };
 
@@ -632,8 +632,7 @@ impl ClientSession {
                                 backend_id,
                             }) if status_code.as_u16() != 430 => {
                                 // Success - article found, return immediately
-                                client_write
-                                    .write_all(&data)
+                                data.write_all_to(client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                                 *backend_to_client_bytes = backend_to_client_bytes.add(data.len());

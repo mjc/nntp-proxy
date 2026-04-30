@@ -10,6 +10,7 @@
 //! `QueueFull` immediately rather than blocking the client session.
 
 use crossbeam::queue::SegQueue;
+use smallvec::SmallVec;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, oneshot};
 
@@ -21,20 +22,90 @@ pub enum PipelineResponse {
     /// Command executed successfully; `data` is the complete response bytes
     Success {
         /// Complete response data (status line + multiline body if applicable)
-        data: bytes::Bytes,
+        data: crate::pool::ChunkedResponse,
         /// Parsed status code from the response
         status_code: crate::protocol::StatusCode,
         /// Which backend handled this request
         backend_id: BackendId,
     },
     /// Command failed (connection error, queue overflow, etc.)
-    Error(String),
+    Error(PipelineError),
+}
+
+/// Queue/worker failures reported back to the waiting session without heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineError {
+    ConnectionAcquire,
+    WriteFailed { index: usize, batch_len: usize },
+    FlushFailed,
+    ReadFailed,
+    ConnectionLost { completed: usize, batch_len: usize },
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionAcquire => f.write_str("connection error"),
+            Self::WriteFailed { index, batch_len } => {
+                write!(f, "write failed at command {index}/{batch_len}")
+            }
+            Self::FlushFailed => f.write_str("flush failed"),
+            Self::ReadFailed => f.write_str("read error"),
+            Self::ConnectionLost {
+                completed,
+                batch_len,
+            } => write!(f, "connection lost after response {completed}/{batch_len}"),
+        }
+    }
+}
+
+/// Stack-backed queued command storage.
+#[derive(Clone, PartialEq, Eq)]
+pub struct QueuedCommand(SmallVec<[u8; 512]>);
+
+impl QueuedCommand {
+    #[must_use]
+    pub fn from_command(command: &str) -> Self {
+        Self(SmallVec::from_slice(command.as_bytes()))
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("")
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<&str> for QueuedCommand {
+    fn from(value: &str) -> Self {
+        Self::from_command(value)
+    }
+}
+
+impl From<String> for QueuedCommand {
+    fn from(value: String) -> Self {
+        Self(SmallVec::from_vec(value.into_bytes()))
+    }
 }
 
 /// A request queued for pipeline execution on a backend
 pub struct QueuedRequest {
     /// The full NNTP command string (including \r\n)
-    pub command: std::sync::Arc<str>,
+    pub command: QueuedCommand,
     /// Channel to send the response back to the waiting client session
     pub response_tx: oneshot::Sender<PipelineResponse>,
 }
@@ -188,7 +259,7 @@ impl BackendQueue {
 impl std::fmt::Debug for QueuedRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedRequest")
-            .field("command", &self.command)
+            .field("command", &self.command.as_str())
             .finish_non_exhaustive()
     }
 }
@@ -197,14 +268,13 @@ impl std::fmt::Debug for QueuedRequest {
 mod tests {
     use super::*;
     use std::sync::Arc;
-
     #[test]
     fn test_queue_enqueue_dequeue() {
         let queue = BackendQueue::new(10);
         let (tx, _rx) = oneshot::channel();
         queue
             .try_enqueue(QueuedRequest {
-                command: "ARTICLE <test@example.com>\r\n".into(),
+                command: QueuedCommand::from_command("ARTICLE <test@example.com>\r\n"),
                 response_tx: tx,
             })
             .unwrap();
@@ -218,14 +288,16 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             queue
                 .try_enqueue(QueuedRequest {
-                    command: format!("ARTICLE <test{i}@example.com>\r\n").into(),
+                    command: QueuedCommand::from_command(&format!(
+                        "ARTICLE <test{i}@example.com>\r\n"
+                    )),
                     response_tx: tx,
                 })
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
         let result = queue.try_enqueue(QueuedRequest {
-            command: "ARTICLE <overflow@example.com>\r\n".into(),
+            command: QueuedCommand::from_command("ARTICLE <overflow@example.com>\r\n"),
             response_tx: tx,
         });
         assert!(result.is_err());
@@ -245,7 +317,7 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             queue
                 .try_enqueue(QueuedRequest {
-                    command: format!("CMD {i}\r\n").into(),
+                    command: QueuedCommand::from_command(&format!("CMD {i}\r\n")),
                     response_tx: tx,
                 })
                 .unwrap();
@@ -282,5 +354,40 @@ mod tests {
 
         let batch = handle.await.unwrap();
         assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn test_pipeline_error_display_messages() {
+        let cases = [
+            (PipelineError::ConnectionAcquire, "connection error"),
+            (
+                PipelineError::WriteFailed {
+                    index: 2,
+                    batch_len: 5,
+                },
+                "write failed at command 2/5",
+            ),
+            (PipelineError::FlushFailed, "flush failed"),
+            (PipelineError::ReadFailed, "read error"),
+            (
+                PipelineError::ConnectionLost {
+                    completed: 3,
+                    batch_len: 5,
+                },
+                "connection lost after response 3/5",
+            ),
+        ];
+
+        cases.into_iter().for_each(|(error, expected)| {
+            assert_eq!(error.to_string(), expected);
+        });
+    }
+
+    #[test]
+    fn test_queued_command_roundtrip_from_string() {
+        let command = QueuedCommand::from(String::from("STAT <test@example.com>\r\n"));
+        assert_eq!(command.as_bytes(), b"STAT <test@example.com>\r\n");
+        assert_eq!(command.as_str(), "STAT <test@example.com>\r\n");
+        assert_eq!(command.len(), 25);
     }
 }

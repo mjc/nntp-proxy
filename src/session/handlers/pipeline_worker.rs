@@ -7,6 +7,7 @@
 //!
 //! This enables N client sessions to share M backend connections (N >> M).
 
+#[cfg(test)]
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -14,7 +15,8 @@ use tracing::{debug, info, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-use crate::router::backend_queue::{BackendQueue, PipelineResponse, QueuedRequest};
+use crate::router::backend_queue::{BackendQueue, PipelineError, PipelineResponse, QueuedRequest};
+#[cfg(test)]
 use crate::session::backend::validate_backend_response;
 use crate::types::BackendId;
 
@@ -52,7 +54,7 @@ pub async fn backend_pipeline_worker(
     );
 
     // Hoist buffers to worker lifetime (reused across batches)
-    let mut result_buf = bytes::BytesMut::with_capacity(4096);
+    let mut result_buf = crate::pool::ChunkedResponse::default();
     let mut batch = Vec::with_capacity(config.batch_size);
 
     loop {
@@ -77,7 +79,7 @@ pub async fn backend_pipeline_worker(
                     backend_id, e
                 );
                 metrics.record_connection_failure(backend_id);
-                batch = fail_batch(batch, &format!("connection error: {e}"));
+                batch = fail_batch(batch, PipelineError::ConnectionAcquire);
                 continue;
             }
         };
@@ -121,7 +123,7 @@ async fn execute_pipeline_batch(
     mut batch: Vec<QueuedRequest>,
     metrics: &MetricsCollector,
     buffer_pool: &BufferPool,
-    result_buf: &mut bytes::BytesMut,
+    result_buf: &mut crate::pool::ChunkedResponse,
 ) -> (bool, Vec<QueuedRequest>) {
     let batch_len = batch.len();
 
@@ -137,8 +139,13 @@ async fn execute_pipeline_batch(
             );
             // We wrote commands 0..i successfully but can't read responses
             // because the connection is broken. Fail everything and return early.
-            let err_msg = format!("write failed at command {}/{}", i + 1, batch_len);
-            let batch = fail_batch(batch, &err_msg);
+            let batch = fail_batch(
+                batch,
+                PipelineError::WriteFailed {
+                    index: i + 1,
+                    batch_len,
+                },
+            );
             return (false, batch);
         }
     }
@@ -150,7 +157,7 @@ async fn execute_pipeline_batch(
             "Pipeline worker backend {:?}: flush failed: {}",
             backend_id, e
         );
-        let batch = fail_batch(batch, &format!("flush failed: {e}"));
+        let batch = fail_batch(batch, PipelineError::FlushFailed);
         return (false, batch);
     }
 
@@ -161,8 +168,18 @@ async fn execute_pipeline_batch(
     let mut batch_iter = batch.drain(..).enumerate();
     while let Some((i, req)) = batch_iter.next() {
         // Read the response for this command
-        match read_full_response(&mut buffer, conn, result_buf).await {
-            Ok((data, status_code)) => {
+        match crate::session::streaming::read_full_response(
+            &mut buffer,
+            conn,
+            result_buf,
+            buffer_pool,
+            backend_id,
+        )
+        .await
+        .map_err(crate::session::streaming::StreamingError::into_anyhow)
+        {
+            Ok(status_code) => {
+                let data = std::mem::take(result_buf);
                 metrics.record_command(backend_id);
                 let data_len = data.len();
                 metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
@@ -180,7 +197,7 @@ async fn execute_pipeline_batch(
                     backend = ?backend_id,
                     response_index = i + 1,
                     batch_size = batch_len,
-                    command = %req.command.trim(),
+                    command = %req.command.as_str().trim(),
                     error = %e,
                     leftover_bytes = conn.leftover_len(),
                     "Pipeline worker read failed"
@@ -189,14 +206,17 @@ async fn execute_pipeline_batch(
                 // Fail this request
                 let _ = req
                     .response_tx
-                    .send(PipelineResponse::Error(format!("read error: {e}")));
+                    .send(PipelineResponse::Error(PipelineError::ReadFailed));
 
                 // Fail remaining requests (no Vec allocation - iterate directly)
-                let error_msg = format!("connection lost after response {}/{}", i + 1, batch_len);
+                let error_msg = PipelineError::ConnectionLost {
+                    completed: i + 1,
+                    batch_len,
+                };
                 for (_, remaining_req) in batch_iter {
                     let _ = remaining_req
                         .response_tx
-                        .send(PipelineResponse::Error(error_msg.clone()));
+                        .send(PipelineResponse::Error(error_msg));
                 }
 
                 // Connection broken — return false immediately
@@ -230,130 +250,25 @@ async fn execute_pipeline_batch(
 
 /// Read a complete NNTP response (status line + multiline body if applicable).
 ///
-/// Returns the full response as `Bytes` and the parsed status code.
+/// Fills `result_buf` with the full response bytes and returns the parsed status code.
 ///
 /// `result_buf` is cleared and reused for each response to avoid per-response allocations.
+#[cfg(test)]
 async fn read_full_response(
     buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
-    result_buf: &mut bytes::BytesMut,
-) -> Result<(bytes::Bytes, crate::protocol::StatusCode)> {
-    use crate::session::streaming::tail_buffer::TailBuffer;
-
-    let mut tail = TailBuffer::default();
-    result_buf.clear(); // Reuse buffer from previous response
-
-    // Get first data directly into result_buf (no intermediate Vec). ConnectionStream
-    // serves any stashed leftover bytes before polling the socket.
-    let from_leftover = conn.has_leftover();
-    let n = buffer.read_from(conn).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
-    result_buf.extend_from_slice(&buffer[..n]);
-
-    // H5: If leftover was too short to validate, read more data
-    if result_buf.len() < crate::protocol::MIN_RESPONSE_LENGTH {
-        let n = buffer.read_from(conn).await?;
-        if n == 0 {
-            anyhow::bail!(
-                "Backend EOF with partial status line ({} bytes)",
-                result_buf.len()
-            );
-        }
-        result_buf.extend_from_slice(&buffer[..n]);
-    }
-
-    // Validate the response to determine if it's multiline and get status code
-    let validated = validate_backend_response(
+    result_buf: &mut crate::pool::ChunkedResponse,
+    pool: &BufferPool,
+) -> Result<crate::protocol::StatusCode> {
+    crate::session::streaming::read_full_response(
+        buffer,
+        conn,
         result_buf,
-        result_buf.len(),
-        crate::protocol::MIN_RESPONSE_LENGTH,
-    );
-    let status_code = validated.response.status_code().ok_or_else(|| {
-        // Log Invalid response with detailed context
-        tracing::warn!(
-            bytes_read = result_buf.len(),
-            first_bytes_hex = %crate::session::backend::format_hex_preview(result_buf, 256),
-            first_bytes_utf8 = %String::from_utf8_lossy(&result_buf[..result_buf.len().min(256)]),
-            source = if from_leftover { "leftover" } else { "fresh_read" },
-            "Invalid status code in pipeline response"
-        );
-        anyhow::anyhow!("Invalid status code in pipeline response")
-    })?;
-
-    if !validated.is_multiline {
-        // Single-line response: split at \r\n boundary to save leftover
-        if let Some(pos) = memchr::memchr(b'\n', &result_buf[..]) {
-            let end = pos + 1;
-            if end < result_buf.len() {
-                let remainder = &result_buf[end..];
-                anyhow::ensure!(
-                    remainder.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
-                    "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
-                    crate::constants::buffer::MAX_LEFTOVER_BYTES,
-                    remainder.len()
-                );
-                conn.stash_leftover(remainder)?;
-                result_buf.truncate(end);
-            }
-        }
-        return Ok((result_buf.split().freeze(), status_code));
-    }
-
-    // Multiline response: use TailBuffer to detect terminator
-    let status = tail.detect_terminator(result_buf);
-    let write_len = status.write_len(result_buf.len());
-
-    // Save any leftover bytes for next response
-    if write_len < result_buf.len() {
-        let remainder = &result_buf[write_len..];
-        anyhow::ensure!(
-            remainder.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
-            "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
-            crate::constants::buffer::MAX_LEFTOVER_BYTES,
-            remainder.len()
-        );
-        conn.stash_leftover(remainder)?;
-        result_buf.truncate(write_len);
-    }
-
-    if !status.is_found() {
-        tail.update(result_buf);
-
-        loop {
-            let n = buffer.read_from(conn).await?;
-            if n == 0 {
-                // C4: EOF before terminator is an error, not success
-                anyhow::bail!(
-                    "Backend EOF before multiline terminator (received {} bytes)",
-                    result_buf.len()
-                );
-            }
-            let chunk = &buffer[..n];
-            let status = tail.detect_terminator(chunk);
-            let write_len = status.write_len(n);
-            result_buf.extend_from_slice(&chunk[..write_len]);
-
-            if status.is_found() {
-                // Save leftover bytes for next response
-                if write_len < n {
-                    let remainder = &chunk[write_len..];
-                    anyhow::ensure!(
-                        remainder.len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
-                        "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
-                        crate::constants::buffer::MAX_LEFTOVER_BYTES,
-                        remainder.len()
-                    );
-                    conn.stash_leftover(remainder)?;
-                }
-                break;
-            }
-            tail.update(&chunk[..write_len]);
-        }
-    }
-
-    Ok((result_buf.split().freeze(), status_code))
+        pool,
+        BackendId::from_index(0),
+    )
+    .await
+    .map_err(crate::session::streaming::StreamingError::into_anyhow)
 }
 
 /// Send error responses to all requests in a batch.
@@ -361,11 +276,9 @@ async fn read_full_response(
 /// Takes ownership of the Vec, drains it, and returns the empty Vec
 /// so the caller can reuse the allocation.
 #[allow(clippy::iter_with_drain)] // drain used intentionally; empty Vec returned for allocation reuse
-fn fail_batch(mut batch: Vec<QueuedRequest>, error_msg: &str) -> Vec<QueuedRequest> {
+fn fail_batch(mut batch: Vec<QueuedRequest>, error: PipelineError) -> Vec<QueuedRequest> {
     for req in batch.drain(..) {
-        let _ = req
-            .response_tx
-            .send(PipelineResponse::Error(error_msg.to_string()));
+        let _ = req.response_tx.send(PipelineResponse::Error(error));
     }
     batch
 }
@@ -374,11 +287,34 @@ fn fail_batch(mut batch: Vec<QueuedRequest>, error_msg: &str) -> Vec<QueuedReque
 mod tests {
     use super::*;
     use crate::pool::BufferPool;
+    use crate::router::backend_queue::QueuedCommand;
     use crate::stream::ConnectionStream;
-    use bytes::BytesMut;
     use proptest::prelude::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn queued_request(
+        command: &str,
+    ) -> (
+        QueuedRequest,
+        tokio::sync::oneshot::Receiver<PipelineResponse>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            QueuedRequest {
+                command: QueuedCommand::from_command(command),
+                response_tx: tx,
+            },
+            rx,
+        )
+    }
+
+    fn expect_success_status(response: PipelineResponse) -> u16 {
+        match response {
+            PipelineResponse::Success { status_code, .. } => status_code.as_u16(),
+            other @ PipelineResponse::Error(_) => panic!("Expected Success, got {other:?}"),
+        }
+    }
 
     /// Helper: create a TCP pair where the server writes `data` then optionally closes.
     /// Returns a `ConnectionStream` connected to the mock server.
@@ -442,13 +378,10 @@ mod tests {
         let mut rxs = Vec::with_capacity(responses.len());
         let mut expected_command_bytes = 0usize;
         for idx in 0..responses.len() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
             let command = format!("STAT <msg{idx}@example.com>\r\n");
             expected_command_bytes += command.len();
-            batch.push(QueuedRequest {
-                command: Arc::from(command),
-                response_tx: tx,
-            });
+            let (request, rx) = queued_request(&command);
+            batch.push(request);
             rxs.push(rx);
         }
 
@@ -470,7 +403,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let mut result_buf = bytes::BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
             &mut conn,
@@ -495,16 +428,16 @@ mod tests {
     async fn test_read_full_response_single_line() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
             .await
             .expect("should parse single-line response");
 
         assert_eq!(status.as_u16(), 430);
-        assert_eq!(&data[..], b"430 No such article\r\n");
+        assert_eq!(result_buf.to_vec(), b"430 No such article\r\n");
         assert!(!conn.has_leftover());
     }
 
@@ -512,17 +445,17 @@ mod tests {
     async fn test_read_full_response_multiline() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
         let mut conn = mock_backend_conn(response).await;
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
             .await
             .expect("should parse multiline response");
 
         assert_eq!(status.as_u16(), 220);
-        assert_eq!(&data[..], &response[..]);
+        assert_eq!(result_buf.to_vec(), response);
         assert!(!conn.has_leftover());
     }
 
@@ -530,7 +463,7 @@ mod tests {
     async fn test_read_full_response_multiline_across_chunks() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Split the terminator \r\n.\r\n across two chunks
         let chunk1 = b"220 0 <msg@id> article\r\nBody\r\n.".to_vec();
@@ -538,13 +471,13 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
             .await
             .expect("should detect terminator across chunks");
 
         assert_eq!(status.as_u16(), 220);
         assert!(
-            data.ends_with(b"\r\n.\r\n"),
+            result_buf.ends_with(b"\r\n.\r\n"),
             "response should end with terminator"
         );
         assert!(!conn.has_leftover());
@@ -554,48 +487,48 @@ mod tests {
     async fn test_read_full_response_with_leftover() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Two responses packed together
         let packed = b"220 0 <a@b> article\r\nBody\r\n.\r\n430 No such article\r\n";
         let mut conn = mock_backend_conn(packed).await;
 
         // First read should get the multiline response and save leftover
-        let (data1, status1) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status1 = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
             .await
             .expect("should parse first response");
 
         assert_eq!(status1.as_u16(), 220);
-        assert!(data1.ends_with(b"\r\n.\r\n"));
+        assert!(result_buf.ends_with(b"\r\n.\r\n"));
         assert!(
             conn.has_leftover(),
             "should have leftover from second response"
         );
 
         // Second read should consume leftover and return the 430
-        let (data2, status2) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status2 = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
             .await
             .expect("should parse second response from leftover");
 
         assert_eq!(status2.as_u16(), 430);
-        assert_eq!(&data2[..], b"430 No such article\r\n");
+        assert_eq!(result_buf.to_vec(), b"430 No such article\r\n");
     }
 
     #[tokio::test]
     async fn test_read_full_response_eof_mid_stream() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Multiline response without terminator — server disconnects
         let mut conn = mock_backend_conn(b"220 0 <a@b> article\r\nBody line\r\n").await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
         assert!(result.is_err(), "EOF before terminator should be an error");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("EOF") || err.contains("eof"),
-            "Error should mention EOF: {err}"
+            err.contains("closed connection before multiline terminator"),
+            "Error should describe the premature backend close: {err}"
         );
     }
 
@@ -603,11 +536,11 @@ mod tests {
     async fn test_read_full_response_invalid_status() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let mut conn = mock_backend_conn(b"garbage data here\r\n").await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
         assert!(result.is_err(), "Invalid status code should be an error");
     }
 
@@ -615,31 +548,31 @@ mod tests {
     async fn test_read_full_response_short_leftover_triggers_h5() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Backend will provide the rest of the response
         let mut conn = mock_backend_conn(b"0 No such article\r\n").await;
         // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
         conn.stash_leftover(b"43").unwrap();
 
-        let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
             .await
             .expect("short leftover + read should produce valid response");
 
         assert_eq!(status.as_u16(), 430);
-        assert!(data.starts_with(b"430"));
+        assert!(result_buf.starts_with(b"430"));
     }
 
     #[tokio::test]
     async fn test_read_full_response_empty_connection() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Server immediately closes
         let mut conn = mock_backend_conn(b"").await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
         assert!(result.is_err(), "Empty connection should be an error");
     }
 
@@ -718,13 +651,10 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn: crate::stream::ConnectionStream = ConnectionStream::plain(stream);
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch = vec![QueuedRequest {
-            command: Arc::from("STAT <test@msg.id>\r\n"),
-            response_tx: tx,
-        }];
+        let (request, rx) = queued_request("STAT <test@msg.id>\r\n");
+        let batch = vec![request];
 
-        let mut result_buf = bytes::BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
@@ -737,12 +667,7 @@ mod tests {
         .await;
 
         assert!(success, "single 430 should not mark connection as broken");
-        match rx.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 430);
-            }
-            other @ PipelineResponse::Error(_) => panic!("Expected Success, got {other:?}"),
-        }
+        assert_eq!(expect_success_status(rx.await.unwrap()), 430);
     }
 
     #[tokio::test]
@@ -772,20 +697,11 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedRequest {
-                command: Arc::from("STAT <a@b>\r\n"),
-                response_tx: tx1,
-            },
-            QueuedRequest {
-                command: Arc::from("STAT <c@d>\r\n"),
-                response_tx: tx2,
-            },
-        ];
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
 
-        let mut result_buf = bytes::BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
@@ -798,18 +714,8 @@ mod tests {
         .await;
         assert!(success);
 
-        match rx1.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 223);
-            }
-            other @ PipelineResponse::Error(_) => panic!("Expected 223 Success, got {other:?}"),
-        }
-        match rx2.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 430);
-            }
-            other @ PipelineResponse::Error(_) => panic!("Expected 430 Success, got {other:?}"),
-        }
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
     }
 
     #[tokio::test]
@@ -835,20 +741,11 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedRequest {
-                command: Arc::from("STAT <a@b>\r\n"),
-                response_tx: tx1,
-            },
-            QueuedRequest {
-                command: Arc::from("STAT <c@d>\r\n"),
-                response_tx: tx2,
-            },
-        ];
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
 
-        let mut result_buf = bytes::BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
@@ -862,14 +759,7 @@ mod tests {
         assert!(!success, "server disconnect should mark connection broken");
 
         // First response should succeed
-        match rx1.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 223);
-            }
-            other @ PipelineResponse::Error(_) => {
-                panic!("Expected first to succeed, got {other:?}")
-            }
-        }
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
         // Second response should be error
         match rx2.await.unwrap() {
             PipelineResponse::Error(_) => {} // Expected
@@ -904,20 +794,11 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedRequest {
-                command: Arc::from("STAT <a@b>\r\n"),
-                response_tx: tx1,
-            },
-            QueuedRequest {
-                command: Arc::from("STAT <c@d>\r\n"),
-                response_tx: tx2,
-            },
-        ];
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
 
-        let mut result_buf = bytes::BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
@@ -938,18 +819,30 @@ mod tests {
             "unexpected extra response bytes should remain buffered until the connection is retired"
         );
 
-        match rx1.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 223);
-            }
-            other => panic!("Expected 223 Success, got {other:?}"),
-        }
-        match rx2.await.unwrap() {
-            PipelineResponse::Success { status_code, .. } => {
-                assert_eq!(status_code.as_u16(), 430);
-            }
-            other => panic!("Expected 430 Success, got {other:?}"),
-        }
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
+    }
+
+    #[test]
+    fn test_fail_batch_sends_same_error_to_all_requests() {
+        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let error = PipelineError::ConnectionLost {
+            completed: 1,
+            batch_len: 2,
+        };
+
+        let reused = fail_batch(vec![req1, req2], error);
+
+        assert!(
+            reused.is_empty(),
+            "drained batch should be returned empty for reuse"
+        );
+        [rx1.blocking_recv().unwrap(), rx2.blocking_recv().unwrap()]
+            .into_iter()
+            .for_each(|response| {
+                assert!(matches!(response, PipelineResponse::Error(e) if e == error))
+            });
     }
 
     proptest! {
@@ -972,7 +865,7 @@ mod tests {
             rt.block_on(async {
                 let pool = BufferPool::for_tests();
                 let mut buffer = pool.acquire().await;
-                let mut result_buf = BytesMut::with_capacity(4096);
+                let mut result_buf = crate::pool::ChunkedResponse::default();
 
                 let responses: Vec<Vec<u8>> = codes
                     .iter()
@@ -989,11 +882,11 @@ mod tests {
                 let mut conn = mock_backend_conn(&wire).await;
 
                 for (idx, expected) in responses.iter().enumerate() {
-                    let (data, status) = read_full_response(&mut buffer, &mut conn, &mut result_buf)
+                    let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
                         .await
                         .expect("packed single-line response should parse");
 
-                    prop_assert_eq!(&data[..], expected.as_slice());
+                    prop_assert_eq!(result_buf.to_vec(), expected.as_slice());
                     prop_assert_eq!(status.as_u16(), codes[idx]);
                 }
 
@@ -1029,7 +922,7 @@ mod tests {
                     match result {
                         PipelineResponse::Success { status_code, data, .. } => {
                             prop_assert_eq!(status_code.as_u16(), codes[idx]);
-                            prop_assert_eq!(&data[..], responses[idx].as_slice());
+                            prop_assert_eq!(data.to_vec(), responses[idx].clone());
                         }
                         other => prop_assert!(false, "expected success response, got {other:?}"),
                     }
@@ -1060,7 +953,7 @@ mod tests {
 
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Create a multiline response that accumulates in result_buf across chunks,
         // followed by oversized leftover. When the terminator is found, the remainder
@@ -1091,7 +984,7 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(chunks).await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
 
         // Should fail with bounds check error (if TCP delivers enough data in one read)
         assert!(
@@ -1111,7 +1004,7 @@ mod tests {
 
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
-        let mut result_buf = BytesMut::with_capacity(4096);
+        let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Create a response where leftover is within bounds (< MAX_LEFTOVER_BYTES)
         let mut normal_data = Vec::new();
@@ -1121,7 +1014,7 @@ mod tests {
 
         let mut conn = mock_backend_conn(&normal_data).await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf).await;
+        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
 
         // Should succeed
         assert!(

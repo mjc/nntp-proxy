@@ -439,21 +439,24 @@ impl ArticleCache {
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
     /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
-    pub async fn upsert(
+    pub async fn upsert<B>(
         &self,
         message_id: MessageId<'_>,
-        buffer: Vec<u8>,
+        buffer: B,
         backend_id: BackendId,
         tier: u8,
-    ) {
+    ) where
+        B: Into<super::CacheBuffer>,
+    {
+        let buffer = buffer.into();
         let key: Arc<str> = message_id.without_brackets().into();
         let cache_articles = self.cache_articles;
 
         // Prepare the new buffer outside the closure for stub extraction
         let new_buffer = if cache_articles {
-            buffer
+            buffer.into_vec()
         } else {
-            Self::create_minimal_stub(&buffer)
+            Self::create_minimal_stub(buffer)
         };
 
         // Wrap in Arc so we can efficiently share/move into closure without clone.
@@ -515,20 +518,28 @@ impl ArticleCache {
     ///
     /// Extracts the status code from the first line and creates a minimal stub.
     /// Falls back to "200\r\n" if parsing fails.
-    fn create_minimal_stub(buffer: &[u8]) -> Vec<u8> {
-        // Find first line (status code line)
-        if let Some(end) = buffer.iter().position(|&b| b == b'\n') {
-            // Extract status code (first 3 digits)
-            if end >= 3 {
-                let code = &buffer[..3];
-                // Verify it's actually digits
-                if code.iter().all(|&b| b.is_ascii_digit()) {
-                    return format!("{}\r\n", String::from_utf8_lossy(code)).into_bytes();
-                }
+    fn create_minimal_stub(buffer: super::CacheBuffer) -> Vec<u8> {
+        let status_line = match buffer {
+            super::CacheBuffer::Vec(buf) => super::entry_helpers::extract_status_line(&buf),
+            super::CacheBuffer::Pooled(buf) => {
+                super::entry_helpers::extract_status_line(buf.as_ref())
             }
-        }
-        // Fallback if we can't parse
-        b"200\r\n".to_vec()
+            super::CacheBuffer::Chunked(buf) => {
+                super::entry_helpers::extract_chunked_status_line(&buf)
+            }
+            super::CacheBuffer::Small(buf) => super::entry_helpers::extract_status_line(&buf),
+        };
+
+        status_line
+            .get(..3)
+            .filter(|digits| digits.iter().all(|b| b.is_ascii_digit()))
+            .map(|digits| {
+                let mut stub = Vec::with_capacity(5);
+                stub.extend_from_slice(digits);
+                stub.extend_from_slice(b"\r\n");
+                stub
+            })
+            .unwrap_or_else(|| b"200\r\n".to_vec())
     }
 
     /// Record that a backend returned 430 for this article - ATOMIC OPERATION

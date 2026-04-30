@@ -322,7 +322,8 @@ async fn test_buffer_pool_different_sizes() {
     for size in &sizes {
         let buffer_pool = BufferPool::new(BufferSize::try_new(*size).unwrap(), 1);
         let buffer = buffer_pool.acquire().await;
-        assert_eq!(buffer.capacity(), *size);
+        assert!(buffer.capacity() >= *size);
+        assert_eq!(buffer.capacity() % 4096, 0);
     }
 }
 
