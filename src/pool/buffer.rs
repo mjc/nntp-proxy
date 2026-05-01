@@ -1,10 +1,11 @@
 use crate::types::BufferSize;
+use bytes::BytesMut;
 use crossbeam::queue::SegQueue;
 use smallvec::SmallVec;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
@@ -21,19 +22,18 @@ use tracing::{debug, info};
 /// process(&*buffer);  // Deref returns only &buffer[..n]
 /// ```
 pub struct PooledBuffer {
-    buffer: Vec<u8>,
-    initialized: usize,
-    pool: Arc<SegQueue<Vec<u8>>>,
+    buffer: BytesMut,
+    pool: Arc<SegQueue<BytesMut>>,
     pool_size: Arc<AtomicUsize>,
     max_pool_size: usize,
     expected_capacity: usize,
-    reset_len: usize,
+    writable_len: usize,
 }
 
 impl std::fmt::Debug for PooledBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PooledBuffer")
-            .field("initialized", &self.initialized)
+            .field("initialized", &self.buffer.len())
             .field("capacity", &self.buffer.capacity())
             .finish_non_exhaustive()
     }
@@ -43,24 +43,25 @@ impl PooledBuffer {
     /// Get the backing allocation capacity of the buffer.
     #[must_use]
     #[inline]
-    pub const fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.buffer.capacity()
     }
 
     /// Get the number of initialized bytes
     #[must_use]
     #[inline]
-    pub const fn initialized(&self) -> usize {
-        self.initialized
+    pub fn initialized(&self) -> usize {
+        self.buffer.len()
     }
 
     /// Read from an `AsyncRead` source, automatically tracking initialized bytes
     pub async fn read_from<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
-        R: tokio::io::AsyncReadExt + Unpin,
+        R: AsyncRead + Unpin,
     {
-        let n = reader.read(&mut self.buffer[..]).await?;
-        self.initialized = n;
+        self.buffer.clear();
+        let limit = self.buffer.capacity();
+        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
         Ok(n)
     }
 
@@ -73,11 +74,10 @@ impl PooledBuffer {
     /// Returns the number of NEW bytes read (not total).
     pub async fn read_more<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
-        R: tokio::io::AsyncReadExt + Unpin,
+        R: AsyncRead + Unpin,
     {
-        let offset = self.initialized;
-        let n = reader.read(&mut self.buffer[offset..]).await?;
-        self.initialized += n;
+        let limit = self.buffer.capacity().saturating_sub(self.buffer.len());
+        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
         Ok(n)
     }
 
@@ -87,22 +87,12 @@ impl PooledBuffer {
     /// Panics if `data.len()` > capacity
     #[inline]
     pub fn copy_from_slice(&mut self, data: &[u8]) {
-        if self.buffer.is_empty() {
-            assert!(
-                data.len() <= self.buffer.capacity(),
-                "data exceeds buffer capacity"
-            );
-            if self.buffer.len() < data.len() {
-                self.buffer.resize(data.len(), 0);
-            }
-        } else {
-            assert!(
-                data.len() <= self.buffer.len(),
-                "data exceeds buffer capacity"
-            );
-        }
-        self.buffer[..data.len()].copy_from_slice(data);
-        self.initialized = data.len();
+        assert!(
+            data.len() <= self.buffer.capacity(),
+            "data exceeds buffer capacity"
+        );
+        self.buffer.clear();
+        self.buffer.extend_from_slice(data);
     }
 
     /// Reset the logical contents of the buffer without changing its backing allocation.
@@ -112,7 +102,7 @@ impl PooledBuffer {
     /// stays available for reuse.
     #[inline]
     pub fn clear(&mut self) {
-        self.initialized = 0;
+        self.buffer.clear();
     }
 
     /// Shorten the logical initialized length without changing the backing allocation.
@@ -122,10 +112,10 @@ impl PooledBuffer {
     #[inline]
     pub fn truncate(&mut self, len: usize) {
         assert!(
-            len <= self.initialized,
+            len <= self.buffer.len(),
             "truncate length exceeds initialized bytes"
         );
-        self.initialized = len;
+        self.buffer.truncate(len);
     }
 
     /// Get mutable access to the full buffer capacity
@@ -148,7 +138,10 @@ impl PooledBuffer {
     #[must_use]
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buffer[..]
+        // `create_aligned_buffer` initializes the full writable region before
+        // clearing the logical length, so this preserves the old fixed-I/O API
+        // without making those bytes part of the initialized slice.
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.as_mut_ptr(), self.writable_len) }
     }
 
     /// Append data to the buffer (accumulator mode)
@@ -171,21 +164,17 @@ impl PooledBuffer {
     /// After calling this, `.len()` (via Deref) returns the total accumulated length.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
-        let needed = self.initialized + data.len();
+        let needed = self.buffer.len() + data.len();
         // Warn if we need to grow beyond pre-allocated capacity (rare for typical articles)
         if needed > self.buffer.capacity() {
             tracing::warn!(
                 "Capture buffer growing: {} + {} > {} capacity (will allocate)",
-                self.initialized,
+                self.buffer.len(),
                 data.len(),
                 self.buffer.capacity()
             );
         }
-        if self.buffer.len() < needed {
-            self.buffer.resize(needed, 0);
-        }
-        self.buffer[self.initialized..needed].copy_from_slice(data);
-        self.initialized = needed;
+        self.buffer.extend_from_slice(data);
     }
 }
 
@@ -194,8 +183,7 @@ impl Deref for PooledBuffer {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        // Immutable access only returns the initialized portion
-        &self.buffer[..self.initialized]
+        &self.buffer
     }
 }
 
@@ -204,8 +192,7 @@ impl Deref for PooledBuffer {
 impl AsRef<[u8]> for PooledBuffer {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        // Only return initialized portion
-        &self.buffer[..self.initialized]
+        &self.buffer
     }
 }
 
@@ -220,9 +207,7 @@ impl Drop for PooledBuffer {
             return;
         }
 
-        if self.buffer.len() != self.reset_len {
-            self.buffer.resize(self.reset_len, 0);
-        }
+        self.buffer.clear();
 
         // Atomically return buffer to pool if pool is not full
         let mut current_size = self.pool_size.load(Ordering::Relaxed);
@@ -432,12 +417,12 @@ impl ChunkedResponse {
 /// Uses crossbeam's `SegQueue` for lock-free operations
 #[derive(Debug, Clone)]
 pub struct BufferPool {
-    pool: Arc<SegQueue<Vec<u8>>>,
+    pool: Arc<SegQueue<BytesMut>>,
     buffer_size: BufferSize,
     max_pool_size: usize,
     pool_size: Arc<AtomicUsize>,
     // Capture buffer pool (for accumulating streaming data)
-    capture_pool: Arc<SegQueue<Vec<u8>>>,
+    capture_pool: Arc<SegQueue<BytesMut>>,
     capture_capacity: usize,
     max_capture_pool_size: usize,
     capture_pool_size: Arc<AtomicUsize>,
@@ -446,33 +431,26 @@ pub struct BufferPool {
 impl BufferPool {
     /// Create a page-aligned buffer for optimal DMA performance
     ///
-    /// Returns a raw Vec<u8> that will be wrapped in `PooledBuffer` by `acquire()`.
-    /// The buffer is NOT zero-initialized for performance.
+    /// Returns a raw `BytesMut` that will be wrapped in `PooledBuffer` by `acquire()`.
+    /// The buffer is pre-faulted, then cleared before it enters the pool.
     ///
     /// # Safety
     ///
     /// **INTERNAL USE ONLY.** This function is not exposed publicly and is only used
     /// within the buffer pool implementation where the safety contract is guaranteed.
     ///
-    /// The returned buffer contains uninitialized memory. Callers must ensure that the buffer
-    /// is only used with `AsyncRead`/`AsyncWrite` operations that fully initialize the bytes
-    /// before they are read. Only the initialized portion of the buffer (`&buf[..n]`, where `n`
-    /// is the number of bytes read or written) may be accessed. Accessing uninitialized bytes
-    /// is undefined behavior.
+    /// The returned buffer has initialized spare storage for the fixed I/O view, but a logical
+    /// length of zero. Only bytes added to the `BytesMut` logical length are exposed through the
+    /// public initialized slice APIs.
     ///
     /// The public API (`acquire()`) returns a `PooledBuffer` which is a safe wrapper that
     /// enforces this contract through the type system and usage patterns.
-    fn create_aligned_buffer(size: usize) -> Vec<u8> {
+    fn create_aligned_buffer(size: usize) -> BytesMut {
         // Align to page boundaries (4KB) for better memory performance
         let page_size = 4096;
         let aligned_size = size.div_ceil(page_size) * page_size;
 
-        // Pre-allocate with page-aligned capacity, then zero-initialize to `size`.
-        // prefault_pages then touches every page up to `capacity` (including alignment
-        // padding) to force physical page allocation upfront, eliminating page-fault
-        // latency during I/O.
-        let mut buffer = Vec::with_capacity(aligned_size);
-        buffer.resize(size, 0u8);
+        let mut buffer = BytesMut::with_capacity(aligned_size);
         Self::prefault_pages(&mut buffer);
         buffer
     }
@@ -489,8 +467,9 @@ impl BufferPool {
     /// `write_volatile` touches one byte per 4KB page to trigger the OS page fault
     /// at init time rather than during streaming I/O. Values are overwritten by
     /// actual I/O before being read.
-    fn prefault_pages(buf: &mut Vec<u8>) {
+    fn prefault_pages(buf: &mut BytesMut) {
         let cap = buf.capacity();
+        buf.resize(cap, 0);
         // SAFETY: We write within the buffer's allocated capacity.
         // Each write_volatile touches one byte per 4KB page to trigger page faults.
         // These sentinel values (1) are overwritten by real I/O data before being read.
@@ -500,6 +479,7 @@ impl BufferPool {
                 std::ptr::write_volatile(ptr.add(offset), 1);
             }
         }
+        buf.clear();
     }
 
     /// Create a new buffer pool with pre-allocated buffers
@@ -575,7 +555,7 @@ impl BufferPool {
         );
 
         for _ in 0..count {
-            let mut buffer = Vec::with_capacity(capacity);
+            let mut buffer = BytesMut::with_capacity(capacity);
             // Pre-fault all pages to map physical memory
             Self::prefault_pages(&mut buffer);
             self.capture_pool.push(buffer);
@@ -642,8 +622,9 @@ impl BufferPool {
     fn acquire_now(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
-            // Buffer from pool is already the correct size (enforced on return)
-            debug_assert_eq!(buffer.len(), self.buffer_size.get());
+            // Buffer from pool is logically empty and has the expected allocation
+            // capacity (enforced on return).
+            debug_assert_eq!(buffer.len(), 0);
             buffer
         } else {
             // Create new page-aligned buffer for better DMA performance
@@ -658,11 +639,10 @@ impl BufferPool {
         PooledBuffer {
             expected_capacity: buffer.capacity(),
             buffer,
-            initialized: 0, // Start with 0 bytes safe to read
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
-            reset_len: self.buffer_size.get(),
+            writable_len: self.buffer_size.get(),
         }
     }
 
@@ -698,7 +678,7 @@ impl BufferPool {
             } else {
                 self.buffer_size.get()
             };
-            let mut buffer = Vec::with_capacity(capacity);
+            let mut buffer = BytesMut::with_capacity(capacity);
             Self::prefault_pages(&mut buffer);
             buffer
         };
@@ -706,11 +686,10 @@ impl BufferPool {
         PooledBuffer {
             expected_capacity: buffer.capacity(),
             buffer,
-            initialized: 0,
             pool: Arc::clone(&self.capture_pool),
             pool_size: Arc::clone(&self.capture_pool_size),
             max_pool_size: self.max_capture_pool_size,
-            reset_len: 0,
+            writable_len: 0,
         }
     }
 
@@ -848,7 +827,7 @@ mod tests {
 
         {
             let mut capture = pool.acquire_capture().await;
-            capture.extend_from_slice(&vec![b'C'; 9]);
+            capture.extend_from_slice(&[b'C'; 9]);
             assert!(capture.capacity() > 8);
         }
 
@@ -1162,7 +1141,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(10).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
-        let too_large = vec![0u8; 20];
+        let too_large = vec![0u8; buffer.capacity() + 1];
         buffer.copy_from_slice(&too_large); // Should panic
     }
 
@@ -1245,11 +1224,11 @@ mod tests {
         // Test that create_aligned_buffer aligns to page boundaries
         let buffer = BufferPool::create_aligned_buffer(1000);
         // Should be aligned to 4096
-        assert_eq!(buffer.len(), 1000);
+        assert_eq!(buffer.len(), 0);
         assert_eq!(buffer.capacity() % 4096, 0);
 
         let buffer2 = BufferPool::create_aligned_buffer(8192);
-        assert_eq!(buffer2.len(), 8192);
+        assert_eq!(buffer2.len(), 0);
         assert_eq!(buffer2.capacity() % 4096, 0);
     }
 }
