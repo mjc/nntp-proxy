@@ -55,13 +55,22 @@ impl PooledBuffer {
         self.buffer.len()
     }
 
+    #[inline]
+    fn read_limit(&self) -> usize {
+        if self.writable_len == 0 {
+            self.buffer.capacity()
+        } else {
+            self.writable_len
+        }
+    }
+
     /// Read from an `AsyncRead` source, automatically tracking initialized bytes
     pub async fn read_from<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
         R: AsyncRead + Unpin,
     {
         self.buffer.clear();
-        let limit = self.buffer.capacity();
+        let limit = self.read_limit();
         let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
         Ok(n)
     }
@@ -77,7 +86,7 @@ impl PooledBuffer {
     where
         R: AsyncRead + Unpin,
     {
-        let limit = self.buffer.capacity().saturating_sub(self.buffer.len());
+        let limit = self.read_limit().saturating_sub(self.buffer.len());
         let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
         Ok(n)
     }
@@ -749,6 +758,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_from_is_limited_to_fixed_writable_region() {
+        let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        assert!(buffer.capacity() > buffer.as_mut_slice().len());
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"220 long response over eight bytes\r\n")
+            .await
+            .unwrap();
+        drop(writer);
+
+        let read = buffer.read_from(&mut reader).await.unwrap();
+        assert_eq!(read, 8);
+        assert_eq!(buffer.initialized(), 8);
+        assert_eq!(buffer.as_mut_slice()[..read].len(), read);
+    }
+
+    #[tokio::test]
     async fn test_read_more_appends_after_initialized_bytes() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let mut buffer = pool.acquire().await;
@@ -762,6 +790,22 @@ mod tests {
         assert_eq!(read, 9);
         assert_eq!(buffer.initialized(), 11);
         assert_eq!(&*buffer, b"220 ready\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_read_more_is_limited_to_remaining_fixed_writable_region() {
+        let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        buffer.copy_from_slice(b"22");
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"0 long response\r\n").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_more(&mut reader).await.unwrap();
+        assert_eq!(read, 6);
+        assert_eq!(buffer.initialized(), 8);
+        assert_eq!(&*buffer, b"220 long");
     }
 
     #[tokio::test]
