@@ -44,12 +44,9 @@ enum BatchStep {
     /// Client disconnected; backend was cleanly drained.
     /// Caller should complete the guard and propagate the error.
     ClientDisconnect(std::io::Error),
-    /// Backend died; caller must send 430s for `commands[from_idx..]`,
-    /// remove the connection, and complete the guard.
-    BackendDead { from_idx: usize },
-    /// All remaining 430s were already sent internally (Invalid + DATE salvage path).
-    /// Caller should complete the guard; connection fate already decided.
-    BatchComplete,
+    /// Backend/protocol failure; caller must close the client session and remove
+    /// the backend connection. It is not safe to synthesize article responses.
+    BackendDead,
 }
 
 impl ClientSession {
@@ -164,28 +161,15 @@ impl ClientSession {
                     guard.complete();
                     return Err(SessionError::ClientDisconnect(io_err));
                 }
-                BatchStep::BackendDead { from_idx } => {
-                    // Send 430s for any unhandled commands, then discard the connection.
-                    self.send_430s_from(
-                        batch,
-                        from_idx,
-                        client_write,
-                        state.backend_to_client_bytes,
-                        state.client_to_backend_bytes,
-                        backend_id,
-                    )
-                    .await?;
-                    // Unconditional: BackendDead signals backend-side failures only.
-                    // Client disconnects surface as BatchStep::ClientDisconnect (handled above).
-                    // conn drops here → ConnectionGuard::remove_with_cooldown
+                BatchStep::BackendDead => {
+                    // Non-430 backend/protocol failures must not be translated into
+                    // "article not found". Close the client so it retries the batch
+                    // on a fresh connection with clean protocol state.
                     guard.complete();
-                    return Ok(());
-                }
-                BatchStep::BatchComplete => {
-                    // All 430s already sent internally; DATE check passed → connection healthy.
-                    let _ = conn.release();
-                    guard.complete();
-                    return Ok(());
+                    return Err(SessionError::ClientDisconnect(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "backend/protocol failure during pipelined batch; closing client",
+                    )));
                 }
             }
         }
@@ -203,8 +187,8 @@ impl ClientSession {
     ///
     /// # Connection pool discipline
     /// This method does **not** call `remove_with_cooldown` — that responsibility belongs
-    /// to the caller. Instead it returns `BackendDead` or `BatchComplete` to signal what
-    /// action is required.
+    /// to the caller. Instead it returns `BackendDead` to signal that the
+    /// backend connection must be discarded and the client session closed.
     async fn process_batch_response(
         &self,
         batch: &CommandBatch,
@@ -225,7 +209,7 @@ impl ClientSession {
         // --- Read first chunk (from leftover or fresh read) ---
         chunk_data.clear();
         let from_leftover = !leftover.is_empty();
-        let initial_chunk_len = if from_leftover {
+        if from_leftover {
             let leftover_len = leftover.len();
             let leftover_hex = crate::session::backend::format_hex_preview(leftover, 64);
             chunk_data.extend_from_slice(leftover);
@@ -238,12 +222,10 @@ impl ClientSession {
                 leftover_hex = %leftover_hex,
                 "Batch response starting from leftover bytes"
             );
-            chunk_data.len()
         } else {
             match bcc.buffer.read_from(&mut **bcc.conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
                     chunk_data.extend_from_slice(&bcc.buffer[..bytes_read]);
-                    bytes_read
                 }
                 Ok(_) => {
                     warn!(
@@ -251,11 +233,11 @@ impl ClientSession {
                         backend = ?backend_id,
                         response_index = idx + 1,
                         total_commands = batch.len(),
-                        "Backend EOF during batch read, sending 430 for remaining commands"
+                        "Backend EOF during batch read; closing client connection"
                     );
                     // Backend dead — unconditional remove (write/flush already succeeded,
                     // so this is a backend-side failure, not a client disconnect).
-                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                    return Ok(BatchStep::BackendDead);
                 }
                 Err(e) => {
                     warn!(
@@ -264,16 +246,16 @@ impl ClientSession {
                         response_index = idx + 1,
                         total_commands = batch.len(),
                         error = %e,
-                        "Backend read error during batch, sending 430 for remaining commands"
+                        "Backend read error during batch; closing client connection"
                     );
                     // Backend dead — unconditional remove.
-                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                    return Ok(BatchStep::BackendDead);
                 }
             }
-        };
+        }
 
-        // --- Read more if the initial chunk was too short to parse ---
-        if initial_chunk_len < crate::protocol::MIN_RESPONSE_LENGTH {
+        // --- Read through the complete status line before classifying ---
+        while backend::status_line_end(chunk_data).is_none() {
             match bcc.buffer.read_from(&mut **bcc.conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
                     chunk_data.extend_from_slice(&bcc.buffer[..bytes_read]);
@@ -284,10 +266,10 @@ impl ClientSession {
                         backend = ?backend_id,
                         response_index = idx + 1,
                         partial_bytes = chunk_data.len(),
-                        "Backend EOF with partial status line, sending 430 for remaining commands"
+                        "Backend EOF before complete status line; closing client connection"
                     );
                     // Backend dead — partial read means backend state unknown.
-                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                    return Ok(BatchStep::BackendDead);
                 }
                 Err(e) => {
                     warn!(
@@ -296,10 +278,10 @@ impl ClientSession {
                         response_index = idx + 1,
                         partial_bytes = chunk_data.len(),
                         error = %e,
-                        "Backend read error with partial status line, sending 430 for remaining commands"
+                        "Backend read error before complete status line; closing client connection"
                     );
                     // Backend dead — partial read means backend state unknown.
-                    return Ok(BatchStep::BackendDead { from_idx: idx });
+                    return Ok(BatchStep::BackendDead);
                 }
             }
         }
@@ -352,45 +334,7 @@ impl ClientSession {
                 "Backend returned Invalid response during batch, aborting batch"
             );
 
-            // Send 430 for this and all remaining commands.
-            self.send_430s_from(
-                batch,
-                idx,
-                client_write,
-                state.backend_to_client_bytes,
-                state.client_to_backend_bytes,
-                backend_id,
-            )
-            .await?;
-
-            // Attempt DATE health-check to salvage the connection.
-            // If leftover data exists in the stream, the DATE response will be corrupted
-            // and the check will fail — this is correct behaviour.
-            debug!(
-                backend = ?backend_id,
-                "Attempting to salvage connection after batch Invalid with DATE check"
-            );
-            match crate::pool::health_check::check_date_response(bcc.conn).await {
-                Ok(()) => {
-                    debug!(
-                        backend = ?backend_id,
-                        "Connection salvaged after batch Invalid + DATE check"
-                    );
-                    // All 430s sent; caller completes guard (conn returns to pool).
-                    return Ok(BatchStep::BatchComplete);
-                }
-                Err(e) => {
-                    warn!(
-                        backend = ?backend_id,
-                        error = %e,
-                        "DATE check failed after batch Invalid"
-                    );
-                    // All 430s sent; caller removes conn + completes guard.
-                    return Ok(BatchStep::BackendDead {
-                        from_idx: batch.len(),
-                    });
-                }
-            }
+            return Ok(BatchStep::BackendDead);
         }
 
         // --- Success: stream response to client ---
@@ -478,32 +422,6 @@ impl ClientSession {
         }
 
         Ok(BatchStep::Continue)
-    }
-
-    /// Send 430 "No Such Article" to the client for each command in `commands[from..]`.
-    ///
-    /// Updates byte counters and records per-command metrics (command count + 4xx error).
-    /// Does NOT touch the backend connection or guard — callers handle those after this
-    /// returns. Consistent 4xx accounting across all backend-dead recovery sites.
-    async fn send_430s_from(
-        &self,
-        batch: &CommandBatch,
-        from: usize,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        backend_to_client_bytes: &mut BackendToClientBytes,
-        client_to_backend_bytes: &mut ClientToBackendBytes,
-        backend_id: BackendId,
-    ) -> Result<()> {
-        for i in from..batch.len() {
-            let cmd = batch.command(i);
-            self.send_430_to_client(client_write, backend_to_client_bytes)
-                .await?;
-            *client_to_backend_bytes = client_to_backend_bytes.add(cmd.len());
-            self.metrics.record_command(backend_id);
-            self.metrics.record_error_4xx(backend_id);
-            self.metrics.user_command(self.username());
-        }
-        Ok(())
     }
 
     /// Route a single command to a backend and execute it

@@ -99,6 +99,32 @@ pub fn validate_backend_response(
     }
 }
 
+/// Return the byte offset immediately after the response status line.
+///
+/// NNTP status lines are CRLF-terminated. For compatibility with existing
+/// behavior, this treats a bare LF as a line boundary too; callers use this
+/// only to avoid classifying a partial status line as a complete response.
+#[must_use]
+pub(crate) fn status_line_end(data: &[u8]) -> Option<usize> {
+    memchr::memchr(b'\n', data).map(|pos| pos + 1)
+}
+
+async fn read_until_status_line<C>(conn: &mut C, buffer: &mut PooledBuffer) -> Result<()>
+where
+    C: AsyncReadExt + Unpin,
+{
+    while status_line_end(buffer).is_none() {
+        let more = buffer.read_more(conn).await?;
+        if more == 0 {
+            anyhow::bail!(
+                "Backend EOF before complete status line ({} bytes)",
+                buffer.initialized()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Format a hex preview of response bytes for debugging Invalid responses
 ///
 /// # Arguments
@@ -257,21 +283,12 @@ where
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    // H5: If first read returned fewer bytes than needed to parse a status code,
-    // accumulate more data. This handles the rare case where a TCP segment
-    // boundary splits the 3-digit status code across reads.
+    // A 3-byte status code is enough to classify the response type, but it is
+    // not a complete single-line response. If TCP splits "111 ...\r\n" after
+    // the digits, returning the connection before reading CRLF leaves stale
+    // bytes for the next borrower.
+    read_until_status_line(conn, buffer).await?;
     let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
-    if n < min_len {
-        loop {
-            let more = buffer.read_more(conn).await?;
-            if more == 0 {
-                break; // EOF — validate what we have
-            }
-            if buffer.initialized() >= min_len {
-                break; // Enough data to validate
-            }
-        }
-    }
     let total = buffer.initialized();
     let recv_elapsed = recv_start.elapsed();
 
@@ -369,6 +386,27 @@ mod tests {
             "Expected 200 greeting, got {:?}",
             resp.response
         );
+    }
+
+    #[tokio::test]
+    async fn test_send_command_reads_complete_status_line_when_code_arrives_first() {
+        // RFC-compliant servers can split a single-line response across TCP reads.
+        // Reading only the 3-byte status code would leave the rest of the line
+        // in the socket for the next command and desynchronize the connection.
+        let mut stream = ChunkedStream::new(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]);
+
+        let pool = crate::pool::BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+
+        let result = send_command(&mut stream, "DATE\r\n", &mut buffer).await;
+        assert!(
+            result.is_ok(),
+            "send_command should read through status-line CRLF"
+        );
+        let resp = result.unwrap();
+        assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
+        assert!(matches!(resp.response, NntpResponse::SingleLine(_)));
+        assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
     }
 
     #[tokio::test]

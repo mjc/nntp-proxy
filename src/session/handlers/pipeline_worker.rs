@@ -442,6 +442,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_full_response_single_line_split_after_status_code() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let mut conn =
+            mock_backend_conn_chunked(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]).await;
+
+        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
+            .await
+            .expect("should wait for complete status line");
+
+        assert_eq!(status.as_u16(), 111);
+        assert_eq!(result_buf.to_vec(), b"111 20260501173336\r\n");
+        assert!(!conn.has_leftover());
+    }
+
+    #[tokio::test]
     async fn test_read_full_response_multiline() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;

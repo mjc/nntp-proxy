@@ -125,7 +125,7 @@ pub enum NntpResponse {
 
     /// Multiline data response
     /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
-    /// - All 1xx codes (100-199)
+    /// - Specific 1xx codes: 100, 101
     /// - Specific 2xx codes: 215, 220, 221, 222, 224, 225, 230, 231, 282
     MultilineData(StatusCode),
 
@@ -164,10 +164,11 @@ impl NntpResponse {
             381 | 480 => Self::AuthRequired(code),
 
             // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
-            // All 1xx are informational multiline; specific 2xx multiline responses:
+            // Specific 1xx and 2xx responses carry multiline data:
+            // 100=HELP, 101=CAPABILITIES,
             // 215=LIST, 220=ARTICLE, 221=HEAD, 222=BODY, 224=XOVER/XHDR,
             // 225=HEADERS, 230=NEWNEWS, 231=NEWGROUPS, 282=XZHDR/XZVER, 288=XFEATURE COMPRESS GZIP
-            100..=199 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => {
+            100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => {
                 Self::MultilineData(code)
             }
 
@@ -260,15 +261,15 @@ impl StatusCode {
     /// certain status codes indicate multiline data follows.
     ///
     /// # Multiline Response Codes
-    /// - **1xx**: All informational responses (100-199)
+    /// - **1xx**: Specific codes - 100, 101
     /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282, 288
     #[inline]
     #[must_use]
     pub fn is_multiline(&self) -> bool {
-        // All 1xx are multiline; specific 2xx multiline codes
+        // DATE (111) is informational but single-line, so do not classify 1xx by range.
         matches!(
             **self,
-            100..=199 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
+            100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
         )
     }
 }
@@ -289,8 +290,10 @@ mod tests {
 
     #[test]
     fn test_status_code_multiline() {
-        // All 1xx are multiline
-        assert!(StatusCode::new(111).is_multiline());
+        // HELP and CAPABILITIES are multiline; DATE (111) is single-line.
+        assert!(StatusCode::new(100).is_multiline());
+        assert!(StatusCode::new(101).is_multiline());
+        assert!(!StatusCode::new(111).is_multiline());
         // Specific 2xx multiline codes
         assert!(StatusCode::new(220).is_multiline());
         assert!(!StatusCode::new(200).is_multiline());

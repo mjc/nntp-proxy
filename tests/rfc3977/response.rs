@@ -180,7 +180,8 @@ fn test_response_101_capability_list() {
 fn test_response_111_server_date() {
     let code = StatusCode::new(111);
     assert!(code.is_informational());
-    assert!(code.is_multiline());
+    assert!(!code.is_multiline());
+    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").is_multiline());
 }
 
 // StatusCode::parse() tests
@@ -417,10 +418,11 @@ fn test_response_status_code_extraction() {
 
 #[test]
 fn test_status_code_multiline_detection() {
-    // All 1xx are multiline
+    // HELP and CAPABILITIES are multiline, but DATE is single-line.
     assert!(StatusCode::new(100).is_multiline());
-    assert!(StatusCode::new(111).is_multiline());
-    assert!(StatusCode::new(199).is_multiline());
+    assert!(StatusCode::new(101).is_multiline());
+    assert!(!StatusCode::new(111).is_multiline());
+    assert!(!StatusCode::new(199).is_multiline());
 
     // Specific 2xx multiline codes
     assert!(StatusCode::new(220).is_multiline());

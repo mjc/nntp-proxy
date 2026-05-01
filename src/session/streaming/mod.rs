@@ -379,22 +379,15 @@ pub(crate) async fn read_full_response(
             "Backend connection closed unexpectedly"
         )));
     }
-    if n < crate::protocol::MIN_RESPONSE_LENGTH {
-        loop {
-            let more = io_buffer.read_more(conn).await.map_err(|e| {
-                StreamingError::Io(
-                    anyhow::Error::from(e).context("Failed to read partial status line"),
-                )
-            })?;
-            if more == 0 {
-                return Err(StreamingError::Io(anyhow::anyhow!(
-                    "Backend EOF with partial status line ({} bytes)",
-                    io_buffer.initialized()
-                )));
-            }
-            if io_buffer.initialized() >= crate::protocol::MIN_RESPONSE_LENGTH {
-                break;
-            }
+    while crate::session::backend::status_line_end(io_buffer).is_none() {
+        let more = io_buffer.read_more(conn).await.map_err(|e| {
+            StreamingError::Io(anyhow::Error::from(e).context("Failed to read partial status line"))
+        })?;
+        if more == 0 {
+            return Err(StreamingError::Io(anyhow::anyhow!(
+                "Backend EOF before complete status line ({} bytes)",
+                io_buffer.initialized()
+            )));
         }
     }
 
