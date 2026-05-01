@@ -723,6 +723,7 @@ impl BufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_buffer_pool_creation() {
@@ -733,6 +734,126 @@ mod tests {
         assert_eq!(buffer1.capacity(), 8192);
         assert_eq!(buffer1.initialized(), 0); // No bytes initialized yet
         // Buffer automatically returned on drop
+    }
+
+    #[tokio::test]
+    async fn test_acquire_starts_empty_with_stable_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+
+        let capacity = {
+            let buffer = pool.acquire().await;
+            assert_eq!(buffer.initialized(), 0);
+            assert_eq!(buffer.len(), 0);
+            buffer.capacity()
+        };
+
+        let buffer = pool.acquire().await;
+        assert_eq!(buffer.initialized(), 0);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn test_read_from_sets_initialized_without_reducing_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let capacity = buffer.capacity();
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+
+        writer.write_all(b"220 ready\r\n").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_from(&mut reader).await.unwrap();
+        assert_eq!(read, 11);
+        assert_eq!(buffer.initialized(), 11);
+        assert_eq!(&*buffer, b"220 ready\r\n");
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn test_read_more_appends_after_initialized_bytes() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        buffer.copy_from_slice(b"22");
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"0 ready\r\n").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_more(&mut reader).await.unwrap();
+        assert_eq!(read, 9);
+        assert_eq!(buffer.initialized(), 11);
+        assert_eq!(&*buffer, b"220 ready\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_copy_from_slice_overwrites_and_allows_up_to_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let capacity = buffer.capacity();
+
+        buffer.copy_from_slice(b"previous bytes");
+        assert_eq!(&*buffer, b"previous bytes");
+
+        let data = vec![b'X'; capacity];
+        buffer.copy_from_slice(&data);
+        assert_eq!(buffer.initialized(), capacity);
+        assert_eq!(&buffer[..4], b"XXXX");
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "data exceeds buffer capacity")]
+    async fn test_copy_from_slice_rejects_larger_than_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let too_large = vec![b'X'; buffer.capacity() + 1];
+
+        buffer.copy_from_slice(&too_large);
+    }
+
+    #[tokio::test]
+    async fn test_clear_and_truncate_only_change_initialized_length() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let capacity = buffer.capacity();
+
+        buffer.copy_from_slice(b"abcdef");
+        buffer.truncate(3);
+        assert_eq!(buffer.initialized(), 3);
+        assert_eq!(&*buffer, b"abc");
+        assert_eq!(buffer.capacity(), capacity);
+
+        buffer.clear();
+        assert_eq!(buffer.initialized(), 0);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn test_resized_buffers_are_discarded_instead_of_repooled() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 1);
+
+        let normal_capacity = {
+            let mut buffer = pool.acquire().await;
+            let capacity = buffer.capacity();
+            buffer.extend_from_slice(&vec![b'N'; capacity + 1]);
+            assert!(buffer.capacity() > capacity);
+            capacity
+        };
+
+        let buffer = pool.acquire().await;
+        assert_eq!(buffer.capacity(), normal_capacity);
+        drop(buffer);
+
+        {
+            let mut capture = pool.acquire_capture().await;
+            capture.extend_from_slice(&vec![b'C'; 9]);
+            assert!(capture.capacity() > 8);
+        }
+
+        let capture = pool.acquire_capture().await;
+        assert_eq!(capture.capacity(), 8);
     }
 
     #[tokio::test]
