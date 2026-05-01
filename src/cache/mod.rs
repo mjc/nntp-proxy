@@ -28,7 +28,9 @@ pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 
 // Internal helper re-exported for session handlers
-pub(crate) use entry_helpers::{build_stat_response, extract_chunked_status_line};
+pub(crate) use entry_helpers::{
+    build_stat_response, extract_chunked_status_line, extract_status_line,
+};
 
 use crate::types::{BackendId, MessageId};
 use smallvec::SmallVec;

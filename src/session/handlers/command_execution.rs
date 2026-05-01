@@ -375,33 +375,28 @@ impl ClientSession {
                 Ok(captured_len as u64)
             }
             (true, CacheAction::TrackAvailability) => {
-                let captured =
-                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
-                        .await?;
-                captured
-                    .write_all_to(client_write)
-                    .await
-                    .map_err(classify_buffered_response_write_err)?;
-
-                // Extract first status line (~30-80 bytes) instead of copying
-                // full response. The cache only needs the status
-                // code to build an availability stub.
-                let stub = crate::cache::extract_chunked_status_line(&captured);
+                // Availability-only mode should not buffer the article body.
+                // Keep first-byte latency and memory bounded by streaming directly,
+                // then cache only the status-line stub after the terminator is seen.
+                let stub = crate::cache::extract_status_line(params.first_chunk);
+                let bytes = streaming::stream_multiline_response(
+                    &mut **pooled_conn,
+                    client_write,
+                    params.first_chunk,
+                    ctx,
+                )
+                .await?;
                 self.maybe_cache_upsert_buffer(params.msg_id, stub.into(), ctx.backend_id);
-                Ok(captured.len() as u64)
+                Ok(bytes)
             }
             (true, _) => {
-                // Multiline responses are fully buffered before any client write in
-                // per-command mode so the full terminator-validated response is known
-                // before forwarding.
-                let captured =
-                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
-                        .await?;
-                captured
-                    .write_all_to(client_write)
-                    .await
-                    .map_err(classify_buffered_response_write_err)?;
-                Ok(captured.len() as u64)
+                streaming::stream_multiline_response(
+                    &mut **pooled_conn,
+                    client_write,
+                    params.first_chunk,
+                    ctx,
+                )
+                .await
             }
             (false, CacheAction::TrackStat) => {
                 // Single-line: backend already has complete response in first_chunk,
