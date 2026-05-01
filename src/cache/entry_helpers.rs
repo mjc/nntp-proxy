@@ -4,7 +4,7 @@
 //! providing common logic used by both `ArticleEntry` (moka) and
 //! `HybridArticleEntry` (foyer) cache implementations.
 
-use crate::session::streaming::tail_buffer::TailBuffer;
+use crate::{pool::ChunkedResponse, session::streaming::tail_buffer::TailBuffer};
 use smallvec::SmallVec;
 
 /// Check if a buffer contains a valid NNTP multiline response
@@ -67,7 +67,7 @@ pub(super) fn response_for_command(
 ) -> Option<Vec<u8>> {
     match (status_code, cmd_verb) {
         // STAT just needs existence confirmation - synthesize response
-        (220..=222, "STAT") => Some(format!("223 0 {message_id}\r\n").into_bytes()),
+        (220..=222, "STAT") => Some(build_stat_response(message_id).into_vec()),
         // Direct match - return cached buffer if valid
         (220, "ARTICLE") | (222, "BODY") | (221, "HEAD") => {
             if is_valid_response(buffer) {
@@ -96,6 +96,16 @@ pub(super) fn response_for_command(
         }
         _ => None,
     }
+}
+
+/// Build a `223 0 <message-id>\r\n` response using stack-backed storage.
+#[must_use]
+pub fn build_stat_response(message_id: &str) -> SmallVec<[u8; 128]> {
+    let mut out = SmallVec::new();
+    out.extend_from_slice(b"223 0 ");
+    out.extend_from_slice(message_id.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// Check if a status code can serve a given command verb
@@ -144,6 +154,14 @@ pub fn extract_status_line(buffer: &[u8]) -> SmallVec<[u8; 128]> {
     } else {
         SmallVec::from_slice(buffer)
     }
+}
+
+/// Extract the first status line from a chunked response without flattening.
+#[inline]
+pub fn extract_chunked_status_line(buffer: &ChunkedResponse) -> SmallVec<[u8; 128]> {
+    let mut prefix = SmallVec::<[u8; 128]>::new();
+    buffer.copy_prefix_into(buffer.len().min(128), &mut prefix);
+    extract_status_line(&prefix)
 }
 
 #[cfg(test)]
@@ -466,5 +484,17 @@ mod tests {
         let stub = extract_status_line(buf);
         // cr_pos = 8, end = min(10, 9) = 9
         assert_eq!(stub.as_slice(), b"220 test\r");
+    }
+
+    #[tokio::test]
+    async fn test_extract_chunked_status_line_across_chunks() {
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
+                .with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"220 0 <test@example.com>\r\nBody\r\n.\r\n");
+
+        let stub = extract_chunked_status_line(&response);
+        assert_eq!(stub.as_slice(), b"220 0 <test@example.com>\r\n");
     }
 }

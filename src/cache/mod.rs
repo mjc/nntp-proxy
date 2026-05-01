@@ -28,9 +28,126 @@ pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 
 // Internal helper re-exported for session handlers
-pub(crate) use entry_helpers::extract_status_line;
+pub(crate) use entry_helpers::{
+    build_stat_response, extract_chunked_status_line, extract_status_line,
+};
 
 use crate::types::{BackendId, MessageId};
+use smallvec::SmallVec;
+
+/// Owned response storage passed across the async cache ingest boundary.
+///
+/// Hot-path code should hand off one of these owned forms directly instead of
+/// flattening into a fresh `Vec<u8>` before spawning cache work.
+#[derive(Debug)]
+pub enum CacheBuffer {
+    Vec(Vec<u8>),
+    Pooled(crate::pool::PooledBuffer),
+    Chunked(crate::pool::ChunkedResponse),
+    Small(SmallVec<[u8; 128]>),
+}
+
+impl CacheBuffer {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Vec(buf) => buf.len(),
+            Self::Pooled(buf) => buf.len(),
+            Self::Chunked(buf) => buf.len(),
+            Self::Small(buf) => buf.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Cold-path flattening for cache backends that still require contiguous bytes.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Vec(buf) => buf,
+            Self::Pooled(buf) => buf.as_ref().to_vec(),
+            Self::Chunked(buf) => buf.to_vec(),
+            Self::Small(buf) => buf.into_vec(),
+        }
+    }
+}
+
+impl PartialEq for CacheBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        fn chunks<'a>(buf: &'a CacheBuffer) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            match buf {
+                CacheBuffer::Vec(v) => Box::new(std::iter::once(v.as_slice())),
+                CacheBuffer::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
+                CacheBuffer::Chunked(v) => Box::new(v.iter_chunks()),
+                CacheBuffer::Small(v) => Box::new(std::iter::once(v.as_slice())),
+            }
+        }
+
+        if self.len() != other.len() {
+            return false;
+        }
+
+        let left = chunks(self).flat_map(|chunk| chunk.iter().copied());
+        let mut right = chunks(other).flat_map(|chunk| chunk.iter().copied());
+        left.eq(&mut right)
+    }
+}
+
+impl Eq for CacheBuffer {}
+
+impl From<Vec<u8>> for CacheBuffer {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Vec(value)
+    }
+}
+
+impl From<crate::pool::PooledBuffer> for CacheBuffer {
+    fn from(value: crate::pool::PooledBuffer) -> Self {
+        Self::Pooled(value)
+    }
+}
+
+impl From<crate::pool::ChunkedResponse> for CacheBuffer {
+    fn from(value: crate::pool::ChunkedResponse) -> Self {
+        Self::Chunked(value)
+    }
+}
+
+impl From<SmallVec<[u8; 128]>> for CacheBuffer {
+    fn from(value: SmallVec<[u8; 128]>) -> Self {
+        Self::Small(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cache_buffer_equality_spans_storage_forms() {
+        let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
+                .with_capture_pool(8, 4);
+
+        let mut pooled = pool.acquire().await;
+        pooled.copy_from_slice(bytes);
+
+        let mut chunked = crate::pool::ChunkedResponse::default();
+        chunked.extend_from_slice(&pool, bytes);
+
+        let small = SmallVec::<[u8; 128]>::from_slice(bytes);
+
+        assert_eq!(
+            CacheBuffer::Vec(bytes.to_vec()),
+            CacheBuffer::Pooled(pooled)
+        );
+        assert_eq!(CacheBuffer::Chunked(chunked), CacheBuffer::Small(small));
+    }
+}
 
 /// Statistics for cache display in TUI
 #[derive(Debug, Clone, Default)]
@@ -148,13 +265,16 @@ impl UnifiedCache {
     /// Upsert (insert or update) an article in the cache
     ///
     /// The tier is used for tier-aware TTL calculation (higher tier = longer TTL).
-    pub async fn upsert(
+    pub async fn upsert<B>(
         &self,
         message_id: MessageId<'_>,
-        buffer: Vec<u8>,
+        buffer: B,
         backend_id: BackendId,
         tier: u8,
-    ) {
+    ) where
+        B: Into<CacheBuffer>,
+    {
+        let buffer = buffer.into();
         match self {
             Self::Memory(cache) => cache.upsert(message_id, buffer, backend_id, tier).await,
             Self::Hybrid(cache) => cache.upsert(message_id, buffer, backend_id, tier).await,

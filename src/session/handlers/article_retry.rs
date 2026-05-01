@@ -3,7 +3,7 @@
 //! Handles routing article commands across backends, using `ArticleAvailability`
 //! to skip backends that have already returned 430 for a given article.
 
-use crate::router::backend_queue::{PipelineResponse, QueuedRequest};
+use crate::router::backend_queue::{PipelineResponse, QueuedCommand, QueuedRequest};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::SessionError;
@@ -23,8 +23,6 @@ use crate::session::precheck;
 pub(super) struct BatchPipelineState<'a> {
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub backend_to_client_bytes: &'a mut BackendToClientBytes,
-    pub leftover: &'a mut bytes::BytesMut,
-    pub chunk_data: &'a mut bytes::BytesMut,
 }
 
 /// Backend connection context for `process_batch_response`
@@ -35,6 +33,8 @@ struct BatchConnContext<'a> {
     conn: &'a mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
     backend_id: BackendId,
     buffer: &'a mut crate::pool::PooledBuffer,
+    leftover: &'a mut crate::pool::PooledBuffer,
+    chunk_data: &'a mut crate::pool::PooledBuffer,
 }
 
 /// Per-response outcome from `process_batch_response`
@@ -130,10 +130,10 @@ impl ClientSession {
 
         // Phase 2: Read and stream responses in order.
         // Buffer acquired once, reused across all responses.
-        // State buffers cleared here; they persist across batch_execute_articles calls.
+        // Scratch buffers are needed only while backend responses are being read.
         let mut buffer = self.buffer_pool.acquire().await;
-        state.leftover.clear();
-        state.chunk_data.clear();
+        let mut leftover = self.buffer_pool.acquire().await;
+        let mut chunk_data = self.buffer_pool.acquire().await;
         debug!(
             client = %self.client_addr,
             backend = ?backend_id,
@@ -147,6 +147,8 @@ impl ClientSession {
                 conn: &mut conn,
                 backend_id,
                 buffer: &mut buffer,
+                leftover: &mut leftover,
+                chunk_data: &mut chunk_data,
             };
             match self
                 .process_batch_response(batch, i, &mut bcc, client_write, &mut state)
@@ -217,15 +219,17 @@ impl ClientSession {
         let backend_id = bcc.backend_id;
         let command = batch.command(idx);
         let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
+        let leftover = &mut bcc.leftover;
+        let chunk_data = &mut bcc.chunk_data;
 
         // --- Read first chunk (from leftover or fresh read) ---
-        state.chunk_data.clear();
-        let from_leftover = !state.leftover.is_empty();
+        chunk_data.clear();
+        let from_leftover = !leftover.is_empty();
         let initial_chunk_len = if from_leftover {
-            let leftover_len = state.leftover.len();
-            let leftover_hex = crate::session::backend::format_hex_preview(state.leftover, 64);
-            state.chunk_data.extend_from_slice(state.leftover);
-            state.leftover.clear();
+            let leftover_len = leftover.len();
+            let leftover_hex = crate::session::backend::format_hex_preview(leftover, 64);
+            chunk_data.extend_from_slice(leftover);
+            leftover.clear();
             debug!(
                 client = %self.client_addr,
                 backend = ?backend_id,
@@ -234,13 +238,11 @@ impl ClientSession {
                 leftover_hex = %leftover_hex,
                 "Batch response starting from leftover bytes"
             );
-            state.chunk_data.len()
+            chunk_data.len()
         } else {
             match bcc.buffer.read_from(&mut **bcc.conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
-                    state
-                        .chunk_data
-                        .extend_from_slice(&bcc.buffer[..bytes_read]);
+                    chunk_data.extend_from_slice(&bcc.buffer[..bytes_read]);
                     bytes_read
                 }
                 Ok(_) => {
@@ -274,16 +276,14 @@ impl ClientSession {
         if initial_chunk_len < crate::protocol::MIN_RESPONSE_LENGTH {
             match bcc.buffer.read_from(&mut **bcc.conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
-                    state
-                        .chunk_data
-                        .extend_from_slice(&bcc.buffer[..bytes_read]);
+                    chunk_data.extend_from_slice(&bcc.buffer[..bytes_read]);
                 }
                 Ok(_) => {
                     warn!(
                         client = %self.client_addr,
                         backend = ?backend_id,
                         response_index = idx + 1,
-                        partial_bytes = state.chunk_data.len(),
+                        partial_bytes = chunk_data.len(),
                         "Backend EOF with partial status line, sending 430 for remaining commands"
                     );
                     // Backend dead — partial read means backend state unknown.
@@ -294,7 +294,7 @@ impl ClientSession {
                         client = %self.client_addr,
                         backend = ?backend_id,
                         response_index = idx + 1,
-                        partial_bytes = state.chunk_data.len(),
+                        partial_bytes = chunk_data.len(),
                         error = %e,
                         "Backend read error with partial status line, sending 430 for remaining commands"
                     );
@@ -304,7 +304,7 @@ impl ClientSession {
             }
         }
 
-        let chunk = &state.chunk_data[..];
+        let chunk = &chunk_data[..];
 
         // --- Validate response ---
         let validated = backend::validate_backend_response(
@@ -319,7 +319,7 @@ impl ClientSession {
         if response_code.is_430() {
             // Single-line 430: split at line boundary, saving the next response's prefix.
             if !is_multiline {
-                super::split_single_line_response(state.chunk_data, state.leftover);
+                super::split_single_line_response(chunk_data, leftover);
             }
 
             self.send_430_to_client(client_write, state.backend_to_client_bytes)
@@ -407,7 +407,7 @@ impl ClientSession {
                 client_write,
                 chunk,
                 &ctx,
-                state.leftover,
+                leftover,
             )
             .await
             {
@@ -417,8 +417,8 @@ impl ClientSession {
                         backend = ?backend_id,
                         idx = idx,
                         bytes_written = bytes,
-                        new_leftover_len = state.leftover.len(),
-                        new_leftover_hex = %crate::session::backend::format_hex_preview(state.leftover, 64),
+                        new_leftover_len = leftover.len(),
+                        new_leftover_hex = %crate::session::backend::format_hex_preview(leftover, 64),
                         "Batch multiline response streamed"
                     );
                     bytes
@@ -456,9 +456,9 @@ impl ClientSession {
             }
         } else {
             // Single-line response: split at line boundary, saving the next response's prefix.
-            super::split_single_line_response(state.chunk_data, state.leftover);
-            client_write.write_all(&state.chunk_data[..]).await?;
-            state.chunk_data.len() as u64
+            super::split_single_line_response(chunk_data, leftover);
+            client_write.write_all(&chunk_data[..]).await?;
+            chunk_data.len() as u64
         };
 
         *state.backend_to_client_bytes = state.backend_to_client_bytes.add(bytes_written as usize);
@@ -615,7 +615,7 @@ impl ClientSession {
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let request = QueuedRequest {
-                    command: std::sync::Arc::from(command),
+                    command: QueuedCommand::from_command(command),
                     response_tx: tx,
                 };
 
@@ -632,8 +632,7 @@ impl ClientSession {
                                 backend_id,
                             }) if status_code.as_u16() != 430 => {
                                 // Success - article found, return immediately
-                                client_write
-                                    .write_all(&data)
+                                data.write_all_to(client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                                 *backend_to_client_bytes = backend_to_client_bytes.add(data.len());

@@ -1,16 +1,20 @@
 use crate::types::BufferSize;
+use bytes::BytesMut;
 use crossbeam::queue::SegQueue;
+use smallvec::SmallVec;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
 ///
-/// # Safety and Uninitialized Memory
+/// # Safety and Initialized Bytes
 ///
-/// Buffers contain **uninitialized memory** for performance (no zeroing overhead).
-/// The type tracks initialized bytes and only exposes that portion, preventing UB.
+/// The backing allocation is pre-faulted and then kept logically empty until
+/// bytes are read or copied into it. `BytesMut::len()` is the initialized length,
+/// and immutable access only exposes that initialized portion.
 ///
 /// ## Usage
 /// ```ignore
@@ -19,35 +23,55 @@ use tracing::{debug, info};
 /// process(&*buffer);  // Deref returns only &buffer[..n]
 /// ```
 pub struct PooledBuffer {
-    buffer: Vec<u8>,
-    initialized: usize,
-    pool: Arc<SegQueue<Vec<u8>>>,
+    buffer: BytesMut,
+    pool: Arc<SegQueue<BytesMut>>,
     pool_size: Arc<AtomicUsize>,
     max_pool_size: usize,
+    expected_capacity: usize,
+    writable_len: usize,
+}
+
+impl std::fmt::Debug for PooledBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledBuffer")
+            .field("initialized", &self.buffer.len())
+            .field("capacity", &self.buffer.capacity())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PooledBuffer {
-    /// Get the full capacity of the buffer
+    /// Get the backing allocation capacity of the buffer.
     #[must_use]
     #[inline]
-    pub const fn capacity(&self) -> usize {
-        self.buffer.len()
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
     }
 
     /// Get the number of initialized bytes
     #[must_use]
     #[inline]
-    pub const fn initialized(&self) -> usize {
-        self.initialized
+    pub fn initialized(&self) -> usize {
+        self.buffer.len()
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize {
+        if self.writable_len == 0 {
+            self.buffer.capacity()
+        } else {
+            self.writable_len
+        }
     }
 
     /// Read from an `AsyncRead` source, automatically tracking initialized bytes
     pub async fn read_from<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
-        R: tokio::io::AsyncReadExt + Unpin,
+        R: AsyncRead + Unpin,
     {
-        let n = reader.read(&mut self.buffer[..]).await?;
-        self.initialized = n;
+        self.buffer.clear();
+        let limit = self.read_limit();
+        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
         Ok(n)
     }
 
@@ -60,11 +84,10 @@ impl PooledBuffer {
     /// Returns the number of NEW bytes read (not total).
     pub async fn read_more<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
-        R: tokio::io::AsyncReadExt + Unpin,
+        R: AsyncRead + Unpin,
     {
-        let offset = self.initialized;
-        let n = reader.read(&mut self.buffer[offset..]).await?;
-        self.initialized += n;
+        let limit = self.read_limit().saturating_sub(self.buffer.len());
+        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
         Ok(n)
     }
 
@@ -75,23 +98,46 @@ impl PooledBuffer {
     #[inline]
     pub fn copy_from_slice(&mut self, data: &[u8]) {
         assert!(
-            data.len() <= self.buffer.len(),
+            data.len() <= self.buffer.capacity(),
             "data exceeds buffer capacity"
         );
-        self.buffer[..data.len()].copy_from_slice(data);
-        self.initialized = data.len();
+        self.buffer.clear();
+        self.buffer.extend_from_slice(data);
     }
 
-    /// Get mutable access to the full buffer capacity
+    /// Reset the logical contents of the buffer without changing its backing allocation.
     ///
-    /// Returns a mutable slice of the entire buffer. After writing to this slice,
-    /// you must manually track how many bytes were initialized (e.g., using the
-    /// return value from `read()` and accessing via `&buffer[..n]`).
+    /// This is safe for both fixed-size I/O buffers and accumulator-style capture buffers:
+    /// callers see an empty initialized slice afterwards, while the underlying allocation
+    /// stays available for reuse.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    /// Shorten the logical initialized length without changing the backing allocation.
+    ///
+    /// Used by response framing helpers when a read contains bytes beyond the current
+    /// response boundary and the remainder is stashed as leftover for the next response.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        assert!(
+            len <= self.buffer.len(),
+            "truncate length exceeds initialized bytes"
+        );
+        self.buffer.truncate(len);
+    }
+
+    /// Get mutable access to the fixed I/O writable region.
+    ///
+    /// This compatibility API is for callers that still perform manual reads
+    /// into a borrowed slice. It does not update the logical initialized length;
+    /// callers must use the read byte count directly.
     ///
     /// # Safety Note
-    /// The returned slice contains **uninitialized memory**. Only access bytes
-    /// that you've written to. This method is primarily for use with I/O
-    /// operations like `AsyncRead::read()`.
+    /// Only bytes written by the caller's I/O operation should be read. Prefer
+    /// `read_from()` or `read_more()` when possible because those update the
+    /// initialized length automatically.
     ///
     /// # Examples
     /// ```ignore
@@ -102,7 +148,10 @@ impl PooledBuffer {
     #[must_use]
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buffer[..]
+        // `create_aligned_buffer` initializes the full writable region before
+        // clearing the logical length, so this preserves the old fixed-I/O API
+        // without making those bytes part of the initialized slice.
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.as_mut_ptr(), self.writable_len) }
     }
 
     /// Append data to the buffer (accumulator mode)
@@ -116,7 +165,7 @@ impl PooledBuffer {
     /// pages are pre-faulted. As long as total accumulated data fits within
     /// capacity, this operation performs NO allocations or page faults.
     ///
-    /// If data exceeds capacity, the Vec will grow automatically (with allocation).
+    /// If data exceeds capacity, the `BytesMut` will grow automatically (with allocation).
     /// This ensures complete data is always captured rather than truncating, which
     /// would corrupt cached responses.
     ///
@@ -125,8 +174,9 @@ impl PooledBuffer {
     /// After calling this, `.len()` (via Deref) returns the total accumulated length.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
-        // Warn if we need to grow beyond pre-allocated capacity (rare for typical articles)
-        if self.buffer.len() + data.len() > self.buffer.capacity() {
+        let needed = self.buffer.len() + data.len();
+        // Accumulator/capture mode may grow; resized buffers are discarded on drop.
+        if needed > self.buffer.capacity() {
             tracing::warn!(
                 "Capture buffer growing: {} + {} > {} capacity (will allocate)",
                 self.buffer.len(),
@@ -134,9 +184,7 @@ impl PooledBuffer {
                 self.buffer.capacity()
             );
         }
-        // Always extend - never truncate to prevent caching partial/corrupt data
         self.buffer.extend_from_slice(data);
-        self.initialized = self.buffer.len();
     }
 }
 
@@ -145,8 +193,7 @@ impl Deref for PooledBuffer {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        // Immutable access only returns the initialized portion
-        &self.buffer[..self.initialized]
+        &self.buffer
     }
 }
 
@@ -155,13 +202,23 @@ impl Deref for PooledBuffer {
 impl AsRef<[u8]> for PooledBuffer {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        // Only return initialized portion
-        &self.buffer[..self.initialized]
+        &self.buffer
     }
 }
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
+        if self.buffer.capacity() != self.expected_capacity {
+            debug!(
+                "Dropping resized pooled buffer instead of returning it to the pool (capacity {} != expected {})",
+                self.buffer.capacity(),
+                self.expected_capacity
+            );
+            return;
+        }
+
+        self.buffer.clear();
+
         // Atomically return buffer to pool if pool is not full
         let mut current_size = self.pool_size.load(Ordering::Relaxed);
         while current_size < self.max_pool_size {
@@ -185,16 +242,197 @@ impl Drop for PooledBuffer {
     }
 }
 
+/// Buffered response assembled from one or more pooled capture buffers.
+///
+/// This avoids reallocating or growing a single `Vec` on the hot path when
+/// a multiline response is larger than the typical capture size.
+#[derive(Debug, Default)]
+pub struct ChunkedResponse {
+    chunks: Vec<PooledBuffer>,
+    len: usize,
+}
+
+impl ChunkedResponse {
+    /// Total buffered length across all chunks.
+    #[must_use]
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true when no bytes are buffered.
+    #[must_use]
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Remove all buffered data, returning chunks to the pool on drop.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.len = 0;
+    }
+
+    /// Append bytes using one or more pooled capture buffers.
+    pub fn extend_from_slice(&mut self, pool: &BufferPool, mut data: &[u8]) {
+        while !data.is_empty() {
+            let need_new_chunk = self
+                .chunks
+                .last()
+                .is_none_or(|chunk| chunk.initialized() == chunk.capacity());
+
+            if need_new_chunk {
+                self.chunks.push(pool.acquire_capture_now());
+            }
+
+            let chunk = self
+                .chunks
+                .last_mut()
+                .expect("chunk just pushed or already existed");
+            let available = chunk.capacity().saturating_sub(chunk.initialized());
+            debug_assert!(available > 0, "chunk must have space after allocation");
+
+            let take = available.min(data.len());
+            chunk.extend_from_slice(&data[..take]);
+            self.len += take;
+            data = &data[take..];
+        }
+    }
+
+    /// Truncate the buffered response to the given absolute length.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len, "truncate length exceeds buffered bytes");
+        if len == self.len {
+            return;
+        }
+
+        let mut remaining = len;
+        let mut keep_chunks = 0;
+
+        for chunk in &mut self.chunks {
+            let chunk_len = chunk.initialized();
+            if remaining >= chunk_len {
+                remaining -= chunk_len;
+                keep_chunks += 1;
+                continue;
+            }
+
+            chunk.truncate(remaining);
+            keep_chunks += 1;
+            break;
+        }
+
+        self.chunks.truncate(keep_chunks);
+        self.len = len;
+    }
+
+    /// First chunk of buffered data, if any.
+    #[must_use]
+    pub fn first_chunk(&self) -> Option<&[u8]> {
+        self.chunks.first().map(AsRef::as_ref)
+    }
+
+    /// Iterate buffered chunks without flattening.
+    pub fn iter_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().map(AsRef::as_ref)
+    }
+
+    /// Copy up to `len` bytes from the front of the response into a small stack-backed buffer.
+    pub fn copy_prefix_into(&self, len: usize, out: &mut SmallVec<[u8; 128]>) {
+        out.clear();
+        let mut remaining = len.min(self.len);
+        for chunk in self.iter_chunks() {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(chunk.len());
+            out.extend_from_slice(&chunk[..take]);
+            remaining -= take;
+        }
+    }
+
+    /// Copy the buffered response into a contiguous `Vec<u8>`.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len);
+        for chunk in self.iter_chunks() {
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    /// Returns true if buffered bytes begin with `prefix`.
+    #[must_use]
+    pub fn starts_with(&self, prefix: &[u8]) -> bool {
+        if prefix.len() > self.len {
+            return false;
+        }
+
+        let mut remaining = prefix;
+        for chunk in &self.chunks {
+            if remaining.is_empty() {
+                return true;
+            }
+
+            let data = chunk.as_ref();
+            let take = data.len().min(remaining.len());
+            if data[..take] != remaining[..take] {
+                return false;
+            }
+            remaining = &remaining[take..];
+        }
+
+        remaining.is_empty()
+    }
+
+    /// Returns true if buffered bytes end with `suffix`.
+    #[must_use]
+    pub fn ends_with(&self, suffix: &[u8]) -> bool {
+        if suffix.len() > self.len {
+            return false;
+        }
+
+        let mut remaining = suffix.len();
+        for chunk in self.chunks.iter().rev() {
+            if remaining == 0 {
+                return true;
+            }
+            let data = chunk.as_ref();
+            let take = remaining.min(data.len());
+            let suffix_start = remaining - take;
+            let data_start = data.len() - take;
+            if data[data_start..] != suffix[suffix_start..remaining] {
+                return false;
+            }
+            remaining -= take;
+        }
+
+        remaining == 0
+    }
+
+    /// Write all buffered chunks to a sink in order.
+    pub async fn write_all_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        for chunk in self.iter_chunks() {
+            writer.write_all(chunk).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Lock-free buffer pool for reusing large I/O buffers
 /// Uses crossbeam's `SegQueue` for lock-free operations
 #[derive(Debug, Clone)]
 pub struct BufferPool {
-    pool: Arc<SegQueue<Vec<u8>>>,
+    pool: Arc<SegQueue<BytesMut>>,
     buffer_size: BufferSize,
     max_pool_size: usize,
     pool_size: Arc<AtomicUsize>,
     // Capture buffer pool (for accumulating streaming data)
-    capture_pool: Arc<SegQueue<Vec<u8>>>,
+    capture_pool: Arc<SegQueue<BytesMut>>,
     capture_capacity: usize,
     max_capture_pool_size: usize,
     capture_pool_size: Arc<AtomicUsize>,
@@ -203,33 +441,26 @@ pub struct BufferPool {
 impl BufferPool {
     /// Create a page-aligned buffer for optimal DMA performance
     ///
-    /// Returns a raw Vec<u8> that will be wrapped in `PooledBuffer` by `acquire()`.
-    /// The buffer is NOT zero-initialized for performance.
+    /// Returns a raw `BytesMut` that will be wrapped in `PooledBuffer` by `acquire()`.
+    /// The buffer is pre-faulted, then cleared before it enters the pool.
     ///
     /// # Safety
     ///
     /// **INTERNAL USE ONLY.** This function is not exposed publicly and is only used
     /// within the buffer pool implementation where the safety contract is guaranteed.
     ///
-    /// The returned buffer contains uninitialized memory. Callers must ensure that the buffer
-    /// is only used with `AsyncRead`/`AsyncWrite` operations that fully initialize the bytes
-    /// before they are read. Only the initialized portion of the buffer (`&buf[..n]`, where `n`
-    /// is the number of bytes read or written) may be accessed. Accessing uninitialized bytes
-    /// is undefined behavior.
+    /// The returned buffer has initialized spare storage for the fixed I/O view, but a logical
+    /// length of zero. Only bytes added to the `BytesMut` logical length are exposed through the
+    /// public initialized slice APIs.
     ///
     /// The public API (`acquire()`) returns a `PooledBuffer` which is a safe wrapper that
     /// enforces this contract through the type system and usage patterns.
-    fn create_aligned_buffer(size: usize) -> Vec<u8> {
+    fn create_aligned_buffer(size: usize) -> BytesMut {
         // Align to page boundaries (4KB) for better memory performance
         let page_size = 4096;
         let aligned_size = size.div_ceil(page_size) * page_size;
 
-        // Pre-allocate with page-aligned capacity, then zero-initialize to `size`.
-        // prefault_pages then touches every page up to `capacity` (including alignment
-        // padding) to force physical page allocation upfront, eliminating page-fault
-        // latency during I/O.
-        let mut buffer = Vec::with_capacity(aligned_size);
-        buffer.resize(size, 0u8);
+        let mut buffer = BytesMut::with_capacity(aligned_size);
         Self::prefault_pages(&mut buffer);
         buffer
     }
@@ -246,8 +477,9 @@ impl BufferPool {
     /// `write_volatile` touches one byte per 4KB page to trigger the OS page fault
     /// at init time rather than during streaming I/O. Values are overwritten by
     /// actual I/O before being read.
-    fn prefault_pages(buf: &mut Vec<u8>) {
+    fn prefault_pages(buf: &mut BytesMut) {
         let cap = buf.capacity();
+        buf.resize(cap, 0);
         // SAFETY: We write within the buffer's allocated capacity.
         // Each write_volatile touches one byte per 4KB page to trigger page faults.
         // These sentinel values (1) are overwritten by real I/O data before being read.
@@ -257,6 +489,7 @@ impl BufferPool {
                 std::ptr::write_volatile(ptr.add(offset), 1);
             }
         }
+        buf.clear();
     }
 
     /// Create a new buffer pool with pre-allocated buffers
@@ -332,7 +565,7 @@ impl BufferPool {
         );
 
         for _ in 0..count {
-            let mut buffer = Vec::with_capacity(capacity);
+            let mut buffer = BytesMut::with_capacity(capacity);
             // Pre-fault all pages to map physical memory
             Self::prefault_pages(&mut buffer);
             self.capture_pool.push(buffer);
@@ -392,16 +625,14 @@ impl BufferPool {
     ///
     /// # Safety Notes
     ///
-    /// The buffer may contain old data, but this is safe because:
-    /// - Callers use `AsyncRead` which writes into the buffer
-    /// - They get back `n` bytes written and access only `&buf[..n]`
-    /// - Stale data beyond `n` is never accessed
-    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
-    pub async fn acquire(&self) -> PooledBuffer {
+    /// The buffer may contain old bytes outside its logical length, but immutable
+    /// access only exposes `BytesMut::len()` initialized bytes.
+    fn acquire_now(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
-            // Buffer from pool is already the correct size (enforced on return)
-            debug_assert_eq!(buffer.len(), self.buffer_size.get());
+            // Buffer from pool is logically empty and has the expected allocation
+            // capacity (enforced on return).
+            debug_assert_eq!(buffer.len(), 0);
             buffer
         } else {
             // Create new page-aligned buffer for better DMA performance
@@ -414,12 +645,18 @@ impl BufferPool {
         };
 
         PooledBuffer {
+            expected_capacity: buffer.capacity(),
             buffer,
-            initialized: 0, // Start with 0 bytes safe to read
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
+            writable_len: self.buffer_size.get(),
         }
+    }
+
+    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
+    pub async fn acquire(&self) -> PooledBuffer {
+        self.acquire_now()
     }
 
     /// Get a capture buffer from the capture pool
@@ -429,8 +666,7 @@ impl BufferPool {
     ///
     /// Pages are pre-faulted to eliminate soft page faults during streaming,
     /// which profiling showed accounted for 96.75% of memmove time.
-    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
-    pub async fn acquire_capture(&self) -> PooledBuffer {
+    pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
         let buffer = if let Some(mut buffer) = self.capture_pool.pop() {
             self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
             // Clear but keep capacity (pages stay mapped)
@@ -445,24 +681,36 @@ impl BufferPool {
                 "Capture pool exhausted (allocating beyond pool size). In use: {}/{}",
                 in_use, self.max_capture_pool_size
             );
-            let mut buffer = Vec::with_capacity(self.capture_capacity);
+            let capacity = if self.capture_capacity > 0 {
+                self.capture_capacity
+            } else {
+                self.buffer_size.get()
+            };
+            let mut buffer = BytesMut::with_capacity(capacity);
             Self::prefault_pages(&mut buffer);
             buffer
         };
 
         PooledBuffer {
+            expected_capacity: buffer.capacity(),
             buffer,
-            initialized: 0,
             pool: Arc::clone(&self.capture_pool),
             pool_size: Arc::clone(&self.capture_pool_size),
             max_pool_size: self.max_capture_pool_size,
+            writable_len: 0,
         }
+    }
+
+    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
+    pub async fn acquire_capture(&self) -> PooledBuffer {
+        self.acquire_capture_now()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_buffer_pool_creation() {
@@ -476,6 +724,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_acquire_starts_empty_with_stable_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+
+        let capacity = {
+            let buffer = pool.acquire().await;
+            assert_eq!(buffer.initialized(), 0);
+            assert_eq!(buffer.len(), 0);
+            buffer.capacity()
+        };
+
+        let buffer = pool.acquire().await;
+        assert_eq!(buffer.initialized(), 0);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn test_read_from_sets_initialized_without_reducing_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let capacity = buffer.capacity();
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+
+        writer.write_all(b"220 ready\r\n").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_from(&mut reader).await.unwrap();
+        assert_eq!(read, 11);
+        assert_eq!(buffer.initialized(), 11);
+        assert_eq!(&*buffer, b"220 ready\r\n");
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn test_read_from_is_limited_to_fixed_writable_region() {
+        let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        assert!(buffer.capacity() > buffer.as_mut_slice().len());
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"220 long response over eight bytes\r\n")
+            .await
+            .unwrap();
+        drop(writer);
+
+        let read = buffer.read_from(&mut reader).await.unwrap();
+        assert_eq!(read, 8);
+        assert_eq!(buffer.initialized(), 8);
+        assert_eq!(buffer.as_mut_slice()[..read].len(), read);
+    }
+
+    #[tokio::test]
+    async fn test_read_more_appends_after_initialized_bytes() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        buffer.copy_from_slice(b"22");
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"0 ready\r\n").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_more(&mut reader).await.unwrap();
+        assert_eq!(read, 9);
+        assert_eq!(buffer.initialized(), 11);
+        assert_eq!(&*buffer, b"220 ready\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_read_more_is_limited_to_remaining_fixed_writable_region() {
+        let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        buffer.copy_from_slice(b"22");
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"0 long response\r\n").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_more(&mut reader).await.unwrap();
+        assert_eq!(read, 6);
+        assert_eq!(buffer.initialized(), 8);
+        assert_eq!(&*buffer, b"220 long");
+    }
+
+    #[tokio::test]
+    async fn test_copy_from_slice_overwrites_and_allows_up_to_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let capacity = buffer.capacity();
+
+        buffer.copy_from_slice(b"previous bytes");
+        assert_eq!(&*buffer, b"previous bytes");
+
+        let data = vec![b'X'; capacity];
+        buffer.copy_from_slice(&data);
+        assert_eq!(buffer.initialized(), capacity);
+        assert_eq!(&buffer[..4], b"XXXX");
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "data exceeds buffer capacity")]
+    async fn test_copy_from_slice_rejects_larger_than_capacity() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let too_large = vec![b'X'; buffer.capacity() + 1];
+
+        buffer.copy_from_slice(&too_large);
+    }
+
+    #[tokio::test]
+    async fn test_clear_and_truncate_only_change_initialized_length() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire().await;
+        let capacity = buffer.capacity();
+
+        buffer.copy_from_slice(b"abcdef");
+        buffer.truncate(3);
+        assert_eq!(buffer.initialized(), 3);
+        assert_eq!(&*buffer, b"abc");
+        assert_eq!(buffer.capacity(), capacity);
+
+        buffer.clear();
+        assert_eq!(buffer.initialized(), 0);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn test_resized_buffers_are_discarded_instead_of_repooled() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 1);
+
+        let normal_capacity = {
+            let mut buffer = pool.acquire().await;
+            let capacity = buffer.capacity();
+            buffer.extend_from_slice(&vec![b'N'; capacity + 1]);
+            assert!(buffer.capacity() > capacity);
+            capacity
+        };
+
+        let buffer = pool.acquire().await;
+        assert_eq!(buffer.capacity(), normal_capacity);
+        drop(buffer);
+
+        {
+            let mut capture = pool.acquire_capture().await;
+            capture.extend_from_slice(&[b'C'; 9]);
+            assert!(capture.capacity() > 8);
+        }
+
+        let capture = pool.acquire_capture().await;
+        assert_eq!(capture.capacity(), 8);
+    }
+
+    #[tokio::test]
     async fn test_buffer_pool_get_and_return() {
         let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 5);
 
@@ -484,8 +887,7 @@ mod tests {
         assert_eq!(buffer.capacity(), 4096);
         assert_eq!(buffer.initialized(), 0);
 
-        // Buffer contains uninitialized data - this is intentional for performance
-        // Callers will write to it via AsyncRead before accessing
+        // Callers see an empty initialized slice until data is read or copied in.
 
         // Drop it (automatically returns to pool)
         drop(buffer);
@@ -505,12 +907,54 @@ mod tests {
 
         // Pool is exhausted, should create new buffer
         let buf3 = pool.acquire().await;
-        assert_eq!(buf3.capacity(), 1024);
+        assert_eq!(buf3.capacity(), 4096);
 
         // Drop buffers (automatically returned)
         drop(buf1);
         drop(buf2);
         drop(buf3);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_capture_buffer_is_not_reused() {
+        let pool =
+            BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);
+
+        let mut capture = pool.acquire_capture().await;
+        capture.extend_from_slice(&vec![b'X'; 8193]);
+        assert!(capture.capacity() > 8192);
+        drop(capture);
+
+        let capture2 = pool.acquire_capture().await;
+        assert_eq!(capture2.capacity(), 8192);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_helpers_without_flattening() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"220 0 <id>\r\nBody\r\n.\r\n");
+
+        let chunks: Vec<&[u8]> = response.iter_chunks().collect();
+        assert!(chunks.len() > 1, "test requires multi-chunk buffering");
+        assert_eq!(chunks.concat(), b"220 0 <id>\r\nBody\r\n.\r\n");
+        assert!(response.starts_with(b"220 0 "));
+        assert!(response.ends_with(b"\r\n.\r\n"));
+
+        let mut prefix = SmallVec::<[u8; 128]>::new();
+        response.copy_prefix_into(12, &mut prefix);
+        assert_eq!(&prefix[..], b"220 0 <id>\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_copy_prefix_clamps_to_length() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"430\r\n");
+
+        let mut prefix = SmallVec::<[u8; 128]>::new();
+        response.copy_prefix_into(64, &mut prefix);
+        assert_eq!(&prefix[..], b"430\r\n");
     }
 
     #[tokio::test]
@@ -524,7 +968,7 @@ mod tests {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
                 let buffer = pool_clone.acquire().await;
-                assert_eq!(buffer.capacity(), 2048);
+                assert_eq!(buffer.capacity(), 4096);
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
             });
@@ -564,8 +1008,8 @@ mod tests {
 
         // Get it again - may contain old data (performance optimization)
         let buffer2 = pool.acquire().await;
-        assert_eq!(buffer2.capacity(), 1024);
-        // Note: buffer may contain previous data - callers must use &buf[..n] pattern
+        assert_eq!(buffer2.capacity(), 4096);
+        // Note: buffer may contain previous bytes outside the initialized range.
     }
 
     #[tokio::test]
@@ -595,7 +1039,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         let buffer = pool.acquire().await;
-        assert_eq!(buffer.capacity(), 1024);
+        assert_eq!(buffer.capacity(), 4096);
 
         // PooledBuffer auto-returns on drop with correct size enforcement in Drop impl
         drop(buffer);
@@ -636,7 +1080,7 @@ mod tests {
         let medium_buf = medium_pool.acquire().await;
         let large_buf = large_pool.acquire().await;
 
-        assert_eq!(small_buf.capacity(), 1024);
+        assert_eq!(small_buf.capacity(), 4096);
         assert_eq!(medium_buf.capacity(), 8192);
         assert_eq!(large_buf.capacity(), 65536);
 
@@ -657,7 +1101,7 @@ mod tests {
         slice[1] = b'i';
         slice[2] = b'!';
 
-        // Can write to the full capacity
+        // Can write to the fixed I/O writable region
         for (i, byte) in slice.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
@@ -739,7 +1183,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(10).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
-        let too_large = vec![0u8; 20];
+        let too_large = vec![0u8; buffer.capacity() + 1];
         buffer.copy_from_slice(&too_large); // Should panic
     }
 
@@ -786,7 +1230,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
-        // as_mut_slice should return full capacity
+        // as_mut_slice should return the fixed I/O writable region
         let slice = buffer.as_mut_slice();
         assert_eq!(slice.len(), 1024);
     }
@@ -809,12 +1253,12 @@ mod tests {
         {
             let mut buffer = pool.acquire().await;
             buffer.copy_from_slice(b"test");
-            assert_eq!(buffer.capacity(), 2048);
+            assert_eq!(buffer.capacity(), 4096);
         } // Drop returns to pool
 
         let buffer2 = pool.acquire().await;
         // Should have same capacity when reused
-        assert_eq!(buffer2.capacity(), 2048);
+        assert_eq!(buffer2.capacity(), 4096);
     }
 
     #[test]
@@ -822,11 +1266,11 @@ mod tests {
         // Test that create_aligned_buffer aligns to page boundaries
         let buffer = BufferPool::create_aligned_buffer(1000);
         // Should be aligned to 4096
-        assert_eq!(buffer.len(), 1000);
+        assert_eq!(buffer.len(), 0);
         assert_eq!(buffer.capacity() % 4096, 0);
 
         let buffer2 = BufferPool::create_aligned_buffer(8192);
-        assert_eq!(buffer2.len(), 8192);
+        assert_eq!(buffer2.len(), 0);
         assert_eq!(buffer2.capacity() % 4096, 0);
     }
 }
