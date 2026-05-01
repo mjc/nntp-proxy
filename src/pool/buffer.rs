@@ -10,10 +10,11 @@ use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
 ///
-/// # Safety and Uninitialized Memory
+/// # Safety and Initialized Bytes
 ///
-/// Buffers contain **uninitialized memory** for performance (no zeroing overhead).
-/// The type tracks initialized bytes and only exposes that portion, preventing UB.
+/// The backing allocation is pre-faulted and then kept logically empty until
+/// bytes are read or copied into it. `BytesMut::len()` is the initialized length,
+/// and immutable access only exposes that initialized portion.
 ///
 /// ## Usage
 /// ```ignore
@@ -118,16 +119,16 @@ impl PooledBuffer {
         self.buffer.truncate(len);
     }
 
-    /// Get mutable access to the full buffer capacity
+    /// Get mutable access to the fixed I/O writable region.
     ///
-    /// Returns a mutable slice of the entire buffer. After writing to this slice,
-    /// you must manually track how many bytes were initialized (e.g., using the
-    /// return value from `read()` and accessing via `&buffer[..n]`).
+    /// This compatibility API is for callers that still perform manual reads
+    /// into a borrowed slice. It does not update the logical initialized length;
+    /// callers must use the read byte count directly.
     ///
     /// # Safety Note
-    /// The returned slice contains **uninitialized memory**. Only access bytes
-    /// that you've written to. This method is primarily for use with I/O
-    /// operations like `AsyncRead::read()`.
+    /// Only bytes written by the caller's I/O operation should be read. Prefer
+    /// `read_from()` or `read_more()` when possible because those update the
+    /// initialized length automatically.
     ///
     /// # Examples
     /// ```ignore
@@ -155,7 +156,7 @@ impl PooledBuffer {
     /// pages are pre-faulted. As long as total accumulated data fits within
     /// capacity, this operation performs NO allocations or page faults.
     ///
-    /// If data exceeds capacity, the Vec will grow automatically (with allocation).
+    /// If data exceeds capacity, the `BytesMut` will grow automatically (with allocation).
     /// This ensures complete data is always captured rather than truncating, which
     /// would corrupt cached responses.
     ///
@@ -165,7 +166,7 @@ impl PooledBuffer {
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
         let needed = self.buffer.len() + data.len();
-        // Warn if we need to grow beyond pre-allocated capacity (rare for typical articles)
+        // Accumulator/capture mode may grow; resized buffers are discarded on drop.
         if needed > self.buffer.capacity() {
             tracing::warn!(
                 "Capture buffer growing: {} + {} > {} capacity (will allocate)",
@@ -615,10 +616,8 @@ impl BufferPool {
     ///
     /// # Safety Notes
     ///
-    /// The buffer may contain old data, but this is safe because:
-    /// - Callers use `AsyncRead` which writes into the buffer
-    /// - They get back `n` bytes written and access only `&buf[..n]`
-    /// - Stale data beyond `n` is never accessed
+    /// The buffer may contain old bytes outside its logical length, but immutable
+    /// access only exposes `BytesMut::len()` initialized bytes.
     fn acquire_now(&self) -> PooledBuffer {
         let buffer = if let Some(buffer) = self.pool.pop() {
             self.pool_size.fetch_sub(1, Ordering::Relaxed);
@@ -844,8 +843,7 @@ mod tests {
         assert_eq!(buffer.capacity(), 4096);
         assert_eq!(buffer.initialized(), 0);
 
-        // Buffer contains uninitialized data - this is intentional for performance
-        // Callers will write to it via AsyncRead before accessing
+        // Callers see an empty initialized slice until data is read or copied in.
 
         // Drop it (automatically returns to pool)
         drop(buffer);
@@ -967,7 +965,7 @@ mod tests {
         // Get it again - may contain old data (performance optimization)
         let buffer2 = pool.acquire().await;
         assert_eq!(buffer2.capacity(), 4096);
-        // Note: buffer may contain previous data - callers must use &buf[..n] pattern
+        // Note: buffer may contain previous bytes outside the initialized range.
     }
 
     #[tokio::test]
@@ -1059,7 +1057,7 @@ mod tests {
         slice[1] = b'i';
         slice[2] = b'!';
 
-        // Can write to the full capacity
+        // Can write to the fixed I/O writable region
         for (i, byte) in slice.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
@@ -1188,7 +1186,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire().await;
 
-        // as_mut_slice should return full capacity
+        // as_mut_slice should return the fixed I/O writable region
         let slice = buffer.as_mut_slice();
         assert_eq!(slice.len(), 1024);
     }
