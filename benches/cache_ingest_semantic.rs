@@ -7,10 +7,12 @@
 //! Run with: cargo bench --bench cache_ingest_semantic
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleEntry, CacheBuffer};
+use nntp_proxy::cache::{ArticleCache, ArticleEntry, CacheBuffer};
 use nntp_proxy::pool::{BufferPool, ChunkedResponse};
 use nntp_proxy::types::BufferSize;
+use nntp_proxy::types::{BackendId, MessageId};
 use smallvec::SmallVec;
+use std::time::Duration;
 
 fn main() {
     divan::main();
@@ -71,6 +73,99 @@ mod semantic_ingest {
     bench_ingest!(missing_430, MISSING_RESPONSE.to_vec(), 1000);
 }
 
+mod semantic_ingest_baselines {
+    use super::{ArticleEntry, Bencher, article_response, black_box, chunked_response};
+
+    #[divan::bench(sample_count = 200, sample_size = 100)]
+    fn clone_vec_then_ingest_64k(bencher: Bencher) {
+        let bytes = article_response(64 * 1024);
+        bencher
+            .counter(divan::counter::BytesCount::new(bytes.len()))
+            .bench(|| {
+                let owned = black_box(&bytes).clone();
+                black_box(ArticleEntry::from_backend_response(black_box(
+                    owned.as_slice(),
+                )))
+            });
+    }
+
+    #[divan::bench(sample_count = 200, sample_size = 100)]
+    fn chunked_flatten_then_ingest_64k(bencher: Bencher) {
+        let bytes = article_response(64 * 1024);
+        let split = 37;
+        let chunks = [bytes[..split].as_ref(), bytes[split..].as_ref()];
+
+        bencher
+            .counter(divan::counter::BytesCount::new(bytes.len()))
+            .bench(|| {
+                let response = chunked_response(black_box(&chunks));
+                let flattened = response.to_vec();
+                black_box(ArticleEntry::from_backend_response(black_box(
+                    flattened.as_slice(),
+                )))
+            });
+    }
+}
+
+mod cache_upsert {
+    use super::{
+        ArticleCache, BackendId, Bencher, CacheBuffer, Duration, MessageId, article_response,
+        black_box, chunked_response,
+    };
+
+    #[divan::bench(sample_count = 100, sample_size = 50)]
+    fn chunked_cache_buffer(bencher: Bencher) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
+        let bytes = article_response(64 * 1024);
+        let split = 37;
+        let chunks = [bytes[..split].as_ref(), bytes[split..].as_ref()];
+
+        bencher
+            .counter(divan::counter::BytesCount::new(bytes.len()))
+            .bench(|| {
+                rt.block_on(async {
+                    let response = chunked_response(black_box(&chunks));
+                    let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
+                    cache
+                        .upsert(
+                            msg_id,
+                            CacheBuffer::Chunked(response),
+                            BackendId::from_index(0),
+                            0.into(),
+                        )
+                        .await;
+                });
+            });
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 50)]
+    fn flattened_vec_baseline(bencher: Bencher) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
+        let bytes = article_response(64 * 1024);
+        let split = 37;
+        let chunks = [bytes[..split].as_ref(), bytes[split..].as_ref()];
+
+        bencher
+            .counter(divan::counter::BytesCount::new(bytes.len()))
+            .bench(|| {
+                rt.block_on(async {
+                    let response = chunked_response(black_box(&chunks));
+                    let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
+                    cache
+                        .upsert(
+                            msg_id,
+                            CacheBuffer::Vec(response.to_vec()),
+                            BackendId::from_index(0),
+                            0.into(),
+                        )
+                        .await;
+                });
+            });
+    }
+}
+
 mod cache_buffer_status {
     use super::{CacheBuffer, SmallVec, black_box, chunked_response};
     use divan::Bencher;
@@ -104,6 +199,22 @@ mod cache_buffer_status {
         bencher.bench(|| {
             let response = chunked_response(&chunks);
             black_box(CacheBuffer::Chunked(response).into_vec())
+        });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 1000)]
+    fn chunked_flatten_status_code_baseline(bencher: Bencher) {
+        let chunks = [
+            b"2".as_slice(),
+            b"20",
+            b" 42 <bench@example.com>\r\nBody\r\n.\r\n",
+        ];
+        bencher.bench(|| {
+            let response = chunked_response(&chunks);
+            let flattened = response.to_vec();
+            black_box(nntp_proxy::protocol::StatusCode::parse(black_box(
+                &flattened,
+            )))
         });
     }
 }
