@@ -434,7 +434,7 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn from_verb_args(verb: &[u8], args: &[u8]) -> Self {
+    pub(crate) fn from_verb_args(verb: &[u8], args: &[u8]) -> Self {
         let verb = SmallVec::from_slice(verb);
         let args = SmallVec::from_slice(args);
         let kind = classify_verb(&verb);
@@ -454,7 +454,7 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn from_verb_arg_slices(verb: &[u8], args: &[&[u8]]) -> Self {
+    pub(crate) fn from_verb_arg_slices(verb: &[u8], args: &[&[u8]]) -> Self {
         let verb = SmallVec::from_slice(verb);
         let arg_len = args.iter().map(|part| part.len()).sum();
         let mut joined_args = SmallVec::<[u8; 512]>::with_capacity(arg_len);
