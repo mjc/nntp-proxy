@@ -102,9 +102,7 @@ async fn execute_backend_query(
             };
 
             let response_shape = request.response_shape(status_code);
-            let response = if matches!(response_shape, ResponseShape::Multiline)
-                && cmd_response.is_multiline_for(request)
-            {
+            let response = if matches!(response_shape, ResponseShape::Multiline) {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
                 let mut response = crate::pool::ChunkedResponse::default();
                 response.extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);

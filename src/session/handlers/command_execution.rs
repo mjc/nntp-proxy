@@ -157,7 +157,10 @@ impl ClientSession {
         }
 
         // Success - stream response
-        let is_multiline = cmd_response.is_multiline_for(request);
+        let is_multiline = matches!(
+            request.response_shape(status_code),
+            crate::protocol::ResponseShape::Multiline
+        );
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),

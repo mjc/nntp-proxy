@@ -167,27 +167,6 @@ impl BackendFirstResponse {
         self.status_code
     }
 
-    /// Derive response shape from the typed request and parsed status.
-    #[inline]
-    #[must_use]
-    pub fn response_shape(
-        &self,
-        request: &RequestContext,
-    ) -> Option<crate::protocol::ResponseShape> {
-        self.status_code
-            .map(|status| request.response_shape(status))
-    }
-
-    /// Whether the typed request/status pair expects a multiline response.
-    #[inline]
-    #[must_use]
-    pub fn is_multiline_for(&self, request: &RequestContext) -> bool {
-        matches!(
-            self.response_shape(request),
-            Some(crate::protocol::ResponseShape::Multiline)
-        )
-    }
-
     /// Log validation warnings with context
     pub fn log_warnings(
         &self,
@@ -381,7 +360,10 @@ mod tests {
         assert!(result.is_ok(), "send_request should handle partial reads");
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(200)));
-        assert!(!resp.is_multiline_for(&request));
+        assert_eq!(
+            request.response_shape(resp.status_code().unwrap()),
+            crate::protocol::ResponseShape::SingleLine
+        );
     }
 
     #[tokio::test]
@@ -403,7 +385,10 @@ mod tests {
         let resp = result.unwrap();
         assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
         assert_eq!(resp.status_code(), Some(StatusCode::new(111)));
-        assert!(!resp.is_multiline_for(&request));
+        assert_eq!(
+            request.response_shape(resp.status_code().unwrap()),
+            crate::protocol::ResponseShape::SingleLine
+        );
         assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
     }
 
@@ -425,7 +410,10 @@ mod tests {
         );
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(211)));
-        assert!(!resp.is_multiline_for(&request));
+        assert_eq!(
+            request.response_shape(resp.status_code().unwrap()),
+            crate::protocol::ResponseShape::SingleLine
+        );
     }
 
     // ─── Command response tests ─────────────────────────────────────────────
