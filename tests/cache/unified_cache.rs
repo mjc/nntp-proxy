@@ -202,6 +202,38 @@ fn test_response_parts_for_command_body_from_article_allocates_nothing() {
 }
 
 #[test]
+fn test_response_parts_for_command_handles_near_limit_message_id_without_allocation() {
+    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+    let entry = ArticleEntry::from_response_buffer(buffer);
+    let local = "a".repeat(520);
+    let msg_id_text = format!("<{local}@example.com>");
+    let mut out = [0_u8; 1024];
+
+    let ((response, len), allocations) = crate::allocation_count_delta(|| {
+        let response = entry
+            .response_parts_for_command_bytes(b"STAT", &msg_id_text)
+            .expect("long message-id still fits stack response buffer");
+        let len = response
+            .copy_to_slice(&mut out)
+            .expect("fixed test buffer is large enough");
+        (response, len)
+    });
+
+    assert_eq!(allocations, 0);
+    assert_eq!(response.len(), len);
+    assert!(
+        std::str::from_utf8(&out[..len])
+            .unwrap()
+            .starts_with("223 0 <")
+    );
+    assert!(
+        std::str::from_utf8(&out[..len])
+            .unwrap()
+            .ends_with("@example.com>\r\n")
+    );
+}
+
+#[test]
 fn test_response_for_command_stat_from_body() {
     // BODY response (222) should also synthesize STAT response
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();

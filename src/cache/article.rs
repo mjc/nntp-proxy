@@ -162,14 +162,14 @@ pub enum CachedArticlePayloadSlices<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct StackStatusLine {
-    bytes: [u8; 512],
+    bytes: [u8; 1024],
     len: usize,
 }
 
 impl StackStatusLine {
     fn new(code: u16, article_number: u64, message_id: &str) -> Option<Self> {
         let mut line = Self {
-            bytes: [0; 512],
+            bytes: [0; 1024],
             len: 0,
         };
         line.push_u64(u64::from(code))?;
