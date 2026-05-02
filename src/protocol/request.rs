@@ -326,6 +326,11 @@ impl<'a> RequestLine<'a> {
     pub fn route_class(&self) -> RequestRouteClass {
         route_class(self.kind, self.message_id.is_some())
     }
+
+    #[must_use]
+    pub fn is_pipelineable(&self) -> bool {
+        matches!(self.route_class(), RequestRouteClass::ArticleByMessageId)
+    }
 }
 
 impl Clone for RequestContext {
