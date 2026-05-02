@@ -525,6 +525,11 @@ impl RequestContext {
     }
 
     #[inline]
+    pub const fn record_local_response(&mut self, response: RequestResponseMetadata) {
+        self.response = Some(response);
+    }
+
+    #[inline]
     #[must_use]
     pub fn verb(&self) -> &[u8] {
         &self.verb
@@ -838,6 +843,22 @@ mod tests {
         assert_eq!(ctx.response_status(), Some(status));
         assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(24)));
         assert_eq!(wire(&ctx), b"HEAD <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_local_response_without_backend() {
+        let mut ctx = RequestContext::from_request_line("QUIT\r\n");
+        let status = StatusCode::new(205);
+
+        ctx.record_local_response(RequestResponseMetadata::new(
+            status,
+            ResponseWireLen::new(24),
+        ));
+
+        assert_eq!(ctx.backend_id(), None);
+        assert_eq!(ctx.response_status(), Some(status));
+        assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(24)));
+        assert_eq!(wire(&ctx), b"QUIT\r\n");
     }
 
     #[test]
