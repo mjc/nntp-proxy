@@ -58,30 +58,6 @@ fn write_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize
     sink.len()
 }
 
-#[inline]
-fn build_request_vec(request: &RequestContext) -> Vec<u8> {
-    let mut out = Vec::with_capacity(request.wire_len());
-    out.extend_from_slice(request.verb());
-    if !request.args().is_empty() {
-        out.push(b' ');
-        out.extend_from_slice(request.args());
-    }
-    out.extend_from_slice(b"\r\n");
-    out
-}
-
-#[inline]
-fn build_request_string(request: &RequestContext) -> String {
-    let mut out = String::with_capacity(request.wire_len());
-    out.push_str(std::str::from_utf8(request.verb()).unwrap_or(""));
-    if !request.args().is_empty() {
-        out.push(' ');
-        out.push_str(std::str::from_utf8(request.args()).unwrap_or(""));
-    }
-    out.push_str("\r\n");
-    out
-}
-
 mod single_request {
     use super::{Bencher, FixedSink, RequestContext, black_box, write_request_slices};
 
@@ -113,41 +89,8 @@ mod single_request {
     );
 }
 
-mod allocating_baselines {
-    use super::{Bencher, RequestContext, black_box, build_request_string, build_request_vec};
-
-    macro_rules! bench_allocating_request {
-        ($name:ident, $line:literal) => {
-            mod $name {
-                use super::*;
-
-                #[divan::bench(sample_count = 1000, sample_size = 1000)]
-                fn vec_builder(bencher: Bencher) {
-                    let request = RequestContext::from_request_bytes($line.as_bytes());
-                    bencher.bench(|| black_box(build_request_vec(black_box(&request))));
-                }
-
-                #[divan::bench(sample_count = 1000, sample_size = 1000)]
-                fn string_builder(bencher: Bencher) {
-                    let request = RequestContext::from_request_bytes($line.as_bytes());
-                    bencher.bench(|| black_box(build_request_string(black_box(&request))));
-                }
-            }
-        };
-    }
-
-    bench_allocating_request!(date_no_args, "DATE\r\n");
-    bench_allocating_request!(article_message_id, "ARTICLE <bench@example.com>\r\n");
-    bench_allocating_request!(
-        group_long_args,
-        "GROUP alt.binaries.multimedia.highspeed.repost\r\n"
-    );
-}
-
 mod mixed_batch {
-    use super::{
-        Bencher, FixedSink, RequestContext, black_box, build_request_vec, write_request_slices,
-    };
+    use super::{Bencher, FixedSink, RequestContext, black_box, write_request_slices};
 
     const COMMANDS: &[&str] = &[
         "ARTICLE <a@example.com>\r\n",
@@ -174,23 +117,6 @@ mod mixed_batch {
                 requests
                     .iter()
                     .map(|request| write_request_slices(black_box(&mut sink), black_box(request)))
-                    .sum::<usize>()
-            });
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 100)]
-    fn realistic_request_stream_vec_baseline(bencher: Bencher) {
-        let requests = COMMANDS
-            .iter()
-            .map(|line| RequestContext::from_request_bytes(line.as_bytes()))
-            .collect::<Vec<_>>();
-
-        bencher
-            .counter(divan::counter::ItemsCount::new(requests.len()))
-            .bench(|| {
-                requests
-                    .iter()
-                    .map(|request| build_request_vec(black_box(request)).len())
                     .sum::<usize>()
             });
     }
