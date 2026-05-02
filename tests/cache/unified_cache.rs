@@ -16,7 +16,10 @@ use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
-use super::article_response_bytes;
+use super::{
+    article_entry, article_response_bytes, assert_article_response, assert_no_article_response,
+    body_entry, head_entry, response_bytes, test_msg_id,
+};
 
 // ============================================================================
 // UnifiedCache Tests
@@ -168,24 +171,15 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 
 #[test]
 fn test_response_for_command_stat_synthesizes_223() {
-    // Create ARTICLE response (220)
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let response = response_bytes(&article_entry(), b"STAT").unwrap();
 
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"STAT", &msg_id);
-    assert!(response.is_some());
-
-    let response_bytes = response.unwrap();
-    let response_str = String::from_utf8_lossy(&response_bytes);
-    assert!(response_str.starts_with("223 0 <test@example.com>\r\n"));
+    assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
 fn test_response_parts_for_command_body_from_article_allocates_nothing() {
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
+    let entry = article_entry();
+    let msg_id = test_msg_id();
 
     let (response, allocations) = crate::allocation_count_delta(|| {
         entry
@@ -203,8 +197,9 @@ fn test_response_parts_for_command_body_from_article_allocates_nothing() {
 
 #[test]
 fn test_response_parts_exposes_typed_status() {
-    let buffer = b"220 42 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_wire_response(
+        b"220 42 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+    );
 
     let cases = [
         (b"ARTICLE".as_slice(), 220),
@@ -224,8 +219,7 @@ fn test_response_parts_exposes_typed_status() {
 
 #[test]
 fn test_response_parts_for_command_handles_near_limit_message_id_without_allocation() {
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = article_entry();
     let local = "a".repeat(520);
     let msg_id_text = format!("<{local}@example.com>");
 
@@ -245,106 +239,60 @@ fn test_response_parts_for_command_handles_near_limit_message_id_without_allocat
 
 #[test]
 fn test_response_for_command_stat_from_body() {
-    // BODY response (222) should also synthesize STAT response
-    let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let response = response_bytes(&body_entry(), b"STAT").unwrap();
 
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"STAT", &msg_id);
-    assert!(response.is_some());
-
-    let response_bytes = response.unwrap();
-    let response_str = String::from_utf8_lossy(&response_bytes);
-    assert!(response_str.starts_with("223 0 <test@example.com>\r\n"));
+    assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
 fn test_response_for_command_stat_from_head() {
-    // HEAD response (221) should also synthesize STAT response
-    let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let response = response_bytes(&head_entry(), b"STAT").unwrap();
 
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"STAT", &msg_id);
-    assert!(response.is_some());
-
-    let response_bytes = response.unwrap();
-    let response_str = String::from_utf8_lossy(&response_bytes);
-    assert!(response_str.starts_with("223 0 <test@example.com>\r\n"));
+    assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
 fn test_response_for_command_430_returns_none_for_stat() {
-    // 430 should NOT synthesize STAT - article doesn't exist
-    let buffer = b"430 No Such Article\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_wire_response(b"430 No Such Article\r\n");
 
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"STAT", &msg_id);
-    assert!(response.is_none());
+    assert_no_article_response(&entry, b"STAT");
 }
 
 #[test]
 fn test_response_for_command_article_direct_match() {
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
-
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
-    assert!(response.is_some());
-    assert_eq!(response.unwrap(), buffer);
+    assert_article_response(
+        &article_entry(),
+        b"ARTICLE",
+        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+    );
 }
 
 #[test]
 fn test_response_for_command_body_from_article() {
-    // ARTICLE (220) can serve BODY request
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
-
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"BODY", &msg_id);
-    assert!(response.is_some());
-    assert_eq!(
-        response.unwrap(),
-        b"222 0 <test@example.com>\r\nBody\r\n.\r\n"
+    assert_article_response(
+        &article_entry(),
+        b"BODY",
+        b"222 0 <test@example.com>\r\nBody\r\n.\r\n",
     );
 }
 
 #[test]
 fn test_response_for_command_head_from_article() {
-    // ARTICLE (220) can serve HEAD request
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
-
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"HEAD", &msg_id);
-    assert!(response.is_some());
-    assert_eq!(
-        response.unwrap(),
-        b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n"
+    assert_article_response(
+        &article_entry(),
+        b"HEAD",
+        b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
     );
 }
 
 #[test]
 fn test_response_for_command_body_cannot_serve_article() {
-    // BODY (222) cannot serve ARTICLE request
-    let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
-
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
-    assert!(response.is_none());
+    assert_no_article_response(&body_entry(), b"ARTICLE");
 }
 
 #[test]
 fn test_response_for_command_head_cannot_serve_body() {
-    // HEAD (221) cannot serve BODY request
-    let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
-
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"BODY", &msg_id);
-    assert!(response.is_none());
+    assert_no_article_response(&head_entry(), b"BODY");
 }
 
 #[test]
@@ -354,9 +302,7 @@ fn test_response_for_command_validates_buffer() {
     let entry = ArticleEntry::from_wire_response(buffer);
 
     // Should return None because buffer fails validation
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
-    assert!(response.is_none());
+    assert_no_article_response(&entry, b"ARTICLE");
 }
 
 #[test]
@@ -600,9 +546,7 @@ fn test_response_validation_rejects_short_buffer() {
     let entry = ArticleEntry::from_wire_response(buffer);
 
     // Should fail validation and return None
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
-    assert!(response.is_none());
+    assert_no_article_response(&entry, b"ARTICLE");
 }
 
 #[test]
@@ -611,9 +555,7 @@ fn test_response_validation_rejects_missing_terminator() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec();
     let entry = ArticleEntry::from_wire_response(buffer);
 
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
-    assert!(response.is_none());
+    assert_no_article_response(&entry, b"ARTICLE");
 }
 
 #[test]
@@ -623,10 +565,7 @@ fn test_response_validation_rejects_non_digit_start() {
     let buffer = b"ABC 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_wire_response(buffer);
 
-    // status_code() will return None, so response_for_command returns None
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
-    assert!(response.is_none());
+    assert_no_article_response(&entry, b"ARTICLE");
 }
 
 #[test]
@@ -636,10 +575,7 @@ fn test_response_validation_accepts_valid_buffer() {
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content here\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_wire_response(buffer.clone());
 
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
-    assert!(response.is_some());
-    assert_eq!(response.unwrap(), buffer);
+    assert_article_response(&entry, b"ARTICLE", &buffer);
 }
 
 // ============================================================================
@@ -656,6 +592,36 @@ fn make_430_stub_buffer() -> Vec<u8> {
     b"430 No such article\r\n".to_vec()
 }
 
+fn hybrid_article() -> HybridArticleEntry {
+    HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap()
+}
+
+fn hybrid_missing() -> HybridArticleEntry {
+    HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap()
+}
+
+fn record_missing(entry: &mut HybridArticleEntry, backends: &[usize]) {
+    backends
+        .iter()
+        .for_each(|backend| entry.record_backend_missing(BackendId::from_index(*backend)));
+}
+
+fn record_has(entry: &mut HybridArticleEntry, backends: &[usize]) {
+    backends
+        .iter()
+        .for_each(|backend| entry.record_backend_has(BackendId::from_index(*backend)));
+}
+
+fn assert_hybrid_should_try(entry: &HybridArticleEntry, cases: &[(usize, bool)]) {
+    cases.iter().for_each(|(backend, expected)| {
+        assert_eq!(
+            entry.should_try_backend(BackendId::from_index(*backend)),
+            *expected,
+            "backend {backend}"
+        );
+    });
+}
+
 fn hybrid_response_bytes(
     entry: &HybridArticleEntry,
     verb: &[u8],
@@ -669,7 +635,7 @@ fn hybrid_response_bytes(
 
 #[test]
 fn test_hybrid_entry_has_availability_info_empty() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = hybrid_article();
 
     // Fresh entry has no availability info
     assert!(!entry.has_availability_info());
@@ -677,25 +643,23 @@ fn test_hybrid_entry_has_availability_info_empty() {
 
 #[test]
 fn test_hybrid_entry_has_availability_info_after_missing() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
-
-    entry.record_backend_missing(BackendId::from_index(0));
+    let mut entry = hybrid_article();
+    record_missing(&mut entry, &[0]);
 
     assert!(entry.has_availability_info());
 }
 
 #[test]
 fn test_hybrid_entry_has_availability_info_after_has() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
-
-    entry.record_backend_has(BackendId::from_index(0));
+    let mut entry = hybrid_article();
+    record_has(&mut entry, &[0]);
 
     assert!(entry.has_availability_info());
 }
 
 #[test]
 fn test_hybrid_entry_is_availability_stale_fresh() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = hybrid_article();
 
     // Entry just created should not be stale with reasonable TTL
     assert!(!entry.is_availability_stale(3600)); // 1 hour TTL
@@ -704,7 +668,7 @@ fn test_hybrid_entry_is_availability_stale_fresh() {
 
 #[test]
 fn test_hybrid_entry_is_availability_stale_zero_ttl() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = hybrid_article();
 
     // With zero TTL, everything is immediately stale (edge case)
     // Note: implementation uses `> ttl` so zero TTL means 0 seconds old is not stale
@@ -713,60 +677,47 @@ fn test_hybrid_entry_is_availability_stale_zero_ttl() {
 
 #[test]
 fn test_hybrid_entry_clear_stale_availability_not_stale() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
-
-    // Record some availability info
-    entry.record_backend_missing(BackendId::from_index(0));
-    entry.record_backend_has(BackendId::from_index(1));
+    let mut entry = hybrid_article();
+    record_missing(&mut entry, &[0]);
+    record_has(&mut entry, &[1]);
 
     assert!(entry.has_availability_info());
-    assert!(!entry.should_try_backend(BackendId::from_index(0)));
-    assert!(entry.should_try_backend(BackendId::from_index(1)));
+    assert_hybrid_should_try(&entry, &[(0, false), (1, true)]);
 
     // With large TTL, should NOT clear
     entry.clear_stale_availability(3600);
 
     // Availability should still be there
     assert!(entry.has_availability_info());
-    assert!(!entry.should_try_backend(BackendId::from_index(0)));
+    assert_hybrid_should_try(&entry, &[(0, false)]);
 }
 
 #[test]
 fn test_hybrid_entry_should_try_after_record_missing() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = hybrid_article();
 
-    // Initially should try all backends
-    assert!(entry.should_try_backend(BackendId::from_index(0)));
-    assert!(entry.should_try_backend(BackendId::from_index(1)));
-    assert!(entry.should_try_backend(BackendId::from_index(2)));
+    assert_hybrid_should_try(&entry, &[(0, true), (1, true), (2, true)]);
 
-    // Mark backend 1 as missing
-    entry.record_backend_missing(BackendId::from_index(1));
+    record_missing(&mut entry, &[1]);
 
-    // Should NOT try backend 1, but others are fine
-    assert!(entry.should_try_backend(BackendId::from_index(0)));
-    assert!(!entry.should_try_backend(BackendId::from_index(1)));
-    assert!(entry.should_try_backend(BackendId::from_index(2)));
+    assert_hybrid_should_try(&entry, &[(0, true), (1, false), (2, true)]);
 }
 
 #[test]
 fn test_hybrid_entry_should_try_after_record_has() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = hybrid_article();
 
-    // Mark backend 0 as missing first
-    entry.record_backend_missing(BackendId::from_index(0));
-    assert!(!entry.should_try_backend(BackendId::from_index(0)));
+    record_missing(&mut entry, &[0]);
+    assert_hybrid_should_try(&entry, &[(0, false)]);
 
-    // Now mark it as having the article (e.g., it acquired it later)
-    entry.record_backend_has(BackendId::from_index(0));
+    record_has(&mut entry, &[0]);
 
-    // Should be able to try it again
-    assert!(entry.should_try_backend(BackendId::from_index(0)));
+    assert_hybrid_should_try(&entry, &[(0, true)]);
 }
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_none() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = hybrid_article();
 
     // With no missing backends marked, not exhausted
     assert!(!entry.all_backends_exhausted(BackendCount::new(3)));
@@ -774,11 +725,9 @@ fn test_hybrid_entry_all_backends_exhausted_none() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_partial() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = hybrid_article();
 
-    // Mark 2 of 3 backends as missing
-    entry.record_backend_missing(BackendId::from_index(0));
-    entry.record_backend_missing(BackendId::from_index(1));
+    record_missing(&mut entry, &[0, 1]);
 
     // Not exhausted yet
     assert!(!entry.all_backends_exhausted(BackendCount::new(3)));
@@ -786,12 +735,9 @@ fn test_hybrid_entry_all_backends_exhausted_partial() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_all() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = hybrid_article();
 
-    // Mark all 3 backends as missing
-    entry.record_backend_missing(BackendId::from_index(0));
-    entry.record_backend_missing(BackendId::from_index(1));
-    entry.record_backend_missing(BackendId::from_index(2));
+    record_missing(&mut entry, &[0, 1, 2]);
 
     // Now exhausted
     assert!(entry.all_backends_exhausted(BackendCount::new(3)));
@@ -799,7 +745,7 @@ fn test_hybrid_entry_all_backends_exhausted_all() {
 
 #[test]
 fn test_hybrid_entry_430_stub_creation() {
-    let entry = HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap();
+    let entry = hybrid_missing();
 
     // 430 responses should be cached
     assert_eq!(entry.status_code().as_u16(), 430);
@@ -810,8 +756,7 @@ fn test_hybrid_entry_430_stub_creation() {
 
 #[test]
 fn test_hybrid_entry_complete_article_detection() {
-    let article_buf = make_valid_article_buffer();
-    let entry = HybridArticleEntry::from_wire_response(article_buf).unwrap();
+    let entry = hybrid_article();
 
     // 220 with proper terminator is a complete article
     assert!(entry.is_complete_article());
@@ -821,7 +766,7 @@ fn test_hybrid_entry_complete_article_detection() {
 #[test]
 fn test_hybrid_entry_response_for_command_article() {
     let buffer = make_valid_article_buffer();
-    let entry = HybridArticleEntry::from_wire_response(buffer.clone()).unwrap();
+    let entry = hybrid_article();
 
     let response = hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>");
     assert!(response.is_some());
@@ -830,7 +775,7 @@ fn test_hybrid_entry_response_for_command_article() {
 
 #[test]
 fn test_hybrid_entry_response_for_command_stat_synthesized() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = hybrid_article();
 
     let response = hybrid_response_bytes(&entry, b"STAT", "<test@example.com>");
     assert!(response.is_some());
@@ -841,7 +786,7 @@ fn test_hybrid_entry_response_for_command_stat_synthesized() {
 
 #[test]
 fn test_hybrid_entry_response_for_command_430_returns_none() {
-    let entry = HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap();
+    let entry = hybrid_missing();
 
     // 430 stubs should not serve ARTICLE requests
     assert!(hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>").is_none());
@@ -886,12 +831,10 @@ fn test_hybrid_entry_serialization_roundtrip() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let buffer = make_valid_article_buffer();
-    let mut entry = HybridArticleEntry::from_wire_response(buffer).unwrap();
+    let mut entry = hybrid_article();
 
-    // Add some availability info
-    entry.record_backend_missing(BackendId::from_index(0));
-    entry.record_backend_has(BackendId::from_index(1));
+    record_missing(&mut entry, &[0]);
+    record_has(&mut entry, &[1]);
 
     // Serialize
     let mut encoded = Vec::new();
@@ -907,8 +850,7 @@ fn test_hybrid_entry_serialization_roundtrip() {
     );
     assert_eq!(decoded.availability(), entry.availability());
     assert_eq!(decoded.tier().get(), entry.tier().get());
-    assert!(!decoded.should_try_backend(BackendId::from_index(0)));
-    assert!(decoded.should_try_backend(BackendId::from_index(1)));
+    assert_hybrid_should_try(&decoded, &[(0, false), (1, true)]);
 }
 
 #[test]
@@ -916,33 +858,27 @@ fn test_hybrid_entry_serialization_preserves_availability() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = hybrid_article();
 
-    // Mark several backends
-    entry.record_backend_missing(BackendId::from_index(0));
-    entry.record_backend_missing(BackendId::from_index(2));
-    entry.record_backend_missing(BackendId::from_index(4));
-    entry.record_backend_has(BackendId::from_index(1));
-    entry.record_backend_has(BackendId::from_index(3));
+    record_missing(&mut entry, &[0, 2, 4]);
+    record_has(&mut entry, &[1, 3]);
 
     // Serialize and deserialize
     let mut encoded = Vec::new();
     entry.encode(&mut encoded).unwrap();
     let decoded = HybridArticleEntry::decode(&mut Cursor::new(&encoded)).unwrap();
 
-    // Verify availability preserved
-    assert!(!decoded.should_try_backend(BackendId::from_index(0)));
-    assert!(decoded.should_try_backend(BackendId::from_index(1)));
-    assert!(!decoded.should_try_backend(BackendId::from_index(2)));
-    assert!(decoded.should_try_backend(BackendId::from_index(3)));
-    assert!(!decoded.should_try_backend(BackendId::from_index(4)));
+    assert_hybrid_should_try(
+        &decoded,
+        &[(0, false), (1, true), (2, false), (3, true), (4, false)],
+    );
 }
 
 #[test]
 fn test_hybrid_entry_serialization_estimated_size() {
     use foyer::Code;
 
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = hybrid_article();
 
     let mut encoded = Vec::new();
     entry.encode(&mut encoded).unwrap();
@@ -954,8 +890,8 @@ fn test_hybrid_entry_serialization_430_stub() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let mut entry = HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap();
-    entry.record_backend_missing(BackendId::from_index(0));
+    let mut entry = hybrid_missing();
+    record_missing(&mut entry, &[0]);
 
     // Serialize and deserialize
     let mut encoded = Vec::new();
@@ -963,7 +899,7 @@ fn test_hybrid_entry_serialization_430_stub() {
     let decoded = HybridArticleEntry::decode(&mut Cursor::new(&encoded)).unwrap();
 
     assert_eq!(decoded.status_code().as_u16(), 430);
-    assert!(!decoded.should_try_backend(BackendId::from_index(0)));
+    assert_hybrid_should_try(&decoded, &[(0, false)]);
 }
 
 #[test]
@@ -971,7 +907,7 @@ fn test_hybrid_entry_serialization_empty_availability() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = hybrid_article();
 
     // No availability recorded
     assert!(!entry.has_availability_info());

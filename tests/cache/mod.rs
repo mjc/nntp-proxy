@@ -63,3 +63,11 @@ pub fn assert_serves(entry: &ArticleEntry, cases: &[(&[u8], bool)]) {
         );
     }
 }
+
+pub fn assert_article_response(entry: &ArticleEntry, verb: &[u8], expected: &[u8]) {
+    assert_eq!(response_bytes(entry, verb).as_deref(), Some(expected));
+}
+
+pub fn assert_no_article_response(entry: &ArticleEntry, verb: &[u8]) {
+    assert_eq!(response_bytes(entry, verb), None);
+}
