@@ -31,7 +31,7 @@ pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 
 // Internal helper re-exported for session handlers
-pub(crate) use entry_helpers::{extract_chunked_status_line, extract_status_line};
+pub(crate) use entry_helpers::extract_chunked_status_line;
 
 use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
@@ -215,6 +215,29 @@ mod tests {
         assert!(matches!(buffer, CacheBuffer::Small(_)));
         assert_eq!(buffer.status_code(), Some(StatusCode::new(223)));
     }
+
+    #[tokio::test]
+    async fn unified_cache_records_typed_availability_without_payload() {
+        let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60), true);
+        let msg_id = MessageId::new("<typed-availability@example>".to_string()).unwrap();
+        let backend_id = BackendId::from_index(1);
+
+        cache
+            .record_backend_has_status(
+                msg_id.clone(),
+                StatusCode::new(220),
+                backend_id,
+                ttl::CacheTier::new(2),
+            )
+            .await;
+
+        let entry = cache.get(&msg_id).await.expect("entry is recorded");
+        assert_eq!(entry.status_code(), StatusCode::new(220));
+        assert_eq!(entry.payload_kind(), CachedPayloadKind::AvailabilityOnly);
+        assert_eq!(entry.payload_len().get(), 0);
+        assert!(entry.has_availability_info());
+        assert!(entry.should_try_backend(backend_id));
+    }
 }
 
 /// Statistics for cache display in TUI
@@ -345,6 +368,28 @@ impl UnifiedCache {
         match self {
             Self::Memory(cache) => cache.record_backend_missing(message_id, backend_id).await,
             Self::Hybrid(cache) => cache.record_missing(message_id, backend_id).await,
+        }
+    }
+
+    /// Record that a backend has an article with a known status, without storing payload bytes.
+    pub async fn record_backend_has_status(
+        &self,
+        message_id: MessageId<'_>,
+        status_code: StatusCode,
+        backend_id: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        match self {
+            Self::Memory(cache) => {
+                cache
+                    .record_backend_has_status(message_id, status_code, backend_id, tier)
+                    .await;
+            }
+            Self::Hybrid(cache) => {
+                cache
+                    .record_has_status(message_id, status_code, backend_id, tier)
+                    .await;
+            }
         }
     }
 

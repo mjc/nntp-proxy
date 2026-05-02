@@ -1048,6 +1048,36 @@ impl ArticleCache {
             .await;
     }
 
+    /// Record successful backend availability without storing response payload bytes.
+    pub async fn record_backend_has_status(
+        &self,
+        message_id: MessageId<'_>,
+        status_code: StatusCode,
+        backend_id: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        let key: Arc<str> = message_id.without_brackets().into();
+        let new_entry_template = ArticleEntry::availability_only(status_code, tier);
+
+        self.cache
+            .entry(key)
+            .and_upsert_with(|maybe_entry| {
+                let mut entry = maybe_entry.map_or_else(
+                    || new_entry_template.clone(),
+                    |existing| existing.into_value(),
+                );
+                if !entry.is_complete_article() {
+                    entry.status_code = status_code;
+                    entry.tier = tier;
+                    entry.payload = CachedPayload::AvailabilityOnly;
+                }
+                entry.inserted_at = ttl::CacheTimestampMillis::now();
+                entry.record_backend_has(backend_id);
+                std::future::ready(entry)
+            })
+            .await;
+    }
+
     /// Record that a backend returned 430 for this article - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.

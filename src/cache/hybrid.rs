@@ -44,6 +44,7 @@
 //! - Compression: Reduces disk usage (LZ4: ~60%, Zstd: ~65%+ for typical NNTP articles)
 
 use crate::config::CompressionCodec;
+use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
@@ -55,7 +56,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::availability::ArticleAvailability;
-use super::hybrid_codec::HybridArticleEntry;
+use super::hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 use super::ttl;
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
@@ -429,6 +430,37 @@ impl HybridArticleCache {
             let mut entry = HybridArticleEntry::from_backend_response(b"430\r\n")
                 .expect("430 is a valid status code");
             entry.record_backend_missing(backend_id);
+            entry
+        };
+
+        self.cache.insert(key, entry);
+    }
+
+    /// Record successful backend availability without storing response payload bytes.
+    pub async fn record_has_status(
+        &self,
+        message_id: MessageId<'_>,
+        status_code: StatusCode,
+        backend_id: BackendId,
+        tier: super::ttl::CacheTier,
+    ) {
+        let Ok(cacheable_status) = CacheableStatusCode::try_from(status_code.as_u16()) else {
+            warn!(
+                msg_id = %message_id,
+                status_code = status_code.as_u16(),
+                "Cannot record availability: invalid cache status code"
+            );
+            return;
+        };
+
+        let key = message_id.without_brackets().to_string();
+        let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
+            let mut updated = existing.value().clone();
+            updated.record_backend_has_status(cacheable_status, backend_id, tier);
+            updated
+        } else {
+            let mut entry = HybridArticleEntry::availability_only(cacheable_status, tier);
+            entry.record_backend_has(backend_id);
             entry
         };
 

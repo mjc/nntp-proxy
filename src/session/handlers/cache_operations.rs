@@ -173,6 +173,24 @@ impl ClientSession {
                 .await;
         });
     }
+
+    /// Spawn async availability-only cache update without response payload storage.
+    pub(super) fn spawn_cache_upsert_availability(
+        &self,
+        msg_id: &crate::types::MessageId<'_>,
+        status_code: StatusCode,
+        backend_id: crate::types::BackendId,
+        tier: CacheTier,
+    ) {
+        let cache_clone = self.cache.clone();
+        let msg_id_owned = msg_id.to_owned();
+        tokio::spawn(async move {
+            cache_clone
+                .record_backend_has_status(msg_id_owned, status_code, backend_id, tier)
+                .await;
+        });
+    }
+
     /// Get the tier for a backend, defaulting to 0 if router or backend not found.
     pub(super) fn tier_for_backend(&self, backend_id: BackendId) -> CacheTier {
         self.router

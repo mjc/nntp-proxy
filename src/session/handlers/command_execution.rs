@@ -373,8 +373,7 @@ impl ClientSession {
             (true, CacheAction::TrackAvailability) => {
                 // Availability-only mode should not buffer the article body.
                 // Keep first-byte latency and memory bounded by streaming directly,
-                // then cache only the status-line stub after the terminator is seen.
-                let stub = crate::cache::extract_status_line(params.first_chunk);
+                // then cache only typed availability metadata after the terminator is seen.
                 let bytes = streaming::stream_multiline_response(
                     &mut **pooled_conn,
                     client_write,
@@ -382,7 +381,14 @@ impl ClientSession {
                     ctx,
                 )
                 .await?;
-                self.maybe_cache_upsert_buffer(params.msg_id, stub.into(), ctx.backend_id);
+                if let Some(msg_id) = params.msg_id {
+                    self.spawn_cache_upsert_availability(
+                        msg_id,
+                        params.status_code,
+                        ctx.backend_id,
+                        self.tier_for_backend(ctx.backend_id),
+                    );
+                }
                 Ok(bytes)
             }
             (true, _) => {

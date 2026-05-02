@@ -483,6 +483,22 @@ impl HybridArticleEntry {
         self.availability.record_has(backend_id);
     }
 
+    /// Record successful backend availability without storing response payload bytes.
+    pub(super) fn record_backend_has_status(
+        &mut self,
+        status_code: CacheableStatusCode,
+        backend_id: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        if !self.is_complete_article() {
+            self.status_code = status_code;
+            self.payload = CachedPayload::AvailabilityOnly;
+            self.tier = tier;
+        }
+        self.timestamp = ttl::CacheTimestampMillis::now();
+        self.record_backend_has(backend_id);
+    }
+
     /// Check if all backends have been tried and none have the article
     #[must_use]
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
