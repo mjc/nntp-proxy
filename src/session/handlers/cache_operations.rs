@@ -114,7 +114,7 @@ impl ClientSession {
 
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
-        if !cached.matches_command_type_verb_bytes(cmd_verb) {
+        if !cached.matches_command_type_verb(cmd_verb) {
             let status_code = cached.status_code().as_u16();
             debug!(
                 "Client {} cached response (code={}) can't serve command {:?}",
