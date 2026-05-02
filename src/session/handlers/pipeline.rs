@@ -33,6 +33,63 @@ pub(super) struct RequestBatch {
 }
 
 impl RequestBatch {
+    fn empty() -> Self {
+        Self {
+            contexts: smallvec::SmallVec::new(),
+            trailing_context: None,
+            trailing_oversized: false,
+            trailing_wire_len: 0,
+            first_oversized: false,
+        }
+    }
+
+    fn first_oversized() -> Self {
+        Self {
+            first_oversized: true,
+            ..Self::empty()
+        }
+    }
+
+    fn trailing(context: RequestContext) -> Self {
+        Self {
+            trailing_context: Some(context),
+            ..Self::empty()
+        }
+    }
+
+    fn contexts_with_trailing_oversized(
+        contexts: smallvec::SmallVec<[RequestContext; 4]>,
+        trailing_wire_len: usize,
+    ) -> Self {
+        Self {
+            contexts,
+            trailing_context: None,
+            trailing_oversized: true,
+            trailing_wire_len,
+            first_oversized: false,
+        }
+    }
+
+    fn contexts_with_trailing(
+        contexts: smallvec::SmallVec<[RequestContext; 4]>,
+        trailing_context: RequestContext,
+    ) -> Self {
+        Self {
+            contexts,
+            trailing_context: Some(trailing_context),
+            trailing_oversized: false,
+            trailing_wire_len: 0,
+            first_oversized: false,
+        }
+    }
+
+    fn contexts(contexts: smallvec::SmallVec<[RequestContext; 4]>) -> Self {
+        Self {
+            contexts,
+            ..Self::empty()
+        }
+    }
+
     /// Whether this batch is empty (client disconnected)
     pub fn is_empty(&self) -> bool {
         self.contexts.is_empty() && self.trailing_context.is_none() && !self.trailing_oversized
@@ -97,30 +154,16 @@ impl ClientSession {
     where
         R: tokio::io::AsyncRead + Unpin,
     {
-        let mut trailing_oversized = false;
-
         // First command: blocking read (must wait for client)
         command_buf.clear();
         match reader.read_until(b'\n', command_buf).await {
             Ok(0) => {
-                return Ok(RequestBatch {
-                    contexts: smallvec::SmallVec::new(),
-                    trailing_context: None,
-                    trailing_oversized: false,
-                    trailing_wire_len: 0,
-                    first_oversized: false,
-                });
+                return Ok(RequestBatch::empty());
             }
             Ok(_) => {
                 // RFC 3977 §3.1: 512-byte command limit — return 501 and keep session alive
                 if command_buf.len() > 512 {
-                    return Ok(RequestBatch {
-                        contexts: smallvec::SmallVec::new(),
-                        trailing_context: None,
-                        trailing_oversized: false,
-                        trailing_wire_len: 0,
-                        first_oversized: true,
-                    });
+                    return Ok(RequestBatch::first_oversized());
                 }
             }
             Err(e) => return Err(e.into()),
@@ -130,14 +173,7 @@ impl ClientSession {
 
         if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
-            let trailing_context = Some(request);
-            return Ok(RequestBatch {
-                contexts: smallvec::SmallVec::new(),
-                trailing_context,
-                trailing_oversized: false,
-                trailing_wire_len: 0,
-                first_oversized: false,
-            });
+            return Ok(RequestBatch::trailing(request));
         }
 
         let mut batch_contexts: smallvec::SmallVec<[RequestContext; 4]> = smallvec::SmallVec::new();
@@ -160,39 +196,25 @@ impl ClientSession {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
                     if command_buf.len() > 512 {
-                        trailing_oversized = true;
-                        return Ok(RequestBatch {
-                            contexts: batch_contexts,
-                            trailing_context: None,
-                            trailing_oversized,
-                            trailing_wire_len: command_buf.len(),
-                            first_oversized: false,
-                        });
+                        return Ok(RequestBatch::contexts_with_trailing_oversized(
+                            batch_contexts,
+                            command_buf.len(),
+                        ));
                     }
                     let request = RequestContext::from_request_bytes(command_buf);
                     if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
-                        let trailing_context = Some(request);
-                        return Ok(RequestBatch {
-                            contexts: batch_contexts,
-                            trailing_context,
-                            trailing_oversized,
-                            trailing_wire_len: 0,
-                            first_oversized: false,
-                        });
+                        return Ok(RequestBatch::contexts_with_trailing(
+                            batch_contexts,
+                            request,
+                        ));
                     }
                     batch_contexts.push(request);
                 }
             }
         }
 
-        Ok(RequestBatch {
-            contexts: batch_contexts,
-            trailing_context: None,
-            trailing_oversized,
-            trailing_wire_len: 0,
-            first_oversized: false,
-        })
+        Ok(RequestBatch::contexts(batch_contexts))
     }
 }
 
