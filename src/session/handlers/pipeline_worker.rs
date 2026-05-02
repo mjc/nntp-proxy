@@ -296,10 +296,10 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedContext {
-                context: crate::protocol::RequestContext::from_request_line(command),
-                client_return: tx,
-            },
+            QueuedContext::new(
+                crate::protocol::RequestContext::from_request_line(command),
+                tx,
+            ),
             rx,
         )
     }

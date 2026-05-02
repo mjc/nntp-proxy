@@ -542,10 +542,7 @@ impl ClientSession {
                 );
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let queued_context = QueuedContext {
-                    context: request.clone(),
-                    client_return: tx,
-                };
+                let queued_context = QueuedContext::new(request.clone(), tx);
 
                 // Enqueue with backpressure - fail fast if queue is full
                 match queue.try_enqueue(queued_context) {

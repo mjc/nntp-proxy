@@ -64,10 +64,19 @@ pub struct QueuedContext {
     /// Typed request context. Owns verb/args, not redundant full wire bytes.
     pub context: RequestContext,
     /// Return path to the client session that queued this request.
-    pub client_return: oneshot::Sender<PipelineResponse>,
+    client_return: oneshot::Sender<PipelineResponse>,
 }
 
 impl QueuedContext {
+    /// Create a queued context with the client return path that should receive completion.
+    #[must_use]
+    pub fn new(context: RequestContext, client_return: oneshot::Sender<PipelineResponse>) -> Self {
+        Self {
+            context,
+            client_return,
+        }
+    }
+
     /// Complete this queued context with the backend response that matched it.
     ///
     /// Responses are matched by each backend connection's FIFO order; consuming
@@ -258,10 +267,10 @@ mod tests {
         let queue = BackendQueue::new(10);
         let (tx, _rx) = oneshot::channel();
         queue
-            .try_enqueue(QueuedContext {
-                context: RequestContext::from_request_line("ARTICLE <test@example.com>\r\n"),
-                client_return: tx,
-            })
+            .try_enqueue(QueuedContext::new(
+                RequestContext::from_request_line("ARTICLE <test@example.com>\r\n"),
+                tx,
+            ))
             .unwrap();
         assert_eq!(queue.len(), 1);
     }
@@ -272,19 +281,19 @@ mod tests {
         for i in 0..2 {
             let (tx, _rx) = oneshot::channel();
             queue
-                .try_enqueue(QueuedContext {
-                    context: RequestContext::from_request_line(&format!(
+                .try_enqueue(QueuedContext::new(
+                    RequestContext::from_request_line(&format!(
                         "ARTICLE <test{i}@example.com>\r\n"
                     )),
-                    client_return: tx,
-                })
+                    tx,
+                ))
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
-        let result = queue.try_enqueue(QueuedContext {
-            context: RequestContext::from_request_line("ARTICLE <overflow@example.com>\r\n"),
-            client_return: tx,
-        });
+        let result = queue.try_enqueue(QueuedContext::new(
+            RequestContext::from_request_line("ARTICLE <overflow@example.com>\r\n"),
+            tx,
+        ));
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -301,10 +310,10 @@ mod tests {
         for i in 0..5 {
             let (tx, _rx) = oneshot::channel();
             queue
-                .try_enqueue(QueuedContext {
-                    context: RequestContext::from_request_line(&format!("CMD {i}\r\n")),
-                    client_return: tx,
-                })
+                .try_enqueue(QueuedContext::new(
+                    RequestContext::from_request_line(&format!("CMD {i}\r\n")),
+                    tx,
+                ))
                 .unwrap();
         }
 
@@ -331,10 +340,10 @@ mod tests {
         // Now enqueue
         let (tx, _rx) = oneshot::channel();
         queue
-            .try_enqueue(QueuedContext {
-                context: RequestContext::from_request_line("HELLO\r\n"),
-                client_return: tx,
-            })
+            .try_enqueue(QueuedContext::new(
+                RequestContext::from_request_line("HELLO\r\n"),
+                tx,
+            ))
             .unwrap();
 
         let batch = handle.await.unwrap();
@@ -379,10 +388,10 @@ mod tests {
     #[test]
     fn test_queued_context_success_completes_matching_context() {
         let (tx, rx) = oneshot::channel();
-        let queued = QueuedContext {
-            context: RequestContext::from_request_line("STAT <test@example.com>\r\n"),
-            client_return: tx,
-        };
+        let queued = QueuedContext::new(
+            RequestContext::from_request_line("STAT <test@example.com>\r\n"),
+            tx,
+        );
         let backend_id = BackendId::from_index(1);
 
         queued.complete_success(
@@ -401,10 +410,10 @@ mod tests {
     #[test]
     fn test_queued_context_error_completes_without_response_data() {
         let (tx, rx) = oneshot::channel();
-        let queued = QueuedContext {
-            context: RequestContext::from_request_line("STAT <test@example.com>\r\n"),
-            client_return: tx,
-        };
+        let queued = QueuedContext::new(
+            RequestContext::from_request_line("STAT <test@example.com>\r\n"),
+            tx,
+        );
 
         queued.complete_error(PipelineError::ReadFailed);
 
