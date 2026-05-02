@@ -182,10 +182,7 @@ impl TcpManager {
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
 
-        if !matches!(
-            crate::protocol::NntpResponse::parse(greeting),
-            crate::protocol::NntpResponse::Greeting(_)
-        ) {
+        if !crate::protocol::StatusCode::parse(greeting).is_some_and(|code| code.is_greeting()) {
             return Err(ConnectionError::InvalidGreeting {
                 backend: self.name.clone(),
                 greeting: greeting_str.trim().to_string(),
@@ -287,10 +284,9 @@ impl TcpManager {
         let response = &buffer[..n];
         let response_str = String::from_utf8_lossy(response);
 
-        if matches!(
-            crate::protocol::NntpResponse::parse(response),
-            crate::protocol::NntpResponse::AuthRequired(_)
-        ) {
+        if crate::protocol::StatusCode::parse(response)
+            .is_some_and(|code| code.requires_auth_credentials())
+        {
             // Password required
             let Some(password) = self.password.as_ref() else {
                 return Err(ConnectionError::PasswordRequired {
@@ -303,10 +299,9 @@ impl TcpManager {
             let response = &buffer[..n];
             let response_str = String::from_utf8_lossy(response);
 
-            if !matches!(
-                crate::protocol::NntpResponse::parse(response),
-                crate::protocol::NntpResponse::AuthSuccess
-            ) {
+            if !crate::protocol::StatusCode::parse(response)
+                .is_some_and(|code| code.is_auth_accepted())
+            {
                 // Check for 482 (connection limit exceeded) before generic auth failure
                 if crate::protocol::StatusCode::parse(response).is_some_and(|c| c.as_u16() == 482) {
                     tracing::error!(
@@ -342,10 +337,9 @@ impl TcpManager {
                 self.port,
                 username
             );
-        } else if !matches!(
-            crate::protocol::NntpResponse::parse(response),
-            crate::protocol::NntpResponse::AuthSuccess
-        ) {
+        } else if !crate::protocol::StatusCode::parse(response)
+            .is_some_and(|code| code.is_auth_accepted())
+        {
             return Err(ConnectionError::UnexpectedAuthResponse {
                 backend: self.name.clone(),
                 response: response_str.trim().to_string(),

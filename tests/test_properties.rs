@@ -12,7 +12,7 @@
 
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, effective_ttl};
-use nntp_proxy::protocol::{NntpResponse, RequestLine, RequestRouteClass, StatusCode};
+use nntp_proxy::protocol::{RequestLine, RequestRouteClass, StatusCode};
 use nntp_proxy::types::MessageId;
 use proptest::prelude::*;
 
@@ -443,78 +443,51 @@ proptest! {
 }
 
 // =============================================================================
-// 7. NntpResponse::parse - Consistency properties
+// 7. StatusCode::parse - Consistency properties
 // =============================================================================
 
 proptest! {
     #[test]
-    fn prop_nntp_response_parse_never_panics(data in prop::collection::vec(any::<u8>(), 0..100)) {
-        // NntpResponse::parse should never panic on arbitrary bytes
-        let _ = NntpResponse::parse(&data);
+    fn prop_status_code_parse_never_panics(data in prop::collection::vec(any::<u8>(), 0..100)) {
+        let _ = StatusCode::parse(&data);
     }
 
     #[test]
-    fn prop_nntp_response_invalid_iff_statuscode_fails(data in prop::collection::vec(any::<u8>(), 0..100)) {
-        let response = NntpResponse::parse(&data);
+    fn prop_status_code_parse_matches_ascii_prefix(data in prop::collection::vec(any::<u8>(), 0..100)) {
         let status = StatusCode::parse(&data);
 
-        // If StatusCode::parse fails, NntpResponse must be Invalid
-        if status.is_none() {
-            prop_assert_eq!(response, NntpResponse::Invalid,
-                "NntpResponse should be Invalid when StatusCode::parse fails");
-        }
-        // If StatusCode::parse succeeds, NntpResponse must NOT be Invalid
-        if status.is_some() {
-            prop_assert_ne!(response, NntpResponse::Invalid,
-                "NntpResponse should NOT be Invalid when StatusCode::parse succeeds");
-        }
+        let expected = data.get(0..3).and_then(|digits| {
+            digits.iter().all(u8::is_ascii_digit).then(|| {
+                u16::from(digits[0] - b'0') * 100
+                    + u16::from(digits[1] - b'0') * 10
+                    + u16::from(digits[2] - b'0')
+            })
+        });
+
+        prop_assert_eq!(status.map(|code| code.as_u16()), expected);
     }
 
     #[test]
-    fn prop_nntp_response_non_invalid_has_status_code(code in 100u16..=599u16) {
+    fn prop_status_code_round_trips_formatted_code(code in 100u16..=599u16) {
         let formatted = format!("{code:03} some text\r\n");
-        let response = NntpResponse::parse(formatted.as_bytes());
-
-        // Non-Invalid responses must have a status code
-        if response != NntpResponse::Invalid {
-            let sc = response.status_code();
-            prop_assert!(sc.is_some(),
-                "Non-Invalid response for code {} should have status_code()", code);
-            prop_assert_eq!(sc.unwrap().as_u16(), code,
-                "Status code should match input code {}", code);
-        }
+        let status = StatusCode::parse(formatted.as_bytes());
+        prop_assert_eq!(status.map(|code| code.as_u16()), Some(code));
     }
 
     #[test]
-    fn prop_nntp_response_multiline_is_status_categorization(code in 100u16..=599u16) {
-        let formatted = format!("{code:03} text\r\n");
-        let response = NntpResponse::parse(formatted.as_bytes());
-
-        if StatusCode::parse(formatted.as_bytes()).is_some() {
-            let expected = matches!(
-                code,
-                100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
-            );
-            prop_assert_eq!(response.status_implies_multiline(), expected,
-                "Multiline categorization mismatch for code {}: response={}",
-                code, response.status_implies_multiline());
-        }
+    fn prop_status_code_setup_helpers_match_literal_codes(code in 100u16..=599u16) {
+        let status = StatusCode::new(code);
+        prop_assert_eq!(status.is_greeting(), matches!(code, 200 | 201));
+        prop_assert_eq!(status.requires_auth_credentials(), matches!(code, 381 | 480));
+        prop_assert_eq!(status.is_auth_accepted(), code == 281);
+        prop_assert_eq!(status.is_article_missing(), code == 430);
     }
 
     #[test]
-    fn prop_nntp_response_success_error_exclusive(code in 100u16..=599u16) {
-        let formatted = format!("{code:03} text\r\n");
-        let response = NntpResponse::parse(formatted.as_bytes());
-
-        if response != NntpResponse::Invalid {
-            let is_success = response.is_success();
-            let sc = response.status_code().unwrap();
-            let is_error = sc.is_error();
-
-            // Success and error must be mutually exclusive
-            prop_assert!(!(is_success && is_error),
-                "Code {} cannot be both success and error", code);
-        }
+    fn prop_status_code_success_error_exclusive(code in 100u16..=599u16) {
+        let status = StatusCode::new(code);
+        prop_assert!(!(status.is_success() && status.is_error()),
+            "Code {} cannot be both success and error", code);
     }
 }
 
@@ -797,15 +770,12 @@ proptest! {
         let data = response.as_bytes();
         let validated = parse_backend_status(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
-        // Should be multiline for 220/221/222
         prop_assert_eq!(
             validated.status_code.map(|status| status.as_u16()),
             Some(code),
             "Code {} should parse as backend status",
             code
         );
-        prop_assert!(NntpResponse::parse(data).status_implies_multiline(),
-            "Code {} should be categorized as multiline", code);
 
         // Terminator detection should find the real terminator, not a false positive
         use nntp_proxy::session::streaming::tail_buffer::TailBuffer;

@@ -24,7 +24,7 @@ pub use request::{
     RequestContext, RequestKind, RequestLine, RequestResponseMetadata, RequestRouteClass,
     RequestWireLen, ResponsePayloadLen, ResponseShape, ResponseWireLen,
 };
-pub use response::{NntpResponse, StatusCode};
+pub use response::StatusCode;
 
 // Re-export command construction helpers
 pub use commands::{

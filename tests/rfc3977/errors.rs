@@ -2,7 +2,7 @@
 //!
 //! These tests verify correct handling of NNTP 4xx and 5xx response codes.
 
-use nntp_proxy::protocol::{NntpResponse, StatusCode, codes};
+use nntp_proxy::protocol::{StatusCode, codes};
 
 const TEMPORARY_ERRORS: &[(u16, u16)] = &[
     (codes::SERVICE_UNAVAILABLE, 400),
@@ -34,10 +34,6 @@ fn error_codes() -> impl Iterator<Item = u16> {
         .map(|(constant, _)| *constant)
 }
 
-fn response(code: u16) -> NntpResponse {
-    NntpResponse::parse(format!("{code} Error message\r\n").as_bytes())
-}
-
 #[test]
 fn test_error_code_constants_match_expected_values() {
     TEMPORARY_ERRORS
@@ -64,22 +60,12 @@ fn test_known_error_codes_are_errors() {
 }
 
 #[test]
-fn test_error_responses_are_single_line_or_auth_required() {
+fn test_error_responses_are_errors() {
     error_codes().for_each(|code| {
-        let response = response(code);
+        let status = StatusCode::new(code);
+        assert!(status.is_error(), "Error code {code} should be error");
         assert!(
-            matches!(
-                response,
-                NntpResponse::SingleLine(_) | NntpResponse::AuthRequired(_)
-            ),
-            "Code {code} should parse as SingleLine or AuthRequired, got {response:?}"
-        );
-        assert!(
-            !response.status_implies_multiline(),
-            "Error code {code} should not be multiline"
-        );
-        assert!(
-            !response.is_success(),
+            !status.is_success(),
             "Error code {code} should not be success"
         );
     });
@@ -109,12 +95,6 @@ fn test_error_boundaries() {
 
 #[test]
 fn test_auth_error_special_cases() {
-    assert!(matches!(
-        NntpResponse::parse(b"480 Authentication required\r\n"),
-        NntpResponse::AuthRequired(_)
-    ));
-    assert!(matches!(
-        NntpResponse::parse(b"481 Authentication rejected\r\n"),
-        NntpResponse::SingleLine(_)
-    ));
+    assert!(StatusCode::new(480).requires_auth_credentials());
+    assert!(!StatusCode::new(481).requires_auth_credentials());
 }

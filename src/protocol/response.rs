@@ -88,139 +88,33 @@ impl StatusCode {
         let code = self.into_inner();
         (100..200).contains(&code)
     }
-}
 
-/// Categorized NNTP response code for type-safe handling
-///
-/// This enum categorizes NNTP response codes based on their semantics and
-/// handling requirements per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2).
-///
-/// # Response Code Ranges
-///
-/// Per [RFC 3977 §3.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2.1):
-/// - **1xx**: Informational (multiline data follows)
-/// - **2xx**: Success (may be multiline)
-/// - **3xx**: Success so far, further input expected
-/// - **4xx**: Temporary failure
-/// - **5xx**: Permanent failure
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NntpResponse {
-    /// Server greeting - [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
-    /// - 200: Posting allowed
-    /// - 201: No posting allowed
-    Greeting(StatusCode),
-
-    /// Disconnect/goodbye - [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4)
-    /// - 205: Connection closing
-    Disconnect,
-
-    /// Authentication required - [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
-    /// - 381: Password required
-    /// - 480: Authentication required
-    AuthRequired(StatusCode),
-
-    /// Authentication successful - [RFC 4643 §2.5.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.5.1)
-    /// - 281: Authentication accepted
-    AuthSuccess,
-
-    /// Multiline data response
-    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
-    /// - Specific 1xx codes: 100, 101
-    /// - Specific 2xx codes: 215, 220, 221, 222, 224, 225, 230, 231, 282
-    MultilineData(StatusCode),
-
-    /// Single-line response (everything else)
-    SingleLine(StatusCode),
-
-    /// Invalid or unparseable response
-    Invalid,
-}
-
-impl NntpResponse {
-    /// Parse response data into a categorized response code
-    ///
-    /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
-    /// responses start with a 3-digit status code.
-    ///
-    /// **Optimization**: Direct byte-to-digit conversion avoids UTF-8 overhead.
+    /// Backend greeting accepted by RFC 3977 connection setup.
     #[inline]
     #[must_use]
-    pub fn parse(data: &[u8]) -> Self {
-        let Some(code) = StatusCode::parse(data) else {
-            return Self::Invalid;
-        };
-
-        match code.as_u16() {
-            // [RFC 3977 §5.1](https://datatracker.ietf.org/doc/html/rfc3977#section-5.1)
-            200 | 201 => Self::Greeting(code),
-
-            // [RFC 3977 §5.4](https://datatracker.ietf.org/doc/html/rfc3977#section-5.4)
-            205 => Self::Disconnect,
-
-            // [RFC 4643 §2.5.1](https://datatracker.ietf.org/doc/html/rfc4643#section-2.5.1)
-            281 => Self::AuthSuccess,
-
-            // [RFC 4643 §2.3](https://datatracker.ietf.org/doc/html/rfc4643#section-2.3)
-            381 | 480 => Self::AuthRequired(code),
-
-            // Multiline responses per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1)
-            // Specific 1xx and 2xx responses carry multiline data:
-            // 100=HELP, 101=CAPABILITIES,
-            // 215=LIST, 220=ARTICLE, 221=HEAD, 222=BODY, 224=XOVER/XHDR,
-            // 225=HEADERS, 230=NEWNEWS, 231=NEWGROUPS, 282=XZHDR/XZVER, 288=XFEATURE COMPRESS GZIP
-            100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288 => {
-                Self::MultilineData(code)
-            }
-
-            // Everything else is a single-line response
-            _ => Self::SingleLine(code),
-        }
+    pub fn is_greeting(&self) -> bool {
+        matches!(self.into_inner(), 200 | 201)
     }
 
-    /// Check whether this status code category normally carries multiline data.
-    ///
-    /// Request-aware paths should prefer [`RequestContext::response_shape`](crate::protocol::RequestContext::response_shape)
-    /// because codes such as `211` depend on the originating command.
+    /// AUTHINFO response indicating a password or authentication is required.
     #[inline]
     #[must_use]
-    pub const fn status_implies_multiline(&self) -> bool {
-        matches!(self, Self::MultilineData(_))
+    pub fn requires_auth_credentials(&self) -> bool {
+        matches!(self.into_inner(), 381 | 480)
     }
 
-    /// Get the numeric status code if available
+    /// AUTHINFO response indicating authentication succeeded.
     #[inline]
     #[must_use]
-    pub fn status_code(&self) -> Option<StatusCode> {
-        match self {
-            Self::Greeting(c)
-            | Self::AuthRequired(c)
-            | Self::MultilineData(c)
-            | Self::SingleLine(c) => Some(*c),
-            Self::Disconnect => Some(StatusCode::new(205)),
-            Self::AuthSuccess => Some(StatusCode::new(281)),
-            Self::Invalid => None,
-        }
+    pub fn is_auth_accepted(&self) -> bool {
+        self.into_inner() == 281
     }
 
-    /// Check if this is a success response (2xx or 3xx)
-    ///
-    /// Per [RFC 3977 §3.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2.1):
-    /// - 2xx: Success
-    /// - 3xx: Success so far, send more input
+    /// Article-not-found response.
     #[inline]
     #[must_use]
-    pub fn is_success(&self) -> bool {
-        self.status_code().is_some_and(|code| code.is_success())
-    }
-
-    /// Check if this is a 430 response (article not found)
-    ///
-    /// Per [RFC 3977 §6.2.1.1](https://datatracker.ietf.org/doc/html/rfc3977#section-6.2.1.1):
-    /// - 430: No such article number
-    #[inline]
-    #[must_use]
-    pub fn is_430(&self) -> bool {
-        self.status_code().is_some_and(|code| code.as_u16() == 430)
+    pub fn is_article_missing(&self) -> bool {
+        self.into_inner() == 430
     }
 }
 
@@ -271,16 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn test_288_xfeature_compress_gzip_status_implies_multiline() {
-        // 288 is returned by XFEATURE COMPRESS GZIP — enables compression.
-        // The response is multiline (compressed data stream follows).
-        assert!(matches!(
-            NntpResponse::parse(b"288 XFEATURE COMPRESS GZIP\r\n"),
-            NntpResponse::MultilineData(_)
-        ));
-    }
-
-    #[test]
     fn test_status_code_parsing() {
         assert_eq!(StatusCode::parse(b"200"), Some(StatusCode::new(200)));
         assert_eq!(
@@ -303,105 +187,20 @@ mod tests {
     }
 
     #[test]
-    fn test_nntp_response_categorization() {
-        // Greetings
-        assert!(matches!(
-            NntpResponse::parse(b"200 OK\r\n"),
-            NntpResponse::Greeting(_)
-        ));
-        assert!(matches!(
-            NntpResponse::parse(b"201 No posting\r\n"),
-            NntpResponse::Greeting(_)
-        ));
+    fn test_status_code_setup_helpers() {
+        assert!(StatusCode::new(200).is_greeting());
+        assert!(StatusCode::new(201).is_greeting());
+        assert!(!StatusCode::new(205).is_greeting());
 
-        // Disconnect
-        assert_eq!(
-            NntpResponse::parse(b"205 Bye\r\n"),
-            NntpResponse::Disconnect
-        );
+        assert!(StatusCode::new(381).requires_auth_credentials());
+        assert!(StatusCode::new(480).requires_auth_credentials());
+        assert!(!StatusCode::new(281).requires_auth_credentials());
 
-        // Auth
-        assert!(matches!(
-            NntpResponse::parse(b"381 Pass\r\n"),
-            NntpResponse::AuthRequired(_)
-        ));
-        assert!(matches!(
-            NntpResponse::parse(b"480 Auth required\r\n"),
-            NntpResponse::AuthRequired(_)
-        ));
-        assert_eq!(
-            NntpResponse::parse(b"281 OK\r\n"),
-            NntpResponse::AuthSuccess
-        );
+        assert!(StatusCode::new(281).is_auth_accepted());
+        assert!(!StatusCode::new(381).is_auth_accepted());
 
-        // Multiline
-        assert!(matches!(
-            NntpResponse::parse(b"220 Art\r\n"),
-            NntpResponse::MultilineData(_)
-        ));
-        assert!(matches!(
-            NntpResponse::parse(b"215 LIST\r\n"),
-            NntpResponse::MultilineData(_)
-        ));
-        assert!(matches!(
-            NntpResponse::parse(b"100 Help\r\n"),
-            NntpResponse::MultilineData(_)
-        ));
-
-        // Single-line
-        assert!(matches!(
-            NntpResponse::parse(b"211 Group\r\n"),
-            NntpResponse::SingleLine(_)
-        ));
-        assert!(matches!(
-            NntpResponse::parse(b"400 Error\r\n"),
-            NntpResponse::SingleLine(_)
-        ));
-
-        // Invalid
-        assert_eq!(NntpResponse::parse(b""), NntpResponse::Invalid);
-        assert_eq!(NntpResponse::parse(b"XXX\r\n"), NntpResponse::Invalid);
-    }
-
-    #[test]
-    fn test_response_is_success() {
-        assert!(NntpResponse::parse(b"200 OK\r\n").is_success());
-        assert!(NntpResponse::parse(b"281 Auth\r\n").is_success());
-        assert!(NntpResponse::parse(b"381 Password required\r\n").is_success()); // 3xx is success
-        assert!(!NntpResponse::parse(b"400 Error\r\n").is_success());
-        assert!(!NntpResponse::parse(b"500 Error\r\n").is_success());
-        assert!(!NntpResponse::Invalid.is_success());
-    }
-
-    #[test]
-    fn test_response_status_implies_multiline() {
-        assert!(NntpResponse::parse(b"220 Article\r\n").status_implies_multiline());
-        assert!(NntpResponse::parse(b"215 LIST\r\n").status_implies_multiline());
-        assert!(!NntpResponse::parse(b"200 OK\r\n").status_implies_multiline());
-        assert!(!NntpResponse::parse(b"211 Group\r\n").status_implies_multiline());
-    }
-
-    #[test]
-    fn test_status_implies_multiline_names_categorization() {
-        assert!(NntpResponse::parse(b"220 Article\r\n").status_implies_multiline());
-        assert!(!NntpResponse::parse(b"211 Group selected\r\n").status_implies_multiline());
-    }
-
-    #[test]
-    fn test_response_status_code() {
-        assert_eq!(
-            NntpResponse::parse(b"200 OK\r\n").status_code(),
-            Some(StatusCode::new(200))
-        );
-        assert_eq!(
-            NntpResponse::Disconnect.status_code(),
-            Some(StatusCode::new(205))
-        );
-        assert_eq!(
-            NntpResponse::AuthSuccess.status_code(),
-            Some(StatusCode::new(281))
-        );
-        assert_eq!(NntpResponse::Invalid.status_code(), None);
+        assert!(StatusCode::new(430).is_article_missing());
+        assert!(!StatusCode::new(400).is_article_missing());
     }
 
     #[test]
