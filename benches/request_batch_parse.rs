@@ -1,9 +1,8 @@
 //! Benchmarks for turning client read buffers into typed request contexts.
 //!
 //! The `typed_contexts` benches model the current request-boundary behavior:
-//! each complete line becomes a `RequestContext`. The baseline modules model
-//! older/raw approaches that either hand around command byte slices or allocate
-//! command strings before later classification.
+//! each complete line becomes a `RequestContext`. The raw-slice baseline models
+//! the lower bound before typed classification work.
 //!
 //! Run with: cargo bench --bench request_batch_parse
 
@@ -48,25 +47,6 @@ fn parse_raw_command_slices(buffer: &[u8]) -> usize {
     count
 }
 
-#[inline]
-fn parse_allocating_command_strings(buffer: &[u8]) -> usize {
-    let mut start = 0;
-    let mut commands = Vec::new();
-
-    while let Some(relative_lf) = buffer[start..].iter().position(|byte| *byte == b'\n') {
-        let end = start + relative_lf + 1;
-        if end >= 2
-            && buffer[end - 2] == b'\r'
-            && let Ok(line) = std::str::from_utf8(&buffer[start..end])
-        {
-            commands.push(line.to_string());
-        }
-        start = end;
-    }
-
-    black_box(commands).len()
-}
-
 fn repeated_article_batch(count: usize) -> Vec<u8> {
     (0..count)
         .map(|i| format!("ARTICLE <bench-{i}@example.com>\r\n"))
@@ -105,26 +85,6 @@ mod raw_slice_baseline {
                 bencher
                     .counter(divan::counter::ItemsCount::new($count as usize))
                     .bench(|| black_box(parse_raw_command_slices(black_box(&buffer))));
-            }
-        };
-    }
-
-    bench_batch!(one_article, 1);
-    bench_batch!(four_articles, 4);
-    bench_batch!(thirty_two_articles, 32);
-}
-
-mod allocating_string_baseline {
-    use super::{Bencher, black_box, parse_allocating_command_strings, repeated_article_batch};
-
-    macro_rules! bench_batch {
-        ($name:ident, $count:expr) => {
-            #[divan::bench(sample_count = 500, sample_size = 100)]
-            fn $name(bencher: Bencher) {
-                let buffer = repeated_article_batch($count);
-                bencher
-                    .counter(divan::counter::ItemsCount::new($count as usize))
-                    .bench(|| black_box(parse_allocating_command_strings(black_box(&buffer))));
             }
         };
     }
