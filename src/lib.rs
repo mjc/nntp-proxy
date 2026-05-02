@@ -92,11 +92,3 @@ pub use config::{
 };
 pub use proxy::{NntpProxy, NntpProxyBuilder};
 pub use runtime::{RuntimeConfig, shutdown_signal};
-
-// Re-export backend command utilities for standalone client use
-pub mod backend {
-    //! Backend communication utilities for NNTP client operations
-    //!
-    //! Use these when building standalone NNTP clients.
-    pub use crate::session::backend::{BackendFirstResponse, send_request};
-}
