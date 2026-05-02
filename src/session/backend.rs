@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
-use crate::protocol::{NntpResponse, RequestContext};
+use crate::protocol::{NntpResponse, RequestContext, StatusCode};
 
 // ─── Response validation ────────────────────────────────────────────────────
 
@@ -43,6 +43,7 @@ pub enum ResponseWarning {
 #[derive(Debug)]
 pub struct ParsedBackendResponse {
     pub response: NntpResponse,
+    pub status_code: Option<StatusCode>,
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
@@ -78,10 +79,11 @@ pub fn validate_backend_response(
 
     // Parse response code
     let response = NntpResponse::parse(&chunk[..bytes_read]);
+    let status_code = StatusCode::parse(&chunk[..bytes_read]);
     // Check for invalid response
     if response == NntpResponse::Invalid {
         warnings.push(ResponseWarning::InvalidResponse);
-    } else if let Some(code) = response.status_code() {
+    } else if let Some(code) = status_code {
         // Check for unusual status codes
         let raw_code = code.as_u16();
         if raw_code == 0 || raw_code >= 600 {
@@ -89,7 +91,11 @@ pub fn validate_backend_response(
         }
     }
 
-    ParsedBackendResponse { response, warnings }
+    ParsedBackendResponse {
+        response,
+        status_code,
+        warnings,
+    }
 }
 
 /// Return the byte offset immediately after the response status line.
@@ -460,6 +466,10 @@ mod tests {
         let data = b"200 OK\r\n";
         let validated = validate_backend_response(data, data.len(), 7);
 
+        assert_eq!(
+            validated.status_code,
+            Some(crate::protocol::StatusCode::new(200))
+        );
         assert!(matches!(validated.response, NntpResponse::Greeting(_)));
         assert!(!validated.response.is_multiline());
         assert!(validated.warnings.is_empty());
