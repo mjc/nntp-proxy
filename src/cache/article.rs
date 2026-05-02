@@ -1081,8 +1081,10 @@ mod tests {
     }
 
     fn rendered(entry: &ArticleEntry, verb: &str, msgid: &str) -> Vec<u8> {
-        let msgid = MessageId::from_borrowed(msgid).unwrap();
-        entry.response_for_command(verb, &msgid).unwrap()
+        entry
+            .response_parts_for_command_bytes(verb.as_bytes(), msgid)
+            .map(|response| response.to_vec())
+            .unwrap()
     }
 
     #[test]
