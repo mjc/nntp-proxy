@@ -265,21 +265,6 @@ impl CachedResponseWrite {
     }
 }
 
-fn cached_response_status_for_verb(verb: &[u8]) -> Option<StatusCode> {
-    let code = if verb.eq_ignore_ascii_case(b"ARTICLE") {
-        220
-    } else if verb.eq_ignore_ascii_case(b"HEAD") {
-        221
-    } else if verb.eq_ignore_ascii_case(b"BODY") {
-        222
-    } else if verb.eq_ignore_ascii_case(b"STAT") {
-        223
-    } else {
-        return None;
-    };
-    Some(StatusCode::new(code))
-}
-
 pub(super) async fn write_cached_article_response<W>(
     client_write: &mut W,
     cached: &crate::cache::ArticleEntry,
@@ -311,10 +296,8 @@ where
             client_write.write_all(b"\r\n.\r\n").await?;
         }
     }
-    let status = cached_response_status_for_verb(cmd_verb)
-        .expect("cached article response has typed status");
     Ok(Some(CachedResponseWrite {
-        status,
+        status: response.status(),
         wire_len: bytes_written.into(),
     }))
 }
@@ -553,24 +536,5 @@ mod tests {
             Some((0b0000_0001, 0b0000_0001))
         );
         assert_eq!(metrics, BackendToClientBytes::zero());
-    }
-
-    #[test]
-    fn cached_response_status_matches_synthesized_article_response() {
-        let cases = [
-            ("ARTICLE <id@example>\r\n", 220),
-            ("HEAD <id@example>\r\n", 221),
-            ("BODY <id@example>\r\n", 222),
-            ("STAT <id@example>\r\n", 223),
-        ];
-
-        for (line, status) in cases {
-            assert_eq!(
-                cached_response_status_for_verb(
-                    RequestContext::from_request_bytes(line.as_bytes()).verb()
-                ),
-                Some(StatusCode::new(status))
-            );
-        }
     }
 }

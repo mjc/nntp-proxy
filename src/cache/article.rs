@@ -108,6 +108,7 @@ pub enum CachedPayloadKind {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CachedArticleResponse<'a> {
+    status: StatusCode,
     status_line: StackStatusLine,
     payload: CachedArticleResponsePayload<'a>,
 }
@@ -134,6 +135,11 @@ impl CachedArticleResponse<'_> {
     #[must_use]
     pub fn status_line(&self) -> &[u8] {
         self.status_line.as_slice()
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.status
     }
 
     #[must_use]
@@ -659,6 +665,7 @@ pub(crate) fn response_parts_for_payload_bytes<'a>(
         )
     {
         Some(CachedArticleResponse {
+            status: StatusCode::new(223),
             status_line: StackStatusLine::new(223, number, message_id)?,
             payload: CachedArticleResponsePayload::None,
         })
@@ -666,6 +673,7 @@ pub(crate) fn response_parts_for_payload_bytes<'a>(
         && let CachedPayload::Article { headers, body, .. } = payload
     {
         Some(CachedArticleResponse {
+            status: StatusCode::new(220),
             status_line: StackStatusLine::new(220, number, message_id)?,
             payload: CachedArticleResponsePayload::Article { headers, body },
         })
@@ -674,6 +682,7 @@ pub(crate) fn response_parts_for_payload_bytes<'a>(
             payload
     {
         Some(CachedArticleResponse {
+            status: StatusCode::new(221),
             status_line: StackStatusLine::new(221, number, message_id)?,
             payload: CachedArticleResponsePayload::Head { headers },
         })
@@ -681,6 +690,7 @@ pub(crate) fn response_parts_for_payload_bytes<'a>(
         && let CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. } = payload
     {
         Some(CachedArticleResponse {
+            status: StatusCode::new(222),
             status_line: StackStatusLine::new(222, number, message_id)?,
             payload: CachedArticleResponsePayload::Body { body },
         })
