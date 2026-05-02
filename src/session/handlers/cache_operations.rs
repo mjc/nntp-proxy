@@ -7,7 +7,7 @@ use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
     RequestCacheAvailability, RequestCacheEntryMetadata, RequestCacheStatus, RequestCacheTier,
-    RequestContext, ResponseWireLen, StatusCode,
+    RequestCacheTimestampMillis, RequestContext, ResponseWireLen, StatusCode,
 };
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
@@ -67,6 +67,7 @@ impl ClientSession {
                 status,
                 cache_availability_metadata(&availability),
                 RequestCacheTier::new(cached.tier().get()),
+                RequestCacheTimestampMillis::new(cached.inserted_at().get()),
             );
             request.record_cache_entry_metadata(metadata);
         }
@@ -433,6 +434,12 @@ mod tests {
             .cache
             .sync_availability(msg_id.clone(), &availability)
             .await;
+        let expected_timestamp = session
+            .cache
+            .get(&msg_id)
+            .await
+            .expect("cached availability entry")
+            .inserted_at();
 
         let mut router = BackendSelector::new();
         router.add_backend(
@@ -472,6 +479,10 @@ mod tests {
         assert_eq!(
             request.cache_entry_tier(),
             Some(crate::protocol::RequestCacheTier::new(0))
+        );
+        assert_eq!(
+            request.cache_entry_timestamp(),
+            Some(RequestCacheTimestampMillis::new(expected_timestamp.get()))
         );
         assert_eq!(
             request

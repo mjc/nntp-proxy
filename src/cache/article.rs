@@ -385,6 +385,12 @@ impl ArticleEntry {
         self.tier
     }
 
+    #[inline]
+    #[must_use]
+    pub const fn inserted_at(&self) -> ttl::CacheTimestampMillis {
+        self.inserted_at
+    }
+
     /// Set the tier (used when updating entry)
     #[inline]
     pub const fn set_tier(&mut self, tier: ttl::CacheTier) {
