@@ -426,23 +426,23 @@ impl ClientSession {
         Ok(BatchStep::Continue)
     }
 
-    /// Route a single command to a backend and execute it
+    /// Route a single request to a backend and execute it
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
     /// (such as `hybrid.rs`) that also need to route commands.
-    pub(super) async fn route_and_execute_command(
+    pub(super) async fn route_and_execute_request(
         &self,
         router: Arc<BackendSelector>,
-        command: &str,
         request: &RequestContext,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<crate::types::BackendId, SessionError> {
         debug!(
-            "Client {} ENTERED route_and_execute_command: {}",
+            "Client {} ENTERED route_and_execute_request: kind={:?}, verb={:?}",
             self.client_addr,
-            command.trim()
+            request.kind(),
+            request.verb()
         );
         // Extract message-ID early for cache/availability tracking
         let msg_id = request.message_id_value();
@@ -534,20 +534,21 @@ impl ClientSession {
                 let guard = CommandGuard::new(router.clone(), backend_id);
 
                 debug!(
-                    "Client {} using pipeline path for backend {:?}: {}",
+                    "Client {} using pipeline path for backend {:?}: kind={:?}, verb={:?}",
                     self.client_addr,
                     backend_id,
-                    command.trim()
+                    request.kind(),
+                    request.verb()
                 );
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let request = QueuedContext {
+                let queued_context = QueuedContext {
                     context: request.clone(),
                     response_tx: tx,
                 };
 
                 // Enqueue with backpressure - fail fast if queue is full
-                match queue.try_enqueue(request) {
+                match queue.try_enqueue(queued_context) {
                     Ok(()) => {
                         self.metrics.record_pipeline_enqueue();
 
@@ -564,7 +565,7 @@ impl ClientSession {
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                                 *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
                                 *client_to_backend_bytes =
-                                    client_to_backend_bytes.add(command.len());
+                                    client_to_backend_bytes.add(request.wire_len());
                                 self.metrics.record_pipeline_complete();
                                 guard.complete();
                                 return Ok(backend_id);
@@ -613,9 +614,10 @@ impl ClientSession {
         // Execute command with availability-aware backend selection.
         // Load availability from cache if not already checked
         debug!(
-            "Client {} starting availability routing for command: {}",
+            "Client {} starting availability routing for request kind={:?}, verb={:?}",
             self.client_addr,
-            command.trim()
+            request.kind(),
+            request.verb()
         );
 
         let mut buffer = self.buffer_pool.acquire().await;

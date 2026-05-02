@@ -159,7 +159,7 @@
 //!   - Acquires dedicated backend connection
 //!   - Hands off to stateful proxy loop
 //!
-//! - `route_and_execute_command()` - Per-command orchestration
+//! - `route_and_execute_request()` - Per-command orchestration
 //!   - Routes command to backend
 //!   - Handles connection pool management
 //!   - Distinguishes backend errors from client disconnects

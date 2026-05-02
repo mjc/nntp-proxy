@@ -137,9 +137,8 @@ impl ClientSession {
                     self.client_addr, trimmed
                 );
                 let mut c2b_mutable = client_to_backend_bytes;
-                self.route_and_execute_command(
+                self.route_and_execute_request(
                     router.clone(),
-                    command,
                     request,
                     client_write,
                     &mut c2b_mutable,
