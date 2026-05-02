@@ -8,15 +8,21 @@ use std::sync::Arc;
 use crate::cache::{ArticleAvailability, ArticleEntry, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
-use crate::protocol::{RequestContext, ResponseShape};
+use crate::protocol::{RequestContext, ResponseShape, StatusCode};
 use crate::router::BackendSelector;
 use crate::session::backend;
 use crate::types::{BackendId, MessageId};
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum PrecheckHit {
+    Payload(crate::cache::CacheBuffer),
+    Availability(StatusCode),
+}
+
 /// Result of querying a backend for an article.
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryResult {
-    Found(BackendId, crate::cache::CacheBuffer),
+    Found(BackendId, PrecheckHit),
     Missing(BackendId),
     Error(BackendId),
 }
@@ -47,6 +53,25 @@ impl PrecheckDeps<'_> {
             buffer_pool: self.buffer_pool.clone(),
             metrics: self.metrics.clone(),
             cache_articles: self.cache_articles,
+        }
+    }
+}
+
+async fn cache_precheck_hit(
+    cache: &UnifiedCache,
+    msg_id: MessageId<'static>,
+    backend_id: BackendId,
+    hit: PrecheckHit,
+    tier: crate::cache::ttl::CacheTier,
+) {
+    match hit {
+        PrecheckHit::Payload(data) => {
+            cache.upsert(msg_id, data, backend_id, tier).await;
+        }
+        PrecheckHit::Availability(status_code) => {
+            cache
+                .record_backend_has_status(msg_id, status_code, backend_id, tier)
+                .await;
         }
     }
 }
@@ -104,8 +129,13 @@ async fn execute_backend_query(
             let response_shape = request.response_shape(status_code);
             let response = if matches!(response_shape, ResponseShape::Multiline) {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
-                let mut response = crate::pool::ChunkedResponse::default();
-                response.extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);
+                let mut response = deps
+                    .cache_articles
+                    .then(crate::pool::ChunkedResponse::default);
+                if let Some(response) = &mut response {
+                    response
+                        .extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);
+                }
                 let mut tail = TailBuffer::default();
                 match tail.detect_terminator(buffer.as_ref()) {
                     TerminatorStatus::FoundAt(pos) => {
@@ -117,7 +147,9 @@ async fn execute_backend_query(
                         {
                             return Err(());
                         }
-                        response.truncate(pos);
+                        if let Some(response) = &mut response {
+                            response.truncate(pos);
+                        }
                     }
                     TerminatorStatus::NotFound => {
                         tail.update(buffer.as_ref());
@@ -130,30 +162,37 @@ async fn execute_backend_query(
                                         {
                                             return Err(());
                                         }
-                                        response
-                                            .extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
+                                        if let Some(response) = &mut response {
+                                            response.extend_from_slice(
+                                                &deps.buffer_pool,
+                                                &buffer[..pos],
+                                            );
+                                        }
                                         break;
                                     }
                                     TerminatorStatus::NotFound => {
                                         tail.update(&buffer[..n]);
-                                        response.extend_from_slice(&deps.buffer_pool, &buffer[..n]);
+                                        if let Some(response) = &mut response {
+                                            response
+                                                .extend_from_slice(&deps.buffer_pool, &buffer[..n]);
+                                        }
                                     }
                                 },
                             }
                         }
                     }
                 }
-                if deps.cache_articles {
-                    crate::cache::CacheBuffer::Chunked(response)
+                if let Some(response) = response {
+                    PrecheckHit::Payload(crate::cache::CacheBuffer::Chunked(response))
                 } else {
-                    crate::cache::CacheBuffer::Small(crate::cache::extract_chunked_status_line(
-                        &response,
-                    ))
+                    PrecheckHit::Availability(status_code)
                 }
-            } else {
+            } else if deps.cache_articles {
                 let mut response = Vec::with_capacity(cmd_response.bytes_read);
                 response.extend_from_slice(&buffer[..cmd_response.bytes_read]);
-                crate::cache::CacheBuffer::Vec(response)
+                PrecheckHit::Payload(crate::cache::CacheBuffer::Vec(response))
+            } else {
+                PrecheckHit::Availability(status_code)
             };
 
             let result = match status_code.as_u16() {
@@ -217,7 +256,7 @@ async fn query_all_backends_racing(
     deps: &OwnedDeps,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
-) -> Option<(BackendId, crate::cache::CacheBuffer)> {
+) -> Option<(BackendId, PrecheckHit)> {
     use futures::StreamExt;
 
     let tasks: Vec<_> = (0..deps.router.backend_count().get())
@@ -288,12 +327,7 @@ async fn query_all_backends_racing(
 /// # NNTP Semantics
 /// 430 responses are authoritative (never false negatives), 2xx are not.
 /// See `crate::cache::article` module docs for full explanation.
-fn summarize(
-    results: Vec<QueryResult>,
-) -> (
-    Option<(BackendId, crate::cache::CacheBuffer)>,
-    ArticleAvailability,
-) {
+fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, ArticleAvailability) {
     let mut availability = ArticleAvailability::new();
     let mut found = None;
 
@@ -350,10 +384,7 @@ pub async fn precheck(
         let tier = crate::cache::ttl::CacheTier::new(0);
         // Move data into upsert, then retrieve the entry via cache.get().
         // The lookup is sub-microsecond vs 750KB memcpy from cloning.
-        owned
-            .cache
-            .upsert(msg_id.to_owned(), data, backend_id, tier)
-            .await;
+        cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
         owned.cache.get(msg_id).await
     } else {
         // No article found - availability is synced by background task
@@ -388,10 +419,7 @@ pub fn spawn_background_precheck(
             // When racing backends, we don't have visibility into which tier actually has
             // the article. Using tier 0 conservatively avoids overestimating TTL.
             let tier = crate::cache::ttl::CacheTier::new(0);
-            owned
-                .cache
-                .upsert(msg_id.to_owned(), data, backend_id, tier)
-                .await;
+            cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
         }
         owned.cache.sync_availability(msg_id, &availability).await;
     });
@@ -407,15 +435,21 @@ mod tests {
     fn summarize_finds_first() {
         let results = vec![
             QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Found(BackendId::from_index(1), b"first".to_vec().into()),
-            QueryResult::Found(BackendId::from_index(2), b"second".to_vec().into()),
+            QueryResult::Found(
+                BackendId::from_index(1),
+                PrecheckHit::Payload(b"first".to_vec().into()),
+            ),
+            QueryResult::Found(
+                BackendId::from_index(2),
+                PrecheckHit::Payload(b"second".to_vec().into()),
+            ),
         ];
         let (found, avail) = summarize(results);
         assert_eq!(
             found,
             Some((
                 BackendId::from_index(1),
-                crate::cache::CacheBuffer::Vec(b"first".to_vec())
+                PrecheckHit::Payload(crate::cache::CacheBuffer::Vec(b"first".to_vec()))
             ))
         );
         assert!(avail.is_missing(BackendId::from_index(0)));
@@ -507,5 +541,31 @@ mod tests {
         let request = RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
         let result = query_backend(&deps, backend_id, &request).await;
         assert_eq!(result, QueryResult::Error(backend_id));
+    }
+
+    #[tokio::test]
+    async fn cache_precheck_availability_hit_records_no_payload() {
+        use crate::cache::CachedPayloadKind;
+        use crate::cache::UnifiedCache;
+        use crate::types::BackendId;
+
+        let backend_id = BackendId::from_index(0);
+        let cache = UnifiedCache::memory(100, Duration::from_secs(60), false);
+        let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        cache_precheck_hit(
+            &cache,
+            msg_id.to_owned(),
+            backend_id,
+            PrecheckHit::Availability(StatusCode::new(223)),
+            crate::cache::ttl::CacheTier::new(0),
+        )
+        .await;
+
+        let entry = cache.get(&msg_id).await.expect("entry cached");
+        assert_eq!(entry.status_code(), StatusCode::new(223));
+        assert_eq!(entry.payload_kind(), CachedPayloadKind::AvailabilityOnly);
+        assert_eq!(entry.payload_len().get(), 0);
+        assert!(entry.has_availability_info());
     }
 }

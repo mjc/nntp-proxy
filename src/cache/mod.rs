@@ -30,9 +30,6 @@ pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 
-// Internal helper re-exported for session handlers
-pub(crate) use entry_helpers::extract_chunked_status_line;
-
 use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
 use smallvec::SmallVec;

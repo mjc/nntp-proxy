@@ -4,10 +4,8 @@
 //! providing common logic used by both `ArticleEntry` (moka) and
 //! `HybridArticleEntry` (foyer) cache implementations.
 
-use crate::pool::ChunkedResponse;
 #[cfg(test)]
 use crate::session::streaming::tail_buffer::TailBuffer;
-use smallvec::SmallVec;
 
 /// Check if a buffer contains a valid NNTP multiline response
 ///
@@ -71,43 +69,6 @@ pub(super) const fn matches_command_type_verb(status_code: u16, cmd_verb: &str) 
         221 => cmd_verb.eq_ignore_ascii_case("HEAD") || cmd_verb.eq_ignore_ascii_case("STAT"),
         _ => false,
     }
-}
-
-/// Extract the first status line from an NNTP response buffer.
-///
-/// Returns bytes up to and including the first `\r\n`, or the first 3 bytes
-/// plus `\r\n` as fallback. Used to create minimal cache stubs without
-/// copying the full response buffer.
-///
-/// This is used when `cache_articles=false` to reduce memory copies —
-/// the cache only needs the status code to build an availability stub,
-/// not the full article content (which can be 8-64KB in `first_chunk`).
-///
-/// Uses `SmallVec` to keep typical status lines (~30-80 bytes) on the stack,
-/// avoiding heap allocation in the common case.
-#[inline]
-pub fn extract_status_line(buffer: &[u8]) -> SmallVec<[u8; 128]> {
-    // Find first \r for end of status line
-    if let Some(cr_pos) = memchr::memchr(b'\r', buffer) {
-        let end = (cr_pos + 2).min(buffer.len());
-        SmallVec::from_slice(&buffer[..end])
-    } else if buffer.len() >= 3 {
-        // Fallback: just the status code digits + CRLF
-        let mut stub = SmallVec::new();
-        stub.extend_from_slice(&buffer[..3]);
-        stub.extend_from_slice(b"\r\n");
-        stub
-    } else {
-        SmallVec::from_slice(buffer)
-    }
-}
-
-/// Extract the first status line from a chunked response without flattening.
-#[inline]
-pub fn extract_chunked_status_line(buffer: &ChunkedResponse) -> SmallVec<[u8; 128]> {
-    let mut prefix = SmallVec::<[u8; 128]>::new();
-    buffer.copy_prefix_into(buffer.len().min(128), &mut prefix);
-    extract_status_line(&prefix)
 }
 
 #[cfg(test)]
@@ -223,60 +184,5 @@ mod tests {
         assert!(!matches_command_type_verb(223, "STAT"));
         assert!(!matches_command_type_verb(430, "ARTICLE"));
         assert!(!matches_command_type_verb(200, "ARTICLE"));
-    }
-
-    // =========================================================================
-    // extract_status_line tests
-    // =========================================================================
-
-    #[test]
-    fn test_extract_status_line_full() {
-        let buf = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content\r\n.\r\n";
-        let stub = extract_status_line(buf);
-        assert_eq!(stub.as_slice(), b"220 0 <test@example.com>\r\n");
-    }
-
-    #[test]
-    fn test_extract_status_line_minimal() {
-        let buf = b"430 not found\r\n";
-        let stub = extract_status_line(buf);
-        assert_eq!(stub.as_slice(), b"430 not found\r\n");
-    }
-
-    #[test]
-    fn test_extract_status_line_no_crlf() {
-        // Fallback: just status code + CRLF
-        let buf = b"220 something without crlf";
-        let stub = extract_status_line(buf);
-        assert_eq!(stub.as_slice(), b"220\r\n");
-    }
-
-    #[test]
-    fn test_extract_status_line_too_short() {
-        // Buffer shorter than 3 bytes - just return it
-        let buf = b"22";
-        let stub = extract_status_line(buf);
-        assert_eq!(stub.as_slice(), b"22");
-    }
-
-    #[test]
-    fn test_extract_status_line_exact_crlf_boundary() {
-        // \r at the end, but buffer doesn't have \n
-        let buf = b"220 test\r";
-        let stub = extract_status_line(buf);
-        // cr_pos = 8, end = min(10, 9) = 9
-        assert_eq!(stub.as_slice(), b"220 test\r");
-    }
-
-    #[tokio::test]
-    async fn test_extract_chunked_status_line_across_chunks() {
-        let pool =
-            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
-                .with_capture_pool(8, 4);
-        let mut response = ChunkedResponse::default();
-        response.extend_from_slice(&pool, b"220 0 <test@example.com>\r\nBody\r\n.\r\n");
-
-        let stub = extract_chunked_status_line(&response);
-        assert_eq!(stub.as_slice(), b"220 0 <test@example.com>\r\n");
     }
 }
