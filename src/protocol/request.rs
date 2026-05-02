@@ -35,6 +35,7 @@ pub enum RequestKind {
     Post,
     Ihave,
     AuthInfo,
+    StartTls,
     Unknown,
 }
 
@@ -590,7 +591,9 @@ impl RequestContext {
             RequestKind::Capabilities | RequestKind::Quit | RequestKind::AuthInfo => {
                 RequestRouteClass::Local
             }
-            RequestKind::Post | RequestKind::Ihave => RequestRouteClass::Reject,
+            RequestKind::Post | RequestKind::Ihave | RequestKind::StartTls => {
+                RequestRouteClass::Reject
+            }
             RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
                 if self.message_id.is_some() =>
             {
@@ -714,6 +717,8 @@ fn classify_verb(verb: &[u8]) -> RequestKind {
         RequestKind::Ihave
     } else if is!(b"AUTHINFO") {
         RequestKind::AuthInfo
+    } else if is!(b"STARTTLS") {
+        RequestKind::StartTls
     } else {
         RequestKind::Unknown
     }
@@ -900,6 +905,7 @@ mod tests {
             ("POST\r\n", RequestKind::Post),
             ("IHAVE <a@b>\r\n", RequestKind::Ihave),
             ("AUTHINFO USER test\r\n", RequestKind::AuthInfo),
+            ("STARTTLS\r\n", RequestKind::StartTls),
         ];
 
         for (line, expected) in cases {
@@ -923,6 +929,7 @@ mod tests {
             ("AUTHINFO PASS secret\r\n", RequestRouteClass::Local),
             ("POST\r\n", RequestRouteClass::Reject),
             ("IHAVE <a@b>\r\n", RequestRouteClass::Reject),
+            ("STARTTLS\r\n", RequestRouteClass::Reject),
             ("XFOO arg\r\n", RequestRouteClass::Stateful),
         ];
 
