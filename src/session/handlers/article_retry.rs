@@ -485,29 +485,28 @@ impl ClientSession {
             && (request.is_stat() || request.is_head())
         {
             let deps = self.precheck_deps(&router);
-            let bytes_written = if let Some(entry) =
-                precheck::precheck(&deps, request, msg_id_ref).await
-            {
-                if let Some(write) =
-                    write_cached_article_response(client_write, &entry, request, msg_id_ref)
-                        .await
-                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
-                {
-                    write.wire_len.get()
+            let bytes_written =
+                if let Some(entry) = precheck::precheck(&deps, request, msg_id_ref).await {
+                    if let Some(write) =
+                        write_cached_article_response(client_write, &entry, request, msg_id_ref)
+                            .await
+                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
+                    {
+                        write.wire_len.get()
+                    } else {
+                        client_write
+                            .write_all(crate::protocol::NO_SUCH_ARTICLE)
+                            .await
+                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                        crate::protocol::NO_SUCH_ARTICLE.len()
+                    }
                 } else {
                     client_write
                         .write_all(crate::protocol::NO_SUCH_ARTICLE)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     crate::protocol::NO_SUCH_ARTICLE.len()
-                }
-            } else {
-                client_write
-                    .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                    .await
-                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                crate::protocol::NO_SUCH_ARTICLE.len()
-            };
+                };
             *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
             return Ok(BackendId::from_index(0));
         }

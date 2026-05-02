@@ -112,8 +112,8 @@ impl ClientSession {
 
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from typed payload sections.
-        let Some(write) = write_cached_article_response(client_write, &cached, request, msg_id_ref)
-            .await?
+        let Some(write) =
+            write_cached_article_response(client_write, &cached, request, msg_id_ref).await?
         else {
             let status_code = cached.status_code().as_u16();
             debug!(
