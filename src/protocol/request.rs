@@ -693,6 +693,21 @@ impl RequestContext {
         self.wire_len().into()
     }
 
+    /// Write the typed request as NNTP wire bytes without building a command buffer.
+    pub async fn write_wire_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt as _;
+
+        writer.write_all(self.verb()).await?;
+        if !self.args().is_empty() {
+            writer.write_all(b" ").await?;
+            writer.write_all(self.args()).await?;
+        }
+        writer.write_all(b"\r\n").await
+    }
+
     #[must_use]
     pub fn response_shape(&self, status: StatusCode) -> ResponseShape {
         let code = status.as_u16();
@@ -836,6 +851,16 @@ mod tests {
         assert_eq!(ctx.response_wire_len(), None);
         assert!(ctx.is_pipelineable());
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[tokio::test]
+    async fn request_context_writes_wire_bytes_without_command_buffer() {
+        let ctx = RequestContext::from_request_bytes(b"BODY <a@b>\r\n");
+        let mut out = Vec::new();
+
+        ctx.write_wire_to(&mut out).await.unwrap();
+
+        assert_eq!(out, b"BODY <a@b>\r\n");
     }
 
     #[test]
