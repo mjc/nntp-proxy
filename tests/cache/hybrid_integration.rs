@@ -27,8 +27,7 @@ fn response_bytes(
     verb: &[u8],
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
-    let response =
-        entry.response_parts_for_request_kind(verb_to_kind(verb)?, message_id.as_str())?;
+    let response = entry.response_for(verb_to_kind(verb)?, message_id.as_str())?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)

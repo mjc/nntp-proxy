@@ -105,7 +105,7 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
 }
 
 #[test]
-fn test_matches_command_type_article_response() {
+fn test_serves_request_kind_article_response() {
     assert_serves(
         &article_entry(),
         &[
@@ -118,7 +118,7 @@ fn test_matches_command_type_article_response() {
 }
 
 #[test]
-fn test_matches_command_type_body_response() {
+fn test_serves_request_kind_body_response() {
     assert_serves(
         &body_entry(),
         &[
@@ -131,7 +131,7 @@ fn test_matches_command_type_body_response() {
 }
 
 #[test]
-fn test_matches_command_type_head_response() {
+fn test_serves_request_kind_head_response() {
     assert_serves(
         &head_entry(),
         &[
@@ -144,7 +144,7 @@ fn test_matches_command_type_head_response() {
 }
 
 #[test]
-fn test_response_for_command_verbs_uppercase() {
+fn test_response_for_request_verbs_uppercase() {
     let body_response = b"222 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(body_response);
 
@@ -209,7 +209,7 @@ fn test_status_code_parsing() {
     assert_eq!(entry_221.status_code().as_u16(), 221);
 }
 #[test]
-fn test_body_article_command_type_mismatch() {
+fn test_body_article_request_kind_mismatch() {
     let body_response = ArticleEntry::from_response_bytes(
         b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n",
     );

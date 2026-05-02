@@ -457,12 +457,12 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
-    pub fn response_parts_for_request_kind(
+    pub fn response_for(
         &self,
         request_kind: RequestKind,
         message_id: &str,
     ) -> Option<super::article::CachedArticleResponse<'_>> {
-        super::article::response_parts_for_payload_kind(&self.payload, request_kind, message_id)
+        super::article::response_for_payload(&self.payload, request_kind, message_id)
     }
 
     #[must_use]
@@ -608,7 +608,7 @@ mod tests {
         verb: &[u8],
         message_id: &str,
     ) -> Option<Vec<u8>> {
-        let response = entry.response_parts_for_request_kind(verb_to_kind(verb)?, message_id)?;
+        let response = entry.response_for(verb_to_kind(verb)?, message_id)?;
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).ok()?;
         Some(out)
@@ -827,13 +827,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_entry_response_parts_do_not_clone_payload() {
+    fn test_hybrid_entry_response_do_not_clone_payload() {
         let buffer = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry =
             HybridArticleEntry::from_response_bytes(buffer.clone()).expect("valid status code");
 
         let response = entry
-            .response_parts_for_request_kind(RequestKind::Head, "<test@example.com>")
+            .response_for(RequestKind::Head, "<test@example.com>")
             .expect("article cache entry can serve HEAD");
 
         let mut rendered = Vec::with_capacity(response.wire_len().get());
@@ -872,51 +872,21 @@ mod tests {
         let article =
             HybridArticleEntry::from_response_bytes(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
                 .expect("valid");
-        assert!(
-            article
-                .response_parts_for_request_kind(RequestKind::Article, "<id>")
-                .is_some()
-        );
-        assert!(
-            article
-                .response_parts_for_request_kind(RequestKind::Body, "<id>")
-                .is_some()
-        );
-        assert!(
-            article
-                .response_parts_for_request_kind(RequestKind::Head, "<id>")
-                .is_some()
-        );
+        assert!(article.response_for(RequestKind::Article, "<id>").is_some());
+        assert!(article.response_for(RequestKind::Body, "<id>").is_some());
+        assert!(article.response_for(RequestKind::Head, "<id>").is_some());
 
         let body =
             HybridArticleEntry::from_response_bytes(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
-        assert!(
-            body.response_parts_for_request_kind(RequestKind::Article, "<id>")
-                .is_none()
-        );
-        assert!(
-            body.response_parts_for_request_kind(RequestKind::Body, "<id>")
-                .is_some()
-        );
-        assert!(
-            body.response_parts_for_request_kind(RequestKind::Head, "<id>")
-                .is_none()
-        );
+        assert!(body.response_for(RequestKind::Article, "<id>").is_none());
+        assert!(body.response_for(RequestKind::Body, "<id>").is_some());
+        assert!(body.response_for(RequestKind::Head, "<id>").is_none());
 
         let head =
             HybridArticleEntry::from_response_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
-        assert!(
-            head.response_parts_for_request_kind(RequestKind::Article, "<id>")
-                .is_none()
-        );
-        assert!(
-            head.response_parts_for_request_kind(RequestKind::Body, "<id>")
-                .is_none()
-        );
-        assert!(
-            head.response_parts_for_request_kind(RequestKind::Head, "<id>")
-                .is_some()
-        );
+        assert!(head.response_for(RequestKind::Article, "<id>").is_none());
+        assert!(head.response_for(RequestKind::Body, "<id>").is_none());
+        assert!(head.response_for(RequestKind::Head, "<id>").is_some());
     }
 
     #[test]
@@ -1110,11 +1080,11 @@ mod tests {
     }
 
     // =========================================================================
-    // response_for_command
+    // response_for_request
     // =========================================================================
 
     #[test]
-    fn test_response_for_command_stat_from_220() {
+    fn test_response_for_request_stat_from_220() {
         let entry = HybridArticleEntry::from_response_bytes(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
@@ -1124,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_command_stat_from_221() {
+    fn test_response_for_request_stat_from_221() {
         let entry =
             HybridArticleEntry::from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         let resp = render_response(&entry, b"STAT", "<t@x>").expect("should serve STAT from head");
@@ -1132,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_command_stat_from_222() {
+    fn test_response_for_request_stat_from_222() {
         let entry =
             HybridArticleEntry::from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
@@ -1141,13 +1111,13 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_command_stat_not_from_430() {
+    fn test_response_for_request_stat_not_from_430() {
         let entry = HybridArticleEntry::from_response_bytes(b"430 not found\r\n").unwrap();
         assert!(render_response(&entry, b"STAT", "<t@x>").is_none());
     }
 
     #[test]
-    fn test_response_for_command_article_direct() {
+    fn test_response_for_request_article_direct() {
         use crate::protocol::RequestKind;
 
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
@@ -1156,7 +1126,7 @@ mod tests {
         assert_eq!(resp, buf);
 
         let response = entry
-            .response_parts_for_request_kind(RequestKind::Article, "<t@x>")
+            .response_for(RequestKind::Article, "<t@x>")
             .expect("should serve ARTICLE by request kind");
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).unwrap();
@@ -1164,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_command_body_from_220() {
+    fn test_response_for_request_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = HybridArticleEntry::from_response_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, b"BODY", "<t@x>").expect("220 can serve BODY");
@@ -1172,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_command_head_from_220() {
+    fn test_response_for_request_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = HybridArticleEntry::from_response_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, b"HEAD", "<t@x>").expect("220 can serve HEAD");
@@ -1180,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_command_body_cannot_serve_article() {
+    fn test_response_for_request_body_cannot_serve_article() {
         let entry =
             HybridArticleEntry::from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
@@ -1188,14 +1158,14 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_command_head_cannot_serve_body() {
+    fn test_response_for_request_head_cannot_serve_body() {
         let entry =
             HybridArticleEntry::from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(render_response(&entry, b"BODY", "<t@x>").is_none());
     }
 
     #[test]
-    fn test_response_for_command_unknown_verb() {
+    fn test_response_for_request_unknown_verb() {
         let entry = HybridArticleEntry::from_response_bytes(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )

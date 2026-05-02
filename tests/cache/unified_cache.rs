@@ -3,7 +3,7 @@
 //! This test suite covers:
 //! - `UnifiedCache` enum dispatch (memory vs hybrid)
 //! - `CacheStatsProvider` trait implementations
-//! - `ArticleEntry::response_parts_for_request_kind()` including STAT synthesis
+//! - `ArticleEntry::response_for()` including STAT synthesis
 //! - `ArticleAvailability::from_bits()` and `ArticleEntry::set_availability()`
 //! - `DiskCache` configuration defaults and validation
 
@@ -166,24 +166,24 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 }
 
 // ============================================================================
-// ArticleEntry::response_parts_for_request_kind() Tests
+// ArticleEntry::response_for() Tests
 // ============================================================================
 
 #[test]
-fn test_response_for_command_stat_synthesizes_223() {
+fn test_response_for_request_stat_synthesizes_223() {
     let response = response_bytes(&article_entry(), b"STAT").unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
-fn test_response_parts_for_command_body_from_article_allocates_nothing() {
+fn test_response_for_request_body_from_article_allocates_nothing() {
     let entry = article_entry();
     let msg_id = test_msg_id();
 
     let (response, allocations) = crate::allocation_count_delta(|| {
         entry
-            .response_parts_for_request_kind(RequestKind::Body, msg_id.as_str())
+            .response_for(RequestKind::Body, msg_id.as_str())
             .expect("ARTICLE cache entry can serve BODY")
     });
 
@@ -196,7 +196,7 @@ fn test_response_parts_for_command_body_from_article_allocates_nothing() {
 }
 
 #[test]
-fn test_response_parts_exposes_typed_status() {
+fn test_response_exposes_typed_status() {
     let entry = ArticleEntry::from_response_bytes(
         b"220 42 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
     );
@@ -210,7 +210,7 @@ fn test_response_parts_exposes_typed_status() {
 
     for (request_kind, status) in cases {
         let response = entry
-            .response_parts_for_request_kind(request_kind, "<test@example.com>")
+            .response_for(request_kind, "<test@example.com>")
             .expect("ARTICLE cache entry can synthesize all article command responses");
 
         assert_eq!(response.status(), StatusCode::new(status));
@@ -218,14 +218,14 @@ fn test_response_parts_exposes_typed_status() {
 }
 
 #[test]
-fn test_response_parts_for_command_handles_near_limit_message_id_without_allocation() {
+fn test_response_for_request_handles_near_limit_message_id_without_allocation() {
     let entry = article_entry();
     let local = "a".repeat(520);
     let msg_id_text = format!("<{local}@example.com>");
 
     let (response, allocations) = crate::allocation_count_delta(|| {
         entry
-            .response_parts_for_request_kind(RequestKind::Stat, &msg_id_text)
+            .response_for(RequestKind::Stat, &msg_id_text)
             .expect("long message-id still fits stack response buffer")
     });
 
@@ -238,28 +238,28 @@ fn test_response_parts_for_command_handles_near_limit_message_id_without_allocat
 }
 
 #[test]
-fn test_response_for_command_stat_from_body() {
+fn test_response_for_request_stat_from_body() {
     let response = response_bytes(&body_entry(), b"STAT").unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
-fn test_response_for_command_stat_from_head() {
+fn test_response_for_request_stat_from_head() {
     let response = response_bytes(&head_entry(), b"STAT").unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
-fn test_response_for_command_430_returns_none_for_stat() {
+fn test_response_for_request_430_returns_none_for_stat() {
     let entry = ArticleEntry::from_response_bytes(b"430 No Such Article\r\n");
 
     assert_no_article_response(&entry, b"STAT");
 }
 
 #[test]
-fn test_response_for_command_article_direct_match() {
+fn test_response_for_request_article_direct_match() {
     assert_article_response(
         &article_entry(),
         b"ARTICLE",
@@ -268,7 +268,7 @@ fn test_response_for_command_article_direct_match() {
 }
 
 #[test]
-fn test_response_for_command_body_from_article() {
+fn test_response_for_request_body_from_article() {
     assert_article_response(
         &article_entry(),
         b"BODY",
@@ -277,7 +277,7 @@ fn test_response_for_command_body_from_article() {
 }
 
 #[test]
-fn test_response_for_command_head_from_article() {
+fn test_response_for_request_head_from_article() {
     assert_article_response(
         &article_entry(),
         b"HEAD",
@@ -286,17 +286,17 @@ fn test_response_for_command_head_from_article() {
 }
 
 #[test]
-fn test_response_for_command_body_cannot_serve_article() {
+fn test_response_for_request_body_cannot_serve_article() {
     assert_no_article_response(&body_entry(), b"ARTICLE");
 }
 
 #[test]
-fn test_response_for_command_head_cannot_serve_body() {
+fn test_response_for_request_head_cannot_serve_body() {
     assert_no_article_response(&head_entry(), b"BODY");
 }
 
 #[test]
-fn test_response_for_command_validates_buffer() {
+fn test_response_for_request_validates_buffer() {
     // Create an invalid buffer (missing .\r\n terminator)
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody".to_vec();
     let entry = ArticleEntry::from_response_bytes(buffer);
@@ -306,7 +306,7 @@ fn test_response_for_command_validates_buffer() {
 }
 
 #[test]
-fn test_response_for_command_empty_message_id() {
+fn test_response_for_request_empty_message_id() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(buffer);
 
@@ -627,7 +627,7 @@ fn hybrid_response_bytes(
     verb: &[u8],
     message_id: &str,
 ) -> Option<Vec<u8>> {
-    let response = entry.response_parts_for_request_kind(verb_to_kind(verb)?, message_id)?;
+    let response = entry.response_for(verb_to_kind(verb)?, message_id)?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
@@ -739,7 +739,7 @@ fn test_hybrid_entry_complete_article_detection() {
 }
 
 #[test]
-fn test_hybrid_entry_response_for_command_article() {
+fn test_hybrid_entry_response_for_request_article() {
     let buffer = make_valid_article_buffer();
     let entry = hybrid_article();
 
@@ -749,7 +749,7 @@ fn test_hybrid_entry_response_for_command_article() {
 }
 
 #[test]
-fn test_hybrid_entry_response_for_command_stat_synthesized() {
+fn test_hybrid_entry_response_for_request_stat_synthesized() {
     let entry = hybrid_article();
 
     let response = hybrid_response_bytes(&entry, b"STAT", "<test@example.com>");
@@ -760,7 +760,7 @@ fn test_hybrid_entry_response_for_command_stat_synthesized() {
 }
 
 #[test]
-fn test_hybrid_entry_response_for_command_430_returns_none() {
+fn test_hybrid_entry_response_for_request_430_returns_none() {
     let entry = hybrid_missing();
 
     // 430 stubs should not serve ARTICLE requests

@@ -267,8 +267,7 @@ pub(super) async fn write_cached_article_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let Some(response) = cached.response_parts_for_request_kind(request.kind(), msg_id.as_str())
-    else {
+    let Some(response) = cached.response_for(request.kind(), msg_id.as_str()) else {
         return Ok(None);
     };
     let wire_len = response.wire_len();

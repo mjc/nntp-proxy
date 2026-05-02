@@ -31,7 +31,7 @@ fn article_entry() -> ArticleEntry {
 
 fn write_cached_response(entry: &ArticleEntry, request_kind: RequestKind) -> usize {
     entry
-        .response_parts_for_request_kind(request_kind, MSG_ID)
+        .response_for(request_kind, MSG_ID)
         .map(|response| {
             let mut sink = tokio::io::sink();
             block_on(response.write_to(&mut sink)).unwrap();
@@ -114,10 +114,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
         bencher.bench(|| {
             black_box(
                 entry
-                    .response_parts_for_request_kind(
-                        black_box(RequestKind::Stat),
-                        black_box(LONG_MSG_ID),
-                    )
+                    .response_for(black_box(RequestKind::Stat), black_box(LONG_MSG_ID))
                     .map(|response| {
                         let mut sink = tokio::io::sink();
                         block_on(response.write_to(&mut sink)).unwrap();

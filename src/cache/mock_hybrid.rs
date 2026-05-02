@@ -205,7 +205,7 @@ mod tests {
         let entry = cache.get(&msg_id()).await.expect("entry remains cached");
         assert!(
             entry
-                .response_parts_for_request_kind(RequestKind::Article, "<mock-hybrid@example>")
+                .response_for(RequestKind::Article, "<mock-hybrid@example>")
                 .is_some(),
             "longer raw wire stubs must not replace semantic article payloads"
         );

@@ -552,16 +552,16 @@ impl ArticleEntry {
     }
 
     #[must_use]
-    pub fn response_parts_for_request_kind(
+    pub fn response_for(
         &self,
         request_kind: RequestKind,
         message_id: &str,
     ) -> Option<CachedArticleResponse<'_>> {
-        response_parts_for_payload_kind(&self.payload, request_kind, message_id)
+        response_for_payload(&self.payload, request_kind, message_id)
     }
 }
 
-pub(crate) fn response_parts_for_payload_kind<'a>(
+pub(crate) fn response_for_payload<'a>(
     payload: &'a CachedPayload,
     request_kind: RequestKind,
     message_id: &str,
@@ -1194,9 +1194,7 @@ mod tests {
             "STAT" => RequestKind::Stat,
             _ => panic!("unsupported test verb {verb}"),
         };
-        let response = entry
-            .response_parts_for_request_kind(request_kind, msgid)
-            .unwrap();
+        let response = entry.response_for(request_kind, msgid).unwrap();
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).unwrap();
         out
@@ -1206,7 +1204,7 @@ mod tests {
     async fn cached_article_response_writes_wire_slices() {
         let entry = create_test_article("<test@example.com>");
         let response = entry
-            .response_parts_for_request_kind(RequestKind::Article, "<test@example.com>")
+            .response_for(RequestKind::Article, "<test@example.com>")
             .unwrap();
         let mut out = Vec::new();
 
@@ -1222,7 +1220,7 @@ mod tests {
     fn cached_article_response_exposes_typed_wire_len() {
         let entry = create_test_article("<test@example.com>");
         let response = entry
-            .response_parts_for_request_kind(RequestKind::Stat, "<test@example.com>")
+            .response_for(RequestKind::Stat, "<test@example.com>")
             .unwrap();
 
         assert_eq!(
@@ -1251,7 +1249,7 @@ mod tests {
 
         for (request_kind, expected) in cases {
             let response = entry
-                .response_parts_for_request_kind(request_kind, "<test@example.com>")
+                .response_for(request_kind, "<test@example.com>")
                 .unwrap();
             let mut out = Vec::new();
 
@@ -1261,7 +1259,7 @@ mod tests {
         }
 
         let response = entry
-            .response_parts_for_request_kind(RequestKind::Body, "<test@example.com>")
+            .response_for(RequestKind::Body, "<test@example.com>")
             .unwrap();
         let mut out = Vec::new();
 
