@@ -623,6 +623,7 @@ impl HybridArticleEntry {
 mod tests {
     use super::*;
     use crate::types::BackendId;
+    use futures::executor::block_on;
 
     fn assert_entry_eq(original: &HybridArticleEntry, decoded: &HybridArticleEntry) {
         assert_eq!(original.status_code, decoded.status_code);
@@ -638,9 +639,8 @@ mod tests {
         message_id: &str,
     ) -> Option<Vec<u8>> {
         let response = entry.response_parts_for_command_bytes(verb, message_id)?;
-        let mut out = vec![0; response.len()];
-        let len = response.copy_to_slice(&mut out)?;
-        out.truncate(len);
+        let mut out = Vec::with_capacity(response.wire_len().get());
+        block_on(response.write_to(&mut out)).ok()?;
         Some(out)
     }
 
@@ -856,9 +856,8 @@ mod tests {
             .response_parts_for_command_bytes(b"HEAD", "<test@example.com>")
             .expect("article cache entry can serve HEAD");
 
-        let response_len = response.len();
-        let mut rendered = vec![0; response_len];
-        assert_eq!(response.copy_to_slice(&mut rendered), Some(response_len));
+        let mut rendered = Vec::with_capacity(response.wire_len().get());
+        block_on(response.write_to(&mut rendered)).unwrap();
         assert_eq!(
             rendered,
             b"221 7 <test@example.com>\r\nSubject: Test\r\n.\r\n"

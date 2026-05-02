@@ -9,6 +9,7 @@
 //! Uses `MockHybridCache` to avoid foyer runtime issues in tests.
 
 use anyhow::Result;
+use futures::executor::block_on;
 use nntp_proxy::cache::mock_hybrid::MockHybridCache;
 use nntp_proxy::types::{BackendId, MessageId};
 
@@ -18,9 +19,8 @@ fn response_bytes(
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
     let response = entry.response_parts_for_command_bytes(verb, message_id.as_str())?;
-    let mut out = vec![0; response.len()];
-    let len = response.copy_to_slice(&mut out)?;
-    out.truncate(len);
+    let mut out = Vec::with_capacity(response.wire_len().get());
+    block_on(response.write_to(&mut out)).ok()?;
     Some(out)
 }
 

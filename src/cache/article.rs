@@ -122,19 +122,18 @@ enum CachedArticleResponsePayload<'a> {
 }
 
 impl CachedArticleResponse<'_> {
-    #[must_use]
-    pub fn len(&self) -> usize {
+    fn wire_len_usize(&self) -> usize {
         self.status_line.len() + self.payload_len()
     }
 
     #[must_use]
     pub fn wire_len(&self) -> crate::protocol::ResponseWireLen {
-        self.len().into()
+        self.wire_len_usize().into()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.wire_len_usize() == 0
     }
 
     fn status_line(&self) -> &[u8] {
@@ -144,32 +143,6 @@ impl CachedArticleResponse<'_> {
     #[must_use]
     pub const fn status(&self) -> StatusCode {
         self.status
-    }
-
-    pub fn copy_to_slice(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < self.len() {
-            return None;
-        }
-        let mut offset = 0;
-        copy_part(out, &mut offset, self.status_line());
-        match self.payload {
-            CachedArticleResponsePayload::None => {}
-            CachedArticleResponsePayload::Article { headers, body } => {
-                copy_part(out, &mut offset, headers);
-                copy_part(out, &mut offset, b"\r\n\r\n");
-                copy_part(out, &mut offset, body);
-                copy_part(out, &mut offset, b"\r\n.\r\n");
-            }
-            CachedArticleResponsePayload::Head { headers } => {
-                copy_part(out, &mut offset, headers);
-                copy_part(out, &mut offset, b"\r\n.\r\n");
-            }
-            CachedArticleResponsePayload::Body { body } => {
-                copy_part(out, &mut offset, body);
-                copy_part(out, &mut offset, b"\r\n.\r\n");
-            }
-        }
-        Some(offset)
     }
 
     pub async fn write_to<W>(&self, writer: &mut W) -> std::io::Result<()>
@@ -262,12 +235,6 @@ impl StackStatusLine {
     fn len(&self) -> usize {
         self.len
     }
-}
-
-fn copy_part(out: &mut [u8], offset: &mut usize, part: &[u8]) {
-    let end = *offset + part.len();
-    out[*offset..end].copy_from_slice(part);
-    *offset = end;
 }
 
 impl CachedPayload {
@@ -1217,6 +1184,7 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::types::MessageId;
+    use futures::executor::block_on;
     use std::time::Duration;
 
     fn create_test_article(msgid: &str) -> ArticleEntry {
@@ -1228,9 +1196,8 @@ mod tests {
         let response = entry
             .response_parts_for_command_bytes(verb.as_bytes(), msgid)
             .unwrap();
-        let mut out = vec![0; response.len()];
-        let len = response.copy_to_slice(&mut out).unwrap();
-        out.truncate(len);
+        let mut out = Vec::with_capacity(response.wire_len().get());
+        block_on(response.write_to(&mut out)).unwrap();
         out
     }
 

@@ -7,6 +7,7 @@
 //! - `ArticleAvailability::from_bits()` and `ArticleEntry::set_availability()`
 //! - `DiskCache` configuration defaults and validation
 
+use futures::executor::block_on;
 use nntp_proxy::cache::{
     ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, UnifiedCache,
 };
@@ -185,21 +186,19 @@ fn test_response_parts_for_command_body_from_article_allocates_nothing() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_wire_response(buffer);
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let mut out = [0_u8; 128];
 
-    let ((response, len), allocations) = crate::allocation_count_delta(|| {
-        let response = entry
+    let (response, allocations) = crate::allocation_count_delta(|| {
+        entry
             .response_parts_for_command_bytes(b"BODY", msg_id.as_str())
-            .expect("ARTICLE cache entry can serve BODY");
-        let len = response
-            .copy_to_slice(&mut out)
-            .expect("fixed test buffer is large enough");
-        (response, len)
+            .expect("ARTICLE cache entry can serve BODY")
     });
 
     assert_eq!(allocations, 0);
-    assert_eq!(&out[..len], b"222 0 <test@example.com>\r\nBody\r\n.\r\n");
-    assert_eq!(response.len(), len);
+    assert_eq!(response.status(), StatusCode::new(222));
+    assert_eq!(
+        response.wire_len().get(),
+        b"222 0 <test@example.com>\r\nBody\r\n.\r\n".len()
+    );
 }
 
 #[test]
@@ -229,29 +228,18 @@ fn test_response_parts_for_command_handles_near_limit_message_id_without_allocat
     let entry = ArticleEntry::from_wire_response(buffer);
     let local = "a".repeat(520);
     let msg_id_text = format!("<{local}@example.com>");
-    let mut out = [0_u8; 1024];
 
-    let ((response, len), allocations) = crate::allocation_count_delta(|| {
-        let response = entry
+    let (response, allocations) = crate::allocation_count_delta(|| {
+        entry
             .response_parts_for_command_bytes(b"STAT", &msg_id_text)
-            .expect("long message-id still fits stack response buffer");
-        let len = response
-            .copy_to_slice(&mut out)
-            .expect("fixed test buffer is large enough");
-        (response, len)
+            .expect("long message-id still fits stack response buffer")
     });
 
     assert_eq!(allocations, 0);
-    assert_eq!(response.len(), len);
-    assert!(
-        std::str::from_utf8(&out[..len])
-            .unwrap()
-            .starts_with("223 0 <")
-    );
-    assert!(
-        std::str::from_utf8(&out[..len])
-            .unwrap()
-            .ends_with("@example.com>\r\n")
+    assert_eq!(response.status(), StatusCode::new(223));
+    assert_eq!(
+        response.wire_len().get(),
+        "223 0 ".len() + msg_id_text.len() + 2
     );
 }
 
@@ -674,9 +662,8 @@ fn hybrid_response_bytes(
     message_id: &str,
 ) -> Option<Vec<u8>> {
     let response = entry.response_parts_for_command_bytes(verb, message_id)?;
-    let mut out = vec![0; response.len()];
-    let len = response.copy_to_slice(&mut out)?;
-    out.truncate(len);
+    let mut out = Vec::with_capacity(response.wire_len().get());
+    block_on(response.write_to(&mut out)).ok()?;
     Some(out)
 }
 

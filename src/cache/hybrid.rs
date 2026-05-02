@@ -676,9 +676,8 @@ mod tests {
         let response = entry
             .response_parts_for_command_bytes(b"ARTICLE", msg_id.as_str())
             .unwrap();
-        let mut rendered = vec![0; response.len()];
-        let len = response.copy_to_slice(&mut rendered).unwrap();
-        rendered.truncate(len);
+        let mut rendered = Vec::with_capacity(response.wire_len().get());
+        response.write_to(&mut rendered).await.unwrap();
         assert_eq!(rendered, buffer);
         assert!(entry.should_try_backend(BackendId::from_index(0)));
 

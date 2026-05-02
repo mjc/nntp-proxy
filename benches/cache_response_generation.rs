@@ -1,12 +1,13 @@
 //! Benchmarks for generating NNTP wire responses from typed cache entries.
 //!
-//! These benches use `copy_to_slice` to keep the measured hit path free of heap
-//! allocation. They cover ARTICLE-derived HEAD/BODY/STAT responses as well as
+//! These benches render typed responses through the same writer path used by
+//! cache hits. They cover ARTICLE-derived HEAD/BODY/STAT responses as well as
 //! missing and availability-only entries that should produce no payload.
 //!
 //! Run with: cargo bench --bench cache_response_generation
 
 use divan::{Bencher, black_box};
+use futures::executor::block_on;
 use nntp_proxy::cache::{ArticleEntry, CacheableStatusCode};
 use nntp_proxy::protocol::StatusCode;
 
@@ -28,15 +29,19 @@ fn article_entry() -> ArticleEntry {
     ArticleEntry::from_wire_response(ARTICLE_RESPONSE)
 }
 
-fn copy_cached_response(entry: &ArticleEntry, verb: &[u8], out: &mut [u8]) -> usize {
+fn write_cached_response(entry: &ArticleEntry, verb: &[u8]) -> usize {
     entry
         .response_parts_for_command_bytes(verb, MSG_ID)
-        .and_then(|response| response.copy_to_slice(out))
+        .map(|response| {
+            let mut sink = tokio::io::sink();
+            block_on(response.write_to(&mut sink)).unwrap();
+            response.wire_len().get()
+        })
         .unwrap_or_default()
 }
 
 mod article_derived_hits {
-    use super::{Bencher, article_entry, black_box, copy_cached_response};
+    use super::{Bencher, article_entry, black_box, write_cached_response};
 
     macro_rules! bench_cached_response {
         ($name:ident, $verb:literal) => {
@@ -45,12 +50,7 @@ mod article_derived_hits {
                 let entry = article_entry();
 
                 bencher.bench(|| {
-                    let mut out = [0u8; 2048];
-                    black_box(copy_cached_response(
-                        black_box(&entry),
-                        black_box($verb),
-                        black_box(&mut out),
-                    ))
+                    black_box(write_cached_response(black_box(&entry), black_box($verb)))
                 });
             }
         };
@@ -64,7 +64,7 @@ mod article_derived_hits {
 
 mod no_payload_entries {
     use super::{
-        ArticleEntry, Bencher, CacheableStatusCode, StatusCode, black_box, copy_cached_response,
+        ArticleEntry, Bencher, CacheableStatusCode, StatusCode, black_box, write_cached_response,
     };
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
@@ -72,11 +72,9 @@ mod no_payload_entries {
         let entry = ArticleEntry::from_wire_response(b"430 No article\r\n");
 
         bencher.bench(|| {
-            let mut out = [0u8; 256];
-            black_box(copy_cached_response(
+            black_box(write_cached_response(
                 black_box(&entry),
                 black_box(b"ARTICLE"),
-                black_box(&mut out),
             ))
         });
     }
@@ -89,18 +87,16 @@ mod no_payload_entries {
         );
 
         bencher.bench(|| {
-            let mut out = [0u8; 256];
-            black_box(copy_cached_response(
+            black_box(write_cached_response(
                 black_box(&entry),
                 black_box(b"ARTICLE"),
-                black_box(&mut out),
             ))
         });
     }
 }
 
 mod near_limit_status_line {
-    use super::{ArticleEntry, Bencher, black_box};
+    use super::{ArticleEntry, Bencher, black_box, block_on};
 
     const LONG_MSG_ID: &str = "<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
@@ -112,11 +108,14 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
         );
 
         bencher.bench(|| {
-            let mut out = [0u8; 512];
             black_box(
                 entry
                     .response_parts_for_command_bytes(black_box(b"STAT"), black_box(LONG_MSG_ID))
-                    .and_then(|response| response.copy_to_slice(black_box(&mut out))),
+                    .map(|response| {
+                        let mut sink = tokio::io::sink();
+                        block_on(response.write_to(&mut sink)).unwrap();
+                        response.wire_len().get()
+                    }),
             )
         });
     }
