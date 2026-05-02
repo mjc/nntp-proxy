@@ -24,28 +24,18 @@ fn msgid(value: &str) -> MessageId<'_> {
 
 fn response_bytes(
     entry: &HybridArticleEntry,
-    verb: &[u8],
+    request_kind: RequestKind,
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
-    let response = entry.response_for(verb_to_kind(verb)?, message_id.as_str())?;
+    let response = entry.response_for(request_kind, message_id.as_str())?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
 }
 
-fn verb_to_kind(verb: &[u8]) -> Option<RequestKind> {
-    match verb {
-        verb if verb.eq_ignore_ascii_case(b"ARTICLE") => Some(RequestKind::Article),
-        verb if verb.eq_ignore_ascii_case(b"HEAD") => Some(RequestKind::Head),
-        verb if verb.eq_ignore_ascii_case(b"BODY") => Some(RequestKind::Body),
-        verb if verb.eq_ignore_ascii_case(b"STAT") => Some(RequestKind::Stat),
-        _ => None,
-    }
-}
-
 fn assert_article(entry: &HybridArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {
     assert_eq!(
-        response_bytes(entry, b"ARTICLE", message_id).unwrap(),
+        response_bytes(entry, RequestKind::Article, message_id).unwrap(),
         expected
     );
 }

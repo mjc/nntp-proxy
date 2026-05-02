@@ -57,7 +57,7 @@ async fn test_unified_cache_memory_upsert_and_get() {
     assert!(result.is_some());
     let entry = result.unwrap();
     assert_eq!(
-        article_response_bytes(&entry, b"ARTICLE", &msg_id).unwrap(),
+        article_response_bytes(&entry, RequestKind::Article, &msg_id).unwrap(),
         buffer
     );
 }
@@ -171,7 +171,7 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 
 #[test]
 fn test_response_for_request_stat_synthesizes_223() {
-    let response = response_bytes(&article_entry(), b"STAT").unwrap();
+    let response = response_bytes(&article_entry(), RequestKind::Stat).unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
@@ -239,14 +239,14 @@ fn test_response_for_request_handles_near_limit_message_id_without_allocation() 
 
 #[test]
 fn test_response_for_request_stat_from_body() {
-    let response = response_bytes(&body_entry(), b"STAT").unwrap();
+    let response = response_bytes(&body_entry(), RequestKind::Stat).unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
 fn test_response_for_request_stat_from_head() {
-    let response = response_bytes(&head_entry(), b"STAT").unwrap();
+    let response = response_bytes(&head_entry(), RequestKind::Stat).unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
@@ -255,14 +255,14 @@ fn test_response_for_request_stat_from_head() {
 fn test_response_for_request_430_returns_none_for_stat() {
     let entry = ArticleEntry::from_response_bytes(b"430 No Such Article\r\n");
 
-    assert_no_article_response(&entry, b"STAT");
+    assert_no_article_response(&entry, RequestKind::Stat);
 }
 
 #[test]
 fn test_response_for_request_article_direct_match() {
     assert_article_response(
         &article_entry(),
-        b"ARTICLE",
+        RequestKind::Article,
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
     );
 }
@@ -271,7 +271,7 @@ fn test_response_for_request_article_direct_match() {
 fn test_response_for_request_body_from_article() {
     assert_article_response(
         &article_entry(),
-        b"BODY",
+        RequestKind::Body,
         b"222 0 <test@example.com>\r\nBody\r\n.\r\n",
     );
 }
@@ -280,19 +280,19 @@ fn test_response_for_request_body_from_article() {
 fn test_response_for_request_head_from_article() {
     assert_article_response(
         &article_entry(),
-        b"HEAD",
+        RequestKind::Head,
         b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
     );
 }
 
 #[test]
 fn test_response_for_request_body_cannot_serve_article() {
-    assert_no_article_response(&body_entry(), b"ARTICLE");
+    assert_no_article_response(&body_entry(), RequestKind::Article);
 }
 
 #[test]
 fn test_response_for_request_head_cannot_serve_body() {
-    assert_no_article_response(&head_entry(), b"BODY");
+    assert_no_article_response(&head_entry(), RequestKind::Body);
 }
 
 #[test]
@@ -302,7 +302,7 @@ fn test_response_for_request_validates_buffer() {
     let entry = ArticleEntry::from_response_bytes(buffer);
 
     // Should return None because buffer fails validation
-    assert_no_article_response(&entry, b"ARTICLE");
+    assert_no_article_response(&entry, RequestKind::Article);
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn test_response_for_request_empty_message_id() {
 
     // STAT with minimal message ID <x> should still work
     let msg_id = MessageId::from_borrowed("<x>").unwrap();
-    let response = article_response_bytes(&entry, b"STAT", &msg_id);
+    let response = article_response_bytes(&entry, RequestKind::Stat, &msg_id);
     assert!(response.is_some());
     let response_bytes = response.unwrap();
     let response_str = String::from_utf8_lossy(&response_bytes);
@@ -546,7 +546,7 @@ fn test_response_validation_rejects_short_buffer() {
     let entry = ArticleEntry::from_response_bytes(buffer);
 
     // Should fail validation and return None
-    assert_no_article_response(&entry, b"ARTICLE");
+    assert_no_article_response(&entry, RequestKind::Article);
 }
 
 #[test]
@@ -555,7 +555,7 @@ fn test_response_validation_rejects_missing_terminator() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(buffer);
 
-    assert_no_article_response(&entry, b"ARTICLE");
+    assert_no_article_response(&entry, RequestKind::Article);
 }
 
 #[test]
@@ -565,7 +565,7 @@ fn test_response_validation_rejects_non_digit_start() {
     let buffer = b"ABC 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(buffer);
 
-    assert_no_article_response(&entry, b"ARTICLE");
+    assert_no_article_response(&entry, RequestKind::Article);
 }
 
 #[test]
@@ -575,7 +575,7 @@ fn test_response_validation_accepts_valid_buffer() {
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content here\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(buffer.clone());
 
-    assert_article_response(&entry, b"ARTICLE", &buffer);
+    assert_article_response(&entry, RequestKind::Article, &buffer);
 }
 
 // ============================================================================
@@ -624,23 +624,13 @@ fn assert_hybrid_should_try(entry: &HybridArticleEntry, cases: &[(usize, bool)])
 
 fn hybrid_response_bytes(
     entry: &HybridArticleEntry,
-    verb: &[u8],
+    request_kind: RequestKind,
     message_id: &str,
 ) -> Option<Vec<u8>> {
-    let response = entry.response_for(verb_to_kind(verb)?, message_id)?;
+    let response = entry.response_for(request_kind, message_id)?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
-}
-
-fn verb_to_kind(verb: &[u8]) -> Option<RequestKind> {
-    match verb {
-        verb if verb.eq_ignore_ascii_case(b"ARTICLE") => Some(RequestKind::Article),
-        verb if verb.eq_ignore_ascii_case(b"HEAD") => Some(RequestKind::Head),
-        verb if verb.eq_ignore_ascii_case(b"BODY") => Some(RequestKind::Body),
-        verb if verb.eq_ignore_ascii_case(b"STAT") => Some(RequestKind::Stat),
-        _ => None,
-    }
 }
 
 #[test]
@@ -743,7 +733,7 @@ fn test_hybrid_entry_response_for_request_article() {
     let buffer = make_valid_article_buffer();
     let entry = hybrid_article();
 
-    let response = hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>");
+    let response = hybrid_response_bytes(&entry, RequestKind::Article, "<test@example.com>");
     assert!(response.is_some());
     assert_eq!(response.unwrap(), buffer);
 }
@@ -752,7 +742,7 @@ fn test_hybrid_entry_response_for_request_article() {
 fn test_hybrid_entry_response_for_request_stat_synthesized() {
     let entry = hybrid_article();
 
-    let response = hybrid_response_bytes(&entry, b"STAT", "<test@example.com>");
+    let response = hybrid_response_bytes(&entry, RequestKind::Stat, "<test@example.com>");
     assert!(response.is_some());
 
     let response_str = String::from_utf8(response.unwrap()).unwrap();
@@ -764,10 +754,10 @@ fn test_hybrid_entry_response_for_request_430_returns_none() {
     let entry = hybrid_missing();
 
     // 430 stubs should not serve ARTICLE requests
-    assert!(hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>").is_none());
+    assert!(hybrid_response_bytes(&entry, RequestKind::Article, "<test@example.com>").is_none());
 
     // 430 stubs should not serve STAT either (article doesn't exist)
-    assert!(hybrid_response_bytes(&entry, b"STAT", "<test@example.com>").is_none());
+    assert!(hybrid_response_bytes(&entry, RequestKind::Stat, "<test@example.com>").is_none());
 }
 
 #[test]
@@ -820,8 +810,8 @@ fn test_hybrid_entry_serialization_roundtrip() {
 
     assert_eq!(decoded.status_code(), entry.status_code());
     assert_eq!(
-        hybrid_response_bytes(&decoded, b"ARTICLE", "<test@example.com>"),
-        hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>")
+        hybrid_response_bytes(&decoded, RequestKind::Article, "<test@example.com>"),
+        hybrid_response_bytes(&entry, RequestKind::Article, "<test@example.com>")
     );
     assert_eq!(decoded.availability(), entry.availability());
     assert_eq!(decoded.tier().get(), entry.tier().get());

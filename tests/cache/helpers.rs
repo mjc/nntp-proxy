@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use nntp_proxy::cache::ArticleCache;
+use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +37,7 @@ async fn test_cache_hit() -> Result<()> {
     let retrieved = cache.get(&msgid).await;
     assert!(retrieved.is_some());
     assert_eq!(
-        article_response_bytes(&retrieved.unwrap(), b"ARTICLE", &msgid).unwrap(),
+        article_response_bytes(&retrieved.unwrap(), RequestKind::Article, &msgid).unwrap(),
         buffer
     );
 

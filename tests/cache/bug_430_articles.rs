@@ -14,6 +14,7 @@
 
 use anyhow::Result;
 use nntp_proxy::cache::{ArticleAvailability, ArticleCache};
+use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -127,7 +128,7 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
         status.as_u16()
     );
 
-    let rendered = article_response_bytes(&cached, b"ARTICLE", &msg_id).unwrap();
+    let rendered = article_response_bytes(&cached, RequestKind::Article, &msg_id).unwrap();
     assert!(rendered.starts_with(b"220"));
 
     Ok(())
@@ -543,7 +544,7 @@ async fn test_precheck_stub_then_article_request() -> Result<()> {
     assert!(cached.is_complete_article());
     assert_eq!(cached.status_code().as_u16(), 220);
     assert!(
-        article_response_bytes(&cached, b"ARTICLE", &msg_id)
+        article_response_bytes(&cached, RequestKind::Article, &msg_id)
             .unwrap()
             .ends_with(b".\r\n")
     );

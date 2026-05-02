@@ -23,23 +23,13 @@ pub mod unified_cache;
 
 pub fn article_response_bytes(
     entry: &ArticleEntry,
-    verb: &[u8],
+    request_kind: RequestKind,
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
-    let response = entry.response_for(verb_to_kind(verb)?, message_id.as_str())?;
+    let response = entry.response_for(request_kind, message_id.as_str())?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
-}
-
-fn verb_to_kind(verb: &[u8]) -> Option<RequestKind> {
-    match verb {
-        verb if verb.eq_ignore_ascii_case(b"ARTICLE") => Some(RequestKind::Article),
-        verb if verb.eq_ignore_ascii_case(b"HEAD") => Some(RequestKind::Head),
-        verb if verb.eq_ignore_ascii_case(b"BODY") => Some(RequestKind::Body),
-        verb if verb.eq_ignore_ascii_case(b"STAT") => Some(RequestKind::Stat),
-        _ => None,
-    }
 }
 
 pub fn test_msg_id() -> MessageId<'static> {
@@ -60,24 +50,27 @@ pub fn head_entry() -> ArticleEntry {
     ArticleEntry::from_response_bytes(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n")
 }
 
-pub fn response_bytes(entry: &ArticleEntry, verb: &[u8]) -> Option<Vec<u8>> {
-    article_response_bytes(entry, verb, &test_msg_id())
+pub fn response_bytes(entry: &ArticleEntry, request_kind: RequestKind) -> Option<Vec<u8>> {
+    article_response_bytes(entry, request_kind, &test_msg_id())
 }
 
-pub fn assert_serves(entry: &ArticleEntry, cases: &[(&[u8], bool)]) {
-    for (verb, expected) in cases {
+pub fn assert_serves(entry: &ArticleEntry, cases: &[(RequestKind, bool)]) {
+    for (request_kind, expected) in cases {
         assert_eq!(
-            response_bytes(entry, verb).is_some(),
+            response_bytes(entry, *request_kind).is_some(),
             *expected,
-            "serve decision for {verb:?}"
+            "serve decision for {request_kind:?}"
         );
     }
 }
 
-pub fn assert_article_response(entry: &ArticleEntry, verb: &[u8], expected: &[u8]) {
-    assert_eq!(response_bytes(entry, verb).as_deref(), Some(expected));
+pub fn assert_article_response(entry: &ArticleEntry, request_kind: RequestKind, expected: &[u8]) {
+    assert_eq!(
+        response_bytes(entry, request_kind).as_deref(),
+        Some(expected)
+    );
 }
 
-pub fn assert_no_article_response(entry: &ArticleEntry, verb: &[u8]) {
-    assert_eq!(response_bytes(entry, verb), None);
+pub fn assert_no_article_response(entry: &ArticleEntry, request_kind: RequestKind) {
+    assert_eq!(response_bytes(entry, request_kind), None);
 }

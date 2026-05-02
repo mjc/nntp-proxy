@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use nntp_proxy::cache::{ArticleCache, ArticleEntry};
+use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
@@ -35,7 +36,7 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");
     assert_eq!(
-        article_response_bytes(&cached, b"BODY", &msg_id).unwrap(),
+        article_response_bytes(&cached, RequestKind::Body, &msg_id).unwrap(),
         full_article.as_bytes()
     );
 
@@ -50,12 +51,12 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
         .await
         .expect("Article should still be cached");
     assert_eq!(
-        article_response_bytes(&cached, b"BODY", &msg_id).unwrap(),
+        article_response_bytes(&cached, RequestKind::Body, &msg_id).unwrap(),
         full_article.as_bytes(),
         "Full article should NOT be overwritten by stub"
     );
     assert_ne!(
-        article_response_bytes(&cached, b"BODY", &msg_id),
+        article_response_bytes(&cached, RequestKind::Body, &msg_id),
         Some(stub)
     );
 
@@ -76,7 +77,7 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
 
     let cached = cache.get(&msg_id).await.expect("Stub should be cached");
     assert!(
-        article_response_bytes(&cached, b"BODY", &msg_id).is_none(),
+        article_response_bytes(&cached, RequestKind::Body, &msg_id).is_none(),
         "Stub should have no payload to serve"
     );
 
@@ -96,7 +97,7 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");
     assert_eq!(
-        article_response_bytes(&cached, b"BODY", &msg_id).unwrap(),
+        article_response_bytes(&cached, RequestKind::Body, &msg_id).unwrap(),
         full_article.as_bytes(),
         "Full article should replace stub"
     );
@@ -109,10 +110,10 @@ fn test_serves_request_kind_article_response() {
     assert_serves(
         &article_entry(),
         &[
-            (b"ARTICLE", true),
-            (b"BODY", true),
-            (b"HEAD", true),
-            (b"STAT", true),
+            (RequestKind::Article, true),
+            (RequestKind::Body, true),
+            (RequestKind::Head, true),
+            (RequestKind::Stat, true),
         ],
     );
 }
@@ -122,10 +123,10 @@ fn test_serves_request_kind_body_response() {
     assert_serves(
         &body_entry(),
         &[
-            (b"BODY", true),
-            (b"ARTICLE", false),
-            (b"HEAD", false),
-            (b"STAT", true),
+            (RequestKind::Body, true),
+            (RequestKind::Article, false),
+            (RequestKind::Head, false),
+            (RequestKind::Stat, true),
         ],
     );
 }
@@ -135,10 +136,10 @@ fn test_serves_request_kind_head_response() {
     assert_serves(
         &head_entry(),
         &[
-            (b"HEAD", true),
-            (b"ARTICLE", false),
-            (b"BODY", false),
-            (b"STAT", true),
+            (RequestKind::Head, true),
+            (RequestKind::Article, false),
+            (RequestKind::Body, false),
+            (RequestKind::Stat, true),
         ],
     );
 }
@@ -148,7 +149,7 @@ fn test_response_for_request_verbs_uppercase() {
     let body_response = b"222 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(body_response);
 
-    assert_serves(&entry, &[(b"BODY", true)]);
+    assert_serves(&entry, &[(RequestKind::Body, true)]);
 }
 
 #[test]
@@ -216,10 +217,10 @@ fn test_body_article_request_kind_mismatch() {
     assert_serves(
         &body_response,
         &[
-            (b"ARTICLE", false),
-            (b"BODY", true),
-            (b"HEAD", false),
-            (b"STAT", true),
+            (RequestKind::Article, false),
+            (RequestKind::Body, true),
+            (RequestKind::Head, false),
+            (RequestKind::Stat, true),
         ],
     );
 
@@ -229,10 +230,10 @@ fn test_body_article_request_kind_mismatch() {
     assert_serves(
         &article_response,
         &[
-            (b"ARTICLE", true),
-            (b"BODY", true),
-            (b"HEAD", true),
-            (b"STAT", true),
+            (RequestKind::Article, true),
+            (RequestKind::Body, true),
+            (RequestKind::Head, true),
+            (RequestKind::Stat, true),
         ],
     );
 }
