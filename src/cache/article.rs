@@ -80,16 +80,16 @@ pub(crate) enum CachedPayload {
     AvailabilityOnly,
     Article {
         article_number: Option<CachedArticleNumber>,
-        headers: Vec<u8>,
-        body: Vec<u8>,
+        headers: Box<[u8]>,
+        body: Box<[u8]>,
     },
     Head {
         article_number: Option<CachedArticleNumber>,
-        headers: Vec<u8>,
+        headers: Box<[u8]>,
     },
     Body {
         article_number: Option<CachedArticleNumber>,
-        body: Vec<u8>,
+        body: Box<[u8]>,
     },
     Stat {
         article_number: Option<CachedArticleNumber>,
@@ -704,24 +704,24 @@ fn payload_from_semantic_bytes(
             if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
                 CachedPayload::Article {
                     article_number,
-                    headers: payload[..split].to_vec(),
-                    body: payload[split + 4..].to_vec(),
+                    headers: payload[..split].into(),
+                    body: payload[split + 4..].into(),
                 }
             } else {
                 CachedPayload::Article {
                     article_number,
-                    headers: Vec::new(),
-                    body: payload.to_vec(),
+                    headers: Box::from([]),
+                    body: payload.into(),
                 }
             }
         }
         221 => CachedPayload::Head {
             article_number,
-            headers: payload.to_vec(),
+            headers: payload.into(),
         },
         222 => CachedPayload::Body {
             article_number,
-            body: payload.to_vec(),
+            body: payload.into(),
         },
         223 => CachedPayload::Stat { article_number },
         _ => CachedPayload::AvailabilityOnly,
@@ -800,7 +800,7 @@ impl ArticleCache {
                 //
                 // Value: ArticleEntry
                 //   - Struct inline metadata: availability, status, tier, timestamp, payload tag
-                //   - Semantic payload Vec fields: headers/body allocation metadata and bytes
+                //   - Semantic boxed payload sections: headers/body slice metadata and bytes
                 //   - Allocator overhead for present payload sections
                 //
                 // Moka internal per-entry overhead is MUCH larger than the data itself:
@@ -816,7 +816,7 @@ impl ArticleCache {
                 //
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
                 const ENTRY_STRUCT: usize = 64; // ArticleEntry inline metadata and enum tag
-                const PAYLOAD_OVERHEAD: usize = 2 * (24 + 16); // Up to headers/body Vecs + allocators
+                const PAYLOAD_OVERHEAD: usize = 2 * (16 + 16); // Up to headers/body boxed slices + allocators
                 // Moka internal structures - empirically measured to address memory reporting gap.
                 // See moka issue #473: https://github.com/moka-rs/moka/issues/473
                 // Observed ratio: 362MB RSS / 36MB weighted_size() = 10x
@@ -1288,6 +1288,25 @@ mod tests {
     }
 
     #[test]
+    fn article_entry_stores_payload_sections_as_boxed_slices() {
+        trait BoxedSlice {}
+        impl BoxedSlice for Box<[u8]> {}
+        fn assert_boxed_slice<T: BoxedSlice>(_: &T) {}
+
+        let entry = ArticleEntry::from_wire_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
+
+        match &entry.payload {
+            CachedPayload::Article { headers, body, .. } => {
+                assert_boxed_slice(headers);
+                assert_boxed_slice(body);
+            }
+            other => panic!("expected article payload, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn article_entry_ingests_cache_buffer_without_required_vec() {
         let entry = ArticleEntry::from_cache_buffer_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
@@ -1324,8 +1343,8 @@ mod tests {
         assert_eq!(entry.status_code(), StatusCode::new(220));
         match entry.payload {
             CachedPayload::Article { headers, body, .. } => {
-                assert_eq!(headers, b"Subject: Test");
-                assert_eq!(body, b"Body");
+                assert_eq!(headers.as_ref(), b"Subject: Test");
+                assert_eq!(body.as_ref(), b"Body");
             }
             other => panic!("expected article payload, got {other:?}"),
         }

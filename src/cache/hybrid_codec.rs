@@ -282,8 +282,8 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }),
         PAYLOAD_ARTICLE => {
             let article_number = read_article_number(reader)?;
-            let headers = read_section(reader)?;
-            let body = read_section(reader)?;
+            let headers = read_section(reader)?.into_boxed_slice();
+            let body = read_section(reader)?.into_boxed_slice();
             Ok(CachedPayload::Article {
                 article_number,
                 headers,
@@ -292,7 +292,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_HEAD => {
             let article_number = read_article_number(reader)?;
-            let headers = read_section(reader)?;
+            let headers = read_section(reader)?.into_boxed_slice();
             Ok(CachedPayload::Head {
                 article_number,
                 headers,
@@ -300,7 +300,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_BODY => {
             let article_number = read_article_number(reader)?;
-            let body = read_section(reader)?;
+            let body = read_section(reader)?.into_boxed_slice();
             Ok(CachedPayload::Body {
                 article_number,
                 body,
@@ -829,8 +829,8 @@ mod tests {
         assert_eq!(entry.status_code().as_u16(), 220);
         match entry.payload {
             CachedPayload::Article { headers, body, .. } => {
-                assert_eq!(headers, b"Subject: Test");
-                assert_eq!(body, b"Body");
+                assert_eq!(headers.as_ref(), b"Subject: Test");
+                assert_eq!(body.as_ref(), b"Body");
             }
             other => panic!("expected article payload, got {other:?}"),
         }
