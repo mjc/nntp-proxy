@@ -64,6 +64,27 @@ pub enum RequestCacheStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RequestWireLen(usize);
+
+impl RequestWireLen {
+    #[must_use]
+    pub const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for RequestWireLen {
+    fn from(value: usize) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ResponseWireLen(usize);
 
 impl ResponseWireLen {
@@ -663,6 +684,11 @@ impl RequestContext {
     }
 
     #[must_use]
+    pub fn request_wire_len(&self) -> RequestWireLen {
+        self.wire_len().into()
+    }
+
+    #[must_use]
     pub fn response_shape(&self, status: StatusCode) -> ResponseShape {
         let code = status.as_u16();
         if status.is_error() {
@@ -791,6 +817,7 @@ mod tests {
     fn typed_request_context_parses_message_id() {
         let ctx = RequestContext::from_request_bytes(b"ARTICLE <a@b>\r\n");
         assert_eq!(ctx.kind(), RequestKind::Article);
+        assert_eq!(ctx.request_wire_len(), RequestWireLen::new(15));
         assert_eq!(ctx.message_id(), Some("<a@b>"));
         assert_eq!(ctx.cache_status(), None);
         assert_eq!(ctx.cache_availability(), None);
