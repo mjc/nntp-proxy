@@ -11,6 +11,7 @@
 use anyhow::Result;
 use futures::executor::block_on;
 use nntp_proxy::cache::{HybridArticleEntry, mock_hybrid::MockHybridCache};
+use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 
 fn backend(index: usize) -> BackendId {
@@ -26,10 +27,21 @@ fn response_bytes(
     verb: &[u8],
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
-    let response = entry.response_parts_for_command_bytes(verb, message_id.as_str())?;
+    let response =
+        entry.response_parts_for_request_kind(verb_to_kind(verb)?, message_id.as_str())?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
+}
+
+fn verb_to_kind(verb: &[u8]) -> Option<RequestKind> {
+    match verb {
+        verb if verb.eq_ignore_ascii_case(b"ARTICLE") => Some(RequestKind::Article),
+        verb if verb.eq_ignore_ascii_case(b"HEAD") => Some(RequestKind::Head),
+        verb if verb.eq_ignore_ascii_case(b"BODY") => Some(RequestKind::Body),
+        verb if verb.eq_ignore_ascii_case(b"STAT") => Some(RequestKind::Stat),
+        _ => None,
+    }
 }
 
 fn assert_article(entry: &HybridArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {

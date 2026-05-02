@@ -548,79 +548,12 @@ impl ArticleEntry {
     }
 
     #[must_use]
-    pub fn response_parts_for_command_bytes(
-        &self,
-        cmd_verb: &[u8],
-        message_id: &str,
-    ) -> Option<CachedArticleResponse<'_>> {
-        response_parts_for_payload_bytes(&self.payload, cmd_verb, message_id)
-    }
-
-    #[must_use]
     pub fn response_parts_for_request_kind(
         &self,
         request_kind: RequestKind,
         message_id: &str,
     ) -> Option<CachedArticleResponse<'_>> {
         response_parts_for_payload_kind(&self.payload, request_kind, message_id)
-    }
-}
-
-pub(crate) fn response_parts_for_payload_bytes<'a>(
-    payload: &'a CachedPayload,
-    cmd_verb: &[u8],
-    message_id: &str,
-) -> Option<CachedArticleResponse<'a>> {
-    let article_number = match payload {
-        CachedPayload::Article { article_number, .. }
-        | CachedPayload::Head { article_number, .. }
-        | CachedPayload::Body { article_number, .. }
-        | CachedPayload::Stat { article_number } => *article_number,
-        CachedPayload::Missing | CachedPayload::AvailabilityOnly => None,
-    };
-    let number = article_number.map_or(0, CachedArticleNumber::get);
-
-    if cmd_verb.eq_ignore_ascii_case(b"STAT")
-        && matches!(
-            payload,
-            CachedPayload::Article { .. }
-                | CachedPayload::Head { .. }
-                | CachedPayload::Body { .. }
-                | CachedPayload::Stat { .. }
-        )
-    {
-        Some(CachedArticleResponse {
-            status: StatusCode::new(223),
-            status_line: StackStatusLine::new(223, number, message_id)?,
-            payload: CachedArticleResponsePayload::None,
-        })
-    } else if cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
-        && let CachedPayload::Article { headers, body, .. } = payload
-    {
-        Some(CachedArticleResponse {
-            status: StatusCode::new(220),
-            status_line: StackStatusLine::new(220, number, message_id)?,
-            payload: CachedArticleResponsePayload::Article { headers, body },
-        })
-    } else if cmd_verb.eq_ignore_ascii_case(b"HEAD")
-        && let CachedPayload::Article { headers, .. } | CachedPayload::Head { headers, .. } =
-            payload
-    {
-        Some(CachedArticleResponse {
-            status: StatusCode::new(221),
-            status_line: StackStatusLine::new(221, number, message_id)?,
-            payload: CachedArticleResponsePayload::Head { headers },
-        })
-    } else if cmd_verb.eq_ignore_ascii_case(b"BODY")
-        && let CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. } = payload
-    {
-        Some(CachedArticleResponse {
-            status: StatusCode::new(222),
-            status_line: StackStatusLine::new(222, number, message_id)?,
-            payload: CachedArticleResponsePayload::Body { body },
-        })
-    } else {
-        None
     }
 }
 
@@ -1242,8 +1175,15 @@ mod tests {
     }
 
     fn rendered(entry: &ArticleEntry, verb: &str, msgid: &str) -> Vec<u8> {
+        let request_kind = match verb {
+            "ARTICLE" => RequestKind::Article,
+            "HEAD" => RequestKind::Head,
+            "BODY" => RequestKind::Body,
+            "STAT" => RequestKind::Stat,
+            _ => panic!("unsupported test verb {verb}"),
+        };
         let response = entry
-            .response_parts_for_command_bytes(verb.as_bytes(), msgid)
+            .response_parts_for_request_kind(request_kind, msgid)
             .unwrap();
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).unwrap();
@@ -1254,7 +1194,7 @@ mod tests {
     async fn cached_article_response_writes_wire_slices() {
         let entry = create_test_article("<test@example.com>");
         let response = entry
-            .response_parts_for_command_bytes(b"ARTICLE", "<test@example.com>")
+            .response_parts_for_request_kind(RequestKind::Article, "<test@example.com>")
             .unwrap();
         let mut out = Vec::new();
 
@@ -1270,7 +1210,7 @@ mod tests {
     fn cached_article_response_exposes_typed_wire_len() {
         let entry = create_test_article("<test@example.com>");
         let response = entry
-            .response_parts_for_command_bytes(b"STAT", "<test@example.com>")
+            .response_parts_for_request_kind(RequestKind::Stat, "<test@example.com>")
             .unwrap();
 
         assert_eq!(
@@ -1281,33 +1221,31 @@ mod tests {
 
     #[tokio::test]
     async fn cached_article_response_writes_derived_wire_shapes() {
-        use crate::protocol::RequestKind;
-
         let entry = create_test_article("<test@example.com>");
         let cases = [
             (
-                b"HEAD".as_slice(),
+                RequestKind::Head,
                 b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".as_slice(),
             ),
             (
-                b"BODY".as_slice(),
+                RequestKind::Body,
                 b"222 0 <test@example.com>\r\nBody\r\n.\r\n".as_slice(),
             ),
             (
-                b"STAT".as_slice(),
+                RequestKind::Stat,
                 b"223 0 <test@example.com>\r\n".as_slice(),
             ),
         ];
 
-        for (verb, expected) in cases {
+        for (request_kind, expected) in cases {
             let response = entry
-                .response_parts_for_command_bytes(verb, "<test@example.com>")
+                .response_parts_for_request_kind(request_kind, "<test@example.com>")
                 .unwrap();
             let mut out = Vec::new();
 
             response.write_to(&mut out).await.unwrap();
 
-            assert_eq!(out, expected, "{}", String::from_utf8_lossy(verb));
+            assert_eq!(out, expected, "{request_kind:?}");
         }
 
         let response = entry

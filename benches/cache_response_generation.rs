@@ -9,7 +9,7 @@
 use divan::{Bencher, black_box};
 use futures::executor::block_on;
 use nntp_proxy::cache::{ArticleEntry, CacheableStatusCode};
-use nntp_proxy::protocol::StatusCode;
+use nntp_proxy::protocol::{RequestKind, StatusCode};
 
 fn main() {
     divan::main();
@@ -29,9 +29,9 @@ fn article_entry() -> ArticleEntry {
     ArticleEntry::from_wire_response(ARTICLE_RESPONSE)
 }
 
-fn write_cached_response(entry: &ArticleEntry, verb: &[u8]) -> usize {
+fn write_cached_response(entry: &ArticleEntry, request_kind: RequestKind) -> usize {
     entry
-        .response_parts_for_command_bytes(verb, MSG_ID)
+        .response_parts_for_request_kind(request_kind, MSG_ID)
         .map(|response| {
             let mut sink = tokio::io::sink();
             block_on(response.write_to(&mut sink)).unwrap();
@@ -41,30 +41,34 @@ fn write_cached_response(entry: &ArticleEntry, verb: &[u8]) -> usize {
 }
 
 mod article_derived_hits {
-    use super::{Bencher, article_entry, black_box, write_cached_response};
+    use super::{Bencher, RequestKind, article_entry, black_box, write_cached_response};
 
     macro_rules! bench_cached_response {
-        ($name:ident, $verb:literal) => {
+        ($name:ident, $request_kind:expr) => {
             #[divan::bench(sample_count = 1000, sample_size = 1000)]
             fn $name(bencher: Bencher) {
                 let entry = article_entry();
 
                 bencher.bench(|| {
-                    black_box(write_cached_response(black_box(&entry), black_box($verb)))
+                    black_box(write_cached_response(
+                        black_box(&entry),
+                        black_box($request_kind),
+                    ))
                 });
             }
         };
     }
 
-    bench_cached_response!(article_from_article, b"ARTICLE");
-    bench_cached_response!(head_from_article, b"HEAD");
-    bench_cached_response!(body_from_article, b"BODY");
-    bench_cached_response!(stat_from_article, b"STAT");
+    bench_cached_response!(article_from_article, RequestKind::Article);
+    bench_cached_response!(head_from_article, RequestKind::Head);
+    bench_cached_response!(body_from_article, RequestKind::Body);
+    bench_cached_response!(stat_from_article, RequestKind::Stat);
 }
 
 mod no_payload_entries {
     use super::{
-        ArticleEntry, Bencher, CacheableStatusCode, StatusCode, black_box, write_cached_response,
+        ArticleEntry, Bencher, CacheableStatusCode, RequestKind, StatusCode, black_box,
+        write_cached_response,
     };
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
@@ -74,7 +78,7 @@ mod no_payload_entries {
         bencher.bench(|| {
             black_box(write_cached_response(
                 black_box(&entry),
-                black_box(b"ARTICLE"),
+                black_box(RequestKind::Article),
             ))
         });
     }
@@ -89,14 +93,14 @@ mod no_payload_entries {
         bencher.bench(|| {
             black_box(write_cached_response(
                 black_box(&entry),
-                black_box(b"ARTICLE"),
+                black_box(RequestKind::Article),
             ))
         });
     }
 }
 
 mod near_limit_status_line {
-    use super::{ArticleEntry, Bencher, black_box, block_on};
+    use super::{ArticleEntry, Bencher, RequestKind, black_box, block_on};
 
     const LONG_MSG_ID: &str = "<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
@@ -110,7 +114,10 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
         bencher.bench(|| {
             black_box(
                 entry
-                    .response_parts_for_command_bytes(black_box(b"STAT"), black_box(LONG_MSG_ID))
+                    .response_parts_for_request_kind(
+                        black_box(RequestKind::Stat),
+                        black_box(LONG_MSG_ID),
+                    )
                     .map(|response| {
                         let mut sink = tokio::io::sink();
                         block_on(response.write_to(&mut sink)).unwrap();

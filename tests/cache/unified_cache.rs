@@ -3,7 +3,7 @@
 //! This test suite covers:
 //! - `UnifiedCache` enum dispatch (memory vs hybrid)
 //! - `CacheStatsProvider` trait implementations
-//! - `ArticleEntry::response_parts_for_command_bytes()` including STAT synthesis
+//! - `ArticleEntry::response_parts_for_request_kind()` including STAT synthesis
 //! - `ArticleAvailability::from_bits()` and `ArticleEntry::set_availability()`
 //! - `DiskCache` configuration defaults and validation
 
@@ -11,7 +11,7 @@ use futures::executor::block_on;
 use nntp_proxy::cache::{
     ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, UnifiedCache,
 };
-use nntp_proxy::protocol::StatusCode;
+use nntp_proxy::protocol::{RequestKind, StatusCode};
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -166,7 +166,7 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 }
 
 // ============================================================================
-// ArticleEntry::response_parts_for_command_bytes() Tests
+// ArticleEntry::response_parts_for_request_kind() Tests
 // ============================================================================
 
 #[test]
@@ -183,7 +183,7 @@ fn test_response_parts_for_command_body_from_article_allocates_nothing() {
 
     let (response, allocations) = crate::allocation_count_delta(|| {
         entry
-            .response_parts_for_command_bytes(b"BODY", msg_id.as_str())
+            .response_parts_for_request_kind(RequestKind::Body, msg_id.as_str())
             .expect("ARTICLE cache entry can serve BODY")
     });
 
@@ -202,15 +202,15 @@ fn test_response_parts_exposes_typed_status() {
     );
 
     let cases = [
-        (b"ARTICLE".as_slice(), 220),
-        (b"HEAD".as_slice(), 221),
-        (b"BODY".as_slice(), 222),
-        (b"STAT".as_slice(), 223),
+        (RequestKind::Article, 220),
+        (RequestKind::Head, 221),
+        (RequestKind::Body, 222),
+        (RequestKind::Stat, 223),
     ];
 
-    for (verb, status) in cases {
+    for (request_kind, status) in cases {
         let response = entry
-            .response_parts_for_command_bytes(verb, "<test@example.com>")
+            .response_parts_for_request_kind(request_kind, "<test@example.com>")
             .expect("ARTICLE cache entry can synthesize all article command responses");
 
         assert_eq!(response.status(), StatusCode::new(status));
@@ -225,7 +225,7 @@ fn test_response_parts_for_command_handles_near_limit_message_id_without_allocat
 
     let (response, allocations) = crate::allocation_count_delta(|| {
         entry
-            .response_parts_for_command_bytes(b"STAT", &msg_id_text)
+            .response_parts_for_request_kind(RequestKind::Stat, &msg_id_text)
             .expect("long message-id still fits stack response buffer")
     });
 
@@ -627,10 +627,20 @@ fn hybrid_response_bytes(
     verb: &[u8],
     message_id: &str,
 ) -> Option<Vec<u8>> {
-    let response = entry.response_parts_for_command_bytes(verb, message_id)?;
+    let response = entry.response_parts_for_request_kind(verb_to_kind(verb)?, message_id)?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
+}
+
+fn verb_to_kind(verb: &[u8]) -> Option<RequestKind> {
+    match verb {
+        verb if verb.eq_ignore_ascii_case(b"ARTICLE") => Some(RequestKind::Article),
+        verb if verb.eq_ignore_ascii_case(b"HEAD") => Some(RequestKind::Head),
+        verb if verb.eq_ignore_ascii_case(b"BODY") => Some(RequestKind::Body),
+        verb if verb.eq_ignore_ascii_case(b"STAT") => Some(RequestKind::Stat),
+        _ => None,
+    }
 }
 
 #[test]

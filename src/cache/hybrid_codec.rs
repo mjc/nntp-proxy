@@ -9,8 +9,8 @@
 //! [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][payload-kind:u8]...
 //! ```
 
-use crate::protocol::StatusCode;
 use crate::protocol::RequestKind;
+use crate::protocol::StatusCode;
 use crate::router::BackendCount;
 use crate::types::BackendId;
 use foyer::Code;
@@ -453,15 +453,6 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
-    pub fn response_parts_for_command_bytes(
-        &self,
-        cmd_verb: &[u8],
-        message_id: &str,
-    ) -> Option<super::article::CachedArticleResponse<'_>> {
-        super::article::response_parts_for_payload_bytes(&self.payload, cmd_verb, message_id)
-    }
-
-    #[must_use]
     pub fn response_parts_for_request_kind(
         &self,
         request_kind: RequestKind,
@@ -621,10 +612,6 @@ mod tests {
     use crate::types::BackendId;
     use futures::executor::block_on;
 
-    fn matches_command_type(entry: &HybridArticleEntry, verb: &[u8]) -> bool {
-        super::super::entry_helpers::matches_command_type_verb(entry.status_code.as_u16(), verb)
-    }
-
     fn assert_entry_eq(original: &HybridArticleEntry, decoded: &HybridArticleEntry) {
         assert_eq!(original.status_code, decoded.status_code);
         assert_eq!(original.availability, decoded.availability);
@@ -638,10 +625,20 @@ mod tests {
         verb: &[u8],
         message_id: &str,
     ) -> Option<Vec<u8>> {
-        let response = entry.response_parts_for_command_bytes(verb, message_id)?;
+        let response = entry.response_parts_for_request_kind(verb_to_kind(verb)?, message_id)?;
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).ok()?;
         Some(out)
+    }
+
+    fn verb_to_kind(verb: &[u8]) -> Option<RequestKind> {
+        match verb {
+            verb if verb.eq_ignore_ascii_case(b"ARTICLE") => Some(RequestKind::Article),
+            verb if verb.eq_ignore_ascii_case(b"HEAD") => Some(RequestKind::Head),
+            verb if verb.eq_ignore_ascii_case(b"BODY") => Some(RequestKind::Body),
+            verb if verb.eq_ignore_ascii_case(b"STAT") => Some(RequestKind::Stat),
+            _ => None,
+        }
     }
 
     // =========================================================================
@@ -853,7 +850,7 @@ mod tests {
             HybridArticleEntry::from_wire_response(buffer.clone()).expect("valid status code");
 
         let response = entry
-            .response_parts_for_command_bytes(b"HEAD", "<test@example.com>")
+            .response_parts_for_request_kind(RequestKind::Head, "<test@example.com>")
             .expect("article cache entry can serve HEAD");
 
         let mut rendered = Vec::with_capacity(response.wire_len().get());
@@ -889,20 +886,54 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_command_matching() {
-        let article = HybridArticleEntry::from_wire_response(b"220 0 <id>\r\n").expect("valid");
-        assert!(matches_command_type(&article, b"ARTICLE"));
-        assert!(matches_command_type(&article, b"BODY"));
-        assert!(matches_command_type(&article, b"HEAD"));
+        let article =
+            HybridArticleEntry::from_wire_response(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
+                .expect("valid");
+        assert!(
+            article
+                .response_parts_for_request_kind(RequestKind::Article, "<id>")
+                .is_some()
+        );
+        assert!(
+            article
+                .response_parts_for_request_kind(RequestKind::Body, "<id>")
+                .is_some()
+        );
+        assert!(
+            article
+                .response_parts_for_request_kind(RequestKind::Head, "<id>")
+                .is_some()
+        );
 
-        let body = HybridArticleEntry::from_wire_response(b"222 0 <id>\r\n").expect("valid");
-        assert!(!matches_command_type(&body, b"ARTICLE"));
-        assert!(matches_command_type(&body, b"BODY"));
-        assert!(!matches_command_type(&body, b"HEAD"));
+        let body =
+            HybridArticleEntry::from_wire_response(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
+        assert!(
+            body.response_parts_for_request_kind(RequestKind::Article, "<id>")
+                .is_none()
+        );
+        assert!(
+            body.response_parts_for_request_kind(RequestKind::Body, "<id>")
+                .is_some()
+        );
+        assert!(
+            body.response_parts_for_request_kind(RequestKind::Head, "<id>")
+                .is_none()
+        );
 
-        let head = HybridArticleEntry::from_wire_response(b"221 0 <id>\r\n").expect("valid");
-        assert!(!matches_command_type(&head, b"ARTICLE"));
-        assert!(!matches_command_type(&head, b"BODY"));
-        assert!(matches_command_type(&head, b"HEAD"));
+        let head =
+            HybridArticleEntry::from_wire_response(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
+        assert!(
+            head.response_parts_for_request_kind(RequestKind::Article, "<id>")
+                .is_none()
+        );
+        assert!(
+            head.response_parts_for_request_kind(RequestKind::Body, "<id>")
+                .is_none()
+        );
+        assert!(
+            head.response_parts_for_request_kind(RequestKind::Head, "<id>")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1189,46 +1220,6 @@ mod tests {
         assert!(render_response(&entry, b"LIST", "<t@x>").is_none());
         assert!(render_response(&entry, b"GROUP", "<t@x>").is_none());
         assert!(render_response(&entry, b"QUIT", "<t@x>").is_none());
-    }
-
-    // =========================================================================
-    // matches_command_type_verb
-    // =========================================================================
-
-    #[test]
-    fn test_matches_command_type_verb_stat_for_all_content_codes() {
-        for buf in [&b"220 ok\r\n"[..], b"221 ok\r\n", b"222 ok\r\n"] {
-            let entry = HybridArticleEntry::from_wire_response(buf).unwrap();
-            assert!(
-                matches_command_type(&entry, b"STAT"),
-                "STAT should match for {}xx entry",
-                buf[0] - b'0'
-            );
-        }
-
-        let stat_entry = HybridArticleEntry::from_wire_response(b"223 stat\r\n").unwrap();
-        assert!(!matches_command_type(&stat_entry, b"STAT"));
-
-        let missing_entry = HybridArticleEntry::from_wire_response(b"430 missing\r\n").unwrap();
-        assert!(!matches_command_type(&missing_entry, b"STAT"));
-    }
-
-    #[test]
-    fn test_matches_command_type_verb_430_matches_nothing() {
-        let entry = HybridArticleEntry::from_wire_response(b"430 missing\r\n").unwrap();
-        assert!(!matches_command_type(&entry, b"ARTICLE"));
-        assert!(!matches_command_type(&entry, b"HEAD"));
-        assert!(!matches_command_type(&entry, b"BODY"));
-        assert!(!matches_command_type(&entry, b"STAT"));
-    }
-
-    #[test]
-    fn test_matches_command_type_verb_223_matches_nothing() {
-        let entry = HybridArticleEntry::from_wire_response(b"223 stat\r\n").unwrap();
-        assert!(!matches_command_type(&entry, b"ARTICLE"));
-        assert!(!matches_command_type(&entry, b"HEAD"));
-        assert!(!matches_command_type(&entry, b"BODY"));
-        assert!(!matches_command_type(&entry, b"STAT"));
     }
 
     #[test]
