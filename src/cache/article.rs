@@ -142,22 +142,6 @@ impl CachedArticleResponse<'_> {
         self.status
     }
 
-    #[must_use]
-    pub fn payload_slices(&self) -> CachedArticlePayloadSlices<'_> {
-        match self.payload {
-            CachedArticleResponsePayload::None => CachedArticlePayloadSlices::None,
-            CachedArticleResponsePayload::Article { headers, body } => {
-                CachedArticlePayloadSlices::Article { headers, body }
-            }
-            CachedArticleResponsePayload::Head { headers } => {
-                CachedArticlePayloadSlices::Head { headers }
-            }
-            CachedArticleResponsePayload::Body { body } => {
-                CachedArticlePayloadSlices::Body { body }
-            }
-        }
-    }
-
     pub fn copy_to_slice(&self, out: &mut [u8]) -> Option<usize> {
         if out.len() < self.len() {
             return None;
@@ -221,14 +205,6 @@ impl CachedArticleResponse<'_> {
             CachedArticleResponsePayload::Body { body } => body.len() + 5,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum CachedArticlePayloadSlices<'a> {
-    None,
-    Article { headers: &'a [u8], body: &'a [u8] },
-    Head { headers: &'a [u8] },
-    Body { body: &'a [u8] },
 }
 
 #[derive(Debug, Clone, Copy)]
