@@ -294,17 +294,11 @@ impl ClientSession {
 
         // Accumulator buffers for zero-alloc batching (hoisted to session scope, reused across batches)
         let mut batch_buf = String::with_capacity(512 * 4); // ~2KB for typical 4-command batch
-        let mut batch_offsets: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
 
         // Process commands in batches (single commands fall through with zero overhead)
         'command_batch_loop: loop {
             let batch = match self
-                .read_command_batch(
-                    &mut client_reader,
-                    &mut command_buf,
-                    &mut batch_buf,
-                    &mut batch_offsets,
-                )
+                .read_command_batch(&mut client_reader, &mut command_buf, &mut batch_buf)
                 .await
             {
                 Ok(batch) => batch,
@@ -508,7 +502,7 @@ impl ClientSession {
             }
 
             // Extract buffers for reuse in next batch (avoids allocating new buffers each iteration)
-            (batch_buf, batch_offsets) = batch.into_buffers();
+            batch_buf = batch.into_buffer();
         }
 
         // Log session summary and close user connection

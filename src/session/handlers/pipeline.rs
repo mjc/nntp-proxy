@@ -17,18 +17,13 @@ const MAX_PIPELINE_DEPTH: usize = 16;
 /// A batch of requests read from the client's TCP buffer.
 ///
 /// Uses an accumulator buffer pattern to avoid per-command allocations:
-/// - All commands stored contiguously in a single String buffer
-/// - Offsets track command boundaries (end position of each command)
-/// - `SmallVec` keeps offsets on stack for common case (≤4 commands)
+/// - Pipelineable requests are stored as typed contexts
+/// - The raw buffer is retained only for a trailing non-pipelineable line
 pub(super) struct RequestBatch {
-    /// All commands accumulated in a single buffer
+    /// Raw trailing command, if present.
     buffer: String,
-    /// End offset of each pipelineable command (offsets[i] = end of command i+1)
-    offsets: smallvec::SmallVec<[usize; 4]>,
     /// Typed contexts for each pipelineable command.
     contexts: smallvec::SmallVec<[RequestContext; 4]>,
-    /// Offset range for trailing non-pipelineable command if present
-    trailing_range: Option<(usize, usize)>,
     /// Typed context for trailing non-pipelineable command if present.
     trailing_context: Option<RequestContext>,
     /// True if the trailing command exceeded the 512-byte RFC 3977 limit
@@ -41,7 +36,7 @@ pub(super) struct RequestBatch {
 impl RequestBatch {
     /// Whether this batch is empty (client disconnected)
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty() && self.trailing_range.is_none()
+        self.contexts.is_empty() && self.trailing_context.is_none()
     }
 
     /// Get a typed context by index from the pipelineable commands.
@@ -51,8 +46,7 @@ impl RequestBatch {
 
     /// Get the trailing non-pipelineable command if present
     pub fn trailing(&self) -> Option<&str> {
-        self.trailing_range
-            .map(|(start, end)| &self.buffer[start..end])
+        self.trailing_context.as_ref().map(|_| self.buffer.as_str())
     }
 
     /// Get the trailing typed context if present.
@@ -62,7 +56,7 @@ impl RequestBatch {
 
     /// Number of pipelineable commands
     pub fn len(&self) -> usize {
-        self.offsets.len()
+        self.contexts.len()
     }
 
     /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
@@ -76,9 +70,9 @@ impl RequestBatch {
         self.first_oversized
     }
 
-    /// Extract buffers for reuse in next batch (move out, leaving empty)
-    pub fn into_buffers(self) -> (String, smallvec::SmallVec<[usize; 4]>) {
-        (self.buffer, self.offsets)
+    /// Extract trailing buffer for reuse in next batch (move out, leaving empty)
+    pub fn into_buffer(self) -> String {
+        self.buffer
     }
 }
 
@@ -97,12 +91,9 @@ impl ClientSession {
         reader: &mut tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
         command_buf: &mut String,
         batch_buf: &mut String,
-        batch_offsets: &mut smallvec::SmallVec<[usize; 4]>,
     ) -> Result<RequestBatch> {
         // Prepare accumulator buffer
         batch_buf.clear();
-        batch_offsets.clear();
-        let mut trailing_range: Option<(usize, usize)> = None;
         let mut trailing_oversized = false;
 
         // First command: blocking read (must wait for client)
@@ -111,9 +102,7 @@ impl ClientSession {
             Ok(0) => {
                 return Ok(RequestBatch {
                     buffer: String::new(),
-                    offsets: smallvec::SmallVec::new(),
                     contexts: smallvec::SmallVec::new(),
-                    trailing_range: None,
                     trailing_context: None,
                     trailing_oversized: false,
                     first_oversized: false,
@@ -124,9 +113,7 @@ impl ClientSession {
                 if command_buf.len() > 512 {
                     return Ok(RequestBatch {
                         buffer: String::new(),
-                        offsets: smallvec::SmallVec::new(),
                         contexts: smallvec::SmallVec::new(),
-                        trailing_range: None,
                         trailing_context: None,
                         trailing_oversized: false,
                         first_oversized: true,
@@ -140,30 +127,22 @@ impl ClientSession {
 
         if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
-            let start = 0;
             batch_buf.push_str(command_buf);
-            let end = batch_buf.len();
-            trailing_range = Some((start, end));
             let trailing_context = Some(request);
             return Ok(RequestBatch {
                 buffer: std::mem::take(batch_buf),
-                offsets: smallvec::SmallVec::new(),
                 contexts: smallvec::SmallVec::new(),
-                trailing_range,
                 trailing_context,
                 trailing_oversized: false,
                 first_oversized: false,
             });
         }
 
-        // Accumulate first pipelineable command
-        batch_buf.push_str(command_buf);
-        batch_offsets.push(batch_buf.len());
         let mut batch_contexts: smallvec::SmallVec<[RequestContext; 4]> = smallvec::SmallVec::new();
         batch_contexts.push(request);
 
         // Read more commands from the buffer (non-blocking)
-        while batch_offsets.len() < MAX_PIPELINE_DEPTH {
+        while batch_contexts.len() < MAX_PIPELINE_DEPTH {
             // Only proceed if buffer has a complete line (contains \n).
             // Checking just is_empty() is insufficient: if the buffer has a partial
             // command without \n, read_line() would block on the socket waiting for
@@ -179,17 +158,12 @@ impl ClientSession {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
                     if command_buf.len() > 512 {
-                        let start = batch_buf.len();
                         batch_buf.push_str(command_buf);
-                        let end = batch_buf.len();
-                        trailing_range = Some((start, end));
                         let trailing_context = Some(RequestContext::from_request_line(command_buf));
                         trailing_oversized = true;
                         return Ok(RequestBatch {
                             buffer: std::mem::take(batch_buf),
-                            offsets: std::mem::take(batch_offsets),
                             contexts: batch_contexts,
-                            trailing_range,
                             trailing_context,
                             trailing_oversized,
                             first_oversized: false,
@@ -198,23 +172,16 @@ impl ClientSession {
                     let request = RequestContext::from_request_line(command_buf);
                     if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
-                        let start = batch_buf.len();
                         batch_buf.push_str(command_buf);
-                        let end = batch_buf.len();
-                        trailing_range = Some((start, end));
                         let trailing_context = Some(request);
                         return Ok(RequestBatch {
                             buffer: std::mem::take(batch_buf),
-                            offsets: std::mem::take(batch_offsets),
                             contexts: batch_contexts,
-                            trailing_range,
                             trailing_context,
                             trailing_oversized,
                             first_oversized: false,
                         });
                     }
-                    batch_buf.push_str(command_buf);
-                    batch_offsets.push(batch_buf.len());
                     batch_contexts.push(request);
                 }
             }
@@ -222,9 +189,7 @@ impl ClientSession {
 
         Ok(RequestBatch {
             buffer: std::mem::take(batch_buf),
-            offsets: std::mem::take(batch_offsets),
             contexts: batch_contexts,
-            trailing_range,
             trailing_context: None,
             trailing_oversized,
             first_oversized: false,
