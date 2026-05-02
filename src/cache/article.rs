@@ -3,7 +3,7 @@
 //! This module provides article caching with per-backend availability tracking.
 //! The availability tracking type itself lives in [`super::availability`].
 
-use crate::protocol::StatusCode;
+use crate::protocol::{RequestKind, StatusCode};
 use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::future::Cache;
@@ -562,6 +562,15 @@ impl ArticleEntry {
     ) -> Option<CachedArticleResponse<'_>> {
         response_parts_for_payload_bytes(&self.payload, cmd_verb, message_id)
     }
+
+    #[must_use]
+    pub fn response_parts_for_request_kind(
+        &self,
+        request_kind: RequestKind,
+        message_id: &str,
+    ) -> Option<CachedArticleResponse<'_>> {
+        response_parts_for_payload_kind(&self.payload, request_kind, message_id)
+    }
 }
 
 pub(crate) fn response_parts_for_payload_bytes<'a>(
@@ -619,6 +628,59 @@ pub(crate) fn response_parts_for_payload_bytes<'a>(
         })
     } else {
         None
+    }
+}
+
+pub(crate) fn response_parts_for_payload_kind<'a>(
+    payload: &'a CachedPayload,
+    request_kind: RequestKind,
+    message_id: &str,
+) -> Option<CachedArticleResponse<'a>> {
+    let article_number = match payload {
+        CachedPayload::Article { article_number, .. }
+        | CachedPayload::Head { article_number, .. }
+        | CachedPayload::Body { article_number, .. }
+        | CachedPayload::Stat { article_number } => *article_number,
+        CachedPayload::Missing | CachedPayload::AvailabilityOnly => None,
+    };
+    let number = article_number.map_or(0, CachedArticleNumber::get);
+
+    match (request_kind, payload) {
+        (
+            RequestKind::Stat,
+            CachedPayload::Article { .. }
+            | CachedPayload::Head { .. }
+            | CachedPayload::Body { .. }
+            | CachedPayload::Stat { .. },
+        ) => Some(CachedArticleResponse {
+            status: StatusCode::new(223),
+            status_line: StackStatusLine::new(223, number, message_id)?,
+            payload: CachedArticleResponsePayload::None,
+        }),
+        (RequestKind::Article, CachedPayload::Article { headers, body, .. }) => {
+            Some(CachedArticleResponse {
+                status: StatusCode::new(220),
+                status_line: StackStatusLine::new(220, number, message_id)?,
+                payload: CachedArticleResponsePayload::Article { headers, body },
+            })
+        }
+        (
+            RequestKind::Head,
+            CachedPayload::Article { headers, .. } | CachedPayload::Head { headers, .. },
+        ) => Some(CachedArticleResponse {
+            status: StatusCode::new(221),
+            status_line: StackStatusLine::new(221, number, message_id)?,
+            payload: CachedArticleResponsePayload::Head { headers },
+        }),
+        (
+            RequestKind::Body,
+            CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. },
+        ) => Some(CachedArticleResponse {
+            status: StatusCode::new(222),
+            status_line: StackStatusLine::new(222, number, message_id)?,
+            payload: CachedArticleResponsePayload::Body { body },
+        }),
+        _ => None,
     }
 }
 
@@ -1226,6 +1288,8 @@ mod tests {
 
     #[tokio::test]
     async fn cached_article_response_writes_derived_wire_shapes() {
+        use crate::protocol::RequestKind;
+
         let entry = create_test_article("<test@example.com>");
         let cases = [
             (
@@ -1252,6 +1316,15 @@ mod tests {
 
             assert_eq!(out, expected, "{}", String::from_utf8_lossy(verb));
         }
+
+        let response = entry
+            .response_parts_for_request_kind(RequestKind::Body, "<test@example.com>")
+            .unwrap();
+        let mut out = Vec::new();
+
+        response.write_to(&mut out).await.unwrap();
+
+        assert_eq!(out, b"222 0 <test@example.com>\r\nBody\r\n.\r\n");
     }
 
     #[test]
