@@ -134,6 +134,26 @@ harness = false
 name = "request_classifier_callgrind"
 harness = false
 
+[[bench]]
+name = "request_serialization"
+harness = false
+
+[[bench]]
+name = "request_batch_parse"
+harness = false
+
+[[bench]]
+name = "cache_response_generation"
+harness = false
+
+[[bench]]
+name = "cache_ingest_semantic"
+harness = false
+
+[[bench]]
+name = "tail_buffer_boundaries"
+harness = false
+
 
 [profile.dev]
 split-debuginfo = "unpacked"  # Faster linking — don't bundle debuginfo into binary
