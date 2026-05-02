@@ -128,6 +128,11 @@ impl CachedArticleResponse<'_> {
     }
 
     #[must_use]
+    pub fn wire_len(&self) -> crate::protocol::ResponseWireLen {
+        self.len().into()
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1242,6 +1247,19 @@ mod tests {
         assert_eq!(
             out,
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+        );
+    }
+
+    #[test]
+    fn cached_article_response_exposes_typed_wire_len() {
+        let entry = create_test_article("<test@example.com>");
+        let response = entry
+            .response_parts_for_command_bytes(b"STAT", "<test@example.com>")
+            .unwrap();
+
+        assert_eq!(
+            response.wire_len(),
+            crate::protocol::ResponseWireLen::new(26)
         );
     }
 
