@@ -481,40 +481,34 @@ impl ClientSession {
         // Adaptive prechecking for STAT/HEAD commands (if enabled and cache missed)
         if self.adaptive_precheck
             && let Some(ref msg_id_ref) = msg_id
+            && (request.is_stat() || request.is_head())
         {
-            let is_head = request.is_head();
-            if request.is_stat() || is_head {
-                let deps = self.precheck_deps(&router);
-                let bytes_written = if let Some(entry) =
-                    precheck::precheck(&deps, request, msg_id_ref, is_head).await
+            let deps = self.precheck_deps(&router);
+            let bytes_written = if let Some(entry) =
+                precheck::precheck(&deps, request, msg_id_ref).await
+            {
+                if let Some(write) =
+                    write_cached_article_response(client_write, &entry, request.verb(), msg_id_ref)
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
                 {
-                    if let Some(write) = write_cached_article_response(
-                        client_write,
-                        &entry,
-                        request.verb(),
-                        msg_id_ref,
-                    )
-                    .await
-                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
-                    {
-                        write.wire_len.get()
-                    } else {
-                        client_write
-                            .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                            .await
-                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                        crate::protocol::NO_SUCH_ARTICLE.len()
-                    }
+                    write.wire_len.get()
                 } else {
                     client_write
                         .write_all(crate::protocol::NO_SUCH_ARTICLE)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     crate::protocol::NO_SUCH_ARTICLE.len()
-                };
-                *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
-                return Ok(BackendId::from_index(0));
-            }
+                }
+            } else {
+                client_write
+                    .write_all(crate::protocol::NO_SUCH_ARTICLE)
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                crate::protocol::NO_SUCH_ARTICLE.len()
+            };
+            *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
+            return Ok(BackendId::from_index(0));
         }
 
         // Detect large-transfer commands that should skip the pipeline.

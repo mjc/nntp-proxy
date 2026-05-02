@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::cache::{ArticleAvailability, ArticleEntry, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
-use crate::protocol::RequestContext;
+use crate::protocol::{RequestContext, ResponseShape};
 use crate::router::BackendSelector;
 use crate::session::backend;
 use crate::types::{BackendId, MessageId};
@@ -55,7 +55,6 @@ async fn query_backend(
     deps: &OwnedDeps,
     backend_id: BackendId,
     request: &RequestContext,
-    multiline: bool,
 ) -> QueryResult {
     let Some(provider) = deps.router.backend_provider(backend_id) else {
         return QueryResult::Error(backend_id);
@@ -66,7 +65,7 @@ async fn query_backend(
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result: QueryResult = crate::session::retry::retry_once!(
-        execute_backend_query(deps, provider, backend_id, request, multiline).await,
+        execute_backend_query(deps, provider, backend_id, request).await,
         backend = backend_id.as_index()
     )
     .unwrap_or(QueryResult::Error(backend_id));
@@ -86,7 +85,6 @@ async fn execute_backend_query(
     provider: &crate::pool::DeadpoolConnectionProvider,
     backend_id: BackendId,
     request: &RequestContext,
-    multiline: bool,
 ) -> Result<QueryResult, ()> {
     let Ok(conn_raw) = provider.get_pooled_connection().await else {
         return Ok(QueryResult::Error(backend_id));
@@ -103,7 +101,10 @@ async fn execute_backend_query(
                 return Err(());
             };
 
-            let response = if multiline && cmd_response.is_multiline {
+            let response_shape = request.response_shape(status_code);
+            let response = if matches!(response_shape, ResponseShape::Multiline)
+                && cmd_response.is_multiline
+            {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
                 let mut response = crate::pool::ChunkedResponse::default();
                 response.extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);
@@ -191,11 +192,7 @@ async fn execute_backend_query(
 }
 
 /// Query all backends, collecting results as they arrive
-async fn query_all_backends(
-    deps: &OwnedDeps,
-    request: &RequestContext,
-    multiline: bool,
-) -> Vec<QueryResult> {
+async fn query_all_backends(deps: &OwnedDeps, request: &RequestContext) -> Vec<QueryResult> {
     use futures::StreamExt;
 
     let tasks: Vec<_> = (0..deps.router.backend_count().get())
@@ -203,7 +200,7 @@ async fn query_all_backends(
         .map(|id| {
             let deps = deps.clone();
             let request = request.clone();
-            tokio::spawn(async move { query_backend(&deps, id, &request, multiline).await })
+            tokio::spawn(async move { query_backend(&deps, id, &request).await })
         })
         .collect();
 
@@ -222,7 +219,6 @@ async fn query_all_backends_racing(
     deps: &OwnedDeps,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
-    multiline: bool,
 ) -> Option<(BackendId, crate::cache::CacheBuffer)> {
     use futures::StreamExt;
 
@@ -231,7 +227,7 @@ async fn query_all_backends_racing(
         .map(|id| {
             let deps = deps.clone();
             let request = request.clone();
-            tokio::spawn(async move { query_backend(&deps, id, &request, multiline).await })
+            tokio::spawn(async move { query_backend(&deps, id, &request).await })
         })
         .collect();
 
@@ -335,7 +331,6 @@ pub async fn precheck(
     deps: &PrecheckDeps<'_>,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
-    multiline: bool,
 ) -> Option<ArticleEntry> {
     // Check cache first - if we have a complete article, return it immediately
     if let Some(cached) = deps.cache.get(msg_id).await
@@ -345,7 +340,7 @@ pub async fn precheck(
     }
 
     let owned = deps.to_owned();
-    let found = query_all_backends_racing(&owned, request, msg_id, multiline).await;
+    let found = query_all_backends_racing(&owned, request, msg_id).await;
 
     // Cache the found result and return it
     if let Some((backend_id, data)) = found {
@@ -387,7 +382,7 @@ pub fn spawn_background_precheck(
             return;
         }
 
-        let results = query_all_backends(&owned, &request, false).await;
+        let results = query_all_backends(&owned, &request).await;
         let (found, availability) = summarize(results);
 
         if let Some((backend_id, data)) = found {
@@ -512,7 +507,7 @@ mod tests {
         };
 
         let request = RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
-        let result = query_backend(&deps, backend_id, &request, true).await;
+        let result = query_backend(&deps, backend_id, &request).await;
         assert_eq!(result, QueryResult::Error(backend_id));
     }
 }
