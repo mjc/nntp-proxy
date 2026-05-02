@@ -166,6 +166,19 @@ impl RequestContext {
     }
 
     #[inline]
+    pub const fn record_cache_response(
+        &mut self,
+        backend_id: BackendId,
+        status: StatusCode,
+        wire_len: usize,
+    ) {
+        self.cache_status = Some(RequestCacheStatus::Hit);
+        self.backend_id = Some(backend_id);
+        self.response_status = Some(status);
+        self.response_wire_len = Some(wire_len);
+    }
+
+    #[inline]
     #[must_use]
     pub fn verb(&self) -> &[u8] {
         &self.verb
@@ -405,6 +418,21 @@ mod tests {
 
         assert_eq!(ctx.cache_status(), Some(RequestCacheStatus::PartialHit));
         assert_eq!(wire(&ctx), b"BODY <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_cache_response_when_served() {
+        let mut ctx = RequestContext::from_request_line("HEAD <a@b>\r\n");
+        let backend_id = BackendId::from_index(1);
+        let status = StatusCode::new(221);
+
+        ctx.record_cache_response(backend_id, status, 24);
+
+        assert_eq!(ctx.cache_status(), Some(RequestCacheStatus::Hit));
+        assert_eq!(ctx.backend_id(), Some(backend_id));
+        assert_eq!(ctx.response_status(), Some(status));
+        assert_eq!(ctx.response_wire_len(), Some(24));
+        assert_eq!(wire(&ctx), b"HEAD <a@b>\r\n");
     }
 
     #[test]
