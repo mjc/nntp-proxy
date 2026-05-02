@@ -277,11 +277,11 @@ where
     let Some(response) = cached.response_parts_for_command_bytes(cmd_verb, msg_id.as_str()) else {
         return Ok(None);
     };
-    let bytes_written = response.len();
+    let wire_len = response.wire_len();
     response.write_to(client_write).await?;
     Ok(Some(CachedResponseWrite {
         status: response.status(),
-        wire_len: bytes_written.into(),
+        wire_len,
     }))
 }
 
