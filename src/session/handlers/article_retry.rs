@@ -107,7 +107,7 @@ impl ClientSession {
                 // Unconditional: write goes to the backend, not the client.
                 // A client disconnect cannot cause a backend write error.
                 // conn drops here → ConnectionGuard::remove_with_cooldown
-                return Err(SessionError::Backend(e));
+                return Err(SessionError::Backend(e.into()));
             }
         }
         if let Err(e) = conn.flush().await {

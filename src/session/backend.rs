@@ -218,11 +218,11 @@ impl BackendFirstResponse {
 }
 
 /// Write a typed request to a backend without building a temporary command buffer.
-pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> Result<()>
+pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> std::io::Result<()>
 where
     C: tokio::io::AsyncWrite + Unpin,
 {
-    request.write_wire_to(conn).await.map_err(Into::into)
+    request.write_wire_to(conn).await
 }
 
 /// Send a typed request and read the first response chunk.

@@ -9,16 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
-use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
+use crate::protocol::{authinfo_pass, authinfo_user};
+use crate::session::backend;
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
-
-async fn write_request(
-    stream: &mut ConnectionStream,
-    request: &RequestContext,
-) -> std::io::Result<()> {
-    request.write_wire_to(stream).await
-}
 
 /// Type alias for the deadpool connection pool
 pub type Pool = managed::Pool<TcpManager>;
@@ -288,7 +282,7 @@ impl TcpManager {
             return Ok(());
         };
 
-        write_request(stream, &authinfo_user(username)).await?;
+        backend::write_request(stream, &authinfo_user(username)).await?;
         let n = stream.read(buffer).await?;
         let response = &buffer[..n];
         let response_str = String::from_utf8_lossy(response);
@@ -304,7 +298,7 @@ impl TcpManager {
                 });
             };
 
-            write_request(stream, &authinfo_pass(password)).await?;
+            backend::write_request(stream, &authinfo_pass(password)).await?;
             let n = stream.read(buffer).await?;
             let response = &buffer[..n];
             let response_str = String::from_utf8_lossy(response);
