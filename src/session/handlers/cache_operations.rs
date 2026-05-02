@@ -211,10 +211,14 @@ fn cache_entry_metadata(
         RequestCacheTier::new(cached.tier().get()),
         RequestCacheTimestampMillis::new(cached.inserted_at().get()),
         cache_payload_kind(cached.payload_kind()),
-        cached
-            .article_number()
-            .map(|number| RequestCacheArticleNumber::new(number.get())),
+        cache_article_number(cached.article_number()),
     ))
+}
+
+fn cache_article_number(
+    article_number: Option<crate::cache::CachedArticleNumber>,
+) -> Option<RequestCacheArticleNumber> {
+    article_number.map(|number| RequestCacheArticleNumber::new(number.get()))
 }
 
 fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCachePayloadKind {
