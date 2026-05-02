@@ -479,6 +479,18 @@ impl RequestContext {
         self.response_payload = Some(response);
     }
 
+    #[inline]
+    pub fn complete_backend_response(
+        &mut self,
+        backend_id: BackendId,
+        status: StatusCode,
+        response: crate::pool::ChunkedResponse,
+    ) {
+        self.backend_id = Some(backend_id);
+        self.response = Some(RequestResponseMetadata::new(status, response.len().into()));
+        self.response_payload = Some(response);
+    }
+
     pub async fn write_response_payload_to<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: tokio::io::AsyncWriteExt + Unpin,

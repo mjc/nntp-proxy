@@ -83,8 +83,7 @@ impl QueuedContext {
         backend_id: BackendId,
     ) {
         let mut context = self.context;
-        context.record_backend_response(backend_id, status_code, data.len().into());
-        context.record_response_payload(data);
+        context.complete_backend_response(backend_id, status_code, data);
         let _ = self
             .client_return
             .send(Ok(CompletedPipelineRequest { context }));
