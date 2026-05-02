@@ -247,7 +247,7 @@ pub struct AuthCheckContext<'a> {
 /// 2. Handling auth commands
 /// 3. Rejecting non-auth commands when not authenticated
 pub async fn handle_stateful_auth_check<W>(
-    command: &str,
+    request: &crate::protocol::RequestContext,
     client_write: &mut W,
     auth_username: &mut Option<String>,
     ctx: &AuthCheckContext<'_>,
@@ -259,7 +259,7 @@ where
 {
     use crate::command::{CommandAction, CommandHandler};
 
-    let action = CommandHandler::classify(command);
+    let action = CommandHandler::classify_request(request);
     match action {
         CommandAction::ForwardStateless => {
             // Reject all non-auth commands before authentication

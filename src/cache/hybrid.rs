@@ -238,7 +238,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
+            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.payload_len())
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
@@ -363,11 +363,33 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let buffer_len = buffer.len();
         let buffer = buffer.into_vec();
+        let mut entry = if self.config.cache_articles {
+            let Some(entry) = HybridArticleEntry::from_response_buffer_with_tier(buffer, tier)
+            else {
+                warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
+                return;
+            };
+            entry
+        } else {
+            // Availability-only mode: store minimal stub
+            let stub = Self::create_stub(&buffer);
+            let Some(entry) = HybridArticleEntry::from_response_buffer_with_tier(stub, tier) else {
+                warn!(
+                    msg_id = %key,
+                    buffer_len,
+                    first_bytes = ?&buffer[..buffer_len.min(32)],
+                    "Cannot cache: invalid status code"
+                );
+                return;
+            };
+            entry
+        };
+        let entry_len = entry.payload_len();
 
-        // Check for existing entry - don't overwrite larger buffers with smaller ones
+        // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Ok(Some(existing)) = self.cache.get(&key).await {
-            let existing_len = existing.value().buffer.len();
-            if existing_len > buffer_len {
+            let existing_len = existing.value().payload_len();
+            if existing_len > entry_len {
                 // Existing entry is larger - just update availability info and refresh TTL
                 let mut updated = existing.value().clone();
                 updated.record_backend_has(backend_id);
@@ -377,38 +399,18 @@ impl HybridArticleCache {
                 debug!(
                     msg_id = %key,
                     existing_bytes = existing_len,
-                    new_bytes = buffer_len,
+                    new_bytes = entry_len,
                     "Hybrid cache upsert: preserved larger existing entry, updated availability"
                 );
                 return;
             }
         }
 
-        // Split into two paths to avoid clone: one moves buffer, one borrows it
+        entry.record_backend_has(backend_id);
+        self.cache.insert(key.clone(), entry);
         if self.config.cache_articles {
-            let Some(mut entry) = HybridArticleEntry::with_tier(buffer, tier) else {
-                warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
-                return;
-            };
-            entry.record_backend_has(backend_id);
-            let entry_len = entry.buffer.len();
-            self.cache.insert(key.clone(), entry);
             debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert");
         } else {
-            // Availability-only mode: store minimal stub
-            let stub = Self::create_stub(&buffer);
-            let Some(mut entry) = HybridArticleEntry::with_tier(stub, tier) else {
-                warn!(
-                    msg_id = %key,
-                    buffer_len,
-                    first_bytes = ?&buffer[..buffer_len.min(32)],
-                    "Cannot cache: invalid status code"
-                );
-                return;
-            };
-            entry.record_backend_has(backend_id);
-            let entry_len = entry.buffer.len();
-            self.cache.insert(key.clone(), entry);
             debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert (stub)");
         }
     }
@@ -425,8 +427,8 @@ impl HybridArticleCache {
         } else {
             // Create stub entry for availability tracking
             // SAFETY: "430\r\n" is a valid NNTP response
-            let mut entry =
-                HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is a valid status code");
+            let mut entry = HybridArticleEntry::from_response_buffer(b"430\r\n".to_vec())
+                .expect("430 is a valid status code");
             entry.record_backend_missing(backend_id);
             entry
         };
@@ -472,7 +474,7 @@ impl HybridArticleCache {
                 } else {
                     // All checked backends returned 430 - create stub to track this
                     // SAFETY: "430\r\n" is a valid NNTP response
-                    let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec())
+                    let mut entry = HybridArticleEntry::from_response_buffer(b"430\r\n".to_vec())
                         .expect("430 is a valid status code");
                     entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);
@@ -584,7 +586,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
+            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.payload_len())
             .storage()
             .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>);
 
@@ -633,7 +635,10 @@ mod tests {
         // Retrieve it
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
-        assert_eq!(entry.buffer(), buffer.as_slice());
+        assert_eq!(
+            entry.response_for_command("ARTICLE", &msg_id).unwrap(),
+            buffer
+        );
         assert!(entry.should_try_backend(BackendId::from_index(0)));
 
         // Check stats

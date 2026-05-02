@@ -6,7 +6,7 @@
 //! # Wire Format
 //!
 //! ```text
-//! [status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][len:u32][buffer:bytes]
+//! [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][payload-kind:u8]...
 //! ```
 
 use crate::protocol::StatusCode;
@@ -14,10 +14,19 @@ use crate::router::BackendCount;
 use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
-use std::sync::Arc;
 
+use super::article::{CachedPayload, parse_payload};
 use super::availability::ArticleAvailability;
 use super::ttl;
+
+const HYBRID_ENTRY_MAGIC_V3: u32 = 0x4e50_4333; // "NPC3"
+const PAYLOAD_MISSING: u8 = 0;
+const PAYLOAD_AVAILABILITY_ONLY: u8 = 1;
+const PAYLOAD_ARTICLE: u8 = 2;
+const PAYLOAD_HEAD: u8 = 3;
+const PAYLOAD_BODY: u8 = 4;
+const PAYLOAD_STAT: u8 = 5;
+const NO_ARTICLE_NUMBER: u64 = u64::MAX;
 
 /// Valid NNTP status codes for cached articles
 ///
@@ -69,7 +78,8 @@ impl TryFrom<u16> for CacheableStatusCode {
 ///
 /// Implements foyer's Code trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
-/// - Simple binary format: [status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][len:u32][buffer:bytes]
+/// - Simple binary format:
+///   [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][typed-payload]
 #[derive(Clone, Debug)]
 pub struct HybridArticleEntry {
     /// Validated NNTP status code — only cacheable codes are representable
@@ -83,15 +93,15 @@ pub struct HybridArticleEntry {
     /// Server tier (lower = higher priority)
     /// Used for tier-aware TTL: higher tier = longer TTL
     tier: u8,
-    /// Complete response buffer (Arc for O(1) clone on cache hits)
-    /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
-    pub(super) buffer: Arc<Vec<u8>>,
+    payload: CachedPayload,
 }
 
 /// Manual Code implementation to avoid bincode's vec resizing overhead
 impl Code for HybridArticleEntry {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
-        // Format: status (2) + checked (1) + missing (1) + timestamp (8) + tier (1) + len (4) + buffer
+        writer
+            .write_all(&HYBRID_ENTRY_MAGIC_V3.to_le_bytes())
+            .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.status_code.as_u16().to_le_bytes())
             .map_err(foyer::Error::io_error)?;
@@ -107,17 +117,23 @@ impl Code for HybridArticleEntry {
         writer
             .write_all(&[self.tier])
             .map_err(foyer::Error::io_error)?;
-        let len = self.buffer.len() as u32;
-        writer
-            .write_all(&len.to_le_bytes())
-            .map_err(foyer::Error::io_error)?;
-        writer
-            .write_all(&self.buffer)
-            .map_err(foyer::Error::io_error)?;
+        encode_payload(writer, &self.payload)?;
         Ok(())
     }
 
     fn decode(reader: &mut impl Read) -> foyer::Result<Self> {
+        let mut magic = [0u8; 4];
+        reader
+            .read_exact(&mut magic)
+            .map_err(foyer::Error::io_error)?;
+        let magic = u32::from_le_bytes(magic);
+        if magic != HYBRID_ENTRY_MAGIC_V3 {
+            return Err(foyer::Error::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "old hybrid cache entry format",
+            )));
+        }
+
         // Read status code
         let mut status_bytes = [0u8; 2];
         reader
@@ -153,90 +169,242 @@ impl Code for HybridArticleEntry {
             .map_err(foyer::Error::io_error)?;
         let tier = tier_byte[0];
 
-        // Read length and pre-allocate buffer (no resizing!)
-        let mut len_bytes = [0u8; 4];
-        reader
-            .read_exact(&mut len_bytes)
-            .map_err(foyer::Error::io_error)?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-
-        // Reject unreasonably large cached entries to avoid OOM on corrupted data.
-        const MAX_BUFFER_SIZE: usize = 100 * 1024 * 1024; // 100 MiB hard limit
-        if len > MAX_BUFFER_SIZE {
-            return Err(foyer::Error::io_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Cached article too large: {len} bytes (max {MAX_BUFFER_SIZE} bytes)"),
-            )));
-        }
-
-        // Read exactly len bytes with pre-allocated capacity (avoids reallocation).
-        // Use take() to limit reads to len bytes, then collect into Vec.
-        use std::io::Read;
-        let mut buffer = Vec::with_capacity(len);
-        reader
-            .take(len as u64)
-            .read_to_end(&mut buffer)
-            .map_err(foyer::Error::io_error)?;
-        if buffer.len() != len {
-            return Err(foyer::Error::io_error(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("Expected {} bytes, got {}", len, buffer.len()),
-            )));
-        }
+        let payload = decode_payload(reader)?;
 
         Ok(Self {
             status_code,
             availability: ArticleAvailability::from_bits(header[0], header[1]),
             timestamp,
             tier,
-            buffer: Arc::new(buffer),
+            payload,
         })
     }
 
     fn estimated_size(&self) -> usize {
-        2 + 2 + 8 + 1 + 4 + self.buffer.len() // status + header + timestamp + tier + len + buffer
+        4 + 2 + 2 + 8 + 1 + encoded_payload_size(&self.payload)
+    }
+}
+
+fn encode_payload(writer: &mut impl Write, payload: &CachedPayload) -> foyer::Result<()> {
+    match payload {
+        CachedPayload::Missing => writer
+            .write_all(&[PAYLOAD_MISSING])
+            .map_err(foyer::Error::io_error),
+        CachedPayload::AvailabilityOnly => writer
+            .write_all(&[PAYLOAD_AVAILABILITY_ONLY])
+            .map_err(foyer::Error::io_error),
+        CachedPayload::Stat { article_number } => {
+            writer
+                .write_all(&[PAYLOAD_STAT])
+                .map_err(foyer::Error::io_error)?;
+            write_article_number(writer, *article_number)
+        }
+        CachedPayload::Article {
+            article_number,
+            headers,
+            body,
+        } => {
+            writer
+                .write_all(&[PAYLOAD_ARTICLE])
+                .map_err(foyer::Error::io_error)?;
+            write_article_number(writer, *article_number)?;
+            write_vec(writer, headers)?;
+            write_vec(writer, body)
+        }
+        CachedPayload::Head {
+            article_number,
+            headers,
+        } => {
+            writer
+                .write_all(&[PAYLOAD_HEAD])
+                .map_err(foyer::Error::io_error)?;
+            write_article_number(writer, *article_number)?;
+            write_vec(writer, headers)
+        }
+        CachedPayload::Body {
+            article_number,
+            body,
+        } => {
+            writer
+                .write_all(&[PAYLOAD_BODY])
+                .map_err(foyer::Error::io_error)?;
+            write_article_number(writer, *article_number)?;
+            write_vec(writer, body)
+        }
+    }
+}
+
+fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
+    let mut kind = [0u8; 1];
+    reader
+        .read_exact(&mut kind)
+        .map_err(foyer::Error::io_error)?;
+    match kind[0] {
+        PAYLOAD_MISSING => Ok(CachedPayload::Missing),
+        PAYLOAD_AVAILABILITY_ONLY => Ok(CachedPayload::AvailabilityOnly),
+        PAYLOAD_STAT => Ok(CachedPayload::Stat {
+            article_number: read_article_number(reader)?,
+        }),
+        PAYLOAD_ARTICLE => {
+            let article_number = read_article_number(reader)?;
+            let headers = read_vec(reader)?;
+            let body = read_vec(reader)?;
+            Ok(CachedPayload::Article {
+                article_number,
+                headers,
+                body,
+            })
+        }
+        PAYLOAD_HEAD => {
+            let article_number = read_article_number(reader)?;
+            let headers = read_vec(reader)?;
+            Ok(CachedPayload::Head {
+                article_number,
+                headers,
+            })
+        }
+        PAYLOAD_BODY => {
+            let article_number = read_article_number(reader)?;
+            let body = read_vec(reader)?;
+            Ok(CachedPayload::Body {
+                article_number,
+                body,
+            })
+        }
+        other => Err(foyer::Error::io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid cached payload kind: {other}"),
+        ))),
+    }
+}
+
+fn write_article_number(writer: &mut impl Write, article_number: Option<u64>) -> foyer::Result<()> {
+    writer
+        .write_all(&article_number.unwrap_or(NO_ARTICLE_NUMBER).to_le_bytes())
+        .map_err(foyer::Error::io_error)
+}
+
+fn read_article_number(reader: &mut impl Read) -> foyer::Result<Option<u64>> {
+    let mut bytes = [0u8; 8];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(foyer::Error::io_error)?;
+    let raw = u64::from_le_bytes(bytes);
+    Ok((raw != NO_ARTICLE_NUMBER).then_some(raw))
+}
+
+fn write_vec(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
+    let len = u32::try_from(data.len()).map_err(|_| {
+        foyer::Error::io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Cached article section too large: {} bytes", data.len()),
+        ))
+    })?;
+    writer
+        .write_all(&len.to_le_bytes())
+        .map_err(foyer::Error::io_error)?;
+    writer.write_all(data).map_err(foyer::Error::io_error)
+}
+
+fn read_vec(reader: &mut impl Read) -> foyer::Result<Vec<u8>> {
+    let mut len_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut len_bytes)
+        .map_err(foyer::Error::io_error)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    const MAX_SECTION_SIZE: usize = 100 * 1024 * 1024;
+    if len > MAX_SECTION_SIZE {
+        return Err(foyer::Error::io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Cached article section too large: {len} bytes"),
+        )));
+    }
+    let mut data = Vec::with_capacity(len);
+    reader
+        .take(len as u64)
+        .read_to_end(&mut data)
+        .map_err(foyer::Error::io_error)?;
+    if data.len() != len {
+        return Err(foyer::Error::io_error(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("Expected {} bytes, got {}", len, data.len()),
+        )));
+    }
+    Ok(data)
+}
+
+fn encoded_payload_size(payload: &CachedPayload) -> usize {
+    match payload {
+        CachedPayload::Missing | CachedPayload::AvailabilityOnly => 1,
+        CachedPayload::Stat { .. } => 1 + 8,
+        CachedPayload::Article { headers, body, .. } => 1 + 8 + 4 + headers.len() + 4 + body.len(),
+        CachedPayload::Head { headers, .. } => 1 + 8 + 4 + headers.len(),
+        CachedPayload::Body { body, .. } => 1 + 8 + 4 + body.len(),
     }
 }
 
 impl HybridArticleEntry {
-    /// Create from response buffer - returns None if buffer has invalid status code
+    /// Ingest a backend response buffer into a typed hybrid cache entry.
     ///
-    /// This is the ONLY way to create an entry. Invalid buffers are rejected.
-    /// Tier defaults to 0.
+    /// Returns `None` if the status code is invalid or not cacheable. The entry
+    /// stores semantic payload sections, not the original wire response.
     #[must_use]
-    pub fn new(buffer: Vec<u8>) -> Option<Self> {
-        Self::with_tier(buffer, 0)
+    pub fn from_response_buffer(buffer: Vec<u8>) -> Option<Self> {
+        Self::from_response_buffer_with_tier(buffer, 0)
     }
 
-    /// Create from response buffer with specified tier
-    ///
-    /// Returns None if buffer has invalid or non-cacheable status code.
+    /// Ingest a backend response buffer with a specific provider tier.
     #[must_use]
-    pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Option<Self> {
+    pub fn from_response_buffer_with_tier(buffer: Vec<u8>, tier: u8) -> Option<Self> {
         let raw_code = StatusCode::parse(&buffer)?.as_u16();
         let status_code = CacheableStatusCode::try_from(raw_code).ok()?;
+        let payload = parse_payload(StatusCode::new(raw_code), &buffer);
 
         Some(Self {
             status_code,
             availability: ArticleAvailability::new(),
             timestamp: ttl::now_millis(),
             tier,
-            buffer: Arc::new(buffer),
+            payload,
         })
     }
 
-    /// Get raw buffer for serving to client
-    #[inline]
+    /// Render this entry as an NNTP response for the given command/message-id.
     #[must_use]
-    pub fn buffer(&self) -> &[u8] {
-        &self.buffer
+    pub fn response_for_command(
+        &self,
+        cmd_verb: &str,
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Option<Vec<u8>> {
+        super::article::ArticleEntry::from_parts(
+            StatusCode::new(self.status_code.as_u16()),
+            self.payload.clone(),
+            self.availability,
+            self.tier,
+            self.timestamp,
+        )
+        .response_for_command(cmd_verb, message_id)
     }
 
-    /// Get buffer as shared Arc (O(1) clone for sending to client)
-    #[inline]
     #[must_use]
-    pub fn into_buffer(self) -> Arc<Vec<u8>> {
-        self.buffer
+    pub fn payload(&self) -> &CachedPayload {
+        &self.payload
+    }
+
+    #[must_use]
+    pub fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    #[must_use]
+    pub(crate) fn to_article_entry(&self) -> super::article::ArticleEntry {
+        super::article::ArticleEntry::from_parts(
+            StatusCode::new(self.status_code.as_u16()),
+            self.payload.clone(),
+            self.availability,
+            self.tier,
+            self.timestamp,
+        )
     }
 
     /// Get the validated status code
@@ -277,36 +445,28 @@ impl HybridArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_complete_article(&self) -> bool {
-        super::entry_helpers::is_complete_article(&self.buffer, self.status_code.as_u16())
+        matches!(
+            (&self.payload, self.status_code.as_u16()),
+            (CachedPayload::Article { headers, body, .. }, 220)
+                if !headers.is_empty() || !body.is_empty()
+        ) || matches!(
+            (&self.payload, self.status_code.as_u16()),
+            (CachedPayload::Body { body, .. }, 222) if !body.is_empty()
+        )
     }
 
     /// Check if buffer contains a valid NNTP multiline response
     #[inline]
     #[must_use]
     pub fn is_valid_response(&self) -> bool {
-        super::entry_helpers::is_valid_response(&self.buffer)
-    }
-
-    /// Get the appropriate response for a command, if this cache entry can serve it
-    ///
-    /// Returns `Some(response_bytes)` if cache can satisfy the command:
-    /// - ARTICLE (220 cached) → returns full cached response
-    /// - BODY (222 cached or 220 cached) → returns cached response
-    /// - HEAD (221 cached or 220 cached) → returns cached response
-    /// - STAT → synthesizes "223 0 <msg-id>\r\n" (we know article exists)
-    ///
-    /// Returns `None` if cached response can't serve this command type.
-    #[must_use]
-    pub fn response_for_command(
-        &self,
-        cmd_verb: &str,
-        message_id: &crate::types::MessageId<'_>,
-    ) -> Option<Vec<u8>> {
-        super::entry_helpers::response_for_command(
-            &self.buffer,
-            self.status_code.as_u16(),
-            cmd_verb,
-            message_id,
+        matches!(
+            self.payload,
+            CachedPayload::Article { .. }
+                | CachedPayload::Head { .. }
+                | CachedPayload::Body { .. }
+                | CachedPayload::Stat { .. }
+                | CachedPayload::Missing
+                | CachedPayload::AvailabilityOnly
         )
     }
 
@@ -378,6 +538,14 @@ impl HybridArticleEntry {
 mod tests {
     use super::*;
     use crate::types::BackendId;
+
+    fn assert_entry_eq(original: &HybridArticleEntry, decoded: &HybridArticleEntry) {
+        assert_eq!(original.status_code, decoded.status_code);
+        assert_eq!(original.availability, decoded.availability);
+        assert_eq!(original.timestamp, decoded.timestamp);
+        assert_eq!(original.tier, decoded.tier);
+        assert_eq!(original.payload, decoded.payload);
+    }
 
     // =========================================================================
     // CacheableStatusCode enum tests
@@ -482,9 +650,14 @@ mod tests {
     #[test]
     fn test_hybrid_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let mut entry = HybridArticleEntry::new(buffer.clone()).expect("valid status code");
+        let mut entry =
+            HybridArticleEntry::from_response_buffer(buffer.clone()).expect("valid status code");
 
-        assert_eq!(entry.buffer(), buffer.as_slice());
+        let msg_id = crate::types::MessageId::from_borrowed("<test@example.com>").unwrap();
+        assert_eq!(
+            entry.response_for_command("ARTICLE", &msg_id).unwrap(),
+            buffer
+        );
         assert_eq!(entry.status_code().map(|c| c.as_u16()), Some(220));
 
         entry.record_backend_has(BackendId::from_index(0));
@@ -498,7 +671,8 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_availability() {
-        let mut entry = HybridArticleEntry::new(b"220 ok\r\n".to_vec()).expect("valid");
+        let mut entry =
+            HybridArticleEntry::from_response_buffer(b"220 ok\r\n".to_vec()).expect("valid");
 
         for i in 0..8 {
             assert!(entry.should_try_backend(BackendId::from_index(i)));
@@ -521,17 +695,20 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_command_matching() {
-        let article = HybridArticleEntry::new(b"220 0 <id>\r\n".to_vec()).expect("valid");
+        let article =
+            HybridArticleEntry::from_response_buffer(b"220 0 <id>\r\n".to_vec()).expect("valid");
         assert!(article.matches_command_type_verb("ARTICLE"));
         assert!(article.matches_command_type_verb("BODY"));
         assert!(article.matches_command_type_verb("HEAD"));
 
-        let body = HybridArticleEntry::new(b"222 0 <id>\r\n".to_vec()).expect("valid");
+        let body =
+            HybridArticleEntry::from_response_buffer(b"222 0 <id>\r\n".to_vec()).expect("valid");
         assert!(!body.matches_command_type_verb("ARTICLE"));
         assert!(body.matches_command_type_verb("BODY"));
         assert!(!body.matches_command_type_verb("HEAD"));
 
-        let head = HybridArticleEntry::new(b"221 0 <id>\r\n".to_vec()).expect("valid");
+        let head =
+            HybridArticleEntry::from_response_buffer(b"221 0 <id>\r\n".to_vec()).expect("valid");
         assert!(!head.matches_command_type_verb("ARTICLE"));
         assert!(!head.matches_command_type_verb("BODY"));
         assert!(head.matches_command_type_verb("HEAD"));
@@ -539,16 +716,16 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_rejects_invalid() {
-        assert!(HybridArticleEntry::new(b"999 invalid\r\n".to_vec()).is_none());
-        assert!(HybridArticleEntry::new(vec![]).is_none());
-        assert!(HybridArticleEntry::new(b"20".to_vec()).is_none());
-        assert!(HybridArticleEntry::new(b"abc\r\n".to_vec()).is_none());
+        assert!(HybridArticleEntry::from_response_buffer(b"999 invalid\r\n".to_vec()).is_none());
+        assert!(HybridArticleEntry::from_response_buffer(vec![]).is_none());
+        assert!(HybridArticleEntry::from_response_buffer(b"20".to_vec()).is_none());
+        assert!(HybridArticleEntry::from_response_buffer(b"abc\r\n".to_vec()).is_none());
 
-        assert!(HybridArticleEntry::new(b"220 article\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"221 head\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"222 body\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"223 stat\r\n".to_vec()).is_some());
-        assert!(HybridArticleEntry::new(b"430 not found\r\n".to_vec()).is_some());
+        assert!(HybridArticleEntry::from_response_buffer(b"220 article\r\n".to_vec()).is_some());
+        assert!(HybridArticleEntry::from_response_buffer(b"221 head\r\n".to_vec()).is_some());
+        assert!(HybridArticleEntry::from_response_buffer(b"222 body\r\n".to_vec()).is_some());
+        assert!(HybridArticleEntry::from_response_buffer(b"223 stat\r\n".to_vec()).is_some());
+        assert!(HybridArticleEntry::from_response_buffer(b"430 not found\r\n".to_vec()).is_some());
     }
 
     // =========================================================================
@@ -557,11 +734,12 @@ mod tests {
 
     #[test]
     fn test_entry_status_code_returns_protocol_status_code() {
-        let entry = HybridArticleEntry::new(b"220 0 <id>\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(b"220 0 <id>\r\n".to_vec()).unwrap();
         let sc = entry.status_code().unwrap();
         assert_eq!(sc.as_u16(), 220);
 
-        let entry = HybridArticleEntry::new(b"430 not found\r\n".to_vec()).unwrap();
+        let entry =
+            HybridArticleEntry::from_response_buffer(b"430 not found\r\n".to_vec()).unwrap();
         let sc = entry.status_code().unwrap();
         assert_eq!(sc.as_u16(), 430);
     }
@@ -576,7 +754,7 @@ mod tests {
             (b"430 missing\r\n", 430),
         ];
         for (buf, expected) in cases {
-            let entry = HybridArticleEntry::new(buf.to_vec())
+            let entry = HybridArticleEntry::from_response_buffer(buf.to_vec())
                 .unwrap_or_else(|| panic!("should accept code {expected}"));
             assert_eq!(entry.status_code().unwrap().as_u16(), *expected);
         }
@@ -587,7 +765,7 @@ mod tests {
         for code in [200, 201, 211, 411, 480, 500, 502] {
             let buf = format!("{code} response\r\n").into_bytes();
             assert!(
-                HybridArticleEntry::new(buf).is_none(),
+                HybridArticleEntry::from_response_buffer(buf).is_none(),
                 "code {code} should be rejected"
             );
         }
@@ -599,15 +777,16 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_roundtrip_article() {
-        let entry =
-            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
-                .unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         let mut buf = Vec::new();
         entry.encode(&mut buf).unwrap();
         let decoded = HybridArticleEntry::decode(&mut buf.as_slice()).unwrap();
 
         assert_eq!(decoded.status_code().unwrap().as_u16(), 220);
-        assert_eq!(decoded.buffer(), entry.buffer());
+        assert_entry_eq(&entry, &decoded);
     }
 
     #[test]
@@ -620,7 +799,7 @@ mod tests {
             b"430 missing\r\n",
         ];
         for raw in buffers {
-            let entry = HybridArticleEntry::new(raw.to_vec()).unwrap();
+            let entry = HybridArticleEntry::from_response_buffer(raw.to_vec()).unwrap();
             let mut encoded = Vec::new();
             entry.encode(&mut encoded).unwrap();
             let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
@@ -628,7 +807,7 @@ mod tests {
                 decoded.status_code().unwrap().as_u16(),
                 entry.status_code().unwrap().as_u16()
             );
-            assert_eq!(decoded.buffer(), entry.buffer());
+            assert_entry_eq(&entry, &decoded);
         }
     }
 
@@ -648,7 +827,9 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_tier() {
-        let entry = HybridArticleEntry::with_tier(b"220 article\r\n".to_vec(), 3).unwrap();
+        let entry =
+            HybridArticleEntry::from_response_buffer_with_tier(b"220 article\r\n".to_vec(), 3)
+                .unwrap();
         assert_eq!(entry.tier(), 3);
 
         let mut encoded = Vec::new();
@@ -659,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_availability() {
-        let mut entry = HybridArticleEntry::new(b"220 ok\r\n".to_vec()).unwrap();
+        let mut entry = HybridArticleEntry::from_response_buffer(b"220 ok\r\n".to_vec()).unwrap();
         entry.record_backend_has(BackendId::from_index(0));
         entry.record_backend_missing(BackendId::from_index(2));
 
@@ -674,8 +855,8 @@ mod tests {
 
     #[test]
     fn test_code_estimated_size() {
-        let entry = HybridArticleEntry::new(b"220 article\r\n".to_vec()).unwrap();
-        let expected = 2 + 2 + 8 + 1 + 4 + entry.buffer().len();
+        let entry = HybridArticleEntry::from_response_buffer(b"220 article\r\n".to_vec()).unwrap();
+        let expected = 4 + 2 + 2 + 8 + 1 + 1;
         assert_eq!(entry.estimated_size(), expected);
     }
 
@@ -685,41 +866,47 @@ mod tests {
 
     #[test]
     fn test_is_complete_article_220() {
-        let entry =
-            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
-                .unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         assert!(entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_222() {
-        let entry =
-            HybridArticleEntry::new(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         assert!(entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_head() {
-        let entry =
-            HybridArticleEntry::new(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_stat() {
-        let entry = HybridArticleEntry::new(b"223 0 <t@x>\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(b"223 0 <t@x>\r\n".to_vec()).unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_430() {
-        let entry = HybridArticleEntry::new(b"430 not found\r\n".to_vec()).unwrap();
+        let entry =
+            HybridArticleEntry::from_response_buffer(b"430 not found\r\n".to_vec()).unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_too_small_buffer() {
-        let entry = HybridArticleEntry::new(b"220 ok\r\n.\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(b"220 ok\r\n.\r\n".to_vec()).unwrap();
         assert!(!entry.is_complete_article());
     }
 
@@ -729,9 +916,10 @@ mod tests {
 
     #[test]
     fn test_response_for_command_stat_from_220() {
-        let entry =
-            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
-                .unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         let resp = entry
             .response_for_command(
                 "STAT",
@@ -743,8 +931,10 @@ mod tests {
 
     #[test]
     fn test_response_for_command_stat_from_221() {
-        let entry =
-            HybridArticleEntry::new(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         let resp = entry
             .response_for_command(
                 "STAT",
@@ -756,8 +946,10 @@ mod tests {
 
     #[test]
     fn test_response_for_command_stat_from_222() {
-        let entry =
-            HybridArticleEntry::new(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         let resp = entry
             .response_for_command(
                 "STAT",
@@ -769,7 +961,8 @@ mod tests {
 
     #[test]
     fn test_response_for_command_stat_not_from_430() {
-        let entry = HybridArticleEntry::new(b"430 not found\r\n".to_vec()).unwrap();
+        let entry =
+            HybridArticleEntry::from_response_buffer(b"430 not found\r\n".to_vec()).unwrap();
         assert!(
             entry
                 .response_for_command(
@@ -783,7 +976,7 @@ mod tests {
     #[test]
     fn test_response_for_command_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::new(buf.clone()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(buf.clone()).unwrap();
         let resp = entry
             .response_for_command(
                 "ARTICLE",
@@ -796,33 +989,35 @@ mod tests {
     #[test]
     fn test_response_for_command_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::new(buf.clone()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(buf.clone()).unwrap();
         let resp = entry
             .response_for_command(
                 "BODY",
                 &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
             )
             .expect("220 can serve BODY");
-        assert_eq!(resp, buf);
+        assert_eq!(resp, b"222 0 <t@x>\r\nBody\r\n.\r\n");
     }
 
     #[test]
     fn test_response_for_command_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::new(buf.clone()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(buf.clone()).unwrap();
         let resp = entry
             .response_for_command(
                 "HEAD",
                 &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
             )
             .expect("220 can serve HEAD");
-        assert_eq!(resp, buf);
+        assert_eq!(resp, b"221 0 <t@x>\r\nSubject: T\r\n.\r\n");
     }
 
     #[test]
     fn test_response_for_command_body_cannot_serve_article() {
-        let entry =
-            HybridArticleEntry::new(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         assert!(
             entry
                 .response_for_command(
@@ -835,8 +1030,10 @@ mod tests {
 
     #[test]
     fn test_response_for_command_head_cannot_serve_body() {
-        let entry =
-            HybridArticleEntry::new(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         assert!(
             entry
                 .response_for_command(
@@ -849,9 +1046,10 @@ mod tests {
 
     #[test]
     fn test_response_for_command_unknown_verb() {
-        let entry =
-            HybridArticleEntry::new(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec())
-                .unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(
+            b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
         assert!(
             entry
                 .response_for_command(
@@ -885,7 +1083,7 @@ mod tests {
     #[test]
     fn test_matches_command_type_verb_stat_for_all_content_codes() {
         for buf in [&b"220 ok\r\n"[..], b"221 ok\r\n", b"222 ok\r\n"] {
-            let entry = HybridArticleEntry::new(buf.to_vec()).unwrap();
+            let entry = HybridArticleEntry::from_response_buffer(buf.to_vec()).unwrap();
             assert!(
                 entry.matches_command_type_verb("STAT"),
                 "STAT should match for {}xx entry",
@@ -893,16 +1091,18 @@ mod tests {
             );
         }
 
-        let stat_entry = HybridArticleEntry::new(b"223 stat\r\n".to_vec()).unwrap();
+        let stat_entry =
+            HybridArticleEntry::from_response_buffer(b"223 stat\r\n".to_vec()).unwrap();
         assert!(!stat_entry.matches_command_type_verb("STAT"));
 
-        let missing_entry = HybridArticleEntry::new(b"430 missing\r\n".to_vec()).unwrap();
+        let missing_entry =
+            HybridArticleEntry::from_response_buffer(b"430 missing\r\n".to_vec()).unwrap();
         assert!(!missing_entry.matches_command_type_verb("STAT"));
     }
 
     #[test]
     fn test_matches_command_type_verb_430_matches_nothing() {
-        let entry = HybridArticleEntry::new(b"430 missing\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(b"430 missing\r\n".to_vec()).unwrap();
         assert!(!entry.matches_command_type_verb("ARTICLE"));
         assert!(!entry.matches_command_type_verb("HEAD"));
         assert!(!entry.matches_command_type_verb("BODY"));
@@ -911,7 +1111,7 @@ mod tests {
 
     #[test]
     fn test_matches_command_type_verb_223_matches_nothing() {
-        let entry = HybridArticleEntry::new(b"223 stat\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(b"223 stat\r\n".to_vec()).unwrap();
         assert!(!entry.matches_command_type_verb("ARTICLE"));
         assert!(!entry.matches_command_type_verb("HEAD"));
         assert!(!entry.matches_command_type_verb("BODY"));
@@ -920,19 +1120,23 @@ mod tests {
 
     #[test]
     fn test_with_tier_sets_tier() {
-        let entry = HybridArticleEntry::with_tier(b"220 ok\r\n".to_vec(), 5).unwrap();
+        let entry =
+            HybridArticleEntry::from_response_buffer_with_tier(b"220 ok\r\n".to_vec(), 5).unwrap();
         assert_eq!(entry.tier(), 5);
     }
 
     #[test]
     fn test_with_tier_zero_default() {
-        let entry = HybridArticleEntry::new(b"220 ok\r\n".to_vec()).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer(b"220 ok\r\n".to_vec()).unwrap();
         assert_eq!(entry.tier(), 0);
     }
 
     #[test]
     fn test_with_tier_rejects_invalid_code() {
-        assert!(HybridArticleEntry::with_tier(b"999 bad\r\n".to_vec(), 0).is_none());
+        assert!(
+            HybridArticleEntry::from_response_buffer_with_tier(b"999 bad\r\n".to_vec(), 0)
+                .is_none()
+        );
     }
 
     // =========================================================================
@@ -941,7 +1145,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_220() {
-        let original = HybridArticleEntry::new(
+        let original = HybridArticleEntry::from_response_buffer(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n".to_vec(),
         )
         .unwrap();
@@ -952,13 +1156,13 @@ mod tests {
         let mut reader = std::io::Cursor::new(buffer);
         let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
 
-        assert_eq!(original.buffer(), decoded.buffer());
+        assert_entry_eq(&original, &decoded);
         assert_eq!(original.tier(), decoded.tier());
     }
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_221() {
-        let original = HybridArticleEntry::new(
+        let original = HybridArticleEntry::from_response_buffer(
             b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n".to_vec(),
         )
         .unwrap();
@@ -969,13 +1173,15 @@ mod tests {
         let mut reader = std::io::Cursor::new(buffer);
         let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
 
-        assert_eq!(original.buffer(), decoded.buffer());
+        assert_entry_eq(&original, &decoded);
     }
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_222() {
-        let original =
-            HybridArticleEntry::new(b"222 body\r\n\r\nbody content\r\n.\r\n".to_vec()).unwrap();
+        let original = HybridArticleEntry::from_response_buffer(
+            b"222 body\r\n\r\nbody content\r\n.\r\n".to_vec(),
+        )
+        .unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -983,12 +1189,13 @@ mod tests {
         let mut reader = std::io::Cursor::new(buffer);
         let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
 
-        assert_eq!(original.buffer(), decoded.buffer());
+        assert_entry_eq(&original, &decoded);
     }
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_223() {
-        let original = HybridArticleEntry::new(b"223 stat\r\n.\r\n".to_vec()).unwrap();
+        let original =
+            HybridArticleEntry::from_response_buffer(b"223 stat\r\n.\r\n".to_vec()).unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -996,12 +1203,13 @@ mod tests {
         let mut reader = std::io::Cursor::new(buffer);
         let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
 
-        assert_eq!(original.buffer(), decoded.buffer());
+        assert_entry_eq(&original, &decoded);
     }
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_430() {
-        let original = HybridArticleEntry::new(b"430 missing\r\n.\r\n".to_vec()).unwrap();
+        let original =
+            HybridArticleEntry::from_response_buffer(b"430 missing\r\n.\r\n".to_vec()).unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1009,7 +1217,7 @@ mod tests {
         let mut reader = std::io::Cursor::new(buffer);
         let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
 
-        assert_eq!(original.buffer(), decoded.buffer());
+        assert_entry_eq(&original, &decoded);
     }
 
     #[test]
@@ -1023,7 +1231,7 @@ mod tests {
         ];
 
         for code in &codes {
-            let entry = HybridArticleEntry::new(code.to_vec()).unwrap();
+            let entry = HybridArticleEntry::from_response_buffer(code.to_vec()).unwrap();
             let estimated = entry.estimated_size();
 
             let mut buffer = Vec::new();
@@ -1063,7 +1271,7 @@ mod tests {
     #[test]
     fn prop_hybrid_article_preserves_tier() {
         for tier in [0u8, 1, 5, 10, 255] {
-            let entry = HybridArticleEntry::with_tier(
+            let entry = HybridArticleEntry::from_response_buffer_with_tier(
                 b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n".to_vec(),
                 tier,
             )
@@ -1081,7 +1289,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_preserves_availability() {
-        let entry = HybridArticleEntry::new(
+        let entry = HybridArticleEntry::from_response_buffer(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n".to_vec(),
         )
         .unwrap();

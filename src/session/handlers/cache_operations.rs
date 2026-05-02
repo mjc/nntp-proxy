@@ -4,7 +4,7 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
-use crate::command::classifier::is_stat_command;
+use crate::protocol::RequestContext;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes};
@@ -36,7 +36,7 @@ impl ClientSession {
     pub(super) async fn try_serve_from_cache(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        command: &str,
+        request: &RequestContext,
         router: &Arc<BackendSelector>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
@@ -75,15 +75,12 @@ impl ClientSession {
         if !self.cache_articles {
             // Availability-only mode - spawn background precheck to update availability
             // then fall through to use availability info for routing
-            if self.adaptive_precheck {
-                let bytes = command.as_bytes();
-                if is_stat_command(bytes) {
-                    precheck::spawn_background_precheck(
-                        self.precheck_deps(router),
-                        command.to_string(),
-                        msg_id_ref.to_owned(),
-                    );
-                }
+            if self.adaptive_precheck && request.is_stat() {
+                precheck::spawn_background_precheck(
+                    self.precheck_deps(router),
+                    request.clone(),
+                    msg_id_ref.to_owned(),
+                );
             }
             return Ok(CacheLookupResult::PartialHit(availability));
         }
@@ -91,53 +88,39 @@ impl ClientSession {
         // Check if this is a complete article we can serve
         // Stubs from STAT/HEAD precheck or availability tracking should not be served
         // Exception: STAT can be answered from any cache entry (we just need to know it exists)
-        let cmd_verb = command.split_whitespace().next().unwrap_or("");
+        let cmd_verb = request.verb();
 
-        if !cmd_verb.eq_ignore_ascii_case("STAT") && !cached.is_complete_article() {
+        if !cmd_verb.eq_ignore_ascii_case(b"STAT") && !cached.is_complete_article() {
             debug!(
-                "Client {} cache entry for {} is a stub (len={}), fetching full article",
+                "Client {} cache entry for {} is a stub (payload_len={}), fetching full article",
                 self.client_addr,
                 msg_id_ref,
-                cached.buffer().len()
+                cached.payload_len()
             );
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
-        if !cached.matches_command_type_verb(cmd_verb) {
+        if !cached.matches_command_type_verb_bytes(cmd_verb) {
             let status_code = cached.status_code().map_or(0, |c| c.as_u16());
             debug!(
-                "Client {} cached response (code={}) can't serve '{}' command",
-                self.client_addr, status_code, cmd_verb
+                "Client {} cached response (code={}) can't serve command {:?}",
+                self.client_addr,
+                status_code,
+                String::from_utf8_lossy(cmd_verb)
             );
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
-        // STAT: synthesize a small response (no buffer copy needed)
-        // Direct serve: write directly from the Arc-backed buffer (zero-copy)
-        let bytes_written = if cmd_verb.eq_ignore_ascii_case("STAT") {
-            let stat_response = crate::cache::build_stat_response(msg_id_ref.as_str());
-            client_write.write_all(&stat_response).await?;
-            stat_response.len()
-        } else {
-            // Validate before serving
-            if !cached.is_valid_response() {
-                let status_code = cached.status_code().map_or(0, |c| c.as_u16());
-                tracing::warn!(
-                    code = status_code,
-                    len = cached.buffer().len(),
-                    "Cached buffer failed validation, discarding"
-                );
-                return Ok(CacheLookupResult::PartialHit(availability));
-            }
-            let buf = cached.buffer();
-            client_write.write_all(buf).await?;
-            buf.len()
+        let Some(response) = cached.response_for_command_bytes(cmd_verb, msg_id_ref) else {
+            return Ok(CacheLookupResult::PartialHit(availability));
         };
+        let bytes_written = response.len();
+        client_write.write_all(&response).await?;
         *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
 
-        let backend_id = router.route_command(self.client_id, command)?;
+        let backend_id = router.route(self.client_id)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
         Ok(CacheLookupResult::Hit(backend_id))

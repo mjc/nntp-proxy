@@ -10,10 +10,10 @@
 //! `QueueFull` immediately rather than blocking the client session.
 
 use crossbeam::queue::SegQueue;
-use smallvec::SmallVec;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, oneshot};
 
+use crate::protocol::RequestContext;
 use crate::types::BackendId;
 
 /// Response sent back to a client session from the pipeline worker
@@ -59,53 +59,10 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
-/// Stack-backed queued command storage.
-#[derive(Clone, PartialEq, Eq)]
-pub struct QueuedCommand(SmallVec<[u8; 512]>);
-
-impl QueuedCommand {
-    #[must_use]
-    pub fn from_command(command: &str) -> Self {
-        Self(SmallVec::from_slice(command.as_bytes()))
-    }
-
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.0).unwrap_or("")
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl From<&str> for QueuedCommand {
-    fn from(value: &str) -> Self {
-        Self::from_command(value)
-    }
-}
-
-impl From<String> for QueuedCommand {
-    fn from(value: String) -> Self {
-        Self(SmallVec::from_vec(value.into_bytes()))
-    }
-}
-
 /// A request queued for pipeline execution on a backend
-pub struct QueuedRequest {
-    /// The full NNTP command string (including \r\n)
-    pub command: QueuedCommand,
+pub struct QueuedContext {
+    /// Typed request context. Owns verb/args, not redundant full wire bytes.
+    pub context: RequestContext,
     /// Channel to send the response back to the waiting client session
     pub response_tx: oneshot::Sender<PipelineResponse>,
 }
@@ -121,7 +78,7 @@ pub enum QueueError {
 /// Lock-free per-backend request queue with async notification
 #[derive(Debug)]
 pub struct BackendQueue {
-    queue: SegQueue<QueuedRequest>,
+    queue: SegQueue<QueuedContext>,
     notify: Notify,
     depth: AtomicUsize,
     max_depth: usize,
@@ -150,7 +107,7 @@ impl BackendQueue {
     /// to the queue. A RAII guard ensures depth is decremented if the push is
     /// not committed (e.g., on panic). This prevents the invariant violation
     /// where depth > actual queue size.
-    pub fn try_enqueue(&self, request: QueuedRequest) -> Result<(), QueueError> {
+    pub fn try_enqueue(&self, request: QueuedContext) -> Result<(), QueueError> {
         let mut current = self.depth.load(Ordering::Acquire);
         loop {
             if current >= self.max_depth {
@@ -204,8 +161,8 @@ impl BackendQueue {
     pub async fn dequeue_batch(
         &self,
         max_batch: usize,
-        mut batch: Vec<QueuedRequest>,
-    ) -> Vec<QueuedRequest> {
+        mut batch: Vec<QueuedContext>,
+    ) -> Vec<QueuedContext> {
         batch.clear();
 
         // Wait for at least one item
@@ -255,11 +212,13 @@ impl BackendQueue {
     }
 }
 
-// QueuedRequest contains a oneshot::Sender which isn't Debug
-impl std::fmt::Debug for QueuedRequest {
+// QueuedContext contains a oneshot::Sender which isn't Debug
+impl std::fmt::Debug for QueuedContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueuedRequest")
-            .field("command", &self.command.as_str())
+        f.debug_struct("QueuedContext")
+            .field("kind", &self.context.kind())
+            .field("verb", &String::from_utf8_lossy(self.context.verb()))
+            .field("args", &String::from_utf8_lossy(self.context.args()))
             .finish_non_exhaustive()
     }
 }
@@ -273,8 +232,8 @@ mod tests {
         let queue = BackendQueue::new(10);
         let (tx, _rx) = oneshot::channel();
         queue
-            .try_enqueue(QueuedRequest {
-                command: QueuedCommand::from_command("ARTICLE <test@example.com>\r\n"),
+            .try_enqueue(QueuedContext {
+                context: RequestContext::from_request_line("ARTICLE <test@example.com>\r\n"),
                 response_tx: tx,
             })
             .unwrap();
@@ -287,8 +246,8 @@ mod tests {
         for i in 0..2 {
             let (tx, _rx) = oneshot::channel();
             queue
-                .try_enqueue(QueuedRequest {
-                    command: QueuedCommand::from_command(&format!(
+                .try_enqueue(QueuedContext {
+                    context: RequestContext::from_request_line(&format!(
                         "ARTICLE <test{i}@example.com>\r\n"
                     )),
                     response_tx: tx,
@@ -296,8 +255,8 @@ mod tests {
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
-        let result = queue.try_enqueue(QueuedRequest {
-            command: QueuedCommand::from_command("ARTICLE <overflow@example.com>\r\n"),
+        let result = queue.try_enqueue(QueuedContext {
+            context: RequestContext::from_request_line("ARTICLE <overflow@example.com>\r\n"),
             response_tx: tx,
         });
         assert!(result.is_err());
@@ -316,8 +275,8 @@ mod tests {
         for i in 0..5 {
             let (tx, _rx) = oneshot::channel();
             queue
-                .try_enqueue(QueuedRequest {
-                    command: QueuedCommand::from_command(&format!("CMD {i}\r\n")),
+                .try_enqueue(QueuedContext {
+                    context: RequestContext::from_request_line(&format!("CMD {i}\r\n")),
                     response_tx: tx,
                 })
                 .unwrap();
@@ -346,8 +305,8 @@ mod tests {
         // Now enqueue
         let (tx, _rx) = oneshot::channel();
         queue
-            .try_enqueue(QueuedRequest {
-                command: "HELLO\r\n".into(),
+            .try_enqueue(QueuedContext {
+                context: RequestContext::from_request_line("HELLO\r\n"),
                 response_tx: tx,
             })
             .unwrap();
@@ -384,10 +343,10 @@ mod tests {
     }
 
     #[test]
-    fn test_queued_command_roundtrip_from_string() {
-        let command = QueuedCommand::from(String::from("STAT <test@example.com>\r\n"));
-        assert_eq!(command.as_bytes(), b"STAT <test@example.com>\r\n");
-        assert_eq!(command.as_str(), "STAT <test@example.com>\r\n");
-        assert_eq!(command.len(), 25);
+    fn test_queued_context_owns_typed_context() {
+        let context = RequestContext::from_request_line("STAT <test@example.com>\r\n");
+        assert_eq!(context.verb(), b"STAT");
+        assert_eq!(context.args(), b"<test@example.com>");
+        assert_eq!(context.wire_len(), 25);
     }
 }

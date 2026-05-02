@@ -3,11 +3,12 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and streaming multiline responses to clients.
 
+use crate::protocol::RequestContext;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
 use crate::session::retry::retry_once;
 use crate::session::routing::{
-    CacheAction, MetricsAction, determine_cache_action, determine_metrics_action,
+    CacheAction, MetricsAction, determine_cache_action_for_request, determine_metrics_action,
 };
 use crate::session::streaming::StreamingError;
 use crate::session::{ClientSession, backend, streaming};
@@ -43,7 +44,7 @@ pub(super) struct ArticleAttemptState<'a> {
 
 /// Parameters describing the response to stream to the client
 struct ResponseStreamParams<'a> {
-    command: &'a str,
+    request: &'a RequestContext,
     msg_id: Option<&'a crate::types::MessageId<'a>>,
     response_code: &'a crate::protocol::NntpResponse,
     is_multiline: bool,
@@ -67,17 +68,14 @@ impl ClientSession {
     pub(super) async fn try_backend_for_article(
         &self,
         router: &Arc<BackendSelector>,
-        command: &str,
+        request: &RequestContext,
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<BackendAttemptResult, SessionError> {
         // Select least-loaded available backend
-        let backend_id = router.route_command_with_availability(
-            self.client_id,
-            command,
-            Some(state.availability),
-        )?;
+        let backend_id =
+            router.route_with_availability(self.client_id, Some(state.availability))?;
 
         // RAII guard ensures complete_command is called on all exit paths (clone Arc here)
         let guard = CommandGuard::new(router.clone(), backend_id);
@@ -91,7 +89,7 @@ impl ClientSession {
 
         // Retry once on backend error (fresh connection on second attempt)
         let (conn, cmd_response, ttfb, send, recv) = retry_once!(
-            self.execute_backend_attempt(provider, backend_id, command, state.buffer)
+            self.execute_backend_attempt(provider, backend_id, request, state.buffer)
                 .await,
             client = self.client_addr,
             backend = backend_id.as_index()
@@ -99,24 +97,17 @@ impl ClientSession {
         .map_err(SessionError::Backend)?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
-        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(command.len());
+        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request.wire_len());
 
         // Reject invalid responses - never forward garbage to client
         if cmd_response.response == crate::protocol::NntpResponse::Invalid {
-            // Extract command verb for logging (avoid logging credentials in AUTHINFO/etc)
-            let cmd_verb = command
-                .split_whitespace()
-                .next()
-                .unwrap_or("UNKNOWN")
-                .to_uppercase();
-
             // Safely clamp buffer slice to prevent panic on out-of-bounds bytes_read
             let bytes_to_read = cmd_response.bytes_read.min(state.buffer.len());
 
             tracing::warn!(
                 client = %self.client_addr,
                 backend = ?backend_id,
-                command_verb = %cmd_verb,
+                command_verb = %String::from_utf8_lossy(request.verb()),
                 bytes_read = cmd_response.bytes_read,
                 first_bytes_hex = %crate::session::backend::format_hex_preview(
                     &state.buffer[..bytes_to_read], 256
@@ -131,13 +122,13 @@ impl ClientSession {
 
             // Try to salvage connection with DATE health check
             // Spawn in background so client can retry immediately
-            let cmd_for_log = command.trim().to_string();
+            let cmd_for_log = String::from_utf8_lossy(request.verb()).into_owned();
             let provider_for_salvage = provider.clone();
             let conn_for_salvage = conn.release(); // hand off; salvage decides pool fate
             tokio::spawn(async move {
                 tracing::debug!(
                     backend = ?backend_id,
-                    command = %cmd_for_log,
+                    command_verb = %cmd_for_log,
                     "Attempting to salvage connection after Invalid response"
                 );
                 crate::pool::salvage_with_health_check(conn_for_salvage, provider_for_salvage)
@@ -160,7 +151,7 @@ impl ClientSession {
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
-            command = %command.trim(),
+            command_verb = %String::from_utf8_lossy(request.verb()),
             first_chunk_bytes = cmd_response.bytes_read,
             response = ?cmd_response.response,
             is_multiline = cmd_response.is_multiline,
@@ -178,7 +169,7 @@ impl ClientSession {
                 client_write,
                 &stream_ctx,
                 ResponseStreamParams {
-                    command,
+                    request,
                     msg_id,
                     response_code: &cmd_response.response,
                     is_multiline: cmd_response.is_multiline,
@@ -197,7 +188,7 @@ impl ClientSession {
                     warn!(
                         client = %self.client_addr,
                         backend = backend_id.as_index(),
-                        command = %command.trim(),
+                        command_verb = %String::from_utf8_lossy(request.verb()),
                         error = %e,
                         "Streaming error, removing connection from pool"
                     );
@@ -211,7 +202,7 @@ impl ClientSession {
                         warn!(
                             client = %self.client_addr,
                             backend = backend_id.as_index(),
-                            command = %command.trim(),
+                            command_verb = %String::from_utf8_lossy(request.verb()),
                             leftover_bytes = conn.leftover_len(),
                             "Buffered direct-path response ended with trailing backend bytes; retiring connection"
                         );
@@ -235,7 +226,7 @@ impl ClientSession {
             backend_id,
             cmd_response.response,
             cmd_response.is_multiline,
-            command.len() as u64,
+            request.wire_len() as u64,
             bytes_written,
         );
 
@@ -245,7 +236,7 @@ impl ClientSession {
             warn!(
                 client = %self.client_addr,
                 backend = backend_id.as_index(),
-                command = %command.trim(),
+                command_verb = %String::from_utf8_lossy(request.verb()),
                 leftover_bytes = conn.leftover_len(),
                 "Direct per-command response left trailing backend bytes; retiring connection"
             );
@@ -267,11 +258,11 @@ impl ClientSession {
         &self,
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend_id: crate::types::BackendId,
-        command: &str,
+        request: &RequestContext,
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(
         crate::pool::ConnectionGuard,
-        backend::CommandResponse,
+        backend::BackendResponse,
         u64,
         u64,
         u64,
@@ -280,7 +271,7 @@ impl ClientSession {
         let mut guard = crate::pool::ConnectionGuard::new(conn, provider.clone());
 
         let result = self
-            .execute_and_get_first_chunk(&mut guard, backend_id, command, buffer)
+            .execute_and_get_first_chunk(&mut guard, backend_id, request, buffer)
             .await;
 
         match result {
@@ -297,14 +288,14 @@ impl ClientSession {
         &self,
         conn: &mut crate::stream::ConnectionStream,
         backend_id: crate::types::BackendId,
-        command: &str,
+        request: &RequestContext,
         buffer: &mut crate::pool::PooledBuffer,
-    ) -> Result<(backend::CommandResponse, u64, u64, u64)> {
+    ) -> Result<(backend::BackendResponse, u64, u64, u64)> {
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
 
         let (response, ttfb, send, recv) =
-            backend::send_command_timed(conn, command, buffer).await?;
+            backend::send_request_timed(conn, request, buffer).await?;
 
         // Log any validation warnings
         response.log_warnings(&buffer[..response.bytes_read], self.client_addr, backend_id);
@@ -336,8 +327,8 @@ impl ClientSession {
             .map_err(StreamingError::Io)?;
         let code = status_code.as_u16();
 
-        let cache_action = determine_cache_action(
-            params.command,
+        let cache_action = determine_cache_action_for_request(
+            params.request,
             code,
             params.is_multiline,
             self.cache_articles,

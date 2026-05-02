@@ -14,10 +14,44 @@ use std::time::Duration;
 use super::availability::ArticleAvailability;
 use super::ttl;
 
-/// Cache entry for an article
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CachedPayload {
+    Missing,
+    AvailabilityOnly,
+    Article {
+        article_number: Option<u64>,
+        headers: Vec<u8>,
+        body: Vec<u8>,
+    },
+    Head {
+        article_number: Option<u64>,
+        headers: Vec<u8>,
+    },
+    Body {
+        article_number: Option<u64>,
+        body: Vec<u8>,
+    },
+    Stat {
+        article_number: Option<u64>,
+    },
+}
+
+impl CachedPayload {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Missing | Self::AvailabilityOnly | Self::Stat { .. } => 0,
+            Self::Article { headers, body, .. } => headers.len() + body.len(),
+            Self::Head { headers, .. } => headers.len(),
+            Self::Body { body, .. } => body.len(),
+        }
+    }
+}
+
+/// Cache entry for an article.
 ///
-/// Stores complete NNTP response buffer plus backend availability tracking.
-/// The buffer is validated once on insert, then can be served directly without re-parsing.
+/// Stores typed response metadata and semantic payload only. Status lines and
+/// multiline terminators are regenerated when serving cache hits.
 #[derive(Clone, Debug)]
 pub struct ArticleEntry {
     /// Backend availability bitset (2 bytes)
@@ -26,10 +60,8 @@ pub struct ArticleEntry {
     /// `cache.insert()` which replaces the whole entry atomically.
     backend_availability: ArticleAvailability,
 
-    /// Complete response buffer (Arc for cheap cloning)
-    /// Format: `220 <msgid>\r\n<headers>\r\n\r\n<body>\r\n.\r\n`
-    /// Status code is always at bytes [0..3]
-    buffer: Arc<Vec<u8>>,
+    status_code: StatusCode,
+    payload: CachedPayload,
 
     /// Tier of the backend that provided this article
     /// Used for tier-aware TTL: higher tier = longer TTL
@@ -41,55 +73,53 @@ pub struct ArticleEntry {
 }
 
 impl ArticleEntry {
-    /// Create from response buffer
+    /// Ingest a backend response buffer into a typed semantic cache entry.
     ///
-    /// The buffer should be a complete NNTP response (status line + data + terminator).
-    /// No validation is performed here - caller must ensure buffer is valid.
-    ///
-    /// Backend availability starts with assumption all backends have the article.
-    /// Tier defaults to 0, timestamp is set to now.
+    /// This is the boundary for cold/full-wire backend responses. The entry
+    /// stores parsed metadata and payload sections, not the original wire
+    /// response.
     #[must_use]
-    pub fn new(buffer: Vec<u8>) -> Self {
-        Self {
-            backend_availability: ArticleAvailability::new(),
-            buffer: Arc::new(buffer),
-            tier: 0,
-            inserted_at: ttl::now_millis(),
-        }
+    pub fn from_response_buffer(buffer: Vec<u8>) -> Self {
+        Self::from_response_buffer_with_tier(buffer, 0)
     }
 
-    /// Create from response buffer with a specific tier
-    ///
-    /// Used when caching articles from backends with known tier.
     #[must_use]
-    pub fn with_tier(buffer: Vec<u8>, tier: u8) -> Self {
+    pub fn availability_only(status_code: StatusCode, tier: u8) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
-            buffer: Arc::new(buffer),
+            status_code,
+            payload: CachedPayload::AvailabilityOnly,
             tier,
             inserted_at: ttl::now_millis(),
         }
     }
 
-    /// Create from pre-wrapped Arc buffer
-    ///
-    /// Use this when the buffer is already wrapped in Arc to avoid double wrapping.
     #[must_use]
-    pub fn from_arc(buffer: Arc<Vec<u8>>) -> Self {
+    pub(crate) const fn from_parts(
+        status_code: StatusCode,
+        payload: CachedPayload,
+        backend_availability: ArticleAvailability,
+        tier: u8,
+        inserted_at: u64,
+    ) -> Self {
         Self {
-            backend_availability: ArticleAvailability::new(),
-            buffer,
-            tier: 0,
-            inserted_at: ttl::now_millis(),
+            backend_availability,
+            status_code,
+            payload,
+            tier,
+            inserted_at,
         }
     }
 
-    /// Create from pre-wrapped Arc buffer with a specific tier
+    /// Ingest a backend response buffer with a specific provider tier.
     #[must_use]
-    pub fn from_arc_with_tier(buffer: Arc<Vec<u8>>, tier: u8) -> Self {
+    pub fn from_response_buffer_with_tier(buffer: Vec<u8>, tier: u8) -> Self {
+        let status_code = StatusCode::parse(&buffer).unwrap_or_else(|| StatusCode::new(430));
+        let payload = parse_payload(status_code, &buffer);
         Self {
             backend_availability: ArticleAvailability::new(),
-            buffer,
+            status_code,
+            payload,
             tier,
             inserted_at: ttl::now_millis(),
         }
@@ -117,11 +147,10 @@ impl ArticleEntry {
         self.tier = tier;
     }
 
-    /// Get raw buffer for serving to client
     #[inline]
     #[must_use]
-    pub const fn buffer(&self) -> &Arc<Vec<u8>> {
-        &self.buffer
+    pub const fn payload(&self) -> &CachedPayload {
+        &self.payload
     }
 
     /// Get status code from the response buffer
@@ -131,7 +160,7 @@ impl ArticleEntry {
     #[inline]
     #[must_use]
     pub fn status_code(&self) -> Option<StatusCode> {
-        StatusCode::parse(&self.buffer)
+        Some(self.status_code)
     }
 
     /// Check if we should try fetching from this backend
@@ -172,15 +201,6 @@ impl ArticleEntry {
             .collect()
     }
 
-    /// Get response buffer (backward compatibility)
-    ///
-    /// This provides the same interface as the old CachedArticle.response field.
-    #[inline]
-    #[must_use]
-    pub const fn response(&self) -> &Arc<Vec<u8>> {
-        &self.buffer
-    }
-
     /// Check if this cache entry has useful availability information
     ///
     /// Returns true if at least one backend has been tried (marked as missing or has article).
@@ -209,7 +229,14 @@ impl ArticleEntry {
         let Some(code) = self.status_code() else {
             return false;
         };
-        super::entry_helpers::is_complete_article(&self.buffer, code.as_u16())
+        matches!(
+            (&self.payload, code.as_u16()),
+            (CachedPayload::Article { headers, body, .. }, 220)
+                if !headers.is_empty() || !body.is_empty()
+        ) || matches!(
+            (&self.payload, code.as_u16()),
+            (CachedPayload::Body { body, .. }, 222) if !body.is_empty()
+        )
     }
 
     /// Check if buffer contains a valid NNTP multiline response
@@ -221,7 +248,15 @@ impl ArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_valid_response(&self) -> bool {
-        super::entry_helpers::is_valid_response(&self.buffer)
+        matches!(
+            self.payload,
+            CachedPayload::Article { .. }
+                | CachedPayload::Head { .. }
+                | CachedPayload::Body { .. }
+                | CachedPayload::Stat { .. }
+                | CachedPayload::Missing
+                | CachedPayload::AvailabilityOnly
+        )
     }
 
     /// Get the appropriate response for a command, if this cache entry can serve it
@@ -240,8 +275,16 @@ impl ArticleEntry {
         cmd_verb: &str,
         message_id: &crate::types::MessageId<'_>,
     ) -> Option<Vec<u8>> {
-        let code = self.status_code()?.as_u16();
-        super::entry_helpers::response_for_command(&self.buffer, code, cmd_verb, message_id)
+        self.render_response_for_command(cmd_verb, message_id.as_str())
+    }
+
+    #[must_use]
+    pub fn response_for_command_bytes(
+        &self,
+        cmd_verb: &[u8],
+        message_id: &crate::types::MessageId<'_>,
+    ) -> Option<Vec<u8>> {
+        self.render_response_for_command_bytes(cmd_verb, message_id.as_str())
     }
 
     /// Check if this entry can serve a given command type
@@ -254,6 +297,15 @@ impl ArticleEntry {
             return false;
         };
         super::entry_helpers::matches_command_type_verb(code.as_u16(), cmd_verb)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn matches_command_type_verb_bytes(&self, cmd_verb: &[u8]) -> bool {
+        let Some(code) = self.status_code() else {
+            return false;
+        };
+        matches_command_type_verb_bytes(code.as_u16(), cmd_verb)
     }
 
     /// Initialize availability tracker from this cached entry
@@ -272,6 +324,150 @@ impl ArticleEntry {
 
         availability
     }
+
+    #[must_use]
+    pub fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    #[must_use]
+    pub fn render_response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
+        self.render_response_for_command_bytes(cmd_verb.as_bytes(), message_id)
+    }
+
+    #[must_use]
+    pub fn render_response_for_command_bytes(
+        &self,
+        cmd_verb: &[u8],
+        message_id: &str,
+    ) -> Option<Vec<u8>> {
+        let article_number = match &self.payload {
+            CachedPayload::Article { article_number, .. }
+            | CachedPayload::Head { article_number, .. }
+            | CachedPayload::Body { article_number, .. }
+            | CachedPayload::Stat { article_number } => *article_number,
+            CachedPayload::Missing | CachedPayload::AvailabilityOnly => None,
+        };
+        let number = article_number.unwrap_or(0);
+
+        if cmd_verb.eq_ignore_ascii_case(b"STAT")
+            && matches!(
+                self.payload,
+                CachedPayload::Article { .. }
+                    | CachedPayload::Head { .. }
+                    | CachedPayload::Body { .. }
+                    | CachedPayload::Stat { .. }
+            )
+        {
+            Some(status_line(223, number, message_id, 0))
+        } else if cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
+            && let CachedPayload::Article { headers, body, .. } = &self.payload
+        {
+            let mut out = status_line(220, number, message_id, headers.len() + body.len() + 5);
+            out.extend_from_slice(headers);
+            out.extend_from_slice(b"\r\n\r\n");
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\r\n.\r\n");
+            Some(out)
+        } else if cmd_verb.eq_ignore_ascii_case(b"HEAD")
+            && let CachedPayload::Article { headers, .. } | CachedPayload::Head { headers, .. } =
+                &self.payload
+        {
+            let mut out = status_line(221, number, message_id, headers.len() + 5);
+            out.extend_from_slice(headers);
+            out.extend_from_slice(b"\r\n.\r\n");
+            Some(out)
+        } else if cmd_verb.eq_ignore_ascii_case(b"BODY")
+            && let CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. } =
+                &self.payload
+        {
+            let mut out = status_line(222, number, message_id, body.len() + 5);
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\r\n.\r\n");
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+fn matches_command_type_verb_bytes(status_code: u16, cmd_verb: &[u8]) -> bool {
+    match status_code {
+        220 => {
+            cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
+                || cmd_verb.eq_ignore_ascii_case(b"BODY")
+                || cmd_verb.eq_ignore_ascii_case(b"HEAD")
+                || cmd_verb.eq_ignore_ascii_case(b"STAT")
+        }
+        222 => cmd_verb.eq_ignore_ascii_case(b"BODY") || cmd_verb.eq_ignore_ascii_case(b"STAT"),
+        221 => cmd_verb.eq_ignore_ascii_case(b"HEAD") || cmd_verb.eq_ignore_ascii_case(b"STAT"),
+        _ => false,
+    }
+}
+
+fn status_line(code: u16, article_number: u64, message_id: &str, extra: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + message_id.len() + extra);
+    out.extend_from_slice(code.to_string().as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(article_number.to_string().as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(message_id.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPayload {
+    let code = status_code.as_u16();
+    if code == 430 {
+        return CachedPayload::Missing;
+    }
+    let Some(status_end) = memchr::memmem::find(buffer, b"\r\n").map(|pos| pos + 2) else {
+        return CachedPayload::AvailabilityOnly;
+    };
+    let article_number = parse_article_number(&buffer[..status_end]);
+    if matches!(code, 220..=222) && !buffer.ends_with(b"\r\n.\r\n") {
+        return CachedPayload::AvailabilityOnly;
+    }
+    let body_end = buffer
+        .len()
+        .checked_sub(5)
+        .map(|end| end.max(status_end))
+        .filter(|_| buffer.ends_with(b"\r\n.\r\n"))
+        .unwrap_or(buffer.len());
+    let payload = &buffer[status_end..body_end];
+    match code {
+        220 => {
+            if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
+                CachedPayload::Article {
+                    article_number,
+                    headers: payload[..split].to_vec(),
+                    body: payload[split + 4..].to_vec(),
+                }
+            } else {
+                CachedPayload::Article {
+                    article_number,
+                    headers: Vec::new(),
+                    body: payload.to_vec(),
+                }
+            }
+        }
+        221 => CachedPayload::Head {
+            article_number,
+            headers: payload.to_vec(),
+        },
+        222 => CachedPayload::Body {
+            article_number,
+            body: payload.to_vec(),
+        },
+        223 => CachedPayload::Stat { article_number },
+        _ => CachedPayload::AvailabilityOnly,
+    }
+}
+
+fn parse_article_number(status_line: &[u8]) -> Option<u64> {
+    let rest = status_line.get(4..)?;
+    let end = memchr::memchr(b' ', rest).unwrap_or(rest.len());
+    std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
 }
 
 /// Article cache using LRU eviction with TTL
@@ -335,11 +531,9 @@ impl ArticleCache {
                 //   - Allocator overhead: ~16 bytes (malloc metadata, alignment)
                 //
                 // Value: ArticleEntry
-                //   - Struct inline: 16 bytes (ArticleAvailability: 2 + padding: 6 + Arc ptr: 8)
-                //   - Arc<Vec<u8>> control block: 16 bytes
-                //   - Vec<u8> struct: 24 bytes (ptr + len + capacity)
-                //   - Vec data: buffer.len() bytes
-                //   - Allocator overhead: ~32 bytes (two allocations: Arc+Vec, Vec data)
+                //   - Struct inline metadata: availability, status, tier, timestamp, payload tag
+                //   - Semantic payload Vec fields: headers/body allocation metadata and bytes
+                //   - Allocator overhead for present payload sections
                 //
                 // Moka internal per-entry overhead is MUCH larger than the data itself:
                 //   - Key stored twice: Bucket.key AND ValueEntry.info.key_hash.key
@@ -353,15 +547,15 @@ impl ArticleCache {
                 // Our observed ratio: 362MB RSS / 36MB weighted = 10x
                 //
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
-                const ENTRY_STRUCT: usize = 16; // ArticleEntry inline size
-                const ARC_VEC_OVERHEAD: usize = 16 + 24 + 32; // Arc + Vec struct + allocator
+                const ENTRY_STRUCT: usize = 64; // ArticleEntry inline metadata and enum tag
+                const PAYLOAD_OVERHEAD: usize = 2 * (24 + 16); // Up to headers/body Vecs + allocators
                 // Moka internal structures - empirically measured to address memory reporting gap.
                 // See moka issue #473: https://github.com/moka-rs/moka/issues/473
                 // Observed ratio: 362MB RSS / 36MB weighted_size() = 10x
                 const MOKA_OVERHEAD: usize = 2000;
 
                 let key_size = ARC_STR_OVERHEAD + key.len();
-                let buffer_size = ARC_VEC_OVERHEAD + entry.buffer().len();
+                let buffer_size = PAYLOAD_OVERHEAD + entry.payload_len();
                 let base_size = key_size + buffer_size + ENTRY_STRUCT + MOKA_OVERHEAD;
 
                 // Stubs (availability-only entries) have higher relative overhead
@@ -452,16 +646,12 @@ impl ArticleCache {
         let key: Arc<str> = message_id.without_brackets().into();
         let cache_articles = self.cache_articles;
 
-        // Prepare the new buffer outside the closure for stub extraction
         let new_buffer = if cache_articles {
             buffer.into_vec()
         } else {
             Self::create_minimal_stub(buffer)
         };
-
-        // Wrap in Arc so we can efficiently share/move into closure without clone.
-        // Arc::try_unwrap will give us the Vec back if we're the only owner.
-        let new_buffer = Arc::new(new_buffer);
+        let new_entry_template = ArticleEntry::from_response_buffer_with_tier(new_buffer, tier);
 
         // Use atomic upsert - this provides key-level locking and eliminates
         // the race condition between get() and insert() calls
@@ -473,21 +663,19 @@ impl ArticleCache {
 
                     // Decide whether to update buffer based on completeness
                     let existing_complete = entry.is_complete_article();
-                    let new_complete = new_buffer.len() >= 30
-                        && crate::session::streaming::tail_buffer::TailBuffer::default()
-                            .detect_terminator(&new_buffer)
-                            .is_found();
+                    let new_complete = new_entry_template.is_complete_article();
 
                     let should_replace = match (existing_complete, new_complete) {
                         (false, true) => true,  // Stub → Complete: Always replace
                         (true, false) => false, // Complete → Stub: Never replace
-                        (true, true) | (false, false) => new_buffer.len() > entry.buffer.len(), // Same type: larger wins
+                        (true, true) | (false, false) => {
+                            new_entry_template.payload_len() > entry.payload_len()
+                        }
                     };
 
                     if should_replace {
-                        // Already wrapped in Arc, just clone the Arc (cheap)
-                        entry.buffer = Arc::clone(&new_buffer);
-                        // Update tier when replacing buffer
+                        entry.status_code = new_entry_template.status_code;
+                        entry.payload = new_entry_template.payload.clone();
                         entry.tier = tier;
                     }
 
@@ -499,12 +687,7 @@ impl ArticleCache {
                     entry
                 } else {
                     // New entry with tier
-                    let mut entry = ArticleEntry {
-                        backend_availability: ArticleAvailability::new(),
-                        buffer: Arc::clone(&new_buffer),
-                        tier,
-                        inserted_at: ttl::now_millis(),
-                    };
+                    let mut entry = new_entry_template.clone();
                     entry.record_backend_has(backend_id);
                     entry
                 };
@@ -570,7 +753,7 @@ impl ArticleCache {
                     entry
                 } else {
                     // First 430 for this article - create cache entry with minimal stub
-                    let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
+                    let mut entry = ArticleEntry::from_response_buffer(b"430\r\n".to_vec());
                     entry.record_backend_missing(backend_id);
                     entry
                 };
@@ -632,7 +815,7 @@ impl ArticleCache {
                         Op::Nop
                     } else {
                         // All checked backends returned 430 - create stub to track this
-                        let mut entry = ArticleEntry::new(b"430\r\n".to_vec());
+                        let mut entry = ArticleEntry::from_response_buffer(b"430\r\n".to_vec());
                         entry.backend_availability = availability;
                         Op::Put(entry)
                     }
@@ -727,16 +910,21 @@ mod tests {
 
     fn create_test_article(msgid: &str) -> ArticleEntry {
         let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
-        ArticleEntry::new(buffer)
+        ArticleEntry::from_response_buffer(buffer)
+    }
+
+    fn rendered(entry: &ArticleEntry, verb: &str, msgid: &str) -> Vec<u8> {
+        let msgid = MessageId::from_borrowed(msgid).unwrap();
+        entry.response_for_command(verb, &msgid).unwrap()
     }
 
     #[test]
     fn test_article_entry_basic() {
-        let buffer = b"220 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
-        let entry = ArticleEntry::new(buffer.clone());
+        let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+        let entry = ArticleEntry::from_response_buffer(buffer.clone());
 
         assert_eq!(entry.status_code(), Some(StatusCode::new(220)));
-        assert_eq!(entry.buffer().as_ref(), &buffer);
+        assert_eq!(rendered(&entry, "ARTICLE", "<test@example.com>"), buffer);
 
         // Default: should try all backends
         assert!(entry.should_try_backend(BackendId::from_index(0)));
@@ -746,28 +934,29 @@ mod tests {
     #[test]
     fn test_is_complete_article() {
         // Stubs should NOT be complete articles
-        let stub_430 = ArticleEntry::new(b"430\r\n".to_vec());
+        let stub_430 = ArticleEntry::from_response_buffer(b"430\r\n".to_vec());
         assert!(!stub_430.is_complete_article());
 
-        let stub_220 = ArticleEntry::new(b"220\r\n".to_vec());
+        let stub_220 = ArticleEntry::from_response_buffer(b"220\r\n".to_vec());
         assert!(!stub_220.is_complete_article());
 
-        let stub_223 = ArticleEntry::new(b"223\r\n".to_vec());
+        let stub_223 = ArticleEntry::from_response_buffer(b"223\r\n".to_vec());
         assert!(!stub_223.is_complete_article());
 
         // Full article SHOULD be complete
-        let full = ArticleEntry::new(
+        let full = ArticleEntry::from_response_buffer(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
         );
         assert!(full.is_complete_article());
 
         // Wrong status code (not 220) should NOT be complete article
-        let head_response =
-            ArticleEntry::new(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec());
+        let head_response = ArticleEntry::from_response_buffer(
+            b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec(),
+        );
         assert!(!head_response.is_complete_article());
 
         // Missing terminator should NOT be complete
-        let no_terminator = ArticleEntry::new(
+        let no_terminator = ArticleEntry::from_response_buffer(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec(),
         );
         assert!(!no_terminator.is_complete_article());
@@ -830,8 +1019,8 @@ mod tests {
             "Arc<str> cache should support Borrow<str> lookups"
         );
         assert_eq!(
-            retrieved.unwrap().buffer().as_ref(),
-            article.buffer().as_ref(),
+            rendered(&retrieved.unwrap(), "ARTICLE", "<test123@example.com>"),
+            rendered(&article, "ARTICLE", "<test123@example.com>"),
             "Retrieved article should match inserted article"
         );
     }
@@ -859,7 +1048,10 @@ mod tests {
         cache.insert(msgid.clone(), article.clone()).await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
-        assert_eq!(retrieved.buffer().as_ref(), article.buffer().as_ref());
+        assert_eq!(
+            rendered(&retrieved, "ARTICLE", "<article@example.com>"),
+            rendered(&article, "ARTICLE", "<article@example.com>")
+        );
     }
 
     #[tokio::test]
@@ -867,14 +1059,17 @@ mod tests {
         let cache = ArticleCache::new(100, Duration::from_secs(300), true);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let buffer = b"220 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
+        let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
         cache
             .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0), 0)
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
-        assert_eq!(retrieved.buffer().as_ref(), &buffer);
+        assert_eq!(
+            rendered(&retrieved, "ARTICLE", "<test@example.com>"),
+            buffer
+        );
         // Default: should try all backends
         assert!(retrieved.should_try_backend(BackendId::from_index(0)));
         assert!(retrieved.should_try_backend(BackendId::from_index(1)));
@@ -885,7 +1080,7 @@ mod tests {
         let cache = ArticleCache::new(100, Duration::from_secs(300), true);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let buffer = b"220 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
+        let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
         // Insert with backend 0
         cache
@@ -964,12 +1159,7 @@ mod tests {
             "Backend 1 should still be available"
         );
 
-        // Verify the cached response is a 430 stub
-        assert_eq!(
-            entry.buffer().as_ref(),
-            b"430\r\n",
-            "Cached buffer should be a 430 stub"
-        );
+        assert!(matches!(entry.payload(), CachedPayload::Missing));
 
         // Record backend 1 also returned 430
         cache
@@ -1046,7 +1236,7 @@ mod tests {
         cache_stub.sync().await;
 
         let retrieved = cache_stub.get(&msgid).await.unwrap();
-        let stub_size = retrieved.buffer().len();
+        let stub_size = retrieved.payload_len();
 
         // Stub should be much smaller than full article (just "220\r\n")
         assert!(stub_size < 10, "Stub size {stub_size} should be < 10 bytes");
@@ -1060,7 +1250,7 @@ mod tests {
 
         let msgid2 = MessageId::from_borrowed("<test2@example.com>").unwrap();
         let buffer2 = b"220 0 <test2@example.com>\r\nSubject: Test2\r\n\r\nBody2\r\n.\r\n".to_vec();
-        let original_size = buffer2.len();
+        let original_payload_size = b"Subject: Test2".len() + b"Body2".len();
 
         cache_full
             .upsert(msgid2.clone(), buffer2, BackendId::from_index(0), 0)
@@ -1069,8 +1259,7 @@ mod tests {
 
         let retrieved2 = cache_full.get(&msgid2).await.unwrap();
 
-        // Should store full article
-        assert_eq!(retrieved2.buffer().len(), original_size);
+        assert_eq!(retrieved2.payload_len(), original_payload_size);
     }
 
     #[tokio::test]
@@ -1102,8 +1291,10 @@ mod tests {
         let article = create_test_article("<test@example.com>");
 
         let cloned = article.clone();
-        assert_eq!(article.buffer().as_ref(), cloned.buffer().as_ref());
-        assert!(Arc::ptr_eq(article.buffer(), cloned.buffer()));
+        assert_eq!(
+            rendered(&article, "ARTICLE", "<test@example.com>"),
+            rendered(&cloned, "ARTICLE", "<test@example.com>")
+        );
     }
 
     #[tokio::test]
@@ -1133,7 +1324,7 @@ mod tests {
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             std::str::from_utf8(&body).unwrap()
         );
-        let article = ArticleEntry::new(response.as_bytes().to_vec());
+        let article = ArticleEntry::from_response_buffer(response.as_bytes().to_vec());
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid.clone(), article).await;
@@ -1153,7 +1344,7 @@ mod tests {
                 msgid.as_str(),
                 std::str::from_utf8(&body).unwrap()
             );
-            let article = ArticleEntry::new(response.as_bytes().to_vec());
+            let article = ArticleEntry::from_response_buffer(response.as_bytes().to_vec());
             cache.insert(msgid, article).await;
             cache.sync().await;
         }
@@ -1178,7 +1369,7 @@ mod tests {
 
         // Create small stub (53 bytes)
         let stub = b"223 0 <test@example.com>\r\n".to_vec();
-        let article = ArticleEntry::new(stub);
+        let article = ArticleEntry::from_response_buffer(stub);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid, article).await;
@@ -1194,7 +1385,7 @@ mod tests {
             let msgid_str = format!("<stub{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let stub = format!("223 0 {}\r\n", msgid.as_str());
-            let article = ArticleEntry::new(stub.as_bytes().to_vec());
+            let article = ArticleEntry::from_response_buffer(stub.as_bytes().to_vec());
             cache.insert(msgid, article).await;
         }
 

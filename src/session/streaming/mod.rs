@@ -295,7 +295,7 @@ fn validate_response_prefix(
         );
         StreamingError::Io(anyhow::anyhow!("Invalid status code in response"))
     })?;
-    Ok((status_code, validated.is_multiline))
+    Ok((status_code, validated.response.is_multiline()))
 }
 
 async fn fill_multiline_response(
@@ -354,10 +354,9 @@ async fn fill_multiline_response(
     }
 }
 
-/// Read a complete NNTP response from a connection into a reusable accumulator.
-///
-/// This is the shared non-streaming response reader used by the pipeline worker.
-pub(crate) async fn read_full_response(
+/// Read a complete NNTP response using request-aware framing.
+pub(crate) async fn read_full_response_for_request(
+    request: &crate::protocol::RequestContext,
     io_buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
     result_buf: &mut crate::pool::ChunkedResponse,
@@ -393,9 +392,9 @@ pub(crate) async fn read_full_response(
 
     let initial_len = io_buffer.initialized();
     let response = &io_buffer[..initial_len];
-    let (status_code, is_multiline) = validate_response_prefix(response, source)?;
+    let (status_code, _) = validate_response_prefix(response, source)?;
 
-    if !is_multiline {
+    if request.response_shape(status_code) == crate::protocol::ResponseShape::SingleLine {
         result_buf.extend_from_slice(pool, response);
         if let Some(pos) = memchr::memchr(b'\n', response) {
             let end = pos + 1;

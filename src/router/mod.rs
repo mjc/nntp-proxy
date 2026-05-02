@@ -30,7 +30,7 @@
 //!
 //! // Route a command
 //! let client_id = ClientId::new();
-//! let backend_id = selector.route_command(client_id, "LIST").unwrap();
+//! let backend_id = selector.route(client_id).unwrap();
 //!
 //! // After command completes
 //! selector.complete_command(backend_id);
@@ -230,7 +230,7 @@ impl Drop for CommandGuard {
 /// );
 ///
 /// // Route commands
-/// let backend = selector.route_command(ClientId::new(), "LIST")?;
+/// let backend = selector.route(ClientId::new())?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 #[derive(Debug)]
@@ -476,17 +476,15 @@ impl BackendSelector {
         }
     }
 
-    /// Select a backend for the given command using round-robin
-    /// Returns the backend ID to use for this command
-    pub fn route_command(&self, client_id: ClientId, command: &str) -> Result<BackendId> {
-        self.route_command_with_availability(client_id, command, None)
+    /// Select a backend for a client request.
+    pub fn route(&self, client_id: ClientId) -> Result<BackendId> {
+        self.route_with_availability(client_id, None)
     }
 
-    /// Select a backend for the given command, optionally filtering by availability
-    pub fn route_command_with_availability(
+    /// Select a backend for a client request, optionally filtering by availability.
+    pub fn route_with_availability(
         &self,
         _client_id: ClientId,
-        _command: &str,
         availability: Option<&crate::cache::ArticleAvailability>,
     ) -> Result<BackendId> {
         let backend = self.select_backend(availability).ok_or_else(|| {
@@ -515,7 +513,7 @@ impl BackendSelector {
     }
 
     /// Manually increment pending count for a specific backend
-    /// Used when directly selecting a backend instead of using `route_command`
+    /// Used when directly selecting a backend instead of using `route`.
     pub fn mark_backend_pending(&self, backend_id: BackendId) {
         if let Some(backend) = self.find_backend(backend_id) {
             backend.pending_count.increment();
@@ -692,7 +690,7 @@ mod tests {
     fn command_guard_decrements_on_drop() {
         let (router, backend_id) = make_router_with_backend();
 
-        // Simulate route_command incrementing the pending count
+        // Simulate route incrementing the pending count.
         router.mark_backend_pending(backend_id);
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
 

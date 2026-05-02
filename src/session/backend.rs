@@ -11,9 +11,9 @@
 //! # Usage
 //!
 //! ```ignore
-//! use crate::session::backend::{send_command, CommandResponse};
+//! use crate::session::backend::{send_request, BackendResponse};
 //!
-//! let response = send_command(&mut conn, command, &mut buffer).await?;
+//! let response = send_request(&mut conn, &request, &mut buffer).await?;
 //! if response.is_430() {
 //!     // Article not found
 //! }
@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
-use crate::protocol::NntpResponse;
+use crate::protocol::{NntpResponse, RequestContext};
 
 // ─── Response validation ────────────────────────────────────────────────────
 
@@ -41,9 +41,8 @@ pub enum ResponseWarning {
 
 /// Validated backend response (pure data)
 #[derive(Debug)]
-pub struct ValidatedResponse {
+pub struct ParsedBackendResponse {
     pub response: NntpResponse,
-    pub is_multiline: bool,
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
@@ -60,13 +59,13 @@ pub struct ValidatedResponse {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// `ValidatedResponse` with parsed response and any warnings
+/// `ParsedBackendResponse` with parsed response and any warnings
 #[must_use]
 pub fn validate_backend_response(
     chunk: &[u8],
     bytes_read: usize,
     min_length: usize,
-) -> ValidatedResponse {
+) -> ParsedBackendResponse {
     let mut warnings = SmallVec::new();
 
     // Check minimum length
@@ -79,8 +78,6 @@ pub fn validate_backend_response(
 
     // Parse response code
     let response = NntpResponse::parse(&chunk[..bytes_read]);
-    let is_multiline = response.is_multiline();
-
     // Check for invalid response
     if response == NntpResponse::Invalid {
         warnings.push(ResponseWarning::InvalidResponse);
@@ -92,11 +89,7 @@ pub fn validate_backend_response(
         }
     }
 
-    ValidatedResponse {
-        response,
-        is_multiline,
-        warnings,
-    }
+    ParsedBackendResponse { response, warnings }
 }
 
 /// Return the byte offset immediately after the response status line.
@@ -155,7 +148,7 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 /// Result of sending a command to a backend
 #[derive(Debug)]
-pub struct CommandResponse {
+pub struct BackendResponse {
     /// Number of bytes read into buffer
     pub bytes_read: usize,
     /// Parsed NNTP response
@@ -166,7 +159,7 @@ pub struct CommandResponse {
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-impl CommandResponse {
+impl BackendResponse {
     /// Get status code if valid
     #[inline]
     #[must_use]
@@ -224,84 +217,75 @@ impl CommandResponse {
     }
 }
 
-/// Send command to backend and read first response chunk
-///
-/// This is the core NNTP client operation: send a command, get a response.
-/// For multiline responses, only the first chunk is read - caller must
-/// stream the rest.
-///
-/// # Arguments
-/// * `conn` - Backend connection (anything implementing `AsyncRead` + `AsyncWrite`)
-/// * `command` - NNTP command to send (should include \r\n)
-/// * `buffer` - Buffer to read response into
-///
-/// # Returns
-/// `CommandResponse` with parsed response and buffer position
-///
-/// # Errors
-/// Returns error if write fails, read fails, or connection closes unexpectedly
-pub async fn send_command<C>(
+/// Write a typed request to a backend without building a temporary command buffer.
+pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> Result<()>
+where
+    C: AsyncWriteExt + Unpin,
+{
+    conn.write_all(request.verb()).await?;
+    if !request.args().is_empty() {
+        conn.write_all(b" ").await?;
+        conn.write_all(request.args()).await?;
+    }
+    conn.write_all(b"\r\n").await?;
+    Ok(())
+}
+
+/// Send a typed request and read the first response chunk.
+pub async fn send_request<C>(
     conn: &mut C,
-    command: &str,
+    request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<CommandResponse>
+) -> Result<BackendResponse>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // Delegate to timed version, discard timing
-    let (response, _, _, _) = send_command_timed(conn, command, buffer).await?;
+    let (response, _, _, _) = send_request_timed(conn, request, buffer).await?;
     Ok(response)
 }
 
-/// Send command with timing measurements
-///
-/// Like `send_command` but also returns timing information for metrics.
-///
-/// # Returns
-/// Tuple of (`CommandResponse`, `ttfb_micros`, `send_micros`, `recv_micros`)
-pub async fn send_command_timed<C>(
+/// Send a typed request with timing measurements.
+pub async fn send_request_timed<C>(
     conn: &mut C,
-    command: &str,
+    request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<(CommandResponse, u64, u64, u64)>
+) -> Result<(BackendResponse, u64, u64, u64)>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    use crate::protocol::ResponseShape;
     use std::time::Instant;
 
     let start = Instant::now();
 
-    // Send command
     let send_start = Instant::now();
-    conn.write_all(command.as_bytes()).await?;
+    write_request(conn, request).await?;
     let send_elapsed = send_start.elapsed();
 
-    // Read first chunk
     let recv_start = Instant::now();
     let n = buffer.read_from(conn).await?;
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    // A 3-byte status code is enough to classify the response type, but it is
-    // not a complete single-line response. If TCP splits "111 ...\r\n" after
-    // the digits, returning the connection before reading CRLF leaves stale
-    // bytes for the next borrower.
     read_until_status_line(conn, buffer).await?;
     let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
     let total = buffer.initialized();
     let recv_elapsed = recv_start.elapsed();
 
-    // Validate response
     let validated = validate_backend_response(&buffer[..total], total, min_len);
+    let is_multiline = validated
+        .response
+        .status_code()
+        .is_some_and(|status| matches!(request.response_shape(status), ResponseShape::Multiline));
 
     let elapsed = start.elapsed();
 
     Ok((
-        CommandResponse {
+        BackendResponse {
             bytes_read: total,
             response: validated.response,
-            is_multiline: validated.is_multiline,
+            is_multiline,
             warnings: validated.warnings,
         },
         elapsed.as_micros() as u64,
@@ -370,7 +354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_command_partial_read_accumulates() {
+    async fn test_send_request_partial_read_accumulates() {
         // Simulate a backend that sends "200 OK\r\n" in two chunks:
         // first read returns "20", second returns "0 OK\r\n"
         let mut stream = ChunkedStream::new(vec![b"20".to_vec(), b"0 OK\r\n".to_vec()]);
@@ -378,8 +362,9 @@ mod tests {
         let pool = crate::pool::BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
 
-        let result = send_command(&mut stream, "DATE\r\n", &mut buffer).await;
-        assert!(result.is_ok(), "send_command should handle partial reads");
+        let request = RequestContext::from_verb_args(b"DATE", b"");
+        let result = send_request(&mut stream, &request, &mut buffer).await;
+        assert!(result.is_ok(), "send_request should handle partial reads");
         let resp = result.unwrap();
         assert!(
             matches!(resp.response, NntpResponse::Greeting(_)),
@@ -389,7 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_command_reads_complete_status_line_when_code_arrives_first() {
+    async fn test_send_request_reads_complete_status_line_when_code_arrives_first() {
         // RFC-compliant servers can split a single-line response across TCP reads.
         // Reading only the 3-byte status code would leave the rest of the line
         // in the socket for the next command and desynchronize the connection.
@@ -398,10 +383,11 @@ mod tests {
         let pool = crate::pool::BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
 
-        let result = send_command(&mut stream, "DATE\r\n", &mut buffer).await;
+        let request = RequestContext::from_verb_args(b"DATE", b"");
+        let result = send_request(&mut stream, &request, &mut buffer).await;
         assert!(
             result.is_ok(),
-            "send_command should read through status-line CRLF"
+            "send_request should read through status-line CRLF"
         );
         let resp = result.unwrap();
         assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
@@ -410,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_command_single_byte_reads() {
+    async fn test_send_request_single_byte_reads() {
         // Extreme case: each byte comes separately
         let data = b"211 Group\r\n";
         let chunks: Vec<Vec<u8>> = data.iter().map(|&b| vec![b]).collect();
@@ -419,10 +405,11 @@ mod tests {
         let pool = crate::pool::BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
 
-        let result = send_command(&mut stream, "GROUP alt.test\r\n", &mut buffer).await;
+        let request = RequestContext::from_verb_args(b"GROUP", b"alt.test");
+        let result = send_request(&mut stream, &request, &mut buffer).await;
         assert!(
             result.is_ok(),
-            "send_command should handle single-byte reads"
+            "send_request should handle single-byte reads"
         );
         let resp = result.unwrap();
         assert!(
@@ -437,7 +424,7 @@ mod tests {
     #[test]
     fn test_command_response_is_430() {
         // Create a 430 response
-        let response = CommandResponse {
+        let response = BackendResponse {
             bytes_read: 20,
             response: NntpResponse::parse(b"430 No such article\r\n"),
             is_multiline: false,
@@ -446,7 +433,7 @@ mod tests {
         assert!(response.response.is_430());
 
         // Create a 220 response
-        let response = CommandResponse {
+        let response = BackendResponse {
             bytes_read: 30,
             response: NntpResponse::parse(b"220 0 <msg@example.com>\r\n"),
             is_multiline: true,
@@ -457,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_command_response_status_code() {
-        let response = CommandResponse {
+        let response = BackendResponse {
             bytes_read: 10,
             response: NntpResponse::parse(b"211 Group\r\n"),
             is_multiline: false,
@@ -474,7 +461,7 @@ mod tests {
         let validated = validate_backend_response(data, data.len(), 7);
 
         assert!(matches!(validated.response, NntpResponse::Greeting(_)));
-        assert!(!validated.is_multiline);
+        assert!(!validated.response.is_multiline());
         assert!(validated.warnings.is_empty());
     }
 
@@ -532,7 +519,7 @@ mod tests {
         let data = b"220 0 <article@example.com>\r\n";
         let validated = validate_backend_response(data, data.len(), 7);
 
-        assert!(validated.is_multiline);
+        assert!(validated.response.is_multiline());
         assert!(validated.warnings.is_empty());
     }
 

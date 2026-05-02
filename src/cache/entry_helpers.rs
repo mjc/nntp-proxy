@@ -4,7 +4,9 @@
 //! providing common logic used by both `ArticleEntry` (moka) and
 //! `HybridArticleEntry` (foyer) cache implementations.
 
-use crate::{pool::ChunkedResponse, session::streaming::tail_buffer::TailBuffer};
+use crate::pool::ChunkedResponse;
+#[cfg(test)]
+use crate::session::streaming::tail_buffer::TailBuffer;
 use smallvec::SmallVec;
 
 /// Check if a buffer contains a valid NNTP multiline response
@@ -14,6 +16,7 @@ use smallvec::SmallVec;
 /// 2. Have CRLF somewhere (line terminator)
 /// 3. End with `\r\n.\r\n` for multiline responses (220/221/222)
 #[inline]
+#[cfg(test)]
 pub(super) fn is_valid_response(buffer: &[u8]) -> bool {
     // Must have at least "NNN \r\n.\r\n" = 9 bytes
     if buffer.len() < 9 {
@@ -42,6 +45,7 @@ pub(super) fn is_valid_response(buffer: &[u8]) -> bool {
 ///
 /// A complete response ends with `\r\n.\r\n` and is at least 30 bytes.
 #[inline]
+#[cfg(test)]
 pub(super) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
     if status_code != 220 && status_code != 222 {
         return false;
@@ -59,6 +63,7 @@ pub(super) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
 /// - STAT -> synthesizes "223 0 <msg-id>\r\n" (we know article exists)
 ///
 /// Returns `None` if cached response can't serve this command type.
+#[cfg(test)]
 pub(super) fn response_for_command(
     buffer: &[u8],
     status_code: u16,
@@ -100,6 +105,7 @@ pub(super) fn response_for_command(
 
 /// Build a `223 0 <message-id>\r\n` response using stack-backed storage.
 #[must_use]
+#[cfg(test)]
 pub fn build_stat_response(message_id: &str) -> SmallVec<[u8; 128]> {
     let mut out = SmallVec::new();
     out.extend_from_slice(b"223 0 ");

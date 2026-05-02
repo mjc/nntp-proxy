@@ -3,8 +3,8 @@
 //! Pure functions for determining how to route NNTP commands based on
 //! authentication state and routing mode.
 
-use crate::command::{CommandAction, CommandHandler, NntpCommand};
 use crate::config::RoutingMode;
+use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
 
 /// Decision for how to handle a command in per-command routing mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,61 +23,52 @@ pub enum CommandRoutingDecision {
     Reject,
 }
 
-/// Determine how to handle a command based on auth state and routing mode
+/// Determine how to handle a request based on auth state and routing mode
 ///
 /// This is a pure function that can be easily tested without I/O dependencies.
-///
-/// # Arguments
-/// * `command` - The raw NNTP command string
-/// * `is_authenticated` - Whether the client has authenticated
-/// * `auth_enabled` - Whether authentication is required
-/// * `routing_mode` - Current routing mode (`PerCommand`, Stateful, Hybrid)
-///
-/// # Returns
-/// A `CommandRoutingDecision` indicating what action to take
-pub fn decide_command_routing(
-    command: &str,
+#[must_use]
+pub fn decide_request_routing(
+    request: &RequestContext,
     is_authenticated: bool,
     auth_enabled: bool,
     routing_mode: RoutingMode,
 ) -> CommandRoutingDecision {
-    use CommandAction::{ForwardStateless, InterceptAuth, InterceptCapabilities, Reject};
-
-    // Classify the command
-    let action = CommandHandler::classify(command);
-
-    match action {
-        // Auth commands - ALWAYS intercept
-        InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
-
-        // CAPABILITIES - ALWAYS intercept to return proxy-accurate list
-        // Per RFC 4643 §3.1, CAPABILITIES must be accessible before authentication.
-        InterceptCapabilities => CommandRoutingDecision::InterceptCapabilities,
-
-        // Stateless commands
-        ForwardStateless => {
-            if is_authenticated || !auth_enabled {
-                CommandRoutingDecision::Forward
-            } else {
-                CommandRoutingDecision::RequireAuth
+    match request.kind() {
+        RequestKind::AuthInfo => CommandRoutingDecision::InterceptAuth,
+        RequestKind::Capabilities => CommandRoutingDecision::InterceptCapabilities,
+        RequestKind::Quit => CommandRoutingDecision::Forward,
+        _ => match request.route_class() {
+            RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
+                if is_authenticated || !auth_enabled {
+                    CommandRoutingDecision::Forward
+                } else {
+                    CommandRoutingDecision::RequireAuth
+                }
             }
-        }
-
-        // Rejected commands in hybrid mode with stateful command -> switch mode
-        Reject(_)
-            if routing_mode == RoutingMode::Hybrid && NntpCommand::parse(command).is_stateful() =>
-        {
-            CommandRoutingDecision::SwitchToStateful
-        }
-
-        // All other rejected commands
-        Reject(_) => CommandRoutingDecision::Reject,
+            RequestRouteClass::Stateful if routing_mode == RoutingMode::Hybrid => {
+                CommandRoutingDecision::SwitchToStateful
+            }
+            RequestRouteClass::Stateful | RequestRouteClass::Reject => {
+                CommandRoutingDecision::Reject
+            }
+            RequestRouteClass::Local => CommandRoutingDecision::Reject,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decide_command_routing(
+        command: &str,
+        is_authenticated: bool,
+        auth_enabled: bool,
+        routing_mode: RoutingMode,
+    ) -> CommandRoutingDecision {
+        let request = RequestContext::from_request_line(command);
+        decide_request_routing(&request, is_authenticated, auth_enabled, routing_mode)
+    }
 
     #[test]
     fn test_decide_routing_auth_commands_always_intercepted() {
@@ -244,6 +235,19 @@ mod tests {
         assert_eq!(
             decide_command_routing("LIST", true, true, RoutingMode::PerCommand),
             CommandRoutingDecision::Forward
+        );
+    }
+
+    #[test]
+    fn test_decide_request_routing_unknown_extensions_are_stateful() {
+        let request = RequestContext::from_request_line("XFOO arg\r\n");
+        assert_eq!(
+            decide_request_routing(&request, true, false, RoutingMode::Hybrid),
+            CommandRoutingDecision::SwitchToStateful
+        );
+        assert_eq!(
+            decide_request_routing(&request, true, false, RoutingMode::PerCommand),
+            CommandRoutingDecision::Reject
         );
     }
 }

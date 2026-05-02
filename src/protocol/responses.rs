@@ -69,6 +69,9 @@ pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 /// Backend server unavailable response (400)
 pub const BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
 
+/// Command line exceeded the RFC 3977 512-byte limit.
+pub const COMMAND_TOO_LONG: &[u8] = b"501 Command too long\r\n";
+
 /// No such article response (430)
 pub const NO_SUCH_ARTICLE: &[u8] = b"430 No such article\r\n";
 

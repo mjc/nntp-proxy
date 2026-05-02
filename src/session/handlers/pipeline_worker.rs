@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-use crate::router::backend_queue::{BackendQueue, PipelineError, PipelineResponse, QueuedRequest};
+use crate::router::backend_queue::{BackendQueue, PipelineError, PipelineResponse, QueuedContext};
 #[cfg(test)]
 use crate::session::backend::validate_backend_response;
 use crate::types::BackendId;
@@ -120,16 +120,16 @@ pub async fn backend_pipeline_worker(
 async fn execute_pipeline_batch(
     backend_id: BackendId,
     conn: &mut crate::stream::ConnectionStream,
-    mut batch: Vec<QueuedRequest>,
+    mut batch: Vec<QueuedContext>,
     metrics: &MetricsCollector,
     buffer_pool: &BufferPool,
     result_buf: &mut crate::pool::ChunkedResponse,
-) -> (bool, Vec<QueuedRequest>) {
+) -> (bool, Vec<QueuedContext>) {
     let batch_len = batch.len();
 
     // Phase 1: Write all commands
     for (i, req) in batch.iter().enumerate() {
-        if let Err(e) = conn.write_all(req.command.as_bytes()).await {
+        if let Err(e) = crate::session::backend::write_request(conn, &req.context).await {
             warn!(
                 "Pipeline worker backend {:?}: write failed at command {}/{}: {}",
                 backend_id,
@@ -168,7 +168,8 @@ async fn execute_pipeline_batch(
     let mut batch_iter = batch.drain(..).enumerate();
     while let Some((i, req)) = batch_iter.next() {
         // Read the response for this command
-        match crate::session::streaming::read_full_response(
+        match crate::session::streaming::read_full_response_for_request(
+            &req.context,
             &mut buffer,
             conn,
             result_buf,
@@ -183,7 +184,8 @@ async fn execute_pipeline_batch(
                 metrics.record_command(backend_id);
                 let data_len = data.len();
                 metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
-                metrics.record_client_to_backend_bytes_for(backend_id, req.command.len() as u64);
+                metrics
+                    .record_client_to_backend_bytes_for(backend_id, req.context.wire_len() as u64);
 
                 // Send response to client (ignore error if client disconnected)
                 let _ = req.response_tx.send(PipelineResponse::Success {
@@ -197,7 +199,7 @@ async fn execute_pipeline_batch(
                     backend = ?backend_id,
                     response_index = i + 1,
                     batch_size = batch_len,
-                    command = %req.command.as_str().trim(),
+                    command_verb = %String::from_utf8_lossy(req.context.verb()),
                     error = %e,
                     leftover_bytes = conn.leftover_len(),
                     "Pipeline worker read failed"
@@ -260,7 +262,9 @@ async fn read_full_response(
     result_buf: &mut crate::pool::ChunkedResponse,
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
-    crate::session::streaming::read_full_response(
+    let request = crate::protocol::RequestContext::from_request_line("ARTICLE <test@example>\r\n");
+    crate::session::streaming::read_full_response_for_request(
+        &request,
         buffer,
         conn,
         result_buf,
@@ -276,7 +280,7 @@ async fn read_full_response(
 /// Takes ownership of the Vec, drains it, and returns the empty Vec
 /// so the caller can reuse the allocation.
 #[allow(clippy::iter_with_drain)] // drain used intentionally; empty Vec returned for allocation reuse
-fn fail_batch(mut batch: Vec<QueuedRequest>, error: PipelineError) -> Vec<QueuedRequest> {
+fn fail_batch(mut batch: Vec<QueuedContext>, error: PipelineError) -> Vec<QueuedContext> {
     for req in batch.drain(..) {
         let _ = req.response_tx.send(PipelineResponse::Error(error));
     }
@@ -287,22 +291,21 @@ fn fail_batch(mut batch: Vec<QueuedRequest>, error: PipelineError) -> Vec<Queued
 mod tests {
     use super::*;
     use crate::pool::BufferPool;
-    use crate::router::backend_queue::QueuedCommand;
     use crate::stream::ConnectionStream;
     use proptest::prelude::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    fn queued_request(
+    fn queued_context(
         command: &str,
     ) -> (
-        QueuedRequest,
+        QueuedContext,
         tokio::sync::oneshot::Receiver<PipelineResponse>,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedRequest {
-                command: QueuedCommand::from_command(command),
+            QueuedContext {
+                context: crate::protocol::RequestContext::from_request_line(command),
                 response_tx: tx,
             },
             rx,
@@ -380,7 +383,7 @@ mod tests {
         for idx in 0..responses.len() {
             let command = format!("STAT <msg{idx}@example.com>\r\n");
             expected_command_bytes += command.len();
-            let (request, rx) = queued_request(&command);
+            let (request, rx) = queued_context(&command);
             batch.push(request);
             rxs.push(rx);
         }
@@ -633,7 +636,7 @@ mod tests {
             validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
         assert!(validated.response.status_code().is_some());
         assert_eq!(validated.response.status_code().unwrap().as_u16(), 430);
-        assert!(!validated.is_multiline);
+        assert!(!validated.response.is_multiline());
     }
 
     #[test]
@@ -643,7 +646,7 @@ mod tests {
             validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
         assert!(validated.response.status_code().is_some());
         assert_eq!(validated.response.status_code().unwrap().as_u16(), 220);
-        assert!(validated.is_multiline);
+        assert!(validated.response.is_multiline());
     }
 
     // ─── execute_pipeline_batch integration tests ────────────────────────────
@@ -669,7 +672,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn: crate::stream::ConnectionStream = ConnectionStream::plain(stream);
 
-        let (request, rx) = queued_request("STAT <test@msg.id>\r\n");
+        let (request, rx) = queued_context("STAT <test@msg.id>\r\n");
         let batch = vec![request];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -715,8 +718,8 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
-        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let (req1, rx1) = queued_context("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
         let batch = vec![req1, req2];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -759,8 +762,8 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
-        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let (req1, rx1) = queued_context("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
         let batch = vec![req1, req2];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -812,8 +815,8 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = ConnectionStream::plain(stream);
 
-        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
-        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let (req1, rx1) = queued_context("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
         let batch = vec![req1, req2];
 
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -843,8 +846,8 @@ mod tests {
 
     #[test]
     fn test_fail_batch_sends_same_error_to_all_requests() {
-        let (req1, rx1) = queued_request("STAT <a@b>\r\n");
-        let (req2, rx2) = queued_request("STAT <c@d>\r\n");
+        let (req1, rx1) = queued_context("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
         let error = PipelineError::ConnectionLost {
             completed: 1,
             batch_len: 2,

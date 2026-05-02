@@ -17,7 +17,7 @@
 //!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
 //!   Used when a feature (e.g. stateful commands in per-command mode) is not supported
 
-use super::classifier::NntpCommand;
+use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
 
 /// Action to take in response to a command
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,76 +49,62 @@ pub enum AuthAction<'a> {
 pub struct CommandHandler;
 
 impl CommandHandler {
-    /// Classify a command and return the action to take
+    /// Classify an already parsed request context and return the action to take.
     #[must_use]
-    pub fn classify(command: &str) -> CommandAction<'_> {
-        match NntpCommand::parse(command) {
-            NntpCommand::AuthUser => {
-                // Extract username from "AUTHINFO USER <username>" — case-insensitive per RFC 3977 §3.1
-                let trimmed = command.trim();
-                const USER_PREFIX: &str = "AUTHINFO USER";
-                let username = if trimmed.len() >= USER_PREFIX.len()
-                    && trimmed[..USER_PREFIX.len()].eq_ignore_ascii_case(USER_PREFIX)
-                {
-                    trimmed[USER_PREFIX.len()..].trim()
+    pub fn classify_request(request: &RequestContext) -> CommandAction<'_> {
+        match request.kind() {
+            RequestKind::AuthInfo => {
+                let args = request.args_str().unwrap_or("").trim();
+                if let Some(username) = strip_authinfo_arg(args, "USER") {
+                    CommandAction::InterceptAuth(AuthAction::RequestPassword(username.trim()))
+                } else if let Some(password) = strip_authinfo_arg(args, "PASS") {
+                    CommandAction::InterceptAuth(AuthAction::ValidateAndRespond {
+                        password: password.trim(),
+                    })
                 } else {
-                    ""
-                };
-                CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
+                    CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
+                }
             }
-            NntpCommand::AuthPass => {
-                // Extract password from "AUTHINFO PASS <password>" — case-insensitive per RFC 3977 §3.1
-                let trimmed = command.trim();
-                const PASS_PREFIX: &str = "AUTHINFO PASS";
-                let password = if trimmed.len() >= PASS_PREFIX.len()
-                    && trimmed[..PASS_PREFIX.len()].eq_ignore_ascii_case(PASS_PREFIX)
-                {
-                    trimmed[PASS_PREFIX.len()..].trim()
-                } else {
-                    ""
-                };
-                CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
-            }
-            NntpCommand::AuthUnknown => {
-                // RFC 4643 §2.3.1: route through InterceptAuth so auth state is checked first.
-                // common::handle_auth_command returns 502 if already authenticated, else 501.
-                CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
-            }
-            NntpCommand::Stateful => {
-                // RFC 3977 §3.2.1: 503 = "Feature not supported" — correct for commands the
-                // proxy structurally cannot support in stateless mode (GROUP, NEXT, etc.)
-                // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
-                CommandAction::Reject("503 Feature not supported in stateless proxy mode\r\n")
-            }
-            NntpCommand::Post => {
-                // RFC 3977 §6.3.1: servers that do not permit posting MUST return 440
-                CommandAction::Reject("440 Posting not permitted\r\n")
-            }
-            NntpCommand::NonRoutable => {
-                // RFC 3977 §3.2.1: 503 = "Feature not supported" — correct for transit-only
-                // commands the proxy cannot route per-command (IHAVE, STARTTLS, etc.)
-                // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1
+            RequestKind::Capabilities => CommandAction::InterceptCapabilities,
+            RequestKind::Post => CommandAction::Reject("440 Posting not permitted\r\n"),
+            RequestKind::Ihave => {
                 CommandAction::Reject("503 Feature not supported in per-command routing mode\r\n")
             }
-            NntpCommand::Capabilities => {
-                // RFC 3977 §5.2 + RFC 4643 §3.1: proxy must return its own capability list,
-                // not forward the backend's. Accessible before and after authentication.
-                CommandAction::InterceptCapabilities
-            }
-            NntpCommand::ArticleByMessageId | NntpCommand::Stateless => {
-                CommandAction::ForwardStateless
-            }
+            _ => match request.route_class() {
+                RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
+                    CommandAction::ForwardStateless
+                }
+                RequestRouteClass::Stateful => {
+                    CommandAction::Reject("503 Feature not supported in stateless proxy mode\r\n")
+                }
+                RequestRouteClass::Reject => CommandAction::Reject(
+                    "503 Feature not supported in per-command routing mode\r\n",
+                ),
+                RequestRouteClass::Local => CommandAction::ForwardStateless,
+            },
         }
     }
+}
+
+fn strip_authinfo_arg<'a>(args: &'a str, subcommand: &str) -> Option<&'a str> {
+    let (head, tail) = args
+        .split_once(char::is_whitespace)
+        .map_or((args, ""), |(head, tail)| (head, tail));
+    head.eq_ignore_ascii_case(subcommand).then_some(tail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn classify(command: &str) -> CommandAction<'static> {
+        let request = Box::leak(Box::new(RequestContext::from_request_line(command)));
+        CommandHandler::classify_request(request)
+    }
+
     #[test]
     fn test_auth_user_command() {
-        let action = CommandHandler::classify("AUTHINFO USER test");
+        let action = classify("AUTHINFO USER test");
         assert!(matches!(
             action,
             CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username == "test"
@@ -127,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_auth_pass_command() {
-        let action = CommandHandler::classify("AUTHINFO PASS secret");
+        let action = classify("AUTHINFO PASS secret");
         assert!(matches!(
             action,
             CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if password == "secret"
@@ -136,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_stateful_command_rejected() {
-        let action = CommandHandler::classify("GROUP alt.test");
+        let action = classify("GROUP alt.test");
         assert!(
             matches!(action, CommandAction::Reject(msg) if msg.contains("stateless")),
             "Expected Reject with 'stateless' in message"
@@ -145,16 +131,16 @@ mod tests {
 
     #[test]
     fn test_article_by_message_id() {
-        let action = CommandHandler::classify("ARTICLE <test@example.com>");
+        let action = classify("ARTICLE <test@example.com>");
         assert_eq!(action, CommandAction::ForwardStateless);
     }
 
     #[test]
     fn test_stateless_command() {
-        let action = CommandHandler::classify("LIST");
+        let action = classify("LIST");
         assert_eq!(action, CommandAction::ForwardStateless);
 
-        let action = CommandHandler::classify("HELP");
+        let action = classify("HELP");
         assert_eq!(action, CommandAction::ForwardStateless);
     }
 
@@ -174,7 +160,7 @@ mod tests {
         ];
 
         for cmd in stateful_commands {
-            match CommandHandler::classify(cmd) {
+            match classify(cmd) {
                 CommandAction::Reject(msg) => {
                     assert!(msg.contains("stateless") || msg.contains("not supported"));
                 }
@@ -195,7 +181,7 @@ mod tests {
 
         for cmd in msgid_commands {
             assert_eq!(
-                CommandHandler::classify(cmd),
+                classify(cmd),
                 CommandAction::ForwardStateless,
                 "Command '{cmd}' should be forwarded as stateless"
             );
@@ -215,7 +201,7 @@ mod tests {
 
         for cmd in stateless_commands {
             assert_eq!(
-                CommandHandler::classify(cmd),
+                classify(cmd),
                 CommandAction::ForwardStateless,
                 "Command '{cmd}' should be stateless"
             );
@@ -227,15 +213,15 @@ mod tests {
         // RFC 3977 §5.2 + RFC 4643 §3.1: CAPABILITIES must be intercepted by the proxy
         // to return an accurate capability list, not forwarded to the backend.
         assert_eq!(
-            CommandHandler::classify("CAPABILITIES"),
+            classify("CAPABILITIES"),
             CommandAction::InterceptCapabilities,
         );
         assert_eq!(
-            CommandHandler::classify("capabilities"),
+            classify("capabilities"),
             CommandAction::InterceptCapabilities,
         );
         assert_eq!(
-            CommandHandler::classify("Capabilities"),
+            classify("Capabilities"),
             CommandAction::InterceptCapabilities,
         );
     }
@@ -248,7 +234,7 @@ mod tests {
     #[test]
     fn test_mixed_case_authinfo_extraction() {
         // "Authinfo User" — Titlecase keyword, Titlecase subcommand
-        let action = CommandHandler::classify("Authinfo User testuser");
+        let action = classify("Authinfo User testuser");
         assert!(
             matches!(
                 action,
@@ -258,7 +244,7 @@ mod tests {
         );
 
         // "AUTHINFO user" — uppercase keyword, lowercase subcommand
-        let action = CommandHandler::classify("AUTHINFO user anotheruser");
+        let action = classify("AUTHINFO user anotheruser");
         assert!(
             matches!(
                 action,
@@ -268,7 +254,7 @@ mod tests {
         );
 
         // "aUtHiNfO pAsS" — fully mixed case
-        let action = CommandHandler::classify("aUtHiNfO pAsS mypassword");
+        let action = classify("aUtHiNfO pAsS mypassword");
         assert!(
             matches!(
                 action,
@@ -278,7 +264,7 @@ mod tests {
         );
 
         // "Authinfo Pass" — Titlecase keyword + Titlecase subcommand
-        let action = CommandHandler::classify("Authinfo Pass s3cr3t");
+        let action = classify("Authinfo Pass s3cr3t");
         assert!(
             matches!(
                 action,
@@ -291,39 +277,31 @@ mod tests {
     #[test]
     fn test_case_insensitive_handling() {
         // Test that command handling is case-insensitive
-        assert_eq!(
-            CommandHandler::classify("list"),
-            CommandAction::ForwardStateless
-        );
-        assert_eq!(
-            CommandHandler::classify("LiSt"),
-            CommandAction::ForwardStateless
-        );
-        assert_eq!(
-            CommandHandler::classify("QUIT"),
-            CommandAction::ForwardStateless
-        );
-        assert_eq!(
-            CommandHandler::classify("quit"),
-            CommandAction::ForwardStateless
-        );
+        assert_eq!(classify("list"), CommandAction::ForwardStateless);
+        assert_eq!(classify("LiSt"), CommandAction::ForwardStateless);
+        assert_eq!(classify("QUIT"), CommandAction::ForwardStateless);
+        assert_eq!(classify("quit"), CommandAction::ForwardStateless);
     }
 
     #[test]
     fn test_empty_command() {
-        // Empty command should be treated as stateless (unknown)
-        let action = CommandHandler::classify("");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        // Empty command is not a valid typed request and falls into stateful fallback.
+        let action = classify("");
+        assert!(matches!(action, CommandAction::Reject(_)));
     }
 
     #[test]
     fn test_whitespace_handling() {
-        // Command with leading/trailing whitespace
-        let action = CommandHandler::classify("  LIST  ");
+        // Leading whitespace is invalid at the typed request boundary.
+        let action = classify("  LIST");
+        assert!(matches!(action, CommandAction::Reject(_)));
+
+        // Command with trailing whitespace
+        let action = classify("LIST  ");
         assert_eq!(action, CommandAction::ForwardStateless);
 
-        // Auth command with extra whitespace
-        let action = CommandHandler::classify("  AUTHINFO USER test  ");
+        // Auth command with trailing whitespace
+        let action = classify("AUTHINFO USER test  ");
         assert!(matches!(
             action,
             CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username == "test"
@@ -332,13 +310,16 @@ mod tests {
 
     #[test]
     fn test_malformed_auth_commands() {
-        // AUTHINFO without subcommand
-        let action = CommandHandler::classify("AUTHINFO");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        // AUTHINFO without subcommand is intercepted as an AUTHINFO syntax error.
+        let action = classify("AUTHINFO");
+        assert!(matches!(
+            action,
+            CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
+        ));
 
         // AUTHINFO with unknown subcommand — intercepted so auth state can be checked first.
         // Returns 501 if not authenticated, 502 if already authenticated (RFC 4643 §2.3.1/§2.2).
-        let action = CommandHandler::classify("AUTHINFO INVALID");
+        let action = classify("AUTHINFO INVALID");
         assert!(
             matches!(
                 action,
@@ -351,14 +332,14 @@ mod tests {
     #[test]
     fn test_auth_commands_without_arguments() {
         // AUTHINFO USER without username (still intercept, empty username)
-        let action = CommandHandler::classify("AUTHINFO USER");
+        let action = classify("AUTHINFO USER");
         assert!(matches!(
             action,
             CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if username.is_empty()
         ));
 
         // AUTHINFO PASS without password (still intercept, empty password)
-        let action = CommandHandler::classify("AUTHINFO PASS");
+        let action = classify("AUTHINFO PASS");
         assert!(matches!(
             action,
             CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if password.is_empty()
@@ -368,11 +349,11 @@ mod tests {
     #[test]
     fn test_article_commands_with_newlines() {
         // Command with CRLF
-        let action = CommandHandler::classify("ARTICLE <msg@test.com>\r\n");
+        let action = classify("ARTICLE <msg@test.com>\r\n");
         assert_eq!(action, CommandAction::ForwardStateless);
 
         // Command with just LF
-        let action = CommandHandler::classify("LIST\n");
+        let action = classify("LIST\n");
         assert_eq!(action, CommandAction::ForwardStateless);
     }
 
@@ -380,12 +361,12 @@ mod tests {
     fn test_very_long_commands() {
         // Very long stateless command
         let long_cmd = format!("LIST {}", "A".repeat(10000));
-        let action = CommandHandler::classify(&long_cmd);
+        let action = classify(&long_cmd);
         assert_eq!(action, CommandAction::ForwardStateless);
 
         // Very long GROUP name (stateful)
         let long_group = format!("GROUP {}", "alt.".repeat(1000));
-        match CommandHandler::classify(&long_group) {
+        match classify(&long_group) {
             CommandAction::Reject(_) => {} // Expected
             other => panic!("Expected Reject for long GROUP, got {other:?}"),
         }
@@ -415,7 +396,7 @@ mod tests {
         // Verify reject messages are informative
         assert!(
             matches!(
-                CommandHandler::classify("GROUP alt.test"),
+                classify("GROUP alt.test"),
                 CommandAction::Reject(msg) if !msg.is_empty() && msg.len() > 10
             ),
             "Expected Reject with meaningful message"
@@ -423,16 +404,18 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_commands_forwarded() {
-        // Unknown commands should be forwarded as stateless
-        // The backend server will handle the error
+    fn test_unknown_commands_rejected() {
+        // Unknown extension commands require stateful fallback, not stateless multiplexing.
         let unknown_commands = ["INVALIDCOMMAND", "XYZABC", "RANDOM DATA", "12345"];
 
         assert!(
-            unknown_commands
-                .iter()
-                .all(|cmd| { CommandHandler::classify(cmd) == CommandAction::ForwardStateless }),
-            "All unknown commands should be forwarded as stateless"
+            unknown_commands.iter().all(|cmd| {
+                matches!(
+                    classify(cmd),
+                    CommandAction::Reject("503 Feature not supported in stateless proxy mode\r\n")
+                )
+            }),
+            "All unknown commands should be rejected from stateless routing"
         );
     }
 
@@ -441,17 +424,17 @@ mod tests {
         // POST must return 440 per RFC 3977 §6.3.1 (posting not permitted)
         assert!(
             matches!(
-                CommandHandler::classify("POST"),
+                classify("POST"),
                 CommandAction::Reject(msg) if msg.starts_with("440")
             ),
             "POST must return 440 (Posting not permitted), got: {:?}",
-            CommandHandler::classify("POST")
+            classify("POST")
         );
 
         // IHAVE should be rejected with 503 (feature not supported)
         assert!(
             matches!(
-                CommandHandler::classify("IHAVE <test@example.com>"),
+                classify("IHAVE <test@example.com>"),
                 CommandAction::Reject(msg) if msg.contains("routing")
             ),
             "Expected Reject for IHAVE"
@@ -459,12 +442,12 @@ mod tests {
 
         // NEWGROUPS/NEWNEWS are stateless (RFC 3977 §7.3-7.4) — forwarded, not rejected
         assert_eq!(
-            CommandHandler::classify("NEWGROUPS 20240101 000000 GMT"),
+            classify("NEWGROUPS 20240101 000000 GMT"),
             CommandAction::ForwardStateless,
             "NEWGROUPS should be forwarded as stateless"
         );
         assert_eq!(
-            CommandHandler::classify("NEWNEWS * 20240101 000000 GMT"),
+            classify("NEWNEWS * 20240101 000000 GMT"),
             CommandAction::ForwardStateless,
             "NEWNEWS should be forwarded as stateless"
         );
@@ -473,16 +456,15 @@ mod tests {
     #[test]
     fn test_reject_message_content() {
         // Verify different reject messages for different command types
-        let CommandAction::Reject(stateful_reject) = CommandHandler::classify("GROUP alt.test")
-        else {
+        let CommandAction::Reject(stateful_reject) = classify("GROUP alt.test") else {
             panic!("Expected Reject")
         };
 
-        let CommandAction::Reject(post_reject) = CommandHandler::classify("POST") else {
+        let CommandAction::Reject(post_reject) = classify("POST") else {
             panic!("Expected Reject")
         };
 
-        let CommandAction::Reject(ihave_reject) = CommandHandler::classify("IHAVE <x@y>") else {
+        let CommandAction::Reject(ihave_reject) = classify("IHAVE <x@y>") else {
             panic!("Expected Reject")
         };
 
@@ -507,7 +489,7 @@ mod tests {
         // RFC 3977 Section 3.1: Response format is "xyz text\r\n"
         // https://www.rfc-editor.org/rfc/rfc3977.html#section-3.1
 
-        let CommandAction::Reject(response) = CommandHandler::classify("GROUP alt.test") else {
+        let CommandAction::Reject(response) = classify("GROUP alt.test") else {
             panic!("Expected Reject")
         };
 
@@ -546,7 +528,7 @@ mod tests {
         ];
 
         for cmd in reject_commands {
-            let CommandAction::Reject(response) = CommandHandler::classify(cmd) else {
+            let CommandAction::Reject(response) = classify(cmd) else {
                 panic!("Expected Reject for command: {cmd}");
             };
 
@@ -577,7 +559,7 @@ mod tests {
         // (e.g. stateful GROUP in per-command mode, or transit-only IHAVE)
 
         // Stateful commands in stateless mode use 503
-        let CommandAction::Reject(response) = CommandHandler::classify("GROUP alt.test") else {
+        let CommandAction::Reject(response) = classify("GROUP alt.test") else {
             panic!("Expected Reject");
         };
         assert!(
@@ -586,7 +568,7 @@ mod tests {
         );
 
         // POST uses 440 per RFC 3977 §6.3.1 (posting not permitted)
-        let CommandAction::Reject(response) = CommandHandler::classify("POST") else {
+        let CommandAction::Reject(response) = classify("POST") else {
             panic!("Expected Reject");
         };
         assert!(
@@ -595,7 +577,7 @@ mod tests {
         );
 
         // IHAVE uses 503 (transit feature not supported in reader proxy)
-        let CommandAction::Reject(response) = CommandHandler::classify("IHAVE <x@y>") else {
+        let CommandAction::Reject(response) = classify("IHAVE <x@y>") else {
             panic!("Expected Reject");
         };
         assert!(
@@ -607,7 +589,7 @@ mod tests {
     #[test]
     fn test_response_messages_are_descriptive() {
         // Responses should explain why the command is rejected
-        let CommandAction::Reject(stateful) = CommandHandler::classify("GROUP alt.test") else {
+        let CommandAction::Reject(stateful) = classify("GROUP alt.test") else {
             panic!("Expected Reject");
         };
         assert!(
@@ -616,7 +598,7 @@ mod tests {
             "Should explain stateless mode restriction: {stateful}"
         );
 
-        let CommandAction::Reject(post) = CommandHandler::classify("POST") else {
+        let CommandAction::Reject(post) = classify("POST") else {
             panic!("Expected Reject");
         };
         assert!(

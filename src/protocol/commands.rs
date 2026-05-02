@@ -3,16 +3,14 @@
 //! This module provides functions for constructing well-formed NNTP commands
 //! according to RFC 3977 and RFC 4643.
 
+use super::RequestContext;
+use crate::types::MessageId;
+
 /// QUIT command (RFC 3977 Section 5.4)
 pub const QUIT: &[u8] = b"QUIT\r\n";
 
 /// COMPRESS DEFLATE command (RFC 8054 §2.2)
 pub const COMPRESS_DEFLATE: &[u8] = b"COMPRESS DEFLATE\r\n";
-
-/// DATE command (RFC 3977 Section 7.1)
-///
-/// The DATE command returns the server's current date and time in UTC.
-pub const DATE: &[u8] = b"DATE\r\n";
 
 /// Construct AUTHINFO USER command (RFC 4643 Section 2.3)
 ///
@@ -32,45 +30,54 @@ pub fn authinfo_pass(password: &str) -> String {
     format!("AUTHINFO PASS {password}\r\n")
 }
 
-/// Construct ARTICLE command with message-ID (RFC 3977 Section 6.2.1)
-///
-/// Returns a properly formatted ARTICLE command for retrieving an article by message-ID.
 #[inline]
 #[must_use]
-pub fn article_by_msgid(msgid: &str) -> String {
-    format!("ARTICLE {msgid}\r\n")
+pub fn article_request(msgid: &MessageId<'_>) -> RequestContext {
+    RequestContext::from_verb_args(b"ARTICLE", msgid.as_str().as_bytes())
 }
 
-/// Construct BODY command with message-ID (RFC 3977 Section 6.2.3)
-///
-/// Returns a properly formatted BODY command for retrieving article body by message-ID.
 #[inline]
 #[must_use]
-pub fn body_by_msgid(msgid: &str) -> String {
-    format!("BODY {msgid}\r\n")
+pub fn body_request(msgid: &MessageId<'_>) -> RequestContext {
+    RequestContext::from_verb_args(b"BODY", msgid.as_str().as_bytes())
 }
 
-/// Construct HEAD command with message-ID (RFC 3977 Section 6.2.2)
-///
-/// Returns a properly formatted HEAD command for retrieving article headers by message-ID.
 #[inline]
 #[must_use]
-pub fn head_by_msgid(msgid: &str) -> String {
-    format!("HEAD {msgid}\r\n")
+pub fn head_request(msgid: &MessageId<'_>) -> RequestContext {
+    RequestContext::from_verb_args(b"HEAD", msgid.as_str().as_bytes())
 }
 
-/// Construct STAT command with message-ID (RFC 3977 Section 6.2.4)
-///
-/// Returns a properly formatted STAT command for checking article existence by message-ID.
 #[inline]
 #[must_use]
-pub fn stat_by_msgid(msgid: &str) -> String {
-    format!("STAT {msgid}\r\n")
+pub fn stat_request(msgid: &MessageId<'_>) -> RequestContext {
+    RequestContext::from_verb_args(b"STAT", msgid.as_str().as_bytes())
+}
+
+#[inline]
+#[must_use]
+pub fn date_request() -> RequestContext {
+    RequestContext::from_verb_args(b"DATE", b"")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msgid(value: &str) -> MessageId<'_> {
+        MessageId::from_borrowed(value).unwrap()
+    }
+
+    fn wire(context: &RequestContext) -> Vec<u8> {
+        let mut out = Vec::with_capacity(context.wire_len());
+        out.extend_from_slice(context.verb());
+        if !context.args().is_empty() {
+            out.push(b' ');
+            out.extend_from_slice(context.args());
+        }
+        out.extend_from_slice(b"\r\n");
+        out
+    }
 
     #[test]
     fn test_quit_command() {
@@ -78,8 +85,8 @@ mod tests {
     }
 
     #[test]
-    fn test_date_command() {
-        assert_eq!(DATE, b"DATE\r\n");
+    fn test_date_request() {
+        assert_eq!(wire(&date_request()), b"DATE\r\n");
     }
 
     #[test]
@@ -130,38 +137,38 @@ mod tests {
     }
 
     #[test]
-    fn test_article_by_msgid() {
+    fn test_article_request() {
         assert_eq!(
-            article_by_msgid("<test@example.com>"),
-            "ARTICLE <test@example.com>\r\n"
+            wire(&article_request(&msgid("<test@example.com>"))),
+            b"ARTICLE <test@example.com>\r\n"
         );
         assert_eq!(
-            article_by_msgid("<msg123@news.server.com>"),
-            "ARTICLE <msg123@news.server.com>\r\n"
-        );
-    }
-
-    #[test]
-    fn test_body_by_msgid() {
-        assert_eq!(
-            body_by_msgid("<test@example.com>"),
-            "BODY <test@example.com>\r\n"
+            wire(&article_request(&msgid("<msg123@news.server.com>"))),
+            b"ARTICLE <msg123@news.server.com>\r\n"
         );
     }
 
     #[test]
-    fn test_head_by_msgid() {
+    fn test_body_request() {
         assert_eq!(
-            head_by_msgid("<test@example.com>"),
-            "HEAD <test@example.com>\r\n"
+            wire(&body_request(&msgid("<test@example.com>"))),
+            b"BODY <test@example.com>\r\n"
         );
     }
 
     #[test]
-    fn test_stat_by_msgid() {
+    fn test_head_request() {
         assert_eq!(
-            stat_by_msgid("<test@example.com>"),
-            "STAT <test@example.com>\r\n"
+            wire(&head_request(&msgid("<test@example.com>"))),
+            b"HEAD <test@example.com>\r\n"
+        );
+    }
+
+    #[test]
+    fn test_stat_request() {
+        assert_eq!(
+            wire(&stat_request(&msgid("<test@example.com>"))),
+            b"STAT <test@example.com>\r\n"
         );
     }
 
@@ -169,9 +176,9 @@ mod tests {
     fn test_commands_end_with_crlf() {
         assert!(authinfo_user("test").ends_with("\r\n"));
         assert!(authinfo_pass("test").ends_with("\r\n"));
-        assert!(article_by_msgid("<test@example.com>").ends_with("\r\n"));
-        assert!(body_by_msgid("<test@example.com>").ends_with("\r\n"));
-        assert!(head_by_msgid("<test@example.com>").ends_with("\r\n"));
-        assert!(stat_by_msgid("<test@example.com>").ends_with("\r\n"));
+        assert!(wire(&article_request(&msgid("<test@example.com>"))).ends_with(b"\r\n"));
+        assert!(wire(&body_request(&msgid("<test@example.com>"))).ends_with(b"\r\n"));
+        assert!(wire(&head_request(&msgid("<test@example.com>"))).ends_with(b"\r\n"));
+        assert!(wire(&stat_request(&msgid("<test@example.com>"))).ends_with(b"\r\n"));
     }
 }

@@ -88,7 +88,7 @@ impl ClientSession {
 
         // Acquire backend connection (returns CommandGuard to track pending_count)
         let (pooled_conn, backend_id, _pending_guard, provider) = self
-            .acquire_stateful_backend(initial_command)
+            .acquire_stateful_backend()
             .await
             .context("Failed to acquire backend for stateful mode")?;
 
@@ -146,14 +146,13 @@ impl ClientSession {
 
     /// Acquire a dedicated backend connection for stateful mode
     ///
-    /// Routes the command to select a backend, then gets a pooled connection.
+    /// Routes the client to a backend, then gets a pooled connection.
     /// Returns the connection, backend ID, and a `CommandGuard` that decrements
-    /// `pending_count` on drop. Creating the guard here (immediately after
-    /// `route_command`) ensures the count is decremented even if
-    /// `get_pooled_connection` fails.
+    /// `pending_count` on drop. Creating the guard here immediately after
+    /// routing ensures the count is decremented even if `get_pooled_connection`
+    /// fails.
     async fn acquire_stateful_backend(
         &self,
-        command: &str,
     ) -> Result<(
         deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         crate::types::BackendId,
@@ -165,7 +164,7 @@ impl ClientSession {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!(error::ROUTER_REQUIRED))?;
 
-        let backend_id = router.route_command(self.client_id, command)?;
+        let backend_id = router.route(self.client_id)?;
 
         // Guard pending_count immediately — if get_pooled_connection fails,
         // the guard drops and decrements automatically

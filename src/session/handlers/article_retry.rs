@@ -3,7 +3,7 @@
 //! Handles routing article commands across backends, using `ArticleAvailability`
 //! to skip backends that have already returned 430 for a given article.
 
-use crate::router::backend_queue::{PipelineResponse, QueuedCommand, QueuedRequest};
+use crate::router::backend_queue::{PipelineResponse, QueuedContext};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::SessionError;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-use crate::command::classifier::{is_head_command, is_large_transfer_command, is_stat_command};
+use crate::protocol::{RequestContext, ResponseShape};
 use crate::session::handlers::pipeline::CommandBatch;
 use crate::session::precheck;
 
@@ -66,7 +66,7 @@ impl ClientSession {
         let mut state = pipeline;
 
         // M1: Load availability for the first command's message-ID
-        let first_msg_id = crate::types::MessageId::extract_from_command_borrowed(batch.command(0));
+        let first_msg_id = batch.context(0).message_id_value();
         let availability = self
             .load_article_availability(first_msg_id.as_ref(), router.backend_count())
             .await;
@@ -75,11 +75,7 @@ impl ClientSession {
         // One pending count for one connection — don't inflate pending by N,
         // as that skews load_ratio and can cause other sessions to over-allocate
         // connections on other backends, hitting provider connection limits.
-        let backend_id = router.route_command_with_availability(
-            self.client_id,
-            batch.command(0),
-            Some(&availability),
-        )?;
+        let backend_id = router.route_with_availability(self.client_id, Some(&availability))?;
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         let Some(provider) = router.backend_provider(backend_id) else {
@@ -96,8 +92,9 @@ impl ClientSession {
 
         // Phase 1: Write all commands, then flush
         for i in 0..batch.len() {
-            let command = batch.command(i);
-            if let Err(e) = conn.write_all(command.as_bytes()).await {
+            if let Err(e) =
+                crate::session::backend::write_request(&mut **conn, batch.context(i)).await
+            {
                 warn!(
                     client = %self.client_addr,
                     backend = ?backend_id,
@@ -108,7 +105,7 @@ impl ClientSession {
                 // Unconditional: write goes to the backend, not the client.
                 // A client disconnect cannot cause a backend write error.
                 // conn drops here → ConnectionGuard::remove_with_cooldown
-                return Err(SessionError::Backend(e.into()));
+                return Err(SessionError::Backend(e));
             }
         }
         if let Err(e) = conn.flush().await {
@@ -201,8 +198,9 @@ impl ClientSession {
         use crate::session::{backend, streaming};
 
         let backend_id = bcc.backend_id;
+        let request = batch.context(idx);
         let command = batch.command(idx);
-        let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
+        let msg_id = request.message_id_value();
         let leftover = &mut bcc.leftover;
         let chunk_data = &mut bcc.chunk_data;
 
@@ -295,7 +293,9 @@ impl ClientSession {
             crate::protocol::MIN_RESPONSE_LENGTH,
         );
         let response_code = validated.response;
-        let is_multiline = validated.is_multiline;
+        let is_multiline = response_code.status_code().is_some_and(|status| {
+            matches!(request.response_shape(status), ResponseShape::Multiline)
+        });
 
         // --- Handle 430 (article not found on this backend) ---
         if response_code.is_430() {
@@ -432,6 +432,7 @@ impl ClientSession {
         &self,
         router: Arc<BackendSelector>,
         command: &str,
+        request: &RequestContext,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
@@ -442,7 +443,7 @@ impl ClientSession {
             command.trim()
         );
         // Extract message-ID early for cache/availability tracking
-        let msg_id = crate::types::MessageId::extract_from_command_borrowed(command);
+        let msg_id = request.message_id_value();
 
         debug!(
             "Client {} msg_id={:?}, cache_articles={}",
@@ -454,7 +455,7 @@ impl ClientSession {
         let cached_availability = match self
             .try_serve_from_cache(
                 msg_id.as_ref(),
-                command,
+                request,
                 &router,
                 client_write,
                 backend_to_client_bytes,
@@ -474,17 +475,17 @@ impl ClientSession {
         if self.adaptive_precheck
             && let Some(ref msg_id_ref) = msg_id
         {
-            // Use optimized command matching from classifier (direct byte comparison)
-            let bytes = command.as_bytes();
-            let is_head = is_head_command(bytes);
-            if is_stat_command(bytes) || is_head {
+            let is_head = request.is_head();
+            if request.is_stat() || is_head {
                 let deps = self.precheck_deps(&router);
                 let bytes_written = if let Some(entry) =
-                    precheck::precheck(&deps, command, msg_id_ref, is_head).await
+                    precheck::precheck(&deps, request, msg_id_ref, is_head).await
                 {
-                    let buf = entry.buffer();
+                    let buf = entry
+                        .response_for_command_bytes(request.verb(), msg_id_ref)
+                        .unwrap_or_else(|| crate::protocol::NO_SUCH_ARTICLE.to_vec());
                     client_write
-                        .write_all(buf)
+                        .write_all(&buf)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     buf.len()
@@ -505,21 +506,18 @@ impl ClientSession {
         // serializes all clients through one connection per backend, killing
         // throughput. These commands fall through to the direct streaming path
         // which gives each client its own pooled connection (~120 MB/s).
-        let cmd_bytes = command.as_bytes();
-        let is_large_transfer = is_large_transfer_command(cmd_bytes);
+        let is_large_transfer = request.is_large_transfer();
 
         // Try pipeline path: if the routed backend has a pipeline queue, enqueue
         // the command and await the response instead of acquiring a direct connection.
         // This allows N client sessions to share M backend connections (N >> M).
-        // NOTE: Pipeline path uses route_command_with_availability to respect 430s
+        // NOTE: Pipeline path uses availability-aware routing to respect 430s.
         if !is_large_transfer {
             // H3: Use pre-loaded availability (no redundant cache lookup)
             // Route with availability awareness (avoids backends that returned 430)
-            if let Ok(backend_id) = router.route_command_with_availability(
-                self.client_id,
-                command,
-                availability.as_ref(),
-            ) && let Some(queue) = router.get_backend_queue(backend_id)
+            if let Ok(backend_id) =
+                router.route_with_availability(self.client_id, availability.as_ref())
+                && let Some(queue) = router.get_backend_queue(backend_id)
             {
                 // Wrap in guard - decrements pending_count on all exit paths
                 let guard = CommandGuard::new(router.clone(), backend_id);
@@ -532,8 +530,8 @@ impl ClientSession {
                 );
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let request = QueuedRequest {
-                    command: QueuedCommand::from_command(command),
+                let request = QueuedContext {
+                    context: request.clone(),
                     response_tx: tx,
                 };
 
@@ -652,7 +650,7 @@ impl ClientSession {
             match self
                 .try_backend_for_article(
                     &router,
-                    command,
+                    request,
                     msg_id.as_ref(),
                     client_write,
                     &mut ArticleAttemptState {

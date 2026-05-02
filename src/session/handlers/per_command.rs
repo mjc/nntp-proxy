@@ -8,8 +8,9 @@
 //! - [`command_execution`]: Single-backend command execution and response streaming
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
+use crate::protocol::RequestContext;
 use crate::session::common;
-use crate::session::routing::{CommandRoutingDecision, decide_command_routing};
+use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
 use crate::session::{ClientSession, connection};
 use anyhow::Result;
 use std::sync::Arc;
@@ -17,7 +18,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::command::classifier::is_large_transfer_command;
 use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 use crate::router::BackendSelector;
@@ -45,6 +45,7 @@ enum SingleCommandResult {
 /// Parameters for executing a command decision
 struct CommandExecutionParams<'a, 'b> {
     command: &'a str,
+    request: &'a RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
     client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
@@ -56,6 +57,7 @@ struct CommandExecutionParams<'a, 'b> {
 /// Parameters for processing a single command (full flow including QUIT handling)
 struct ProcessCommandParams<'a, 'b> {
     command: &'a str,
+    request: &'a RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
     client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
@@ -75,6 +77,7 @@ impl ClientSession {
     ) -> Result<CommandResult> {
         let CommandExecutionParams {
             command,
+            request,
             skip_auth_check,
             router,
             client_write,
@@ -83,8 +86,8 @@ impl ClientSession {
             backend_to_client_bytes,
         } = params;
 
-        let decision = decide_command_routing(
-            command,
+        let decision = decide_request_routing(
+            request,
             skip_auth_check,
             self.auth_handler.is_enabled(),
             self.mode_state.routing_mode(),
@@ -94,7 +97,7 @@ impl ClientSession {
         match decision {
             CommandRoutingDecision::InterceptAuth => {
                 debug!("Client {} decision: InterceptAuth", self.client_addr);
-                let action = CommandHandler::classify(command);
+                let action = CommandHandler::classify_request(request);
                 let CommandAction::InterceptAuth(auth_action) = action else {
                     unreachable!("InterceptAuth decision must come from InterceptAuth action")
                 };
@@ -138,6 +141,7 @@ impl ClientSession {
                 self.route_and_execute_command(
                     router.clone(),
                     command,
+                    request,
                     client_write,
                     &mut c2b_mutable,
                     backend_to_client_bytes,
@@ -173,7 +177,7 @@ impl ClientSession {
 
             CommandRoutingDecision::Reject => {
                 debug!("Client {} decision: Reject", self.client_addr);
-                let action = CommandHandler::classify(command);
+                let action = CommandHandler::classify_request(request);
                 let CommandAction::Reject(response) = action else {
                     unreachable!("Reject decision must come from Reject action")
                 };
@@ -217,6 +221,7 @@ impl ClientSession {
     ) -> Result<SingleCommandResult> {
         let ProcessCommandParams {
             command,
+            request,
             skip_auth_check,
             router,
             client_write,
@@ -242,6 +247,7 @@ impl ClientSession {
         match self
             .execute_command_decision(CommandExecutionParams {
                 command: last_command,
+                request,
                 skip_auth_check,
                 router,
                 client_write,
@@ -338,7 +344,7 @@ impl ClientSession {
                     self.client_addr
                 );
                 client_write
-                    .write_all(b"501 Command too long\r\n")
+                    .write_all(crate::protocol::COMMAND_TOO_LONG)
                     .await
                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                 continue;
@@ -362,9 +368,8 @@ impl ClientSession {
 
                 // Detect if entire batch is large-transfer commands (ARTICLE/BODY by message-ID)
                 // that benefit from TCP pipelining on a single backend connection.
-                let all_large_transfer = batch_size > 1
-                    && (0..batch_size)
-                        .all(|i| is_large_transfer_command(batch.command(i).as_bytes()));
+                let all_large_transfer =
+                    batch_size > 1 && (0..batch_size).all(|i| batch.context(i).is_large_transfer());
 
                 // Try batch pipelining for all-ARTICLE/BODY batches;
                 // fall through to individual processing on failure.
@@ -401,6 +406,7 @@ impl ClientSession {
                     // Sequential processing for mixed, single-command, or failed-batch commands
                     for i in 0..batch_size {
                         let command = batch.command(i);
+                        let request = batch.context(i);
                         debug!(
                             "Client {} received {} bytes: {:?}",
                             self.client_addr,
@@ -414,6 +420,7 @@ impl ClientSession {
                         match self
                             .process_single_command(ProcessCommandParams {
                                 command,
+                                request,
                                 skip_auth_check,
                                 router,
                                 client_write: &mut client_write,
@@ -453,6 +460,7 @@ impl ClientSession {
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
             if let Some(trailing_cmd) = batch.trailing() {
+                let trailing_context = batch.trailing_context();
                 // Reject oversized commands per RFC 3977 (512-byte limit)
                 if batch.is_trailing_oversized() {
                     warn!(
@@ -461,15 +469,16 @@ impl ClientSession {
                         trailing_cmd.len()
                     );
                     client_write
-                        .write_all(b"501 Command too long\r\n")
+                        .write_all(crate::protocol::COMMAND_TOO_LONG)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     continue;
                 }
 
                 debug!(
-                    "Client {} trailing non-pipelineable: {:?}",
+                    "Client {} trailing non-pipelineable {:?}: {:?}",
                     self.client_addr,
+                    trailing_context.map(|ctx| ctx.kind()),
                     trailing_cmd.trim()
                 );
 
@@ -479,6 +488,7 @@ impl ClientSession {
                 match self
                     .process_single_command(ProcessCommandParams {
                         command: trailing_cmd,
+                        request: trailing_context.expect("valid trailing command has context"),
                         skip_auth_check,
                         router,
                         client_write: &mut client_write,

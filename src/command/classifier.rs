@@ -548,7 +548,7 @@ impl NntpCommand {
     /// - 5%: XOVER/OVER → `Stateful`  
     /// - 5%: LIST/DATE/CAPABILITIES → `Stateless`
     /// - 5%: AUTHINFO → `AuthUser`/`AuthPass`
-    /// - <5%: Everything else
+    /// - <5%: Unknown extensions → `Stateful`
     ///
     /// ## Algorithm
     /// 1. **Ultra-fast path**: Check for article-by-message-ID in one pass (70%+ hit rate)
@@ -565,6 +565,10 @@ impl NntpCommand {
     pub fn parse(command: &str) -> Self {
         let trimmed = command.trim();
         let bytes = trimmed.as_bytes();
+
+        if bytes.is_empty() {
+            return Self::Stateless;
+        }
 
         // ═════════════════════════════════════════════════════════════════
         // CRITICAL HOT PATH: Article retrieval by message-ID (70%+ of traffic)
@@ -593,7 +597,7 @@ impl NntpCommand {
             cmd_upper_buf[..cmd_end].make_ascii_uppercase();
             &cmd_upper_buf[..cmd_end]
         } else {
-            &bytes[..cmd_end] // Longer than any valid NNTP keyword; falls through to Stateless
+            &bytes[..cmd_end] // Longer than any valid NNTP keyword; falls through to Stateful
         };
 
         // Article retrieval commands WITHOUT message-ID (by number or current article)
@@ -682,8 +686,9 @@ impl NntpCommand {
             return Self::Stateless;
         }
 
-        // Unknown commands: Treat as stateless and let backend handle
-        Self::Stateless
+        // Unknown extension commands may carry session semantics the proxy does not
+        // understand, so force stateful handling instead of multiplexing them.
+        Self::Stateful
     }
 
     /// Parse AUTHINFO subcommand (USER or PASS)
@@ -788,10 +793,7 @@ mod tests {
         );
         assert_eq!(NntpCommand::parse("QUIT"), NntpCommand::Stateless);
         assert_eq!(NntpCommand::parse("LIST ACTIVE"), NntpCommand::Stateless);
-        assert_eq!(
-            NntpCommand::parse("UNKNOWN COMMAND"),
-            NntpCommand::Stateless
-        );
+        assert_eq!(NntpCommand::parse("UNKNOWN COMMAND"), NntpCommand::Stateful);
     }
 
     #[test]
@@ -900,8 +902,8 @@ mod tests {
             NntpCommand::Stateless
         );
 
-        // Command with tabs
-        assert_eq!(NntpCommand::parse("LIST\tACTIVE"), NntpCommand::Stateless);
+        // Tab is not the RFC command separator; treat it as an unknown extension command.
+        assert_eq!(NntpCommand::parse("LIST\tACTIVE"), NntpCommand::Stateful);
     }
 
     #[test]
@@ -946,12 +948,12 @@ mod tests {
     #[test]
     fn test_boundary_conditions() {
         // Single character command
-        assert_eq!(NntpCommand::parse("X"), NntpCommand::Stateless);
+        assert_eq!(NntpCommand::parse("X"), NntpCommand::Stateful);
 
         // Command that looks like message-ID but isn't
         assert_eq!(
             NntpCommand::parse("NOTARTICLE <test@example.com>"),
-            NntpCommand::Stateless
+            NntpCommand::Stateful
         );
 
         // Message-ID without angle brackets (not valid, treated as number)

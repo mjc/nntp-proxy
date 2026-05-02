@@ -42,8 +42,8 @@ use deadpool::managed::Object;
 
 use crate::pool::deadpool_connection::TcpManager;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
-use crate::protocol::{article_by_msgid, body_by_msgid, head_by_msgid, stat_by_msgid};
-use crate::session::backend::send_command;
+use crate::protocol::{RequestContext, article_request, body_request, head_request, stat_request};
+use crate::session::backend::send_request;
 
 /// Standalone NNTP client for fetching articles
 ///
@@ -80,8 +80,7 @@ impl NntpClient {
         &self,
         message_id: &crate::types::MessageId<'_>,
     ) -> Result<PooledBuffer> {
-        let command = body_by_msgid(message_id);
-        self.fetch_response(&command).await
+        self.fetch_response(&body_request(message_id)).await
     }
 
     /// Fetch article headers (HEAD command)
@@ -96,8 +95,7 @@ impl NntpClient {
         &self,
         message_id: &crate::types::MessageId<'_>,
     ) -> Result<PooledBuffer> {
-        let command = head_by_msgid(message_id);
-        self.fetch_response(&command).await
+        self.fetch_response(&head_request(message_id)).await
     }
 
     /// Fetch full article (ARTICLE command)
@@ -112,8 +110,7 @@ impl NntpClient {
         &self,
         message_id: &crate::types::MessageId<'_>,
     ) -> Result<PooledBuffer> {
-        let command = article_by_msgid(message_id);
-        self.fetch_response(&command).await
+        self.fetch_response(&article_request(message_id)).await
     }
 
     /// Check if article exists (STAT command)
@@ -124,11 +121,11 @@ impl NntpClient {
     /// # Returns
     /// `true` if article exists, `false` if 430 (not found)
     pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
-        let command = stat_by_msgid(message_id);
+        let request = stat_request(message_id);
         let mut conn = self.get_connection().await?;
         let mut buffer = self.buffer_pool.acquire().await;
 
-        let response = send_command(&mut *conn, &command, &mut buffer).await?;
+        let response = send_request(&mut *conn, &request, &mut buffer).await?;
 
         Self::parse_stat_response(response.status_code())
     }
@@ -155,11 +152,11 @@ impl NntpClient {
     }
 
     /// Internal: fetch response into `PooledBuffer`
-    async fn fetch_response(&self, command: &str) -> Result<PooledBuffer> {
+    async fn fetch_response(&self, request: &RequestContext) -> Result<PooledBuffer> {
         let mut conn = self.get_connection().await?;
         let mut io_buffer = self.buffer_pool.acquire().await;
 
-        let response = send_command(&mut *conn, command, &mut io_buffer).await?;
+        let response = send_request(&mut *conn, request, &mut io_buffer).await?;
 
         // Validate response - early return on errors
         Self::validate_response(&response)?;
@@ -248,7 +245,7 @@ impl NntpClient {
 
     /// Validate NNTP response status code
     #[inline]
-    fn validate_response(response: &crate::session::backend::CommandResponse) -> Result<()> {
+    fn validate_response(response: &crate::session::backend::BackendResponse) -> Result<()> {
         response
             .response
             .status_code()
@@ -419,7 +416,7 @@ mod tests {
         let mut io_buffer = buffer_pool.acquire().await;
         let mut capture = buffer_pool.acquire_capture().await;
 
-        // Simulate send_command pre-reading the full first response chunk
+        // Simulate send_request pre-reading the full first response chunk
         let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
 
         NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)

@@ -6,7 +6,7 @@
 //!
 //! Single-command batches fall through to the existing sequential path with zero overhead.
 
-use crate::command::NntpCommand;
+use crate::protocol::RequestContext;
 use crate::session::ClientSession;
 use anyhow::Result;
 use tokio::io::AsyncBufReadExt;
@@ -25,8 +25,12 @@ pub(super) struct CommandBatch {
     buffer: String,
     /// End offset of each pipelineable command (offsets[i] = end of command i+1)
     offsets: smallvec::SmallVec<[usize; 4]>,
+    /// Typed contexts for each pipelineable command.
+    contexts: smallvec::SmallVec<[RequestContext; 4]>,
     /// Offset range for trailing non-pipelineable command if present
     trailing_range: Option<(usize, usize)>,
+    /// Typed context for trailing non-pipelineable command if present.
+    trailing_context: Option<RequestContext>,
     /// True if the trailing command exceeded the 512-byte RFC 3977 limit
     trailing_oversized: bool,
     /// True if the first (blocking) command exceeded the 512-byte RFC 3977 limit.
@@ -47,10 +51,20 @@ impl CommandBatch {
         &self.buffer[start..end]
     }
 
+    /// Get a typed context by index from the pipelineable commands.
+    pub fn context(&self, i: usize) -> &RequestContext {
+        &self.contexts[i]
+    }
+
     /// Get the trailing non-pipelineable command if present
     pub fn trailing(&self) -> Option<&str> {
         self.trailing_range
             .map(|(start, end)| &self.buffer[start..end])
+    }
+
+    /// Get the trailing typed context if present.
+    pub fn trailing_context(&self) -> Option<&RequestContext> {
+        self.trailing_context.as_ref()
     }
 
     /// Number of pipelineable commands
@@ -105,7 +119,9 @@ impl ClientSession {
                 return Ok(CommandBatch {
                     buffer: String::new(),
                     offsets: smallvec::SmallVec::new(),
+                    contexts: smallvec::SmallVec::new(),
                     trailing_range: None,
+                    trailing_context: None,
                     trailing_oversized: false,
                     first_oversized: false,
                 });
@@ -116,7 +132,9 @@ impl ClientSession {
                     return Ok(CommandBatch {
                         buffer: String::new(),
                         offsets: smallvec::SmallVec::new(),
+                        contexts: smallvec::SmallVec::new(),
                         trailing_range: None,
+                        trailing_context: None,
                         trailing_oversized: false,
                         first_oversized: true,
                     });
@@ -125,18 +143,21 @@ impl ClientSession {
             Err(e) => return Err(e.into()),
         }
 
-        let parsed = NntpCommand::parse(command_buf);
+        let request = RequestContext::from_request_line(command_buf);
 
-        if !parsed.is_pipelineable() {
+        if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
             let start = 0;
             batch_buf.push_str(command_buf);
             let end = batch_buf.len();
             trailing_range = Some((start, end));
+            let trailing_context = Some(request);
             return Ok(CommandBatch {
                 buffer: std::mem::take(batch_buf),
                 offsets: smallvec::SmallVec::new(),
+                contexts: smallvec::SmallVec::new(),
                 trailing_range,
+                trailing_context,
                 trailing_oversized: false,
                 first_oversized: false,
             });
@@ -145,6 +166,8 @@ impl ClientSession {
         // Accumulate first pipelineable command
         batch_buf.push_str(command_buf);
         batch_offsets.push(batch_buf.len());
+        let mut batch_contexts: smallvec::SmallVec<[RequestContext; 4]> = smallvec::SmallVec::new();
+        batch_contexts.push(request);
 
         // Read more commands from the buffer (non-blocking)
         while batch_offsets.len() < MAX_PIPELINE_DEPTH {
@@ -167,20 +190,39 @@ impl ClientSession {
                         batch_buf.push_str(command_buf);
                         let end = batch_buf.len();
                         trailing_range = Some((start, end));
+                        let trailing_context = Some(RequestContext::from_request_line(command_buf));
                         trailing_oversized = true;
-                        break;
+                        return Ok(CommandBatch {
+                            buffer: std::mem::take(batch_buf),
+                            offsets: std::mem::take(batch_offsets),
+                            contexts: batch_contexts,
+                            trailing_range,
+                            trailing_context,
+                            trailing_oversized,
+                            first_oversized: false,
+                        });
                     }
-                    let parsed = NntpCommand::parse(command_buf);
-                    if !parsed.is_pipelineable() {
+                    let request = RequestContext::from_request_line(command_buf);
+                    if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
                         let start = batch_buf.len();
                         batch_buf.push_str(command_buf);
                         let end = batch_buf.len();
                         trailing_range = Some((start, end));
-                        break;
+                        let trailing_context = Some(request);
+                        return Ok(CommandBatch {
+                            buffer: std::mem::take(batch_buf),
+                            offsets: std::mem::take(batch_offsets),
+                            contexts: batch_contexts,
+                            trailing_range,
+                            trailing_context,
+                            trailing_oversized,
+                            first_oversized: false,
+                        });
                     }
                     batch_buf.push_str(command_buf);
                     batch_offsets.push(batch_buf.len());
+                    batch_contexts.push(request);
                 }
             }
         }
@@ -188,7 +230,9 @@ impl ClientSession {
         Ok(CommandBatch {
             buffer: std::mem::take(batch_buf),
             offsets: std::mem::take(batch_offsets),
+            contexts: batch_contexts,
             trailing_range,
+            trailing_context: None,
             trailing_oversized,
             first_oversized: false,
         })

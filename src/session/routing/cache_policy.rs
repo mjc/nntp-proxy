@@ -3,7 +3,7 @@
 //! Pure functions for determining caching behavior based on response codes
 //! and command types.
 
-use crate::command::NntpCommand;
+use crate::protocol::{RequestContext, RequestRouteClass};
 
 /// Determine what caching action to take for a response
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,32 +55,46 @@ pub const fn should_track_availability(response_code: u16, has_message_id: bool)
 ///
 /// The command is validated to ensure it's not a stateful command
 /// that would require mode switching (GROUP, NEXT, XOVER, etc.)
-pub fn determine_cache_action(
+#[cfg(test)]
+fn determine_cache_action(
     command: &str,
     response_code: u16,
     is_multiline: bool,
     cache_articles: bool,
     has_message_id: bool,
 ) -> CacheAction {
-    // Defensive check: stateful commands should have triggered mode switch before reaching here
-    // In debug builds, catch bugs; in release, zero-cost assertion (optimized out)
+    let request = RequestContext::from_request_line(command);
+    determine_cache_action_for_request(
+        &request,
+        response_code,
+        is_multiline,
+        cache_articles,
+        has_message_id,
+    )
+}
+
+pub fn determine_cache_action_for_request(
+    request: &RequestContext,
+    response_code: u16,
+    is_multiline: bool,
+    cache_articles: bool,
+    has_message_id: bool,
+) -> CacheAction {
     debug_assert!(
-        !NntpCommand::parse(command).is_stateful(),
-        "stateful command in PerCommand path: {command}"
+        !matches!(request.route_class(), RequestRouteClass::Stateful),
+        "stateful command in PerCommand path: {:?}",
+        request.kind()
     );
 
     if !has_message_id {
         return CacheAction::None;
     }
 
-    // Full article caching only for 220 response (ARTICLE command)
     if should_capture_for_cache(response_code, is_multiline, cache_articles, has_message_id) {
         CacheAction::CaptureArticle
     } else if is_multiline && should_track_availability(response_code, has_message_id) {
-        // Track availability for HEAD (221), BODY (222), and ARTICLE (220) when cache disabled
         CacheAction::TrackAvailability
     } else if response_code == 223 {
-        // STAT response - not multiline but track availability
         CacheAction::TrackStat
     } else {
         CacheAction::None

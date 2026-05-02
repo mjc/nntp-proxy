@@ -28,9 +28,7 @@ pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 
 // Internal helper re-exported for session handlers
-pub(crate) use entry_helpers::{
-    build_stat_response, extract_chunked_status_line, extract_status_line,
-};
+pub(crate) use entry_helpers::{extract_chunked_status_line, extract_status_line};
 
 use crate::types::{BackendId, MessageId};
 use smallvec::SmallVec;
@@ -246,19 +244,10 @@ impl UnifiedCache {
     pub async fn get(&self, message_id: &MessageId<'_>) -> Option<ArticleEntry> {
         match self {
             Self::Memory(cache) => cache.get(message_id).await,
-            Self::Hybrid(cache) => {
-                // Convert HybridArticleEntry to ArticleEntry
-                cache.get(message_id).await.map(|entry| {
-                    // Get availability and tier before consuming buffer
-                    let availability = entry.availability();
-                    let tier = entry.tier();
-                    let mut article_entry =
-                        ArticleEntry::from_arc_with_tier(entry.into_buffer(), tier);
-                    // Copy availability from hybrid entry
-                    article_entry.set_availability(availability);
-                    article_entry
-                })
-            }
+            Self::Hybrid(cache) => cache
+                .get(message_id)
+                .await
+                .map(|entry| entry.to_article_entry()),
         }
     }
 
