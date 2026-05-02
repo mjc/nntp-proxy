@@ -853,11 +853,11 @@ fn test_hybrid_entry_invalid_status_code_rejected() {
 fn test_hybrid_entry_valid_status_codes() {
     // Valid codes: 220 (ARTICLE), 221 (HEAD), 222 (BODY), 223 (STAT), 430 (not found)
     let valid_220 =
-        HybridArticleEntry::from_wire_response(b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n".to_vec());
-    let valid_221 = HybridArticleEntry::from_wire_response(b"221 0 <id>\r\nH: V\r\n.\r\n".to_vec());
-    let valid_222 = HybridArticleEntry::from_wire_response(b"222 0 <id>\r\nBody\r\n.\r\n".to_vec());
-    let valid_223 = HybridArticleEntry::from_wire_response(b"223 0 <id>\r\n".to_vec());
-    let valid_430 = HybridArticleEntry::from_wire_response(b"430 No article\r\n".to_vec());
+        HybridArticleEntry::from_wire_response(b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n");
+    let valid_221 = HybridArticleEntry::from_wire_response(b"221 0 <id>\r\nH: V\r\n.\r\n");
+    let valid_222 = HybridArticleEntry::from_wire_response(b"222 0 <id>\r\nBody\r\n.\r\n");
+    let valid_223 = HybridArticleEntry::from_wire_response(b"223 0 <id>\r\n");
+    let valid_430 = HybridArticleEntry::from_wire_response(b"430 No article\r\n");
 
     assert!(valid_220.is_some());
     assert!(valid_221.is_some());

@@ -207,7 +207,7 @@ fn test_response_for_command_verbs_uppercase() {
 fn test_is_complete_article_accepts_body_responses() {
     // BODY response (222) with full content should be considered complete
     let body_response = format!("222 0 <test@example.com>\r\n{}\r\n.\r\n", "X".repeat(100));
-    let entry = ArticleEntry::from_wire_response(body_response.as_bytes().to_vec());
+    let entry = ArticleEntry::from_wire_response(body_response.as_bytes());
 
     assert!(
         entry.is_complete_article(),
@@ -251,25 +251,21 @@ fn test_is_complete_article_rejects_stubs() {
 
 #[test]
 fn test_status_code_parsing() {
-    let entry_220 =
-        ArticleEntry::from_wire_response(b"220 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
+    let entry_220 = ArticleEntry::from_wire_response(b"220 0 <test@example.com>\r\nTest\r\n.\r\n");
     assert_eq!(entry_220.status_code().as_u16(), 220);
 
-    let entry_222 =
-        ArticleEntry::from_wire_response(b"222 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
+    let entry_222 = ArticleEntry::from_wire_response(b"222 0 <test@example.com>\r\nTest\r\n.\r\n");
     assert_eq!(entry_222.status_code().as_u16(), 222);
 
-    let entry_221 =
-        ArticleEntry::from_wire_response(b"221 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
+    let entry_221 = ArticleEntry::from_wire_response(b"221 0 <test@example.com>\r\nTest\r\n.\r\n");
     assert_eq!(entry_221.status_code().as_u16(), 221);
 }
 #[test]
 fn test_body_article_command_type_mismatch() {
     // When a BODY (222) response is cached and a client requests ARTICLE (220),
     // it should NOT match because BODY doesn't include headers
-    let body_response = ArticleEntry::from_wire_response(
-        b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n".to_vec(),
-    );
+    let body_response =
+        ArticleEntry::from_wire_response(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n");
     let msg_id = "<test@example.com>";
 
     // BODY response should NOT match ARTICLE request (no headers)
@@ -299,7 +295,7 @@ fn test_body_article_command_type_mismatch() {
 
     // ARTICLE (220) response matches all three
     let article_response = ArticleEntry::from_wire_response(
-        b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec(),
+        b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n",
     );
     assert!(
         can_serve(&article_response, b"ARTICLE", msg_id_ref),
