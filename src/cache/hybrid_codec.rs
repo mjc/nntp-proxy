@@ -360,11 +360,6 @@ impl HybridArticleEntry {
         Self::from_wire_response_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
-    #[must_use]
-    pub fn from_backend_response(buffer: impl AsRef<[u8]>) -> Option<Self> {
-        Self::from_wire_response(buffer)
-    }
-
     /// Ingest a cold wire response with a specific provider tier.
     #[must_use]
     pub fn from_wire_response_with_tier(
@@ -386,29 +381,19 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
-    pub fn from_backend_response_with_tier(
-        buffer: impl AsRef<[u8]>,
-        tier: ttl::CacheTier,
-    ) -> Option<Self> {
-        Self::from_wire_response_with_tier(buffer, tier)
-    }
-
-    #[must_use]
     pub(crate) fn from_cache_buffer_with_tier(
         buffer: super::CacheBuffer,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
         match buffer {
-            super::CacheBuffer::Vec(buffer) => Self::from_backend_response_with_tier(buffer, tier),
+            super::CacheBuffer::Vec(buffer) => Self::from_wire_response_with_tier(buffer, tier),
             super::CacheBuffer::Pooled(buffer) => {
-                Self::from_backend_response_with_tier(buffer.as_ref(), tier)
+                Self::from_wire_response_with_tier(buffer.as_ref(), tier)
             }
             super::CacheBuffer::Chunked(buffer) => {
                 Self::from_chunked_response_with_tier(&buffer, tier)
             }
-            super::CacheBuffer::Small(buffer) => {
-                Self::from_backend_response_with_tier(buffer, tier)
-            }
+            super::CacheBuffer::Small(buffer) => Self::from_wire_response_with_tier(buffer, tier),
         }
     }
 
@@ -740,7 +725,7 @@ mod tests {
     fn test_hybrid_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let mut entry =
-            HybridArticleEntry::from_backend_response(buffer.clone()).expect("valid status code");
+            HybridArticleEntry::from_wire_response(buffer.clone()).expect("valid status code");
 
         assert_eq!(
             render_response(&entry, b"ARTICLE", "<test@example.com>").unwrap(),
@@ -795,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_chunked_cache_buffer_without_flattening_backend_response() {
+    fn hybrid_entry_ingests_chunked_cache_buffer_without_flattening_wire_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
@@ -831,7 +816,7 @@ mod tests {
     fn test_hybrid_entry_response_parts_do_not_clone_payload() {
         let buffer = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry =
-            HybridArticleEntry::from_backend_response(buffer.clone()).expect("valid status code");
+            HybridArticleEntry::from_wire_response(buffer.clone()).expect("valid status code");
 
         let response = entry
             .response_parts_for_command_bytes(b"HEAD", "<test@example.com>")
@@ -848,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_availability() {
-        let mut entry = HybridArticleEntry::from_backend_response(b"220 ok\r\n").expect("valid");
+        let mut entry = HybridArticleEntry::from_wire_response(b"220 ok\r\n").expect("valid");
 
         for i in 0..8 {
             assert!(entry.should_try_backend(BackendId::from_index(i)));
@@ -871,17 +856,17 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_command_matching() {
-        let article = HybridArticleEntry::from_backend_response(b"220 0 <id>\r\n").expect("valid");
+        let article = HybridArticleEntry::from_wire_response(b"220 0 <id>\r\n").expect("valid");
         assert!(article.matches_command_type_verb(b"ARTICLE"));
         assert!(article.matches_command_type_verb(b"BODY"));
         assert!(article.matches_command_type_verb(b"HEAD"));
 
-        let body = HybridArticleEntry::from_backend_response(b"222 0 <id>\r\n").expect("valid");
+        let body = HybridArticleEntry::from_wire_response(b"222 0 <id>\r\n").expect("valid");
         assert!(!body.matches_command_type_verb(b"ARTICLE"));
         assert!(body.matches_command_type_verb(b"BODY"));
         assert!(!body.matches_command_type_verb(b"HEAD"));
 
-        let head = HybridArticleEntry::from_backend_response(b"221 0 <id>\r\n").expect("valid");
+        let head = HybridArticleEntry::from_wire_response(b"221 0 <id>\r\n").expect("valid");
         assert!(!head.matches_command_type_verb(b"ARTICLE"));
         assert!(!head.matches_command_type_verb(b"BODY"));
         assert!(head.matches_command_type_verb(b"HEAD"));
@@ -889,16 +874,16 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_rejects_invalid() {
-        assert!(HybridArticleEntry::from_backend_response(b"999 invalid\r\n").is_none());
-        assert!(HybridArticleEntry::from_backend_response(vec![]).is_none());
-        assert!(HybridArticleEntry::from_backend_response(b"20").is_none());
-        assert!(HybridArticleEntry::from_backend_response(b"abc\r\n").is_none());
+        assert!(HybridArticleEntry::from_wire_response(b"999 invalid\r\n").is_none());
+        assert!(HybridArticleEntry::from_wire_response(vec![]).is_none());
+        assert!(HybridArticleEntry::from_wire_response(b"20").is_none());
+        assert!(HybridArticleEntry::from_wire_response(b"abc\r\n").is_none());
 
-        assert!(HybridArticleEntry::from_backend_response(b"220 article\r\n").is_some());
-        assert!(HybridArticleEntry::from_backend_response(b"221 head\r\n").is_some());
-        assert!(HybridArticleEntry::from_backend_response(b"222 body\r\n").is_some());
-        assert!(HybridArticleEntry::from_backend_response(b"223 stat\r\n").is_some());
-        assert!(HybridArticleEntry::from_backend_response(b"430 not found\r\n").is_some());
+        assert!(HybridArticleEntry::from_wire_response(b"220 article\r\n").is_some());
+        assert!(HybridArticleEntry::from_wire_response(b"221 head\r\n").is_some());
+        assert!(HybridArticleEntry::from_wire_response(b"222 body\r\n").is_some());
+        assert!(HybridArticleEntry::from_wire_response(b"223 stat\r\n").is_some());
+        assert!(HybridArticleEntry::from_wire_response(b"430 not found\r\n").is_some());
     }
 
     // =========================================================================
@@ -907,11 +892,11 @@ mod tests {
 
     #[test]
     fn test_entry_status_code_returns_protocol_status_code() {
-        let entry = HybridArticleEntry::from_backend_response(b"220 0 <id>\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"220 0 <id>\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 220);
 
-        let entry = HybridArticleEntry::from_backend_response(b"430 not found\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"430 not found\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 430);
     }
@@ -926,7 +911,7 @@ mod tests {
             (b"430 missing\r\n", 430),
         ];
         for (buf, expected) in cases {
-            let entry = HybridArticleEntry::from_backend_response(buf)
+            let entry = HybridArticleEntry::from_wire_response(buf)
                 .unwrap_or_else(|| panic!("should accept code {expected}"));
             assert_eq!(entry.status_code().as_u16(), *expected);
         }
@@ -937,7 +922,7 @@ mod tests {
         for code in [200, 201, 211, 411, 480, 500, 502] {
             let buf = format!("{code} response\r\n").into_bytes();
             assert!(
-                HybridArticleEntry::from_backend_response(buf).is_none(),
+                HybridArticleEntry::from_wire_response(buf).is_none(),
                 "code {code} should be rejected"
             );
         }
@@ -949,7 +934,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_roundtrip_article() {
-        let entry = HybridArticleEntry::from_backend_response(
+        let entry = HybridArticleEntry::from_wire_response(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
         .unwrap();
@@ -971,7 +956,7 @@ mod tests {
             b"430 missing\r\n",
         ];
         for raw in buffers {
-            let entry = HybridArticleEntry::from_backend_response(raw).unwrap();
+            let entry = HybridArticleEntry::from_wire_response(raw).unwrap();
             let mut encoded = Vec::new();
             entry.encode(&mut encoded).unwrap();
             let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
@@ -996,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_tier() {
-        let entry = HybridArticleEntry::from_backend_response_with_tier(
+        let entry = HybridArticleEntry::from_wire_response_with_tier(
             b"220 article\r\n",
             ttl::CacheTier::new(3),
         )
@@ -1011,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_availability() {
-        let mut entry = HybridArticleEntry::from_backend_response(b"220 ok\r\n").unwrap();
+        let mut entry = HybridArticleEntry::from_wire_response(b"220 ok\r\n").unwrap();
         entry.record_backend_has(BackendId::from_index(0));
         entry.record_backend_missing(BackendId::from_index(2));
 
@@ -1026,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_code_estimated_size() {
-        let entry = HybridArticleEntry::from_backend_response(b"220 article\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"220 article\r\n").unwrap();
         let expected = 4 + 2 + 2 + 8 + 1 + 1;
         assert_eq!(entry.estimated_size(), expected);
     }
@@ -1037,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_is_complete_article_220() {
-        let entry = HybridArticleEntry::from_backend_response(
+        let entry = HybridArticleEntry::from_wire_response(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
         .unwrap();
@@ -1047,7 +1032,7 @@ mod tests {
     #[test]
     fn test_is_complete_article_222() {
         let entry =
-            HybridArticleEntry::from_backend_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
+            HybridArticleEntry::from_wire_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
         assert!(entry.is_complete_article());
     }
@@ -1055,26 +1040,25 @@ mod tests {
     #[test]
     fn test_is_complete_article_false_for_head() {
         let entry =
-            HybridArticleEntry::from_backend_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n")
-                .unwrap();
+            HybridArticleEntry::from_wire_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_stat() {
-        let entry = HybridArticleEntry::from_backend_response(b"223 0 <t@x>\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"223 0 <t@x>\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_430() {
-        let entry = HybridArticleEntry::from_backend_response(b"430 not found\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"430 not found\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_too_small_buffer() {
-        let entry = HybridArticleEntry::from_backend_response(b"220 ok\r\n.\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"220 ok\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
@@ -1084,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_response_for_command_stat_from_220() {
-        let entry = HybridArticleEntry::from_backend_response(
+        let entry = HybridArticleEntry::from_wire_response(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
         .unwrap();
@@ -1095,8 +1079,7 @@ mod tests {
     #[test]
     fn test_response_for_command_stat_from_221() {
         let entry =
-            HybridArticleEntry::from_backend_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n")
-                .unwrap();
+            HybridArticleEntry::from_wire_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         let resp = render_response(&entry, b"STAT", "<t@x>").expect("should serve STAT from head");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
@@ -1104,7 +1087,7 @@ mod tests {
     #[test]
     fn test_response_for_command_stat_from_222() {
         let entry =
-            HybridArticleEntry::from_backend_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
+            HybridArticleEntry::from_wire_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
         let resp = render_response(&entry, b"STAT", "<t@x>").expect("should serve STAT from body");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
@@ -1112,14 +1095,14 @@ mod tests {
 
     #[test]
     fn test_response_for_command_stat_not_from_430() {
-        let entry = HybridArticleEntry::from_backend_response(b"430 not found\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"430 not found\r\n").unwrap();
         assert!(render_response(&entry, b"STAT", "<t@x>").is_none());
     }
 
     #[test]
     fn test_response_for_command_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::from_backend_response(buf.clone()).unwrap();
+        let entry = HybridArticleEntry::from_wire_response(buf.clone()).unwrap();
         let resp = render_response(&entry, b"ARTICLE", "<t@x>").expect("should serve ARTICLE");
         assert_eq!(resp, buf);
     }
@@ -1127,7 +1110,7 @@ mod tests {
     #[test]
     fn test_response_for_command_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::from_backend_response(buf.clone()).unwrap();
+        let entry = HybridArticleEntry::from_wire_response(buf.clone()).unwrap();
         let resp = render_response(&entry, b"BODY", "<t@x>").expect("220 can serve BODY");
         assert_eq!(resp, b"222 0 <t@x>\r\nBody\r\n.\r\n");
     }
@@ -1135,7 +1118,7 @@ mod tests {
     #[test]
     fn test_response_for_command_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::from_backend_response(buf.clone()).unwrap();
+        let entry = HybridArticleEntry::from_wire_response(buf.clone()).unwrap();
         let resp = render_response(&entry, b"HEAD", "<t@x>").expect("220 can serve HEAD");
         assert_eq!(resp, b"221 0 <t@x>\r\nSubject: T\r\n.\r\n");
     }
@@ -1143,7 +1126,7 @@ mod tests {
     #[test]
     fn test_response_for_command_body_cannot_serve_article() {
         let entry =
-            HybridArticleEntry::from_backend_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
+            HybridArticleEntry::from_wire_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
         assert!(render_response(&entry, b"ARTICLE", "<t@x>").is_none());
     }
@@ -1151,14 +1134,13 @@ mod tests {
     #[test]
     fn test_response_for_command_head_cannot_serve_body() {
         let entry =
-            HybridArticleEntry::from_backend_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n")
-                .unwrap();
+            HybridArticleEntry::from_wire_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(render_response(&entry, b"BODY", "<t@x>").is_none());
     }
 
     #[test]
     fn test_response_for_command_unknown_verb() {
-        let entry = HybridArticleEntry::from_backend_response(
+        let entry = HybridArticleEntry::from_wire_response(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
         .unwrap();
@@ -1174,7 +1156,7 @@ mod tests {
     #[test]
     fn test_matches_command_type_verb_stat_for_all_content_codes() {
         for buf in [&b"220 ok\r\n"[..], b"221 ok\r\n", b"222 ok\r\n"] {
-            let entry = HybridArticleEntry::from_backend_response(buf).unwrap();
+            let entry = HybridArticleEntry::from_wire_response(buf).unwrap();
             assert!(
                 entry.matches_command_type_verb(b"STAT"),
                 "STAT should match for {}xx entry",
@@ -1182,16 +1164,16 @@ mod tests {
             );
         }
 
-        let stat_entry = HybridArticleEntry::from_backend_response(b"223 stat\r\n").unwrap();
+        let stat_entry = HybridArticleEntry::from_wire_response(b"223 stat\r\n").unwrap();
         assert!(!stat_entry.matches_command_type_verb(b"STAT"));
 
-        let missing_entry = HybridArticleEntry::from_backend_response(b"430 missing\r\n").unwrap();
+        let missing_entry = HybridArticleEntry::from_wire_response(b"430 missing\r\n").unwrap();
         assert!(!missing_entry.matches_command_type_verb(b"STAT"));
     }
 
     #[test]
     fn test_matches_command_type_verb_430_matches_nothing() {
-        let entry = HybridArticleEntry::from_backend_response(b"430 missing\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"430 missing\r\n").unwrap();
         assert!(!entry.matches_command_type_verb(b"ARTICLE"));
         assert!(!entry.matches_command_type_verb(b"HEAD"));
         assert!(!entry.matches_command_type_verb(b"BODY"));
@@ -1200,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_matches_command_type_verb_223_matches_nothing() {
-        let entry = HybridArticleEntry::from_backend_response(b"223 stat\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"223 stat\r\n").unwrap();
         assert!(!entry.matches_command_type_verb(b"ARTICLE"));
         assert!(!entry.matches_command_type_verb(b"HEAD"));
         assert!(!entry.matches_command_type_verb(b"BODY"));
@@ -1209,24 +1191,22 @@ mod tests {
 
     #[test]
     fn test_with_tier_sets_tier() {
-        let entry = HybridArticleEntry::from_backend_response_with_tier(
-            b"220 ok\r\n",
-            ttl::CacheTier::new(5),
-        )
-        .unwrap();
+        let entry =
+            HybridArticleEntry::from_wire_response_with_tier(b"220 ok\r\n", ttl::CacheTier::new(5))
+                .unwrap();
         assert_eq!(entry.tier().get(), 5);
     }
 
     #[test]
     fn test_with_tier_zero_default() {
-        let entry = HybridArticleEntry::from_backend_response(b"220 ok\r\n").unwrap();
+        let entry = HybridArticleEntry::from_wire_response(b"220 ok\r\n").unwrap();
         assert_eq!(entry.tier().get(), 0);
     }
 
     #[test]
     fn test_with_tier_rejects_invalid_code() {
         assert!(
-            HybridArticleEntry::from_backend_response_with_tier(
+            HybridArticleEntry::from_wire_response_with_tier(
                 b"999 bad\r\n",
                 ttl::CacheTier::new(0)
             )
@@ -1240,7 +1220,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_220() {
-        let original = HybridArticleEntry::from_backend_response(
+        let original = HybridArticleEntry::from_wire_response(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();
@@ -1257,7 +1237,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_221() {
-        let original = HybridArticleEntry::from_backend_response(
+        let original = HybridArticleEntry::from_wire_response(
             b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n",
         )
         .unwrap();
@@ -1274,7 +1254,7 @@ mod tests {
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_222() {
         let original =
-            HybridArticleEntry::from_backend_response(b"222 body\r\n\r\nbody content\r\n.\r\n")
+            HybridArticleEntry::from_wire_response(b"222 body\r\n\r\nbody content\r\n.\r\n")
                 .unwrap();
 
         let mut buffer = Vec::new();
@@ -1288,7 +1268,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_223() {
-        let original = HybridArticleEntry::from_backend_response(b"223 stat\r\n.\r\n").unwrap();
+        let original = HybridArticleEntry::from_wire_response(b"223 stat\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1301,7 +1281,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_430() {
-        let original = HybridArticleEntry::from_backend_response(b"430 missing\r\n.\r\n").unwrap();
+        let original = HybridArticleEntry::from_wire_response(b"430 missing\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1323,7 +1303,7 @@ mod tests {
         ];
 
         for code in &codes {
-            let entry = HybridArticleEntry::from_backend_response(code).unwrap();
+            let entry = HybridArticleEntry::from_wire_response(code).unwrap();
             let estimated = entry.estimated_size();
 
             let mut buffer = Vec::new();
@@ -1363,7 +1343,7 @@ mod tests {
     #[test]
     fn prop_hybrid_article_preserves_tier() {
         for tier in [0u8, 1, 5, 10, 255] {
-            let entry = HybridArticleEntry::from_backend_response_with_tier(
+            let entry = HybridArticleEntry::from_wire_response_with_tier(
                 b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
                 ttl::CacheTier::new(tier),
             )
@@ -1381,7 +1361,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_preserves_availability() {
-        let entry = HybridArticleEntry::from_backend_response(
+        let entry = HybridArticleEntry::from_wire_response(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();

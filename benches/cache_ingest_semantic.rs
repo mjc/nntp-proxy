@@ -1,6 +1,6 @@
 //! Benchmarks for typed cache ingestion and cache buffer metadata reads.
 //!
-//! Public cache ingestion currently accepts contiguous backend responses for
+//! Public cache ingestion currently accepts contiguous wire responses for
 //! semantic parsing; cache buffer status benchmarks cover the owned forms used
 //! across async cache handoff, including chunked responses without flattening.
 //!
@@ -56,7 +56,7 @@ mod semantic_ingest {
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
                     .bench(|| {
-                        black_box(ArticleEntry::from_backend_response(black_box(
+                        black_box(ArticleEntry::from_wire_response(black_box(
                             bytes.as_slice(),
                         )))
                     });

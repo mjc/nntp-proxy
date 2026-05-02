@@ -25,7 +25,7 @@ It has multiple lines.\r\n\
 .\r\n";
 
 fn article_entry() -> ArticleEntry {
-    ArticleEntry::from_backend_response(ARTICLE_RESPONSE)
+    ArticleEntry::from_wire_response(ARTICLE_RESPONSE)
 }
 
 fn copy_cached_response(entry: &ArticleEntry, verb: &[u8], out: &mut [u8]) -> usize {
@@ -69,7 +69,7 @@ mod no_payload_entries {
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn missing_entry_returns_none(bencher: Bencher) {
-        let entry = ArticleEntry::from_backend_response(b"430 No article\r\n");
+        let entry = ArticleEntry::from_wire_response(b"430 No article\r\n");
 
         bencher.bench(|| {
             let mut out = [0u8; 256];
@@ -107,7 +107,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn stat_with_long_message_id(bencher: Bencher) {
-        let entry = ArticleEntry::from_backend_response(
+        let entry = ArticleEntry::from_wire_response(
             b"220 42 <x@y>\r\nSubject: Benchmark\r\n\r\nBody\r\n.\r\n",
         );
 
