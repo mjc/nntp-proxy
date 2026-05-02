@@ -375,7 +375,7 @@ fn encoded_payload_size(payload: &CachedPayload) -> usize {
 }
 
 impl HybridArticleEntry {
-    /// Ingest a cold wire response into a typed hybrid cache entry.
+    /// Ingest cold response bytes into a typed hybrid cache entry.
     ///
     /// Returns `None` if the status code is invalid or not cacheable. The entry
     /// stores semantic payload sections, not the original response.
@@ -384,7 +384,7 @@ impl HybridArticleEntry {
         Self::from_response_bytes_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
-    /// Ingest a cold wire response with a specific provider tier.
+    /// Ingest cold response bytes with a specific provider tier.
     #[must_use]
     pub fn from_response_bytes_with_tier(
         buffer: impl AsRef<[u8]>,
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_wire_response_by_name() {
+    fn hybrid_entry_ingests_response_bytes_by_name() {
         let entry = HybridArticleEntry::from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_borrowed_wire_response_bytes() {
+    fn hybrid_entry_ingests_borrowed_response_bytes() {
         let entry = HybridArticleEntry::from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         )
@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_cache_buffer_without_required_vec() {
+    fn hybrid_entry_ingests_ingest_bytes_without_required_vec() {
         let entry = HybridArticleEntry::from_ingest_bytes_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_chunked_cache_buffer_without_flattening_wire_response() {
+    fn hybrid_entry_ingests_chunked_ingest_bytes_without_flattening_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
