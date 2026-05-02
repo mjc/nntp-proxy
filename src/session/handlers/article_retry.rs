@@ -681,14 +681,11 @@ impl ClientSession {
                     },
                 )
                 .await;
-            if let Ok(result) = &attempt {
-                result.record_on_request(request);
-            }
             match attempt {
-                Ok(BackendAttemptResult::Success {
-                    backend_id,
-                    response,
-                }) => {
+                Ok(BackendAttemptResult::Success { backend_id }) => {
+                    let response = request
+                        .response_metadata()
+                        .expect("successful direct attempt records response metadata");
                     *backend_to_client_bytes =
                         backend_to_client_bytes.add(response.wire_len().get());
                     // complete_command already called by CommandGuard inside try_backend_for_article

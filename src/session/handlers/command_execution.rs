@@ -22,10 +22,7 @@ use tracing::{debug, warn};
 /// Result of attempting to execute a command on a backend
 pub(super) enum BackendAttemptResult {
     /// Article found - response streamed successfully
-    Success {
-        backend_id: BackendId,
-        response: RequestResponseMetadata,
-    },
+    Success { backend_id: BackendId },
     /// Article not found (430) - try next backend
     /// Note: The 430 response is read and drained, just not stored
     ArticleNotFound { backend_id: BackendId },
@@ -35,21 +32,13 @@ pub(super) enum BackendAttemptResult {
 
 impl BackendAttemptResult {
     #[must_use]
-    const fn success(backend_id: BackendId, response: RequestResponseMetadata) -> Self {
-        Self::Success {
-            backend_id,
-            response,
-        }
-    }
-
-    pub(super) const fn record_on_request(&self, request: &mut RequestContext) {
-        if let Self::Success {
-            backend_id,
-            response,
-        } = self
-        {
-            request.record_backend_response(*backend_id, *response);
-        }
+    fn success(
+        request: &mut RequestContext,
+        backend_id: BackendId,
+        response: RequestResponseMetadata,
+    ) -> Self {
+        request.record_backend_response(backend_id, response);
+        Self::Success { backend_id }
     }
 }
 
@@ -89,7 +78,7 @@ impl ClientSession {
     pub(super) async fn try_backend_for_article(
         &self,
         router: &Arc<BackendSelector>,
-        request: &RequestContext,
+        request: &mut RequestContext,
         msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         state: &mut ArticleAttemptState<'_>,
@@ -266,6 +255,7 @@ impl ClientSession {
         }
 
         Ok(BackendAttemptResult::success(
+            request,
             backend_id,
             RequestResponseMetadata::new(status_code, (bytes_written as usize).into()),
         ))
@@ -510,18 +500,18 @@ mod tests {
     use crate::types::BackendId;
 
     #[test]
-    fn backend_attempt_success_carries_typed_response_metadata() {
+    fn backend_attempt_success_carries_backend_id() {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
-        let result = BackendAttemptResult::success(backend_id, response);
+        let mut request =
+            crate::protocol::RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
+        let result = BackendAttemptResult::success(&mut request, backend_id, response);
 
         match result {
             BackendAttemptResult::Success {
                 backend_id: actual_backend,
-                response: actual_response,
             } => {
                 assert_eq!(actual_backend, backend_id);
-                assert_eq!(actual_response, response);
             }
             _ => panic!("expected success"),
         }
@@ -531,12 +521,15 @@ mod tests {
     fn backend_attempt_success_records_request_context() {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
-        let result = BackendAttemptResult::success(backend_id, response);
         let mut request =
             crate::protocol::RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
 
-        result.record_on_request(&mut request);
+        let result = BackendAttemptResult::success(&mut request, backend_id, response);
 
+        assert!(matches!(
+            result,
+            BackendAttemptResult::Success { backend_id: actual } if actual == backend_id
+        ));
         assert_eq!(request.backend_id(), Some(backend_id));
         assert_eq!(request.response_metadata(), Some(response));
     }
