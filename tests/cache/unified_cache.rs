@@ -45,7 +45,7 @@ async fn test_unified_cache_memory_upsert_and_get() {
     let backend_id = BackendId::from_index(0);
 
     cache
-        .upsert(msg_id.clone(), buffer.clone(), backend_id, 0)
+        .upsert(msg_id.clone(), buffer.clone(), backend_id, 0.into())
         .await;
 
     let result = cache.get(&msg_id).await;
@@ -82,7 +82,7 @@ async fn test_unified_cache_sync_availability() {
 
     // First insert an article
     cache
-        .upsert(msg_id.clone(), buffer.clone(), backend_id, 0)
+        .upsert(msg_id.clone(), buffer.clone(), backend_id, 0.into())
         .await;
 
     // Create availability with backend 1 marked as missing
@@ -120,7 +120,7 @@ async fn test_unified_cache_weighted_size() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 0)
+        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
         .await;
 
     // Run pending tasks to ensure moka updates its internal state

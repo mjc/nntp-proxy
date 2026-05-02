@@ -4,6 +4,7 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
+use crate::cache::ttl::CacheTier;
 use crate::protocol::RequestContext;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
@@ -137,7 +138,7 @@ impl ClientSession {
         msg_id: &crate::types::MessageId<'_>,
         buffer: &[u8],
         backend_id: crate::types::BackendId,
-        tier: u8,
+        tier: CacheTier,
     ) {
         self.spawn_cache_upsert_buffer(msg_id, buffer.to_vec().into(), backend_id, tier);
     }
@@ -148,7 +149,7 @@ impl ClientSession {
         msg_id: &crate::types::MessageId<'_>,
         buffer: crate::cache::CacheBuffer,
         backend_id: crate::types::BackendId,
-        tier: u8,
+        tier: CacheTier,
     ) {
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
@@ -159,11 +160,12 @@ impl ClientSession {
         });
     }
     /// Get the tier for a backend, defaulting to 0 if router or backend not found.
-    pub(super) fn tier_for_backend(&self, backend_id: BackendId) -> u8 {
+    pub(super) fn tier_for_backend(&self, backend_id: BackendId) -> CacheTier {
         self.router
             .as_ref()
             .and_then(|r| r.get_tier(backend_id))
             .unwrap_or(0)
+            .into()
     }
 
     /// Create precheck dependencies

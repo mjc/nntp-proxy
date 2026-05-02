@@ -259,7 +259,7 @@ impl UnifiedCache {
         message_id: MessageId<'_>,
         buffer: B,
         backend_id: BackendId,
-        tier: u8,
+        tier: ttl::CacheTier,
     ) where
         B: Into<CacheBuffer>,
     {

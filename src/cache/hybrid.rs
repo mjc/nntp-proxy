@@ -355,7 +355,7 @@ impl HybridArticleCache {
         message_id: MessageId<'_>,
         buffer: B,
         backend_id: BackendId,
-        tier: u8,
+        tier: super::ttl::CacheTier,
     ) where
         B: Into<super::CacheBuffer>,
     {
@@ -363,7 +363,6 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let buffer_len = buffer.len();
         let buffer = buffer.into_vec();
-        let tier = super::ttl::CacheTier::new(tier);
         let mut entry = if self.config.cache_articles {
             let Some(entry) = HybridArticleEntry::from_response_buffer_with_tier(buffer, tier)
             else {
@@ -630,7 +629,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert(msg_id, buffer.clone(), BackendId::from_index(0), 0)
+            .upsert(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
             .await;
 
         // Retrieve it

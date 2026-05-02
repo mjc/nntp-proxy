@@ -239,7 +239,7 @@ async fn test_cache_tier_0_expires_at_base_ttl() {
 
     // Insert with tier 0 (1x TTL = 50ms)
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 0)
+        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
         .await;
 
     // Should be cached immediately
@@ -262,7 +262,7 @@ async fn test_cache_higher_tier_longer_ttl() {
 
     // Insert with tier 1 (2x TTL = 400ms)
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 1)
+        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 1.into())
         .await;
 
     // Verify tier was stored correctly
@@ -303,7 +303,7 @@ async fn test_cache_tier_2_even_longer() {
 
     // Insert with tier 2 (4x TTL = 800ms)
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 2)
+        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 2.into())
         .await;
 
     // Wait 500ms - both tier 0 (200ms) and tier 1 (400ms) would expire
@@ -326,7 +326,7 @@ async fn test_cache_preserves_tier_on_get() {
 
     // Insert with tier 3
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 3)
+        .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 3.into())
         .await;
 
     // Get and verify tier is preserved
@@ -345,7 +345,12 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
 
     // Insert with tier 5 and small buffer
     cache
-        .upsert(msg_id.clone(), buffer_small, BackendId::from_index(0), 5)
+        .upsert(
+            msg_id.clone(),
+            buffer_small,
+            BackendId::from_index(0),
+            5.into(),
+        )
         .await;
 
     let entry = cache.get(&msg_id).await.expect("Should be cached");
@@ -353,7 +358,12 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
 
     // Upsert with different tier and LARGER buffer (triggers replacement)
     cache
-        .upsert(msg_id.clone(), buffer_large, BackendId::from_index(1), 2)
+        .upsert(
+            msg_id.clone(),
+            buffer_large,
+            BackendId::from_index(1),
+            2.into(),
+        )
         .await;
 
     let entry = cache.get(&msg_id).await.expect("Should still be cached");
@@ -371,7 +381,12 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
 
     // Insert with tier 5
     cache
-        .upsert(msg_id.clone(), buffer.clone(), BackendId::from_index(0), 5)
+        .upsert(
+            msg_id.clone(),
+            buffer.clone(),
+            BackendId::from_index(0),
+            5.into(),
+        )
         .await;
 
     let entry = cache.get(&msg_id).await.expect("Should be cached");
@@ -379,7 +394,7 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
 
     // Upsert with same-sized buffer (doesn't trigger replacement)
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(1), 2)
+        .upsert(msg_id.clone(), buffer, BackendId::from_index(1), 2.into())
         .await;
 
     let entry = cache.get(&msg_id).await.expect("Should still be cached");

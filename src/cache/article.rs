@@ -810,7 +810,7 @@ impl ArticleCache {
         message_id: MessageId<'_>,
         buffer: B,
         backend_id: BackendId,
-        tier: u8,
+        tier: ttl::CacheTier,
     ) where
         B: Into<super::CacheBuffer>,
     {
@@ -823,7 +823,6 @@ impl ArticleCache {
         } else {
             Self::create_minimal_stub(buffer)
         };
-        let tier = ttl::CacheTier::new(tier);
         let new_entry_template = ArticleEntry::from_response_buffer_with_tier(new_buffer, tier);
 
         // Use atomic upsert - this provides key-level locking and eliminates
@@ -1237,7 +1236,12 @@ mod tests {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
         cache
-            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0), 0)
+            .upsert(
+                msgid.clone(),
+                buffer.clone(),
+                BackendId::from_index(0),
+                0.into(),
+            )
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
@@ -1259,12 +1263,22 @@ mod tests {
 
         // Insert with backend 0
         cache
-            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(0), 0)
+            .upsert(
+                msgid.clone(),
+                buffer.clone(),
+                BackendId::from_index(0),
+                0.into(),
+            )
             .await;
 
         // Update with backend 1 - does nothing (entry already exists)
         cache
-            .upsert(msgid.clone(), buffer.clone(), BackendId::from_index(1), 0)
+            .upsert(
+                msgid.clone(),
+                buffer.clone(),
+                BackendId::from_index(1),
+                0.into(),
+            )
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
@@ -1406,7 +1420,7 @@ mod tests {
         let full_size = buffer.len();
 
         cache_stub
-            .upsert(msgid.clone(), buffer, BackendId::from_index(0), 0)
+            .upsert(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
         cache_stub.sync().await;
 
@@ -1428,7 +1442,7 @@ mod tests {
         let original_payload_size = b"Subject: Test2".len() + b"Body2".len();
 
         cache_full
-            .upsert(msgid2.clone(), buffer2, BackendId::from_index(0), 0)
+            .upsert(msgid2.clone(), buffer2, BackendId::from_index(0), 0.into())
             .await;
         cache_full.sync().await;
 
