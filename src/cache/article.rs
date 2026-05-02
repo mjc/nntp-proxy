@@ -252,7 +252,7 @@ pub struct ArticleEntry {
 
     /// Unix timestamp when this entry was inserted (milliseconds since epoch)
     /// Populated via `ttl::now_millis()` and used with `tier` for TTL expiration
-    inserted_at: u64,
+    inserted_at: ttl::CacheTimestampMillis,
 }
 
 impl ArticleEntry {
@@ -273,7 +273,7 @@ impl ArticleEntry {
             status_code,
             payload: CachedPayload::AvailabilityOnly,
             tier: tier.into(),
-            inserted_at: ttl::now_millis(),
+            inserted_at: ttl::CacheTimestampMillis::now(),
         }
     }
 
@@ -290,7 +290,7 @@ impl ArticleEntry {
             status_code,
             payload,
             tier: ttl::CacheTier::new(tier),
-            inserted_at,
+            inserted_at: ttl::CacheTimestampMillis::new(inserted_at),
         }
     }
 
@@ -304,7 +304,7 @@ impl ArticleEntry {
             status_code,
             payload,
             tier: tier.into(),
-            inserted_at: ttl::now_millis(),
+            inserted_at: ttl::CacheTimestampMillis::now(),
         }
     }
 
@@ -314,7 +314,7 @@ impl ArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.inserted_at, base_ttl_millis, self.tier.get())
+        ttl::is_expired(self.inserted_at.get(), base_ttl_millis, self.tier.get())
     }
 
     /// Get the tier of the backend that provided this article
@@ -827,7 +827,7 @@ impl ArticleCache {
                     }
 
                     // Refresh TTL on every successful upsert, independent of buffer replacement
-                    entry.inserted_at = ttl::now_millis();
+                    entry.inserted_at = ttl::CacheTimestampMillis::now();
 
                     // Mark backend as having the article
                     entry.record_backend_has(backend_id);

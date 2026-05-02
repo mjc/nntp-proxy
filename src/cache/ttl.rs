@@ -45,6 +45,33 @@ impl From<u8> for CacheTier {
     }
 }
 
+/// Millisecond Unix timestamp used by cache entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct CacheTimestampMillis(u64);
+
+impl CacheTimestampMillis {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn now() -> Self {
+        Self(now_millis())
+    }
+}
+
+impl From<u64> for CacheTimestampMillis {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
 /// Calculate effective TTL based on tier
 ///
 /// Returns `base_ttl * (2 ^ min(tier, MAX_TTL_TIER))`
