@@ -132,8 +132,7 @@ impl CachedArticleResponse<'_> {
         self.len() == 0
     }
 
-    #[must_use]
-    pub fn status_line(&self) -> &[u8] {
+    fn status_line(&self) -> &[u8] {
         self.status_line.as_slice()
     }
 
