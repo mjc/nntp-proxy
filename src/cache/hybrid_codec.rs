@@ -616,9 +616,11 @@ mod tests {
         verb: &[u8],
         message_id: &str,
     ) -> Option<Vec<u8>> {
-        entry
-            .response_parts_for_command_bytes(verb, message_id)
-            .map(|response| response.to_vec())
+        let response = entry.response_parts_for_command_bytes(verb, message_id)?;
+        let mut out = vec![0; response.len()];
+        let len = response.copy_to_slice(&mut out)?;
+        out.truncate(len);
+        Some(out)
     }
 
     // =========================================================================

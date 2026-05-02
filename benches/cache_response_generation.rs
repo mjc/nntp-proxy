@@ -35,13 +35,6 @@ fn copy_cached_response(entry: &ArticleEntry, verb: &[u8], out: &mut [u8]) -> us
         .unwrap_or_default()
 }
 
-fn alloc_cached_response(entry: &ArticleEntry, verb: &[u8]) -> usize {
-    entry
-        .response_parts_for_command_bytes(verb, MSG_ID)
-        .map(|response| response.to_vec().len())
-        .unwrap_or_default()
-}
-
 mod article_derived_hits {
     use super::{Bencher, article_entry, black_box, copy_cached_response};
 
@@ -67,28 +60,6 @@ mod article_derived_hits {
     bench_cached_response!(head_from_article, b"HEAD");
     bench_cached_response!(body_from_article, b"BODY");
     bench_cached_response!(stat_from_article, b"STAT");
-}
-
-mod allocating_baseline {
-    use super::{Bencher, alloc_cached_response, article_entry, black_box};
-
-    macro_rules! bench_cached_response_alloc {
-        ($name:ident, $verb:literal) => {
-            #[divan::bench(sample_count = 1000, sample_size = 1000)]
-            fn $name(bencher: Bencher) {
-                let entry = article_entry();
-
-                bencher.bench(|| {
-                    black_box(alloc_cached_response(black_box(&entry), black_box($verb)))
-                });
-            }
-        };
-    }
-
-    bench_cached_response_alloc!(article_from_article_to_vec, b"ARTICLE");
-    bench_cached_response_alloc!(head_from_article_to_vec, b"HEAD");
-    bench_cached_response_alloc!(body_from_article_to_vec, b"BODY");
-    bench_cached_response_alloc!(stat_from_article_to_vec, b"STAT");
 }
 
 mod no_payload_entries {

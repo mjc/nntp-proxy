@@ -158,18 +158,6 @@ impl CachedArticleResponse<'_> {
         }
     }
 
-    #[must_use]
-    pub fn to_vec(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.len());
-        self.extend_vec(&mut out);
-        out
-    }
-
-    pub fn extend_vec(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(self.status_line());
-        self.extend_payload_vec(out);
-    }
-
     pub fn copy_to_slice(&self, out: &mut [u8]) -> Option<usize> {
         if out.len() < self.len() {
             return None;
@@ -204,26 +192,6 @@ impl CachedArticleResponse<'_> {
             }
             CachedArticleResponsePayload::Head { headers } => headers.len() + 5,
             CachedArticleResponsePayload::Body { body } => body.len() + 5,
-        }
-    }
-
-    fn extend_payload_vec(&self, out: &mut Vec<u8>) {
-        match self.payload {
-            CachedArticleResponsePayload::None => {}
-            CachedArticleResponsePayload::Article { headers, body } => {
-                out.extend_from_slice(headers);
-                out.extend_from_slice(b"\r\n\r\n");
-                out.extend_from_slice(body);
-                out.extend_from_slice(b"\r\n.\r\n");
-            }
-            CachedArticleResponsePayload::Head { headers } => {
-                out.extend_from_slice(headers);
-                out.extend_from_slice(b"\r\n.\r\n");
-            }
-            CachedArticleResponsePayload::Body { body } => {
-                out.extend_from_slice(body);
-                out.extend_from_slice(b"\r\n.\r\n");
-            }
         }
     }
 }
@@ -1277,10 +1245,13 @@ mod tests {
     }
 
     fn rendered(entry: &ArticleEntry, verb: &str, msgid: &str) -> Vec<u8> {
-        entry
+        let response = entry
             .response_parts_for_command_bytes(verb.as_bytes(), msgid)
-            .map(|response| response.to_vec())
-            .unwrap()
+            .unwrap();
+        let mut out = vec![0; response.len()];
+        let len = response.copy_to_slice(&mut out).unwrap();
+        out.truncate(len);
+        out
     }
 
     #[test]

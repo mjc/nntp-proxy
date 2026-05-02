@@ -676,7 +676,10 @@ mod tests {
         let response = entry
             .response_parts_for_command_bytes(b"ARTICLE", msg_id.as_str())
             .unwrap();
-        assert_eq!(response.to_vec(), buffer);
+        let mut rendered = vec![0; response.len()];
+        let len = response.copy_to_slice(&mut rendered).unwrap();
+        rendered.truncate(len);
+        assert_eq!(rendered, buffer);
         assert!(entry.should_try_backend(BackendId::from_index(0)));
 
         // Check stats

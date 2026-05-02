@@ -17,9 +17,11 @@ fn response_bytes(
     verb: &[u8],
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
-    entry
-        .response_parts_for_command_bytes(verb, message_id.as_str())
-        .map(|response| response.to_vec())
+    let response = entry.response_parts_for_command_bytes(verb, message_id.as_str())?;
+    let mut out = vec![0; response.len()];
+    let len = response.copy_to_slice(&mut out)?;
+    out.truncate(len);
+    Some(out)
 }
 
 #[tokio::test]
