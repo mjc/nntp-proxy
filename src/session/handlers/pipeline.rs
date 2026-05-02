@@ -25,6 +25,8 @@ pub(super) struct RequestBatch {
     trailing_context: Option<RequestContext>,
     /// True if the trailing command exceeded the 512-byte RFC 3977 limit
     trailing_oversized: bool,
+    /// Wire length for a trailing oversized command rejected before context creation.
+    trailing_wire_len: usize,
     /// True if the first (blocking) command exceeded the 512-byte RFC 3977 limit.
     /// The batch is otherwise empty; caller must send 501 and continue.
     first_oversized: bool,
@@ -33,7 +35,7 @@ pub(super) struct RequestBatch {
 impl RequestBatch {
     /// Whether this batch is empty (client disconnected)
     pub fn is_empty(&self) -> bool {
-        self.contexts.is_empty() && self.trailing_context.is_none()
+        self.contexts.is_empty() && self.trailing_context.is_none() && !self.trailing_oversized
     }
 
     /// Get a typed context by index from the pipelineable commands.
@@ -64,6 +66,11 @@ impl RequestBatch {
     /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
     pub const fn is_trailing_oversized(&self) -> bool {
         self.trailing_oversized
+    }
+
+    /// Wire length for the trailing oversized command, if any.
+    pub const fn trailing_wire_len(&self) -> usize {
+        self.trailing_wire_len
     }
 
     /// Whether the *first* command (blocking read) exceeded the 512-byte limit.
@@ -100,6 +107,7 @@ impl ClientSession {
                     contexts: smallvec::SmallVec::new(),
                     trailing_context: None,
                     trailing_oversized: false,
+                    trailing_wire_len: 0,
                     first_oversized: false,
                 });
             }
@@ -110,6 +118,7 @@ impl ClientSession {
                         contexts: smallvec::SmallVec::new(),
                         trailing_context: None,
                         trailing_oversized: false,
+                        trailing_wire_len: 0,
                         first_oversized: true,
                     });
                 }
@@ -126,6 +135,7 @@ impl ClientSession {
                 contexts: smallvec::SmallVec::new(),
                 trailing_context,
                 trailing_oversized: false,
+                trailing_wire_len: 0,
                 first_oversized: false,
             });
         }
@@ -150,13 +160,12 @@ impl ClientSession {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
                     if command_buf.len() > 512 {
-                        let trailing_context =
-                            Some(RequestContext::from_request_bytes(command_buf));
                         trailing_oversized = true;
                         return Ok(RequestBatch {
                             contexts: batch_contexts,
-                            trailing_context,
+                            trailing_context: None,
                             trailing_oversized,
+                            trailing_wire_len: command_buf.len(),
                             first_oversized: false,
                         });
                     }
@@ -168,6 +177,7 @@ impl ClientSession {
                             contexts: batch_contexts,
                             trailing_context,
                             trailing_oversized,
+                            trailing_wire_len: 0,
                             first_oversized: false,
                         });
                     }
@@ -180,6 +190,7 @@ impl ClientSession {
             contexts: batch_contexts,
             trailing_context: None,
             trailing_oversized,
+            trailing_wire_len: 0,
             first_oversized: false,
         })
     }
@@ -239,5 +250,31 @@ mod tests {
         assert_eq!(trailing.kind(), RequestKind::Unknown);
         assert_eq!(trailing.args(), b"\xff");
         assert_eq!(trailing.route_class(), RequestRouteClass::Stateful);
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_rejects_oversized_trailing_before_context_creation() {
+        let session = test_session();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let oversized_arg = vec![b'a'; 520];
+
+        client.write_all(b"STAT <a@b>\r\nXOVER ").await.unwrap();
+        client.write_all(&oversized_arg).await.unwrap();
+        client.write_all(b"\r\n").await.unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let mut command_buf = Vec::with_capacity(COMMAND);
+
+        let batch = session
+            .read_command_batch(&mut reader, &mut command_buf)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.context(0).kind(), RequestKind::Stat);
+        assert!(batch.is_trailing_oversized());
+        assert!(batch.trailing_context().is_none());
+        assert!(batch.trailing_wire_len() > 512);
     }
 }

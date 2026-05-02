@@ -457,21 +457,21 @@ impl ClientSession {
             }
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
+            if batch.is_trailing_oversized() {
+                warn!(
+                    "Client {} sent oversized command ({} bytes), rejecting",
+                    self.client_addr,
+                    batch.trailing_wire_len()
+                );
+                client_write
+                    .write_all(crate::protocol::COMMAND_TOO_LONG)
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                continue;
+            }
+
             if let Some(trailing_context) = batch.trailing_context() {
                 let trailing_cmd_len = trailing_context.wire_len();
-                // Reject oversized commands per RFC 3977 (512-byte limit)
-                if batch.is_trailing_oversized() {
-                    warn!(
-                        "Client {} sent oversized command ({} bytes), rejecting",
-                        self.client_addr, trailing_cmd_len
-                    );
-                    client_write
-                        .write_all(crate::protocol::COMMAND_TOO_LONG)
-                        .await
-                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                    continue;
-                }
-
                 debug!(
                     "Client {} trailing non-pipelineable {:?}: {:?}",
                     self.client_addr,
