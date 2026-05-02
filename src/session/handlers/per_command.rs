@@ -8,7 +8,7 @@
 //! - [`command_execution`]: Single-backend command execution and response streaming
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
-use crate::protocol::{RequestContext, RequestResponseMetadata};
+use crate::protocol::{RequestContext, RequestResponseMetadata, StatusCode, codes};
 use crate::session::common;
 use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
 use crate::session::{ClientSession, connection};
@@ -64,10 +64,11 @@ struct ProcessCommandParams<'a, 'b> {
     backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
 
-fn record_local_wire_response(request: &mut RequestContext, response: &[u8]) {
-    let response = RequestResponseMetadata::from_wire_response(response)
-        .expect("local NNTP response starts with status code");
-    request.record_local_response(response);
+fn record_local_response(request: &mut RequestContext, status: u16, response: &[u8]) {
+    request.record_local_response(RequestResponseMetadata::new(
+        StatusCode::new(status),
+        response.len().into(),
+    ));
 }
 
 impl ClientSession {
@@ -162,7 +163,7 @@ impl ClientSession {
                 debug!("Client {} decision: RequireAuth", self.client_addr);
                 use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
                 client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
-                record_local_wire_response(request, AUTH_REQUIRED_FOR_COMMAND);
+                record_local_response(request, codes::AUTH_REQUIRED, AUTH_REQUIRED_FOR_COMMAND);
                 *backend_to_client_bytes =
                     backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                 Ok(CommandResult::Continue {
@@ -193,10 +194,7 @@ impl ClientSession {
                     unreachable!("Reject decision must come from Reject action")
                 };
                 client_write.write_all(response.as_bytes()).await?;
-                request.record_local_response(RequestResponseMetadata::new(
-                    response.status(),
-                    response.len().into(),
-                ));
+                request.record_local_response(response.metadata());
                 *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                 Ok(CommandResult::Continue {
                     auth_succeeded: false,
@@ -219,7 +217,7 @@ impl ClientSession {
                     crate::protocol::CAPABILITIES_WITH_AUTHINFO
                 };
                 client_write.write_all(capabilities).await?;
-                record_local_wire_response(request, capabilities);
+                record_local_response(request, codes::CAPABILITY_LIST, capabilities);
                 *backend_to_client_bytes = backend_to_client_bytes.add(capabilities.len());
                 Ok(CommandResult::Continue {
                     auth_succeeded: false,
@@ -249,7 +247,11 @@ impl ClientSession {
         if let common::QuitStatus::Quit(bytes) =
             common::handle_quit_command(request, client_write).await?
         {
-            record_local_wire_response(request, crate::protocol::CONNECTION_CLOSING);
+            record_local_response(
+                request,
+                codes::CONNECTION_CLOSING,
+                crate::protocol::CONNECTION_CLOSING,
+            );
             *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
             return Ok(SingleCommandResult::Quit);
         }
@@ -539,10 +541,14 @@ mod tests {
     use crate::protocol::{RequestContext, ResponseWireLen, StatusCode};
 
     #[test]
-    fn local_wire_response_records_status_and_wire_len() {
+    fn local_response_records_typed_status_and_wire_len() {
         let mut request = RequestContext::from_request_line("QUIT\r\n");
 
-        super::record_local_wire_response(&mut request, crate::protocol::CONNECTION_CLOSING);
+        super::record_local_response(
+            &mut request,
+            crate::protocol::codes::CONNECTION_CLOSING,
+            crate::protocol::CONNECTION_CLOSING,
+        );
 
         assert_eq!(request.backend_id(), None);
         assert_eq!(request.response_status(), Some(StatusCode::new(205)));

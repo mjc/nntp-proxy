@@ -17,7 +17,9 @@
 //!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
 //!   Used when a feature (e.g. stateful commands in per-command mode) is not supported
 
-use crate::protocol::{RequestContext, RequestKind, RequestRouteClass, StatusCode, codes};
+use crate::protocol::{
+    RequestContext, RequestKind, RequestResponseMetadata, RequestRouteClass, StatusCode, codes,
+};
 
 /// Action to take in response to a command
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +51,11 @@ impl RejectResponse {
     #[must_use]
     pub fn status(self) -> StatusCode {
         StatusCode::new(self.status)
+    }
+
+    #[must_use]
+    pub fn metadata(self) -> RequestResponseMetadata {
+        RequestResponseMetadata::new(self.status(), self.len().into())
     }
 
     #[must_use]
