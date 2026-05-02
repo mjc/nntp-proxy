@@ -697,9 +697,10 @@ impl ClientSession {
             {
                 Ok(BackendAttemptResult::Success {
                     backend_id,
-                    bytes_written,
+                    response,
                 }) => {
-                    *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written as usize);
+                    *backend_to_client_bytes =
+                        backend_to_client_bytes.add(response.wire_len().get());
                     // complete_command already called by CommandGuard inside try_backend_for_article
                     // Sync availability to cache before returning (got a success, but we may have
                     // recorded some 430s from other backends along the way)

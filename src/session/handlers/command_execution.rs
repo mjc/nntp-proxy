@@ -3,7 +3,7 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and streaming multiline responses to clients.
 
-use crate::protocol::RequestContext;
+use crate::protocol::{RequestContext, RequestResponseMetadata};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
 use crate::session::retry::retry_once;
@@ -23,7 +23,7 @@ pub(super) enum BackendAttemptResult {
     /// Article found - response streamed successfully
     Success {
         backend_id: BackendId,
-        bytes_written: u64,
+        response: RequestResponseMetadata,
     },
     /// Article not found (430) - try next backend
     /// Note: The 430 response is read and drained, just not stored
@@ -246,7 +246,12 @@ impl ClientSession {
 
         Ok(BackendAttemptResult::Success {
             backend_id,
-            bytes_written,
+            response: RequestResponseMetadata::new(
+                cmd_response
+                    .status_code()
+                    .expect("valid streamed response has status code"),
+                (bytes_written as usize).into(),
+            ),
         })
     }
 
@@ -497,7 +502,31 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use super::BackendAttemptResult;
     use super::classify_buffered_response_write_err;
+    use crate::protocol::{RequestResponseMetadata, ResponseWireLen, StatusCode};
+    use crate::types::BackendId;
+
+    #[test]
+    fn backend_attempt_success_carries_typed_response_metadata() {
+        let backend_id = BackendId::from_index(1);
+        let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
+        let result = BackendAttemptResult::Success {
+            backend_id,
+            response,
+        };
+
+        match result {
+            BackendAttemptResult::Success {
+                backend_id: actual_backend,
+                response: actual_response,
+            } => {
+                assert_eq!(actual_backend, backend_id);
+                assert_eq!(actual_response, response);
+            }
+            _ => panic!("expected success"),
+        }
+    }
 
     #[test]
     fn buffered_response_timeout_is_terminal_client_disconnect() {
