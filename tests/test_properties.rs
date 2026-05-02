@@ -737,18 +737,18 @@ proptest! {
 }
 
 // =============================================================================
-// 11. validate_backend_response - Response validation robustness
+// 11. parse_backend_status - status parse robustness
 // =============================================================================
 
-use nntp_proxy::session::backend::validate_backend_response;
+use nntp_proxy::session::backend::parse_backend_status;
 
 proptest! {
     #[test]
-    fn prop_validate_backend_response_never_panics(
+    fn prop_parse_backend_status_never_panics(
         data in prop::collection::vec(any::<u8>(), 0..200)
     ) {
-        // validate_backend_response should never panic on arbitrary bytes
-        let _ = validate_backend_response(&data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
+        // parse_backend_status should never panic on arbitrary bytes
+        let _ = parse_backend_status(&data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
     }
 
     #[test]
@@ -759,7 +759,7 @@ proptest! {
         // Generate valid NNTP response: "{code} {text}\r\n"
         let response = format!("{code} {text}\r\n");
         let data = response.as_bytes();
-        let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
+        let validated = parse_backend_status(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
         let status = validated
             .status_code
@@ -795,7 +795,7 @@ proptest! {
         response.push_str(".\r\n");
 
         let data = response.as_bytes();
-        let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
+        let validated = parse_backend_status(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
         // Should be multiline for 220/221/222
         prop_assert_eq!(

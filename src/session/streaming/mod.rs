@@ -280,7 +280,7 @@ fn validate_response_prefix(
     response: &[u8],
     source: &'static str,
 ) -> Result<crate::protocol::StatusCode, StreamingError> {
-    let validated = crate::session::backend::validate_backend_response(
+    let validated = crate::session::backend::parse_backend_status(
         response,
         response.len(),
         crate::protocol::MIN_RESPONSE_LENGTH,

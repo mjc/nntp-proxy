@@ -288,11 +288,8 @@ impl ClientSession {
         let chunk = &chunk_data[..];
 
         // --- Validate response ---
-        let validated = backend::validate_backend_response(
-            chunk,
-            chunk.len(),
-            crate::protocol::MIN_RESPONSE_LENGTH,
-        );
+        let validated =
+            backend::parse_backend_status(chunk, chunk.len(), crate::protocol::MIN_RESPONSE_LENGTH);
         let Some(status_code) = validated.status_code else {
             warn!(
                 client = %self.client_addr,

@@ -5,7 +5,7 @@
 //!
 //! # Structure
 //!
-//! - Response validation functions (pure, easily testable)
+//! - Response status parsing functions (pure, easily testable)
 //! - Command execution helpers - Send command, read response
 //!
 //! # Usage
@@ -26,9 +26,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::pool::PooledBuffer;
 use crate::protocol::{RequestContext, StatusCode};
 
-// ─── Response validation ────────────────────────────────────────────────────
+// ─── Response status parsing ────────────────────────────────────────────────
 
-/// Response validation warnings (pure data)
+/// Response status parse warnings (pure data)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseWarning {
     /// Response too short to be valid
@@ -39,14 +39,14 @@ pub enum ResponseWarning {
     UnusualStatusCode(u16),
 }
 
-/// Validated backend response status (pure data)
+/// Parsed backend response status (pure data)
 #[derive(Debug)]
-pub struct BackendStatusValidation {
+pub struct BackendStatusParse {
     pub status_code: Option<StatusCode>,
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-/// Validate backend response data (pure function - easily testable)
+/// Parse backend response status (pure function - easily testable)
 ///
 /// Checks response for:
 /// - Minimum length requirement
@@ -59,13 +59,13 @@ pub struct BackendStatusValidation {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// `BackendStatusValidation` with parsed status and any warnings
+/// `BackendStatusParse` with parsed status and any warnings
 #[must_use]
-pub fn validate_backend_response(
+pub fn parse_backend_status(
     chunk: &[u8],
     bytes_read: usize,
     min_length: usize,
-) -> BackendStatusValidation {
+) -> BackendStatusParse {
     let mut warnings = SmallVec::new();
 
     // Check minimum length
@@ -88,7 +88,7 @@ pub fn validate_backend_response(
         warnings.push(ResponseWarning::InvalidResponse);
     }
 
-    BackendStatusValidation {
+    BackendStatusParse {
         status_code,
         warnings,
     }
@@ -275,7 +275,7 @@ where
     let total = buffer.initialized();
     let recv_elapsed = recv_start.elapsed();
 
-    let validated = validate_backend_response(&buffer[..total], total, min_len);
+    let validated = parse_backend_status(&buffer[..total], total, min_len);
     let is_multiline = validated
         .status_code
         .is_some_and(|status| matches!(request.response_shape(status), ResponseShape::Multiline));
@@ -452,9 +452,9 @@ mod tests {
     // ─── Validation tests ───────────────────────────────────────────────────
 
     #[test]
-    fn test_validate_backend_response_valid() {
+    fn test_parse_backend_status_valid() {
         let data = b"200 OK\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert_eq!(
             validated.status_code,
@@ -464,9 +464,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_short() {
+    fn test_parse_backend_status_short() {
         let data = b"200";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert_eq!(validated.warnings.len(), 1);
         assert_eq!(
@@ -476,9 +476,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_invalid() {
+    fn test_parse_backend_status_invalid() {
         let data = b"garbage response";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert_eq!(validated.status_code, None);
         assert!(
@@ -489,9 +489,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_unusual_status_zero() {
+    fn test_parse_backend_status_unusual_status_zero() {
         let data = b"000 Weird\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert!(
             validated
@@ -501,9 +501,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_unusual_status_high() {
+    fn test_parse_backend_status_unusual_status_high() {
         let data = b"700 Too High\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert!(
             validated
@@ -513,9 +513,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_multiline() {
+    fn test_parse_backend_status_multiline() {
         let data = b"220 0 <article@example.com>\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert_eq!(
             validated.status_code,
@@ -525,9 +525,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_multiple_warnings() {
+    fn test_parse_backend_status_multiple_warnings() {
         let data = b"000";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         // Should have both short response AND unusual status
         assert!(!validated.warnings.is_empty());
@@ -540,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_normal_codes() {
+    fn test_parse_backend_status_normal_codes() {
         // Test various normal response codes don't generate warnings
         let test_cases = vec![
             b"200 OK\r\n".as_ref(),
@@ -549,7 +549,7 @@ mod tests {
         ];
 
         for data in test_cases {
-            let validated = validate_backend_response(data, data.len(), 7);
+            let validated = parse_backend_status(data, data.len(), 7);
             assert!(validated.status_code.is_some());
             assert!(
                 validated
