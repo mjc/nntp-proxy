@@ -97,12 +97,6 @@ impl RequestResponseMetadata {
     }
 
     #[must_use]
-    pub fn from_wire_response(response: &[u8]) -> Option<Self> {
-        let status = StatusCode::parse(response)?;
-        Some(Self::new(status, response.len().into()))
-    }
-
-    #[must_use]
     pub const fn status(self) -> StatusCode {
         self.status
     }
