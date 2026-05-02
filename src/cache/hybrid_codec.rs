@@ -92,7 +92,7 @@ pub struct HybridArticleEntry {
     pub(super) timestamp: u64,
     /// Server tier (lower = higher priority)
     /// Used for tier-aware TTL: higher tier = longer TTL
-    tier: u8,
+    tier: ttl::CacheTier,
     payload: CachedPayload,
 }
 
@@ -115,7 +115,7 @@ impl Code for HybridArticleEntry {
             .write_all(&self.timestamp.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
-            .write_all(&[self.tier])
+            .write_all(&[self.tier.get()])
             .map_err(foyer::Error::io_error)?;
         encode_payload(writer, &self.payload)?;
         Ok(())
@@ -167,7 +167,7 @@ impl Code for HybridArticleEntry {
         reader
             .read_exact(&mut tier_byte)
             .map_err(foyer::Error::io_error)?;
-        let tier = tier_byte[0];
+        let tier = ttl::CacheTier::new(tier_byte[0]);
 
         let payload = decode_payload(reader)?;
 
@@ -364,7 +364,7 @@ impl HybridArticleEntry {
             status_code,
             availability: ArticleAvailability::new(),
             timestamp: ttl::now_millis(),
-            tier,
+            tier: tier.into(),
             payload,
         })
     }
@@ -394,7 +394,7 @@ impl HybridArticleEntry {
             StatusCode::new(self.status_code.as_u16()),
             self.payload.clone(),
             self.availability,
-            self.tier,
+            self.tier.get(),
             self.timestamp,
         )
     }
@@ -515,14 +515,14 @@ impl HybridArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.timestamp, base_ttl_millis, self.tier)
+        ttl::is_expired(self.timestamp, base_ttl_millis, self.tier.get())
     }
 
     /// Get the tier of the backend that provided this article
     #[inline]
     #[must_use]
     pub const fn tier(&self) -> u8 {
-        self.tier
+        self.tier.get()
     }
 }
 
