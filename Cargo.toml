@@ -103,6 +103,9 @@ divan = "0.1"  # Modern benchmarking framework
 proptest = "1.5"  # Property-based testing for comprehensive coverage
 yenc = "0.2.2"  # For benchmark comparison only
 
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
+iai-callgrind = "0.16.1"  # Instruction-count benchmarking for hot path comparisons
+
 [features]
 default = []
 zlib-ng = ["flate2/zlib-ng"]  # SIMD-optimized compression (requires cmake; ~2-3x faster)
@@ -125,6 +128,10 @@ harness = false
 
 [[bench]]
 name = "router_selection"
+harness = false
+
+[[bench]]
+name = "request_classifier_callgrind"
 harness = false
 
 

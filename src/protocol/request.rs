@@ -670,66 +670,71 @@ impl RequestContext {
 }
 
 fn classify_verb(verb: &[u8]) -> RequestKind {
-    macro_rules! is {
-        ($lit:literal) => {
-            verb.eq_ignore_ascii_case($lit)
-        };
+    macro_rules! classify_verbs {
+        ($verb:expr; $($len:literal => { $($lit:literal => $kind:expr),+ $(,)? }),+ $(,)?) => {{
+            match $verb.len() {
+                $(
+                    $len => {
+                        $(
+                            const _: [(); $len] = [(); $lit.len()];
+                        )+
+                        $(
+                            if $verb.eq_ignore_ascii_case($lit) {
+                                $kind
+                            } else
+                        )+
+                        {
+                            RequestKind::Unknown
+                        }
+                    }
+                )+
+                _ => RequestKind::Unknown,
+            }
+        }};
     }
-    if is!(b"ARTICLE") {
-        RequestKind::Article
-    } else if is!(b"BODY") {
-        RequestKind::Body
-    } else if is!(b"HEAD") {
-        RequestKind::Head
-    } else if is!(b"STAT") {
-        RequestKind::Stat
-    } else if is!(b"GROUP") {
-        RequestKind::Group
-    } else if is!(b"LISTGROUP") {
-        RequestKind::ListGroup
-    } else if is!(b"LAST") {
-        RequestKind::Last
-    } else if is!(b"NEXT") {
-        RequestKind::Next
-    } else if is!(b"LIST") {
-        RequestKind::List
-    } else if is!(b"DATE") {
-        RequestKind::Date
-    } else if is!(b"HELP") {
-        RequestKind::Help
-    } else if is!(b"CAPABILITIES") {
-        RequestKind::Capabilities
-    } else if is!(b"MODE") {
-        RequestKind::Mode
-    } else if is!(b"QUIT") {
-        RequestKind::Quit
-    } else if is!(b"OVER") {
-        RequestKind::Over
-    } else if is!(b"XOVER") {
-        RequestKind::Xover
-    } else if is!(b"HDR") {
-        RequestKind::Hdr
-    } else if is!(b"XHDR") {
-        RequestKind::Xhdr
-    } else if is!(b"NEWGROUPS") {
-        RequestKind::NewGroups
-    } else if is!(b"NEWNEWS") {
-        RequestKind::NewNews
-    } else if is!(b"POST") {
-        RequestKind::Post
-    } else if is!(b"IHAVE") {
-        RequestKind::Ihave
-    } else if is!(b"CHECK") {
-        RequestKind::Check
-    } else if is!(b"TAKETHIS") {
-        RequestKind::TakeThis
-    } else if is!(b"AUTHINFO") {
-        RequestKind::AuthInfo
-    } else if is!(b"STARTTLS") {
-        RequestKind::StartTls
-    } else {
-        RequestKind::Unknown
-    }
+
+    classify_verbs!(verb;
+        3 => {
+            b"HDR" => RequestKind::Hdr,
+        },
+        4 => {
+            b"BODY" => RequestKind::Body,
+            b"DATE" => RequestKind::Date,
+            b"HEAD" => RequestKind::Head,
+            b"HELP" => RequestKind::Help,
+            b"LAST" => RequestKind::Last,
+            b"LIST" => RequestKind::List,
+            b"MODE" => RequestKind::Mode,
+            b"NEXT" => RequestKind::Next,
+            b"OVER" => RequestKind::Over,
+            b"POST" => RequestKind::Post,
+            b"QUIT" => RequestKind::Quit,
+            b"STAT" => RequestKind::Stat,
+            b"XHDR" => RequestKind::Xhdr,
+        },
+        5 => {
+            b"CHECK" => RequestKind::Check,
+            b"GROUP" => RequestKind::Group,
+            b"IHAVE" => RequestKind::Ihave,
+            b"XOVER" => RequestKind::Xover,
+        },
+        7 => {
+            b"ARTICLE" => RequestKind::Article,
+            b"NEWNEWS" => RequestKind::NewNews,
+        },
+        8 => {
+            b"AUTHINFO" => RequestKind::AuthInfo,
+            b"STARTTLS" => RequestKind::StartTls,
+            b"TAKETHIS" => RequestKind::TakeThis,
+        },
+        9 => {
+            b"LISTGROUP" => RequestKind::ListGroup,
+            b"NEWGROUPS" => RequestKind::NewGroups,
+        },
+        12 => {
+            b"CAPABILITIES" => RequestKind::Capabilities,
+        },
+    )
 }
 
 fn find_message_id(args: &[u8]) -> Option<(usize, usize)> {
