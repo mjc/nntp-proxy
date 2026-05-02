@@ -17,12 +17,7 @@ async fn write_request(
     stream: &mut ConnectionStream,
     request: &RequestContext,
 ) -> std::io::Result<()> {
-    stream.write_all(request.verb()).await?;
-    if !request.args().is_empty() {
-        stream.write_all(b" ").await?;
-        stream.write_all(request.args()).await?;
-    }
-    stream.write_all(b"\r\n").await
+    request.write_wire_to(stream).await
 }
 
 /// Type alias for the deadpool connection pool

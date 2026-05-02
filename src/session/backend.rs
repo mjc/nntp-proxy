@@ -220,15 +220,9 @@ impl BackendFirstResponse {
 /// Write a typed request to a backend without building a temporary command buffer.
 pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> Result<()>
 where
-    C: AsyncWriteExt + Unpin,
+    C: tokio::io::AsyncWrite + Unpin,
 {
-    conn.write_all(request.verb()).await?;
-    if !request.args().is_empty() {
-        conn.write_all(b" ").await?;
-        conn.write_all(request.args()).await?;
-    }
-    conn.write_all(b"\r\n").await?;
-    Ok(())
+    request.write_wire_to(conn).await.map_err(Into::into)
 }
 
 /// Send a typed request and read the first response chunk.
