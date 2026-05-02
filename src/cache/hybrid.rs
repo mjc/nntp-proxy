@@ -238,7 +238,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.payload_len())
+            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.payload_len().get())
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
@@ -398,8 +398,8 @@ impl HybridArticleCache {
                 self.cache.insert(key.clone(), updated);
                 debug!(
                     msg_id = %key,
-                    existing_bytes = existing_len,
-                    new_bytes = entry_len,
+                    existing_bytes = existing_len.get(),
+                    new_bytes = entry_len.get(),
                     "Hybrid cache upsert: preserved larger existing entry, updated availability"
                 );
                 return;
@@ -409,9 +409,9 @@ impl HybridArticleCache {
         entry.record_backend_has(backend_id);
         self.cache.insert(key.clone(), entry);
         if self.config.cache_articles {
-            debug!(msg_id = %key, stored_bytes = entry_len, tier = tier.get(), "Hybrid cache upsert");
+            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
         } else {
-            debug!(msg_id = %key, stored_bytes = entry_len, tier = tier.get(), "Hybrid cache upsert (stub)");
+            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert (stub)");
         }
     }
 
@@ -586,7 +586,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.payload_len())
+            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.payload_len().get())
             .storage()
             .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>);
 

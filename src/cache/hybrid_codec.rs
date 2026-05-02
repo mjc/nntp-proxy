@@ -391,7 +391,7 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
-    pub fn payload_len(&self) -> usize {
+    pub fn payload_len(&self) -> super::article::CachedPayloadLen {
         self.payload.len()
     }
 

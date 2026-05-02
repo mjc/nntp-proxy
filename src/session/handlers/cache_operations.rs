@@ -100,7 +100,7 @@ impl ClientSession {
                 "Client {} cache entry for {} is a stub (payload_len={}), fetching full article",
                 self.client_addr,
                 msg_id_ref,
-                cached.payload_len()
+                cached.payload_len().get()
             );
             request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));

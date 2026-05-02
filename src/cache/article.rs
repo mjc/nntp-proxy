@@ -35,6 +35,45 @@ impl From<u64> for CachedArticleNumber {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CachedPayloadLen(usize);
+
+impl CachedPayloadLen {
+    #[must_use]
+    pub const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for CachedPayloadLen {
+    fn from(value: usize) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for CachedPayloadLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+impl PartialEq<usize> for CachedPayloadLen {
+    fn eq(&self, other: &usize) -> bool {
+        self.get() == *other
+    }
+}
+
+impl PartialOrd<usize> for CachedPayloadLen {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        self.get().partial_cmp(other)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CachedPayload {
     Missing,
@@ -242,13 +281,14 @@ fn copy_part(out: &mut [u8], offset: &mut usize, part: &[u8]) {
 
 impl CachedPayload {
     #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
+    pub fn len(&self) -> CachedPayloadLen {
+        let len = match self {
             Self::Missing | Self::AvailabilityOnly | Self::Stat { .. } => 0,
             Self::Article { headers, body, .. } => headers.len() + body.len(),
             Self::Head { headers, .. } => headers.len(),
             Self::Body { body, .. } => body.len(),
-        }
+        };
+        CachedPayloadLen::new(len)
     }
 }
 
@@ -502,7 +542,7 @@ impl ArticleEntry {
     }
 
     #[must_use]
-    pub fn payload_len(&self) -> usize {
+    pub fn payload_len(&self) -> CachedPayloadLen {
         self.payload.len()
     }
 
@@ -727,7 +767,7 @@ impl ArticleCache {
                 const MOKA_OVERHEAD: usize = 2000;
 
                 let key_size = ARC_STR_OVERHEAD + key.len();
-                let buffer_size = PAYLOAD_OVERHEAD + entry.payload_len();
+                let buffer_size = PAYLOAD_OVERHEAD + entry.payload_len().get();
                 let base_size = key_size + buffer_size + ENTRY_STRUCT + MOKA_OVERHEAD;
 
                 // Stubs (availability-only entries) have higher relative overhead
