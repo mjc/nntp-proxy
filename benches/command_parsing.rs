@@ -25,9 +25,7 @@ macro_rules! bench_command {
 
             #[divan::bench(name = "classifier", sample_count = 1000, sample_size = 100)]
             fn classifier(bencher: Bencher) {
-                bencher.bench(|| {
-                    black_box(RequestLine::parse(black_box($command.as_bytes())))
-                });
+                bencher.bench(|| black_box(RequestLine::parse(black_box($command.as_bytes()))));
             }
         }
     };

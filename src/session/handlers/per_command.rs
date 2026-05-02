@@ -533,11 +533,11 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{RequestContext, ResponseWireLen, StatusCode};
+    use crate::protocol::{RequestContext, RequestLine, ResponseWireLen, StatusCode};
 
     #[test]
     fn local_response_records_typed_status_and_wire_len() {
-        let mut request = RequestContext::from_request_bytes(b"QUIT\r\n");
+        let mut request = RequestContext::from_request_line(RequestLine::parse(b"QUIT\r\n"));
 
         super::record_local_response(
             &mut request,

@@ -189,7 +189,7 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::RequestContext;
+    use crate::protocol::{RequestContext, RequestLine};
 
     #[test]
     fn test_error_messages_are_descriptive() {
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn stateful_initial_client_bytes_uses_typed_wire_len() {
-        let request = RequestContext::from_request_bytes(b"group alt.test\r\n");
+        let request = RequestContext::from_request_line(RequestLine::parse(b"group alt.test\r\n"));
 
         assert_eq!(
             super::stateful_initial_client_bytes(10, &request),

@@ -510,15 +510,20 @@ impl ClientSession {
 mod tests {
     use super::BackendAttemptResult;
     use super::classify_buffered_response_write_err;
-    use crate::protocol::{RequestResponseMetadata, ResponseWireLen, StatusCode};
+    use crate::protocol::{
+        RequestContext, RequestLine, RequestResponseMetadata, ResponseWireLen, StatusCode,
+    };
     use crate::types::BackendId;
+
+    fn request_context(line: &[u8]) -> RequestContext {
+        RequestContext::from_request_line(RequestLine::parse(line))
+    }
 
     #[test]
     fn backend_attempt_success_carries_backend_id() {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
-        let mut request =
-            crate::protocol::RequestContext::from_request_bytes(b"ARTICLE <test@example.com>\r\n");
+        let mut request = request_context(b"ARTICLE <test@example.com>\r\n");
         let result = BackendAttemptResult::success(&mut request, backend_id, response);
 
         match result {
@@ -535,8 +540,7 @@ mod tests {
     fn backend_attempt_success_records_request_context() {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
-        let mut request =
-            crate::protocol::RequestContext::from_request_bytes(b"ARTICLE <test@example.com>\r\n");
+        let mut request = request_context(b"ARTICLE <test@example.com>\r\n");
 
         let result = BackendAttemptResult::success(&mut request, backend_id, response);
 

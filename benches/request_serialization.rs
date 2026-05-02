@@ -144,12 +144,7 @@ mod response_shape {
     fn request_aware_shape(bencher: Bencher) {
         let cases = CASES
             .iter()
-            .map(|(line, status)| {
-                (
-                    request_context(line.as_bytes()),
-                    StatusCode::new(*status),
-                )
-            })
+            .map(|(line, status)| (request_context(line.as_bytes()), StatusCode::new(*status)))
             .collect::<Vec<_>>();
 
         bencher

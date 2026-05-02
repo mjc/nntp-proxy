@@ -416,11 +416,6 @@ impl RequestCacheEntryMetadata {
 
 impl RequestContext {
     #[must_use]
-    pub fn from_request_bytes(line: &[u8]) -> Self {
-        Self::from_request_line(RequestLine::parse(line))
-    }
-
-    #[must_use]
     pub fn from_request_line(line: RequestLine<'_>) -> Self {
         let verb = SmallVec::from_slice(line.verb());
         let args = SmallVec::from_slice(line.args());
@@ -916,9 +911,13 @@ mod tests {
         out
     }
 
+    fn request_context(line: &[u8]) -> RequestContext {
+        RequestContext::from_request_line(RequestLine::parse(line))
+    }
+
     #[test]
     fn typed_request_context_parses_message_id() {
-        let ctx = RequestContext::from_request_bytes(b"ARTICLE <a@b>\r\n");
+        let ctx = request_context(b"ARTICLE <a@b>\r\n");
         assert_eq!(ctx.kind(), RequestKind::Article);
         assert_eq!(ctx.request_wire_len(), RequestWireLen::new(15));
         assert_eq!(ctx.message_id(), Some("<a@b>"));
@@ -963,7 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_context_writes_wire_bytes_without_command_buffer() {
-        let ctx = RequestContext::from_request_bytes(b"BODY <a@b>\r\n");
+        let ctx = request_context(b"BODY <a@b>\r\n");
         let mut out = Vec::new();
 
         ctx.write_wire_to(&mut out).await.unwrap();
@@ -973,7 +972,7 @@ mod tests {
 
     #[test]
     fn typed_request_context_parses_request_bytes() {
-        let ctx = RequestContext::from_request_bytes(b"XFOO \xff\r\n");
+        let ctx = request_context(b"XFOO \xff\r\n");
 
         assert_eq!(ctx.kind(), RequestKind::Unknown);
         assert_eq!(ctx.verb(), b"XFOO");
@@ -984,7 +983,7 @@ mod tests {
 
     #[test]
     fn request_context_records_backend_response_when_known() {
-        let mut ctx = RequestContext::from_request_bytes(b"STAT <a@b>\r\n");
+        let mut ctx = request_context(b"STAT <a@b>\r\n");
         let backend_id = BackendId::from_index(2);
         let status = StatusCode::new(223);
 
@@ -1008,7 +1007,7 @@ mod tests {
 
     #[test]
     fn request_context_compares_chunked_response_payload_without_flattening() {
-        let mut ctx = RequestContext::from_request_bytes(b"STAT <a@b>\r\n");
+        let mut ctx = request_context(b"STAT <a@b>\r\n");
         let backend_id = BackendId::from_index(2);
         let pool = crate::pool::BufferPool::for_tests();
         let mut response = crate::pool::ChunkedResponse::default();
@@ -1031,7 +1030,7 @@ mod tests {
 
     #[test]
     fn request_context_records_cache_status_when_known() {
-        let mut ctx = RequestContext::from_request_bytes(b"BODY <a@b>\r\n");
+        let mut ctx = request_context(b"BODY <a@b>\r\n");
 
         ctx.record_cache_status(RequestCacheStatus::PartialHit);
 
@@ -1041,7 +1040,7 @@ mod tests {
 
     #[test]
     fn request_context_records_cache_entry_metadata_together() {
-        let mut ctx = RequestContext::from_request_bytes(b"ARTICLE <a@b>\r\n");
+        let mut ctx = request_context(b"ARTICLE <a@b>\r\n");
         let status = StatusCode::new(430);
         let availability = RequestCacheAvailability::from_bits(0b0000_0010, 0b0000_0010);
         let tier = RequestCacheTier::new(2);
@@ -1081,7 +1080,7 @@ mod tests {
 
     #[test]
     fn request_context_records_cache_response_when_served() {
-        let mut ctx = RequestContext::from_request_bytes(b"HEAD <a@b>\r\n");
+        let mut ctx = request_context(b"HEAD <a@b>\r\n");
         let backend_id = BackendId::from_index(1);
         let status = StatusCode::new(221);
 
@@ -1099,7 +1098,7 @@ mod tests {
 
     #[test]
     fn request_context_records_local_response_without_backend() {
-        let mut ctx = RequestContext::from_request_bytes(b"QUIT\r\n");
+        let mut ctx = request_context(b"QUIT\r\n");
         let status = StatusCode::new(205);
 
         ctx.record_local_response(RequestResponseMetadata::new(
@@ -1115,7 +1114,7 @@ mod tests {
 
     #[test]
     fn unknown_extensions_are_stateful() {
-        let ctx = RequestContext::from_request_bytes(b"XFOO arg\r\n");
+        let ctx = request_context(b"XFOO arg\r\n");
         assert_eq!(ctx.kind(), RequestKind::Unknown);
         assert_eq!(ctx.route_class(), RequestRouteClass::Stateful);
     }
@@ -1153,7 +1152,7 @@ mod tests {
 
         for (line, expected) in cases {
             assert_eq!(
-                RequestContext::from_request_bytes(line.as_bytes()).kind(),
+                RequestLine::parse(line.as_bytes()).kind(),
                 expected,
                 "{line}"
             );
@@ -1180,7 +1179,7 @@ mod tests {
 
         for (line, expected) in cases {
             assert_eq!(
-                RequestContext::from_request_bytes(line.as_bytes()).route_class(),
+                RequestLine::parse(line.as_bytes()).route_class(),
                 expected,
                 "{line}"
             );
@@ -1189,8 +1188,8 @@ mod tests {
 
     #[test]
     fn request_aware_response_shape() {
-        let group = RequestContext::from_request_bytes(b"GROUP alt.test\r\n");
-        let listgroup = RequestContext::from_request_bytes(b"LISTGROUP alt.test\r\n");
+        let group = request_context(b"GROUP alt.test\r\n");
+        let listgroup = request_context(b"LISTGROUP alt.test\r\n");
         assert_eq!(
             group.response_shape(StatusCode::new(211)),
             ResponseShape::SingleLine
@@ -1200,8 +1199,7 @@ mod tests {
             ResponseShape::Multiline
         );
         assert_eq!(
-            RequestContext::from_request_bytes(b"ARTICLE <x@y>\r\n")
-                .response_shape(StatusCode::new(430)),
+            request_context(b"ARTICLE <x@y>\r\n").response_shape(StatusCode::new(430)),
             ResponseShape::SingleLine
         );
     }

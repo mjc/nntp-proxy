@@ -59,6 +59,7 @@ pub fn decide_request_routing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::RequestLine;
 
     fn decide_command_routing(
         command: &str,
@@ -66,7 +67,7 @@ mod tests {
         auth_enabled: bool,
         routing_mode: RoutingMode,
     ) -> CommandRoutingDecision {
-        let request = RequestContext::from_request_bytes(command.as_bytes());
+        let request = RequestContext::from_request_line(RequestLine::parse(command.as_bytes()));
         decide_request_routing(&request, is_authenticated, auth_enabled, routing_mode)
     }
 
@@ -240,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_decide_request_routing_unknown_extensions_are_stateful() {
-        let request = RequestContext::from_request_bytes(b"XFOO arg\r\n");
+        let request = RequestContext::from_request_line(RequestLine::parse(b"XFOO arg\r\n"));
         assert_eq!(
             decide_request_routing(&request, true, false, RoutingMode::Hybrid),
             CommandRoutingDecision::SwitchToStateful

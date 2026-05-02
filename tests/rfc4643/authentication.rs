@@ -15,12 +15,12 @@ use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{CommandAction, CommandHandler};
 use nntp_proxy::config::RoutingMode;
-use nntp_proxy::protocol::RequestContext;
+use nntp_proxy::protocol::{RequestContext, RequestLine};
 use nntp_proxy::session::ClientSession;
 
 fn classify(command: &str) -> CommandAction<'static> {
-    let request = Box::leak(Box::new(RequestContext::from_request_bytes(
-        command.as_bytes(),
+    let request = Box::leak(Box::new(RequestContext::from_request_line(
+        RequestLine::parse(command.as_bytes()),
     )));
     CommandHandler::classify_request(request)
 }

@@ -258,8 +258,9 @@ async fn read_full_response(
     result_buf: &mut crate::pool::ChunkedResponse,
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
-    let request =
-        crate::protocol::RequestContext::from_request_bytes(b"ARTICLE <test@example>\r\n");
+    let request = crate::protocol::RequestContext::from_request_line(
+        crate::protocol::RequestLine::parse(b"ARTICLE <test@example>\r\n"),
+    );
     crate::session::streaming::read_full_response_for_request(
         &request,
         buffer,
@@ -288,6 +289,7 @@ fn fail_batch(mut batch: Vec<QueuedContext>, error: PipelineError) -> Vec<Queued
 mod tests {
     use super::*;
     use crate::pool::BufferPool;
+    use crate::protocol::{RequestContext, RequestLine};
     use crate::router::backend_queue::PipelineResponse;
     use crate::stream::ConnectionStream;
     use proptest::prelude::*;
@@ -302,12 +304,13 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedContext::new(
-                crate::protocol::RequestContext::from_request_bytes(command.as_bytes()),
-                tx,
-            ),
+            QueuedContext::new(request_context(command.as_bytes()), tx),
             rx,
         )
+    }
+
+    fn request_context(line: &[u8]) -> RequestContext {
+        RequestContext::from_request_line(RequestLine::parse(line))
     }
 
     fn expect_success_status(response: PipelineResponse) -> u16 {
