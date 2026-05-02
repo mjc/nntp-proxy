@@ -19,14 +19,13 @@ use tracing::debug;
 /// Result of a cache lookup attempt in `try_serve_from_cache`.
 ///
 /// Distinguishes between a full cache hit (response served), a partial hit
-/// (entry existed but wasn't servable — availability info is available),
-/// and a complete miss (no entry in cache at all).
+/// (entry existed but wasn't servable), and a complete miss (no entry in cache
+/// at all). Cache metadata is recorded on the request context.
 pub(super) enum CacheLookupResult {
     /// Response was served directly from cache.
     Hit,
-    /// Entry existed but wasn't servable. Carries the availability info
-    /// so callers can skip a redundant `cache.get()`.
-    PartialHit(ArticleAvailability),
+    /// Entry existed but wasn't servable; availability metadata is recorded on the request.
+    PartialHit,
     /// No entry in cache at all.
     Miss,
 }
@@ -35,7 +34,7 @@ impl ClientSession {
     /// Try to serve from cache
     ///
     /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but
-    /// wasn't servable (carries availability to avoid a redundant lookup), or `Miss`.
+    /// wasn't servable, or `Miss`.
     pub(super) async fn try_serve_from_cache(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
@@ -70,7 +69,7 @@ impl ClientSession {
                 msg_id_ref
             );
             request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit(availability));
+            return Ok(CacheLookupResult::PartialHit);
         }
 
         debug!(
@@ -90,7 +89,7 @@ impl ClientSession {
                 );
             }
             request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit(availability));
+            return Ok(CacheLookupResult::PartialHit);
         }
 
         // Check if this is a complete article we can serve
@@ -106,7 +105,7 @@ impl ClientSession {
                 cached.payload_len().get()
             );
             request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit(availability));
+            return Ok(CacheLookupResult::PartialHit);
         }
 
         // Serve from cache, avoiding buffer copies for the common path.
@@ -120,14 +119,14 @@ impl ClientSession {
                 String::from_utf8_lossy(cmd_verb)
             );
             request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit(availability));
+            return Ok(CacheLookupResult::PartialHit);
         }
 
         let Some(write) =
             write_cached_article_response(client_write, &cached, cmd_verb, msg_id_ref).await?
         else {
             request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit(availability));
+            return Ok(CacheLookupResult::PartialHit);
         };
         *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len.get());
 
@@ -459,7 +458,7 @@ mod tests {
             .await
             .expect("lookup succeeds");
 
-        assert!(matches!(result, CacheLookupResult::PartialHit(_)));
+        assert!(matches!(result, CacheLookupResult::PartialHit));
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::PartialHit));
         assert_eq!(
             request

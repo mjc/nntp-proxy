@@ -453,7 +453,7 @@ impl ClientSession {
         );
 
         // Try cache first - may return early if cache hit.
-        // On partial hit, we get availability info to avoid a redundant cache.get() later.
+        // On partial hit, the request carries availability info to avoid a redundant cache.get().
         let cached_availability = match self
             .try_serve_from_cache(
                 msg_id.as_ref(),
@@ -469,7 +469,12 @@ impl ClientSession {
                     .backend_id()
                     .expect("cache hit records selected backend id"));
             }
-            CacheLookupResult::PartialHit(availability) => Some(availability),
+            CacheLookupResult::PartialHit => request.cache_availability().map(|availability| {
+                crate::cache::ArticleAvailability::from_bits(
+                    availability.checked_bits(),
+                    availability.missing_bits(),
+                )
+            }),
             CacheLookupResult::Miss => None,
         };
 
