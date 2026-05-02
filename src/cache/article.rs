@@ -462,16 +462,6 @@ impl ArticleEntry {
             .map(|response| response.to_vec())
     }
 
-    #[must_use]
-    pub fn response_for_command_bytes(
-        &self,
-        cmd_verb: &[u8],
-        message_id: &crate::types::MessageId<'_>,
-    ) -> Option<Vec<u8>> {
-        self.response_parts_for_command_bytes(cmd_verb, message_id.as_str())
-            .map(|response| response.to_vec())
-    }
-
     /// Check if this entry can serve a given command type
     ///
     /// Simpler version of `response_for_command` for boolean checks.
