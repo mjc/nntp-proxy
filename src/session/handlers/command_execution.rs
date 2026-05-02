@@ -3,7 +3,7 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and streaming multiline responses to clients.
 
-use crate::protocol::{RequestContext, RequestResponseMetadata};
+use crate::protocol::{RequestContext, RequestResponseMetadata, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
 use crate::session::retry::retry_once;
@@ -66,7 +66,7 @@ pub(super) struct ArticleAttemptState<'a> {
 struct ResponseStreamParams<'a> {
     request: &'a RequestContext,
     msg_id: Option<&'a crate::types::MessageId<'a>>,
-    response_code: &'a crate::protocol::NntpResponse,
+    status_code: StatusCode,
     is_multiline: bool,
     first_chunk: &'a [u8],
 }
@@ -120,7 +120,7 @@ impl ClientSession {
         *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request.wire_len());
 
         // Reject invalid responses - never forward garbage to client
-        if cmd_response.response == crate::protocol::NntpResponse::Invalid {
+        let Some(status_code) = cmd_response.status_code() else {
             // Safely clamp buffer slice to prevent panic on out-of-bounds bytes_read
             let bytes_to_read = cmd_response.bytes_read.min(state.buffer.len());
 
@@ -157,11 +157,11 @@ impl ClientSession {
 
             // guard drops here → complete_command called automatically
             return Ok(BackendAttemptResult::BackendUnavailable);
-        }
+        };
 
         // Handle 430 - article not found
         // Note: response is already read into buffer, keeping connection clean
-        if cmd_response.response.is_430() {
+        if status_code.as_u16() == 430 {
             self.handle_430_availability(backend_id, state.availability);
             let _ = conn.release(); // connection is healthy; return to pool
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
@@ -191,7 +191,7 @@ impl ClientSession {
                 ResponseStreamParams {
                     request,
                     msg_id,
-                    response_code: &cmd_response.response,
+                    status_code,
                     is_multiline: cmd_response.is_multiline,
                     first_chunk: &state.buffer[..cmd_response.bytes_read],
                 },
@@ -244,7 +244,7 @@ impl ClientSession {
         );
         self.record_response_metrics(
             backend_id,
-            cmd_response.response,
+            status_code,
             cmd_response.is_multiline,
             request.wire_len() as u64,
             bytes_written,
@@ -266,12 +266,7 @@ impl ClientSession {
 
         Ok(BackendAttemptResult::success(
             backend_id,
-            RequestResponseMetadata::new(
-                cmd_response
-                    .status_code()
-                    .expect("valid streamed response has status code"),
-                (bytes_written as usize).into(),
-            ),
+            RequestResponseMetadata::new(status_code, (bytes_written as usize).into()),
         ))
     }
 
@@ -339,18 +334,7 @@ impl ClientSession {
         ctx: &streaming::StreamContext<'_>,
         params: ResponseStreamParams<'_>,
     ) -> Result<u64, StreamingError> {
-        // SAFETY: Caller must validate response before calling this function.
-        // An invalid response (code 0) should never reach here.
-        let status_code = params
-            .response_code
-            .status_code()
-            .ok_or_else(|| {
-                // This should never happen - caller should reject Invalid responses
-                tracing::error!("BUG: stream_response_to_client called with Invalid response");
-                anyhow::anyhow!("Cannot stream invalid response")
-            })
-            .map_err(StreamingError::Io)?;
-        let code = status_code.as_u16();
+        let code = params.status_code.as_u16();
 
         let cache_action = determine_cache_action_for_request(
             params.request,
@@ -493,20 +477,18 @@ impl ClientSession {
     fn record_response_metrics(
         &self,
         backend_id: crate::types::BackendId,
-        response_code: crate::protocol::NntpResponse,
+        status_code: StatusCode,
         is_multiline: bool,
         cmd_bytes: u64,
         resp_bytes: u64,
     ) {
         use crate::types::MetricsBytes;
 
-        if let Some(code) = response_code.status_code() {
-            match determine_metrics_action(code.as_u16(), is_multiline) {
-                MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
-                MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
-                MetricsAction::Article => self.metrics.record_article(backend_id, resp_bytes),
-                MetricsAction::None => {}
-            }
+        match determine_metrics_action(status_code.as_u16(), is_multiline) {
+            MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+            MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+            MetricsAction::Article => self.metrics.record_article(backend_id, resp_bytes),
+            MetricsAction::None => {}
         }
 
         let cmd_bytes_metric = MetricsBytes::new(cmd_bytes);
