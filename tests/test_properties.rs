@@ -486,7 +486,7 @@ proptest! {
     }
 
     #[test]
-    fn prop_nntp_response_multiline_is_response_categorization(code in 100u16..=599u16) {
+    fn prop_nntp_response_multiline_is_status_categorization(code in 100u16..=599u16) {
         let formatted = format!("{code:03} text\r\n");
         let response = NntpResponse::parse(formatted.as_bytes());
 
@@ -495,9 +495,9 @@ proptest! {
                 code,
                 100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
             );
-            prop_assert_eq!(response.is_multiline(), expected,
+            prop_assert_eq!(response.status_implies_multiline(), expected,
                 "Multiline categorization mismatch for code {}: response={}",
-                code, response.is_multiline());
+                code, response.status_implies_multiline());
         }
     }
 
@@ -804,7 +804,7 @@ proptest! {
             "Code {} should parse as backend status",
             code
         );
-        prop_assert!(NntpResponse::parse(data).is_multiline(),
+        prop_assert!(NntpResponse::parse(data).status_implies_multiline(),
             "Code {} should be categorized as multiline", code);
 
         // Terminator detection should find the real terminator, not a false positive

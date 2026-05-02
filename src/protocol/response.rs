@@ -177,16 +177,6 @@ impl NntpResponse {
         }
     }
 
-    /// Check if this response type is multiline
-    ///
-    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
-    /// multiline responses require special handling with terminator detection.
-    #[inline]
-    #[must_use]
-    pub const fn is_multiline(&self) -> bool {
-        matches!(self, Self::MultilineData(_))
-    }
-
     /// Check whether this status code category normally carries multiline data.
     ///
     /// Request-aware paths should prefer [`RequestContext::response_shape`](crate::protocol::RequestContext::response_shape)
@@ -281,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_288_xfeature_compress_gzip_is_multiline() {
+    fn test_288_xfeature_compress_gzip_status_implies_multiline() {
         // 288 is returned by XFEATURE COMPRESS GZIP — enables compression.
         // The response is multiline (compressed data stream follows).
         assert!(matches!(
@@ -384,11 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn test_response_is_multiline() {
-        assert!(NntpResponse::parse(b"220 Article\r\n").is_multiline());
-        assert!(NntpResponse::parse(b"215 LIST\r\n").is_multiline());
-        assert!(!NntpResponse::parse(b"200 OK\r\n").is_multiline());
-        assert!(!NntpResponse::parse(b"211 Group\r\n").is_multiline());
+    fn test_response_status_implies_multiline() {
+        assert!(NntpResponse::parse(b"220 Article\r\n").status_implies_multiline());
+        assert!(NntpResponse::parse(b"215 LIST\r\n").status_implies_multiline());
+        assert!(!NntpResponse::parse(b"200 OK\r\n").status_implies_multiline());
+        assert!(!NntpResponse::parse(b"211 Group\r\n").status_implies_multiline());
     }
 
     #[test]

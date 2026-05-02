@@ -253,7 +253,7 @@ fn test_error_response_not_multiline() {
         let data = format!("{code} Error\r\n");
         let response = NntpResponse::parse(data.as_bytes());
         assert!(
-            !response.is_multiline(),
+            !response.status_implies_multiline(),
             "Error code {code} should not be multiline"
         );
     }

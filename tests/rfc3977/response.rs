@@ -166,21 +166,21 @@ fn test_response_383_sasl_continue() {
 fn test_response_100_help_text() {
     let code = StatusCode::new(100);
     assert!(code.is_informational());
-    assert!(NntpResponse::parse(b"100 Help\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"100 Help\r\n").status_implies_multiline());
 }
 
 #[test]
 fn test_response_101_capability_list() {
     let code = StatusCode::new(101);
     assert!(code.is_informational());
-    assert!(NntpResponse::parse(b"101 Capability list\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"101 Capability list\r\n").status_implies_multiline());
 }
 
 #[test]
 fn test_response_111_server_date() {
     let code = StatusCode::new(111);
     assert!(code.is_informational());
-    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").status_implies_multiline());
 }
 
 // StatusCode::parse() tests
@@ -327,8 +327,8 @@ fn test_response_auth_required_480() {
 
 #[test]
 fn test_response_multiline_1xx() {
-    assert!(NntpResponse::parse(b"100 Help\r\n").is_multiline());
-    assert!(NntpResponse::parse(b"101 Capabilities\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"100 Help\r\n").status_implies_multiline());
+    assert!(NntpResponse::parse(b"101 Capabilities\r\n").status_implies_multiline());
 }
 
 #[test]
@@ -337,7 +337,7 @@ fn test_response_multiline_specific_2xx() {
     for code in multiline_codes {
         let data = format!("{code} Test\r\n");
         assert!(
-            NntpResponse::parse(data.as_bytes()).is_multiline(),
+            NntpResponse::parse(data.as_bytes()).status_implies_multiline(),
             "Code {code} should be multiline"
         );
     }
@@ -350,7 +350,7 @@ fn test_response_non_multiline_2xx() {
     for code in non_multiline {
         let data = format!("{code} Test\r\n");
         assert!(
-            !NntpResponse::parse(data.as_bytes()).is_multiline(),
+            !NntpResponse::parse(data.as_bytes()).status_implies_multiline(),
             "Code {code} should not be multiline"
         );
     }
@@ -418,21 +418,21 @@ fn test_response_status_code_extraction() {
 #[test]
 fn test_response_multiline_detection() {
     // HELP and CAPABILITIES are multiline, but DATE is single-line.
-    assert!(NntpResponse::parse(b"100 Help\r\n").is_multiline());
-    assert!(NntpResponse::parse(b"101 Capability list\r\n").is_multiline());
-    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").is_multiline());
-    assert!(!NntpResponse::parse(b"199 Other informational\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"100 Help\r\n").status_implies_multiline());
+    assert!(NntpResponse::parse(b"101 Capability list\r\n").status_implies_multiline());
+    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").status_implies_multiline());
+    assert!(!NntpResponse::parse(b"199 Other informational\r\n").status_implies_multiline());
 
     // Specific 2xx multiline codes
-    assert!(NntpResponse::parse(b"220 Article\r\n").is_multiline());
-    assert!(NntpResponse::parse(b"221 Headers\r\n").is_multiline());
-    assert!(NntpResponse::parse(b"222 Body\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"220 Article\r\n").status_implies_multiline());
+    assert!(NntpResponse::parse(b"221 Headers\r\n").status_implies_multiline());
+    assert!(NntpResponse::parse(b"222 Body\r\n").status_implies_multiline());
 
     // Non-multiline
-    assert!(!NntpResponse::parse(b"200 Posting allowed\r\n").is_multiline());
-    assert!(!NntpResponse::parse(b"211 Group selected\r\n").is_multiline());
-    assert!(!NntpResponse::parse(b"400 Temporary failure\r\n").is_multiline());
-    assert!(!NntpResponse::parse(b"500 Syntax error\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"200 Posting allowed\r\n").status_implies_multiline());
+    assert!(!NntpResponse::parse(b"211 Group selected\r\n").status_implies_multiline());
+    assert!(!NntpResponse::parse(b"400 Temporary failure\r\n").status_implies_multiline());
+    assert!(!NntpResponse::parse(b"500 Syntax error\r\n").status_implies_multiline());
 }
 
 // Response with multiline content
