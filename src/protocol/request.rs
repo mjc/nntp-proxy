@@ -214,6 +214,16 @@ impl RequestContext {
     }
 
     #[inline]
+    pub const fn record_cache_entry_metadata(
+        &mut self,
+        status: StatusCode,
+        availability: RequestCacheAvailability,
+    ) {
+        self.cache_entry_status = Some(status);
+        self.cache_availability = Some(availability);
+    }
+
+    #[inline]
     #[must_use]
     pub const fn response_status(&self) -> Option<StatusCode> {
         self.response_status
@@ -516,6 +526,20 @@ mod tests {
         ctx.record_cache_entry_status(status);
 
         assert_eq!(ctx.cache_entry_status(), Some(status));
+        assert_eq!(ctx.response_status(), None);
+        assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_cache_entry_metadata_together() {
+        let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
+        let status = StatusCode::new(430);
+        let availability = RequestCacheAvailability::from_bits(0b0000_0010, 0b0000_0010);
+
+        ctx.record_cache_entry_metadata(status, availability);
+
+        assert_eq!(ctx.cache_entry_status(), Some(status));
+        assert_eq!(ctx.cache_availability(), Some(availability));
         assert_eq!(ctx.response_status(), None);
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }

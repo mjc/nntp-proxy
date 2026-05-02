@@ -61,9 +61,8 @@ impl ClientSession {
 
         // Extract availability before any early returns so we can pass it back
         let availability = cached.to_availability(router.backend_count());
-        request.record_cache_availability(cache_availability_metadata(&availability));
         if let Some(status) = cached.status_code() {
-            request.record_cache_entry_status(status);
+            request.record_cache_entry_metadata(status, cache_availability_metadata(&availability));
         }
 
         if !cached.has_availability_info() {
