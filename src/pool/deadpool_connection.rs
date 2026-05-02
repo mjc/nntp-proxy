@@ -5,12 +5,25 @@
 
 use deadpool::managed;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
-use crate::protocol::{authinfo_pass, authinfo_user};
+use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
+
+async fn write_request(
+    stream: &mut ConnectionStream,
+    request: &RequestContext,
+) -> std::io::Result<()> {
+    stream.write_all(request.verb()).await?;
+    if !request.args().is_empty() {
+        stream.write_all(b" ").await?;
+        stream.write_all(request.args()).await?;
+    }
+    stream.write_all(b"\r\n").await
+}
 
 /// Type alias for the deadpool connection pool
 pub type Pool = managed::Pool<TcpManager>;
@@ -176,8 +189,6 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<(), ConnectionError> {
-        use tokio::io::AsyncReadExt;
-
         let n = stream.read(buffer).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
@@ -205,8 +216,6 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<(), ConnectionError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         stream.write_all(b"MODE READER\r\n").await?;
         stream.flush().await?;
 
@@ -238,8 +247,6 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<bool, ConnectionError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         if self.compress == Some(false) {
             return Ok(false);
         }
@@ -282,13 +289,11 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<(), ConnectionError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let Some(username) = &self.username else {
             return Ok(());
         };
 
-        stream.write_all(authinfo_user(username).as_bytes()).await?;
+        write_request(stream, &authinfo_user(username)).await?;
         let n = stream.read(buffer).await?;
         let response = &buffer[..n];
         let response_str = String::from_utf8_lossy(response);
@@ -304,7 +309,7 @@ impl TcpManager {
                 });
             };
 
-            stream.write_all(authinfo_pass(password).as_bytes()).await?;
+            write_request(stream, &authinfo_pass(password)).await?;
             let n = stream.read(buffer).await?;
             let response = &buffer[..n];
             let response_str = String::from_utf8_lossy(response);

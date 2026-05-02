@@ -344,6 +344,29 @@ impl RequestContext {
         }
     }
 
+    #[must_use]
+    pub fn from_verb_arg_slices(verb: &[u8], args: &[&[u8]]) -> Self {
+        let verb = SmallVec::from_slice(verb);
+        let arg_len = args.iter().map(|part| part.len()).sum();
+        let mut joined_args = SmallVec::<[u8; 512]>::with_capacity(arg_len);
+        args.iter()
+            .for_each(|part| joined_args.extend_from_slice(part));
+        let kind = classify_verb(&verb);
+        let message_id = find_message_id(&joined_args);
+
+        Self {
+            kind,
+            verb,
+            args: joined_args,
+            message_id,
+            cache_status: None,
+            cache_entry: None,
+            backend_id: None,
+            response: None,
+            response_payload: None,
+        }
+    }
+
     #[inline]
     #[must_use]
     pub const fn kind(&self) -> RequestKind {

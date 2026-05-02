@@ -12,22 +12,22 @@ pub const QUIT: &[u8] = b"QUIT\r\n";
 /// COMPRESS DEFLATE command (RFC 8054 §2.2)
 pub const COMPRESS_DEFLATE: &[u8] = b"COMPRESS DEFLATE\r\n";
 
-/// Construct AUTHINFO USER command (RFC 4643 Section 2.3)
+/// Construct AUTHINFO USER request (RFC 4643 Section 2.3)
 ///
-/// Returns a properly formatted AUTHINFO USER command with CRLF termination.
+/// Returns a typed request context with verb `AUTHINFO` and args `USER <username>`.
 #[inline]
 #[must_use]
-pub fn authinfo_user(username: &str) -> String {
-    format!("AUTHINFO USER {username}\r\n")
+pub fn authinfo_user(username: &str) -> RequestContext {
+    RequestContext::from_verb_arg_slices(b"AUTHINFO", &[b"USER ", username.as_bytes()])
 }
 
-/// Construct AUTHINFO PASS command (RFC 4643 Section 2.4)
+/// Construct AUTHINFO PASS request (RFC 4643 Section 2.4)
 ///
-/// Returns a properly formatted AUTHINFO PASS command with CRLF termination.
+/// Returns a typed request context with verb `AUTHINFO` and args `PASS <password>`.
 #[inline]
 #[must_use]
-pub fn authinfo_pass(password: &str) -> String {
-    format!("AUTHINFO PASS {password}\r\n")
+pub fn authinfo_pass(password: &str) -> RequestContext {
+    RequestContext::from_verb_arg_slices(b"AUTHINFO", &[b"PASS ", password.as_bytes()])
 }
 
 #[inline]
@@ -91,49 +91,63 @@ mod tests {
 
     #[test]
     fn test_authinfo_user() {
-        assert_eq!(authinfo_user("testuser"), "AUTHINFO USER testuser\r\n");
-        assert_eq!(authinfo_user(""), "AUTHINFO USER \r\n");
+        assert_eq!(
+            wire(&authinfo_user("testuser")),
+            b"AUTHINFO USER testuser\r\n"
+        );
+        assert_eq!(wire(&authinfo_user("")), b"AUTHINFO USER \r\n");
+        assert_eq!(
+            authinfo_user("testuser").kind(),
+            crate::protocol::RequestKind::AuthInfo
+        );
     }
 
     #[test]
     fn test_authinfo_user_special_chars() {
         assert_eq!(
-            authinfo_user("user@example.com"),
-            "AUTHINFO USER user@example.com\r\n"
+            wire(&authinfo_user("user@example.com")),
+            b"AUTHINFO USER user@example.com\r\n"
         );
     }
 
     #[test]
     fn test_authinfo_user_spaces() {
         assert_eq!(
-            authinfo_user("user with spaces"),
-            "AUTHINFO USER user with spaces\r\n"
+            wire(&authinfo_user("user with spaces")),
+            b"AUTHINFO USER user with spaces\r\n"
         );
     }
 
     #[test]
     fn test_authinfo_pass() {
-        assert_eq!(authinfo_pass("secret"), "AUTHINFO PASS secret\r\n");
-        assert_eq!(authinfo_pass(""), "AUTHINFO PASS \r\n");
+        assert_eq!(wire(&authinfo_pass("secret")), b"AUTHINFO PASS secret\r\n");
+        assert_eq!(wire(&authinfo_pass("")), b"AUTHINFO PASS \r\n");
+        assert_eq!(
+            authinfo_pass("secret").kind(),
+            crate::protocol::RequestKind::AuthInfo
+        );
     }
 
     #[test]
     fn test_authinfo_pass_special_chars() {
         assert_eq!(
-            authinfo_pass("p@ssw0rd!#$"),
-            "AUTHINFO PASS p@ssw0rd!#$\r\n"
+            wire(&authinfo_pass("p@ssw0rd!#$")),
+            b"AUTHINFO PASS p@ssw0rd!#$\r\n"
         );
     }
 
     #[test]
     fn test_authinfo_pass_spaces() {
-        assert_eq!(authinfo_pass("pass word"), "AUTHINFO PASS pass word\r\n");
+        assert_eq!(
+            wire(&authinfo_pass("pass word")),
+            b"AUTHINFO PASS pass word\r\n"
+        );
     }
 
     #[test]
     fn test_authinfo_crlf_termination() {
-        assert!(authinfo_user("user").ends_with("\r\n"));
-        assert!(authinfo_pass("pass").ends_with("\r\n"));
+        assert!(wire(&authinfo_user("user")).ends_with(b"\r\n"));
+        assert!(wire(&authinfo_pass("pass")).ends_with(b"\r\n"));
     }
 
     #[test]
@@ -174,8 +188,8 @@ mod tests {
 
     #[test]
     fn test_commands_end_with_crlf() {
-        assert!(authinfo_user("test").ends_with("\r\n"));
-        assert!(authinfo_pass("test").ends_with("\r\n"));
+        assert!(wire(&authinfo_user("test")).ends_with(b"\r\n"));
+        assert!(wire(&authinfo_pass("test")).ends_with(b"\r\n"));
         assert!(wire(&article_request(&msgid("<test@example.com>"))).ends_with(b"\r\n"));
         assert!(wire(&body_request(&msgid("<test@example.com>"))).ends_with(b"\r\n"));
         assert!(wire(&head_request(&msgid("<test@example.com>"))).ends_with(b"\r\n"));

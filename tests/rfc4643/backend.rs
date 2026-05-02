@@ -4,10 +4,27 @@
 
 use anyhow::Result;
 use nntp_proxy::pool::BufferPool;
-use nntp_proxy::protocol::{NntpResponse, authinfo_pass, authinfo_user};
+use nntp_proxy::protocol::{NntpResponse, RequestContext, authinfo_pass, authinfo_user};
 use nntp_proxy::types::BufferSize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+fn command_wire(request: &RequestContext) -> Vec<u8> {
+    let mut out = Vec::with_capacity(request.wire_len());
+    out.extend_from_slice(request.verb());
+    if !request.args().is_empty() {
+        out.push(b' ');
+        out.extend_from_slice(request.args());
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+async fn write_command(stream: &mut TcpStream, request: &RequestContext) -> Result<()> {
+    let command = command_wire(request);
+    stream.write_all(&command).await?;
+    Ok(())
+}
 
 /// Mock NNTP server for testing authentication
 struct MockAuthServer {
@@ -241,7 +258,7 @@ fn test_is_greeting_rejects_others() {
 #[test]
 fn test_authinfo_user_formatting() {
     let command = authinfo_user("testuser");
-    assert_eq!(command, "AUTHINFO USER testuser\r\n");
+    assert_eq!(command_wire(&command), b"AUTHINFO USER testuser\r\n");
 }
 
 /// Test `authinfo_user` with various usernames
@@ -255,7 +272,7 @@ fn test_authinfo_user_variations() {
     ];
 
     for (username, expected) in &test_cases {
-        assert_eq!(authinfo_user(username), *expected);
+        assert_eq!(command_wire(&authinfo_user(username)), expected.as_bytes());
     }
 }
 
@@ -263,14 +280,14 @@ fn test_authinfo_user_variations() {
 #[test]
 fn test_authinfo_user_empty() {
     let command = authinfo_user("");
-    assert_eq!(command, "AUTHINFO USER \r\n");
+    assert_eq!(command_wire(&command), b"AUTHINFO USER \r\n");
 }
 
 /// Test `authinfo_pass` command formatting
 #[test]
 fn test_authinfo_pass_formatting() {
     let command = authinfo_pass("testpass");
-    assert_eq!(command, "AUTHINFO PASS testpass\r\n");
+    assert_eq!(command_wire(&command), b"AUTHINFO PASS testpass\r\n");
 }
 
 /// Test `authinfo_pass` with various passwords
@@ -284,7 +301,7 @@ fn test_authinfo_pass_variations() {
     ];
 
     for (password, expected) in &test_cases {
-        assert_eq!(authinfo_pass(password), *expected);
+        assert_eq!(command_wire(&authinfo_pass(password)), expected.as_bytes());
     }
 }
 
@@ -292,7 +309,7 @@ fn test_authinfo_pass_variations() {
 #[test]
 fn test_authinfo_pass_empty() {
     let command = authinfo_pass("");
-    assert_eq!(command, "AUTHINFO PASS \r\n");
+    assert_eq!(command_wire(&command), b"AUTHINFO PASS \r\n");
 }
 
 /// Test buffer pool creation and usage
@@ -356,9 +373,7 @@ async fn test_auth_flow_success_with_password() -> Result<()> {
     ));
 
     // Send AUTHINFO USER
-    stream
-        .write_all(authinfo_user("testuser").as_bytes())
-        .await?;
+    write_command(&mut stream, &authinfo_user("testuser")).await?;
 
     // Read 381 response
     let n = stream.read(&mut buf).await?;
@@ -368,9 +383,7 @@ async fn test_auth_flow_success_with_password() -> Result<()> {
     ));
 
     // Send AUTHINFO PASS
-    stream
-        .write_all(authinfo_pass("testpass").as_bytes())
-        .await?;
+    write_command(&mut stream, &authinfo_pass("testpass")).await?;
 
     // Read 281 response
     let n = stream.read(&mut buf).await?;
@@ -407,9 +420,7 @@ async fn test_auth_flow_success_username_only() -> Result<()> {
     ));
 
     // Send AUTHINFO USER
-    stream
-        .write_all(authinfo_user("testuser").as_bytes())
-        .await?;
+    write_command(&mut stream, &authinfo_user("testuser")).await?;
 
     // Should get immediate 281 success
     let n = stream.read(&mut buf).await?;
@@ -446,9 +457,7 @@ async fn test_auth_flow_failure() -> Result<()> {
     ));
 
     // Send AUTHINFO USER
-    stream
-        .write_all(authinfo_user("baduser").as_bytes())
-        .await?;
+    write_command(&mut stream, &authinfo_user("baduser")).await?;
 
     // Read 381
     let n = stream.read(&mut buf).await?;
@@ -458,9 +467,7 @@ async fn test_auth_flow_failure() -> Result<()> {
     ));
 
     // Send AUTHINFO PASS
-    stream
-        .write_all(authinfo_pass("badpass").as_bytes())
-        .await?;
+    write_command(&mut stream, &authinfo_pass("badpass")).await?;
 
     // Should get 481 failure
     let n = stream.read(&mut buf).await?;
@@ -499,9 +506,7 @@ async fn test_auth_flow_unexpected_response() -> Result<()> {
     ));
 
     // Send AUTHINFO USER
-    stream
-        .write_all(authinfo_user("testuser").as_bytes())
-        .await?;
+    write_command(&mut stream, &authinfo_user("testuser")).await?;
 
     // Should get unexpected 500 response (not 281 or 381)
     let n = stream.read(&mut buf).await?;
@@ -612,12 +617,26 @@ fn test_response_parsing_whitespace() {
 #[test]
 fn test_command_formatting_crlf() {
     let user_cmd = authinfo_user("test");
-    assert!(user_cmd.ends_with("\r\n"));
-    assert_eq!(user_cmd.matches("\r\n").count(), 1);
+    let user_wire = command_wire(&user_cmd);
+    assert!(user_wire.ends_with(b"\r\n"));
+    assert_eq!(
+        user_wire
+            .windows(2)
+            .filter(|window| *window == b"\r\n")
+            .count(),
+        1
+    );
 
     let pass_cmd = authinfo_pass("test");
-    assert!(pass_cmd.ends_with("\r\n"));
-    assert_eq!(pass_cmd.matches("\r\n").count(), 1);
+    let pass_wire = command_wire(&pass_cmd);
+    assert!(pass_wire.ends_with(b"\r\n"));
+    assert_eq!(
+        pass_wire
+            .windows(2)
+            .filter(|window| *window == b"\r\n")
+            .count(),
+        1
+    );
 }
 
 /// Test buffer pool concurrent access

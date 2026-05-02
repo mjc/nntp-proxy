@@ -33,8 +33,8 @@ fn wire(context: &protocol::RequestContext) -> Vec<u8> {
 fn test_all_commands_end_with_crlf() {
     // RFC 3977 §3.1: "Commands in NNTP MUST use the canonical CRLF"
     let test_commands = vec![
-        protocol::authinfo_user("user").into_bytes(),
-        protocol::authinfo_pass("pass").into_bytes(),
+        wire(&protocol::authinfo_user("user")),
+        wire(&protocol::authinfo_pass("pass")),
         wire(&protocol::article_request(&msgid("<msgid@example>"))),
         wire(&protocol::body_request(&msgid("<msgid@example>"))),
         wire(&protocol::head_request(&msgid("<msgid@example>"))),
@@ -57,8 +57,8 @@ fn test_all_commands_end_with_crlf() {
 fn test_commands_only_one_crlf() {
     // Commands should have exactly one CRLF - prevents command injection
     let commands = vec![
-        protocol::authinfo_user("testuser").into_bytes(),
-        protocol::authinfo_pass("testpass").into_bytes(),
+        wire(&protocol::authinfo_user("testuser")),
+        wire(&protocol::authinfo_pass("testpass")),
         wire(&protocol::article_request(&msgid("<test@example>"))),
         wire(&protocol::body_request(&msgid("<test@example>"))),
         wire(&protocol::head_request(&msgid("<test@example>"))),
@@ -79,19 +79,19 @@ fn test_commands_only_one_crlf() {
 #[test]
 fn test_authinfo_user_format() {
     let cmd = protocol::authinfo_user("testuser");
-    assert_eq!(cmd, "AUTHINFO USER testuser\r\n");
+    assert_eq!(wire(&cmd), b"AUTHINFO USER testuser\r\n");
 }
 
 #[test]
 fn test_authinfo_user_with_spaces() {
     let cmd = protocol::authinfo_user("user name");
-    assert_eq!(cmd, "AUTHINFO USER user name\r\n");
+    assert_eq!(wire(&cmd), b"AUTHINFO USER user name\r\n");
 }
 
 #[test]
 fn test_authinfo_pass_with_special_chars() {
     let cmd = protocol::authinfo_pass("p@ss!w0rd#$%");
-    assert_eq!(cmd, "AUTHINFO PASS p@ss!w0rd#$%\r\n");
+    assert_eq!(wire(&cmd), b"AUTHINFO PASS p@ss!w0rd#$%\r\n");
 }
 
 // === ARTICLE/HEAD/BODY/STAT Commands (RFC 3977 §6.2) ===
@@ -137,8 +137,8 @@ fn test_date_constant() {
 #[test]
 fn test_keywords_are_uppercase() {
     // RFC 3977 §3.1: Keywords are case-insensitive, convention is UPPERCASE
-    assert!(protocol::authinfo_user("u").starts_with("AUTHINFO USER "));
-    assert!(protocol::authinfo_pass("p").starts_with("AUTHINFO PASS "));
+    assert!(wire(&protocol::authinfo_user("u")).starts_with(b"AUTHINFO USER "));
+    assert!(wire(&protocol::authinfo_pass("p")).starts_with(b"AUTHINFO PASS "));
     assert!(wire(&protocol::article_request(&msgid("<m>"))).starts_with(b"ARTICLE "));
     assert!(wire(&protocol::body_request(&msgid("<m>"))).starts_with(b"BODY "));
     assert!(wire(&protocol::head_request(&msgid("<m>"))).starts_with(b"HEAD "));
@@ -153,8 +153,8 @@ fn test_keywords_are_uppercase() {
 fn test_standard_commands_under_512_octets() {
     // RFC 3977 §3.1: "command line MUST NOT exceed 512 octets"
     let commands = vec![
-        protocol::authinfo_user("typical_username"),
-        protocol::authinfo_pass("typical_password"),
+        String::from_utf8(wire(&protocol::authinfo_user("typical_username"))).unwrap(),
+        String::from_utf8(wire(&protocol::authinfo_pass("typical_password"))).unwrap(),
         String::from_utf8(wire(&protocol::article_request(&msgid(
             "<typical-msgid@example.com>",
         ))))
