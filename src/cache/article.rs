@@ -184,6 +184,33 @@ impl CachedArticleResponse<'_> {
         Some(offset)
     }
 
+    pub async fn write_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt as _;
+
+        writer.write_all(self.status_line()).await?;
+        match self.payload {
+            CachedArticleResponsePayload::None => {}
+            CachedArticleResponsePayload::Article { headers, body } => {
+                writer.write_all(headers).await?;
+                writer.write_all(b"\r\n\r\n").await?;
+                writer.write_all(body).await?;
+                writer.write_all(b"\r\n.\r\n").await?;
+            }
+            CachedArticleResponsePayload::Head { headers } => {
+                writer.write_all(headers).await?;
+                writer.write_all(b"\r\n.\r\n").await?;
+            }
+            CachedArticleResponsePayload::Body { body } => {
+                writer.write_all(body).await?;
+                writer.write_all(b"\r\n.\r\n").await?;
+            }
+        }
+        Ok(())
+    }
+
     fn payload_len(&self) -> usize {
         match self.payload {
             CachedArticleResponsePayload::None => 0,
@@ -1225,6 +1252,22 @@ mod tests {
         let len = response.copy_to_slice(&mut out).unwrap();
         out.truncate(len);
         out
+    }
+
+    #[tokio::test]
+    async fn cached_article_response_writes_wire_slices() {
+        let entry = create_test_article("<test@example.com>");
+        let response = entry
+            .response_parts_for_command_bytes(b"ARTICLE", "<test@example.com>")
+            .unwrap();
+        let mut out = Vec::new();
+
+        response.write_to(&mut out).await.unwrap();
+
+        assert_eq!(
+            out,
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+        );
     }
 
     #[test]
