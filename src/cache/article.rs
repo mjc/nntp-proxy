@@ -97,7 +97,7 @@ pub(crate) enum CachedPayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CachedPayloadKind {
+pub(crate) enum CachedPayloadKind {
     Missing,
     AvailabilityOnly,
     Article,
@@ -415,7 +415,7 @@ impl ArticleEntry {
 
     #[inline]
     #[must_use]
-    pub const fn payload_kind(&self) -> CachedPayloadKind {
+    pub(crate) const fn payload_kind(&self) -> CachedPayloadKind {
         self.payload.kind()
     }
 
