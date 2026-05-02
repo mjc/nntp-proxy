@@ -458,7 +458,8 @@ impl ArticleEntry {
         cmd_verb: &str,
         message_id: &crate::types::MessageId<'_>,
     ) -> Option<Vec<u8>> {
-        self.render_response_for_command(cmd_verb, message_id.as_str())
+        self.response_parts_for_command_bytes(cmd_verb.as_bytes(), message_id.as_str())
+            .map(|response| response.to_vec())
     }
 
     #[must_use]
@@ -512,21 +513,6 @@ impl ArticleEntry {
     #[must_use]
     pub fn payload_len(&self) -> usize {
         self.payload.len()
-    }
-
-    #[must_use]
-    pub fn render_response_for_command(&self, cmd_verb: &str, message_id: &str) -> Option<Vec<u8>> {
-        self.render_response_for_command_bytes(cmd_verb.as_bytes(), message_id)
-    }
-
-    #[must_use]
-    pub fn render_response_for_command_bytes(
-        &self,
-        cmd_verb: &[u8],
-        message_id: &str,
-    ) -> Option<Vec<u8>> {
-        self.response_parts_for_command_bytes(cmd_verb, message_id)
-            .map(|response| response.to_vec())
     }
 
     #[must_use]
