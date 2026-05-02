@@ -311,13 +311,10 @@ impl ClientSession {
         // If auth is disabled, skip checks from the start
         let mut skip_auth_check = !self.auth_handler.is_enabled();
 
-        // Accumulator buffers for zero-alloc batching (hoisted to session scope, reused across batches)
-        let mut batch_buf = String::with_capacity(512 * 4); // ~2KB for typical 4-command batch
-
         // Process commands in batches (single commands fall through with zero overhead)
         'command_batch_loop: loop {
             let mut batch = match self
-                .read_command_batch(&mut client_reader, &mut command_buf, &mut batch_buf)
+                .read_command_batch(&mut client_reader, &mut command_buf)
                 .await
             {
                 Ok(batch) => batch,
@@ -460,8 +457,8 @@ impl ClientSession {
             }
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
-            if batch.trailing_context().is_some() {
-                let trailing_cmd_len = batch.trailing().expect("trailing command exists").len();
+            if let Some(trailing_context) = batch.trailing_context() {
+                let trailing_cmd_len = trailing_context.wire_len();
                 // Reject oversized commands per RFC 3977 (512-byte limit)
                 if batch.is_trailing_oversized() {
                     warn!(
@@ -478,8 +475,8 @@ impl ClientSession {
                 debug!(
                     "Client {} trailing non-pipelineable {:?}: {:?}",
                     self.client_addr,
-                    batch.trailing_context().map(|ctx| ctx.kind()),
-                    batch.trailing().expect("trailing command exists").trim()
+                    trailing_context.kind(),
+                    String::from_utf8_lossy(trailing_context.verb())
                 );
 
                 client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd_len);
@@ -521,9 +518,6 @@ impl ClientSession {
                     }
                 }
             }
-
-            // Extract buffers for reuse in next batch (avoids allocating new buffers each iteration)
-            batch_buf = batch.into_buffer();
         }
 
         // Log session summary and close user connection

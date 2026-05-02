@@ -16,12 +16,9 @@ const MAX_PIPELINE_DEPTH: usize = 16;
 
 /// A batch of requests read from the client's TCP buffer.
 ///
-/// Uses an accumulator buffer pattern to avoid per-command allocations:
-/// - Pipelineable requests are stored as typed contexts
-/// - The raw buffer is retained only for a trailing non-pipelineable line
+/// Uses typed contexts for pipelineable requests and the trailing
+/// non-pipelineable line, avoiding parallel raw command state.
 pub(super) struct RequestBatch {
-    /// Raw trailing command, if present.
-    buffer: String,
     /// Typed contexts for each pipelineable command.
     contexts: smallvec::SmallVec<[RequestContext; 4]>,
     /// Typed context for trailing non-pipelineable command if present.
@@ -49,11 +46,6 @@ impl RequestBatch {
         &mut self.contexts[i]
     }
 
-    /// Get the trailing non-pipelineable command if present
-    pub fn trailing(&self) -> Option<&str> {
-        self.trailing_context.as_ref().map(|_| self.buffer.as_str())
-    }
-
     /// Get the trailing typed context if present.
     pub fn trailing_context(&self) -> Option<&RequestContext> {
         self.trailing_context.as_ref()
@@ -79,11 +71,6 @@ impl RequestBatch {
     pub const fn is_first_oversized(&self) -> bool {
         self.first_oversized
     }
-
-    /// Extract trailing buffer for reuse in next batch (move out, leaving empty)
-    pub fn into_buffer(self) -> String {
-        self.buffer
-    }
 }
 
 impl ClientSession {
@@ -95,15 +82,11 @@ impl ClientSession {
     ///
     /// Returns empty batch on client disconnect.
     ///
-    /// Uses accumulator buffer to avoid per-command allocations.
     pub(super) async fn read_command_batch(
         &self,
         reader: &mut tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
         command_buf: &mut String,
-        batch_buf: &mut String,
     ) -> Result<RequestBatch> {
-        // Prepare accumulator buffer
-        batch_buf.clear();
         let mut trailing_oversized = false;
 
         // First command: blocking read (must wait for client)
@@ -111,7 +94,6 @@ impl ClientSession {
         match reader.read_line(command_buf).await {
             Ok(0) => {
                 return Ok(RequestBatch {
-                    buffer: String::new(),
                     contexts: smallvec::SmallVec::new(),
                     trailing_context: None,
                     trailing_oversized: false,
@@ -122,7 +104,6 @@ impl ClientSession {
                 // RFC 3977 §3.1: 512-byte command limit — return 501 and keep session alive
                 if command_buf.len() > 512 {
                     return Ok(RequestBatch {
-                        buffer: String::new(),
                         contexts: smallvec::SmallVec::new(),
                         trailing_context: None,
                         trailing_oversized: false,
@@ -137,10 +118,8 @@ impl ClientSession {
 
         if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
-            batch_buf.push_str(command_buf);
             let trailing_context = Some(request);
             return Ok(RequestBatch {
-                buffer: std::mem::take(batch_buf),
                 contexts: smallvec::SmallVec::new(),
                 trailing_context,
                 trailing_oversized: false,
@@ -168,11 +147,9 @@ impl ClientSession {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
                     if command_buf.len() > 512 {
-                        batch_buf.push_str(command_buf);
                         let trailing_context = Some(RequestContext::from_request_line(command_buf));
                         trailing_oversized = true;
                         return Ok(RequestBatch {
-                            buffer: std::mem::take(batch_buf),
                             contexts: batch_contexts,
                             trailing_context,
                             trailing_oversized,
@@ -182,10 +159,8 @@ impl ClientSession {
                     let request = RequestContext::from_request_line(command_buf);
                     if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
-                        batch_buf.push_str(command_buf);
                         let trailing_context = Some(request);
                         return Ok(RequestBatch {
-                            buffer: std::mem::take(batch_buf),
                             contexts: batch_contexts,
                             trailing_context,
                             trailing_oversized,
@@ -198,7 +173,6 @@ impl ClientSession {
         }
 
         Ok(RequestBatch {
-            buffer: std::mem::take(batch_buf),
             contexts: batch_contexts,
             trailing_context: None,
             trailing_oversized,
