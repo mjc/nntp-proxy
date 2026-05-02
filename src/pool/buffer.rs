@@ -130,9 +130,9 @@ impl PooledBuffer {
 
     /// Get mutable access to the fixed I/O writable region.
     ///
-    /// This compatibility API is for callers that still perform manual reads
-    /// into a borrowed slice. It does not update the logical initialized length;
-    /// callers must use the read byte count directly.
+    /// This is for scratch-buffer paths that need to inspect bytes returned by
+    /// a read that already reported its byte count. It does not update the
+    /// logical initialized length; callers must use the read byte count directly.
     ///
     /// # Safety Note
     /// Only bytes written by the caller's I/O operation should be read. Prefer
