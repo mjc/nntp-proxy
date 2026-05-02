@@ -36,7 +36,7 @@ where
     B: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let mut buffer_b2c = buffer_pool.acquire().await;
-    let mut command = String::with_capacity(COMMAND);
+    let mut command = Vec::with_capacity(COMMAND);
 
     let mut c2b = client_to_backend_bytes;
     let mut b2c = backend_to_client_bytes;
@@ -44,11 +44,11 @@ where
     loop {
         tokio::select! {
             // Read from client and forward to backend
-            result = client_reader.read_line(&mut command) => {
+            result = client_reader.read_until(b'\n', &mut command) => {
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Err(e) = pooled_conn.write_all(command.as_bytes()).await {
+                        if let Err(e) = pooled_conn.write_all(&command).await {
                             if crate::connection_error::is_connection_error_kind(e.kind()) {
                                 return Ok(ForwardResult::BackendError(
                                     TransferMetrics {
@@ -389,6 +389,56 @@ mod tests {
                     "b2c should include at least initial bytes: {}",
                     metrics.backend_to_client.as_u64()
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_forward_preserves_non_utf8_command_bytes() {
+        let pool = test_buffer_pool();
+        let command = b"XFOO \xff\r\n";
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, mut proxy_backend_end) = tokio::io::duplex(4096);
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+
+        let backend = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 64];
+            let n = tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf)
+                .await
+                .unwrap();
+            let _ = captured_tx.send(buf[..n].to_vec());
+        });
+
+        client_end.write_all(command).await.unwrap();
+        drop(client_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let mut client_reader = BufReader::new(proxy_client_read);
+        let mut client_writer = proxy_client_write;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bidirectional_forward(
+                &mut client_reader,
+                &mut client_writer,
+                &mut proxy_backend_end,
+                &pool,
+                ClientToBackendBytes::zero(),
+                BackendToClientBytes::zero(),
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        backend.await.unwrap();
+
+        assert_eq!(captured_rx.await.unwrap(), command);
+        match result {
+            ForwardResult::NormalDisconnect(metrics) | ForwardResult::BackendError(metrics) => {
+                assert_eq!(metrics.client_to_backend.as_u64(), command.len() as u64);
             }
         }
     }
