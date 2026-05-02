@@ -36,8 +36,8 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");
     assert_eq!(
-        cached.buffer().len(),
-        full_article.len(),
+        cached.payload_len(),
+        750_000,
         "Full article should be cached"
     );
 
@@ -52,12 +52,12 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
         .await
         .expect("Article should still be cached");
     assert_eq!(
-        cached.buffer().len(),
-        full_article.len(),
+        cached.payload_len(),
+        750_000,
         "Full article should NOT be overwritten by stub"
     );
     assert_ne!(
-        cached.buffer().len(),
+        cached.payload_len(),
         stub.len(),
         "Stub should not overwrite full article"
     );
@@ -78,7 +78,7 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
         .await;
 
     let cached = cache.get(&msg_id).await.expect("Stub should be cached");
-    assert_eq!(cached.buffer().len(), stub.len(), "Stub should be cached");
+    assert_eq!(cached.payload_len(), 0, "Stub should have no payload");
 
     // Second upsert: Replace with full article (larger)
     let full_article = format!(
@@ -96,8 +96,8 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");
     assert_eq!(
-        cached.buffer().len(),
-        full_article.len(),
+        cached.payload_len(),
+        750_000,
         "Full article should replace stub"
     );
 
@@ -109,7 +109,7 @@ fn test_matches_command_type_article_response() {
     // Create ARTICLE response (220)
     let article_response =
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(article_response);
+    let entry = ArticleEntry::from_response_buffer(article_response);
     let msg_id = "<test@example.com>";
 
     // ARTICLE response can serve ARTICLE, BODY, HEAD, or STAT requests
@@ -136,7 +136,7 @@ fn test_matches_command_type_article_response() {
 fn test_matches_command_type_body_response() {
     // Create BODY response (222)
     let body_response = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(body_response);
+    let entry = ArticleEntry::from_response_buffer(body_response);
     let msg_id = "<test@example.com>";
 
     // BODY response can serve BODY and STAT requests
@@ -163,7 +163,7 @@ fn test_matches_command_type_body_response() {
 fn test_matches_command_type_head_response() {
     // Create HEAD response (221)
     let head_response = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(head_response);
+    let entry = ArticleEntry::from_response_buffer(head_response);
     let msg_id = "<test@example.com>";
 
     // HEAD response can serve HEAD and STAT requests
@@ -189,7 +189,7 @@ fn test_matches_command_type_head_response() {
 #[test]
 fn test_response_for_command_verbs_uppercase() {
     let body_response = b"222 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(body_response);
+    let entry = ArticleEntry::from_response_buffer(body_response);
     let msg_id = "<test@example.com>";
 
     // Only uppercase verbs are expected (caller is responsible for uppercasing)
@@ -201,7 +201,7 @@ fn test_response_for_command_verbs_uppercase() {
 fn test_is_complete_article_accepts_body_responses() {
     // BODY response (222) with full content should be considered complete
     let body_response = format!("222 0 <test@example.com>\r\n{}\r\n.\r\n", "X".repeat(100));
-    let entry = ArticleEntry::new(body_response.as_bytes().to_vec());
+    let entry = ArticleEntry::from_response_buffer(body_response.as_bytes().to_vec());
 
     assert!(
         entry.is_complete_article(),
@@ -210,7 +210,7 @@ fn test_is_complete_article_accepts_body_responses() {
 
     // BODY stub should NOT be considered complete
     let stub = b"222 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::new(stub);
+    let entry = ArticleEntry::from_response_buffer(stub);
 
     assert!(
         !entry.is_complete_article(),
@@ -222,21 +222,21 @@ fn test_is_complete_article_accepts_body_responses() {
 fn test_is_complete_article_rejects_stubs() {
     // Stubs are too small to be complete articles
     let stub_220 = b"220 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::new(stub_220);
+    let entry = ArticleEntry::from_response_buffer(stub_220);
     assert!(
         !entry.is_complete_article(),
         "220 stub should not be complete"
     );
 
     let stub_222 = b"222 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::new(stub_222);
+    let entry = ArticleEntry::from_response_buffer(stub_222);
     assert!(
         !entry.is_complete_article(),
         "222 stub should not be complete"
     );
 
     let stub_223 = b"223 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::new(stub_223);
+    let entry = ArticleEntry::from_response_buffer(stub_223);
     assert!(
         !entry.is_complete_article(),
         "223 (STAT) should never be complete"
@@ -245,21 +245,25 @@ fn test_is_complete_article_rejects_stubs() {
 
 #[test]
 fn test_status_code_parsing() {
-    let entry_220 = ArticleEntry::new(b"220 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
+    let entry_220 =
+        ArticleEntry::from_response_buffer(b"220 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
     assert_eq!(entry_220.status_code().unwrap().as_u16(), 220);
 
-    let entry_222 = ArticleEntry::new(b"222 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
+    let entry_222 =
+        ArticleEntry::from_response_buffer(b"222 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
     assert_eq!(entry_222.status_code().unwrap().as_u16(), 222);
 
-    let entry_221 = ArticleEntry::new(b"221 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
+    let entry_221 =
+        ArticleEntry::from_response_buffer(b"221 0 <test@example.com>\r\nTest\r\n.\r\n".to_vec());
     assert_eq!(entry_221.status_code().unwrap().as_u16(), 221);
 }
 #[test]
 fn test_body_article_command_type_mismatch() {
     // When a BODY (222) response is cached and a client requests ARTICLE (220),
     // it should NOT match because BODY doesn't include headers
-    let body_response =
-        ArticleEntry::new(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n".to_vec());
+    let body_response = ArticleEntry::from_response_buffer(
+        b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n".to_vec(),
+    );
     let msg_id = "<test@example.com>";
 
     // BODY response should NOT match ARTICLE request (no headers)
@@ -296,8 +300,9 @@ fn test_body_article_command_type_mismatch() {
     );
 
     // ARTICLE (220) response matches all three
-    let article_response =
-        ArticleEntry::new(b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec());
+    let article_response = ArticleEntry::from_response_buffer(
+        b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec(),
+    );
     assert!(
         article_response
             .response_for_command("ARTICLE", msg_id_ref)

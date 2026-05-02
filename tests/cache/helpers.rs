@@ -28,7 +28,13 @@ async fn test_cache_hit() -> Result<()> {
     // Retrieve - should hit
     let retrieved = cache.get(&msgid).await;
     assert!(retrieved.is_some());
-    assert_eq!(retrieved.unwrap().buffer().as_ref(), &buffer);
+    assert_eq!(
+        retrieved
+            .unwrap()
+            .response_for_command("ARTICLE", &msgid)
+            .unwrap(),
+        buffer
+    );
 
     Ok(())
 }

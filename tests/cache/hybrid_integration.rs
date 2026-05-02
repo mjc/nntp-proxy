@@ -28,7 +28,13 @@ async fn test_mock_cache_basic_ops() -> Result<()> {
     // Retrieve it
     let entry = cache.get(&msg_id).await;
     assert!(entry.is_some(), "Entry should exist");
-    assert_eq!(entry.unwrap().buffer(), buffer.as_slice());
+    assert_eq!(
+        entry
+            .unwrap()
+            .response_for_command("ARTICLE", &msg_id)
+            .unwrap(),
+        buffer
+    );
 
     // Check stats
     let stats = cache.stats();
@@ -80,8 +86,14 @@ async fn test_upsert_preserves_larger_buffer() -> Result<()> {
 
     // Should still have large buffer
     let entry = cache.get(&msg_id).await.unwrap();
-    assert_eq!(entry.buffer().len(), large_buffer.len());
-    assert_eq!(entry.buffer(), large_buffer.as_slice());
+    assert_eq!(
+        entry.payload_len(),
+        b"Subject: Test".len() + b"Large body content here".len()
+    );
+    assert_eq!(
+        entry.response_for_command("ARTICLE", &msg_id).unwrap(),
+        large_buffer
+    );
 
     // But should have availability for both backends
     assert!(entry.should_try_backend(BackendId::from_index(0)));

@@ -45,9 +45,9 @@ async fn test_sync_availability_does_not_create_430_stub_when_backend_has_articl
         assert!(
             status.map(|s| s.as_u16()) != Some(430),
             "sync_availability should NOT create 430 stub when backend has article! \
-             Got status code: {:?}, buffer: {:?}",
+             Got status code: {:?}, payload_len: {}",
             status,
-            String::from_utf8_lossy(entry.buffer())
+            entry.payload_len()
         );
     }
     // If no entry was created, that's also acceptable
@@ -126,12 +126,8 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
         status.as_u16()
     );
 
-    // Verify we can serve the actual article
-    assert!(
-        cached.buffer().starts_with(b"220"),
-        "Buffer should start with 220, got: {:?}",
-        String::from_utf8_lossy(&cached.buffer()[..20.min(cached.buffer().len())])
-    );
+    let rendered = cached.response_for_command("ARTICLE", &msg_id).unwrap();
+    assert!(rendered.starts_with(b"220"));
 
     Ok(())
 }
@@ -376,28 +372,28 @@ fn test_is_complete_article_rejects_stubs() {
     use nntp_proxy::cache::ArticleEntry;
 
     // 430 stub
-    let stub_430 = ArticleEntry::new(b"430\r\n".to_vec());
+    let stub_430 = ArticleEntry::from_response_buffer(b"430\r\n".to_vec());
     assert!(
         !stub_430.is_complete_article(),
         "430 stub should not be complete article"
     );
 
     // 220 stub (from availability tracking)
-    let stub_220 = ArticleEntry::new(b"220\r\n".to_vec());
+    let stub_220 = ArticleEntry::from_response_buffer(b"220\r\n".to_vec());
     assert!(
         !stub_220.is_complete_article(),
         "220 stub should not be complete article"
     );
 
     // 223 stub (from STAT precheck)
-    let stub_223 = ArticleEntry::new(b"223\r\n".to_vec());
+    let stub_223 = ArticleEntry::from_response_buffer(b"223\r\n".to_vec());
     assert!(
         !stub_223.is_complete_article(),
         "223 stub should not be complete article"
     );
 
     // 221 stub (from HEAD precheck)
-    let stub_221 = ArticleEntry::new(b"221\r\n".to_vec());
+    let stub_221 = ArticleEntry::from_response_buffer(b"221\r\n".to_vec());
     assert!(
         !stub_221.is_complete_article(),
         "221 stub should not be complete article"
@@ -410,7 +406,7 @@ fn test_is_complete_article_accepts_real_articles() {
     use nntp_proxy::cache::ArticleEntry;
 
     // Full article response
-    let full_article = ArticleEntry::new(
+    let full_article = ArticleEntry::from_response_buffer(
         b"220 0 <test@example.com>\r\nSubject: Test\r\nFrom: test@example.com\r\n\r\nThis is the body.\r\n.\r\n"
             .to_vec(),
     );
@@ -420,8 +416,9 @@ fn test_is_complete_article_accepts_real_articles() {
     );
 
     // Minimal but valid article
-    let minimal_article =
-        ArticleEntry::new(b"220 0 <x@y>\r\nSubject: X\r\n\r\nBody text here\r\n.\r\n".to_vec());
+    let minimal_article = ArticleEntry::from_response_buffer(
+        b"220 0 <x@y>\r\nSubject: X\r\n\r\nBody text here\r\n.\r\n".to_vec(),
+    );
     assert!(
         minimal_article.is_complete_article(),
         "Minimal article should be complete"
@@ -434,7 +431,7 @@ fn test_is_complete_article_accepts_220_and_222() {
     use nntp_proxy::cache::ArticleEntry;
 
     // ARTICLE response (220) should be considered complete
-    let article_response = ArticleEntry::new(
+    let article_response = ArticleEntry::from_response_buffer(
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
     );
     assert!(
@@ -443,15 +440,16 @@ fn test_is_complete_article_accepts_220_and_222() {
     );
 
     // BODY response (222) with content should be considered complete
-    let body_response =
-        ArticleEntry::new(b"222 0 <test@example.com>\r\nThis is body text.\r\n.\r\n".to_vec());
+    let body_response = ArticleEntry::from_response_buffer(
+        b"222 0 <test@example.com>\r\nThis is body text.\r\n.\r\n".to_vec(),
+    );
     assert!(
         body_response.is_complete_article(),
         "BODY response (222) with content should be complete article"
     );
 
     // HEAD response (221) should NOT be considered complete article
-    let head_response = ArticleEntry::new(
+    let head_response = ArticleEntry::from_response_buffer(
         b"221 0 <test@example.com>\r\nSubject: Test\r\nFrom: test@example.com\r\n.\r\n".to_vec(),
     );
     assert!(
@@ -460,7 +458,8 @@ fn test_is_complete_article_accepts_220_and_222() {
     );
 
     // STAT response (223) should NOT be complete article
-    let stat_response = ArticleEntry::new(b"223 0 <test@example.com>\r\n".to_vec());
+    let stat_response =
+        ArticleEntry::from_response_buffer(b"223 0 <test@example.com>\r\n".to_vec());
     assert!(
         !stat_response.is_complete_article(),
         "STAT response (223) should not be complete article"
@@ -544,7 +543,12 @@ async fn test_precheck_stub_then_article_request() -> Result<()> {
     let cached = cache.get(&msg_id).await.expect("Should have article");
     assert!(cached.is_complete_article());
     assert_eq!(cached.status_code().map(|s| s.as_u16()), Some(220));
-    assert!(cached.buffer().ends_with(b".\r\n"));
+    assert!(
+        cached
+            .response_for_command("ARTICLE", &msg_id)
+            .unwrap()
+            .ends_with(b".\r\n")
+    );
 
     Ok(())
 }

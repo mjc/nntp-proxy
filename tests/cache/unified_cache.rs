@@ -49,7 +49,10 @@ async fn test_unified_cache_memory_upsert_and_get() {
     let result = cache.get(&msg_id).await;
     assert!(result.is_some());
     let entry = result.unwrap();
-    assert_eq!(&**entry.response(), buffer.as_slice());
+    assert_eq!(
+        entry.response_for_command("ARTICLE", &msg_id).unwrap(),
+        buffer
+    );
 }
 
 #[tokio::test]
@@ -163,7 +166,7 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 fn test_response_for_command_stat_synthesizes_223() {
     // Create ARTICLE response (220)
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     let response = entry.response_for_command(
         "STAT",
@@ -180,7 +183,7 @@ fn test_response_for_command_stat_synthesizes_223() {
 fn test_response_for_command_stat_from_body() {
     // BODY response (222) should also synthesize STAT response
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     let response = entry.response_for_command(
         "STAT",
@@ -197,7 +200,7 @@ fn test_response_for_command_stat_from_body() {
 fn test_response_for_command_stat_from_head() {
     // HEAD response (221) should also synthesize STAT response
     let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     let response = entry.response_for_command(
         "STAT",
@@ -214,7 +217,7 @@ fn test_response_for_command_stat_from_head() {
 fn test_response_for_command_430_returns_none_for_stat() {
     // 430 should NOT synthesize STAT - article doesn't exist
     let buffer = b"430 No Such Article\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     let response = entry.response_for_command(
         "STAT",
@@ -226,7 +229,7 @@ fn test_response_for_command_430_returns_none_for_stat() {
 #[test]
 fn test_response_for_command_article_direct_match() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer.clone());
+    let entry = ArticleEntry::from_response_buffer(buffer.clone());
 
     let response = entry.response_for_command(
         "ARTICLE",
@@ -240,35 +243,41 @@ fn test_response_for_command_article_direct_match() {
 fn test_response_for_command_body_from_article() {
     // ARTICLE (220) can serve BODY request
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer.clone());
+    let entry = ArticleEntry::from_response_buffer(buffer.clone());
 
     let response = entry.response_for_command(
         "BODY",
         &MessageId::from_borrowed("<test@example.com>").unwrap(),
     );
     assert!(response.is_some());
-    assert_eq!(response.unwrap(), buffer);
+    assert_eq!(
+        response.unwrap(),
+        b"222 0 <test@example.com>\r\nBody\r\n.\r\n"
+    );
 }
 
 #[test]
 fn test_response_for_command_head_from_article() {
     // ARTICLE (220) can serve HEAD request
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer.clone());
+    let entry = ArticleEntry::from_response_buffer(buffer.clone());
 
     let response = entry.response_for_command(
         "HEAD",
         &MessageId::from_borrowed("<test@example.com>").unwrap(),
     );
     assert!(response.is_some());
-    assert_eq!(response.unwrap(), buffer);
+    assert_eq!(
+        response.unwrap(),
+        b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n"
+    );
 }
 
 #[test]
 fn test_response_for_command_body_cannot_serve_article() {
     // BODY (222) cannot serve ARTICLE request
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     let response = entry.response_for_command(
         "ARTICLE",
@@ -281,7 +290,7 @@ fn test_response_for_command_body_cannot_serve_article() {
 fn test_response_for_command_head_cannot_serve_body() {
     // HEAD (221) cannot serve BODY request
     let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     let response = entry.response_for_command(
         "BODY",
@@ -294,7 +303,7 @@ fn test_response_for_command_head_cannot_serve_body() {
 fn test_response_for_command_validates_buffer() {
     // Create an invalid buffer (missing .\r\n terminator)
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     // Should return None because buffer fails validation
     let response = entry.response_for_command(
@@ -307,7 +316,7 @@ fn test_response_for_command_validates_buffer() {
 #[test]
 fn test_response_for_command_empty_message_id() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     // STAT with minimal message ID <x> should still work
     let response = entry.response_for_command("STAT", &MessageId::from_borrowed("<x>").unwrap());
@@ -410,7 +419,7 @@ fn test_availability_from_bits_roundtrip() {
 #[test]
 fn test_article_entry_set_availability() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::new(buffer);
+    let mut entry = ArticleEntry::from_response_buffer(buffer);
 
     // Initially no availability info
     assert!(!entry.has_availability_info());
@@ -432,7 +441,7 @@ fn test_article_entry_set_availability() {
 #[test]
 fn test_article_entry_set_availability_overwrites() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::new(buffer);
+    let mut entry = ArticleEntry::from_response_buffer(buffer);
 
     // Set initial availability
     let mut avail1 = ArticleAvailability::new();
@@ -541,7 +550,7 @@ fn test_cache_config_without_disk() {
 fn test_response_validation_rejects_short_buffer() {
     // Buffer too short (< 9 bytes)
     let buffer = b"220 ok".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     // Should fail validation and return None
     let response = entry.response_for_command(
@@ -555,7 +564,7 @@ fn test_response_validation_rejects_short_buffer() {
 fn test_response_validation_rejects_missing_terminator() {
     // Buffer missing .\r\n terminator
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     let response = entry.response_for_command(
         "ARTICLE",
@@ -569,7 +578,7 @@ fn test_response_validation_rejects_non_digit_start() {
     // Buffer not starting with digits - but this won't even parse as valid status code
     // So we test with a valid-looking but corrupted buffer
     let buffer = b"ABC 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer);
+    let entry = ArticleEntry::from_response_buffer(buffer);
 
     // status_code() will return None, so response_for_command returns None
     let response = entry.response_for_command(
@@ -584,7 +593,7 @@ fn test_response_validation_accepts_valid_buffer() {
     // Valid buffer passes validation
     let buffer =
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content here\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::new(buffer.clone());
+    let entry = ArticleEntry::from_response_buffer(buffer.clone());
 
     let response = entry.response_for_command(
         "ARTICLE",
@@ -610,7 +619,7 @@ fn make_430_stub_buffer() -> Vec<u8> {
 
 #[test]
 fn test_hybrid_entry_has_availability_info_empty() {
-    let entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Fresh entry has no availability info
     assert!(!entry.has_availability_info());
@@ -618,7 +627,7 @@ fn test_hybrid_entry_has_availability_info_empty() {
 
 #[test]
 fn test_hybrid_entry_has_availability_info_after_missing() {
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     entry.record_backend_missing(BackendId::from_index(0));
 
@@ -627,7 +636,7 @@ fn test_hybrid_entry_has_availability_info_after_missing() {
 
 #[test]
 fn test_hybrid_entry_has_availability_info_after_has() {
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     entry.record_backend_has(BackendId::from_index(0));
 
@@ -636,7 +645,7 @@ fn test_hybrid_entry_has_availability_info_after_has() {
 
 #[test]
 fn test_hybrid_entry_is_availability_stale_fresh() {
-    let entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Entry just created should not be stale with reasonable TTL
     assert!(!entry.is_availability_stale(3600)); // 1 hour TTL
@@ -645,7 +654,7 @@ fn test_hybrid_entry_is_availability_stale_fresh() {
 
 #[test]
 fn test_hybrid_entry_is_availability_stale_zero_ttl() {
-    let entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // With zero TTL, everything is immediately stale (edge case)
     // Note: implementation uses `> ttl` so zero TTL means 0 seconds old is not stale
@@ -654,7 +663,7 @@ fn test_hybrid_entry_is_availability_stale_zero_ttl() {
 
 #[test]
 fn test_hybrid_entry_clear_stale_availability_not_stale() {
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Record some availability info
     entry.record_backend_missing(BackendId::from_index(0));
@@ -674,7 +683,7 @@ fn test_hybrid_entry_clear_stale_availability_not_stale() {
 
 #[test]
 fn test_hybrid_entry_should_try_after_record_missing() {
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Initially should try all backends
     assert!(entry.should_try_backend(BackendId::from_index(0)));
@@ -692,7 +701,7 @@ fn test_hybrid_entry_should_try_after_record_missing() {
 
 #[test]
 fn test_hybrid_entry_should_try_after_record_has() {
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Mark backend 0 as missing first
     entry.record_backend_missing(BackendId::from_index(0));
@@ -707,7 +716,7 @@ fn test_hybrid_entry_should_try_after_record_has() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_none() {
-    let entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // With no missing backends marked, not exhausted
     assert!(!entry.all_backends_exhausted(BackendCount::new(3)));
@@ -715,7 +724,7 @@ fn test_hybrid_entry_all_backends_exhausted_none() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_partial() {
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Mark 2 of 3 backends as missing
     entry.record_backend_missing(BackendId::from_index(0));
@@ -727,7 +736,7 @@ fn test_hybrid_entry_all_backends_exhausted_partial() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_all() {
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Mark all 3 backends as missing
     entry.record_backend_missing(BackendId::from_index(0));
@@ -740,7 +749,7 @@ fn test_hybrid_entry_all_backends_exhausted_all() {
 
 #[test]
 fn test_hybrid_entry_430_stub_creation() {
-    let entry = HybridArticleEntry::new(make_430_stub_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_430_stub_buffer()).unwrap();
 
     // 430 responses should be cached
     assert_eq!(entry.status_code().unwrap().as_u16(), 430);
@@ -752,7 +761,7 @@ fn test_hybrid_entry_430_stub_creation() {
 #[test]
 fn test_hybrid_entry_complete_article_detection() {
     let article_buf = make_valid_article_buffer();
-    let entry = HybridArticleEntry::new(article_buf).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(article_buf).unwrap();
 
     // 220 with proper terminator is a complete article
     assert!(entry.is_complete_article());
@@ -762,7 +771,7 @@ fn test_hybrid_entry_complete_article_detection() {
 #[test]
 fn test_hybrid_entry_response_for_command_article() {
     let buffer = make_valid_article_buffer();
-    let entry = HybridArticleEntry::new(buffer.clone()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(buffer.clone()).unwrap();
 
     let response = entry.response_for_command(
         "ARTICLE",
@@ -774,7 +783,7 @@ fn test_hybrid_entry_response_for_command_article() {
 
 #[test]
 fn test_hybrid_entry_response_for_command_stat_synthesized() {
-    let entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     let response = entry.response_for_command(
         "STAT",
@@ -788,7 +797,7 @@ fn test_hybrid_entry_response_for_command_stat_synthesized() {
 
 #[test]
 fn test_hybrid_entry_response_for_command_430_returns_none() {
-    let entry = HybridArticleEntry::new(make_430_stub_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_430_stub_buffer()).unwrap();
 
     // 430 stubs should not serve ARTICLE requests
     assert!(
@@ -815,7 +824,7 @@ fn test_hybrid_entry_response_for_command_430_returns_none() {
 fn test_hybrid_entry_invalid_status_code_rejected() {
     // 200 is not a valid article response code
     let buffer = b"200 server ready\r\n".to_vec();
-    let entry = HybridArticleEntry::new(buffer);
+    let entry = HybridArticleEntry::from_response_buffer(buffer);
 
     // Should reject invalid status codes
     assert!(entry.is_none());
@@ -824,11 +833,15 @@ fn test_hybrid_entry_invalid_status_code_rejected() {
 #[test]
 fn test_hybrid_entry_valid_status_codes() {
     // Valid codes: 220 (ARTICLE), 221 (HEAD), 222 (BODY), 223 (STAT), 430 (not found)
-    let valid_220 = HybridArticleEntry::new(b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n".to_vec());
-    let valid_221 = HybridArticleEntry::new(b"221 0 <id>\r\nH: V\r\n.\r\n".to_vec());
-    let valid_222 = HybridArticleEntry::new(b"222 0 <id>\r\nBody\r\n.\r\n".to_vec());
-    let valid_223 = HybridArticleEntry::new(b"223 0 <id>\r\n".to_vec());
-    let valid_430 = HybridArticleEntry::new(b"430 No article\r\n".to_vec());
+    let valid_220 = HybridArticleEntry::from_response_buffer(
+        b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n".to_vec(),
+    );
+    let valid_221 =
+        HybridArticleEntry::from_response_buffer(b"221 0 <id>\r\nH: V\r\n.\r\n".to_vec());
+    let valid_222 =
+        HybridArticleEntry::from_response_buffer(b"222 0 <id>\r\nBody\r\n.\r\n".to_vec());
+    let valid_223 = HybridArticleEntry::from_response_buffer(b"223 0 <id>\r\n".to_vec());
+    let valid_430 = HybridArticleEntry::from_response_buffer(b"430 No article\r\n".to_vec());
 
     assert!(valid_220.is_some());
     assert!(valid_221.is_some());
@@ -847,7 +860,7 @@ fn test_hybrid_entry_serialization_roundtrip() {
     use std::io::Cursor;
 
     let buffer = make_valid_article_buffer();
-    let mut entry = HybridArticleEntry::new(buffer).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(buffer).unwrap();
 
     // Add some availability info
     entry.record_backend_missing(BackendId::from_index(0));
@@ -862,7 +875,9 @@ fn test_hybrid_entry_serialization_roundtrip() {
 
     // Verify all fields match
     assert_eq!(decoded.status_code(), entry.status_code());
-    assert_eq!(decoded.buffer(), entry.buffer());
+    assert_eq!(decoded.payload(), entry.payload());
+    assert_eq!(decoded.availability(), entry.availability());
+    assert_eq!(decoded.tier(), entry.tier());
     assert!(!decoded.should_try_backend(BackendId::from_index(0)));
     assert!(decoded.should_try_backend(BackendId::from_index(1)));
 }
@@ -872,7 +887,7 @@ fn test_hybrid_entry_serialization_preserves_availability() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let mut entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // Mark several backends
     entry.record_backend_missing(BackendId::from_index(0));
@@ -898,13 +913,11 @@ fn test_hybrid_entry_serialization_preserves_availability() {
 fn test_hybrid_entry_serialization_estimated_size() {
     use foyer::Code;
 
-    let buffer = make_valid_article_buffer();
-    let entry = HybridArticleEntry::new(buffer.clone()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
-    // estimated_size = 2 (status) + 2 (checked+missing) + 8 (timestamp) + 1 (tier) + 4 (len) + buffer.len()
-    // Format: [status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][len:u32][buffer:bytes]
-    let expected_size = 2 + 2 + 8 + 1 + 4 + buffer.len();
-    assert_eq!(entry.estimated_size(), expected_size);
+    let mut encoded = Vec::new();
+    entry.encode(&mut encoded).unwrap();
+    assert_eq!(entry.estimated_size(), encoded.len());
 }
 
 #[test]
@@ -912,7 +925,7 @@ fn test_hybrid_entry_serialization_430_stub() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let mut entry = HybridArticleEntry::new(make_430_stub_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_response_buffer(make_430_stub_buffer()).unwrap();
     entry.record_backend_missing(BackendId::from_index(0));
 
     // Serialize and deserialize
@@ -929,7 +942,7 @@ fn test_hybrid_entry_serialization_empty_availability() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let entry = HybridArticleEntry::new(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
     // No availability recorded
     assert!(!entry.has_availability_info());
