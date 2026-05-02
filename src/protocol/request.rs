@@ -53,12 +53,20 @@ pub enum RequestRouteClass {
     Reject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestCacheStatus {
+    Hit,
+    PartialHit,
+    Miss,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     kind: RequestKind,
     verb: SmallVec<[u8; 16]>,
     args: SmallVec<[u8; 512]>,
     message_id: Option<(usize, usize)>,
+    cache_status: Option<RequestCacheStatus>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
     response_wire_len: Option<usize>,
@@ -84,6 +92,7 @@ impl RequestContext {
             verb,
             args,
             message_id,
+            cache_status: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -102,6 +111,7 @@ impl RequestContext {
             verb,
             args,
             message_id,
+            cache_status: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -118,6 +128,17 @@ impl RequestContext {
     #[must_use]
     pub const fn backend_id(&self) -> Option<BackendId> {
         self.backend_id
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn cache_status(&self) -> Option<RequestCacheStatus> {
+        self.cache_status
+    }
+
+    #[inline]
+    pub const fn record_cache_status(&mut self, status: RequestCacheStatus) {
+        self.cache_status = Some(status);
     }
 
     #[inline]
@@ -354,6 +375,7 @@ mod tests {
         let ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
         assert_eq!(ctx.kind(), RequestKind::Article);
         assert_eq!(ctx.message_id(), Some("<a@b>"));
+        assert_eq!(ctx.cache_status(), None);
         assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(ctx.response_wire_len(), None);
@@ -373,6 +395,16 @@ mod tests {
         assert_eq!(ctx.response_status(), Some(status));
         assert_eq!(ctx.response_wire_len(), Some(19));
         assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_cache_status_when_known() {
+        let mut ctx = RequestContext::from_request_line("BODY <a@b>\r\n");
+
+        ctx.record_cache_status(RequestCacheStatus::PartialHit);
+
+        assert_eq!(ctx.cache_status(), Some(RequestCacheStatus::PartialHit));
+        assert_eq!(wire(&ctx), b"BODY <a@b>\r\n");
     }
 
     #[test]
