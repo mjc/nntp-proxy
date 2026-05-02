@@ -7,7 +7,7 @@
 //! Run with: cargo bench --bench request_serialization
 
 use divan::{Bencher, black_box};
-use nntp_proxy::protocol::{RequestContext, StatusCode};
+use nntp_proxy::protocol::{RequestContext, RequestLine, StatusCode};
 
 fn main() {
     divan::main();
@@ -58,14 +58,18 @@ fn write_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize
     sink.len()
 }
 
+fn request_context(line: &[u8]) -> RequestContext {
+    RequestContext::from_request_line(RequestLine::parse(line))
+}
+
 mod single_request {
-    use super::{Bencher, FixedSink, RequestContext, black_box, write_request_slices};
+    use super::{Bencher, FixedSink, black_box, request_context, write_request_slices};
 
     macro_rules! bench_request {
         ($name:ident, $line:literal) => {
             #[divan::bench(sample_count = 1000, sample_size = 1000)]
             fn $name(bencher: Bencher) {
-                let request = RequestContext::from_request_bytes($line.as_bytes());
+                let request = request_context($line.as_bytes());
                 bencher.bench(|| {
                     let mut sink = FixedSink::default();
                     black_box(write_request_slices(
@@ -90,7 +94,7 @@ mod single_request {
 }
 
 mod mixed_batch {
-    use super::{Bencher, FixedSink, RequestContext, black_box, write_request_slices};
+    use super::{Bencher, FixedSink, black_box, request_context, write_request_slices};
 
     const COMMANDS: &[&str] = &[
         "ARTICLE <a@example.com>\r\n",
@@ -107,7 +111,7 @@ mod mixed_batch {
     fn realistic_request_stream(bencher: Bencher) {
         let requests = COMMANDS
             .iter()
-            .map(|line| RequestContext::from_request_bytes(line.as_bytes()))
+            .map(|line| request_context(line.as_bytes()))
             .collect::<Vec<_>>();
 
         bencher
@@ -123,7 +127,7 @@ mod mixed_batch {
 }
 
 mod response_shape {
-    use super::{Bencher, RequestContext, StatusCode, black_box};
+    use super::{Bencher, StatusCode, black_box, request_context};
 
     const CASES: &[(&str, u16)] = &[
         ("GROUP alt.test\r\n", 211),
@@ -142,7 +146,7 @@ mod response_shape {
             .iter()
             .map(|(line, status)| {
                 (
-                    RequestContext::from_request_bytes(line.as_bytes()),
+                    request_context(line.as_bytes()),
                     StatusCode::new(*status),
                 )
             })
