@@ -472,7 +472,7 @@ impl ClientSession {
             }
 
             if let Some(trailing_context) = batch.trailing_context() {
-                let trailing_cmd_len = trailing_context.wire_len();
+                let trailing_wire_len = trailing_context.request_wire_len();
                 debug!(
                     "Client {} trailing non-pipelineable {:?}: {:?}",
                     self.client_addr,
@@ -480,7 +480,7 @@ impl ClientSession {
                     String::from_utf8_lossy(trailing_context.verb())
                 );
 
-                client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd_len);
+                client_to_backend_bytes = client_to_backend_bytes.add(trailing_wire_len.get());
                 skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
                 let trailing_context = batch
