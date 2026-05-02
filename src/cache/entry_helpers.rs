@@ -52,21 +52,21 @@ pub(super) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
     buffer.len() >= MIN_ARTICLE_SIZE && TailBuffer::default().detect_terminator(buffer).is_found()
 }
 
-/// Check if a status code can serve a given command verb
+/// Check if a status code can serve a given command verb.
 ///
-/// Simpler version of `response_for_command` for boolean checks.
-/// Case-insensitive per RFC 3977 (commands are case-insensitive).
+/// Simpler version of `response_for_command` for boolean checks. Commands are
+/// ASCII and case-insensitive per RFC 3977, so keep this byte-native.
 #[inline]
-pub(super) const fn matches_command_type_verb(status_code: u16, cmd_verb: &str) -> bool {
+pub(super) fn matches_command_type_verb_bytes(status_code: u16, cmd_verb: &[u8]) -> bool {
     match status_code {
         220 => {
-            cmd_verb.eq_ignore_ascii_case("ARTICLE")
-                || cmd_verb.eq_ignore_ascii_case("BODY")
-                || cmd_verb.eq_ignore_ascii_case("HEAD")
-                || cmd_verb.eq_ignore_ascii_case("STAT")
+            cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
+                || cmd_verb.eq_ignore_ascii_case(b"BODY")
+                || cmd_verb.eq_ignore_ascii_case(b"HEAD")
+                || cmd_verb.eq_ignore_ascii_case(b"STAT")
         }
-        222 => cmd_verb.eq_ignore_ascii_case("BODY") || cmd_verb.eq_ignore_ascii_case("STAT"),
-        221 => cmd_verb.eq_ignore_ascii_case("HEAD") || cmd_verb.eq_ignore_ascii_case("STAT"),
+        222 => cmd_verb.eq_ignore_ascii_case(b"BODY") || cmd_verb.eq_ignore_ascii_case(b"STAT"),
+        221 => cmd_verb.eq_ignore_ascii_case(b"HEAD") || cmd_verb.eq_ignore_ascii_case(b"STAT"),
         _ => false,
     }
 }
@@ -152,37 +152,44 @@ mod tests {
     }
 
     // =========================================================================
-    // matches_command_type_verb tests
+    // matches_command_type_verb_bytes tests
     // =========================================================================
 
     #[test]
     fn test_220_matches() {
-        assert!(matches_command_type_verb(220, "ARTICLE"));
-        assert!(matches_command_type_verb(220, "BODY"));
-        assert!(matches_command_type_verb(220, "HEAD"));
-        assert!(matches_command_type_verb(220, "STAT"));
+        assert!(matches_command_type_verb_bytes(220, b"ARTICLE"));
+        assert!(matches_command_type_verb_bytes(220, b"BODY"));
+        assert!(matches_command_type_verb_bytes(220, b"HEAD"));
+        assert!(matches_command_type_verb_bytes(220, b"STAT"));
     }
 
     #[test]
     fn test_222_matches() {
-        assert!(!matches_command_type_verb(222, "ARTICLE"));
-        assert!(matches_command_type_verb(222, "BODY"));
-        assert!(!matches_command_type_verb(222, "HEAD"));
-        assert!(matches_command_type_verb(222, "STAT"));
+        assert!(!matches_command_type_verb_bytes(222, b"ARTICLE"));
+        assert!(matches_command_type_verb_bytes(222, b"BODY"));
+        assert!(!matches_command_type_verb_bytes(222, b"HEAD"));
+        assert!(matches_command_type_verb_bytes(222, b"STAT"));
     }
 
     #[test]
     fn test_221_matches() {
-        assert!(!matches_command_type_verb(221, "ARTICLE"));
-        assert!(!matches_command_type_verb(221, "BODY"));
-        assert!(matches_command_type_verb(221, "HEAD"));
-        assert!(matches_command_type_verb(221, "STAT"));
+        assert!(!matches_command_type_verb_bytes(221, b"ARTICLE"));
+        assert!(!matches_command_type_verb_bytes(221, b"BODY"));
+        assert!(matches_command_type_verb_bytes(221, b"HEAD"));
+        assert!(matches_command_type_verb_bytes(221, b"STAT"));
     }
 
     #[test]
     fn test_other_codes_match_nothing() {
-        assert!(!matches_command_type_verb(223, "STAT"));
-        assert!(!matches_command_type_verb(430, "ARTICLE"));
-        assert!(!matches_command_type_verb(200, "ARTICLE"));
+        assert!(!matches_command_type_verb_bytes(223, b"STAT"));
+        assert!(!matches_command_type_verb_bytes(430, b"ARTICLE"));
+        assert!(!matches_command_type_verb_bytes(200, b"ARTICLE"));
+    }
+
+    #[test]
+    fn test_byte_verbs_match_without_utf8() {
+        assert!(matches_command_type_verb_bytes(220, b"article"));
+        assert!(matches_command_type_verb_bytes(221, b"head"));
+        assert!(!matches_command_type_verb_bytes(220, b"ARTICLE \xff"));
     }
 }

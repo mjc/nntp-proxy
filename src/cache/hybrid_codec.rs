@@ -539,8 +539,8 @@ impl HybridArticleEntry {
     /// Simpler version of `response_for_command` for boolean checks.
     #[inline]
     #[must_use]
-    pub const fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
-        super::entry_helpers::matches_command_type_verb(self.status_code.as_u16(), cmd_verb)
+    pub fn matches_command_type_verb_bytes(&self, cmd_verb: &[u8]) -> bool {
+        super::entry_helpers::matches_command_type_verb_bytes(self.status_code.as_u16(), cmd_verb)
     }
 
     /// Get backend availability as `ArticleAvailability` struct
@@ -859,19 +859,19 @@ mod tests {
     #[test]
     fn test_hybrid_entry_command_matching() {
         let article = HybridArticleEntry::from_backend_response(b"220 0 <id>\r\n").expect("valid");
-        assert!(article.matches_command_type_verb("ARTICLE"));
-        assert!(article.matches_command_type_verb("BODY"));
-        assert!(article.matches_command_type_verb("HEAD"));
+        assert!(article.matches_command_type_verb_bytes(b"ARTICLE"));
+        assert!(article.matches_command_type_verb_bytes(b"BODY"));
+        assert!(article.matches_command_type_verb_bytes(b"HEAD"));
 
         let body = HybridArticleEntry::from_backend_response(b"222 0 <id>\r\n").expect("valid");
-        assert!(!body.matches_command_type_verb("ARTICLE"));
-        assert!(body.matches_command_type_verb("BODY"));
-        assert!(!body.matches_command_type_verb("HEAD"));
+        assert!(!body.matches_command_type_verb_bytes(b"ARTICLE"));
+        assert!(body.matches_command_type_verb_bytes(b"BODY"));
+        assert!(!body.matches_command_type_verb_bytes(b"HEAD"));
 
         let head = HybridArticleEntry::from_backend_response(b"221 0 <id>\r\n").expect("valid");
-        assert!(!head.matches_command_type_verb("ARTICLE"));
-        assert!(!head.matches_command_type_verb("BODY"));
-        assert!(head.matches_command_type_verb("HEAD"));
+        assert!(!head.matches_command_type_verb_bytes(b"ARTICLE"));
+        assert!(!head.matches_command_type_verb_bytes(b"BODY"));
+        assert!(head.matches_command_type_verb_bytes(b"HEAD"));
     }
 
     #[test]
@@ -1155,43 +1155,43 @@ mod tests {
     }
 
     // =========================================================================
-    // matches_command_type_verb
+    // matches_command_type_verb_bytes
     // =========================================================================
 
     #[test]
-    fn test_matches_command_type_verb_stat_for_all_content_codes() {
+    fn test_matches_command_type_verb_bytes_stat_for_all_content_codes() {
         for buf in [&b"220 ok\r\n"[..], b"221 ok\r\n", b"222 ok\r\n"] {
             let entry = HybridArticleEntry::from_backend_response(buf).unwrap();
             assert!(
-                entry.matches_command_type_verb("STAT"),
+                entry.matches_command_type_verb_bytes(b"STAT"),
                 "STAT should match for {}xx entry",
                 buf[0] - b'0'
             );
         }
 
         let stat_entry = HybridArticleEntry::from_backend_response(b"223 stat\r\n").unwrap();
-        assert!(!stat_entry.matches_command_type_verb("STAT"));
+        assert!(!stat_entry.matches_command_type_verb_bytes(b"STAT"));
 
         let missing_entry = HybridArticleEntry::from_backend_response(b"430 missing\r\n").unwrap();
-        assert!(!missing_entry.matches_command_type_verb("STAT"));
+        assert!(!missing_entry.matches_command_type_verb_bytes(b"STAT"));
     }
 
     #[test]
-    fn test_matches_command_type_verb_430_matches_nothing() {
+    fn test_matches_command_type_verb_bytes_430_matches_nothing() {
         let entry = HybridArticleEntry::from_backend_response(b"430 missing\r\n").unwrap();
-        assert!(!entry.matches_command_type_verb("ARTICLE"));
-        assert!(!entry.matches_command_type_verb("HEAD"));
-        assert!(!entry.matches_command_type_verb("BODY"));
-        assert!(!entry.matches_command_type_verb("STAT"));
+        assert!(!entry.matches_command_type_verb_bytes(b"ARTICLE"));
+        assert!(!entry.matches_command_type_verb_bytes(b"HEAD"));
+        assert!(!entry.matches_command_type_verb_bytes(b"BODY"));
+        assert!(!entry.matches_command_type_verb_bytes(b"STAT"));
     }
 
     #[test]
-    fn test_matches_command_type_verb_223_matches_nothing() {
+    fn test_matches_command_type_verb_bytes_223_matches_nothing() {
         let entry = HybridArticleEntry::from_backend_response(b"223 stat\r\n").unwrap();
-        assert!(!entry.matches_command_type_verb("ARTICLE"));
-        assert!(!entry.matches_command_type_verb("HEAD"));
-        assert!(!entry.matches_command_type_verb("BODY"));
-        assert!(!entry.matches_command_type_verb("STAT"));
+        assert!(!entry.matches_command_type_verb_bytes(b"ARTICLE"));
+        assert!(!entry.matches_command_type_verb_bytes(b"HEAD"));
+        assert!(!entry.matches_command_type_verb_bytes(b"BODY"));
+        assert!(!entry.matches_command_type_verb_bytes(b"STAT"));
     }
 
     #[test]

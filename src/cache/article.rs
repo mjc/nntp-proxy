@@ -560,21 +560,11 @@ impl ArticleEntry {
         )
     }
 
-    /// Check if this entry can serve a given command type
-    ///
-    /// Simpler version of `response_for_command` for boolean checks.
-    #[inline]
-    #[must_use]
-    pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
-        let code = self.status_code();
-        super::entry_helpers::matches_command_type_verb(code.as_u16(), cmd_verb)
-    }
-
     #[inline]
     #[must_use]
     pub fn matches_command_type_verb_bytes(&self, cmd_verb: &[u8]) -> bool {
         let code = self.status_code();
-        matches_command_type_verb_bytes(code.as_u16(), cmd_verb)
+        super::entry_helpers::matches_command_type_verb_bytes(code.as_u16(), cmd_verb)
     }
 
     /// Initialize availability tracker from this cached entry
@@ -664,20 +654,6 @@ pub(crate) fn response_parts_for_payload_bytes<'a>(
         })
     } else {
         None
-    }
-}
-
-fn matches_command_type_verb_bytes(status_code: u16, cmd_verb: &[u8]) -> bool {
-    match status_code {
-        220 => {
-            cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
-                || cmd_verb.eq_ignore_ascii_case(b"BODY")
-                || cmd_verb.eq_ignore_ascii_case(b"HEAD")
-                || cmd_verb.eq_ignore_ascii_case(b"STAT")
-        }
-        222 => cmd_verb.eq_ignore_ascii_case(b"BODY") || cmd_verb.eq_ignore_ascii_case(b"STAT"),
-        221 => cmd_verb.eq_ignore_ascii_case(b"HEAD") || cmd_verb.eq_ignore_ascii_case(b"STAT"),
-        _ => false,
     }
 }
 
