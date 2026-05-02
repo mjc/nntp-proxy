@@ -60,7 +60,7 @@ impl MockHybridCache {
             return;
         }
 
-        if let Some(mut entry) = HybridArticleEntry::from_response_buffer(buffer) {
+        if let Some(mut entry) = HybridArticleEntry::from_wire_response(buffer) {
             entry.record_backend_has(backend_id);
             storage.insert(key, entry);
         }
@@ -75,8 +75,8 @@ impl MockHybridCache {
             updated.record_backend_missing(backend_id);
             updated
         } else {
-            let mut entry = HybridArticleEntry::from_response_buffer(b"430\r\n".to_vec())
-                .expect("430 is valid");
+            let mut entry =
+                HybridArticleEntry::from_wire_response(b"430\r\n".to_vec()).expect("430 is valid");
             entry.record_backend_missing(backend_id);
             entry
         };
@@ -114,7 +114,7 @@ impl MockHybridCache {
                 if availability.any_backend_has_article() {
                     None
                 } else {
-                    let mut entry = HybridArticleEntry::from_response_buffer(b"430\r\n".to_vec())
+                    let mut entry = HybridArticleEntry::from_wire_response(b"430\r\n".to_vec())
                         .expect("430 is valid");
                     for i in 0..8 {
                         let backend_id = BackendId::from_index(i);

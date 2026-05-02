@@ -364,8 +364,7 @@ impl HybridArticleCache {
         let buffer_len = buffer.len();
         let buffer = buffer.into_vec();
         let mut entry = if self.config.cache_articles {
-            let Some(entry) = HybridArticleEntry::from_response_buffer_with_tier(buffer, tier)
-            else {
+            let Some(entry) = HybridArticleEntry::from_wire_response_with_tier(buffer, tier) else {
                 warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
                 return;
             };
@@ -373,7 +372,7 @@ impl HybridArticleCache {
         } else {
             // Availability-only mode: store minimal stub
             let stub = Self::create_stub(&buffer);
-            let Some(entry) = HybridArticleEntry::from_response_buffer_with_tier(stub, tier) else {
+            let Some(entry) = HybridArticleEntry::from_wire_response_with_tier(stub, tier) else {
                 warn!(
                     msg_id = %key,
                     buffer_len,
@@ -427,7 +426,7 @@ impl HybridArticleCache {
         } else {
             // Create stub entry for availability tracking
             // SAFETY: "430\r\n" is a valid NNTP response
-            let mut entry = HybridArticleEntry::from_response_buffer(b"430\r\n".to_vec())
+            let mut entry = HybridArticleEntry::from_wire_response(b"430\r\n".to_vec())
                 .expect("430 is a valid status code");
             entry.record_backend_missing(backend_id);
             entry
@@ -474,7 +473,7 @@ impl HybridArticleCache {
                 } else {
                     // All checked backends returned 430 - create stub to track this
                     // SAFETY: "430\r\n" is a valid NNTP response
-                    let mut entry = HybridArticleEntry::from_response_buffer(b"430\r\n".to_vec())
+                    let mut entry = HybridArticleEntry::from_wire_response(b"430\r\n".to_vec())
                         .expect("430 is a valid status code");
                     entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);
