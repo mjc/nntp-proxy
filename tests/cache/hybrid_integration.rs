@@ -10,11 +10,19 @@
 
 use anyhow::Result;
 use futures::executor::block_on;
-use nntp_proxy::cache::mock_hybrid::MockHybridCache;
+use nntp_proxy::cache::{HybridArticleEntry, mock_hybrid::MockHybridCache};
 use nntp_proxy::types::{BackendId, MessageId};
 
+fn backend(index: usize) -> BackendId {
+    BackendId::from_index(index)
+}
+
+fn msgid(value: &str) -> MessageId<'_> {
+    MessageId::from_borrowed(value).unwrap()
+}
+
 fn response_bytes(
-    entry: &nntp_proxy::cache::HybridArticleEntry,
+    entry: &HybridArticleEntry,
     verb: &[u8],
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
@@ -24,28 +32,40 @@ fn response_bytes(
     Some(out)
 }
 
+fn assert_article(entry: &HybridArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {
+    assert_eq!(
+        response_bytes(entry, b"ARTICLE", message_id).unwrap(),
+        expected
+    );
+}
+
+fn assert_availability(entry: &HybridArticleEntry, cases: &[(usize, bool)]) {
+    cases.iter().for_each(|(backend_index, should_try)| {
+        assert_eq!(
+            entry.should_try_backend(backend(*backend_index)),
+            *should_try,
+            "backend {backend_index}"
+        );
+    });
+}
+
 #[tokio::test]
 async fn test_mock_cache_basic_ops() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
 
-    // Insert article
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let backend_id = BackendId::from_index(0);
+    let msg_id = msgid("<test@example.com>");
+    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
     cache
-        .upsert(msg_id.clone(), buffer.clone(), backend_id)
+        .upsert(msg_id.clone(), buffer.as_slice(), backend(0))
         .await;
 
-    // Retrieve it
-    let entry = cache.get(&msg_id).await;
-    assert!(entry.is_some(), "Entry should exist");
-    assert_eq!(
-        response_bytes(&entry.unwrap(), b"ARTICLE", &msg_id).unwrap(),
-        buffer
+    assert_article(
+        &cache.get(&msg_id).await.expect("Entry should exist"),
+        &msg_id,
+        buffer,
     );
 
-    // Check stats
     let stats = cache.stats();
     assert_eq!(stats.hits, 1);
     assert_eq!(stats.misses, 0);
@@ -56,17 +76,17 @@ async fn test_mock_cache_basic_ops() -> Result<()> {
 #[tokio::test]
 async fn test_mock_cache_upsert_accepts_borrowed_backend_bytes() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
-    let msg_id = MessageId::from_borrowed("<borrowed@example.com>").unwrap();
+    let msg_id = msgid("<borrowed@example.com>");
     let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
     cache
-        .upsert(msg_id.clone(), buffer.as_slice(), BackendId::from_index(0))
+        .upsert(msg_id.clone(), buffer.as_slice(), backend(0))
         .await;
 
-    let entry = cache.get(&msg_id).await.expect("cached entry");
-    assert_eq!(
-        response_bytes(&entry, b"ARTICLE", &msg_id).unwrap(),
-        buffer.as_slice()
+    assert_article(
+        &cache.get(&msg_id).await.expect("cached entry"),
+        &msg_id,
+        buffer,
     );
 
     Ok(())
@@ -76,7 +96,7 @@ async fn test_mock_cache_upsert_accepts_borrowed_backend_bytes() -> Result<()> {
 async fn test_cache_miss() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
 
-    let msg_id = MessageId::from_borrowed("<nonexistent@example.com>").unwrap();
+    let msg_id = msgid("<nonexistent@example.com>");
     let entry = cache.get(&msg_id).await;
 
     assert!(entry.is_none());
@@ -92,36 +112,25 @@ async fn test_cache_miss() -> Result<()> {
 async fn test_upsert_preserves_larger_buffer() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
 
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
+    let msg_id = msgid("<test@example.com>");
 
-    // Insert large article
     let large_buffer =
-        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nLarge body content here\r\n.\r\n"
-            .to_vec();
+        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nLarge body content here\r\n.\r\n";
+    cache
+        .upsert(msg_id.clone(), large_buffer.as_slice(), backend(0))
+        .await;
+
     cache
         .upsert(
             msg_id.clone(),
-            large_buffer.clone(),
-            BackendId::from_index(0),
+            b"223 0 <test@example.com>\r\n".as_slice(),
+            backend(1),
         )
         .await;
 
-    // Try to overwrite with smaller stub (should be rejected)
-    let small_buffer = b"223 0 <test@example.com>\r\n".to_vec();
-    cache
-        .upsert(msg_id.clone(), small_buffer, BackendId::from_index(1))
-        .await;
-
-    // Should still have large buffer
     let entry = cache.get(&msg_id).await.unwrap();
-    assert_eq!(
-        response_bytes(&entry, b"ARTICLE", &msg_id).unwrap(),
-        large_buffer
-    );
-
-    // But should have availability for both backends
-    assert!(entry.should_try_backend(BackendId::from_index(0)));
-    assert!(entry.should_try_backend(BackendId::from_index(1)));
+    assert_article(&entry, &msg_id, large_buffer);
+    assert_availability(&entry, &[(0, true), (1, true)]);
 
     Ok(())
 }
@@ -130,20 +139,15 @@ async fn test_upsert_preserves_larger_buffer() -> Result<()> {
 async fn test_record_missing() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
 
-    let msg_id = MessageId::from_borrowed("<missing@example.com>").unwrap();
+    let msg_id = msgid("<missing@example.com>");
 
-    // Record missing for backend 0
-    cache
-        .record_missing(msg_id.clone(), BackendId::from_index(0))
-        .await;
+    cache.record_missing(msg_id.clone(), backend(0)).await;
 
-    // Should create 430 stub
     let entry = cache.get(&msg_id).await;
     assert!(entry.is_some());
 
     let entry = entry.unwrap();
-    assert!(!entry.should_try_backend(BackendId::from_index(0)));
-    assert!(entry.should_try_backend(BackendId::from_index(1))); // Not checked yet
+    assert_availability(&entry, &[(0, false), (1, true)]);
 
     Ok(())
 }
@@ -152,40 +156,21 @@ async fn test_record_missing() -> Result<()> {
 async fn test_availability_tracking() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
 
-    let msg_id = MessageId::from_borrowed("<avail@example.com>").unwrap();
-    let buffer = b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".to_vec();
+    let msg_id = msgid("<avail@example.com>");
 
-    // Insert with backend 0
     cache
-        .upsert(msg_id.clone(), buffer, BackendId::from_index(0))
+        .upsert(
+            msg_id.clone(),
+            b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".as_slice(),
+            backend(0),
+        )
         .await;
 
-    // Mark backends 1 and 2 as missing
-    cache
-        .record_missing(msg_id.clone(), BackendId::from_index(1))
-        .await;
-    cache
-        .record_missing(msg_id.clone(), BackendId::from_index(2))
-        .await;
+    cache.record_missing(msg_id.clone(), backend(1)).await;
+    cache.record_missing(msg_id.clone(), backend(2)).await;
 
-    // Verify availability
     let entry = cache.get(&msg_id).await.unwrap();
-    assert!(
-        entry.should_try_backend(BackendId::from_index(0)),
-        "Backend 0 should have article"
-    );
-    assert!(
-        !entry.should_try_backend(BackendId::from_index(1)),
-        "Backend 1 marked missing"
-    );
-    assert!(
-        !entry.should_try_backend(BackendId::from_index(2)),
-        "Backend 2 marked missing"
-    );
-    assert!(
-        entry.should_try_backend(BackendId::from_index(3)),
-        "Backend 3 not checked"
-    );
+    assert_availability(&entry, &[(0, true), (1, false), (2, false), (3, true)]);
 
     Ok(())
 }
@@ -194,17 +179,15 @@ async fn test_availability_tracking() -> Result<()> {
 async fn test_close_succeeds() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
 
-    // Insert some data
-    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
+    let msg_id = msgid("<test@example.com>");
     cache
         .upsert(
             msg_id,
-            b"220 0 <test@example.com>\r\n.\r\n".to_vec(),
-            BackendId::from_index(0),
+            b"220 0 <test@example.com>\r\n.\r\n".as_slice(),
+            backend(0),
         )
         .await;
 
-    // Close should not error
     cache.close().await?;
 
     Ok(())
