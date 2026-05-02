@@ -283,8 +283,8 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }),
         PAYLOAD_ARTICLE => {
             let article_number = read_article_number(reader)?;
-            let headers = read_section(reader)?.into_boxed_slice();
-            let body = read_section(reader)?.into_boxed_slice();
+            let headers = read_section(reader)?;
+            let body = read_section(reader)?;
             Ok(CachedPayload::Article {
                 article_number,
                 headers,
@@ -293,7 +293,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_HEAD => {
             let article_number = read_article_number(reader)?;
-            let headers = read_section(reader)?.into_boxed_slice();
+            let headers = read_section(reader)?;
             Ok(CachedPayload::Head {
                 article_number,
                 headers,
@@ -301,7 +301,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_BODY => {
             let article_number = read_article_number(reader)?;
-            let body = read_section(reader)?.into_boxed_slice();
+            let body = read_section(reader)?;
             Ok(CachedPayload::Body {
                 article_number,
                 body,
@@ -344,7 +344,7 @@ fn write_section(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
     writer.write_all(data).map_err(foyer::Error::io_error)
 }
 
-fn read_section(reader: &mut impl Read) -> foyer::Result<Vec<u8>> {
+fn read_section(reader: &mut impl Read) -> foyer::Result<Box<[u8]>> {
     let mut len_bytes = [0u8; 4];
     reader
         .read_exact(&mut len_bytes)
@@ -361,7 +361,7 @@ fn read_section(reader: &mut impl Read) -> foyer::Result<Vec<u8>> {
             format!("Expected {} bytes, got {}", len, data.len()),
         )));
     }
-    Ok(data)
+    Ok(data.into_boxed_slice())
 }
 
 fn encoded_payload_size(payload: &CachedPayload) -> usize {
