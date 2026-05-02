@@ -156,6 +156,27 @@ pub enum RequestCachePayloadKind {
     Stat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestCacheArticleNumber(u64);
+
+impl RequestCacheArticleNumber {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for RequestCacheArticleNumber {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     kind: RequestKind,
@@ -168,6 +189,7 @@ pub struct RequestContext {
     cache_entry_tier: Option<RequestCacheTier>,
     cache_entry_timestamp: Option<RequestCacheTimestampMillis>,
     cache_payload_kind: Option<RequestCachePayloadKind>,
+    cache_article_number: Option<RequestCacheArticleNumber>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
     response_wire_len: Option<ResponseWireLen>,
@@ -180,6 +202,7 @@ pub struct RequestCacheEntryMetadata {
     tier: RequestCacheTier,
     timestamp: RequestCacheTimestampMillis,
     payload_kind: RequestCachePayloadKind,
+    article_number: Option<RequestCacheArticleNumber>,
 }
 
 impl RequestCacheEntryMetadata {
@@ -190,6 +213,7 @@ impl RequestCacheEntryMetadata {
         tier: RequestCacheTier,
         timestamp: RequestCacheTimestampMillis,
         payload_kind: RequestCachePayloadKind,
+        article_number: Option<RequestCacheArticleNumber>,
     ) -> Self {
         Self {
             status,
@@ -197,6 +221,7 @@ impl RequestCacheEntryMetadata {
             tier,
             timestamp,
             payload_kind,
+            article_number,
         }
     }
 
@@ -223,6 +248,11 @@ impl RequestCacheEntryMetadata {
     #[must_use]
     pub const fn payload_kind(self) -> RequestCachePayloadKind {
         self.payload_kind
+    }
+
+    #[must_use]
+    pub const fn article_number(self) -> Option<RequestCacheArticleNumber> {
+        self.article_number
     }
 }
 
@@ -252,6 +282,7 @@ impl RequestContext {
             cache_entry_tier: None,
             cache_entry_timestamp: None,
             cache_payload_kind: None,
+            cache_article_number: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -276,6 +307,7 @@ impl RequestContext {
             cache_entry_tier: None,
             cache_entry_timestamp: None,
             cache_payload_kind: None,
+            cache_article_number: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -331,6 +363,12 @@ impl RequestContext {
     }
 
     #[inline]
+    #[must_use]
+    pub const fn cache_article_number(&self) -> Option<RequestCacheArticleNumber> {
+        self.cache_article_number
+    }
+
+    #[inline]
     pub const fn record_cache_status(&mut self, status: RequestCacheStatus) {
         self.cache_status = Some(status);
     }
@@ -352,6 +390,7 @@ impl RequestContext {
         self.cache_entry_tier = Some(metadata.tier);
         self.cache_entry_timestamp = Some(metadata.timestamp);
         self.cache_payload_kind = Some(metadata.payload_kind);
+        self.cache_article_number = metadata.article_number;
     }
 
     #[inline]
@@ -608,6 +647,7 @@ mod tests {
         assert_eq!(ctx.cache_entry_tier(), None);
         assert_eq!(ctx.cache_entry_timestamp(), None);
         assert_eq!(ctx.cache_payload_kind(), None);
+        assert_eq!(ctx.cache_article_number(), None);
         assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(ctx.response_wire_len(), None);
@@ -672,6 +712,7 @@ mod tests {
         let tier = RequestCacheTier::new(2);
         let timestamp = RequestCacheTimestampMillis::new(123_456);
         let payload_kind = RequestCachePayloadKind::Missing;
+        let article_number = Some(RequestCacheArticleNumber::new(42));
 
         ctx.record_cache_entry_metadata(RequestCacheEntryMetadata::new(
             status,
@@ -679,6 +720,7 @@ mod tests {
             tier,
             timestamp,
             payload_kind,
+            article_number,
         ));
 
         assert_eq!(ctx.cache_entry_status(), Some(status));
@@ -686,6 +728,7 @@ mod tests {
         assert_eq!(ctx.cache_entry_tier(), Some(tier));
         assert_eq!(ctx.cache_entry_timestamp(), Some(timestamp));
         assert_eq!(ctx.cache_payload_kind(), Some(payload_kind));
+        assert_eq!(ctx.cache_article_number(), article_number);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }

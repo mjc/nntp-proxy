@@ -6,9 +6,9 @@
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
-    RequestCacheAvailability, RequestCacheEntryMetadata, RequestCachePayloadKind,
-    RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis, RequestContext,
-    ResponseWireLen, StatusCode,
+    RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
+    RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
+    RequestContext, ResponseWireLen, StatusCode,
 };
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
@@ -211,6 +211,9 @@ fn cache_entry_metadata(
         RequestCacheTier::new(cached.tier().get()),
         RequestCacheTimestampMillis::new(cached.inserted_at().get()),
         cache_payload_kind(cached.payload_kind()),
+        cached
+            .article_number()
+            .map(|number| RequestCacheArticleNumber::new(number.get())),
     ))
 }
 
@@ -439,6 +442,10 @@ mod tests {
         assert_eq!(request.backend_id(), Some(backend_id));
         assert_eq!(request.response_status(), Some(StatusCode::new(220)));
         assert_eq!(
+            request.cache_article_number(),
+            Some(RequestCacheArticleNumber::new(0))
+        );
+        assert_eq!(
             request.response_wire_len(),
             Some(ResponseWireLen::new(expected.len()))
         );
@@ -509,6 +516,7 @@ mod tests {
             request.cache_payload_kind(),
             Some(RequestCachePayloadKind::Missing)
         );
+        assert_eq!(request.cache_article_number(), None);
         assert_eq!(
             request
                 .cache_availability()

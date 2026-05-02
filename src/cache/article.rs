@@ -312,6 +312,17 @@ impl CachedPayload {
             Self::Stat { .. } => CachedPayloadKind::Stat,
         }
     }
+
+    #[must_use]
+    pub const fn article_number(&self) -> Option<CachedArticleNumber> {
+        match self {
+            Self::Article { article_number, .. }
+            | Self::Head { article_number, .. }
+            | Self::Body { article_number, .. }
+            | Self::Stat { article_number } => *article_number,
+            Self::Missing | Self::AvailabilityOnly => None,
+        }
+    }
 }
 
 /// Cache entry for an article.
@@ -429,6 +440,12 @@ impl ArticleEntry {
     #[must_use]
     pub const fn payload_kind(&self) -> CachedPayloadKind {
         self.payload.kind()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn article_number(&self) -> Option<CachedArticleNumber> {
+        self.payload.article_number()
     }
 
     /// Get status code from the response buffer
