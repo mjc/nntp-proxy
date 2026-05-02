@@ -351,7 +351,7 @@ fn encoded_payload_size(payload: &CachedPayload) -> usize {
 }
 
 impl HybridArticleEntry {
-    /// Ingest a backend response buffer into a typed hybrid cache entry.
+    /// Ingest a backend wire response into a typed hybrid cache entry.
     ///
     /// Returns `None` if the status code is invalid or not cacheable. The entry
     /// stores semantic payload sections, not the original wire response.
@@ -360,7 +360,7 @@ impl HybridArticleEntry {
         Self::from_wire_response_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
-    /// Ingest a backend response buffer with a specific provider tier.
+    /// Ingest a backend wire response with a specific provider tier.
     #[must_use]
     pub fn from_wire_response_with_tier(buffer: Vec<u8>, tier: ttl::CacheTier) -> Option<Self> {
         let raw_code = StatusCode::parse(&buffer)?.as_u16();

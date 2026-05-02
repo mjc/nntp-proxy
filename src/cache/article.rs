@@ -350,9 +350,9 @@ pub struct ArticleEntry {
 }
 
 impl ArticleEntry {
-    /// Ingest a backend response buffer into a typed semantic cache entry.
+    /// Ingest a backend wire response into a typed semantic cache entry.
     ///
-    /// This is the boundary for cold/full-wire backend responses. The entry
+    /// This is the boundary for cold backend wire responses. The entry
     /// stores parsed metadata and payload sections, not the original wire
     /// response.
     #[must_use]
@@ -388,7 +388,7 @@ impl ArticleEntry {
         }
     }
 
-    /// Ingest a backend response buffer with a specific provider tier.
+    /// Ingest a backend wire response with a specific provider tier.
     #[must_use]
     pub fn from_wire_response_with_tier(buffer: Vec<u8>, tier: ttl::CacheTier) -> Self {
         let status_code = StatusCode::parse(&buffer).unwrap_or_else(|| StatusCode::new(430));
@@ -448,7 +448,7 @@ impl ArticleEntry {
         self.payload.article_number()
     }
 
-    /// Get status code from the response buffer
+    /// Get status code for the cached entry.
     ///
     /// Parses the first 3 bytes as the status code.
     /// Returns None if buffer is too short or invalid.
@@ -960,7 +960,7 @@ impl ArticleCache {
             .await;
     }
 
-    /// Create minimal stub from response buffer
+    /// Create minimal stub from a backend wire response.
     ///
     /// Extracts the status code from the first line and creates a minimal stub.
     /// Falls back to "200\r\n" if parsing fails.

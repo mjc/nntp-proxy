@@ -487,7 +487,7 @@ impl HybridArticleCache {
         }
     }
 
-    /// Create a minimal stub from a response buffer (for availability-only mode)
+    /// Create a minimal stub from a backend wire response (for availability-only mode)
     fn create_stub(buffer: &[u8]) -> Vec<u8> {
         super::entry_helpers::extract_status_line(buffer).into_vec()
     }
