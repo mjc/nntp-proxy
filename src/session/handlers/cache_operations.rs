@@ -8,7 +8,7 @@ use crate::cache::ttl::CacheTier;
 use crate::protocol::{
     RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
-    RequestContext, ResponseWireLen, StatusCode,
+    RequestContext, RequestResponseMetadata, ResponseWireLen, StatusCode,
 };
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
@@ -137,7 +137,10 @@ impl ClientSession {
         let backend_id = router.route(self.client_id)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
-        request.record_cache_response(backend_id, write.status, write.wire_len);
+        request.record_cache_response(
+            backend_id,
+            RequestResponseMetadata::new(write.status, write.wire_len),
+        );
         Ok(CacheLookupResult::Hit)
     }
 
