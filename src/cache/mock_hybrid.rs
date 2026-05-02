@@ -53,9 +53,16 @@ impl MockHybridCache {
         let mut storage = self.storage.lock().unwrap();
         let buffer = buffer.into();
 
-        // Check for existing entry - don't overwrite larger with smaller
+        let Some(mut entry) =
+            HybridArticleEntry::from_cache_buffer_with_tier(buffer, super::ttl::CacheTier::new(0))
+        else {
+            return;
+        };
+        let entry_len = entry.payload_len();
+
+        // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Some(existing) = storage.get(&key)
-            && existing.payload_len() > buffer.len()
+            && existing.payload_len() > entry_len
         {
             // Just update availability
             let mut updated = existing.clone();
@@ -64,12 +71,8 @@ impl MockHybridCache {
             return;
         }
 
-        if let Some(mut entry) =
-            HybridArticleEntry::from_cache_buffer_with_tier(buffer, super::ttl::CacheTier::new(0))
-        {
-            entry.record_backend_has(backend_id);
-            storage.insert(key, entry);
-        }
+        entry.record_backend_has(backend_id);
+        storage.insert(key, entry);
     }
 
     pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
@@ -157,5 +160,44 @@ impl MockHybridCache {
 
     pub async fn close(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::RequestKind;
+
+    fn msg_id() -> MessageId<'static> {
+        MessageId::from_borrowed("<mock-hybrid@example>").expect("valid message id")
+    }
+
+    #[tokio::test]
+    async fn upsert_keeps_existing_semantic_payload_over_longer_wire_stub() {
+        let cache = MockHybridCache::new(1024);
+        cache
+            .upsert(
+                msg_id(),
+                b"220 1 <mock-hybrid@example>\r\nH: V\r\n\r\nBody\r\n.\r\n".as_slice(),
+                BackendId::from_index(0),
+            )
+            .await;
+
+        cache
+            .upsert(
+                msg_id(),
+                b"220 1 <mock-hybrid@example> long status line without payload\r\n".as_slice(),
+                BackendId::from_index(1),
+            )
+            .await;
+
+        let entry = cache.get(&msg_id()).await.expect("entry remains cached");
+        assert!(
+            entry
+                .response_parts_for_request_kind(RequestKind::Article, "<mock-hybrid@example>")
+                .is_some(),
+            "longer raw wire stubs must not replace semantic article payloads"
+        );
+        assert!(entry.should_try_backend(BackendId::from_index(1)));
     }
 }
