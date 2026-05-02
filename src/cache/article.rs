@@ -356,8 +356,8 @@ impl ArticleEntry {
     /// stores parsed metadata and payload sections, not the original wire
     /// response.
     #[must_use]
-    pub fn from_response_buffer(buffer: Vec<u8>) -> Self {
-        Self::from_response_buffer_with_tier(buffer, ttl::CacheTier::new(0))
+    pub fn from_wire_response(buffer: Vec<u8>) -> Self {
+        Self::from_wire_response_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     #[must_use]
@@ -390,7 +390,7 @@ impl ArticleEntry {
 
     /// Ingest a backend response buffer with a specific provider tier.
     #[must_use]
-    pub fn from_response_buffer_with_tier(buffer: Vec<u8>, tier: ttl::CacheTier) -> Self {
+    pub fn from_wire_response_with_tier(buffer: Vec<u8>, tier: ttl::CacheTier) -> Self {
         let status_code = StatusCode::parse(&buffer).unwrap_or_else(|| StatusCode::new(430));
         let payload = parse_payload(status_code, &buffer);
         Self {
@@ -914,7 +914,7 @@ impl ArticleCache {
         } else {
             Self::create_minimal_stub(buffer)
         };
-        let new_entry_template = ArticleEntry::from_response_buffer_with_tier(new_buffer, tier);
+        let new_entry_template = ArticleEntry::from_wire_response_with_tier(new_buffer, tier);
 
         // Use atomic upsert - this provides key-level locking and eliminates
         // the race condition between get() and insert() calls
@@ -1016,7 +1016,7 @@ impl ArticleCache {
                     entry
                 } else {
                     // First 430 for this article - create cache entry with minimal stub
-                    let mut entry = ArticleEntry::from_response_buffer(b"430\r\n".to_vec());
+                    let mut entry = ArticleEntry::from_wire_response(b"430\r\n".to_vec());
                     entry.record_backend_missing(backend_id);
                     entry
                 };
@@ -1078,7 +1078,7 @@ impl ArticleCache {
                         Op::Nop
                     } else {
                         // All checked backends returned 430 - create stub to track this
-                        let mut entry = ArticleEntry::from_response_buffer(b"430\r\n".to_vec());
+                        let mut entry = ArticleEntry::from_wire_response(b"430\r\n".to_vec());
                         entry.backend_availability = availability;
                         Op::Put(entry)
                     }
@@ -1173,7 +1173,7 @@ mod tests {
 
     fn create_test_article(msgid: &str) -> ArticleEntry {
         let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
-        ArticleEntry::from_response_buffer(buffer)
+        ArticleEntry::from_wire_response(buffer)
     }
 
     fn rendered(entry: &ArticleEntry, verb: &str, msgid: &str) -> Vec<u8> {
@@ -1186,7 +1186,7 @@ mod tests {
     #[test]
     fn test_article_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = ArticleEntry::from_response_buffer(buffer.clone());
+        let entry = ArticleEntry::from_wire_response(buffer.clone());
 
         assert_eq!(entry.status_code(), Some(StatusCode::new(220)));
         assert_eq!(rendered(&entry, "ARTICLE", "<test@example.com>"), buffer);
@@ -1197,31 +1197,41 @@ mod tests {
     }
 
     #[test]
+    fn article_entry_ingests_wire_response_by_name() {
+        let entry = ArticleEntry::from_wire_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
+        );
+
+        assert_eq!(entry.status_code(), Some(StatusCode::new(220)));
+        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+    }
+
+    #[test]
     fn test_is_complete_article() {
         // Stubs should NOT be complete articles
-        let stub_430 = ArticleEntry::from_response_buffer(b"430\r\n".to_vec());
+        let stub_430 = ArticleEntry::from_wire_response(b"430\r\n".to_vec());
         assert!(!stub_430.is_complete_article());
 
-        let stub_220 = ArticleEntry::from_response_buffer(b"220\r\n".to_vec());
+        let stub_220 = ArticleEntry::from_wire_response(b"220\r\n".to_vec());
         assert!(!stub_220.is_complete_article());
 
-        let stub_223 = ArticleEntry::from_response_buffer(b"223\r\n".to_vec());
+        let stub_223 = ArticleEntry::from_wire_response(b"223\r\n".to_vec());
         assert!(!stub_223.is_complete_article());
 
         // Full article SHOULD be complete
-        let full = ArticleEntry::from_response_buffer(
+        let full = ArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
         );
         assert!(full.is_complete_article());
 
         // Wrong status code (not 220) should NOT be complete article
-        let head_response = ArticleEntry::from_response_buffer(
+        let head_response = ArticleEntry::from_wire_response(
             b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec(),
         );
         assert!(!head_response.is_complete_article());
 
         // Missing terminator should NOT be complete
-        let no_terminator = ArticleEntry::from_response_buffer(
+        let no_terminator = ArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec(),
         );
         assert!(!no_terminator.is_complete_article());
@@ -1604,7 +1614,7 @@ mod tests {
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             std::str::from_utf8(&body).unwrap()
         );
-        let article = ArticleEntry::from_response_buffer(response.as_bytes().to_vec());
+        let article = ArticleEntry::from_wire_response(response.as_bytes().to_vec());
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid.clone(), article).await;
@@ -1624,7 +1634,7 @@ mod tests {
                 msgid.as_str(),
                 std::str::from_utf8(&body).unwrap()
             );
-            let article = ArticleEntry::from_response_buffer(response.as_bytes().to_vec());
+            let article = ArticleEntry::from_wire_response(response.as_bytes().to_vec());
             cache.insert(msgid, article).await;
             cache.sync().await;
         }
@@ -1649,7 +1659,7 @@ mod tests {
 
         // Create small stub (53 bytes)
         let stub = b"223 0 <test@example.com>\r\n".to_vec();
-        let article = ArticleEntry::from_response_buffer(stub);
+        let article = ArticleEntry::from_wire_response(stub);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid, article).await;
@@ -1665,7 +1675,7 @@ mod tests {
             let msgid_str = format!("<stub{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let stub = format!("223 0 {}\r\n", msgid.as_str());
-            let article = ArticleEntry::from_response_buffer(stub.as_bytes().to_vec());
+            let article = ArticleEntry::from_wire_response(stub.as_bytes().to_vec());
             cache.insert(msgid, article).await;
         }
 
