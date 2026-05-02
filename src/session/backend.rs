@@ -39,9 +39,9 @@ pub enum ResponseWarning {
     UnusualStatusCode(u16),
 }
 
-/// Validated backend response (pure data)
+/// Validated backend response status (pure data)
 #[derive(Debug)]
-pub struct ParsedBackendResponse {
+pub struct BackendResponseValidation {
     pub status_code: Option<StatusCode>,
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
@@ -59,13 +59,13 @@ pub struct ParsedBackendResponse {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// `ParsedBackendResponse` with parsed status and any warnings
+/// `BackendResponseValidation` with parsed status and any warnings
 #[must_use]
 pub fn validate_backend_response(
     chunk: &[u8],
     bytes_read: usize,
     min_length: usize,
-) -> ParsedBackendResponse {
+) -> BackendResponseValidation {
     let mut warnings = SmallVec::new();
 
     // Check minimum length
@@ -88,7 +88,7 @@ pub fn validate_backend_response(
         warnings.push(ResponseWarning::InvalidResponse);
     }
 
-    ParsedBackendResponse {
+    BackendResponseValidation {
         status_code,
         warnings,
     }
