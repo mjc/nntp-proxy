@@ -417,15 +417,10 @@ impl HybridArticleEntry {
         )
     }
 
-    /// Get the validated status code
-    ///
-    /// This always returns a valid code because entries cannot be created
-    /// with invalid status codes. Returns Option for API consistency with `ArticleEntry`.
     #[inline]
     #[must_use]
-    pub fn status_code(&self) -> Option<StatusCode> {
-        // SAFETY: Invariant enforced by new() and decode()
-        Some(StatusCode::new(self.status_code.as_u16()))
+    pub fn status_code(&self) -> StatusCode {
+        StatusCode::new(self.status_code.as_u16())
     }
 
     /// Check if we should try fetching from this backend
@@ -677,7 +672,7 @@ mod tests {
             render_response(&entry, b"ARTICLE", "<test@example.com>").unwrap(),
             buffer
         );
-        assert_eq!(entry.status_code().map(|c| c.as_u16()), Some(220));
+        assert_eq!(entry.status_code().as_u16(), 220);
 
         entry.record_backend_has(BackendId::from_index(0));
         assert!(entry.should_try_backend(BackendId::from_index(0)));
@@ -695,7 +690,7 @@ mod tests {
         )
         .expect("valid status code");
 
-        assert_eq!(entry.status_code().map(|code| code.as_u16()), Some(220));
+        assert_eq!(entry.status_code().as_u16(), 220);
         assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
     }
 
@@ -784,11 +779,11 @@ mod tests {
     #[test]
     fn test_entry_status_code_returns_protocol_status_code() {
         let entry = HybridArticleEntry::from_wire_response(b"220 0 <id>\r\n".to_vec()).unwrap();
-        let sc = entry.status_code().unwrap();
+        let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 220);
 
         let entry = HybridArticleEntry::from_wire_response(b"430 not found\r\n".to_vec()).unwrap();
-        let sc = entry.status_code().unwrap();
+        let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 430);
     }
 
@@ -804,7 +799,7 @@ mod tests {
         for (buf, expected) in cases {
             let entry = HybridArticleEntry::from_wire_response(buf.to_vec())
                 .unwrap_or_else(|| panic!("should accept code {expected}"));
-            assert_eq!(entry.status_code().unwrap().as_u16(), *expected);
+            assert_eq!(entry.status_code().as_u16(), *expected);
         }
     }
 
@@ -833,7 +828,7 @@ mod tests {
         entry.encode(&mut buf).unwrap();
         let decoded = HybridArticleEntry::decode(&mut buf.as_slice()).unwrap();
 
-        assert_eq!(decoded.status_code().unwrap().as_u16(), 220);
+        assert_eq!(decoded.status_code().as_u16(), 220);
         assert_entry_eq(&entry, &decoded);
     }
 
@@ -851,10 +846,7 @@ mod tests {
             let mut encoded = Vec::new();
             entry.encode(&mut encoded).unwrap();
             let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
-            assert_eq!(
-                decoded.status_code().unwrap().as_u16(),
-                entry.status_code().unwrap().as_u16()
-            );
+            assert_eq!(decoded.status_code().as_u16(), entry.status_code().as_u16());
             assert_entry_eq(&entry, &decoded);
         }
     }

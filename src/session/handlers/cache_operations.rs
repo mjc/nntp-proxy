@@ -115,7 +115,7 @@ impl ClientSession {
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
         if !cached.matches_command_type_verb_bytes(cmd_verb) {
-            let status_code = cached.status_code().map_or(0, |c| c.as_u16());
+            let status_code = cached.status_code().as_u16();
             debug!(
                 "Client {} cached response (code={}) can't serve command {:?}",
                 self.client_addr,
@@ -206,7 +206,7 @@ fn cache_entry_metadata(
     availability: &ArticleAvailability,
 ) -> Option<RequestCacheEntryMetadata> {
     Some(RequestCacheEntryMetadata::new(
-        cached.status_code()?,
+        cached.status_code(),
         cache_availability_metadata(availability),
         RequestCacheTier::new(cached.tier().get()),
         RequestCacheTimestampMillis::new(cached.inserted_at().get()),

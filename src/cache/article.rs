@@ -448,14 +448,10 @@ impl ArticleEntry {
         self.payload.article_number()
     }
 
-    /// Get status code for the cached entry.
-    ///
-    /// Parses the first 3 bytes as the status code.
-    /// Returns None if buffer is too short or invalid.
     #[inline]
     #[must_use]
-    pub fn status_code(&self) -> Option<StatusCode> {
-        Some(self.status_code)
+    pub const fn status_code(&self) -> StatusCode {
+        self.status_code
     }
 
     /// Check if we should try fetching from this backend
@@ -521,9 +517,7 @@ impl ArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_complete_article(&self) -> bool {
-        let Some(code) = self.status_code() else {
-            return false;
-        };
+        let code = self.status_code();
         matches!(
             (&self.payload, code.as_u16()),
             (CachedPayload::Article { headers, body, .. }, 220)
@@ -560,18 +554,14 @@ impl ArticleEntry {
     #[inline]
     #[must_use]
     pub fn matches_command_type_verb(&self, cmd_verb: &str) -> bool {
-        let Some(code) = self.status_code() else {
-            return false;
-        };
+        let code = self.status_code();
         super::entry_helpers::matches_command_type_verb(code.as_u16(), cmd_verb)
     }
 
     #[inline]
     #[must_use]
     pub fn matches_command_type_verb_bytes(&self, cmd_verb: &[u8]) -> bool {
-        let Some(code) = self.status_code() else {
-            return false;
-        };
+        let code = self.status_code();
         matches_command_type_verb_bytes(code.as_u16(), cmd_verb)
     }
 
@@ -1162,7 +1152,7 @@ mod tests {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = ArticleEntry::from_wire_response(buffer.clone());
 
-        assert_eq!(entry.status_code(), Some(StatusCode::new(220)));
+        assert_eq!(entry.status_code(), StatusCode::new(220));
         assert_eq!(rendered(&entry, "ARTICLE", "<test@example.com>"), buffer);
 
         // Default: should try all backends
@@ -1176,7 +1166,7 @@ mod tests {
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
         );
 
-        assert_eq!(entry.status_code(), Some(StatusCode::new(220)));
+        assert_eq!(entry.status_code(), StatusCode::new(220));
         assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
     }
 
