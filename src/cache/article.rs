@@ -335,7 +335,7 @@ impl ArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.inserted_at.get(), base_ttl_millis, self.tier.get())
+        ttl::is_expired(self.inserted_at.get(), base_ttl_millis, self.tier)
     }
 
     /// Get the tier of the backend that provided this article

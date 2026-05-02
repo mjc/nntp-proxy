@@ -11,7 +11,7 @@
 #![allow(clippy::format_push_string)]
 
 use nntp_proxy::cache::ArticleAvailability;
-use nntp_proxy::cache::ttl::effective_ttl;
+use nntp_proxy::cache::ttl::{CacheTier, effective_ttl};
 use nntp_proxy::protocol::{RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::types::MessageId;
 use proptest::prelude::*;
@@ -283,7 +283,7 @@ proptest! {
         tier in any::<u8>()
     ) {
         // Should work for all combinations
-        let _ = effective_ttl(base, tier);
+        let _ = effective_ttl(base, CacheTier::new(tier));
     }
 
     #[test]
@@ -293,8 +293,8 @@ proptest! {
         tier in 0u8..=10u8
     ) {
         if b1 <= b2 {
-            let ttl1 = effective_ttl(b1, tier);
-            let ttl2 = effective_ttl(b2, tier);
+            let ttl1 = effective_ttl(b1, CacheTier::new(tier));
+            let ttl2 = effective_ttl(b2, CacheTier::new(tier));
 
             // Higher base should give higher or equal TTL
             prop_assert!(ttl1 <= ttl2,
@@ -310,8 +310,8 @@ proptest! {
         t2 in 0u8..20u8
     ) {
         if t1 <= t2 {
-            let ttl1 = effective_ttl(base, t1);
-            let ttl2 = effective_ttl(base, t2);
+            let ttl1 = effective_ttl(base, CacheTier::new(t1));
+            let ttl2 = effective_ttl(base, CacheTier::new(t2));
 
             // Higher tier should give higher or equal TTL
             prop_assert!(ttl1 <= ttl2,
@@ -322,7 +322,7 @@ proptest! {
 
     #[test]
     fn prop_effective_ttl_zero_base_is_zero(tier in any::<u8>()) {
-        let ttl = effective_ttl(0, tier);
+        let ttl = effective_ttl(0, CacheTier::new(tier));
         prop_assert_eq!(ttl, 0, "Zero base should always give zero TTL");
     }
 }

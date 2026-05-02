@@ -7,7 +7,9 @@
 //! - Tier 10: 1024x base TTL (~43 days with 1h base)
 //! - etc. (capped at tier 63 to prevent shift overflow)
 
-use nntp_proxy::cache::ttl::{MAX_TTL_TIER, effective_ttl, is_expired, now_millis, ttl_multiplier};
+use nntp_proxy::cache::ttl::{
+    CacheTier, MAX_TTL_TIER, effective_ttl, is_expired, now_millis, ttl_multiplier,
+};
 use nntp_proxy::cache::{ArticleCache, ArticleEntry};
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -19,22 +21,22 @@ use std::time::Duration;
 #[test]
 fn test_tier_multiplier_calculation() {
     // Tier 0: 1x
-    assert_eq!(ttl_multiplier(0), 1);
+    assert_eq!(ttl_multiplier(CacheTier::new(0)), 1);
     // Tier 1: 2x
-    assert_eq!(ttl_multiplier(1), 2);
+    assert_eq!(ttl_multiplier(CacheTier::new(1)), 2);
     // Tier 2: 4x
-    assert_eq!(ttl_multiplier(2), 4);
+    assert_eq!(ttl_multiplier(CacheTier::new(2)), 4);
     // Tier 3: 8x
-    assert_eq!(ttl_multiplier(3), 8);
+    assert_eq!(ttl_multiplier(CacheTier::new(3)), 8);
     // Tier 7: 128x
-    assert_eq!(ttl_multiplier(7), 128);
+    assert_eq!(ttl_multiplier(CacheTier::new(7)), 128);
     // Tier 10: 1024x
-    assert_eq!(ttl_multiplier(10), 1024);
+    assert_eq!(ttl_multiplier(CacheTier::new(10)), 1024);
     // Tier 63: max (2^63)
-    assert_eq!(ttl_multiplier(63), 1u64 << 63);
+    assert_eq!(ttl_multiplier(CacheTier::new(63)), 1u64 << 63);
     // Tier 64+: capped at 2^63
-    assert_eq!(ttl_multiplier(64), 1u64 << 63);
-    assert_eq!(ttl_multiplier(255), 1u64 << 63);
+    assert_eq!(ttl_multiplier(CacheTier::new(64)), 1u64 << 63);
+    assert_eq!(ttl_multiplier(CacheTier::new(255)), 1u64 << 63);
 }
 
 #[test]
@@ -42,55 +44,55 @@ fn test_effective_ttl_formula() {
     let base_ttl = 1000u64; // 1 second
 
     // effective_ttl = base_ttl * (2^tier)
-    assert_eq!(effective_ttl(base_ttl, 0), 1000); // tier 0: 1x
-    assert_eq!(effective_ttl(base_ttl, 1), 2000); // tier 1: 2x
-    assert_eq!(effective_ttl(base_ttl, 2), 4000); // tier 2: 4x
-    assert_eq!(effective_ttl(base_ttl, 3), 8000); // tier 3: 8x
-    assert_eq!(effective_ttl(base_ttl, 4), 16000); // tier 4: 16x
-    assert_eq!(effective_ttl(base_ttl, 5), 32000); // tier 5: 32x
-    assert_eq!(effective_ttl(base_ttl, 6), 64000); // tier 6: 64x
-    assert_eq!(effective_ttl(base_ttl, 7), 128_000); // tier 7: 128x
-    assert_eq!(effective_ttl(base_ttl, 10), 1_024_000); // tier 10: 1024x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(0)), 1000); // tier 0: 1x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(1)), 2000); // tier 1: 2x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(2)), 4000); // tier 2: 4x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(3)), 8000); // tier 3: 8x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(4)), 16000); // tier 4: 16x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(5)), 32000); // tier 5: 32x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(6)), 64000); // tier 6: 64x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(7)), 128_000); // tier 7: 128x
+    assert_eq!(effective_ttl(base_ttl, CacheTier::new(10)), 1_024_000); // tier 10: 1024x
 }
 
 #[test]
 fn test_effective_ttl_caps_at_tier_63() {
     // Use base_ttl of 1 to avoid overflow in result comparison
-    let tier_63_result = effective_ttl(1, 63);
+    let tier_63_result = effective_ttl(1, CacheTier::new(63));
     assert_eq!(tier_63_result, 1u64 << 63);
 
     // All tiers above 63 should give same result as tier 63
-    assert_eq!(effective_ttl(1, 64), tier_63_result);
-    assert_eq!(effective_ttl(1, 100), tier_63_result);
-    assert_eq!(effective_ttl(1, 255), tier_63_result);
+    assert_eq!(effective_ttl(1, CacheTier::new(64)), tier_63_result);
+    assert_eq!(effective_ttl(1, CacheTier::new(100)), tier_63_result);
+    assert_eq!(effective_ttl(1, CacheTier::new(255)), tier_63_result);
 }
 
 #[test]
 fn test_overflow_protection() {
     // Very large base TTL with high tier shouldn't overflow
-    assert_eq!(effective_ttl(u64::MAX, 0), u64::MAX);
-    assert_eq!(effective_ttl(u64::MAX, 1), u64::MAX); // saturates
-    assert_eq!(effective_ttl(u64::MAX, 63), u64::MAX); // saturates
+    assert_eq!(effective_ttl(u64::MAX, CacheTier::new(0)), u64::MAX);
+    assert_eq!(effective_ttl(u64::MAX, CacheTier::new(1)), u64::MAX); // saturates
+    assert_eq!(effective_ttl(u64::MAX, CacheTier::new(63)), u64::MAX); // saturates
 
     // Large value that would overflow without saturation
     // u64::MAX / 2 + 1 times 2 would overflow
-    let result = effective_ttl(u64::MAX / 2 + 1, 1);
+    let result = effective_ttl(u64::MAX / 2 + 1, CacheTier::new(1));
     assert_eq!(result, u64::MAX); // Saturates to MAX
 }
 
 #[test]
 fn test_zero_ttl_stays_zero() {
     // Zero TTL should stay zero regardless of tier
-    assert_eq!(effective_ttl(0, 0), 0);
-    assert_eq!(effective_ttl(0, 1), 0);
-    assert_eq!(effective_ttl(0, 63), 0);
-    assert_eq!(effective_ttl(0, 255), 0);
+    assert_eq!(effective_ttl(0, CacheTier::new(0)), 0);
+    assert_eq!(effective_ttl(0, CacheTier::new(1)), 0);
+    assert_eq!(effective_ttl(0, CacheTier::new(63)), 0);
+    assert_eq!(effective_ttl(0, CacheTier::new(255)), 0);
 }
 
 #[test]
 fn test_max_ttl_tier_constant() {
     assert_eq!(MAX_TTL_TIER, 63);
-    assert_eq!(ttl_multiplier(MAX_TTL_TIER), 1u64 << 63);
+    assert_eq!(ttl_multiplier(CacheTier::new(MAX_TTL_TIER)), 1u64 << 63);
 }
 
 // =============================================================================
@@ -101,9 +103,9 @@ fn test_max_ttl_tier_constant() {
 fn test_is_expired_fresh_entry() {
     let now = now_millis();
     // Just inserted with 1s TTL - should not be expired
-    assert!(!is_expired(now, 1000, 0));
-    assert!(!is_expired(now, 1000, 1));
-    assert!(!is_expired(now, 1000, 63));
+    assert!(!is_expired(now, 1000, CacheTier::new(0)));
+    assert!(!is_expired(now, 1000, CacheTier::new(1)));
+    assert!(!is_expired(now, 1000, CacheTier::new(63)));
 }
 
 #[test]
@@ -111,7 +113,7 @@ fn test_is_expired_tier_0() {
     let now = now_millis();
     // 1.5s ago with 1s base TTL, tier 0 (1x = 1s effective)
     let inserted = now.saturating_sub(1500);
-    assert!(is_expired(inserted, 1000, 0)); // expired
+    assert!(is_expired(inserted, 1000, CacheTier::new(0))); // expired
 }
 
 #[test]
@@ -121,9 +123,9 @@ fn test_is_expired_tier_1_extends_ttl() {
     let inserted = now.saturating_sub(1500);
 
     // Tier 0 (1s effective TTL) = expired
-    assert!(is_expired(inserted, 1000, 0));
+    assert!(is_expired(inserted, 1000, CacheTier::new(0)));
     // Tier 1 (2s effective TTL) = NOT expired
-    assert!(!is_expired(inserted, 1000, 1));
+    assert!(!is_expired(inserted, 1000, CacheTier::new(1)));
 }
 
 #[test]
@@ -133,11 +135,11 @@ fn test_is_expired_tier_2_extends_further() {
     let inserted = now.saturating_sub(3000);
 
     // Tier 0 (1s) = expired
-    assert!(is_expired(inserted, 1000, 0));
+    assert!(is_expired(inserted, 1000, CacheTier::new(0)));
     // Tier 1 (2s) = expired
-    assert!(is_expired(inserted, 1000, 1));
+    assert!(is_expired(inserted, 1000, CacheTier::new(1)));
     // Tier 2 (4s) = NOT expired
-    assert!(!is_expired(inserted, 1000, 2));
+    assert!(!is_expired(inserted, 1000, CacheTier::new(2)));
 }
 
 #[test]
@@ -147,26 +149,26 @@ fn test_is_expired_high_tier_extension() {
     let inserted = now.saturating_sub(100_000);
 
     // Tiers 0-6 should all be expired
-    assert!(is_expired(inserted, 1000, 0)); // 1s TTL
-    assert!(is_expired(inserted, 1000, 1)); // 2s TTL
-    assert!(is_expired(inserted, 1000, 2)); // 4s TTL
-    assert!(is_expired(inserted, 1000, 3)); // 8s TTL
-    assert!(is_expired(inserted, 1000, 4)); // 16s TTL
-    assert!(is_expired(inserted, 1000, 5)); // 32s TTL
-    assert!(is_expired(inserted, 1000, 6)); // 64s TTL
+    assert!(is_expired(inserted, 1000, CacheTier::new(0))); // 1s TTL
+    assert!(is_expired(inserted, 1000, CacheTier::new(1))); // 2s TTL
+    assert!(is_expired(inserted, 1000, CacheTier::new(2))); // 4s TTL
+    assert!(is_expired(inserted, 1000, CacheTier::new(3))); // 8s TTL
+    assert!(is_expired(inserted, 1000, CacheTier::new(4))); // 16s TTL
+    assert!(is_expired(inserted, 1000, CacheTier::new(5))); // 32s TTL
+    assert!(is_expired(inserted, 1000, CacheTier::new(6))); // 64s TTL
     // Tier 7 (128s) = NOT expired
-    assert!(!is_expired(inserted, 1000, 7));
+    assert!(!is_expired(inserted, 1000, CacheTier::new(7)));
     // Tier 10 (1024s) = NOT expired
-    assert!(!is_expired(inserted, 1000, 10));
+    assert!(!is_expired(inserted, 1000, CacheTier::new(10)));
 }
 
 #[test]
 fn test_is_expired_zero_ttl_always_expires() {
     let now = now_millis();
     // Zero TTL = everything expires immediately
-    assert!(is_expired(now, 0, 0));
-    assert!(is_expired(now, 0, 1));
-    assert!(is_expired(now, 0, 63)); // Even with tier 63, 0 * 2^63 = 0
+    assert!(is_expired(now, 0, CacheTier::new(0)));
+    assert!(is_expired(now, 0, CacheTier::new(1)));
+    assert!(is_expired(now, 0, CacheTier::new(63))); // Even with tier 63, 0 * 2^63 = 0
 }
 
 #[test]
@@ -174,7 +176,7 @@ fn test_is_expired_future_timestamp() {
     // Edge case: timestamp in the future (clock skew)
     let future = now_millis().saturating_add(10000);
     // Should not be expired - elapsed would be 0 due to saturating_sub
-    assert!(!is_expired(future, 1000, 0));
+    assert!(!is_expired(future, 1000, CacheTier::new(0)));
 }
 
 // =============================================================================
