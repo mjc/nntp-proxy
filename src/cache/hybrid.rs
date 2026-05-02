@@ -353,16 +353,24 @@ impl HybridArticleCache {
     /// A cached full article (220/222 response) must not be replaced by a STAT stub.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert<B>(
+    pub async fn upsert(
         &self,
         message_id: MessageId<'_>,
-        buffer: B,
+        buffer: impl AsRef<[u8]>,
         backend_id: BackendId,
         tier: super::ttl::CacheTier,
-    ) where
-        B: Into<super::CacheIngestBytes>,
-    {
-        let buffer = buffer.into();
+    ) {
+        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id, tier)
+            .await;
+    }
+
+    pub(crate) async fn upsert_ingest(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: super::CacheIngestBytes,
+        backend_id: BackendId,
+        tier: super::ttl::CacheTier,
+    ) {
         let key = message_id.without_brackets().to_string();
         let mut entry = if self.config.cache_articles {
             let buffer_len = buffer.len();

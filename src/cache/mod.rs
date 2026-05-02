@@ -37,7 +37,7 @@ use smallvec::SmallVec;
 /// Hot-path code should hand off one of these owned forms directly instead of
 /// flattening into a fresh `Vec<u8>` before spawning cache work.
 #[derive(Debug)]
-pub enum CacheIngestBytes {
+pub(crate) enum CacheIngestBytes {
     Boxed(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
     Chunked(crate::pool::ChunkedResponse),
@@ -46,7 +46,7 @@ pub enum CacheIngestBytes {
 
 impl CacheIngestBytes {
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Boxed(buf) => buf.len(),
             Self::Pooled(buf) => buf.len(),
@@ -56,12 +56,7 @@ impl CacheIngestBytes {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[must_use]
-    pub fn status_code(&self) -> Option<StatusCode> {
+    pub(crate) fn status_code(&self) -> Option<StatusCode> {
         match self {
             Self::Boxed(buf) => StatusCode::parse(buf),
             Self::Pooled(buf) => StatusCode::parse(buf.as_ref()),
@@ -138,7 +133,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn cache_buffer_equality_spans_storage_forms() {
+    async fn ingest_bytes_equality_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
@@ -163,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_buffer_status_code_spans_storage_forms() {
+    async fn ingest_bytes_status_code_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
@@ -196,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_buffer_from_short_slice_uses_inline_storage() {
+    fn ingest_bytes_from_short_slice_uses_inline_storage() {
         let buffer = CacheIngestBytes::from(b"223\r\n".as_slice());
 
         assert!(matches!(buffer, CacheIngestBytes::Small(_)));
@@ -204,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_buffer_from_vec_stores_tight_owned_slice() {
+    fn ingest_bytes_from_vec_stores_tight_owned_slice() {
         let buffer = CacheIngestBytes::from(Vec::from(&b"220 1 <tight@example>\r\n.\r\n"[..]));
 
         assert!(matches!(buffer, CacheIngestBytes::Boxed(_)));
@@ -342,19 +337,35 @@ impl UnifiedCache {
     /// Upsert (insert or update) an article in the cache
     ///
     /// The tier is used for tier-aware TTL calculation (higher tier = longer TTL).
-    pub async fn upsert<B>(
+    pub async fn upsert(
         &self,
         message_id: MessageId<'_>,
-        buffer: B,
+        buffer: impl AsRef<[u8]>,
         backend_id: BackendId,
         tier: ttl::CacheTier,
-    ) where
-        B: Into<CacheIngestBytes>,
-    {
-        let buffer = buffer.into();
+    ) {
+        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id, tier)
+            .await;
+    }
+
+    pub(crate) async fn upsert_ingest(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: CacheIngestBytes,
+        backend_id: BackendId,
+        tier: ttl::CacheTier,
+    ) {
         match self {
-            Self::Memory(cache) => cache.upsert(message_id, buffer, backend_id, tier).await,
-            Self::Hybrid(cache) => cache.upsert(message_id, buffer, backend_id, tier).await,
+            Self::Memory(cache) => {
+                cache
+                    .upsert_ingest(message_id, buffer, backend_id, tier)
+                    .await;
+            }
+            Self::Hybrid(cache) => {
+                cache
+                    .upsert_ingest(message_id, buffer, backend_id, tier)
+                    .await;
+            }
         }
     }
 

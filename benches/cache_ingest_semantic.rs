@@ -1,17 +1,10 @@
-//! Benchmarks for typed cache ingestion and cache buffer metadata reads.
-//!
-//! Public cache ingestion currently accepts contiguous wire responses for
-//! semantic parsing; cache buffer status benchmarks cover the owned forms used
-//! across async cache handoff, including chunked responses without flattening.
+//! Benchmarks for typed cache ingestion from response bytes.
 //!
 //! Run with: cargo bench --bench cache_ingest_semantic
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleCache, ArticleEntry, CacheIngestBytes};
-use nntp_proxy::pool::{BufferPool, ChunkedResponse};
-use nntp_proxy::types::BufferSize;
+use nntp_proxy::cache::{ArticleCache, ArticleEntry};
 use nntp_proxy::types::{BackendId, MessageId};
-use smallvec::SmallVec;
 use std::time::Duration;
 
 fn main() {
@@ -31,16 +24,6 @@ const HEAD_RESPONSE: &[u8] =
 const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com>\r\nBody line\r\n.\r\n";
 const STAT_RESPONSE: &[u8] = b"223 42 <bench@example.com>\r\n";
 const MISSING_RESPONSE: &[u8] = b"430 No article\r\n";
-
-fn chunked_response(chunks: &[&[u8]]) -> ChunkedResponse {
-    let pool = BufferPool::new(BufferSize::try_new(64).unwrap(), 8);
-    chunks
-        .iter()
-        .fold(ChunkedResponse::default(), |mut response, chunk| {
-            response.extend_from_slice(&pool, chunk);
-            response
-        })
-}
 
 mod semantic_ingest {
     use super::{
@@ -75,60 +58,29 @@ mod semantic_ingest {
 
 mod cache_upsert {
     use super::{
-        ArticleCache, BackendId, Bencher, CacheIngestBytes, Duration, MessageId, article_response,
-        black_box, chunked_response,
+        ArticleCache, BackendId, Bencher, Duration, MessageId, article_response, black_box,
     };
 
     #[divan::bench(sample_count = 100, sample_size = 50)]
-    fn chunked_cache_buffer(bencher: Bencher) {
+    fn response_bytes(bencher: Bencher) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
         let bytes = article_response(64 * 1024);
-        let split = 37;
-        let chunks = [bytes[..split].as_ref(), bytes[split..].as_ref()];
 
         bencher
             .counter(divan::counter::BytesCount::new(bytes.len()))
             .bench(|| {
                 rt.block_on(async {
-                    let response = chunked_response(black_box(&chunks));
                     let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
                     cache
                         .upsert(
                             msg_id,
-                            CacheIngestBytes::Chunked(response),
+                            black_box(bytes.as_slice()),
                             BackendId::from_index(0),
                             0.into(),
                         )
                         .await;
                 });
             });
-    }
-}
-
-mod cache_buffer_status {
-    use super::{CacheIngestBytes, SmallVec, black_box, chunked_response};
-    use divan::Bencher;
-
-    #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn vec_status_code(bencher: Bencher) {
-        let buffer =
-            CacheIngestBytes::from(b"220 42 <bench@example.com>\r\nBody\r\n.\r\n".to_vec());
-        bencher.bench(|| black_box(black_box(&buffer).status_code()));
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn small_status_code(bencher: Bencher) {
-        let buffer =
-            CacheIngestBytes::Small(SmallVec::from_slice(b"223 42 <bench@example.com>\r\n"));
-        bencher.bench(|| black_box(black_box(&buffer).status_code()));
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn chunked_status_code_split(bencher: Bencher) {
-        let response =
-            chunked_response(&[b"2", b"20", b" 42 <bench@example.com>\r\nBody\r\n.\r\n"]);
-        let buffer = CacheIngestBytes::Chunked(response);
-        bencher.bench(|| black_box(black_box(&buffer).status_code()));
     }
 }

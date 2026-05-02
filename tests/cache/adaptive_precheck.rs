@@ -126,7 +126,7 @@ async fn test_stat_precheck_first_response() -> Result<()> {
         "Expected 223 from backend, got: {response}"
     );
 
-    // Should be reasonably fast (first wire response + small overhead)
+    // Should be reasonably fast (first response bytes + small overhead)
     assert!(
         elapsed < Duration::from_millis(200),
         "Response took too long: {elapsed:?}"

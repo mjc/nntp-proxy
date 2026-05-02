@@ -298,7 +298,7 @@ pub struct ArticleEntry {
 }
 
 impl ArticleEntry {
-    /// Ingest a cold wire response into a typed semantic cache entry.
+    /// Ingest a cold response bytes into a typed semantic cache entry.
     ///
     /// This is the boundary for cold responses read from the wire. The entry
     /// stores parsed metadata and payload sections, not the original response.
@@ -335,7 +335,7 @@ impl ArticleEntry {
         }
     }
 
-    /// Ingest a cold wire response with a specific provider tier.
+    /// Ingest a cold response bytes with a specific provider tier.
     #[must_use]
     pub fn from_response_bytes_with_tier(buffer: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
         let buffer = buffer.as_ref();
@@ -893,16 +893,24 @@ impl ArticleCache {
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
     /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
-    pub async fn upsert<B>(
+    pub async fn upsert(
         &self,
         message_id: MessageId<'_>,
-        buffer: B,
+        buffer: impl AsRef<[u8]>,
         backend_id: BackendId,
         tier: ttl::CacheTier,
-    ) where
-        B: Into<super::CacheIngestBytes>,
-    {
-        let buffer = buffer.into();
+    ) {
+        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id, tier)
+            .await;
+    }
+
+    pub(crate) async fn upsert_ingest(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: super::CacheIngestBytes,
+        backend_id: BackendId,
+        tier: ttl::CacheTier,
+    ) {
         let key: Arc<str> = message_id.without_brackets().into();
         let cache_articles = self.cache_articles;
 
@@ -1276,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_wire_response_by_name() {
+    fn article_entry_ingests_response_bytes_by_name() {
         let entry = ArticleEntry::from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
@@ -1286,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_borrowed_wire_response_bytes() {
+    fn article_entry_ingests_borrowed_response_bytes() {
         let entry = ArticleEntry::from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         );
@@ -1315,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_cache_buffer_without_required_vec() {
+    fn article_entry_ingests_ingest_bytes_without_required_vec() {
         let entry = ArticleEntry::from_ingest_bytes_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
@@ -1329,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_chunked_cache_buffer_without_flattening_wire_response() {
+    fn article_entry_ingests_chunked_ingest_bytes_without_flattening_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,

@@ -14,14 +14,14 @@ use crate::session::backend;
 use crate::types::{BackendId, MessageId};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum PrecheckHit {
+pub(crate) enum PrecheckHit {
     Payload(crate::cache::CacheIngestBytes),
     Availability(StatusCode),
 }
 
 /// Result of querying a backend for an article.
 #[derive(Debug, PartialEq, Eq)]
-pub enum QueryResult {
+pub(crate) enum QueryResult {
     Found(BackendId, PrecheckHit),
     Missing(BackendId),
     Error(BackendId),
@@ -66,7 +66,7 @@ async fn cache_precheck_hit(
 ) {
     match hit {
         PrecheckHit::Payload(data) => {
-            cache.upsert(msg_id, data, backend_id, tier).await;
+            cache.upsert_ingest(msg_id, data, backend_id, tier).await;
         }
         PrecheckHit::Availability(status_code) => {
             cache

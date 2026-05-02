@@ -45,13 +45,24 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn upsert<B>(&self, message_id: MessageId<'_>, buffer: B, backend_id: BackendId)
-    where
-        B: Into<CacheIngestBytes>,
-    {
+    pub async fn upsert(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: impl AsRef<[u8]>,
+        backend_id: BackendId,
+    ) {
+        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id)
+            .await;
+    }
+
+    pub(crate) async fn upsert_ingest(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: CacheIngestBytes,
+        backend_id: BackendId,
+    ) {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
-        let buffer = buffer.into();
 
         let Some(mut entry) =
             HybridArticleEntry::from_ingest_bytes_with_tier(buffer, super::ttl::CacheTier::new(0))

@@ -1,4 +1,4 @@
-//! Benchmarks for generating NNTP wire responses from typed cache entries.
+//! Benchmarks for generating NNTP responses from typed cache entries.
 //!
 //! These benches render typed responses through the same writer path used by
 //! cache hits. They cover ARTICLE-derived HEAD/BODY/STAT responses as well as

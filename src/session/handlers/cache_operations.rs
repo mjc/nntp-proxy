@@ -162,7 +162,7 @@ impl ClientSession {
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
             cache_clone
-                .upsert(msg_id_owned, buffer, backend_id, tier)
+                .upsert_ingest(msg_id_owned, buffer, backend_id, tier)
                 .await;
         });
     }
