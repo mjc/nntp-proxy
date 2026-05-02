@@ -10,7 +10,7 @@
 //! Run with: cargo bench --bench `command_parsing`
 
 use divan::{Bencher, black_box};
-use nntp_proxy::command::classifier::NntpCommand;
+use nntp_proxy::protocol::RequestContext;
 
 fn main() {
     divan::main();
@@ -25,7 +25,7 @@ macro_rules! bench_command {
 
             #[divan::bench(name = "classifier", sample_count = 1000, sample_size = 100)]
             fn classifier(bencher: Bencher) {
-                bencher.bench(|| black_box(NntpCommand::parse(black_box($command))));
+                bencher.bench(|| black_box(RequestContext::from_request_line(black_box($command))));
             }
         }
     };
@@ -107,7 +107,7 @@ bench_command!(
 // =============================================================================
 
 mod realistic_workload {
-    use super::{Bencher, NntpCommand, black_box};
+    use super::{Bencher, RequestContext, black_box};
 
     /// Simulates a realistic distribution of NNTP commands:
     /// - 70% article retrieval (ARTICLE/BODY/HEAD/STAT)
@@ -142,7 +142,7 @@ mod realistic_workload {
             .counter(divan::counter::ItemsCount::new(COMMANDS.len()))
             .bench(|| {
                 for cmd in COMMANDS {
-                    black_box(NntpCommand::parse(black_box(cmd)));
+                    black_box(RequestContext::from_request_line(black_box(cmd)));
                 }
             });
     }

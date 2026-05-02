@@ -138,7 +138,7 @@ mod unified_cache {
                     msg_id.to_owned(),
                     b"220 0 <hit@example.com>\r\nSubject: test\r\n\r\nbody\r\n.\r\n".to_vec(),
                     BackendId::from_index(0),
-                    0,
+                    0.into(),
                 )
                 .await;
         });
@@ -162,7 +162,12 @@ mod unified_cache {
                 rt.block_on(async {
                     let msg_id = MessageId::from_borrowed("<bench@test.com>").unwrap();
                     cache
-                        .upsert(msg_id.to_owned(), data.clone(), BackendId::from_index(0), 0)
+                        .upsert(
+                            msg_id.to_owned(),
+                            data.clone(),
+                            BackendId::from_index(0),
+                            0.into(),
+                        )
                         .await;
                 });
             });
