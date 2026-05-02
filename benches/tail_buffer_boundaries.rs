@@ -43,47 +43,38 @@ fn naive_detect_with_previous_tail(previous: &[u8], current: &[u8]) -> bool {
     naive_find_terminator(&combined).is_some()
 }
 
-mod split_boundaries {
-    use super::{Bencher, black_box, detect_with_previous_tail, naive_detect_with_previous_tail};
+macro_rules! bench_split {
+    ($module:ident, $detect:ident, $(($name:ident, $previous:literal, $current:literal)),+ $(,)?) => {
+        mod $module {
+            use super::{Bencher, black_box, $detect};
 
-    macro_rules! bench_split {
-        ($name:ident, $previous:literal, $current:literal) => {
-            #[divan::bench(sample_count = 1000, sample_size = 1000)]
-            fn $name(bencher: Bencher) {
-                bencher.bench(|| {
-                    black_box(detect_with_previous_tail(
-                        black_box($previous),
-                        black_box($current),
-                    ))
-                });
-            }
-        };
-    }
-
-    bench_split!(split_after_cr, b"\r", b"\n.\r\n");
-    bench_split!(split_after_crlf, b"\r\n", b".\r\n");
-    bench_split!(split_after_dot, b"\r\n.", b"\r\n");
-    bench_split!(split_before_final_lf, b"\r\n.\r", b"\n");
-
-    macro_rules! bench_naive_split {
-        ($name:ident, $previous:literal, $current:literal) => {
-            #[divan::bench(sample_count = 1000, sample_size = 1000)]
-            fn $name(bencher: Bencher) {
-                bencher.bench(|| {
-                    black_box(naive_detect_with_previous_tail(
-                        black_box($previous),
-                        black_box($current),
-                    ))
-                });
-            }
-        };
-    }
-
-    bench_naive_split!(naive_split_after_cr, b"\r", b"\n.\r\n");
-    bench_naive_split!(naive_split_after_crlf, b"\r\n", b".\r\n");
-    bench_naive_split!(naive_split_after_dot, b"\r\n.", b"\r\n");
-    bench_naive_split!(naive_split_before_final_lf, b"\r\n.\r", b"\n");
+            $(
+                #[divan::bench(sample_count = 1000, sample_size = 1000)]
+                fn $name(bencher: Bencher) {
+                    bencher.bench(|| black_box($detect(black_box($previous), black_box($current))));
+                }
+            )+
+        }
+    };
 }
+
+bench_split!(
+    split_boundaries,
+    detect_with_previous_tail,
+    (after_cr, b"\r", b"\n.\r\n"),
+    (after_crlf, b"\r\n", b".\r\n"),
+    (after_dot, b"\r\n.", b"\r\n"),
+    (before_final_lf, b"\r\n.\r", b"\n"),
+);
+
+bench_split!(
+    naive_split_boundaries,
+    naive_detect_with_previous_tail,
+    (after_cr, b"\r", b"\n.\r\n"),
+    (after_crlf, b"\r\n", b".\r\n"),
+    (after_dot, b"\r\n.", b"\r\n"),
+    (before_final_lf, b"\r\n.\r", b"\n"),
+);
 
 mod full_chunk_scans {
     use super::{Bencher, TailBuffer, black_box, large_body, naive_find_terminator};
@@ -95,54 +86,61 @@ mod full_chunk_scans {
         bencher.bench(|| black_box(tail.detect_terminator(black_box(chunk)).is_found()));
     }
 
-    #[divan::bench(sample_count = 500, sample_size = 100)]
-    fn no_terminator_64k(bencher: Bencher) {
-        let chunk = large_body(64 * 1024, false);
-        let tail = TailBuffer::default();
-        bencher
-            .counter(divan::counter::BytesCount::new(chunk.len()))
-            .bench(|| black_box(tail.detect_terminator(black_box(&chunk)).is_found()));
+    macro_rules! bench_scan {
+        ($name:ident, $size:expr, $terminator:expr, $samples:expr, $sample_size:expr, $body:expr) => {
+            #[divan::bench(sample_count = $samples, sample_size = $sample_size)]
+            fn $name(bencher: Bencher) {
+                let chunk = large_body($size, $terminator);
+                bencher
+                    .counter(divan::counter::BytesCount::new(chunk.len()))
+                    .bench(|| black_box($body(&chunk)));
+            }
+        };
     }
 
-    #[divan::bench(sample_count = 500, sample_size = 100)]
-    fn naive_no_terminator_64k(bencher: Bencher) {
-        let chunk = large_body(64 * 1024, false);
-        bencher
-            .counter(divan::counter::BytesCount::new(chunk.len()))
-            .bench(|| black_box(naive_find_terminator(black_box(&chunk))));
+    fn tail_detect(chunk: &[u8]) -> bool {
+        TailBuffer::default().detect_terminator(chunk).is_found()
     }
 
-    #[divan::bench(sample_count = 500, sample_size = 100)]
-    fn terminator_at_end_64k(bencher: Bencher) {
-        let chunk = large_body(64 * 1024, true);
-        let tail = TailBuffer::default();
-        bencher
-            .counter(divan::counter::BytesCount::new(chunk.len()))
-            .bench(|| black_box(tail.detect_terminator(black_box(&chunk)).is_found()));
-    }
-
-    #[divan::bench(sample_count = 500, sample_size = 100)]
-    fn naive_terminator_at_end_64k(bencher: Bencher) {
-        let chunk = large_body(64 * 1024, true);
-        bencher
-            .counter(divan::counter::BytesCount::new(chunk.len()))
-            .bench(|| black_box(naive_find_terminator(black_box(&chunk))));
-    }
-
-    #[divan::bench(sample_count = 100, sample_size = 25)]
-    fn terminator_at_end_1mb(bencher: Bencher) {
-        let chunk = large_body(1024 * 1024, true);
-        let tail = TailBuffer::default();
-        bencher
-            .counter(divan::counter::BytesCount::new(chunk.len()))
-            .bench(|| black_box(tail.detect_terminator(black_box(&chunk)).is_found()));
-    }
-
-    #[divan::bench(sample_count = 100, sample_size = 25)]
-    fn naive_terminator_at_end_1mb(bencher: Bencher) {
-        let chunk = large_body(1024 * 1024, true);
-        bencher
-            .counter(divan::counter::BytesCount::new(chunk.len()))
-            .bench(|| black_box(naive_find_terminator(black_box(&chunk))));
-    }
+    bench_scan!(no_terminator_64k, 64 * 1024, false, 500, 100, tail_detect);
+    bench_scan!(
+        naive_no_terminator_64k,
+        64 * 1024,
+        false,
+        500,
+        100,
+        naive_find_terminator
+    );
+    bench_scan!(
+        terminator_at_end_64k,
+        64 * 1024,
+        true,
+        500,
+        100,
+        tail_detect
+    );
+    bench_scan!(
+        naive_terminator_at_end_64k,
+        64 * 1024,
+        true,
+        500,
+        100,
+        naive_find_terminator
+    );
+    bench_scan!(
+        terminator_at_end_1mb,
+        1024 * 1024,
+        true,
+        100,
+        25,
+        tail_detect
+    );
+    bench_scan!(
+        naive_terminator_at_end_1mb,
+        1024 * 1024,
+        true,
+        100,
+        25,
+        naive_find_terminator
+    );
 }

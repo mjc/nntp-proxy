@@ -56,45 +56,32 @@ fn repeated_article_batch(count: usize) -> Vec<u8> {
         .into_bytes()
 }
 
-mod typed_contexts {
-    use super::{Bencher, black_box, parse_typed_contexts, repeated_article_batch};
+macro_rules! bench_batches {
+    ($module:ident, $parse:ident) => {
+        mod $module {
+            use super::{Bencher, black_box, repeated_article_batch, $parse};
 
-    macro_rules! bench_batch {
-        ($name:ident, $count:expr) => {
-            #[divan::bench(sample_count = 1000, sample_size = 100)]
-            fn $name(bencher: Bencher) {
-                let buffer = repeated_article_batch($count);
-                bencher
-                    .counter(divan::counter::ItemsCount::new($count as usize))
-                    .bench(|| black_box(parse_typed_contexts(black_box(&buffer))));
+            macro_rules! bench_batch {
+                ($name:ident, $count:expr) => {
+                    #[divan::bench(sample_count = 1000, sample_size = 100)]
+                    fn $name(bencher: Bencher) {
+                        let buffer = repeated_article_batch($count);
+                        bencher
+                            .counter(divan::counter::ItemsCount::new($count as usize))
+                            .bench(|| black_box($parse(black_box(&buffer))));
+                    }
+                };
             }
-        };
-    }
 
-    bench_batch!(one_article, 1);
-    bench_batch!(four_articles, 4);
-    bench_batch!(thirty_two_articles, 32);
+            bench_batch!(one_article, 1);
+            bench_batch!(four_articles, 4);
+            bench_batch!(thirty_two_articles, 32);
+        }
+    };
 }
 
-mod raw_slice_baseline {
-    use super::{Bencher, black_box, parse_raw_command_slices, repeated_article_batch};
-
-    macro_rules! bench_batch {
-        ($name:ident, $count:expr) => {
-            #[divan::bench(sample_count = 1000, sample_size = 100)]
-            fn $name(bencher: Bencher) {
-                let buffer = repeated_article_batch($count);
-                bencher
-                    .counter(divan::counter::ItemsCount::new($count as usize))
-                    .bench(|| black_box(parse_raw_command_slices(black_box(&buffer))));
-            }
-        };
-    }
-
-    bench_batch!(one_article, 1);
-    bench_batch!(four_articles, 4);
-    bench_batch!(thirty_two_articles, 32);
-}
+bench_batches!(typed_contexts, parse_typed_contexts);
+bench_batches!(raw_slice_baseline, parse_raw_command_slices);
 
 mod mixed_buffers {
     use super::{Bencher, black_box, parse_typed_contexts};
