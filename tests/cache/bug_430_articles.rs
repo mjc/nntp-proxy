@@ -374,28 +374,28 @@ fn test_is_complete_article_rejects_stubs() {
     use nntp_proxy::cache::ArticleEntry;
 
     // 430 stub
-    let stub_430 = ArticleEntry::from_wire_response(b"430\r\n");
+    let stub_430 = ArticleEntry::from_backend_response(b"430\r\n");
     assert!(
         !stub_430.is_complete_article(),
         "430 stub should not be complete article"
     );
 
     // 220 stub (from availability tracking)
-    let stub_220 = ArticleEntry::from_wire_response(b"220\r\n");
+    let stub_220 = ArticleEntry::from_backend_response(b"220\r\n");
     assert!(
         !stub_220.is_complete_article(),
         "220 stub should not be complete article"
     );
 
     // 223 stub (from STAT precheck)
-    let stub_223 = ArticleEntry::from_wire_response(b"223\r\n");
+    let stub_223 = ArticleEntry::from_backend_response(b"223\r\n");
     assert!(
         !stub_223.is_complete_article(),
         "223 stub should not be complete article"
     );
 
     // 221 stub (from HEAD precheck)
-    let stub_221 = ArticleEntry::from_wire_response(b"221\r\n");
+    let stub_221 = ArticleEntry::from_backend_response(b"221\r\n");
     assert!(
         !stub_221.is_complete_article(),
         "221 stub should not be complete article"
@@ -408,7 +408,7 @@ fn test_is_complete_article_accepts_real_articles() {
     use nntp_proxy::cache::ArticleEntry;
 
     // Full article response
-    let full_article = ArticleEntry::from_wire_response(
+    let full_article = ArticleEntry::from_backend_response(
         b"220 0 <test@example.com>\r\nSubject: Test\r\nFrom: test@example.com\r\n\r\nThis is the body.\r\n.\r\n",
     );
     assert!(
@@ -417,7 +417,7 @@ fn test_is_complete_article_accepts_real_articles() {
     );
 
     // Minimal but valid article
-    let minimal_article = ArticleEntry::from_wire_response(
+    let minimal_article = ArticleEntry::from_backend_response(
         b"220 0 <x@y>\r\nSubject: X\r\n\r\nBody text here\r\n.\r\n",
     );
     assert!(
@@ -432,7 +432,7 @@ fn test_is_complete_article_accepts_220_and_222() {
     use nntp_proxy::cache::ArticleEntry;
 
     // ARTICLE response (220) should be considered complete
-    let article_response = ArticleEntry::from_wire_response(
+    let article_response = ArticleEntry::from_backend_response(
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
     );
     assert!(
@@ -441,7 +441,7 @@ fn test_is_complete_article_accepts_220_and_222() {
     );
 
     // BODY response (222) with content should be considered complete
-    let body_response = ArticleEntry::from_wire_response(
+    let body_response = ArticleEntry::from_backend_response(
         b"222 0 <test@example.com>\r\nThis is body text.\r\n.\r\n",
     );
     assert!(
@@ -450,7 +450,7 @@ fn test_is_complete_article_accepts_220_and_222() {
     );
 
     // HEAD response (221) should NOT be considered complete article
-    let head_response = ArticleEntry::from_wire_response(
+    let head_response = ArticleEntry::from_backend_response(
         b"221 0 <test@example.com>\r\nSubject: Test\r\nFrom: test@example.com\r\n.\r\n",
     );
     assert!(
@@ -459,7 +459,7 @@ fn test_is_complete_article_accepts_220_and_222() {
     );
 
     // STAT response (223) should NOT be complete article
-    let stat_response = ArticleEntry::from_wire_response(b"223 0 <test@example.com>\r\n");
+    let stat_response = ArticleEntry::from_backend_response(b"223 0 <test@example.com>\r\n");
     assert!(
         !stat_response.is_complete_article(),
         "STAT response (223) should not be complete article"

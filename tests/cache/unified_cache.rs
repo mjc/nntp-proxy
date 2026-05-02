@@ -168,7 +168,7 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 fn test_response_for_command_stat_synthesizes_223() {
     // Create ARTICLE response (220)
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"STAT", &msg_id);
@@ -182,7 +182,7 @@ fn test_response_for_command_stat_synthesizes_223() {
 #[test]
 fn test_response_parts_for_command_body_from_article_allocates_nothing() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let mut out = [0_u8; 128];
 
@@ -204,7 +204,7 @@ fn test_response_parts_for_command_body_from_article_allocates_nothing() {
 #[test]
 fn test_response_parts_for_command_handles_near_limit_message_id_without_allocation() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
     let local = "a".repeat(520);
     let msg_id_text = format!("<{local}@example.com>");
     let mut out = [0_u8; 1024];
@@ -237,7 +237,7 @@ fn test_response_parts_for_command_handles_near_limit_message_id_without_allocat
 fn test_response_for_command_stat_from_body() {
     // BODY response (222) should also synthesize STAT response
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"STAT", &msg_id);
@@ -252,7 +252,7 @@ fn test_response_for_command_stat_from_body() {
 fn test_response_for_command_stat_from_head() {
     // HEAD response (221) should also synthesize STAT response
     let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"STAT", &msg_id);
@@ -267,7 +267,7 @@ fn test_response_for_command_stat_from_head() {
 fn test_response_for_command_430_returns_none_for_stat() {
     // 430 should NOT synthesize STAT - article doesn't exist
     let buffer = b"430 No Such Article\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"STAT", &msg_id);
@@ -277,7 +277,7 @@ fn test_response_for_command_430_returns_none_for_stat() {
 #[test]
 fn test_response_for_command_article_direct_match() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
+    let entry = ArticleEntry::from_backend_response(buffer.clone());
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
@@ -289,7 +289,7 @@ fn test_response_for_command_article_direct_match() {
 fn test_response_for_command_body_from_article() {
     // ARTICLE (220) can serve BODY request
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
+    let entry = ArticleEntry::from_backend_response(buffer.clone());
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"BODY", &msg_id);
@@ -304,7 +304,7 @@ fn test_response_for_command_body_from_article() {
 fn test_response_for_command_head_from_article() {
     // ARTICLE (220) can serve HEAD request
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
+    let entry = ArticleEntry::from_backend_response(buffer.clone());
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"HEAD", &msg_id);
@@ -319,7 +319,7 @@ fn test_response_for_command_head_from_article() {
 fn test_response_for_command_body_cannot_serve_article() {
     // BODY (222) cannot serve ARTICLE request
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
@@ -330,7 +330,7 @@ fn test_response_for_command_body_cannot_serve_article() {
 fn test_response_for_command_head_cannot_serve_body() {
     // HEAD (221) cannot serve BODY request
     let buffer = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"BODY", &msg_id);
@@ -341,7 +341,7 @@ fn test_response_for_command_head_cannot_serve_body() {
 fn test_response_for_command_validates_buffer() {
     // Create an invalid buffer (missing .\r\n terminator)
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     // Should return None because buffer fails validation
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
@@ -352,7 +352,7 @@ fn test_response_for_command_validates_buffer() {
 #[test]
 fn test_response_for_command_empty_message_id() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     // STAT with minimal message ID <x> should still work
     let msg_id = MessageId::from_borrowed("<x>").unwrap();
@@ -456,7 +456,7 @@ fn test_availability_from_bits_roundtrip() {
 #[test]
 fn test_article_entry_set_availability() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::from_wire_response(buffer);
+    let mut entry = ArticleEntry::from_backend_response(buffer);
 
     // Initially no availability info
     assert!(!entry.has_availability_info());
@@ -478,7 +478,7 @@ fn test_article_entry_set_availability() {
 #[test]
 fn test_article_entry_set_availability_overwrites() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::from_wire_response(buffer);
+    let mut entry = ArticleEntry::from_backend_response(buffer);
 
     // Set initial availability
     let mut avail1 = ArticleAvailability::new();
@@ -587,7 +587,7 @@ fn test_cache_config_without_disk() {
 fn test_response_validation_rejects_short_buffer() {
     // Buffer too short (< 9 bytes)
     let buffer = b"220 ok".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     // Should fail validation and return None
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
@@ -599,7 +599,7 @@ fn test_response_validation_rejects_short_buffer() {
 fn test_response_validation_rejects_missing_terminator() {
     // Buffer missing .\r\n terminator
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
@@ -611,7 +611,7 @@ fn test_response_validation_rejects_non_digit_start() {
     // Buffer not starting with digits - but this won't even parse as valid status code
     // So we test with a valid-looking but corrupted buffer
     let buffer = b"ABC 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_backend_response(buffer);
 
     // status_code() will return None, so response_for_command returns None
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
@@ -624,7 +624,7 @@ fn test_response_validation_accepts_valid_buffer() {
     // Valid buffer passes validation
     let buffer =
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content here\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
+    let entry = ArticleEntry::from_backend_response(buffer.clone());
 
     let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
     let response = article_response_bytes(&entry, b"ARTICLE", &msg_id);
