@@ -1270,6 +1270,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cached_article_response_writes_derived_wire_shapes() {
+        let entry = create_test_article("<test@example.com>");
+        let cases = [
+            (
+                b"HEAD".as_slice(),
+                b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".as_slice(),
+            ),
+            (
+                b"BODY".as_slice(),
+                b"222 0 <test@example.com>\r\nBody\r\n.\r\n".as_slice(),
+            ),
+            (
+                b"STAT".as_slice(),
+                b"223 0 <test@example.com>\r\n".as_slice(),
+            ),
+        ];
+
+        for (verb, expected) in cases {
+            let response = entry
+                .response_parts_for_command_bytes(verb, "<test@example.com>")
+                .unwrap();
+            let mut out = Vec::new();
+
+            response.write_to(&mut out).await.unwrap();
+
+            assert_eq!(out, expected, "{}", String::from_utf8_lossy(verb));
+        }
+    }
+
     #[test]
     fn test_article_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
