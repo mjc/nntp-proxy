@@ -6,7 +6,7 @@
 // Methods are async to match the HybridArticleCache trait interface; no internal awaits needed.
 #![allow(clippy::unused_async)]
 
-use super::{ArticleAvailability, HybridArticleEntry, HybridCacheStats};
+use super::{ArticleAvailability, CacheBuffer, HybridArticleEntry, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,9 +45,13 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn upsert(&self, message_id: MessageId<'_>, buffer: Vec<u8>, backend_id: BackendId) {
+    pub async fn upsert<B>(&self, message_id: MessageId<'_>, buffer: B, backend_id: BackendId)
+    where
+        B: Into<CacheBuffer>,
+    {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
+        let buffer = buffer.into();
 
         // Check for existing entry - don't overwrite larger with smaller
         if let Some(existing) = storage.get(&key)
@@ -60,7 +64,9 @@ impl MockHybridCache {
             return;
         }
 
-        if let Some(mut entry) = HybridArticleEntry::from_wire_response(buffer) {
+        if let Some(mut entry) =
+            HybridArticleEntry::from_cache_buffer_with_tier(buffer, super::ttl::CacheTier::new(0))
+        {
             entry.record_backend_has(backend_id);
             storage.insert(key, entry);
         }

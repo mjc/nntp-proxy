@@ -52,6 +52,25 @@ async fn test_mock_cache_basic_ops() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_mock_cache_upsert_accepts_borrowed_wire_bytes() -> Result<()> {
+    let cache = MockHybridCache::new(1024 * 1024);
+    let msg_id = MessageId::from_borrowed("<borrowed@example.com>").unwrap();
+    let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
+
+    cache
+        .upsert(msg_id.clone(), buffer.as_slice(), BackendId::from_index(0))
+        .await;
+
+    let entry = cache.get(&msg_id).await.expect("cached entry");
+    assert_eq!(
+        response_bytes(&entry, b"ARTICLE", &msg_id).unwrap(),
+        buffer.as_slice()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_cache_miss() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
 
