@@ -104,6 +104,27 @@ impl RequestCacheAvailability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RequestCacheTier(u8);
+
+impl RequestCacheTier {
+    #[must_use]
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl From<u8> for RequestCacheTier {
+    fn from(value: u8) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     kind: RequestKind,
@@ -113,6 +134,7 @@ pub struct RequestContext {
     cache_status: Option<RequestCacheStatus>,
     cache_availability: Option<RequestCacheAvailability>,
     cache_entry_status: Option<StatusCode>,
+    cache_entry_tier: Option<RequestCacheTier>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
     response_wire_len: Option<ResponseWireLen>,
@@ -141,6 +163,7 @@ impl RequestContext {
             cache_status: None,
             cache_availability: None,
             cache_entry_status: None,
+            cache_entry_tier: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -162,6 +185,7 @@ impl RequestContext {
             cache_status: None,
             cache_availability: None,
             cache_entry_status: None,
+            cache_entry_tier: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -199,6 +223,12 @@ impl RequestContext {
     }
 
     #[inline]
+    #[must_use]
+    pub const fn cache_entry_tier(&self) -> Option<RequestCacheTier> {
+        self.cache_entry_tier
+    }
+
+    #[inline]
     pub const fn record_cache_status(&mut self, status: RequestCacheStatus) {
         self.cache_status = Some(status);
     }
@@ -218,9 +248,11 @@ impl RequestContext {
         &mut self,
         status: StatusCode,
         availability: RequestCacheAvailability,
+        tier: RequestCacheTier,
     ) {
         self.cache_entry_status = Some(status);
         self.cache_availability = Some(availability);
+        self.cache_entry_tier = Some(tier);
     }
 
     #[inline]
@@ -474,6 +506,7 @@ mod tests {
         assert_eq!(ctx.cache_status(), None);
         assert_eq!(ctx.cache_availability(), None);
         assert_eq!(ctx.cache_entry_status(), None);
+        assert_eq!(ctx.cache_entry_tier(), None);
         assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(ctx.response_wire_len(), None);
@@ -535,11 +568,13 @@ mod tests {
         let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
         let status = StatusCode::new(430);
         let availability = RequestCacheAvailability::from_bits(0b0000_0010, 0b0000_0010);
+        let tier = RequestCacheTier::new(2);
 
-        ctx.record_cache_entry_metadata(status, availability);
+        ctx.record_cache_entry_metadata(status, availability, tier);
 
         assert_eq!(ctx.cache_entry_status(), Some(status));
         assert_eq!(ctx.cache_availability(), Some(availability));
+        assert_eq!(ctx.cache_entry_tier(), Some(tier));
         assert_eq!(ctx.response_status(), None);
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }

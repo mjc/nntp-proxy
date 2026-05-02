@@ -6,7 +6,8 @@
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
-    RequestCacheAvailability, RequestCacheStatus, RequestContext, ResponseWireLen, StatusCode,
+    RequestCacheAvailability, RequestCacheStatus, RequestCacheTier, RequestContext,
+    ResponseWireLen, StatusCode,
 };
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
@@ -62,7 +63,11 @@ impl ClientSession {
         // Extract availability before any early returns so we can pass it back
         let availability = cached.to_availability(router.backend_count());
         if let Some(status) = cached.status_code() {
-            request.record_cache_entry_metadata(status, cache_availability_metadata(&availability));
+            request.record_cache_entry_metadata(
+                status,
+                cache_availability_metadata(&availability),
+                RequestCacheTier::new(cached.tier().get()),
+            );
         }
 
         if !cached.has_availability_info() {
@@ -463,6 +468,10 @@ mod tests {
         assert!(matches!(result, CacheLookupResult::PartialHit));
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::PartialHit));
         assert_eq!(request.cache_entry_status(), Some(StatusCode::new(430)));
+        assert_eq!(
+            request.cache_entry_tier(),
+            Some(crate::protocol::RequestCacheTier::new(0))
+        );
         assert_eq!(
             request
                 .cache_availability()
