@@ -63,6 +63,7 @@ pub fn date_request() -> RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
 
     fn msgid(value: &str) -> MessageId<'_> {
         MessageId::from_borrowed(value).unwrap()
@@ -70,12 +71,7 @@ mod tests {
 
     fn wire(context: &RequestContext) -> Vec<u8> {
         let mut out = Vec::with_capacity(context.request_wire_len().get());
-        out.extend_from_slice(context.verb());
-        if !context.args().is_empty() {
-            out.push(b' ');
-            out.extend_from_slice(context.args());
-        }
-        out.extend_from_slice(b"\r\n");
+        block_on(context.write_wire_to(&mut out)).unwrap();
         out
     }
 

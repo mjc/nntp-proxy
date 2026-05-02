@@ -3,6 +3,7 @@
 //! Tests backend authentication logic and response parsing.
 
 use anyhow::Result;
+use futures::executor::block_on;
 use nntp_proxy::pool::BufferPool;
 use nntp_proxy::protocol::{NntpResponse, RequestContext, authinfo_pass, authinfo_user};
 use nntp_proxy::types::BufferSize;
@@ -11,12 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 fn command_wire(request: &RequestContext) -> Vec<u8> {
     let mut out = Vec::with_capacity(request.request_wire_len().get());
-    out.extend_from_slice(request.verb());
-    if !request.args().is_empty() {
-        out.push(b' ');
-        out.extend_from_slice(request.args());
-    }
-    out.extend_from_slice(b"\r\n");
+    block_on(request.write_wire_to(&mut out)).unwrap();
     out
 }
 
