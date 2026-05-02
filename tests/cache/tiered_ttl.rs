@@ -185,13 +185,13 @@ fn test_is_expired_future_timestamp() {
 
 #[test]
 fn test_article_entry_tier_default() {
-    let entry = ArticleEntry::from_response_buffer(b"220 0 <test@example.com>\r\n.\r\n".to_vec());
+    let entry = ArticleEntry::from_wire_response(b"220 0 <test@example.com>\r\n.\r\n".to_vec());
     assert_eq!(entry.tier().get(), 0);
 }
 
 #[test]
 fn test_article_entry_with_tier() {
-    let entry = ArticleEntry::from_response_buffer_with_tier(
+    let entry = ArticleEntry::from_wire_response_with_tier(
         b"220 0 <test@example.com>\r\n.\r\n".to_vec(),
         CacheTier::new(3),
     );
@@ -200,8 +200,7 @@ fn test_article_entry_with_tier() {
 
 #[test]
 fn test_article_entry_set_tier() {
-    let mut entry =
-        ArticleEntry::from_response_buffer(b"220 0 <test@example.com>\r\n.\r\n".to_vec());
+    let mut entry = ArticleEntry::from_wire_response(b"220 0 <test@example.com>\r\n.\r\n".to_vec());
     assert_eq!(entry.tier().get(), 0);
 
     entry.set_tier(CacheTier::new(5));
@@ -210,11 +209,11 @@ fn test_article_entry_set_tier() {
 
 #[test]
 fn test_article_entry_is_expired_uses_tier() {
-    let entry_tier_0 = ArticleEntry::from_response_buffer_with_tier(
+    let entry_tier_0 = ArticleEntry::from_wire_response_with_tier(
         b"220 test\r\n.\r\n".to_vec(),
         CacheTier::new(0),
     );
-    let entry_tier_1 = ArticleEntry::from_response_buffer_with_tier(
+    let entry_tier_1 = ArticleEntry::from_wire_response_with_tier(
         b"220 test\r\n.\r\n".to_vec(),
         CacheTier::new(1),
     );
