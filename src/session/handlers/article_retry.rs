@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
 use crate::protocol::{RequestContext, ResponseShape};
-use crate::session::handlers::pipeline::CommandBatch;
+use crate::session::handlers::pipeline::RequestBatch;
 use crate::session::precheck;
 
 /// Mutable pipeline batch state passed into `batch_execute_articles`
@@ -59,7 +59,7 @@ impl ClientSession {
     pub(super) async fn batch_execute_articles(
         &self,
         router: &Arc<BackendSelector>,
-        batch: &CommandBatch,
+        batch: &RequestBatch,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         pipeline: BatchPipelineState<'_>,
     ) -> Result<(), SessionError> {
@@ -188,7 +188,7 @@ impl ClientSession {
     /// backend connection must be discarded and the client session closed.
     async fn process_batch_response(
         &self,
-        batch: &CommandBatch,
+        batch: &RequestBatch,
         idx: usize,
         bcc: &mut BatchConnContext<'_>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,

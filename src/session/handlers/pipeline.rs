@@ -14,13 +14,13 @@ use tokio::io::AsyncBufReadExt;
 /// Maximum pipeline depth (number of commands read from client buffer at once)
 const MAX_PIPELINE_DEPTH: usize = 16;
 
-/// A batch of commands read from the client's TCP buffer.
+/// A batch of requests read from the client's TCP buffer.
 ///
 /// Uses an accumulator buffer pattern to avoid per-command allocations:
 /// - All commands stored contiguously in a single String buffer
 /// - Offsets track command boundaries (end position of each command)
 /// - `SmallVec` keeps offsets on stack for common case (≤4 commands)
-pub(super) struct CommandBatch {
+pub(super) struct RequestBatch {
     /// All commands accumulated in a single buffer
     buffer: String,
     /// End offset of each pipelineable command (offsets[i] = end of command i+1)
@@ -38,7 +38,7 @@ pub(super) struct CommandBatch {
     first_oversized: bool,
 }
 
-impl CommandBatch {
+impl RequestBatch {
     /// Whether this batch is empty (client disconnected)
     pub fn is_empty(&self) -> bool {
         self.offsets.is_empty() && self.trailing_range.is_none()
@@ -105,7 +105,7 @@ impl ClientSession {
         command_buf: &mut String,
         batch_buf: &mut String,
         batch_offsets: &mut smallvec::SmallVec<[usize; 4]>,
-    ) -> Result<CommandBatch> {
+    ) -> Result<RequestBatch> {
         // Prepare accumulator buffer
         batch_buf.clear();
         batch_offsets.clear();
@@ -116,7 +116,7 @@ impl ClientSession {
         command_buf.clear();
         match reader.read_line(command_buf).await {
             Ok(0) => {
-                return Ok(CommandBatch {
+                return Ok(RequestBatch {
                     buffer: String::new(),
                     offsets: smallvec::SmallVec::new(),
                     contexts: smallvec::SmallVec::new(),
@@ -129,7 +129,7 @@ impl ClientSession {
             Ok(_) => {
                 // RFC 3977 §3.1: 512-byte command limit — return 501 and keep session alive
                 if command_buf.len() > 512 {
-                    return Ok(CommandBatch {
+                    return Ok(RequestBatch {
                         buffer: String::new(),
                         offsets: smallvec::SmallVec::new(),
                         contexts: smallvec::SmallVec::new(),
@@ -152,7 +152,7 @@ impl ClientSession {
             let end = batch_buf.len();
             trailing_range = Some((start, end));
             let trailing_context = Some(request);
-            return Ok(CommandBatch {
+            return Ok(RequestBatch {
                 buffer: std::mem::take(batch_buf),
                 offsets: smallvec::SmallVec::new(),
                 contexts: smallvec::SmallVec::new(),
@@ -192,7 +192,7 @@ impl ClientSession {
                         trailing_range = Some((start, end));
                         let trailing_context = Some(RequestContext::from_request_line(command_buf));
                         trailing_oversized = true;
-                        return Ok(CommandBatch {
+                        return Ok(RequestBatch {
                             buffer: std::mem::take(batch_buf),
                             offsets: std::mem::take(batch_offsets),
                             contexts: batch_contexts,
@@ -210,7 +210,7 @@ impl ClientSession {
                         let end = batch_buf.len();
                         trailing_range = Some((start, end));
                         let trailing_context = Some(request);
-                        return Ok(CommandBatch {
+                        return Ok(RequestBatch {
                             buffer: std::mem::take(batch_buf),
                             offsets: std::mem::take(batch_offsets),
                             contexts: batch_contexts,
@@ -227,7 +227,7 @@ impl ClientSession {
             }
         }
 
-        Ok(CommandBatch {
+        Ok(RequestBatch {
             buffer: std::mem::take(batch_buf),
             offsets: std::mem::take(batch_offsets),
             contexts: batch_contexts,
