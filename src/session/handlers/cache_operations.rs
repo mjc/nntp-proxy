@@ -243,10 +243,11 @@ mod tests {
     use crate::auth::AuthHandler;
     use crate::cache::UnifiedCache;
     use crate::metrics::MetricsCollector;
-    use crate::pool::BufferPool;
-    use crate::types::{BufferSize, ClientAddress};
+    use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+    use crate::types::{BufferSize, ClientAddress, ServerName};
     use std::net::SocketAddr;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
 
     fn test_session() -> ClientSession {
@@ -325,6 +326,70 @@ mod tests {
         assert!(matches!(result, CacheLookupResult::Miss));
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::Miss));
         assert_eq!(metrics, BackendToClientBytes::zero());
+    }
+
+    #[tokio::test]
+    async fn cache_hit_records_response_metadata_on_request_context() {
+        let session = test_session();
+        let msg_id = MessageId::new("<hit@example>".to_string()).expect("valid message id");
+        let expected = b"220 0 <hit@example>\r\nHeader: v\r\n\r\nBody\r\n.\r\n";
+        session
+            .cache
+            .upsert(
+                msg_id.clone(),
+                expected.to_vec(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+
+        let mut router = BackendSelector::new();
+        let backend_id = BackendId::from_index(0);
+        router.add_backend(
+            backend_id,
+            ServerName::try_new("cache-hit-backend".to_string()).expect("server name"),
+            DeadpoolConnectionProvider::new(
+                "127.0.0.1".to_string(),
+                119,
+                "cache-hit-backend".to_string(),
+                1,
+                None,
+                None,
+            ),
+            0,
+            None,
+        );
+        let router = Arc::new(router);
+
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, mut server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = RequestContext::from_request_line("ARTICLE <hit@example>\r\n");
+
+        let result = session
+            .try_serve_from_cache(
+                Some(&msg_id),
+                &mut request,
+                &router,
+                &mut write,
+                &mut metrics,
+            )
+            .await
+            .expect("lookup succeeds");
+
+        let mut written = vec![0; expected.len()];
+        server
+            .read_exact(&mut written)
+            .await
+            .expect("cached response written");
+
+        assert!(matches!(result, CacheLookupResult::Hit));
+        assert_eq!(written, expected);
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::Hit));
+        assert_eq!(request.backend_id(), Some(backend_id));
+        assert_eq!(request.response_status(), Some(StatusCode::new(220)));
+        assert_eq!(request.response_wire_len(), Some(expected.len()));
+        assert_eq!(metrics, BackendToClientBytes::zero().add(expected.len()));
     }
 
     #[test]
