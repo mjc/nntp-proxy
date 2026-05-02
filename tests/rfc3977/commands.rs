@@ -8,8 +8,8 @@
 //!
 //! Adapted from nntp-rs RFC 3977 commands.rs tests.
 
-use nntp_proxy::command::NntpCommand;
 use nntp_proxy::protocol;
+use nntp_proxy::protocol::{RequestContext, RequestKind, RequestRouteClass};
 use nntp_proxy::types::MessageId;
 
 fn msgid(value: &str) -> MessageId<'_> {
@@ -185,169 +185,168 @@ fn test_long_message_id_command_length() {
     assert!(wire(&cmd).ends_with(b"\r\n"));
 }
 
-// === Command Classification (NntpCommand::parse) ===
+// === Request Classification ===
 
 #[test]
 fn test_classify_article_by_message_id() {
-    assert!(matches!(
-        NntpCommand::parse("ARTICLE <test@example.com>"),
-        NntpCommand::ArticleByMessageId
-    ));
-    assert!(matches!(
-        NntpCommand::parse("BODY <test@example.com>"),
-        NntpCommand::ArticleByMessageId
-    ));
-    assert!(matches!(
-        NntpCommand::parse("HEAD <test@example.com>"),
-        NntpCommand::ArticleByMessageId
-    ));
-    assert!(matches!(
-        NntpCommand::parse("STAT <test@example.com>"),
-        NntpCommand::ArticleByMessageId
-    ));
+    for line in [
+        "ARTICLE <test@example.com>",
+        "BODY <test@example.com>",
+        "HEAD <test@example.com>",
+        "STAT <test@example.com>",
+    ] {
+        assert_eq!(
+            RequestContext::from_request_line(line).route_class(),
+            RequestRouteClass::ArticleByMessageId
+        );
+    }
 }
 
 #[test]
 fn test_classify_article_by_number_is_stateful() {
-    assert!(matches!(
-        NntpCommand::parse("ARTICLE 12345"),
-        NntpCommand::Stateful
-    ));
-    assert!(matches!(
-        NntpCommand::parse("BODY 12345"),
-        NntpCommand::Stateful
-    ));
+    for line in ["ARTICLE 12345", "BODY 12345"] {
+        assert_eq!(
+            RequestContext::from_request_line(line).route_class(),
+            RequestRouteClass::Stateful
+        );
+    }
 }
 
 #[test]
 fn test_classify_case_insensitive() {
     // RFC 3977 §3.1: Keywords are case-insensitive
-    assert!(matches!(
-        NntpCommand::parse("article <test@example.com>"),
-        NntpCommand::ArticleByMessageId
-    ));
-    assert!(matches!(
-        NntpCommand::parse("Article <test@example.com>"),
-        NntpCommand::ArticleByMessageId
-    ));
-    assert!(matches!(
-        NntpCommand::parse("ARTICLE <test@example.com>"),
-        NntpCommand::ArticleByMessageId
-    ));
+    for line in [
+        "article <test@example.com>",
+        "Article <test@example.com>",
+        "ARTICLE <test@example.com>",
+    ] {
+        let request = RequestContext::from_request_line(line);
+        assert_eq!(request.kind(), RequestKind::Article);
+        assert_eq!(request.route_class(), RequestRouteClass::ArticleByMessageId);
+    }
 }
 
 #[test]
 fn test_classify_auth_commands() {
-    assert!(matches!(
-        NntpCommand::parse("AUTHINFO USER testuser"),
-        NntpCommand::AuthUser
-    ));
-    assert!(matches!(
-        NntpCommand::parse("AUTHINFO PASS testpass"),
-        NntpCommand::AuthPass
-    ));
+    for line in ["AUTHINFO USER testuser", "AUTHINFO PASS testpass"] {
+        let request = RequestContext::from_request_line(line);
+        assert_eq!(request.kind(), RequestKind::AuthInfo);
+        assert_eq!(request.route_class(), RequestRouteClass::Local);
+    }
 }
 
 #[test]
 fn test_classify_stateless_commands() {
-    assert!(matches!(NntpCommand::parse("QUIT"), NntpCommand::Stateless));
-    assert!(matches!(NntpCommand::parse("DATE"), NntpCommand::Stateless));
-    assert!(matches!(NntpCommand::parse("LIST"), NntpCommand::Stateless));
-    assert!(matches!(NntpCommand::parse("HELP"), NntpCommand::Stateless));
-    assert!(matches!(
-        NntpCommand::parse("CAPABILITIES"),
-        NntpCommand::Capabilities
-    ));
+    let cases = [
+        ("QUIT", RequestKind::Quit, RequestRouteClass::Local),
+        ("DATE", RequestKind::Date, RequestRouteClass::Stateless),
+        ("LIST", RequestKind::List, RequestRouteClass::Stateless),
+        ("HELP", RequestKind::Help, RequestRouteClass::Stateless),
+        (
+            "CAPABILITIES",
+            RequestKind::Capabilities,
+            RequestRouteClass::Local,
+        ),
+    ];
+    for (line, kind, route_class) in cases {
+        let request = RequestContext::from_request_line(line);
+        assert_eq!(request.kind(), kind);
+        assert_eq!(request.route_class(), route_class);
+    }
 }
 
 #[test]
 fn test_classify_stateful_commands() {
-    assert!(matches!(
-        NntpCommand::parse("GROUP alt.test"),
-        NntpCommand::Stateful
-    ));
-    assert!(matches!(NntpCommand::parse("NEXT"), NntpCommand::Stateful));
-    assert!(matches!(NntpCommand::parse("LAST"), NntpCommand::Stateful));
-    assert!(matches!(
-        NntpCommand::parse("XOVER 1-100"),
-        NntpCommand::Stateful
-    ));
+    for line in ["GROUP alt.test", "NEXT", "LAST", "XOVER 1-100"] {
+        assert_eq!(
+            RequestContext::from_request_line(line).route_class(),
+            RequestRouteClass::Stateful
+        );
+    }
 }
 
 #[test]
 fn test_classify_non_routable_commands() {
     // POST — RFC 3977 §6.3.1: posting not permitted → dedicated Post variant
-    assert!(matches!(NntpCommand::parse("POST"), NntpCommand::Post));
-    assert!(matches!(
-        NntpCommand::parse("IHAVE <msgid@example>"),
-        NntpCommand::NonRoutable
-    ));
+    for line in ["POST", "IHAVE <msgid@example>"] {
+        assert_eq!(
+            RequestContext::from_request_line(line).route_class(),
+            RequestRouteClass::Reject
+        );
+    }
 }
 
 #[test]
 fn test_classify_empty_command() {
     // Empty input shouldn't panic
-    let _ = NntpCommand::parse("");
+    let _ = RequestContext::from_request_line("");
 }
 
 #[test]
 fn test_classify_whitespace_only() {
-    let _ = NntpCommand::parse("   ");
+    let _ = RequestContext::from_request_line("   ");
 }
 
 #[test]
 fn test_classify_unknown_command() {
     // Unknown commands fall through to a default classification
-    let cmd = NntpCommand::parse("XYZZY");
-    // Should not panic; exact classification depends on implementation
-    let _ = cmd;
+    let request = RequestContext::from_request_line("XYZZY");
+    assert_eq!(request.kind(), RequestKind::Unknown);
+    assert_eq!(request.route_class(), RequestRouteClass::Stateful);
 }
 
 #[test]
 fn test_classify_case_insensitive_auth() {
-    assert!(matches!(
-        NntpCommand::parse("authinfo user test"),
-        NntpCommand::AuthUser
-    ));
-    assert!(matches!(
-        NntpCommand::parse("Authinfo Pass test"),
-        NntpCommand::AuthPass
-    ));
+    for line in ["authinfo user test", "Authinfo Pass test"] {
+        let request = RequestContext::from_request_line(line);
+        assert_eq!(request.kind(), RequestKind::AuthInfo);
+        assert_eq!(request.route_class(), RequestRouteClass::Local);
+    }
 }
 
 #[test]
 fn test_classify_case_insensitive_stateless() {
-    assert!(matches!(NntpCommand::parse("quit"), NntpCommand::Stateless));
-    assert!(matches!(NntpCommand::parse("list"), NntpCommand::Stateless));
-    assert!(matches!(NntpCommand::parse("help"), NntpCommand::Stateless));
-    assert!(matches!(NntpCommand::parse("date"), NntpCommand::Stateless));
+    let cases = [
+        ("quit", RequestKind::Quit, RequestRouteClass::Local),
+        ("list", RequestKind::List, RequestRouteClass::Stateless),
+        ("help", RequestKind::Help, RequestRouteClass::Stateless),
+        ("date", RequestKind::Date, RequestRouteClass::Stateless),
+        (
+            "newgroups 20240101 000000",
+            RequestKind::NewGroups,
+            RequestRouteClass::Stateless,
+        ),
+        (
+            "newnews * 20240101 000000",
+            RequestKind::NewNews,
+            RequestRouteClass::Stateless,
+        ),
+    ];
     // NEWGROUPS/NEWNEWS are read-only queries (RFC 3977 §7.3-7.4)
-    assert!(matches!(
-        NntpCommand::parse("newgroups 20240101 000000"),
-        NntpCommand::Stateless
-    ));
-    assert!(matches!(
-        NntpCommand::parse("newnews * 20240101 000000"),
-        NntpCommand::Stateless
-    ));
+    for (line, kind, route_class) in cases {
+        let request = RequestContext::from_request_line(line);
+        assert_eq!(request.kind(), kind);
+        assert_eq!(request.route_class(), route_class);
+    }
 }
 
 #[test]
 fn test_classify_case_insensitive_stateful() {
-    assert!(matches!(
-        NntpCommand::parse("group alt.test"),
-        NntpCommand::Stateful
-    ));
-    assert!(matches!(NntpCommand::parse("next"), NntpCommand::Stateful));
-    assert!(matches!(NntpCommand::parse("last"), NntpCommand::Stateful));
+    for line in ["group alt.test", "next", "last"] {
+        assert_eq!(
+            RequestContext::from_request_line(line).route_class(),
+            RequestRouteClass::Stateful
+        );
+    }
 }
 
 #[test]
 fn test_classify_case_insensitive_non_routable() {
     // POST — RFC 3977 §6.3.1: dedicated Post variant, case-insensitive
-    assert!(matches!(NntpCommand::parse("post"), NntpCommand::Post));
-    assert!(matches!(
-        NntpCommand::parse("ihave <msgid@example>"),
-        NntpCommand::NonRoutable
-    ));
+    for line in ["post", "ihave <msgid@example>"] {
+        assert_eq!(
+            RequestContext::from_request_line(line).route_class(),
+            RequestRouteClass::Reject
+        );
+    }
 }
