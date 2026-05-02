@@ -710,43 +710,13 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
         return CachedPayload::AvailabilityOnly;
     };
     let article_number = parse_article_number(&buffer[..status_end]);
-    if matches!(code, 220..=222) && !buffer.ends_with(b"\r\n.\r\n") {
-        return CachedPayload::AvailabilityOnly;
-    }
-    let body_end = buffer
-        .len()
-        .checked_sub(5)
-        .map(|end| end.max(status_end))
-        .filter(|_| buffer.ends_with(b"\r\n.\r\n"))
-        .unwrap_or(buffer.len());
-    let payload = &buffer[status_end..body_end];
-    match code {
-        220 => {
-            if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
-                CachedPayload::Article {
-                    article_number,
-                    headers: payload[..split].to_vec(),
-                    body: payload[split + 4..].to_vec(),
-                }
-            } else {
-                CachedPayload::Article {
-                    article_number,
-                    headers: Vec::new(),
-                    body: payload.to_vec(),
-                }
-            }
-        }
-        221 => CachedPayload::Head {
-            article_number,
-            headers: payload.to_vec(),
-        },
-        222 => CachedPayload::Body {
-            article_number,
-            body: payload.to_vec(),
-        },
-        223 => CachedPayload::Stat { article_number },
-        _ => CachedPayload::AvailabilityOnly,
-    }
+    let Some(payload) = payload_without_multiline_terminator(code, &buffer[status_end..]) else {
+        return match code {
+            223 => CachedPayload::Stat { article_number },
+            _ => CachedPayload::AvailabilityOnly,
+        };
+    };
+    payload_from_semantic_bytes(code, article_number, payload)
 }
 
 pub(crate) fn parse_payload_chunks<'a>(
