@@ -22,7 +22,7 @@ pub use request::{
     RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
     RequestContext, RequestKind, RequestResponseMetadata, RequestRouteClass, RequestWireLen,
-    ResponseShape, ResponseWireLen,
+    ResponsePayloadLen, ResponseShape, ResponseWireLen,
 };
 pub use response::{NntpResponse, StatusCode};
 

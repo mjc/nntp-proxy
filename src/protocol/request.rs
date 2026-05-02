@@ -110,6 +110,27 @@ impl From<usize> for ResponseWireLen {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ResponsePayloadLen(usize);
+
+impl ResponsePayloadLen {
+    #[must_use]
+    pub const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for ResponsePayloadLen {
+    fn from(value: usize) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestResponseMetadata {
     status: StatusCode,
@@ -507,9 +528,9 @@ impl RequestContext {
 
     #[inline]
     #[must_use]
-    pub const fn response_payload_len(&self) -> Option<usize> {
+    pub const fn response_payload_len(&self) -> Option<ResponsePayloadLen> {
         match &self.response_payload {
-            Some(response) => Some(response.len()),
+            Some(response) => Some(ResponsePayloadLen::new(response.len())),
             None => None,
         }
     }
@@ -909,6 +930,10 @@ mod tests {
 
         ctx.complete_backend_response(backend_id, StatusCode::new(223), response);
 
+        assert_eq!(
+            ctx.response_payload_len(),
+            Some(ResponsePayloadLen::new(13))
+        );
         assert_eq!(ctx.response_payload_eq(b"223 0 <a@b>\r\n"), Some(true));
         assert_eq!(ctx.response_payload_eq(b"223 0 <other>\r\n"), Some(false));
         assert_eq!(

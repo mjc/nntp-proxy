@@ -181,7 +181,10 @@ async fn execute_pipeline_batch(
         {
             Ok(()) => {
                 metrics.record_command(backend_id);
-                let data_len = req.context.response_payload_len().unwrap_or_default();
+                let data_len = req
+                    .context
+                    .response_payload_len()
+                    .map_or(0, crate::protocol::ResponsePayloadLen::get);
                 metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
                 metrics.record_client_to_backend_bytes_for(
                     backend_id,

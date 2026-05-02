@@ -395,7 +395,10 @@ mod tests {
                 0.into()
             ))
         );
-        assert_eq!(completed.context.response_payload_len(), Some(0));
+        assert_eq!(
+            completed.context.response_payload_len(),
+            Some(crate::protocol::ResponsePayloadLen::new(0))
+        );
         assert_eq!(completed.context.response_payload_is_empty(), Some(true));
     }
 
