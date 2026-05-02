@@ -23,6 +23,28 @@
 /// i.e. effectively infinite for cache purposes.
 pub const MAX_TTL_TIER: u8 = 63;
 
+/// Backend cache tier used for tier-aware TTL calculations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct CacheTier(u8);
+
+impl CacheTier {
+    #[must_use]
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl From<u8> for CacheTier {
+    fn from(value: u8) -> Self {
+        Self::new(value)
+    }
+}
+
 /// Calculate effective TTL based on tier
 ///
 /// Returns `base_ttl * (2 ^ min(tier, MAX_TTL_TIER))`

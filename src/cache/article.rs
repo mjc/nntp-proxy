@@ -248,7 +248,7 @@ pub struct ArticleEntry {
 
     /// Tier of the backend that provided this article
     /// Used for tier-aware TTL: higher tier = longer TTL
-    tier: u8,
+    tier: ttl::CacheTier,
 
     /// Unix timestamp when this entry was inserted (milliseconds since epoch)
     /// Populated via `ttl::now_millis()` and used with `tier` for TTL expiration
@@ -272,7 +272,7 @@ impl ArticleEntry {
             backend_availability: ArticleAvailability::new(),
             status_code,
             payload: CachedPayload::AvailabilityOnly,
-            tier,
+            tier: tier.into(),
             inserted_at: ttl::now_millis(),
         }
     }
@@ -289,7 +289,7 @@ impl ArticleEntry {
             backend_availability,
             status_code,
             payload,
-            tier,
+            tier: ttl::CacheTier::new(tier),
             inserted_at,
         }
     }
@@ -303,7 +303,7 @@ impl ArticleEntry {
             backend_availability: ArticleAvailability::new(),
             status_code,
             payload,
-            tier,
+            tier: tier.into(),
             inserted_at: ttl::now_millis(),
         }
     }
@@ -314,20 +314,20 @@ impl ArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.inserted_at, base_ttl_millis, self.tier)
+        ttl::is_expired(self.inserted_at, base_ttl_millis, self.tier.get())
     }
 
     /// Get the tier of the backend that provided this article
     #[inline]
     #[must_use]
     pub const fn tier(&self) -> u8 {
-        self.tier
+        self.tier.get()
     }
 
     /// Set the tier (used when updating entry)
     #[inline]
     pub const fn set_tier(&mut self, tier: u8) {
-        self.tier = tier;
+        self.tier = ttl::CacheTier::new(tier);
     }
 
     #[inline]
@@ -823,7 +823,7 @@ impl ArticleCache {
                     if should_replace {
                         entry.status_code = new_entry_template.status_code;
                         entry.payload = new_entry_template.payload.clone();
-                        entry.tier = tier;
+                        entry.tier = tier.into();
                     }
 
                     // Refresh TTL on every successful upsert, independent of buffer replacement
