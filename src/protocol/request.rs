@@ -200,7 +200,7 @@ impl From<u64> for RequestCacheArticleNumber {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct RequestContext {
     kind: RequestKind,
     verb: SmallVec<[u8; 16]>,
@@ -215,6 +215,32 @@ pub struct RequestContext {
     cache_article_number: Option<RequestCacheArticleNumber>,
     backend_id: Option<BackendId>,
     response: Option<RequestResponseMetadata>,
+    response_payload: Option<crate::pool::ChunkedResponse>,
+}
+
+impl Clone for RequestContext {
+    fn clone(&self) -> Self {
+        debug_assert!(
+            self.response_payload.is_none(),
+            "completed response payloads are not cloned"
+        );
+        Self {
+            kind: self.kind,
+            verb: self.verb.clone(),
+            args: self.args.clone(),
+            message_id: self.message_id,
+            cache_status: self.cache_status,
+            cache_availability: self.cache_availability,
+            cache_entry_status: self.cache_entry_status,
+            cache_entry_tier: self.cache_entry_tier,
+            cache_entry_timestamp: self.cache_entry_timestamp,
+            cache_payload_kind: self.cache_payload_kind,
+            cache_article_number: self.cache_article_number,
+            backend_id: self.backend_id,
+            response: self.response,
+            response_payload: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +333,7 @@ impl RequestContext {
             cache_article_number: None,
             backend_id: None,
             response: None,
+            response_payload: None,
         }
     }
 
@@ -331,6 +358,7 @@ impl RequestContext {
             cache_article_number: None,
             backend_id: None,
             response: None,
+            response_payload: None,
         }
     }
 
@@ -435,6 +463,48 @@ impl RequestContext {
     #[must_use]
     pub const fn response_metadata(&self) -> Option<RequestResponseMetadata> {
         self.response
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn response_payload_len(&self) -> Option<usize> {
+        match &self.response_payload {
+            Some(response) => Some(response.len()),
+            None => None,
+        }
+    }
+
+    #[inline]
+    pub fn record_response_payload(&mut self, response: crate::pool::ChunkedResponse) {
+        self.response_payload = Some(response);
+    }
+
+    pub async fn write_response_payload_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWriteExt + Unpin,
+    {
+        self.response_payload
+            .as_ref()
+            .expect("completed request context carries response payload")
+            .write_all_to(writer)
+            .await
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn response_payload_to_vec(&self) -> Option<Vec<u8>> {
+        self.response_payload
+            .as_ref()
+            .map(crate::pool::ChunkedResponse::to_vec)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn response_payload_is_empty(&self) -> Option<bool> {
+        match &self.response_payload {
+            Some(response) => Some(response.is_empty()),
+            None => None,
+        }
     }
 
     #[inline]

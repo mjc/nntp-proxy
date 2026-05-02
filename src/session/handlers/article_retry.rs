@@ -568,8 +568,8 @@ impl ClientSession {
                             {
                                 // Success - article found, return immediately
                                 completed
-                                    .response
-                                    .write_all_to(client_write)
+                                    .context
+                                    .write_response_payload_to(client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                                 let response = completed

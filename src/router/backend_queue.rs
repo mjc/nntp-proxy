@@ -16,49 +16,11 @@ use tokio::sync::{Notify, oneshot};
 use crate::protocol::RequestContext;
 use crate::types::BackendId;
 
-/// Backend response payload that completed a queued request.
-#[derive(Debug)]
-pub struct CompletedResponse {
-    /// Complete response data (status line + multiline body if applicable).
-    data: crate::pool::ChunkedResponse,
-}
-
-impl CompletedResponse {
-    #[must_use]
-    pub const fn new(data: crate::pool::ChunkedResponse) -> Self {
-        Self { data }
-    }
-
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    pub async fn write_all_to<W>(&self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: tokio::io::AsyncWriteExt + Unpin,
-    {
-        self.data.write_all_to(writer).await
-    }
-
-    #[must_use]
-    pub fn to_vec(&self) -> Vec<u8> {
-        self.data.to_vec()
-    }
-}
-
 /// A queued request completed by one backend connection.
 #[derive(Debug)]
 pub struct CompletedPipelineRequest {
     /// Typed request context that was completed in backend-connection FIFO order.
     pub context: RequestContext,
-    /// Response payload that matched this context.
-    pub response: CompletedResponse,
 }
 
 /// Response sent back to a client session from the pipeline worker.
@@ -122,10 +84,10 @@ impl QueuedContext {
     ) {
         let mut context = self.context;
         context.record_backend_response(backend_id, status_code, data.len().into());
-        let response = CompletedResponse::new(data);
+        context.record_response_payload(data);
         let _ = self
             .client_return
-            .send(Ok(CompletedPipelineRequest { context, response }));
+            .send(Ok(CompletedPipelineRequest { context }));
     }
 
     /// Complete this queued context with a queue/worker failure.
@@ -443,7 +405,8 @@ mod tests {
             completed.context.response_wire_len().map(|len| len.get()),
             Some(0)
         );
-        assert!(completed.response.is_empty());
+        assert_eq!(completed.context.response_payload_len(), Some(0));
+        assert_eq!(completed.context.response_payload_is_empty(), Some(true));
     }
 
     #[test]

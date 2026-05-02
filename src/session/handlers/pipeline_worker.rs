@@ -963,7 +963,10 @@ mod tests {
                                     .map(|response| response.status().as_u16()),
                                 Some(codes[idx])
                             );
-                            prop_assert_eq!(completed.response.to_vec(), responses[idx].clone());
+                            prop_assert_eq!(
+                                completed.context.response_payload_to_vec(),
+                                Some(responses[idx].clone())
+                            );
                         }
                         other => prop_assert!(false, "expected success response, got {other:?}"),
                     }
