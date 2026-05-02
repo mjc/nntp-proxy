@@ -376,14 +376,17 @@ impl HybridArticleEntry {
         cmd_verb: &str,
         message_id: &crate::types::MessageId<'_>,
     ) -> Option<Vec<u8>> {
-        super::article::ArticleEntry::from_parts(
-            StatusCode::new(self.status_code.as_u16()),
-            self.payload.clone(),
-            self.availability,
-            self.tier,
-            self.timestamp,
-        )
-        .response_for_command(cmd_verb, message_id)
+        self.response_parts_for_command_bytes(cmd_verb.as_bytes(), message_id.as_str())
+            .map(|response| response.to_vec())
+    }
+
+    #[must_use]
+    pub fn response_parts_for_command_bytes(
+        &self,
+        cmd_verb: &[u8],
+        message_id: &str,
+    ) -> Option<super::article::CachedArticleResponse<'_>> {
+        super::article::response_parts_for_payload_bytes(&self.payload, cmd_verb, message_id)
     }
 
     #[must_use]
@@ -667,6 +670,25 @@ mod tests {
         entry.record_backend_missing(BackendId::from_index(1));
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(!entry.should_try_backend(BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn test_hybrid_entry_response_parts_do_not_clone_payload() {
+        let buffer = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+        let entry =
+            HybridArticleEntry::from_response_buffer(buffer.clone()).expect("valid status code");
+
+        let response = entry
+            .response_parts_for_command_bytes(b"HEAD", "<test@example.com>")
+            .expect("article cache entry can serve HEAD");
+
+        let response_len = response.len();
+        let mut rendered = vec![0; response_len];
+        assert_eq!(response.copy_to_slice(&mut rendered), Some(response_len));
+        assert_eq!(
+            rendered,
+            b"221 7 <test@example.com>\r\nSubject: Test\r\n.\r\n"
+        );
     }
 
     #[test]

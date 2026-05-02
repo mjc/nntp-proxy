@@ -535,54 +535,61 @@ impl ArticleEntry {
         cmd_verb: &[u8],
         message_id: &str,
     ) -> Option<CachedArticleResponse<'_>> {
-        let article_number = match &self.payload {
-            CachedPayload::Article { article_number, .. }
-            | CachedPayload::Head { article_number, .. }
-            | CachedPayload::Body { article_number, .. }
-            | CachedPayload::Stat { article_number } => *article_number,
-            CachedPayload::Missing | CachedPayload::AvailabilityOnly => None,
-        };
-        let number = article_number.unwrap_or(0);
+        response_parts_for_payload_bytes(&self.payload, cmd_verb, message_id)
+    }
+}
 
-        if cmd_verb.eq_ignore_ascii_case(b"STAT")
-            && matches!(
-                self.payload,
-                CachedPayload::Article { .. }
-                    | CachedPayload::Head { .. }
-                    | CachedPayload::Body { .. }
-                    | CachedPayload::Stat { .. }
-            )
-        {
-            Some(CachedArticleResponse {
-                status_line: StackStatusLine::new(223, number, message_id)?,
-                payload: CachedArticleResponsePayload::None,
-            })
-        } else if cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
-            && let CachedPayload::Article { headers, body, .. } = &self.payload
-        {
-            Some(CachedArticleResponse {
-                status_line: StackStatusLine::new(220, number, message_id)?,
-                payload: CachedArticleResponsePayload::Article { headers, body },
-            })
-        } else if cmd_verb.eq_ignore_ascii_case(b"HEAD")
-            && let CachedPayload::Article { headers, .. } | CachedPayload::Head { headers, .. } =
-                &self.payload
-        {
-            Some(CachedArticleResponse {
-                status_line: StackStatusLine::new(221, number, message_id)?,
-                payload: CachedArticleResponsePayload::Head { headers },
-            })
-        } else if cmd_verb.eq_ignore_ascii_case(b"BODY")
-            && let CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. } =
-                &self.payload
-        {
-            Some(CachedArticleResponse {
-                status_line: StackStatusLine::new(222, number, message_id)?,
-                payload: CachedArticleResponsePayload::Body { body },
-            })
-        } else {
-            None
-        }
+pub(crate) fn response_parts_for_payload_bytes<'a>(
+    payload: &'a CachedPayload,
+    cmd_verb: &[u8],
+    message_id: &str,
+) -> Option<CachedArticleResponse<'a>> {
+    let article_number = match payload {
+        CachedPayload::Article { article_number, .. }
+        | CachedPayload::Head { article_number, .. }
+        | CachedPayload::Body { article_number, .. }
+        | CachedPayload::Stat { article_number } => *article_number,
+        CachedPayload::Missing | CachedPayload::AvailabilityOnly => None,
+    };
+    let number = article_number.unwrap_or(0);
+
+    if cmd_verb.eq_ignore_ascii_case(b"STAT")
+        && matches!(
+            payload,
+            CachedPayload::Article { .. }
+                | CachedPayload::Head { .. }
+                | CachedPayload::Body { .. }
+                | CachedPayload::Stat { .. }
+        )
+    {
+        Some(CachedArticleResponse {
+            status_line: StackStatusLine::new(223, number, message_id)?,
+            payload: CachedArticleResponsePayload::None,
+        })
+    } else if cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
+        && let CachedPayload::Article { headers, body, .. } = payload
+    {
+        Some(CachedArticleResponse {
+            status_line: StackStatusLine::new(220, number, message_id)?,
+            payload: CachedArticleResponsePayload::Article { headers, body },
+        })
+    } else if cmd_verb.eq_ignore_ascii_case(b"HEAD")
+        && let CachedPayload::Article { headers, .. } | CachedPayload::Head { headers, .. } =
+            payload
+    {
+        Some(CachedArticleResponse {
+            status_line: StackStatusLine::new(221, number, message_id)?,
+            payload: CachedArticleResponsePayload::Head { headers },
+        })
+    } else if cmd_verb.eq_ignore_ascii_case(b"BODY")
+        && let CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. } = payload
+    {
+        Some(CachedArticleResponse {
+            status_line: StackStatusLine::new(222, number, message_id)?,
+            payload: CachedArticleResponsePayload::Body { body },
+        })
+    } else {
+        None
     }
 }
 
