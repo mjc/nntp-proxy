@@ -599,7 +599,12 @@ mod tests {
     #[test]
     fn test_validate_empty_response() {
         let validated = validate_backend_response(b"", 0, crate::protocol::MIN_RESPONSE_LENGTH);
-        assert_eq!(validated.response, crate::protocol::NntpResponse::Invalid);
+        assert_eq!(validated.status_code, None);
+        assert!(
+            validated
+                .warnings
+                .contains(&crate::session::backend::ResponseWarning::InvalidResponse)
+        );
     }
 
     #[test]
@@ -611,9 +616,9 @@ mod tests {
         // Should still parse the status code but emit warning for short response
         assert!(!validated.warnings.is_empty());
         // Status code parsing should work even for short responses
-        assert_ne!(
-            validated.response,
-            crate::protocol::NntpResponse::Invalid,
+        assert_eq!(
+            validated.status_code,
+            Some(crate::protocol::StatusCode::new(220)),
             "3-digit code should be parseable even if short"
         );
     }
@@ -623,7 +628,12 @@ mod tests {
         let data = &[0xFF, 0xFE, 0x00, 0x01, 0x02];
         let validated =
             validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
-        assert_eq!(validated.response, crate::protocol::NntpResponse::Invalid);
+        assert_eq!(validated.status_code, None);
+        assert!(
+            validated
+                .warnings
+                .contains(&crate::session::backend::ResponseWarning::InvalidResponse)
+        );
     }
 
     #[test]
@@ -631,9 +641,10 @@ mod tests {
         let data = b"430 No such article\r\n";
         let validated =
             validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
-        assert!(validated.response.status_code().is_some());
-        assert_eq!(validated.response.status_code().unwrap().as_u16(), 430);
-        assert!(!validated.response.is_multiline());
+        assert_eq!(
+            validated.status_code,
+            Some(crate::protocol::StatusCode::new(430))
+        );
     }
 
     #[test]
@@ -641,9 +652,10 @@ mod tests {
         let data = b"220 0 <msg@id> article\r\nBody\r\n.\r\n";
         let validated =
             validate_backend_response(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
-        assert!(validated.response.status_code().is_some());
-        assert_eq!(validated.response.status_code().unwrap().as_u16(), 220);
-        assert!(validated.response.is_multiline());
+        assert_eq!(
+            validated.status_code,
+            Some(crate::protocol::StatusCode::new(220))
+        );
     }
 
     // ─── execute_pipeline_batch integration tests ────────────────────────────

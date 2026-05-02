@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
-use crate::protocol::{NntpResponse, RequestContext, StatusCode};
+use crate::protocol::{RequestContext, StatusCode};
 
 // ─── Response validation ────────────────────────────────────────────────────
 
@@ -42,7 +42,6 @@ pub enum ResponseWarning {
 /// Validated backend response (pure data)
 #[derive(Debug)]
 pub struct ParsedBackendResponse {
-    pub response: NntpResponse,
     pub status_code: Option<StatusCode>,
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
@@ -60,7 +59,7 @@ pub struct ParsedBackendResponse {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// `ParsedBackendResponse` with parsed response and any warnings
+/// `ParsedBackendResponse` with parsed status and any warnings
 #[must_use]
 pub fn validate_backend_response(
     chunk: &[u8],
@@ -77,22 +76,19 @@ pub fn validate_backend_response(
         });
     }
 
-    // Parse response code
-    let response = NntpResponse::parse(&chunk[..bytes_read]);
     let status_code = StatusCode::parse(&chunk[..bytes_read]);
     // Check for invalid response
-    if response == NntpResponse::Invalid {
-        warnings.push(ResponseWarning::InvalidResponse);
-    } else if let Some(code) = status_code {
+    if let Some(code) = status_code {
         // Check for unusual status codes
         let raw_code = code.as_u16();
         if raw_code == 0 || raw_code >= 600 {
             warnings.push(ResponseWarning::UnusualStatusCode(raw_code));
         }
+    } else {
+        warnings.push(ResponseWarning::InvalidResponse);
     }
 
     ParsedBackendResponse {
-        response,
         status_code,
         warnings,
     }
@@ -464,8 +460,6 @@ mod tests {
             validated.status_code,
             Some(crate::protocol::StatusCode::new(200))
         );
-        assert!(matches!(validated.response, NntpResponse::Greeting(_)));
-        assert!(!validated.response.is_multiline());
         assert!(validated.warnings.is_empty());
     }
 
@@ -486,7 +480,7 @@ mod tests {
         let data = b"garbage response";
         let validated = validate_backend_response(data, data.len(), 7);
 
-        assert_eq!(validated.response, NntpResponse::Invalid);
+        assert_eq!(validated.status_code, None);
         assert!(
             validated
                 .warnings
@@ -523,7 +517,10 @@ mod tests {
         let data = b"220 0 <article@example.com>\r\n";
         let validated = validate_backend_response(data, data.len(), 7);
 
-        assert!(validated.response.is_multiline());
+        assert_eq!(
+            validated.status_code,
+            Some(crate::protocol::StatusCode::new(220))
+        );
         assert!(validated.warnings.is_empty());
     }
 
@@ -553,7 +550,7 @@ mod tests {
 
         for data in test_cases {
             let validated = validate_backend_response(data, data.len(), 7);
-            assert!(!matches!(validated.response, NntpResponse::Invalid));
+            assert!(validated.status_code.is_some());
             assert!(
                 validated
                     .warnings
