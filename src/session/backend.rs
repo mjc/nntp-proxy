@@ -11,7 +11,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use crate::session::backend::{send_request, BackendResponse};
+//! use crate::session::backend::{send_request, BackendFirstResponse};
 //!
 //! let response = send_request(&mut conn, &request, &mut buffer).await?;
 //! if response.is_430() {
@@ -41,7 +41,7 @@ pub enum ResponseWarning {
 
 /// Validated backend response status (pure data)
 #[derive(Debug)]
-pub struct BackendResponseValidation {
+pub struct BackendStatusValidation {
     pub status_code: Option<StatusCode>,
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
@@ -59,13 +59,13 @@ pub struct BackendResponseValidation {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// `BackendResponseValidation` with parsed status and any warnings
+/// `BackendStatusValidation` with parsed status and any warnings
 #[must_use]
 pub fn validate_backend_response(
     chunk: &[u8],
     bytes_read: usize,
     min_length: usize,
-) -> BackendResponseValidation {
+) -> BackendStatusValidation {
     let mut warnings = SmallVec::new();
 
     // Check minimum length
@@ -88,7 +88,7 @@ pub fn validate_backend_response(
         warnings.push(ResponseWarning::InvalidResponse);
     }
 
-    BackendResponseValidation {
+    BackendStatusValidation {
         status_code,
         warnings,
     }
@@ -148,9 +148,9 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 // ─── Command execution ──────────────────────────────────────────────────────
 
-/// Result of sending a command to a backend
+/// Metadata for the first backend response chunk.
 #[derive(Debug)]
-pub struct BackendResponse {
+pub struct BackendFirstResponse {
     /// Number of bytes read into buffer
     pub bytes_read: usize,
     /// Parsed status code, if present
@@ -161,7 +161,7 @@ pub struct BackendResponse {
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-impl BackendResponse {
+impl BackendFirstResponse {
     /// Get status code if valid
     #[inline]
     #[must_use]
@@ -238,7 +238,7 @@ pub async fn send_request<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<BackendResponse>
+) -> Result<BackendFirstResponse>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -251,7 +251,7 @@ pub async fn send_request_timed<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<(BackendResponse, u64, u64, u64)>
+) -> Result<(BackendFirstResponse, u64, u64, u64)>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -283,7 +283,7 @@ where
     let elapsed = start.elapsed();
 
     Ok((
-        BackendResponse {
+        BackendFirstResponse {
             bytes_read: total,
             status_code: validated.status_code,
             is_multiline,
@@ -418,9 +418,9 @@ mod tests {
     // ─── Command response tests ─────────────────────────────────────────────
 
     #[test]
-    fn test_command_response_is_430() {
+    fn test_backend_first_response_is_430() {
         // Create a 430 response
-        let response = BackendResponse {
+        let response = BackendFirstResponse {
             bytes_read: 20,
             status_code: Some(StatusCode::new(430)),
             is_multiline: false,
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(response.status_code(), Some(StatusCode::new(430)));
 
         // Create a 220 response
-        let response = BackendResponse {
+        let response = BackendFirstResponse {
             bytes_read: 30,
             status_code: Some(StatusCode::new(220)),
             is_multiline: true,
@@ -439,8 +439,8 @@ mod tests {
     }
 
     #[test]
-    fn test_command_response_status_code() {
-        let response = BackendResponse {
+    fn test_backend_first_response_status_code() {
+        let response = BackendFirstResponse {
             bytes_read: 10,
             status_code: Some(StatusCode::new(211)),
             is_multiline: false,

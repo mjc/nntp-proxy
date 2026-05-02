@@ -98,5 +98,5 @@ pub mod backend {
     //! Backend communication utilities for NNTP client operations
     //!
     //! Use these when building standalone NNTP clients.
-    pub use crate::session::backend::{BackendResponse, send_request};
+    pub use crate::session::backend::{BackendFirstResponse, send_request};
 }

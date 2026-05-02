@@ -245,7 +245,7 @@ impl NntpClient {
 
     /// Validate NNTP response status code
     #[inline]
-    fn validate_response(response: &crate::session::backend::BackendResponse) -> Result<()> {
+    fn validate_response(response: &crate::session::backend::BackendFirstResponse) -> Result<()> {
         response
             .status_code()
             .ok_or_else(|| anyhow::anyhow!("Invalid response from server"))

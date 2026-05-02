@@ -283,7 +283,7 @@ impl ClientSession {
         buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(
         crate::pool::ConnectionGuard,
-        backend::BackendResponse,
+        backend::BackendFirstResponse,
         u64,
         u64,
         u64,
@@ -311,7 +311,7 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         request: &RequestContext,
         buffer: &mut crate::pool::PooledBuffer,
-    ) -> Result<(backend::BackendResponse, u64, u64, u64)> {
+    ) -> Result<(backend::BackendFirstResponse, u64, u64, u64)> {
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
 
