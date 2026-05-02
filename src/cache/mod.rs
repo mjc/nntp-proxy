@@ -138,6 +138,17 @@ impl From<SmallVec<[u8; 128]>> for CacheBuffer {
     }
 }
 
+impl From<&[u8]> for CacheBuffer {
+    fn from(value: &[u8]) -> Self {
+        let small = SmallVec::<[u8; 128]>::from_slice(value);
+        if small.spilled() {
+            Self::Vec(value.to_vec())
+        } else {
+            Self::Small(small)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +206,14 @@ mod tests {
             CacheBuffer::Small(small).status_code(),
             Some(StatusCode::new(220))
         );
+    }
+
+    #[test]
+    fn cache_buffer_from_short_slice_uses_inline_storage() {
+        let buffer = CacheBuffer::from(b"223\r\n".as_slice());
+
+        assert!(matches!(buffer, CacheBuffer::Small(_)));
+        assert_eq!(buffer.status_code(), Some(StatusCode::new(223)));
     }
 }
 

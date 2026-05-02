@@ -154,7 +154,7 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         tier: CacheTier,
     ) {
-        self.spawn_cache_upsert_buffer(msg_id, buffer.to_vec().into(), backend_id, tier);
+        self.spawn_cache_upsert_buffer(msg_id, buffer.into(), backend_id, tier);
     }
 
     /// Spawn async cache upsert task with owned hot-path storage.
