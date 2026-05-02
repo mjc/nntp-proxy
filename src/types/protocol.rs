@@ -53,28 +53,6 @@ impl<'a> MessageId<'a> {
         MessageId::new(wrapped)
     }
 
-    /// Extract message ID from NNTP command (zero-copy, returns borrowed)
-    ///
-    /// Uses SIMD-accelerated memchr for fast scanning.
-    #[inline]
-    #[must_use]
-    pub fn extract_from_command_borrowed(command: &'a str) -> Option<Self> {
-        let bytes = command.as_bytes();
-        let start = memchr::memchr(b'<', bytes)?;
-        let end = memchr::memchr(b'>', &bytes[start..])?;
-        let slice = &command[start..=(start + end)];
-        if slice.len() < 3 {
-            return None; // Reject "<>"
-        }
-        // SAFETY: We verified starts_with('<'), ends_with('>'), len >= 3
-        Some(unsafe { Self::from_str_unchecked(slice) })
-    }
-
-    /// Extract message ID from NNTP command (returns owned)
-    pub fn extract_from_command(command: &'a str) -> Option<MessageId<'static>> {
-        Self::extract_from_command_borrowed(command).map(MessageId::into_owned)
-    }
-
     #[inline]
     fn validate(s: &str) -> Result<(), ValidationError> {
         if s.len() < 3 || !s.starts_with('<') || !s.ends_with('>') {
@@ -194,13 +172,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_from_command() {
-        let msgid = MessageId::extract_from_command("ARTICLE <12345@example.com>").unwrap();
-        assert_eq!(msgid.as_str(), "<12345@example.com>");
-        assert!(MessageId::extract_from_command("LIST").is_none());
-    }
-
-    #[test]
     fn test_from_str_or_wrap() {
         assert_eq!(
             MessageId::from_str_or_wrap("<test@example.com>")
@@ -274,23 +245,6 @@ mod tests {
         let msgid = MessageId::new("<test@example.com>".to_string()).unwrap();
         let s: String = msgid.into();
         assert_eq!(s, "<test@example.com>");
-    }
-
-    #[test]
-    fn test_extract_from_command_edge_cases() {
-        // Multiple message IDs - should extract first
-        assert_eq!(
-            MessageId::extract_from_command("ARTICLE <first@test> <second@test>")
-                .unwrap()
-                .as_str(),
-            "<first@test>"
-        );
-
-        // No closing bracket
-        assert!(MessageId::extract_from_command("ARTICLE <incomplete").is_none());
-
-        // Empty command
-        assert!(MessageId::extract_from_command("").is_none());
     }
 
     #[test]
