@@ -111,7 +111,7 @@ impl ClientSession {
                                 state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
                                 continue;
                             }
-                            let request = RequestContext::from_request_line(&line);
+                            let request = RequestContext::from_request_bytes(line.as_bytes());
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {

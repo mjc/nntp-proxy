@@ -114,7 +114,7 @@ impl ClientSession {
             Err(e) => return Err(e.into()),
         }
 
-        let request = RequestContext::from_request_line(command_buf);
+        let request = RequestContext::from_request_bytes(command_buf.as_bytes());
 
         if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
@@ -147,7 +147,8 @@ impl ClientSession {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
                     if command_buf.len() > 512 {
-                        let trailing_context = Some(RequestContext::from_request_line(command_buf));
+                        let trailing_context =
+                            Some(RequestContext::from_request_bytes(command_buf.as_bytes()));
                         trailing_oversized = true;
                         return Ok(RequestBatch {
                             contexts: batch_contexts,
@@ -156,7 +157,7 @@ impl ClientSession {
                             first_oversized: false,
                         });
                     }
-                    let request = RequestContext::from_request_line(command_buf);
+                    let request = RequestContext::from_request_bytes(command_buf.as_bytes());
                     if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
                         let trailing_context = Some(request);
