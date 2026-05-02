@@ -187,6 +187,16 @@ impl NntpResponse {
         matches!(self, Self::MultilineData(_))
     }
 
+    /// Check whether this status code category normally carries multiline data.
+    ///
+    /// Request-aware paths should prefer [`RequestContext::response_shape`](crate::protocol::RequestContext::response_shape)
+    /// because codes such as `211` depend on the originating command.
+    #[inline]
+    #[must_use]
+    pub const fn status_implies_multiline(&self) -> bool {
+        matches!(self, Self::MultilineData(_))
+    }
+
     /// Get the numeric status code if available
     #[inline]
     #[must_use]
@@ -379,6 +389,12 @@ mod tests {
         assert!(NntpResponse::parse(b"215 LIST\r\n").is_multiline());
         assert!(!NntpResponse::parse(b"200 OK\r\n").is_multiline());
         assert!(!NntpResponse::parse(b"211 Group\r\n").is_multiline());
+    }
+
+    #[test]
+    fn test_status_implies_multiline_names_categorization() {
+        assert!(NntpResponse::parse(b"220 Article\r\n").status_implies_multiline());
+        assert!(!NntpResponse::parse(b"211 Group selected\r\n").status_implies_multiline());
     }
 
     #[test]
