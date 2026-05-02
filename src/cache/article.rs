@@ -890,8 +890,8 @@ impl ArticleCache {
     /// If entry exists: updates the entry and marks backend as having the article
     /// If entry doesn't exist: inserts new entry
     ///
-    /// When `cache_articles=false`, extracts status code from buffer and stores minimal stub.
-    /// When `cache_articles=true`, stores full buffer.
+    /// When `cache_articles=false`, stores typed availability without payload bytes.
+    /// When `cache_articles=true`, parses and stores semantic payload sections.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
@@ -909,12 +909,14 @@ impl ArticleCache {
         let key: Arc<str> = message_id.without_brackets().into();
         let cache_articles = self.cache_articles;
 
-        let new_buffer = if cache_articles {
-            buffer.into_vec()
+        let new_entry_template = if cache_articles {
+            ArticleEntry::from_wire_response_with_tier(buffer.into_vec(), tier)
         } else {
-            Self::create_minimal_stub(buffer)
+            let Some(status_code) = buffer.status_code() else {
+                return;
+            };
+            ArticleEntry::availability_only(status_code, tier)
         };
-        let new_entry_template = ArticleEntry::from_wire_response_with_tier(new_buffer, tier);
 
         // Use atomic upsert - this provides key-level locking and eliminates
         // the race condition between get() and insert() calls
@@ -958,34 +960,6 @@ impl ArticleCache {
                 std::future::ready(new_entry)
             })
             .await;
-    }
-
-    /// Create minimal stub from a backend wire response.
-    ///
-    /// Extracts the status code from the first line and creates a minimal stub.
-    /// Falls back to "200\r\n" if parsing fails.
-    fn create_minimal_stub(buffer: super::CacheBuffer) -> Vec<u8> {
-        let status_line = match buffer {
-            super::CacheBuffer::Vec(buf) => super::entry_helpers::extract_status_line(&buf),
-            super::CacheBuffer::Pooled(buf) => {
-                super::entry_helpers::extract_status_line(buf.as_ref())
-            }
-            super::CacheBuffer::Chunked(buf) => {
-                super::entry_helpers::extract_chunked_status_line(&buf)
-            }
-            super::CacheBuffer::Small(buf) => super::entry_helpers::extract_status_line(&buf),
-        };
-
-        status_line
-            .get(..3)
-            .filter(|digits| digits.iter().all(|b| b.is_ascii_digit()))
-            .map(|digits| {
-                let mut stub = Vec::with_capacity(5);
-                stub.extend_from_slice(digits);
-                stub.extend_from_slice(b"\r\n");
-                stub
-            })
-            .unwrap_or_else(|| b"200\r\n".to_vec())
     }
 
     /// Record that a backend returned 430 for this article - ATOMIC OPERATION
@@ -1513,7 +1487,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_respects_cache_articles_flag() {
-        // Test with cache_articles=false - should store minimal stub
+        // Test with cache_articles=false - should store availability without payload bytes
         let cache_stub = ArticleCache::new(1024 * 1024, Duration::from_secs(300), false);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
@@ -1526,14 +1500,12 @@ mod tests {
         cache_stub.sync().await;
 
         let retrieved = cache_stub.get(&msgid).await.unwrap();
-        let stub_size = retrieved.payload_len();
-
-        // Stub should be much smaller than full article (just "220\r\n")
-        assert!(stub_size < 10, "Stub size {stub_size} should be < 10 bytes");
-        assert!(
-            stub_size < full_size,
-            "Stub {stub_size} should be smaller than full {full_size}"
+        assert_eq!(
+            retrieved.payload_kind(),
+            CachedPayloadKind::AvailabilityOnly
         );
+        assert_eq!(retrieved.payload_len(), 0);
+        assert!(retrieved.payload_len() < full_size);
 
         // Test with cache_articles=true - should store full article
         let cache_full = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true);

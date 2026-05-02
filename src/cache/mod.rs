@@ -33,6 +33,7 @@ pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
 // Internal helper re-exported for session handlers
 pub(crate) use entry_helpers::{extract_chunked_status_line, extract_status_line};
 
+use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
 use smallvec::SmallVec;
 
@@ -62,6 +63,20 @@ impl CacheBuffer {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[must_use]
+    pub fn status_code(&self) -> Option<StatusCode> {
+        match self {
+            Self::Vec(buf) => StatusCode::parse(buf),
+            Self::Pooled(buf) => StatusCode::parse(buf.as_ref()),
+            Self::Chunked(buf) => {
+                let mut prefix = SmallVec::<[u8; 128]>::new();
+                buf.copy_prefix_into(3, &mut prefix);
+                StatusCode::parse(&prefix)
+            }
+            Self::Small(buf) => StatusCode::parse(buf),
+        }
     }
 
     /// Cold-path flattening for cache backends that still require contiguous bytes.
@@ -147,6 +162,39 @@ mod tests {
             CacheBuffer::Pooled(pooled)
         );
         assert_eq!(CacheBuffer::Chunked(chunked), CacheBuffer::Small(small));
+    }
+
+    #[tokio::test]
+    async fn cache_buffer_status_code_spans_storage_forms() {
+        let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
+                .with_capture_pool(8, 4);
+
+        let mut pooled = pool.acquire().await;
+        pooled.copy_from_slice(bytes);
+
+        let mut chunked = crate::pool::ChunkedResponse::default();
+        chunked.extend_from_slice(&pool, bytes);
+
+        let small = SmallVec::<[u8; 128]>::from_slice(bytes);
+
+        assert_eq!(
+            CacheBuffer::Vec(bytes.to_vec()).status_code(),
+            Some(StatusCode::new(220))
+        );
+        assert_eq!(
+            CacheBuffer::Pooled(pooled).status_code(),
+            Some(StatusCode::new(220))
+        );
+        assert_eq!(
+            CacheBuffer::Chunked(chunked).status_code(),
+            Some(StatusCode::new(220))
+        );
+        assert_eq!(
+            CacheBuffer::Small(small).status_code(),
+            Some(StatusCode::new(220))
+        );
     }
 }
 

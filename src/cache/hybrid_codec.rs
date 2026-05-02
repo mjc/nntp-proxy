@@ -377,6 +377,17 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
+    pub fn availability_only(status_code: CacheableStatusCode, tier: ttl::CacheTier) -> Self {
+        Self {
+            status_code,
+            availability: ArticleAvailability::new(),
+            timestamp: ttl::CacheTimestampMillis::now(),
+            tier,
+            payload: CachedPayload::AvailabilityOnly,
+        }
+    }
+
+    #[must_use]
     pub fn response_parts_for_command_bytes(
         &self,
         cmd_verb: &[u8],

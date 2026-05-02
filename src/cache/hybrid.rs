@@ -346,7 +346,7 @@ impl HybridArticleCache {
     /// With `WriteOnInsertion` policy, articles are written to disk immediately
     /// in a background task (non-blocking).
     ///
-    /// **UPSERT SEMANTICS**: Never overwrites a larger buffer with a smaller one.
+    /// **UPSERT SEMANTICS**: Never overwrites a larger semantic payload with a smaller one.
     /// A cached full article (220/222 response) must not be replaced by a STAT stub.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
@@ -361,27 +361,26 @@ impl HybridArticleCache {
     {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
-        let buffer_len = buffer.len();
-        let buffer = buffer.into_vec();
         let mut entry = if self.config.cache_articles {
+            let buffer_len = buffer.len();
+            let buffer = buffer.into_vec();
             let Some(entry) = HybridArticleEntry::from_wire_response_with_tier(buffer, tier) else {
                 warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
                 return;
             };
             entry
         } else {
-            // Availability-only mode: store minimal stub
-            let stub = Self::create_stub(&buffer);
-            let Some(entry) = HybridArticleEntry::from_wire_response_with_tier(stub, tier) else {
+            let Some(status_code) = buffer
+                .status_code()
+                .and_then(|code| super::CacheableStatusCode::try_from(code.as_u16()).ok())
+            else {
                 warn!(
                     msg_id = %key,
-                    buffer_len,
-                    first_bytes = ?&buffer[..buffer_len.min(32)],
                     "Cannot cache: invalid status code"
                 );
                 return;
             };
-            entry
+            HybridArticleEntry::availability_only(status_code, tier)
         };
         let entry_len = entry.payload_len();
 
@@ -487,11 +486,6 @@ impl HybridArticleCache {
         }
     }
 
-    /// Create a minimal stub from a backend wire response (for availability-only mode)
-    fn create_stub(buffer: &[u8]) -> Vec<u8> {
-        super::entry_helpers::extract_status_line(buffer).into_vec()
-    }
-
     /// Get cache statistics
     pub fn stats(&self) -> HybridCacheStats {
         let foyer_stats = self.cache.statistics();
@@ -569,6 +563,13 @@ impl HybridArticleCache {
     /// to `NoopEngineConfig` — a trivially synchronous engine that spawns zero
     /// background tasks. Safe with any tokio runtime flavor.
     pub async fn new_memory_only(memory_capacity: u64) -> anyhow::Result<Self> {
+        Self::new_memory_only_with_cache_articles(memory_capacity, true).await
+    }
+
+    async fn new_memory_only_with_cache_articles(
+        memory_capacity: u64,
+        cache_articles: bool,
+    ) -> anyhow::Result<Self> {
         use foyer::NoopIoEngineConfig;
 
         let memory_capacity_usize: usize = memory_capacity
@@ -596,7 +597,7 @@ impl HybridArticleCache {
             disk_capacity: 0, // No disk in memory-only mode
             disk_path: std::path::PathBuf::new(),
             ttl: Duration::from_secs(3600),
-            cache_articles: true,
+            cache_articles,
             compression: CompressionCodec::None,
             shards: 1,
         };
@@ -644,6 +645,29 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 0);
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_cache_availability_only_stores_no_payload() {
+        let cache = HybridArticleCache::new_memory_only_with_cache_articles(1024 * 1024, false)
+            .await
+            .unwrap();
+
+        let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
+        let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+        cache
+            .upsert(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
+            .await;
+
+        let entry = cache.get(&msg_id).await.unwrap();
+        assert!(matches!(
+            entry.payload(),
+            crate::cache::article::CachedPayload::AvailabilityOnly
+        ));
+        assert_eq!(entry.payload_len(), 0);
+        assert!(entry.should_try_backend(BackendId::from_index(0)));
 
         cache.close().await.unwrap();
     }
