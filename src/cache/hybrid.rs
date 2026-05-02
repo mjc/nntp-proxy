@@ -635,10 +635,10 @@ mod tests {
         // Retrieve it
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
-        assert_eq!(
-            entry.response_for_command("ARTICLE", &msg_id).unwrap(),
-            buffer
-        );
+        let response = entry
+            .response_parts_for_command_bytes(b"ARTICLE", msg_id.as_str())
+            .unwrap();
+        assert_eq!(response.to_vec(), buffer);
         assert!(entry.should_try_backend(BackendId::from_index(0)));
 
         // Check stats

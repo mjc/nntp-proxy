@@ -12,6 +12,16 @@ use anyhow::Result;
 use nntp_proxy::cache::mock_hybrid::MockHybridCache;
 use nntp_proxy::types::{BackendId, MessageId};
 
+fn response_bytes(
+    entry: &nntp_proxy::cache::HybridArticleEntry,
+    verb: &[u8],
+    message_id: &MessageId<'_>,
+) -> Option<Vec<u8>> {
+    entry
+        .response_parts_for_command_bytes(verb, message_id.as_str())
+        .map(|response| response.to_vec())
+}
+
 #[tokio::test]
 async fn test_mock_cache_basic_ops() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
@@ -29,10 +39,7 @@ async fn test_mock_cache_basic_ops() -> Result<()> {
     let entry = cache.get(&msg_id).await;
     assert!(entry.is_some(), "Entry should exist");
     assert_eq!(
-        entry
-            .unwrap()
-            .response_for_command("ARTICLE", &msg_id)
-            .unwrap(),
+        response_bytes(&entry.unwrap(), b"ARTICLE", &msg_id).unwrap(),
         buffer
     );
 
@@ -91,7 +98,7 @@ async fn test_upsert_preserves_larger_buffer() -> Result<()> {
         b"Subject: Test".len() + b"Large body content here".len()
     );
     assert_eq!(
-        entry.response_for_command("ARTICLE", &msg_id).unwrap(),
+        response_bytes(&entry, b"ARTICLE", &msg_id).unwrap(),
         large_buffer
     );
 

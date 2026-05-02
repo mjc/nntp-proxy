@@ -671,6 +671,16 @@ fn make_430_stub_buffer() -> Vec<u8> {
     b"430 No such article\r\n".to_vec()
 }
 
+fn hybrid_response_bytes(
+    entry: &HybridArticleEntry,
+    verb: &[u8],
+    message_id: &str,
+) -> Option<Vec<u8>> {
+    entry
+        .response_parts_for_command_bytes(verb, message_id)
+        .map(|response| response.to_vec())
+}
+
 #[test]
 fn test_hybrid_entry_has_availability_info_empty() {
     let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
@@ -827,10 +837,7 @@ fn test_hybrid_entry_response_for_command_article() {
     let buffer = make_valid_article_buffer();
     let entry = HybridArticleEntry::from_response_buffer(buffer.clone()).unwrap();
 
-    let response = entry.response_for_command(
-        "ARTICLE",
-        &MessageId::from_borrowed("<test@example.com>").unwrap(),
-    );
+    let response = hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>");
     assert!(response.is_some());
     assert_eq!(response.unwrap(), buffer);
 }
@@ -839,10 +846,7 @@ fn test_hybrid_entry_response_for_command_article() {
 fn test_hybrid_entry_response_for_command_stat_synthesized() {
     let entry = HybridArticleEntry::from_response_buffer(make_valid_article_buffer()).unwrap();
 
-    let response = entry.response_for_command(
-        "STAT",
-        &MessageId::from_borrowed("<test@example.com>").unwrap(),
-    );
+    let response = hybrid_response_bytes(&entry, b"STAT", "<test@example.com>");
     assert!(response.is_some());
 
     let response_str = String::from_utf8(response.unwrap()).unwrap();
@@ -854,24 +858,10 @@ fn test_hybrid_entry_response_for_command_430_returns_none() {
     let entry = HybridArticleEntry::from_response_buffer(make_430_stub_buffer()).unwrap();
 
     // 430 stubs should not serve ARTICLE requests
-    assert!(
-        entry
-            .response_for_command(
-                "ARTICLE",
-                &MessageId::from_borrowed("<test@example.com>").unwrap()
-            )
-            .is_none()
-    );
+    assert!(hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>").is_none());
 
     // 430 stubs should not serve STAT either (article doesn't exist)
-    assert!(
-        entry
-            .response_for_command(
-                "STAT",
-                &MessageId::from_borrowed("<test@example.com>").unwrap()
-            )
-            .is_none()
-    );
+    assert!(hybrid_response_bytes(&entry, b"STAT", "<test@example.com>").is_none());
 }
 
 #[test]

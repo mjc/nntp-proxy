@@ -369,17 +369,6 @@ impl HybridArticleEntry {
         })
     }
 
-    /// Render this entry as an NNTP response for the given command/message-id.
-    #[must_use]
-    pub fn response_for_command(
-        &self,
-        cmd_verb: &str,
-        message_id: &crate::types::MessageId<'_>,
-    ) -> Option<Vec<u8>> {
-        self.response_parts_for_command_bytes(cmd_verb.as_bytes(), message_id.as_str())
-            .map(|response| response.to_vec())
-    }
-
     #[must_use]
     pub fn response_parts_for_command_bytes(
         &self,
@@ -550,6 +539,16 @@ mod tests {
         assert_eq!(original.payload, decoded.payload);
     }
 
+    fn render_response(
+        entry: &HybridArticleEntry,
+        verb: &[u8],
+        message_id: &str,
+    ) -> Option<Vec<u8>> {
+        entry
+            .response_parts_for_command_bytes(verb, message_id)
+            .map(|response| response.to_vec())
+    }
+
     // =========================================================================
     // CacheableStatusCode enum tests
     // =========================================================================
@@ -656,9 +655,8 @@ mod tests {
         let mut entry =
             HybridArticleEntry::from_response_buffer(buffer.clone()).expect("valid status code");
 
-        let msg_id = crate::types::MessageId::from_borrowed("<test@example.com>").unwrap();
         assert_eq!(
-            entry.response_for_command("ARTICLE", &msg_id).unwrap(),
+            render_response(&entry, b"ARTICLE", "<test@example.com>").unwrap(),
             buffer
         );
         assert_eq!(entry.status_code().map(|c| c.as_u16()), Some(220));
@@ -942,12 +940,7 @@ mod tests {
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec(),
         )
         .unwrap();
-        let resp = entry
-            .response_for_command(
-                "STAT",
-                &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
-            )
-            .expect("should serve STAT");
+        let resp = render_response(&entry, b"STAT", "<t@x>").expect("should serve STAT");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
 
@@ -957,12 +950,7 @@ mod tests {
             b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec(),
         )
         .unwrap();
-        let resp = entry
-            .response_for_command(
-                "STAT",
-                &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
-            )
-            .expect("should serve STAT from head");
+        let resp = render_response(&entry, b"STAT", "<t@x>").expect("should serve STAT from head");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
 
@@ -972,12 +960,7 @@ mod tests {
             b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec(),
         )
         .unwrap();
-        let resp = entry
-            .response_for_command(
-                "STAT",
-                &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
-            )
-            .expect("should serve STAT from body");
+        let resp = render_response(&entry, b"STAT", "<t@x>").expect("should serve STAT from body");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
 
@@ -985,26 +968,14 @@ mod tests {
     fn test_response_for_command_stat_not_from_430() {
         let entry =
             HybridArticleEntry::from_response_buffer(b"430 not found\r\n".to_vec()).unwrap();
-        assert!(
-            entry
-                .response_for_command(
-                    "STAT",
-                    &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
-                )
-                .is_none()
-        );
+        assert!(render_response(&entry, b"STAT", "<t@x>").is_none());
     }
 
     #[test]
     fn test_response_for_command_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = HybridArticleEntry::from_response_buffer(buf.clone()).unwrap();
-        let resp = entry
-            .response_for_command(
-                "ARTICLE",
-                &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
-            )
-            .expect("should serve ARTICLE");
+        let resp = render_response(&entry, b"ARTICLE", "<t@x>").expect("should serve ARTICLE");
         assert_eq!(resp, buf);
     }
 
@@ -1012,12 +983,7 @@ mod tests {
     fn test_response_for_command_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = HybridArticleEntry::from_response_buffer(buf.clone()).unwrap();
-        let resp = entry
-            .response_for_command(
-                "BODY",
-                &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
-            )
-            .expect("220 can serve BODY");
+        let resp = render_response(&entry, b"BODY", "<t@x>").expect("220 can serve BODY");
         assert_eq!(resp, b"222 0 <t@x>\r\nBody\r\n.\r\n");
     }
 
@@ -1025,12 +991,7 @@ mod tests {
     fn test_response_for_command_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = HybridArticleEntry::from_response_buffer(buf.clone()).unwrap();
-        let resp = entry
-            .response_for_command(
-                "HEAD",
-                &crate::types::MessageId::from_borrowed("<t@x>").unwrap(),
-            )
-            .expect("220 can serve HEAD");
+        let resp = render_response(&entry, b"HEAD", "<t@x>").expect("220 can serve HEAD");
         assert_eq!(resp, b"221 0 <t@x>\r\nSubject: T\r\n.\r\n");
     }
 
@@ -1040,14 +1001,7 @@ mod tests {
             b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n".to_vec(),
         )
         .unwrap();
-        assert!(
-            entry
-                .response_for_command(
-                    "ARTICLE",
-                    &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
-                )
-                .is_none()
-        );
+        assert!(render_response(&entry, b"ARTICLE", "<t@x>").is_none());
     }
 
     #[test]
@@ -1056,14 +1010,7 @@ mod tests {
             b"221 0 <t@x>\r\nSubject: T\r\n.\r\n".to_vec(),
         )
         .unwrap();
-        assert!(
-            entry
-                .response_for_command(
-                    "BODY",
-                    &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
-                )
-                .is_none()
-        );
+        assert!(render_response(&entry, b"BODY", "<t@x>").is_none());
     }
 
     #[test]
@@ -1072,30 +1019,9 @@ mod tests {
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec(),
         )
         .unwrap();
-        assert!(
-            entry
-                .response_for_command(
-                    "LIST",
-                    &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
-                )
-                .is_none()
-        );
-        assert!(
-            entry
-                .response_for_command(
-                    "GROUP",
-                    &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
-                )
-                .is_none()
-        );
-        assert!(
-            entry
-                .response_for_command(
-                    "QUIT",
-                    &crate::types::MessageId::from_borrowed("<t@x>").unwrap()
-                )
-                .is_none()
-        );
+        assert!(render_response(&entry, b"LIST", "<t@x>").is_none());
+        assert!(render_response(&entry, b"GROUP", "<t@x>").is_none());
+        assert!(render_response(&entry, b"QUIT", "<t@x>").is_none());
     }
 
     // =========================================================================
