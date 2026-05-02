@@ -8,7 +8,7 @@
 use smallvec::SmallVec;
 
 use super::StatusCode;
-use crate::types::MessageId;
+use crate::types::{BackendId, MessageId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -59,6 +59,7 @@ pub struct RequestContext {
     verb: SmallVec<[u8; 16]>,
     args: SmallVec<[u8; 512]>,
     message_id: Option<(usize, usize)>,
+    backend_id: Option<BackendId>,
 }
 
 impl RequestContext {
@@ -81,6 +82,7 @@ impl RequestContext {
             verb,
             args,
             message_id,
+            backend_id: None,
         }
     }
 
@@ -96,6 +98,7 @@ impl RequestContext {
             verb,
             args,
             message_id,
+            backend_id: None,
         }
     }
 
@@ -103,6 +106,17 @@ impl RequestContext {
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
         self.kind
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn backend_id(&self) -> Option<BackendId> {
+        self.backend_id
+    }
+
+    #[inline]
+    pub const fn set_backend_id(&mut self, backend_id: BackendId) {
+        self.backend_id = Some(backend_id);
     }
 
     #[inline]
@@ -315,8 +329,20 @@ mod tests {
         let ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
         assert_eq!(ctx.kind(), RequestKind::Article);
         assert_eq!(ctx.message_id(), Some("<a@b>"));
+        assert_eq!(ctx.backend_id(), None);
         assert!(ctx.is_pipelineable());
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_backend_when_known() {
+        let mut ctx = RequestContext::from_request_line("STAT <a@b>\r\n");
+        let backend_id = BackendId::from_index(2);
+
+        ctx.set_backend_id(backend_id);
+
+        assert_eq!(ctx.backend_id(), Some(backend_id));
+        assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
     }
 
     #[test]

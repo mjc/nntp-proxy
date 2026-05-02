@@ -88,8 +88,10 @@ impl QueuedContext {
         status_code: crate::protocol::StatusCode,
         backend_id: BackendId,
     ) {
+        let mut context = self.context;
+        context.set_backend_id(backend_id);
         let _ = self.client_return.send(Ok(CompletedPipelineRequest {
-            context: self.context,
+            context,
             data,
             status_code,
             backend_id,
@@ -402,6 +404,7 @@ mod tests {
 
         let completed = rx.blocking_recv().unwrap().unwrap();
         assert_eq!(completed.context.message_id(), Some("<test@example.com>"));
+        assert_eq!(completed.context.backend_id(), Some(backend_id));
         assert_eq!(completed.status_code.as_u16(), 223);
         assert_eq!(completed.backend_id, backend_id);
         assert!(completed.data.is_empty());
