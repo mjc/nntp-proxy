@@ -409,12 +409,13 @@ impl ClientSession {
                         debug!(
                             "Client {} received {} request bytes: kind={:?}, verb={:?}",
                             self.client_addr,
-                            request.wire_len(),
+                            request.request_wire_len().get(),
                             request.kind(),
                             request.verb()
                         );
 
-                        client_to_backend_bytes = client_to_backend_bytes.add(request.wire_len());
+                        client_to_backend_bytes =
+                            client_to_backend_bytes.add(request.request_wire_len().get());
                         skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
                         match self

@@ -106,7 +106,9 @@ impl ClientSession {
         .map_err(SessionError::Backend)?;
 
         self.record_timing_metrics(backend_id, ttfb, send, recv);
-        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request.wire_len());
+        *state.client_to_backend_bytes = state
+            .client_to_backend_bytes
+            .add(request.request_wire_len().get());
 
         // Reject invalid responses - never forward garbage to client
         let Some(status_code) = cmd_response.status_code() else {
@@ -238,7 +240,7 @@ impl ClientSession {
             backend_id,
             request,
             status_code,
-            request.wire_len() as u64,
+            request.request_wire_len().as_u64(),
             bytes_written,
         );
 

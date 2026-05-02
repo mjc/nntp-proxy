@@ -183,8 +183,10 @@ async fn execute_pipeline_batch(
                 metrics.record_command(backend_id);
                 let data_len = req.context.response_payload_len().unwrap_or_default();
                 metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
-                metrics
-                    .record_client_to_backend_bytes_for(backend_id, req.context.wire_len() as u64);
+                metrics.record_client_to_backend_bytes_for(
+                    backend_id,
+                    req.context.request_wire_len().as_u64(),
+                );
 
                 req.complete_context();
             }

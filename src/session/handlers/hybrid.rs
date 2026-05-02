@@ -62,7 +62,7 @@ fn stateful_initial_client_bytes(
     carried_client_to_backend_bytes: u64,
     initial_request: &crate::protocol::RequestContext,
 ) -> u64 {
-    carried_client_to_backend_bytes + initial_request.wire_len() as u64
+    carried_client_to_backend_bytes + initial_request.request_wire_len().as_u64()
 }
 
 impl ClientSession {

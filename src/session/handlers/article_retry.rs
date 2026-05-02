@@ -321,7 +321,9 @@ impl ClientSession {
 
             self.send_430_to_client(client_write, state.backend_to_client_bytes)
                 .await?;
-            *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request.wire_len());
+            *state.client_to_backend_bytes = state
+                .client_to_backend_bytes
+                .add(request.request_wire_len().get());
 
             if let Some(mid) = msg_id.as_ref() {
                 self.cache
@@ -335,7 +337,9 @@ impl ClientSession {
         }
 
         // --- Success: stream response to client ---
-        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request.wire_len());
+        *state.client_to_backend_bytes = state
+            .client_to_backend_bytes
+            .add(request.request_wire_len().get());
 
         let bytes_written = if is_multiline {
             let ctx = streaming::StreamContext {
@@ -565,8 +569,8 @@ impl ClientSession {
                                     .expect("completed queued request records response metadata");
                                 *backend_to_client_bytes =
                                     backend_to_client_bytes.add(response.wire_len().get());
-                                *client_to_backend_bytes =
-                                    client_to_backend_bytes.add(completed.context.wire_len());
+                                *client_to_backend_bytes = client_to_backend_bytes
+                                    .add(completed.context.request_wire_len().get());
                                 self.metrics.record_pipeline_complete();
                                 guard.complete();
                                 return Ok(completed
