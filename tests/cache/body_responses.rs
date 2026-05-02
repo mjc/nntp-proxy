@@ -42,9 +42,8 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");
     assert_eq!(
-        cached.payload_len(),
-        750_000,
-        "Full article should be cached"
+        article_response_bytes(&cached, b"BODY", &msg_id).unwrap(),
+        full_article.as_bytes()
     );
 
     // Second upsert: Try to overwrite with stub (53 bytes)
@@ -58,14 +57,13 @@ async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
         .await
         .expect("Article should still be cached");
     assert_eq!(
-        cached.payload_len(),
-        750_000,
+        article_response_bytes(&cached, b"BODY", &msg_id).unwrap(),
+        full_article.as_bytes(),
         "Full article should NOT be overwritten by stub"
     );
     assert_ne!(
-        cached.payload_len(),
-        stub.len(),
-        "Stub should not overwrite full article"
+        article_response_bytes(&cached, b"BODY", &msg_id),
+        Some(stub)
     );
 
     Ok(())
@@ -84,7 +82,10 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
         .await;
 
     let cached = cache.get(&msg_id).await.expect("Stub should be cached");
-    assert_eq!(cached.payload_len(), 0, "Stub should have no payload");
+    assert!(
+        article_response_bytes(&cached, b"BODY", &msg_id).is_none(),
+        "Stub should have no payload to serve"
+    );
 
     // Second upsert: Replace with full article (larger)
     let full_article = format!(
@@ -102,8 +103,8 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
 
     let cached = cache.get(&msg_id).await.expect("Article should be cached");
     assert_eq!(
-        cached.payload_len(),
-        750_000,
+        article_response_bytes(&cached, b"BODY", &msg_id).unwrap(),
+        full_article.as_bytes(),
         "Full article should replace stub"
     );
 

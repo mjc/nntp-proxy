@@ -36,7 +36,7 @@ impl From<u64> for CachedArticleNumber {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CachedPayloadLen(usize);
+pub(crate) struct CachedPayloadLen(usize);
 
 impl CachedPayloadLen {
     #[must_use]
@@ -239,7 +239,7 @@ impl StackStatusLine {
 
 impl CachedPayload {
     #[must_use]
-    pub fn len(&self) -> CachedPayloadLen {
+    pub(crate) fn len(&self) -> CachedPayloadLen {
         let len = match self {
             Self::Missing | Self::AvailabilityOnly | Self::Stat { .. } => 0,
             Self::Article { headers, body, .. } => headers.len() + body.len(),
@@ -550,7 +550,7 @@ impl ArticleEntry {
     }
 
     #[must_use]
-    pub fn payload_len(&self) -> CachedPayloadLen {
+    pub(crate) fn payload_len(&self) -> CachedPayloadLen {
         self.payload.len()
     }
 

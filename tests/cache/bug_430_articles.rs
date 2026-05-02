@@ -47,9 +47,8 @@ async fn test_sync_availability_does_not_create_430_stub_when_backend_has_articl
         assert!(
             status.as_u16() != 430,
             "sync_availability should NOT create 430 stub when backend has article! \
-             Got status code: {:?}, payload_len: {}",
-            status,
-            entry.payload_len()
+             Got status code: {:?}",
+            status
         );
     }
     // If no entry was created, that's also acceptable

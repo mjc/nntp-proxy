@@ -115,10 +115,6 @@ async fn test_upsert_preserves_larger_buffer() -> Result<()> {
     // Should still have large buffer
     let entry = cache.get(&msg_id).await.unwrap();
     assert_eq!(
-        entry.payload_len(),
-        b"Subject: Test".len() + b"Large body content here".len()
-    );
-    assert_eq!(
         response_bytes(&entry, b"ARTICLE", &msg_id).unwrap(),
         large_buffer
     );

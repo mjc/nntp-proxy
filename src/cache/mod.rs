@@ -23,9 +23,7 @@ pub mod ttl;
 pub mod mock_hybrid;
 
 pub(crate) use article::CachedPayloadKind;
-pub use article::{
-    ArticleCache, ArticleEntry, CachedArticleNumber, CachedArticleResponse, CachedPayloadLen,
-};
+pub use article::{ArticleCache, ArticleEntry, CachedArticleNumber, CachedArticleResponse};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 pub use hybrid_codec::{CacheableStatusCode, HybridArticleEntry};
