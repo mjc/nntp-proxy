@@ -300,8 +300,12 @@ impl RequestCacheEntryMetadata {
 impl RequestContext {
     #[must_use]
     pub fn from_request_line(line: &str) -> Self {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let bytes = trimmed.as_bytes();
+        Self::from_request_bytes(line.as_bytes())
+    }
+
+    #[must_use]
+    pub fn from_request_bytes(line: &[u8]) -> Self {
+        let bytes = trim_line_end(line);
         let split = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
         let verb = SmallVec::from_slice(&bytes[..split]);
         let args = if split < bytes.len() {
@@ -663,6 +667,13 @@ impl RequestContext {
     }
 }
 
+fn trim_line_end(mut line: &[u8]) -> &[u8] {
+    while matches!(line.last(), Some(b'\r' | b'\n')) {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
 fn classify_verb(verb: &[u8]) -> RequestKind {
     macro_rules! classify_verbs {
         ($verb:expr; $($len:literal => { $($lit:literal => $kind:expr),+ $(,)? }),+ $(,)?) => {{
@@ -769,6 +780,18 @@ mod tests {
         assert_eq!(ctx.response_wire_len(), None);
         assert!(ctx.is_pipelineable());
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[test]
+    fn typed_request_context_parses_request_bytes() {
+        let ctx = RequestContext::from_request_bytes(b"XFOO \xff\r\n");
+
+        assert_eq!(ctx.kind(), RequestKind::Unknown);
+        assert_eq!(ctx.verb(), b"XFOO");
+        assert_eq!(ctx.args(), b"\xff");
+        assert_eq!(ctx.args_str(), None);
+        assert_eq!(ctx.route_class(), RequestRouteClass::Stateful);
+        assert_eq!(wire(&ctx), b"XFOO \xff\r\n");
     }
 
     #[test]
