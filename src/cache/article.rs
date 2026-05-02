@@ -442,26 +442,6 @@ impl ArticleEntry {
         )
     }
 
-    /// Get the appropriate response for a command, if this cache entry can serve it
-    ///
-    /// Returns `Some(response_bytes)` if cache can satisfy the command:
-    /// - ARTICLE (220 cached) → returns full cached response
-    /// - BODY (222 cached or 220 cached) → returns cached response
-    /// - HEAD (221 cached or 220 cached) → returns cached response
-    /// - STAT → synthesizes "223 0 <msg-id>\r\n" (we know article exists)
-    ///
-    /// Returns `None` if cached response can't serve this command type or if
-    /// the cached buffer fails validation.
-    #[must_use]
-    pub fn response_for_command(
-        &self,
-        cmd_verb: &str,
-        message_id: &crate::types::MessageId<'_>,
-    ) -> Option<Vec<u8>> {
-        self.response_parts_for_command_bytes(cmd_verb.as_bytes(), message_id.as_str())
-            .map(|response| response.to_vec())
-    }
-
     /// Check if this entry can serve a given command type
     ///
     /// Simpler version of `response_for_command` for boolean checks.
