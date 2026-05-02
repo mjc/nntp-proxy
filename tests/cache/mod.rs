@@ -70,8 +70,7 @@ pub fn assert_serves(entry: &ArticleEntry, cases: &[(&[u8], bool)]) {
         assert_eq!(
             response_bytes(entry, verb).is_some(),
             *expected,
-            "serve decision for {}",
-            String::from_utf8_lossy(verb)
+            "serve decision for {verb:?}"
         );
     }
 }

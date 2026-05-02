@@ -237,8 +237,8 @@ impl std::fmt::Debug for QueuedContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedContext")
             .field("kind", &self.context.kind())
-            .field("verb", &String::from_utf8_lossy(self.context.verb()))
-            .field("args", &String::from_utf8_lossy(self.context.args()))
+            .field("verb", &self.context.verb())
+            .field("args", &self.context.args())
             .finish_non_exhaustive()
     }
 }

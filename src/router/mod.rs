@@ -548,7 +548,7 @@ impl BackendSelector {
         match &self.strategy {
             SelectionStrategy::WeightedRoundRobin(wrr) => TotalWeight::new(wrr.total_weight()),
             SelectionStrategy::LeastLoaded(_) => {
-                // For least-loaded, return sum of all max_connections for compatibility
+                // Least-loaded does not use weights; expose aggregate capacity.
                 TotalWeight::new(self.backends.iter().map(|b| b.provider.max_size()).sum())
             }
         }

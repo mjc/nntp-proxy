@@ -96,9 +96,8 @@ pub fn parse_backend_status(
 
 /// Return the byte offset immediately after the response status line.
 ///
-/// NNTP status lines are CRLF-terminated. For compatibility with existing
-/// behavior, this treats a bare LF as a line boundary too; callers use this
-/// only to avoid classifying a partial status line as a complete response.
+/// NNTP status lines are CRLF-terminated. We also treat a bare LF as a line
+/// boundary here so callers do not classify a partial status line as complete.
 #[must_use]
 pub(crate) fn status_line_end(data: &[u8]) -> Option<usize> {
     memchr::memchr(b'\n', data).map(|pos| pos + 1)

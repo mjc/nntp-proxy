@@ -280,8 +280,8 @@ pub mod tests {
     }
 
     #[test]
-    fn test_backward_compatibility_new() {
-        // Ensure NntpProxy::new_sync() still works (it uses builder internally)
+    fn test_new_sync_constructs_proxy() {
+        // Ensure NntpProxy::new_sync() constructs through the builder path.
         let config = create_test_config();
         let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful)
             .expect("Failed to create proxy with new_sync()");

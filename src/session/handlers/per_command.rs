@@ -477,7 +477,7 @@ impl ClientSession {
                     "Client {} trailing non-pipelineable {:?}: {:?}",
                     self.client_addr,
                     trailing_context.kind(),
-                    String::from_utf8_lossy(trailing_context.verb())
+                    trailing_context.verb()
                 );
 
                 client_to_backend_bytes = client_to_backend_bytes.add(trailing_wire_len.get());
