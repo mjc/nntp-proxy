@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, oneshot};
 
 use crate::protocol::RequestContext;
-use crate::types::BackendId;
 
 /// A queued request completed by one backend connection.
 #[derive(Debug)]
@@ -71,25 +70,11 @@ impl QueuedContext {
         }
     }
 
-    /// Complete this queued context with the backend response that matched it.
+    /// Complete this queued context after a response reader has filled it.
     ///
     /// Responses are matched by each backend connection's FIFO order; consuming
-    /// the queued context here prevents sending response data without its
+    /// the queued context here prevents delivering response data without its
     /// matching request context.
-    pub fn complete_success(
-        self,
-        data: crate::pool::ChunkedResponse,
-        status_code: crate::protocol::StatusCode,
-        backend_id: BackendId,
-    ) {
-        let mut context = self.context;
-        context.complete_backend_response(backend_id, status_code, data);
-        let _ = self
-            .client_return
-            .send(Ok(CompletedPipelineRequest { context }));
-    }
-
-    /// Complete this queued context after a response reader has filled it.
     pub fn complete_context(self) {
         let _ = self.client_return.send(Ok(CompletedPipelineRequest {
             context: self.context,
@@ -261,6 +246,7 @@ impl std::fmt::Debug for QueuedContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::BackendId;
     use std::sync::Arc;
     #[test]
     fn test_queue_enqueue_dequeue() {
@@ -386,36 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_queued_context_success_completes_matching_context() {
-        let (tx, rx) = oneshot::channel();
-        let queued = QueuedContext::new(
-            RequestContext::from_request_line("STAT <test@example.com>\r\n"),
-            tx,
-        );
-        let backend_id = BackendId::from_index(1);
-
-        queued.complete_success(
-            crate::pool::ChunkedResponse::default(),
-            crate::protocol::StatusCode::new(223),
-            backend_id,
-        );
-
-        let completed = rx.blocking_recv().unwrap().unwrap();
-        assert_eq!(completed.context.message_id(), Some("<test@example.com>"));
-        assert_eq!(completed.context.backend_id(), Some(backend_id));
-        assert_eq!(
-            completed.context.response_metadata(),
-            Some(crate::protocol::RequestResponseMetadata::new(
-                crate::protocol::StatusCode::new(223),
-                0.into()
-            ))
-        );
-        assert_eq!(completed.context.response_payload_len(), Some(0));
-        assert_eq!(completed.context.response_payload_is_empty(), Some(true));
-    }
-
-    #[test]
-    fn test_queued_context_returns_precompleted_context() {
+    fn test_queued_context_returns_completed_matching_context() {
         let (tx, rx) = oneshot::channel();
         let backend_id = BackendId::from_index(1);
         let mut context = RequestContext::from_request_line("STAT <test@example.com>\r\n");
@@ -429,11 +386,17 @@ mod tests {
         queued.complete_context();
 
         let completed = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(completed.context.message_id(), Some("<test@example.com>"));
         assert_eq!(completed.context.backend_id(), Some(backend_id));
         assert_eq!(
-            completed.context.response_status(),
-            Some(crate::protocol::StatusCode::new(223))
+            completed.context.response_metadata(),
+            Some(crate::protocol::RequestResponseMetadata::new(
+                crate::protocol::StatusCode::new(223),
+                0.into()
+            ))
         );
+        assert_eq!(completed.context.response_payload_len(), Some(0));
+        assert_eq!(completed.context.response_payload_is_empty(), Some(true));
     }
 
     #[test]
