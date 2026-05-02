@@ -180,6 +180,28 @@ fn test_response_for_command_stat_synthesizes_223() {
 }
 
 #[test]
+fn test_response_parts_for_command_body_from_article_allocates_nothing() {
+    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+    let entry = ArticleEntry::from_response_buffer(buffer);
+    let msg_id = MessageId::from_borrowed("<test@example.com>").unwrap();
+    let mut out = [0_u8; 128];
+
+    let ((response, len), allocations) = crate::allocation_count_delta(|| {
+        let response = entry
+            .response_parts_for_command_bytes(b"BODY", msg_id.as_str())
+            .expect("ARTICLE cache entry can serve BODY");
+        let len = response
+            .copy_to_slice(&mut out)
+            .expect("fixed test buffer is large enough");
+        (response, len)
+    });
+
+    assert_eq!(allocations, 0);
+    assert_eq!(&out[..len], b"222 0 <test@example.com>\r\nBody\r\n.\r\n");
+    assert_eq!(response.len(), len);
+}
+
+#[test]
 fn test_response_for_command_stat_from_body() {
     // BODY response (222) should also synthesize STAT response
     let buffer = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();

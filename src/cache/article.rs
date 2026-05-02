@@ -36,6 +36,189 @@ pub enum CachedPayload {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CachedArticleResponse<'a> {
+    status_line: StackStatusLine,
+    payload: CachedArticleResponsePayload<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CachedArticleResponsePayload<'a> {
+    None,
+    Article { headers: &'a [u8], body: &'a [u8] },
+    Head { headers: &'a [u8] },
+    Body { body: &'a [u8] },
+}
+
+impl CachedArticleResponse<'_> {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.status_line.len() + self.payload_len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn status_line(&self) -> &[u8] {
+        self.status_line.as_slice()
+    }
+
+    #[must_use]
+    pub fn payload_slices(&self) -> CachedArticlePayloadSlices<'_> {
+        match self.payload {
+            CachedArticleResponsePayload::None => CachedArticlePayloadSlices::None,
+            CachedArticleResponsePayload::Article { headers, body } => {
+                CachedArticlePayloadSlices::Article { headers, body }
+            }
+            CachedArticleResponsePayload::Head { headers } => {
+                CachedArticlePayloadSlices::Head { headers }
+            }
+            CachedArticleResponsePayload::Body { body } => {
+                CachedArticlePayloadSlices::Body { body }
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len());
+        self.extend_vec(&mut out);
+        out
+    }
+
+    pub fn extend_vec(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.status_line());
+        self.extend_payload_vec(out);
+    }
+
+    pub fn copy_to_slice(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < self.len() {
+            return None;
+        }
+        let mut offset = 0;
+        copy_part(out, &mut offset, self.status_line());
+        match self.payload {
+            CachedArticleResponsePayload::None => {}
+            CachedArticleResponsePayload::Article { headers, body } => {
+                copy_part(out, &mut offset, headers);
+                copy_part(out, &mut offset, b"\r\n\r\n");
+                copy_part(out, &mut offset, body);
+                copy_part(out, &mut offset, b"\r\n.\r\n");
+            }
+            CachedArticleResponsePayload::Head { headers } => {
+                copy_part(out, &mut offset, headers);
+                copy_part(out, &mut offset, b"\r\n.\r\n");
+            }
+            CachedArticleResponsePayload::Body { body } => {
+                copy_part(out, &mut offset, body);
+                copy_part(out, &mut offset, b"\r\n.\r\n");
+            }
+        }
+        Some(offset)
+    }
+
+    fn payload_len(&self) -> usize {
+        match self.payload {
+            CachedArticleResponsePayload::None => 0,
+            CachedArticleResponsePayload::Article { headers, body } => {
+                headers.len() + 4 + body.len() + 5
+            }
+            CachedArticleResponsePayload::Head { headers } => headers.len() + 5,
+            CachedArticleResponsePayload::Body { body } => body.len() + 5,
+        }
+    }
+
+    fn extend_payload_vec(&self, out: &mut Vec<u8>) {
+        match self.payload {
+            CachedArticleResponsePayload::None => {}
+            CachedArticleResponsePayload::Article { headers, body } => {
+                out.extend_from_slice(headers);
+                out.extend_from_slice(b"\r\n\r\n");
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\r\n.\r\n");
+            }
+            CachedArticleResponsePayload::Head { headers } => {
+                out.extend_from_slice(headers);
+                out.extend_from_slice(b"\r\n.\r\n");
+            }
+            CachedArticleResponsePayload::Body { body } => {
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\r\n.\r\n");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CachedArticlePayloadSlices<'a> {
+    None,
+    Article { headers: &'a [u8], body: &'a [u8] },
+    Head { headers: &'a [u8] },
+    Body { body: &'a [u8] },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StackStatusLine {
+    bytes: [u8; 512],
+    len: usize,
+}
+
+impl StackStatusLine {
+    fn new(code: u16, article_number: u64, message_id: &str) -> Option<Self> {
+        let mut line = Self {
+            bytes: [0; 512],
+            len: 0,
+        };
+        line.push_u64(u64::from(code))?;
+        line.push_slice(b" ")?;
+        line.push_u64(article_number)?;
+        line.push_slice(b" ")?;
+        line.push_slice(message_id.as_bytes())?;
+        line.push_slice(b"\r\n")?;
+        Some(line)
+    }
+
+    fn push_slice(&mut self, part: &[u8]) -> Option<()> {
+        let end = self.len.checked_add(part.len())?;
+        let dst = self.bytes.get_mut(self.len..end)?;
+        dst.copy_from_slice(part);
+        self.len = end;
+        Some(())
+    }
+
+    fn push_u64(&mut self, value: u64) -> Option<()> {
+        let mut digits = [0_u8; 20];
+        let mut cursor = digits.len();
+        let mut n = value;
+        loop {
+            cursor -= 1;
+            digits[cursor] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.push_slice(&digits[cursor..])
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+fn copy_part(out: &mut [u8], offset: &mut usize, part: &[u8]) {
+    let end = *offset + part.len();
+    out[*offset..end].copy_from_slice(part);
+    *offset = end;
+}
+
 impl CachedPayload {
     #[must_use]
     pub fn len(&self) -> usize {
@@ -284,7 +467,8 @@ impl ArticleEntry {
         cmd_verb: &[u8],
         message_id: &crate::types::MessageId<'_>,
     ) -> Option<Vec<u8>> {
-        self.render_response_for_command_bytes(cmd_verb, message_id.as_str())
+        self.response_parts_for_command_bytes(cmd_verb, message_id.as_str())
+            .map(|response| response.to_vec())
     }
 
     /// Check if this entry can serve a given command type
@@ -341,6 +525,16 @@ impl ArticleEntry {
         cmd_verb: &[u8],
         message_id: &str,
     ) -> Option<Vec<u8>> {
+        self.response_parts_for_command_bytes(cmd_verb, message_id)
+            .map(|response| response.to_vec())
+    }
+
+    #[must_use]
+    pub fn response_parts_for_command_bytes(
+        &self,
+        cmd_verb: &[u8],
+        message_id: &str,
+    ) -> Option<CachedArticleResponse<'_>> {
         let article_number = match &self.payload {
             CachedPayload::Article { article_number, .. }
             | CachedPayload::Head { article_number, .. }
@@ -359,32 +553,33 @@ impl ArticleEntry {
                     | CachedPayload::Stat { .. }
             )
         {
-            Some(status_line(223, number, message_id, 0))
+            Some(CachedArticleResponse {
+                status_line: StackStatusLine::new(223, number, message_id)?,
+                payload: CachedArticleResponsePayload::None,
+            })
         } else if cmd_verb.eq_ignore_ascii_case(b"ARTICLE")
             && let CachedPayload::Article { headers, body, .. } = &self.payload
         {
-            let mut out = status_line(220, number, message_id, headers.len() + body.len() + 5);
-            out.extend_from_slice(headers);
-            out.extend_from_slice(b"\r\n\r\n");
-            out.extend_from_slice(body);
-            out.extend_from_slice(b"\r\n.\r\n");
-            Some(out)
+            Some(CachedArticleResponse {
+                status_line: StackStatusLine::new(220, number, message_id)?,
+                payload: CachedArticleResponsePayload::Article { headers, body },
+            })
         } else if cmd_verb.eq_ignore_ascii_case(b"HEAD")
             && let CachedPayload::Article { headers, .. } | CachedPayload::Head { headers, .. } =
                 &self.payload
         {
-            let mut out = status_line(221, number, message_id, headers.len() + 5);
-            out.extend_from_slice(headers);
-            out.extend_from_slice(b"\r\n.\r\n");
-            Some(out)
+            Some(CachedArticleResponse {
+                status_line: StackStatusLine::new(221, number, message_id)?,
+                payload: CachedArticleResponsePayload::Head { headers },
+            })
         } else if cmd_verb.eq_ignore_ascii_case(b"BODY")
             && let CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. } =
                 &self.payload
         {
-            let mut out = status_line(222, number, message_id, body.len() + 5);
-            out.extend_from_slice(body);
-            out.extend_from_slice(b"\r\n.\r\n");
-            Some(out)
+            Some(CachedArticleResponse {
+                status_line: StackStatusLine::new(222, number, message_id)?,
+                payload: CachedArticleResponsePayload::Body { body },
+            })
         } else {
             None
         }
@@ -403,17 +598,6 @@ fn matches_command_type_verb_bytes(status_code: u16, cmd_verb: &[u8]) -> bool {
         221 => cmd_verb.eq_ignore_ascii_case(b"HEAD") || cmd_verb.eq_ignore_ascii_case(b"STAT"),
         _ => false,
     }
-}
-
-fn status_line(code: u16, article_number: u64, message_id: &str, extra: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + message_id.len() + extra);
-    out.extend_from_slice(code.to_string().as_bytes());
-    out.extend_from_slice(b" ");
-    out.extend_from_slice(article_number.to_string().as_bytes());
-    out.extend_from_slice(b" ");
-    out.extend_from_slice(message_id.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    out
 }
 
 pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPayload {

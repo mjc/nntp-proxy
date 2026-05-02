@@ -113,11 +113,29 @@ impl ClientSession {
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
-        let Some(response) = cached.response_for_command_bytes(cmd_verb, msg_id_ref) else {
+        let Some(response) = cached.response_parts_for_command_bytes(cmd_verb, msg_id_ref.as_str())
+        else {
             return Ok(CacheLookupResult::PartialHit(availability));
         };
         let bytes_written = response.len();
-        client_write.write_all(&response).await?;
+        client_write.write_all(response.status_line()).await?;
+        match response.payload_slices() {
+            crate::cache::CachedArticlePayloadSlices::None => {}
+            crate::cache::CachedArticlePayloadSlices::Article { headers, body } => {
+                client_write.write_all(headers).await?;
+                client_write.write_all(b"\r\n\r\n").await?;
+                client_write.write_all(body).await?;
+                client_write.write_all(b"\r\n.\r\n").await?;
+            }
+            crate::cache::CachedArticlePayloadSlices::Head { headers } => {
+                client_write.write_all(headers).await?;
+                client_write.write_all(b"\r\n.\r\n").await?;
+            }
+            crate::cache::CachedArticlePayloadSlices::Body { body } => {
+                client_write.write_all(body).await?;
+                client_write.write_all(b"\r\n.\r\n").await?;
+            }
+        }
         *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
 
         let backend_id = router.route(self.client_id)?;
