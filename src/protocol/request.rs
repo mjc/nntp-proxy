@@ -121,19 +121,9 @@ impl RequestContext {
     }
 
     #[inline]
-    pub const fn set_backend_id(&mut self, backend_id: BackendId) {
-        self.backend_id = Some(backend_id);
-    }
-
-    #[inline]
     #[must_use]
     pub const fn response_status(&self) -> Option<StatusCode> {
         self.response_status
-    }
-
-    #[inline]
-    pub const fn set_response_status(&mut self, status: StatusCode) {
-        self.response_status = Some(status);
     }
 
     #[inline]
@@ -143,8 +133,15 @@ impl RequestContext {
     }
 
     #[inline]
-    pub const fn set_response_wire_len(&mut self, len: usize) {
-        self.response_wire_len = Some(len);
+    pub const fn record_backend_response(
+        &mut self,
+        backend_id: BackendId,
+        status: StatusCode,
+        wire_len: usize,
+    ) {
+        self.backend_id = Some(backend_id);
+        self.response_status = Some(status);
+        self.response_wire_len = Some(wire_len);
     }
 
     #[inline]
@@ -365,33 +362,15 @@ mod tests {
     }
 
     #[test]
-    fn request_context_records_backend_when_known() {
+    fn request_context_records_backend_response_when_known() {
         let mut ctx = RequestContext::from_request_line("STAT <a@b>\r\n");
         let backend_id = BackendId::from_index(2);
-
-        ctx.set_backend_id(backend_id);
-
-        assert_eq!(ctx.backend_id(), Some(backend_id));
-        assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
-    }
-
-    #[test]
-    fn request_context_records_response_status_when_known() {
-        let mut ctx = RequestContext::from_request_line("STAT <a@b>\r\n");
         let status = StatusCode::new(223);
 
-        ctx.set_response_status(status);
+        ctx.record_backend_response(backend_id, status, 19);
 
+        assert_eq!(ctx.backend_id(), Some(backend_id));
         assert_eq!(ctx.response_status(), Some(status));
-        assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
-    }
-
-    #[test]
-    fn request_context_records_response_wire_len_when_known() {
-        let mut ctx = RequestContext::from_request_line("STAT <a@b>\r\n");
-
-        ctx.set_response_wire_len(19);
-
         assert_eq!(ctx.response_wire_len(), Some(19));
         assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
     }
