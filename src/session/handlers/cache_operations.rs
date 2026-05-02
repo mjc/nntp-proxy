@@ -5,7 +5,7 @@
 
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
-use crate::protocol::{RequestCacheStatus, RequestContext};
+use crate::protocol::{RequestCacheStatus, RequestContext, RequestKind, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
@@ -131,7 +131,8 @@ impl ClientSession {
         let backend_id = router.route(self.client_id)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
-        request.record_cache_status(RequestCacheStatus::Hit);
+        let status = cached_response_status(request).expect("cache hit has typed response status");
+        request.record_cache_response(backend_id, status, bytes_written);
         Ok(CacheLookupResult::Hit(backend_id))
     }
 
@@ -189,6 +190,17 @@ impl ClientSession {
             cache_articles: self.cache_articles,
         }
     }
+}
+
+fn cached_response_status(request: &RequestContext) -> Option<StatusCode> {
+    let code = match request.kind() {
+        RequestKind::Article => 220,
+        RequestKind::Head => 221,
+        RequestKind::Body => 222,
+        RequestKind::Stat => 223,
+        _ => return None,
+    };
+    Some(StatusCode::new(code))
 }
 
 pub(super) async fn write_cached_article_response<W>(
@@ -313,5 +325,24 @@ mod tests {
         assert!(matches!(result, CacheLookupResult::Miss));
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::Miss));
         assert_eq!(metrics, BackendToClientBytes::zero());
+    }
+
+    #[test]
+    fn cached_response_status_matches_synthesized_article_response() {
+        let cases = [
+            ("ARTICLE <id@example>\r\n", 220),
+            ("HEAD <id@example>\r\n", 221),
+            ("BODY <id@example>\r\n", 222),
+            ("STAT <id@example>\r\n", 223),
+        ];
+
+        for (line, status) in cases {
+            let request = RequestContext::from_request_line(line);
+
+            assert_eq!(
+                cached_response_status(&request),
+                Some(StatusCode::new(status))
+            );
+        }
     }
 }
