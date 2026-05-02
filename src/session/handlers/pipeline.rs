@@ -82,16 +82,19 @@ impl ClientSession {
     ///
     /// Returns empty batch on client disconnect.
     ///
-    pub(super) async fn read_command_batch(
+    pub(super) async fn read_command_batch<R>(
         &self,
-        reader: &mut tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
-        command_buf: &mut String,
-    ) -> Result<RequestBatch> {
+        reader: &mut tokio::io::BufReader<R>,
+        command_buf: &mut Vec<u8>,
+    ) -> Result<RequestBatch>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
         let mut trailing_oversized = false;
 
         // First command: blocking read (must wait for client)
         command_buf.clear();
-        match reader.read_line(command_buf).await {
+        match reader.read_until(b'\n', command_buf).await {
             Ok(0) => {
                 return Ok(RequestBatch {
                     contexts: smallvec::SmallVec::new(),
@@ -114,7 +117,7 @@ impl ClientSession {
             Err(e) => return Err(e.into()),
         }
 
-        let request = RequestContext::from_request_bytes(command_buf.as_bytes());
+        let request = RequestContext::from_request_bytes(command_buf);
 
         if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
@@ -141,14 +144,14 @@ impl ClientSession {
             }
 
             command_buf.clear();
-            match reader.read_line(command_buf).await {
+            match reader.read_until(b'\n', command_buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
                     if command_buf.len() > 512 {
                         let trailing_context =
-                            Some(RequestContext::from_request_bytes(command_buf.as_bytes()));
+                            Some(RequestContext::from_request_bytes(command_buf));
                         trailing_oversized = true;
                         return Ok(RequestBatch {
                             contexts: batch_contexts,
@@ -157,7 +160,7 @@ impl ClientSession {
                             first_oversized: false,
                         });
                     }
-                    let request = RequestContext::from_request_bytes(command_buf.as_bytes());
+                    let request = RequestContext::from_request_bytes(command_buf);
                     if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
                         let trailing_context = Some(request);
@@ -179,5 +182,63 @@ impl ClientSession {
             trailing_oversized,
             first_oversized: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    use crate::auth::AuthHandler;
+    use crate::constants::buffer::COMMAND;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::BufferPool;
+    use crate::protocol::{RequestKind, RequestRouteClass};
+    use crate::session::ClientSession;
+    use crate::types::{BufferSize, ClientAddress};
+
+    fn test_session() -> ClientSession {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let metrics = MetricsCollector::new(1);
+        ClientSession::builder(
+            ClientAddress::from(addr),
+            buffer_pool,
+            auth_handler,
+            metrics,
+        )
+        .build()
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_preserves_non_utf8_trailing_command_bytes() {
+        let session = test_session();
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"ARTICLE <a@b>\r\nXFOO \xff\r\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let mut command_buf = Vec::with_capacity(COMMAND);
+
+        let batch = session
+            .read_command_batch(&mut reader, &mut command_buf)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.context(0).kind(), RequestKind::Article);
+        let trailing = batch
+            .trailing_context()
+            .expect("non-pipelineable command trails the ARTICLE batch");
+        assert_eq!(trailing.kind(), RequestKind::Unknown);
+        assert_eq!(trailing.args(), b"\xff");
+        assert_eq!(trailing.args_str(), None);
+        assert_eq!(trailing.route_class(), RequestRouteClass::Stateful);
     }
 }

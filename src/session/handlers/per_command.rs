@@ -305,7 +305,7 @@ impl ClientSession {
         debug!("Client {} entering command loop", self.client_addr);
 
         // Reuse command buffer to avoid allocations per command
-        let mut command_buf = String::with_capacity(COMMAND);
+        let mut command_buf = Vec::with_capacity(COMMAND);
 
         // PERFORMANCE: Cache authenticated state to avoid atomic loads after auth succeeds
         // If auth is disabled, skip checks from the start
