@@ -313,6 +313,11 @@ impl<'a> RequestLine<'a> {
     }
 
     #[must_use]
+    const fn message_id_span(&self) -> Option<(usize, usize)> {
+        self.message_id
+    }
+
+    #[must_use]
     pub fn request_wire_len(&self) -> RequestWireLen {
         (self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2).into()
     }
@@ -407,22 +412,19 @@ impl RequestCacheEntryMetadata {
 impl RequestContext {
     #[must_use]
     pub fn from_request_bytes(line: &[u8]) -> Self {
-        let bytes = trim_line_end(line);
-        let split = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
-        let verb = SmallVec::from_slice(&bytes[..split]);
-        let args = if split < bytes.len() {
-            SmallVec::from_slice(&bytes[split + 1..])
-        } else {
-            SmallVec::new()
-        };
-        let kind = classify_verb(&verb);
-        let message_id = find_message_id(&args);
+        Self::from_request_line(RequestLine::parse(line))
+    }
+
+    #[must_use]
+    pub fn from_request_line(line: RequestLine<'_>) -> Self {
+        let verb = SmallVec::from_slice(line.verb());
+        let args = SmallVec::from_slice(line.args());
 
         Self {
-            kind,
+            kind: line.kind(),
             verb,
             args,
-            message_id,
+            message_id: line.message_id_span(),
             cache_status: None,
             cache_entry: None,
             backend_id: None,
@@ -940,6 +942,18 @@ mod tests {
         assert_eq!(parsed.message_id(), Some("<a@b>"));
         assert_eq!(parsed.request_wire_len(), RequestWireLen::new(15));
         assert_eq!(parsed.route_class(), RequestRouteClass::ArticleByMessageId);
+    }
+
+    #[test]
+    fn request_context_owns_borrowed_request_line() {
+        let parsed = RequestLine::parse(b"BODY <a@b>\r\n");
+        let ctx = RequestContext::from_request_line(parsed);
+
+        assert_eq!(ctx.kind(), RequestKind::Body);
+        assert_eq!(ctx.verb(), b"BODY");
+        assert_eq!(ctx.args(), b"<a@b>");
+        assert_eq!(ctx.message_id(), Some("<a@b>"));
+        assert_eq!(ctx.request_wire_len(), parsed.request_wire_len());
     }
 
     #[tokio::test]
