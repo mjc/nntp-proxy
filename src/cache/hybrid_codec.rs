@@ -10,6 +10,7 @@
 //! ```
 
 use crate::protocol::StatusCode;
+use crate::protocol::RequestKind;
 use crate::router::BackendCount;
 use crate::types::BackendId;
 use foyer::Code;
@@ -458,6 +459,15 @@ impl HybridArticleEntry {
         message_id: &str,
     ) -> Option<super::article::CachedArticleResponse<'_>> {
         super::article::response_parts_for_payload_bytes(&self.payload, cmd_verb, message_id)
+    }
+
+    #[must_use]
+    pub fn response_parts_for_request_kind(
+        &self,
+        request_kind: RequestKind,
+        message_id: &str,
+    ) -> Option<super::article::CachedArticleResponse<'_>> {
+        super::article::response_parts_for_payload_kind(&self.payload, request_kind, message_id)
     }
 
     #[must_use]
@@ -1124,10 +1134,19 @@ mod tests {
 
     #[test]
     fn test_response_for_command_article_direct() {
+        use crate::protocol::RequestKind;
+
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = HybridArticleEntry::from_wire_response(buf.clone()).unwrap();
         let resp = render_response(&entry, b"ARTICLE", "<t@x>").expect("should serve ARTICLE");
         assert_eq!(resp, buf);
+
+        let response = entry
+            .response_parts_for_request_kind(RequestKind::Article, "<t@x>")
+            .expect("should serve ARTICLE by request kind");
+        let mut out = Vec::with_capacity(response.wire_len().get());
+        block_on(response.write_to(&mut out)).unwrap();
+        assert_eq!(out, buf);
     }
 
     #[test]
