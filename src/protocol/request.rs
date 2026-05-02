@@ -313,6 +313,12 @@ impl<'a> RequestLine<'a> {
     }
 
     #[must_use]
+    pub fn message_id_value(&self) -> Option<MessageId<'a>> {
+        let (start, end) = self.message_id?;
+        MessageId::from_borrowed(std::str::from_utf8(&self.args[start..end]).ok()?).ok()
+    }
+
+    #[must_use]
     const fn message_id_span(&self) -> Option<(usize, usize)> {
         self.message_id
     }
@@ -944,6 +950,10 @@ mod tests {
         assert_eq!(parsed.verb(), b"ARTICLE");
         assert_eq!(parsed.args(), b"<a@b>");
         assert_eq!(parsed.message_id(), Some("<a@b>"));
+        assert_eq!(
+            parsed.message_id_value(),
+            Some(MessageId::from_borrowed("<a@b>").unwrap())
+        );
         assert_eq!(parsed.request_wire_len(), RequestWireLen::new(15));
         assert_eq!(parsed.route_class(), RequestRouteClass::ArticleByMessageId);
     }
