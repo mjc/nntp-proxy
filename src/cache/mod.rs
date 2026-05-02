@@ -75,17 +75,6 @@ impl CacheBuffer {
             Self::Small(buf) => StatusCode::parse(buf),
         }
     }
-
-    /// Cold-path flattening for cache backends that still require contiguous bytes.
-    #[must_use]
-    pub fn into_vec(self) -> Vec<u8> {
-        match self {
-            Self::Vec(buf) => buf,
-            Self::Pooled(buf) => buf.as_ref().to_vec(),
-            Self::Chunked(buf) => buf.to_vec(),
-            Self::Small(buf) => buf.into_vec(),
-        }
-    }
 }
 
 impl PartialEq for CacheBuffer {

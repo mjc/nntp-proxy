@@ -190,18 +190,6 @@ mod cache_buffer_status {
         bencher.bench(|| black_box(black_box(&buffer).status_code()));
     }
 
-    #[divan::bench(sample_count = 100, sample_size = 100)]
-    fn chunked_flatten_baseline(bencher: Bencher) {
-        let chunks = [
-            b"220 42 <bench@example.com>\r\n".as_slice(),
-            b"Body\r\n.\r\n",
-        ];
-        bencher.bench(|| {
-            let response = chunked_response(&chunks);
-            black_box(CacheBuffer::Chunked(response).into_vec())
-        });
-    }
-
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn chunked_flatten_status_code_baseline(bencher: Bencher) {
         let chunks = [
