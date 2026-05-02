@@ -81,6 +81,29 @@ impl From<usize> for ResponseWireLen {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RequestCacheAvailability {
+    checked: u8,
+    missing: u8,
+}
+
+impl RequestCacheAvailability {
+    #[must_use]
+    pub const fn from_bits(checked: u8, missing: u8) -> Self {
+        Self { checked, missing }
+    }
+
+    #[must_use]
+    pub const fn checked_bits(self) -> u8 {
+        self.checked
+    }
+
+    #[must_use]
+    pub const fn missing_bits(self) -> u8 {
+        self.missing
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     kind: RequestKind,
@@ -88,6 +111,7 @@ pub struct RequestContext {
     args: SmallVec<[u8; 512]>,
     message_id: Option<(usize, usize)>,
     cache_status: Option<RequestCacheStatus>,
+    cache_availability: Option<RequestCacheAvailability>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
     response_wire_len: Option<ResponseWireLen>,
@@ -114,6 +138,7 @@ impl RequestContext {
             args,
             message_id,
             cache_status: None,
+            cache_availability: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -133,6 +158,7 @@ impl RequestContext {
             args,
             message_id,
             cache_status: None,
+            cache_availability: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -158,8 +184,19 @@ impl RequestContext {
     }
 
     #[inline]
+    #[must_use]
+    pub const fn cache_availability(&self) -> Option<RequestCacheAvailability> {
+        self.cache_availability
+    }
+
+    #[inline]
     pub const fn record_cache_status(&mut self, status: RequestCacheStatus) {
         self.cache_status = Some(status);
+    }
+
+    #[inline]
+    pub const fn record_cache_availability(&mut self, availability: RequestCacheAvailability) {
+        self.cache_availability = Some(availability);
     }
 
     #[inline]
@@ -410,6 +447,7 @@ mod tests {
         assert_eq!(ctx.kind(), RequestKind::Article);
         assert_eq!(ctx.message_id(), Some("<a@b>"));
         assert_eq!(ctx.cache_status(), None);
+        assert_eq!(ctx.cache_availability(), None);
         assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(ctx.response_wire_len(), None);
@@ -439,6 +477,19 @@ mod tests {
 
         assert_eq!(ctx.cache_status(), Some(RequestCacheStatus::PartialHit));
         assert_eq!(wire(&ctx), b"BODY <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_cache_availability_when_known() {
+        let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
+        let availability = RequestCacheAvailability::from_bits(0b0000_0011, 0b0000_0001);
+
+        ctx.record_cache_availability(availability);
+
+        assert_eq!(ctx.cache_availability(), Some(availability));
+        assert_eq!(availability.checked_bits(), 0b0000_0011);
+        assert_eq!(availability.missing_bits(), 0b0000_0001);
+        assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }
 
     #[test]

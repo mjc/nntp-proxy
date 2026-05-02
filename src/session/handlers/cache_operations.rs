@@ -5,7 +5,9 @@
 
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
-use crate::protocol::{RequestCacheStatus, RequestContext, ResponseWireLen, StatusCode};
+use crate::protocol::{
+    RequestCacheAvailability, RequestCacheStatus, RequestContext, ResponseWireLen, StatusCode,
+};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
@@ -60,6 +62,7 @@ impl ClientSession {
 
         // Extract availability before any early returns so we can pass it back
         let availability = cached.to_availability(router.backend_count());
+        request.record_cache_availability(cache_availability_metadata(&availability));
 
         if !cached.has_availability_info() {
             debug!(
@@ -189,6 +192,10 @@ impl ClientSession {
             cache_articles: self.cache_articles,
         }
     }
+}
+
+fn cache_availability_metadata(availability: &ArticleAvailability) -> RequestCacheAvailability {
+    RequestCacheAvailability::from_bits(availability.checked_bits(), availability.missing_bits())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +414,60 @@ mod tests {
             Some(ResponseWireLen::new(expected.len()))
         );
         assert_eq!(metrics, BackendToClientBytes::zero().add(expected.len()));
+    }
+
+    #[tokio::test]
+    async fn partial_cache_hit_records_availability_on_request_context() {
+        let session = test_session();
+        let msg_id = MessageId::new("<partial@example>".to_string()).expect("valid message id");
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(0));
+        session
+            .cache
+            .sync_availability(msg_id.clone(), &availability)
+            .await;
+
+        let mut router = BackendSelector::new();
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::try_new("partial-backend".to_string()).expect("server name"),
+            DeadpoolConnectionProvider::new(
+                "127.0.0.1".to_string(),
+                119,
+                "partial-backend".to_string(),
+                1,
+                None,
+                None,
+            ),
+            0,
+            None,
+        );
+        let router = Arc::new(router);
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, _server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = RequestContext::from_request_line("ARTICLE <partial@example>\r\n");
+
+        let result = session
+            .try_serve_from_cache(
+                Some(&msg_id),
+                &mut request,
+                &router,
+                &mut write,
+                &mut metrics,
+            )
+            .await
+            .expect("lookup succeeds");
+
+        assert!(matches!(result, CacheLookupResult::PartialHit(_)));
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::PartialHit));
+        assert_eq!(
+            request
+                .cache_availability()
+                .map(|availability| { (availability.checked_bits(), availability.missing_bits()) }),
+            Some((0b0000_0001, 0b0000_0001))
+        );
+        assert_eq!(metrics, BackendToClientBytes::zero());
     }
 
     #[test]
