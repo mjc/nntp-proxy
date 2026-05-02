@@ -40,6 +40,16 @@ impl BackendAttemptResult {
             response,
         }
     }
+
+    pub(super) const fn record_on_request(&self, request: &mut RequestContext) {
+        if let Self::Success {
+            backend_id,
+            response,
+        } = self
+        {
+            request.record_backend_response(*backend_id, *response);
+        }
+    }
 }
 
 /// Mutable state for an article backend attempt loop
@@ -533,6 +543,20 @@ mod tests {
             }
             _ => panic!("expected success"),
         }
+    }
+
+    #[test]
+    fn backend_attempt_success_records_request_context() {
+        let backend_id = BackendId::from_index(1);
+        let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
+        let result = BackendAttemptResult::success(backend_id, response);
+        let mut request =
+            crate::protocol::RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
+
+        result.record_on_request(&mut request);
+
+        assert_eq!(request.backend_id(), Some(backend_id));
+        assert_eq!(request.response_metadata(), Some(response));
     }
 
     #[test]

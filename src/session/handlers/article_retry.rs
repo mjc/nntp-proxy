@@ -681,7 +681,7 @@ impl ClientSession {
 
         // Try backends until success or exhaustion
         while !availability.all_exhausted(router.backend_count()) {
-            match self
+            let attempt = self
                 .try_backend_for_article(
                     &router,
                     request,
@@ -693,8 +693,11 @@ impl ClientSession {
                         client_to_backend_bytes,
                     },
                 )
-                .await
-            {
+                .await;
+            if let Ok(result) = &attempt {
+                result.record_on_request(request);
+            }
+            match attempt {
                 Ok(BackendAttemptResult::Success {
                     backend_id,
                     response,
