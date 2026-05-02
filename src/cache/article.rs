@@ -527,7 +527,7 @@ impl ArticleEntry {
 
     #[inline]
     #[must_use]
-    pub fn matches_command_type_verb(&self, cmd_verb: &[u8]) -> bool {
+    pub(crate) fn matches_command_type_verb(&self, cmd_verb: &[u8]) -> bool {
         let code = self.status_code();
         super::entry_helpers::matches_command_type_verb(code.as_u16(), cmd_verb)
     }
