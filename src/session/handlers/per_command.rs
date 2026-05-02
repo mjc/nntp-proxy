@@ -102,16 +102,16 @@ impl ClientSession {
                     unreachable!("InterceptAuth decision must come from InterceptAuth action")
                 };
 
-                let auth_succeeded = match common::handle_auth_command(
+                let result = common::handle_auth_command(
                     &self.auth_handler,
                     auth_action,
                     client_write,
                     auth_username,
                     &self.auth_state,
                 )
-                .await?
-                {
-                    common::AuthResult::Authenticated(bytes) => {
+                .await?;
+                let auth_succeeded = match result {
+                    common::AuthResult::Authenticated { .. } => {
                         common::on_authentication_success(
                             self.client_addr,
                             auth_username.clone(),
@@ -120,11 +120,15 @@ impl ClientSession {
                             self.connection_stats(),
                             |username| self.set_username(username),
                         );
-                        *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.as_u64());
+                        request.record_local_response(result.response_metadata());
+                        *backend_to_client_bytes =
+                            backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
                         true
                     }
-                    common::AuthResult::NotAuthenticated(bytes) => {
-                        *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.as_u64());
+                    common::AuthResult::NotAuthenticated { .. } => {
+                        request.record_local_response(result.response_metadata());
+                        *backend_to_client_bytes =
+                            backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
                         false
                     }
                 };

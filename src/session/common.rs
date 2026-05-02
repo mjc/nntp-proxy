@@ -2,7 +2,7 @@
 
 use crate::auth::AuthHandler;
 use crate::command::AuthAction;
-use crate::protocol::{RequestContext, RequestKind};
+use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::types::BackendToClientBytes;
 
 use anyhow::Result;
@@ -13,9 +13,33 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthResult {
     /// Authentication succeeded
-    Authenticated(BackendToClientBytes),
+    Authenticated {
+        bytes: BackendToClientBytes,
+        response: RequestResponseMetadata,
+    },
     /// Authentication failed or not required yet
-    NotAuthenticated(BackendToClientBytes),
+    NotAuthenticated {
+        bytes: BackendToClientBytes,
+        response: RequestResponseMetadata,
+    },
+}
+
+impl AuthResult {
+    #[must_use]
+    pub const fn bytes_written(self) -> BackendToClientBytes {
+        match self {
+            Self::Authenticated { bytes, .. } | Self::NotAuthenticated { bytes, .. } => bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn response_metadata(self) -> RequestResponseMetadata {
+        match self {
+            Self::Authenticated { response, .. } | Self::NotAuthenticated { response, .. } => {
+                response
+            }
+        }
+    }
 }
 
 /// Result of checking for QUIT command
@@ -44,9 +68,13 @@ where
         use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
         client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
         let bytes = BackendToClientBytes::new(AUTH_ALREADY_AUTHENTICATED.len() as u64);
-        return Ok(AuthResult::NotAuthenticated(bytes));
+        return Ok(AuthResult::NotAuthenticated {
+            bytes,
+            response: local_response_metadata(AUTH_ALREADY_AUTHENTICATED),
+        });
     }
 
+    let had_username = auth_username.is_some();
     if let AuthAction::RequestPassword(username) = auth_action {
         *auth_username = Some(username.to_string());
     }
@@ -60,12 +88,46 @@ where
     }
 
     let bytes_written = BackendToClientBytes::new(bytes as u64);
+    let response = auth_response_metadata(auth_action, had_username, auth_success);
 
     Ok(if auth_success {
-        AuthResult::Authenticated(bytes_written)
+        AuthResult::Authenticated {
+            bytes: bytes_written,
+            response,
+        }
     } else {
-        AuthResult::NotAuthenticated(bytes_written)
+        AuthResult::NotAuthenticated {
+            bytes: bytes_written,
+            response,
+        }
     })
+}
+
+fn local_response_metadata(response: &[u8]) -> RequestResponseMetadata {
+    let status = StatusCode::parse(response).expect("local NNTP response starts with status code");
+    RequestResponseMetadata::new(status, response.len().into())
+}
+
+fn auth_response_metadata(
+    auth_action: AuthAction<'_>,
+    had_username: bool,
+    auth_success: bool,
+) -> RequestResponseMetadata {
+    match auth_action {
+        AuthAction::RequestPassword(_) => local_response_metadata(crate::protocol::AUTH_REQUIRED),
+        AuthAction::ValidateAndRespond { .. } if !had_username => {
+            local_response_metadata(crate::protocol::AUTH_OUT_OF_SEQUENCE)
+        }
+        AuthAction::ValidateAndRespond { .. } if auth_success => {
+            local_response_metadata(crate::protocol::AUTH_ACCEPTED)
+        }
+        AuthAction::ValidateAndRespond { .. } => {
+            local_response_metadata(crate::protocol::AUTH_FAILED)
+        }
+        AuthAction::UnknownSubcommand => {
+            local_response_metadata(crate::protocol::AUTH_UNKNOWN_SUBCOMMAND)
+        }
+    }
 }
 
 /// Check if command is QUIT and send closing response
@@ -131,12 +193,27 @@ mod tests {
 
     #[test]
     fn test_auth_result_equality() {
-        let auth1 = AuthResult::Authenticated(BackendToClientBytes::new(100));
-        let auth2 = AuthResult::Authenticated(BackendToClientBytes::new(100));
-        let not_auth = AuthResult::NotAuthenticated(BackendToClientBytes::new(100));
+        let response = crate::protocol::RequestResponseMetadata::new(
+            crate::protocol::StatusCode::new(281),
+            27_usize.into(),
+        );
+        let auth1 = AuthResult::Authenticated {
+            bytes: BackendToClientBytes::new(100),
+            response,
+        };
+        let auth2 = AuthResult::Authenticated {
+            bytes: BackendToClientBytes::new(100),
+            response,
+        };
+        let not_auth = AuthResult::NotAuthenticated {
+            bytes: BackendToClientBytes::new(100),
+            response,
+        };
 
         assert_eq!(auth1, auth2);
         assert_ne!(auth1, not_auth);
+        assert_eq!(auth1.bytes_written(), BackendToClientBytes::new(100));
+        assert_eq!(auth1.response_metadata(), response);
     }
 
     #[test]
@@ -320,7 +397,7 @@ where
             .await?;
 
             match result {
-                AuthResult::Authenticated(bytes) => {
+                AuthResult::Authenticated { bytes, .. } => {
                     on_authentication_success(
                         client_addr,
                         auth_username.clone(),
@@ -335,9 +412,11 @@ where
                         skip_further_checks: true,
                     })
                 }
-                AuthResult::NotAuthenticated(bytes) => Ok(AuthHandlerResult::NotAuthenticated {
-                    bytes_written: bytes.as_u64(),
-                }),
+                AuthResult::NotAuthenticated { bytes, .. } => {
+                    Ok(AuthHandlerResult::NotAuthenticated {
+                        bytes_written: bytes.as_u64(),
+                    })
+                }
             }
         }
         CommandAction::Reject(response) => {
