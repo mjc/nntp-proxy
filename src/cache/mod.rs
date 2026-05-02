@@ -23,7 +23,8 @@ pub mod ttl;
 pub mod mock_hybrid;
 
 pub use article::{
-    ArticleCache, ArticleEntry, CachedArticlePayloadSlices, CachedArticleResponse, CachedPayloadLen,
+    ArticleCache, ArticleEntry, CachedArticlePayloadSlices, CachedArticleResponse, CachedPayload,
+    CachedPayloadLen,
 };
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};

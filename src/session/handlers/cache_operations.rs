@@ -6,8 +6,9 @@
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
-    RequestCacheAvailability, RequestCacheEntryMetadata, RequestCacheStatus, RequestCacheTier,
-    RequestCacheTimestampMillis, RequestContext, ResponseWireLen, StatusCode,
+    RequestCacheAvailability, RequestCacheEntryMetadata, RequestCachePayloadKind,
+    RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis, RequestContext,
+    ResponseWireLen, StatusCode,
 };
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
@@ -209,7 +210,19 @@ fn cache_entry_metadata(
         cache_availability_metadata(availability),
         RequestCacheTier::new(cached.tier().get()),
         RequestCacheTimestampMillis::new(cached.inserted_at().get()),
+        cache_payload_kind(cached.payload()),
     ))
+}
+
+fn cache_payload_kind(payload: &crate::cache::CachedPayload) -> RequestCachePayloadKind {
+    match payload {
+        crate::cache::CachedPayload::Missing => RequestCachePayloadKind::Missing,
+        crate::cache::CachedPayload::AvailabilityOnly => RequestCachePayloadKind::AvailabilityOnly,
+        crate::cache::CachedPayload::Article { .. } => RequestCachePayloadKind::Article,
+        crate::cache::CachedPayload::Head { .. } => RequestCachePayloadKind::Head,
+        crate::cache::CachedPayload::Body { .. } => RequestCachePayloadKind::Body,
+        crate::cache::CachedPayload::Stat { .. } => RequestCachePayloadKind::Stat,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,6 +502,10 @@ mod tests {
         assert_eq!(
             request.cache_entry_timestamp(),
             Some(RequestCacheTimestampMillis::new(expected_timestamp.get()))
+        );
+        assert_eq!(
+            request.cache_payload_kind(),
+            Some(RequestCachePayloadKind::Missing)
         );
         assert_eq!(
             request

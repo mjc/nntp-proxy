@@ -146,6 +146,16 @@ impl From<u64> for RequestCacheTimestampMillis {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestCachePayloadKind {
+    Missing,
+    AvailabilityOnly,
+    Article,
+    Head,
+    Body,
+    Stat,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     kind: RequestKind,
@@ -157,6 +167,7 @@ pub struct RequestContext {
     cache_entry_status: Option<StatusCode>,
     cache_entry_tier: Option<RequestCacheTier>,
     cache_entry_timestamp: Option<RequestCacheTimestampMillis>,
+    cache_payload_kind: Option<RequestCachePayloadKind>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
     response_wire_len: Option<ResponseWireLen>,
@@ -168,6 +179,7 @@ pub struct RequestCacheEntryMetadata {
     availability: RequestCacheAvailability,
     tier: RequestCacheTier,
     timestamp: RequestCacheTimestampMillis,
+    payload_kind: RequestCachePayloadKind,
 }
 
 impl RequestCacheEntryMetadata {
@@ -177,12 +189,14 @@ impl RequestCacheEntryMetadata {
         availability: RequestCacheAvailability,
         tier: RequestCacheTier,
         timestamp: RequestCacheTimestampMillis,
+        payload_kind: RequestCachePayloadKind,
     ) -> Self {
         Self {
             status,
             availability,
             tier,
             timestamp,
+            payload_kind,
         }
     }
 
@@ -204,6 +218,11 @@ impl RequestCacheEntryMetadata {
     #[must_use]
     pub const fn timestamp(self) -> RequestCacheTimestampMillis {
         self.timestamp
+    }
+
+    #[must_use]
+    pub const fn payload_kind(self) -> RequestCachePayloadKind {
+        self.payload_kind
     }
 }
 
@@ -232,6 +251,7 @@ impl RequestContext {
             cache_entry_status: None,
             cache_entry_tier: None,
             cache_entry_timestamp: None,
+            cache_payload_kind: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -255,6 +275,7 @@ impl RequestContext {
             cache_entry_status: None,
             cache_entry_tier: None,
             cache_entry_timestamp: None,
+            cache_payload_kind: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -304,6 +325,12 @@ impl RequestContext {
     }
 
     #[inline]
+    #[must_use]
+    pub const fn cache_payload_kind(&self) -> Option<RequestCachePayloadKind> {
+        self.cache_payload_kind
+    }
+
+    #[inline]
     pub const fn record_cache_status(&mut self, status: RequestCacheStatus) {
         self.cache_status = Some(status);
     }
@@ -324,6 +351,7 @@ impl RequestContext {
         self.cache_availability = Some(metadata.availability);
         self.cache_entry_tier = Some(metadata.tier);
         self.cache_entry_timestamp = Some(metadata.timestamp);
+        self.cache_payload_kind = Some(metadata.payload_kind);
     }
 
     #[inline]
@@ -579,6 +607,7 @@ mod tests {
         assert_eq!(ctx.cache_entry_status(), None);
         assert_eq!(ctx.cache_entry_tier(), None);
         assert_eq!(ctx.cache_entry_timestamp(), None);
+        assert_eq!(ctx.cache_payload_kind(), None);
         assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(ctx.response_wire_len(), None);
@@ -642,18 +671,21 @@ mod tests {
         let availability = RequestCacheAvailability::from_bits(0b0000_0010, 0b0000_0010);
         let tier = RequestCacheTier::new(2);
         let timestamp = RequestCacheTimestampMillis::new(123_456);
+        let payload_kind = RequestCachePayloadKind::Missing;
 
         ctx.record_cache_entry_metadata(RequestCacheEntryMetadata::new(
             status,
             availability,
             tier,
             timestamp,
+            payload_kind,
         ));
 
         assert_eq!(ctx.cache_entry_status(), Some(status));
         assert_eq!(ctx.cache_availability(), Some(availability));
         assert_eq!(ctx.cache_entry_tier(), Some(tier));
         assert_eq!(ctx.cache_entry_timestamp(), Some(timestamp));
+        assert_eq!(ctx.cache_payload_kind(), Some(payload_kind));
         assert_eq!(ctx.response_status(), None);
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }
