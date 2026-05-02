@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+use crate::protocol::ResponsePayloadLen;
 use crate::router::backend_queue::{BackendQueue, PipelineError, QueuedContext};
 #[cfg(test)]
 use crate::session::backend::parse_backend_status;
@@ -184,7 +185,7 @@ async fn execute_pipeline_batch(
                 let data_len = req
                     .context
                     .response_payload_len()
-                    .map_or(0, crate::protocol::ResponsePayloadLen::get);
+                    .map_or(0, ResponsePayloadLen::get);
                 metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
                 metrics.record_client_to_backend_bytes_for(
                     backend_id,
