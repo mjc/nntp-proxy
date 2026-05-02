@@ -3,7 +3,7 @@
 //! Handles routing article commands across backends, using `ArticleAvailability`
 //! to skip backends that have already returned 430 for a given article.
 
-use crate::router::backend_queue::{PipelineResponse, QueuedContext};
+use crate::router::backend_queue::QueuedContext;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::SessionError;
@@ -554,36 +554,35 @@ impl ClientSession {
 
                         // Await response from the pipeline worker
                         match rx.await {
-                            Ok(PipelineResponse::Success {
-                                data,
-                                status_code,
-                                backend_id,
-                            }) if status_code.as_u16() != 430 => {
+                            Ok(Ok(completed)) if completed.status_code.as_u16() != 430 => {
                                 // Success - article found, return immediately
-                                data.write_all_to(client_write)
+                                completed
+                                    .data
+                                    .write_all_to(client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                                *backend_to_client_bytes = backend_to_client_bytes.add(data.len());
+                                *backend_to_client_bytes =
+                                    backend_to_client_bytes.add(completed.data.len());
                                 *client_to_backend_bytes =
-                                    client_to_backend_bytes.add(request.wire_len());
+                                    client_to_backend_bytes.add(completed.context.wire_len());
                                 self.metrics.record_pipeline_complete();
                                 guard.complete();
-                                return Ok(backend_id);
+                                return Ok(completed.backend_id);
                             }
-                            Ok(PipelineResponse::Success { backend_id, .. }) => {
+                            Ok(Ok(completed)) => {
                                 // 430 (article not found) - fall through to retry loop
                                 debug!(
                                     "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
-                                    self.client_addr, backend_id
+                                    self.client_addr, completed.backend_id
                                 );
                                 // O2: Record this backend as missing in local availability (no cache round-trip)
                                 let avail = availability.get_or_insert_default();
-                                avail.record_missing(backend_id);
+                                avail.record_missing(completed.backend_id);
                                 self.metrics.record_pipeline_complete();
-                                self.metrics.record_error_4xx(backend_id);
+                                self.metrics.record_error_4xx(completed.backend_id);
                                 // Fall through - guard drops, decrementing pending_count
                             }
-                            Ok(PipelineResponse::Error(e)) => {
+                            Ok(Err(e)) => {
                                 debug!(
                                     "Client {} pipeline error for backend {:?}: {}",
                                     self.client_addr, backend_id, e

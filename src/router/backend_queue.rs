@@ -16,21 +16,21 @@ use tokio::sync::{Notify, oneshot};
 use crate::protocol::RequestContext;
 use crate::types::BackendId;
 
-/// Response sent back to a client session from the pipeline worker
+/// A queued request completed by one backend connection.
 #[derive(Debug)]
-pub enum PipelineResponse {
-    /// Command executed successfully; `data` is the complete response bytes
-    Success {
-        /// Complete response data (status line + multiline body if applicable)
-        data: crate::pool::ChunkedResponse,
-        /// Parsed status code from the response
-        status_code: crate::protocol::StatusCode,
-        /// Which backend handled this request
-        backend_id: BackendId,
-    },
-    /// Command failed (connection error, queue overflow, etc.)
-    Error(PipelineError),
+pub struct CompletedPipelineRequest {
+    /// Typed request context that was completed in backend-connection FIFO order.
+    pub context: RequestContext,
+    /// Complete response data (status line + multiline body if applicable).
+    pub data: crate::pool::ChunkedResponse,
+    /// Parsed status code from the response.
+    pub status_code: crate::protocol::StatusCode,
+    /// Which backend handled this request.
+    pub backend_id: BackendId,
 }
+
+/// Response sent back to a client session from the pipeline worker.
+pub type PipelineResponse = Result<CompletedPipelineRequest, PipelineError>;
 
 /// Queue/worker failures reported back to the waiting session without heap allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

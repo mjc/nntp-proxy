@@ -15,7 +15,9 @@ use tracing::{debug, info, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-use crate::router::backend_queue::{BackendQueue, PipelineError, PipelineResponse, QueuedContext};
+use crate::router::backend_queue::{
+    BackendQueue, CompletedPipelineRequest, PipelineError, QueuedContext,
+};
 #[cfg(test)]
 use crate::session::backend::validate_backend_response;
 use crate::types::BackendId;
@@ -188,11 +190,12 @@ async fn execute_pipeline_batch(
                     .record_client_to_backend_bytes_for(backend_id, req.context.wire_len() as u64);
 
                 // Send response to client (ignore error if client disconnected)
-                let _ = req.response_tx.send(PipelineResponse::Success {
+                let _ = req.response_tx.send(Ok(CompletedPipelineRequest {
+                    context: req.context,
                     data,
                     status_code,
                     backend_id,
-                });
+                }));
             }
             Err(e) => {
                 warn!(
@@ -206,9 +209,7 @@ async fn execute_pipeline_batch(
                 );
 
                 // Fail this request
-                let _ = req
-                    .response_tx
-                    .send(PipelineResponse::Error(PipelineError::ReadFailed));
+                let _ = req.response_tx.send(Err(PipelineError::ReadFailed));
 
                 // Fail remaining requests (no Vec allocation - iterate directly)
                 let error_msg = PipelineError::ConnectionLost {
@@ -216,9 +217,7 @@ async fn execute_pipeline_batch(
                     batch_len,
                 };
                 for (_, remaining_req) in batch_iter {
-                    let _ = remaining_req
-                        .response_tx
-                        .send(PipelineResponse::Error(error_msg));
+                    let _ = remaining_req.response_tx.send(Err(error_msg));
                 }
 
                 // Connection broken — return false immediately
@@ -282,7 +281,7 @@ async fn read_full_response(
 #[allow(clippy::iter_with_drain)] // drain used intentionally; empty Vec returned for allocation reuse
 fn fail_batch(mut batch: Vec<QueuedContext>, error: PipelineError) -> Vec<QueuedContext> {
     for req in batch.drain(..) {
-        let _ = req.response_tx.send(PipelineResponse::Error(error));
+        let _ = req.response_tx.send(Err(error));
     }
     batch
 }
@@ -291,6 +290,7 @@ fn fail_batch(mut batch: Vec<QueuedContext>, error: PipelineError) -> Vec<Queued
 mod tests {
     use super::*;
     use crate::pool::BufferPool;
+    use crate::router::backend_queue::PipelineResponse;
     use crate::stream::ConnectionStream;
     use proptest::prelude::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -314,8 +314,8 @@ mod tests {
 
     fn expect_success_status(response: PipelineResponse) -> u16 {
         match response {
-            PipelineResponse::Success { status_code, .. } => status_code.as_u16(),
-            other @ PipelineResponse::Error(_) => panic!("Expected Success, got {other:?}"),
+            Ok(completed) => completed.status_code.as_u16(),
+            other @ Err(_) => panic!("Expected Success, got {other:?}"),
         }
     }
 
@@ -783,8 +783,8 @@ mod tests {
         assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
         // Second response should be error
         match rx2.await.unwrap() {
-            PipelineResponse::Error(_) => {} // Expected
-            other @ PipelineResponse::Success { .. } => {
+            Err(_) => {} // Expected
+            other @ Ok(_) => {
                 panic!("Expected error for second, got {other:?}")
             }
         }
@@ -861,9 +861,7 @@ mod tests {
         );
         [rx1.blocking_recv().unwrap(), rx2.blocking_recv().unwrap()]
             .into_iter()
-            .for_each(|response| {
-                assert!(matches!(response, PipelineResponse::Error(e) if e == error))
-            });
+            .for_each(|response| assert!(matches!(response, Err(e) if e == error)));
     }
 
     proptest! {
@@ -941,9 +939,9 @@ mod tests {
                 prop_assert_eq!(results.len(), responses.len());
                 for (idx, result) in results.into_iter().enumerate() {
                     match result {
-                        PipelineResponse::Success { status_code, data, .. } => {
-                            prop_assert_eq!(status_code.as_u16(), codes[idx]);
-                            prop_assert_eq!(data.to_vec(), responses[idx].clone());
+                        Ok(completed) => {
+                            prop_assert_eq!(completed.status_code.as_u16(), codes[idx]);
+                            prop_assert_eq!(completed.data.to_vec(), responses[idx].clone());
                         }
                         other => prop_assert!(false, "expected success response, got {other:?}"),
                     }
