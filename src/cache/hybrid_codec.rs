@@ -243,8 +243,8 @@ fn encode_payload(writer: &mut impl Write, payload: &CachedPayload) -> foyer::Re
                 .write_all(&[PAYLOAD_ARTICLE])
                 .map_err(foyer::Error::io_error)?;
             write_article_number(writer, *article_number)?;
-            write_vec(writer, headers)?;
-            write_vec(writer, body)
+            write_section(writer, headers)?;
+            write_section(writer, body)
         }
         CachedPayload::Head {
             article_number,
@@ -254,7 +254,7 @@ fn encode_payload(writer: &mut impl Write, payload: &CachedPayload) -> foyer::Re
                 .write_all(&[PAYLOAD_HEAD])
                 .map_err(foyer::Error::io_error)?;
             write_article_number(writer, *article_number)?;
-            write_vec(writer, headers)
+            write_section(writer, headers)
         }
         CachedPayload::Body {
             article_number,
@@ -264,7 +264,7 @@ fn encode_payload(writer: &mut impl Write, payload: &CachedPayload) -> foyer::Re
                 .write_all(&[PAYLOAD_BODY])
                 .map_err(foyer::Error::io_error)?;
             write_article_number(writer, *article_number)?;
-            write_vec(writer, body)
+            write_section(writer, body)
         }
     }
 }
@@ -282,8 +282,8 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }),
         PAYLOAD_ARTICLE => {
             let article_number = read_article_number(reader)?;
-            let headers = read_vec(reader)?;
-            let body = read_vec(reader)?;
+            let headers = read_section(reader)?;
+            let body = read_section(reader)?;
             Ok(CachedPayload::Article {
                 article_number,
                 headers,
@@ -292,7 +292,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_HEAD => {
             let article_number = read_article_number(reader)?;
-            let headers = read_vec(reader)?;
+            let headers = read_section(reader)?;
             Ok(CachedPayload::Head {
                 article_number,
                 headers,
@@ -300,7 +300,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_BODY => {
             let article_number = read_article_number(reader)?;
-            let body = read_vec(reader)?;
+            let body = read_section(reader)?;
             Ok(CachedPayload::Body {
                 article_number,
                 body,
@@ -335,7 +335,7 @@ fn read_article_number(reader: &mut impl Read) -> foyer::Result<Option<CachedArt
     Ok((raw != NO_ARTICLE_NUMBER).then(|| CachedArticleNumber::new(raw)))
 }
 
-fn write_vec(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
+fn write_section(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
     let len = CachedSectionLen::try_from_usize(data.len())?;
     writer
         .write_all(&len.get().to_le_bytes())
@@ -343,7 +343,7 @@ fn write_vec(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
     writer.write_all(data).map_err(foyer::Error::io_error)
 }
 
-fn read_vec(reader: &mut impl Read) -> foyer::Result<Vec<u8>> {
+fn read_section(reader: &mut impl Read) -> foyer::Result<Vec<u8>> {
     let mut len_bytes = [0u8; 4];
     reader
         .read_exact(&mut len_bytes)
