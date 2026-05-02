@@ -207,12 +207,7 @@ pub struct RequestContext {
     args: SmallVec<[u8; 512]>,
     message_id: Option<(usize, usize)>,
     cache_status: Option<RequestCacheStatus>,
-    cache_availability: Option<RequestCacheAvailability>,
-    cache_entry_status: Option<StatusCode>,
-    cache_entry_tier: Option<RequestCacheTier>,
-    cache_entry_timestamp: Option<RequestCacheTimestampMillis>,
-    cache_payload_kind: Option<RequestCachePayloadKind>,
-    cache_article_number: Option<RequestCacheArticleNumber>,
+    cache_entry: Option<RequestCacheEntryMetadata>,
     backend_id: Option<BackendId>,
     response: Option<RequestResponseMetadata>,
     response_payload: Option<crate::pool::ChunkedResponse>,
@@ -230,12 +225,7 @@ impl Clone for RequestContext {
             args: self.args.clone(),
             message_id: self.message_id,
             cache_status: self.cache_status,
-            cache_availability: self.cache_availability,
-            cache_entry_status: self.cache_entry_status,
-            cache_entry_tier: self.cache_entry_tier,
-            cache_entry_timestamp: self.cache_entry_timestamp,
-            cache_payload_kind: self.cache_payload_kind,
-            cache_article_number: self.cache_article_number,
+            cache_entry: self.cache_entry,
             backend_id: self.backend_id,
             response: self.response,
             response_payload: None,
@@ -325,12 +315,7 @@ impl RequestContext {
             args,
             message_id,
             cache_status: None,
-            cache_availability: None,
-            cache_entry_status: None,
-            cache_entry_tier: None,
-            cache_entry_timestamp: None,
-            cache_payload_kind: None,
-            cache_article_number: None,
+            cache_entry: None,
             backend_id: None,
             response: None,
             response_payload: None,
@@ -350,12 +335,7 @@ impl RequestContext {
             args,
             message_id,
             cache_status: None,
-            cache_availability: None,
-            cache_entry_status: None,
-            cache_entry_tier: None,
-            cache_entry_timestamp: None,
-            cache_payload_kind: None,
-            cache_article_number: None,
+            cache_entry: None,
             backend_id: None,
             response: None,
             response_payload: None,
@@ -383,37 +363,61 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn cache_availability(&self) -> Option<RequestCacheAvailability> {
-        self.cache_availability
+        match self.cache_entry {
+            Some(entry) => Some(entry.availability),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     pub const fn cache_entry_status(&self) -> Option<StatusCode> {
-        self.cache_entry_status
+        match self.cache_entry {
+            Some(entry) => Some(entry.status),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     pub const fn cache_entry_tier(&self) -> Option<RequestCacheTier> {
-        self.cache_entry_tier
+        match self.cache_entry {
+            Some(entry) => Some(entry.tier),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     pub const fn cache_entry_timestamp(&self) -> Option<RequestCacheTimestampMillis> {
-        self.cache_entry_timestamp
+        match self.cache_entry {
+            Some(entry) => Some(entry.timestamp),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     pub const fn cache_payload_kind(&self) -> Option<RequestCachePayloadKind> {
-        self.cache_payload_kind
+        match self.cache_entry {
+            Some(entry) => Some(entry.payload_kind),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     pub const fn cache_article_number(&self) -> Option<RequestCacheArticleNumber> {
-        self.cache_article_number
+        match self.cache_entry {
+            Some(entry) => entry.article_number,
+            None => None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn cache_entry_metadata(&self) -> Option<RequestCacheEntryMetadata> {
+        self.cache_entry
     }
 
     #[inline]
@@ -422,23 +426,8 @@ impl RequestContext {
     }
 
     #[inline]
-    pub const fn record_cache_availability(&mut self, availability: RequestCacheAvailability) {
-        self.cache_availability = Some(availability);
-    }
-
-    #[inline]
-    pub const fn record_cache_entry_status(&mut self, status: StatusCode) {
-        self.cache_entry_status = Some(status);
-    }
-
-    #[inline]
     pub const fn record_cache_entry_metadata(&mut self, metadata: RequestCacheEntryMetadata) {
-        self.cache_entry_status = Some(metadata.status);
-        self.cache_availability = Some(metadata.availability);
-        self.cache_entry_tier = Some(metadata.tier);
-        self.cache_entry_timestamp = Some(metadata.timestamp);
-        self.cache_payload_kind = Some(metadata.payload_kind);
-        self.cache_article_number = metadata.article_number;
+        self.cache_entry = Some(metadata);
     }
 
     #[inline]
@@ -533,7 +522,6 @@ impl RequestContext {
         wire_len: ResponseWireLen,
     ) {
         self.cache_status = Some(RequestCacheStatus::Hit);
-        self.cache_entry_status = Some(status);
         self.backend_id = Some(backend_id);
         self.response = Some(RequestResponseMetadata::new(status, wire_len));
     }
@@ -794,31 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn request_context_records_cache_availability_when_known() {
-        let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
-        let availability = RequestCacheAvailability::from_bits(0b0000_0011, 0b0000_0001);
-
-        ctx.record_cache_availability(availability);
-
-        assert_eq!(ctx.cache_availability(), Some(availability));
-        assert_eq!(availability.checked_bits(), 0b0000_0011);
-        assert_eq!(availability.missing_bits(), 0b0000_0001);
-        assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
-    }
-
-    #[test]
-    fn request_context_records_cache_entry_status_when_known() {
-        let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
-        let status = StatusCode::new(430);
-
-        ctx.record_cache_entry_status(status);
-
-        assert_eq!(ctx.cache_entry_status(), Some(status));
-        assert_eq!(ctx.response_status(), None);
-        assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
-    }
-
-    #[test]
     fn request_context_records_cache_entry_metadata_together() {
         let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
         let status = StatusCode::new(430);
@@ -837,6 +800,17 @@ mod tests {
             article_number,
         ));
 
+        assert_eq!(
+            ctx.cache_entry_metadata(),
+            Some(RequestCacheEntryMetadata::new(
+                status,
+                availability,
+                tier,
+                timestamp,
+                payload_kind,
+                article_number
+            ))
+        );
         assert_eq!(ctx.cache_entry_status(), Some(status));
         assert_eq!(ctx.cache_availability(), Some(availability));
         assert_eq!(ctx.cache_entry_tier(), Some(tier));
