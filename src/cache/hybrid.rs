@@ -363,6 +363,7 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let buffer_len = buffer.len();
         let buffer = buffer.into_vec();
+        let tier = super::ttl::CacheTier::new(tier);
         let mut entry = if self.config.cache_articles {
             let Some(entry) = HybridArticleEntry::from_response_buffer_with_tier(buffer, tier)
             else {
@@ -409,9 +410,9 @@ impl HybridArticleCache {
         entry.record_backend_has(backend_id);
         self.cache.insert(key.clone(), entry);
         if self.config.cache_articles {
-            debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert");
+            debug!(msg_id = %key, stored_bytes = entry_len, tier = tier.get(), "Hybrid cache upsert");
         } else {
-            debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert (stub)");
+            debug!(msg_id = %key, stored_bytes = entry_len, tier = tier.get(), "Hybrid cache upsert (stub)");
         }
     }
 

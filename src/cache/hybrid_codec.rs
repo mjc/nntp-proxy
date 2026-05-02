@@ -357,12 +357,12 @@ impl HybridArticleEntry {
     /// stores semantic payload sections, not the original wire response.
     #[must_use]
     pub fn from_response_buffer(buffer: Vec<u8>) -> Option<Self> {
-        Self::from_response_buffer_with_tier(buffer, 0)
+        Self::from_response_buffer_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     /// Ingest a backend response buffer with a specific provider tier.
     #[must_use]
-    pub fn from_response_buffer_with_tier(buffer: Vec<u8>, tier: u8) -> Option<Self> {
+    pub fn from_response_buffer_with_tier(buffer: Vec<u8>, tier: ttl::CacheTier) -> Option<Self> {
         let raw_code = StatusCode::parse(&buffer)?.as_u16();
         let status_code = CacheableStatusCode::try_from(raw_code).ok()?;
         let payload = parse_payload(StatusCode::new(raw_code), &buffer);
@@ -371,7 +371,7 @@ impl HybridArticleEntry {
             status_code,
             availability: ArticleAvailability::new(),
             timestamp: ttl::CacheTimestampMillis::now(),
-            tier: tier.into(),
+            tier,
             payload,
         })
     }
@@ -854,9 +854,11 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_tier() {
-        let entry =
-            HybridArticleEntry::from_response_buffer_with_tier(b"220 article\r\n".to_vec(), 3)
-                .unwrap();
+        let entry = HybridArticleEntry::from_response_buffer_with_tier(
+            b"220 article\r\n".to_vec(),
+            ttl::CacheTier::new(3),
+        )
+        .unwrap();
         assert_eq!(entry.tier(), 3);
 
         let mut encoded = Vec::new();
@@ -1075,8 +1077,11 @@ mod tests {
 
     #[test]
     fn test_with_tier_sets_tier() {
-        let entry =
-            HybridArticleEntry::from_response_buffer_with_tier(b"220 ok\r\n".to_vec(), 5).unwrap();
+        let entry = HybridArticleEntry::from_response_buffer_with_tier(
+            b"220 ok\r\n".to_vec(),
+            ttl::CacheTier::new(5),
+        )
+        .unwrap();
         assert_eq!(entry.tier(), 5);
     }
 
@@ -1089,8 +1094,11 @@ mod tests {
     #[test]
     fn test_with_tier_rejects_invalid_code() {
         assert!(
-            HybridArticleEntry::from_response_buffer_with_tier(b"999 bad\r\n".to_vec(), 0)
-                .is_none()
+            HybridArticleEntry::from_response_buffer_with_tier(
+                b"999 bad\r\n".to_vec(),
+                ttl::CacheTier::new(0)
+            )
+            .is_none()
         );
     }
 
@@ -1228,7 +1236,7 @@ mod tests {
         for tier in [0u8, 1, 5, 10, 255] {
             let entry = HybridArticleEntry::from_response_buffer_with_tier(
                 b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n".to_vec(),
-                tier,
+                ttl::CacheTier::new(tier),
             )
             .unwrap();
 
