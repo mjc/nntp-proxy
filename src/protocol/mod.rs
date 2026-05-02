@@ -19,8 +19,8 @@ pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
 pub use request::{
-    RequestCacheAvailability, RequestCacheStatus, RequestCacheTier, RequestContext, RequestKind,
-    RequestRouteClass, ResponseShape, ResponseWireLen,
+    RequestCacheAvailability, RequestCacheEntryMetadata, RequestCacheStatus, RequestCacheTier,
+    RequestContext, RequestKind, RequestRouteClass, ResponseShape, ResponseWireLen,
 };
 pub use response::{NntpResponse, StatusCode};
 

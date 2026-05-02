@@ -140,6 +140,43 @@ pub struct RequestContext {
     response_wire_len: Option<ResponseWireLen>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestCacheEntryMetadata {
+    status: StatusCode,
+    availability: RequestCacheAvailability,
+    tier: RequestCacheTier,
+}
+
+impl RequestCacheEntryMetadata {
+    #[must_use]
+    pub const fn new(
+        status: StatusCode,
+        availability: RequestCacheAvailability,
+        tier: RequestCacheTier,
+    ) -> Self {
+        Self {
+            status,
+            availability,
+            tier,
+        }
+    }
+
+    #[must_use]
+    pub const fn status(self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn availability(self) -> RequestCacheAvailability {
+        self.availability
+    }
+
+    #[must_use]
+    pub const fn tier(self) -> RequestCacheTier {
+        self.tier
+    }
+}
+
 impl RequestContext {
     #[must_use]
     pub fn from_request_line(line: &str) -> Self {
@@ -244,15 +281,10 @@ impl RequestContext {
     }
 
     #[inline]
-    pub const fn record_cache_entry_metadata(
-        &mut self,
-        status: StatusCode,
-        availability: RequestCacheAvailability,
-        tier: RequestCacheTier,
-    ) {
-        self.cache_entry_status = Some(status);
-        self.cache_availability = Some(availability);
-        self.cache_entry_tier = Some(tier);
+    pub const fn record_cache_entry_metadata(&mut self, metadata: RequestCacheEntryMetadata) {
+        self.cache_entry_status = Some(metadata.status);
+        self.cache_availability = Some(metadata.availability);
+        self.cache_entry_tier = Some(metadata.tier);
     }
 
     #[inline]
@@ -570,7 +602,7 @@ mod tests {
         let availability = RequestCacheAvailability::from_bits(0b0000_0010, 0b0000_0010);
         let tier = RequestCacheTier::new(2);
 
-        ctx.record_cache_entry_metadata(status, availability, tier);
+        ctx.record_cache_entry_metadata(RequestCacheEntryMetadata::new(status, availability, tier));
 
         assert_eq!(ctx.cache_entry_status(), Some(status));
         assert_eq!(ctx.cache_availability(), Some(availability));
