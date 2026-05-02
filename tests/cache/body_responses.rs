@@ -11,14 +11,7 @@ use nntp_proxy::cache::{ArticleCache, ArticleEntry};
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
-use super::article_response_bytes;
-
-// NOTE: Cache policy tests are in src/session/routing/cache_policy.rs unit tests
-// as the routing module is private
-
-fn can_serve(entry: &ArticleEntry, verb: &[u8], message_id: &MessageId<'_>) -> bool {
-    article_response_bytes(entry, verb, message_id).is_some()
-}
+use super::{article_entry, article_response_bytes, assert_serves, body_entry, head_entry};
 
 #[tokio::test]
 async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
@@ -113,83 +106,40 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
 
 #[test]
 fn test_matches_command_type_article_response() {
-    // Create ARTICLE response (220)
-    let article_response =
-        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(article_response);
-    let msg_id = "<test@example.com>";
-
-    // ARTICLE response can serve ARTICLE, BODY, HEAD, or STAT requests
-    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
-    assert!(
-        can_serve(&entry, b"ARTICLE", msg_id_ref),
-        "ARTICLE (220) should match ARTICLE command"
-    );
-    assert!(
-        can_serve(&entry, b"BODY", msg_id_ref),
-        "ARTICLE (220) should match BODY command"
-    );
-    assert!(
-        can_serve(&entry, b"HEAD", msg_id_ref),
-        "ARTICLE (220) should match HEAD command"
-    );
-    assert!(
-        can_serve(&entry, b"STAT", msg_id_ref),
-        "ARTICLE (220) should match STAT command"
+    assert_serves(
+        &article_entry(),
+        &[
+            (b"ARTICLE", true),
+            (b"BODY", true),
+            (b"HEAD", true),
+            (b"STAT", true),
+        ],
     );
 }
 
 #[test]
 fn test_matches_command_type_body_response() {
-    // Create BODY response (222)
-    let body_response = b"222 0 <test@example.com>\r\nBody content\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(body_response);
-    let msg_id = "<test@example.com>";
-
-    // BODY response can serve BODY and STAT requests
-    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
-    assert!(
-        can_serve(&entry, b"BODY", msg_id_ref),
-        "BODY (222) should match BODY command"
-    );
-    assert!(
-        !can_serve(&entry, b"ARTICLE", msg_id_ref),
-        "BODY (222) should NOT match ARTICLE command"
-    );
-    assert!(
-        !can_serve(&entry, b"HEAD", msg_id_ref),
-        "BODY (222) should NOT match HEAD command"
-    );
-    assert!(
-        can_serve(&entry, b"STAT", msg_id_ref),
-        "BODY (222) should match STAT command (article exists)"
+    assert_serves(
+        &body_entry(),
+        &[
+            (b"BODY", true),
+            (b"ARTICLE", false),
+            (b"HEAD", false),
+            (b"STAT", true),
+        ],
     );
 }
 
 #[test]
 fn test_matches_command_type_head_response() {
-    // Create HEAD response (221)
-    let head_response = b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(head_response);
-    let msg_id = "<test@example.com>";
-
-    // HEAD response can serve HEAD and STAT requests
-    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
-    assert!(
-        can_serve(&entry, b"HEAD", msg_id_ref),
-        "HEAD (221) should match HEAD command"
-    );
-    assert!(
-        !can_serve(&entry, b"ARTICLE", msg_id_ref),
-        "HEAD (221) should NOT match ARTICLE command"
-    );
-    assert!(
-        !can_serve(&entry, b"BODY", msg_id_ref),
-        "HEAD (221) should NOT match BODY command"
-    );
-    assert!(
-        can_serve(&entry, b"STAT", msg_id_ref),
-        "HEAD (221) should match STAT command (article exists)"
+    assert_serves(
+        &head_entry(),
+        &[
+            (b"HEAD", true),
+            (b"ARTICLE", false),
+            (b"BODY", false),
+            (b"STAT", true),
+        ],
     );
 }
 
@@ -197,11 +147,8 @@ fn test_matches_command_type_head_response() {
 fn test_response_for_command_verbs_uppercase() {
     let body_response = b"222 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_wire_response(body_response);
-    let msg_id = "<test@example.com>";
 
-    // Only uppercase verbs are expected (caller is responsible for uppercasing)
-    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
-    assert!(can_serve(&entry, b"BODY", msg_id_ref));
+    assert_serves(&entry, &[(b"BODY", true)]);
 }
 
 #[test]
@@ -263,55 +210,28 @@ fn test_status_code_parsing() {
 }
 #[test]
 fn test_body_article_command_type_mismatch() {
-    // When a BODY (222) response is cached and a client requests ARTICLE (220),
-    // it should NOT match because BODY doesn't include headers
     let body_response =
         ArticleEntry::from_wire_response(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n");
-    let msg_id = "<test@example.com>";
-
-    // BODY response should NOT match ARTICLE request (no headers)
-    let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
-    assert!(
-        !can_serve(&body_response, b"ARTICLE", msg_id_ref),
-        "ARTICLE command should not match BODY (222) response"
+    assert_serves(
+        &body_response,
+        &[
+            (b"ARTICLE", false),
+            (b"BODY", true),
+            (b"HEAD", false),
+            (b"STAT", true),
+        ],
     );
 
-    // But BODY response should match BODY request
-    assert!(
-        can_serve(&body_response, b"BODY", msg_id_ref),
-        "BODY command should match BODY (222) response"
-    );
-
-    // And should not match HEAD request (no body)
-    assert!(
-        !can_serve(&body_response, b"HEAD", msg_id_ref),
-        "HEAD command should not match BODY (222) response"
-    );
-
-    // STAT should work - we know the article exists
-    assert!(
-        can_serve(&body_response, b"STAT", msg_id_ref),
-        "STAT should match BODY (222) response (article exists)"
-    );
-
-    // ARTICLE (220) response matches all three
     let article_response = ArticleEntry::from_wire_response(
         b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n",
     );
-    assert!(
-        can_serve(&article_response, b"ARTICLE", msg_id_ref),
-        "ARTICLE command should match ARTICLE (220) response"
-    );
-    assert!(
-        can_serve(&article_response, b"BODY", msg_id_ref),
-        "BODY command should match ARTICLE (220) response"
-    );
-    assert!(
-        can_serve(&article_response, b"HEAD", msg_id_ref),
-        "HEAD command should match ARTICLE (220) response"
-    );
-    assert!(
-        can_serve(&article_response, b"STAT", msg_id_ref),
-        "STAT should match ARTICLE (220) response"
+    assert_serves(
+        &article_response,
+        &[
+            (b"ARTICLE", true),
+            (b"BODY", true),
+            (b"HEAD", true),
+            (b"STAT", true),
+        ],
     );
 }

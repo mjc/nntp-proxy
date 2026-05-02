@@ -30,3 +30,36 @@ pub fn article_response_bytes(
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
 }
+
+pub fn test_msg_id() -> MessageId<'static> {
+    MessageId::from_borrowed("<test@example.com>").unwrap()
+}
+
+pub fn article_entry() -> ArticleEntry {
+    ArticleEntry::from_wire_response(
+        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+    )
+}
+
+pub fn body_entry() -> ArticleEntry {
+    ArticleEntry::from_wire_response(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n")
+}
+
+pub fn head_entry() -> ArticleEntry {
+    ArticleEntry::from_wire_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n")
+}
+
+pub fn response_bytes(entry: &ArticleEntry, verb: &[u8]) -> Option<Vec<u8>> {
+    article_response_bytes(entry, verb, &test_msg_id())
+}
+
+pub fn assert_serves(entry: &ArticleEntry, cases: &[(&[u8], bool)]) {
+    for (verb, expected) in cases {
+        assert_eq!(
+            response_bytes(entry, verb).is_some(),
+            *expected,
+            "serve decision for {}",
+            String::from_utf8_lossy(verb)
+        );
+    }
+}
