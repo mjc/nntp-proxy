@@ -52,7 +52,7 @@ async fn test_mock_cache_basic_ops() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_mock_cache_upsert_accepts_borrowed_wire_bytes() -> Result<()> {
+async fn test_mock_cache_upsert_accepts_borrowed_backend_bytes() -> Result<()> {
     let cache = MockHybridCache::new(1024 * 1024);
     let msg_id = MessageId::from_borrowed("<borrowed@example.com>").unwrap();
     let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";

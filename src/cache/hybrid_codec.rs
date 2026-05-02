@@ -354,7 +354,7 @@ impl HybridArticleEntry {
     /// Ingest a cold backend response into a typed hybrid cache entry.
     ///
     /// Returns `None` if the status code is invalid or not cacheable. The entry
-    /// stores semantic payload sections, not the original wire response.
+    /// stores semantic payload sections, not the original backend response.
     #[must_use]
     pub fn from_backend_response(buffer: impl AsRef<[u8]>) -> Option<Self> {
         Self::from_backend_response_with_tier(buffer, ttl::CacheTier::new(0))
@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_wire_response_by_name() {
+    fn hybrid_entry_ingests_backend_response_by_name() {
         let entry = HybridArticleEntry::from_backend_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_borrowed_wire_response_bytes() {
+    fn hybrid_entry_ingests_borrowed_backend_response_bytes() {
         let entry = HybridArticleEntry::from_backend_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         )
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_chunked_cache_buffer_without_flattening_wire_response() {
+    fn hybrid_entry_ingests_chunked_cache_buffer_without_flattening_backend_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,

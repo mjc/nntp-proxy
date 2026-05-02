@@ -1257,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_wire_response_by_name() {
+    fn article_entry_ingests_backend_response_by_name() {
         let entry = ArticleEntry::from_backend_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_borrowed_wire_response_bytes() {
+    fn article_entry_ingests_borrowed_backend_response_bytes() {
         let entry = ArticleEntry::from_backend_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         );
@@ -1291,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_chunked_cache_buffer_without_flattening_wire_response() {
+    fn article_entry_ingests_chunked_cache_buffer_without_flattening_backend_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
