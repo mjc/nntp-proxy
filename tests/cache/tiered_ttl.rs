@@ -193,7 +193,7 @@ fn test_article_entry_tier_default() {
 fn test_article_entry_with_tier() {
     let entry = ArticleEntry::from_response_buffer_with_tier(
         b"220 0 <test@example.com>\r\n.\r\n".to_vec(),
-        3,
+        CacheTier::new(3),
     );
     assert_eq!(entry.tier(), 3);
 }
@@ -204,16 +204,20 @@ fn test_article_entry_set_tier() {
         ArticleEntry::from_response_buffer(b"220 0 <test@example.com>\r\n.\r\n".to_vec());
     assert_eq!(entry.tier(), 0);
 
-    entry.set_tier(5);
+    entry.set_tier(CacheTier::new(5));
     assert_eq!(entry.tier(), 5);
 }
 
 #[test]
 fn test_article_entry_is_expired_uses_tier() {
-    let entry_tier_0 =
-        ArticleEntry::from_response_buffer_with_tier(b"220 test\r\n.\r\n".to_vec(), 0);
-    let entry_tier_1 =
-        ArticleEntry::from_response_buffer_with_tier(b"220 test\r\n.\r\n".to_vec(), 1);
+    let entry_tier_0 = ArticleEntry::from_response_buffer_with_tier(
+        b"220 test\r\n.\r\n".to_vec(),
+        CacheTier::new(0),
+    );
+    let entry_tier_1 = ArticleEntry::from_response_buffer_with_tier(
+        b"220 test\r\n.\r\n".to_vec(),
+        CacheTier::new(1),
+    );
 
     // With a very short TTL, tier 0 might expire but tier 1 has 2x
     // Just verify the method exists and uses tier

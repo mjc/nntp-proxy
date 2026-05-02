@@ -401,7 +401,7 @@ impl HybridArticleEntry {
             StatusCode::new(self.status_code.as_u16()),
             self.payload.clone(),
             self.availability,
-            self.tier.get(),
+            self.tier,
             self.timestamp.get(),
         )
     }

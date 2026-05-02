@@ -284,16 +284,16 @@ impl ArticleEntry {
     /// response.
     #[must_use]
     pub fn from_response_buffer(buffer: Vec<u8>) -> Self {
-        Self::from_response_buffer_with_tier(buffer, 0)
+        Self::from_response_buffer_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     #[must_use]
-    pub fn availability_only(status_code: StatusCode, tier: u8) -> Self {
+    pub fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
             status_code,
             payload: CachedPayload::AvailabilityOnly,
-            tier: tier.into(),
+            tier,
             inserted_at: ttl::CacheTimestampMillis::now(),
         }
     }
@@ -303,28 +303,28 @@ impl ArticleEntry {
         status_code: StatusCode,
         payload: CachedPayload,
         backend_availability: ArticleAvailability,
-        tier: u8,
+        tier: ttl::CacheTier,
         inserted_at: u64,
     ) -> Self {
         Self {
             backend_availability,
             status_code,
             payload,
-            tier: ttl::CacheTier::new(tier),
+            tier,
             inserted_at: ttl::CacheTimestampMillis::new(inserted_at),
         }
     }
 
     /// Ingest a backend response buffer with a specific provider tier.
     #[must_use]
-    pub fn from_response_buffer_with_tier(buffer: Vec<u8>, tier: u8) -> Self {
+    pub fn from_response_buffer_with_tier(buffer: Vec<u8>, tier: ttl::CacheTier) -> Self {
         let status_code = StatusCode::parse(&buffer).unwrap_or_else(|| StatusCode::new(430));
         let payload = parse_payload(status_code, &buffer);
         Self {
             backend_availability: ArticleAvailability::new(),
             status_code,
             payload,
-            tier: tier.into(),
+            tier,
             inserted_at: ttl::CacheTimestampMillis::now(),
         }
     }
@@ -347,8 +347,8 @@ impl ArticleEntry {
 
     /// Set the tier (used when updating entry)
     #[inline]
-    pub const fn set_tier(&mut self, tier: u8) {
-        self.tier = ttl::CacheTier::new(tier);
+    pub const fn set_tier(&mut self, tier: ttl::CacheTier) {
+        self.tier = tier;
     }
 
     #[inline]
@@ -823,6 +823,7 @@ impl ArticleCache {
         } else {
             Self::create_minimal_stub(buffer)
         };
+        let tier = ttl::CacheTier::new(tier);
         let new_entry_template = ArticleEntry::from_response_buffer_with_tier(new_buffer, tier);
 
         // Use atomic upsert - this provides key-level locking and eliminates
@@ -848,7 +849,7 @@ impl ArticleCache {
                     if should_replace {
                         entry.status_code = new_entry_template.status_code;
                         entry.payload = new_entry_template.payload.clone();
-                        entry.tier = tier.into();
+                        entry.tier = tier;
                     }
 
                     // Refresh TTL on every successful upsert, independent of buffer replacement
