@@ -475,11 +475,6 @@ impl RequestContext {
     }
 
     #[inline]
-    pub fn record_response_payload(&mut self, response: crate::pool::ChunkedResponse) {
-        self.response_payload = Some(response);
-    }
-
-    #[inline]
     pub fn complete_backend_response(
         &mut self,
         backend_id: BackendId,

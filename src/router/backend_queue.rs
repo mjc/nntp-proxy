@@ -397,12 +397,11 @@ mod tests {
         assert_eq!(completed.context.message_id(), Some("<test@example.com>"));
         assert_eq!(completed.context.backend_id(), Some(backend_id));
         assert_eq!(
-            completed.context.response_status(),
-            Some(crate::protocol::StatusCode::new(223))
-        );
-        assert_eq!(
-            completed.context.response_wire_len().map(|len| len.get()),
-            Some(0)
+            completed.context.response_metadata(),
+            Some(crate::protocol::RequestResponseMetadata::new(
+                crate::protocol::StatusCode::new(223),
+                0.into()
+            ))
         );
         assert_eq!(completed.context.response_payload_len(), Some(0));
         assert_eq!(completed.context.response_payload_is_empty(), Some(true));
