@@ -254,24 +254,6 @@ impl StatusCode {
         let code = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
         Some(Self::new(code))
     }
-
-    /// Check if this code indicates a multiline response
-    ///
-    /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
-    /// certain status codes indicate multiline data follows.
-    ///
-    /// # Multiline Response Codes
-    /// - **1xx**: Specific codes - 100, 101
-    /// - **2xx**: Specific codes - 215, 220, 221, 222, 224, 225, 230, 231, 282, 288
-    #[inline]
-    #[must_use]
-    pub fn is_multiline(&self) -> bool {
-        // DATE (111) is informational but single-line, so do not classify 1xx by range.
-        matches!(
-            **self,
-            100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
-        )
-    }
 }
 
 #[cfg(test)]
@@ -289,22 +271,9 @@ mod tests {
     }
 
     #[test]
-    fn test_status_code_multiline() {
-        // HELP and CAPABILITIES are multiline; DATE (111) is single-line.
-        assert!(StatusCode::new(100).is_multiline());
-        assert!(StatusCode::new(101).is_multiline());
-        assert!(!StatusCode::new(111).is_multiline());
-        // Specific 2xx multiline codes
-        assert!(StatusCode::new(220).is_multiline());
-        assert!(!StatusCode::new(200).is_multiline());
-        assert!(!StatusCode::new(400).is_multiline());
-    }
-
-    #[test]
     fn test_288_xfeature_compress_gzip_is_multiline() {
         // 288 is returned by XFEATURE COMPRESS GZIP — enables compression.
         // The response is multiline (compressed data stream follows).
-        assert!(StatusCode::new(288).is_multiline());
         assert!(matches!(
             NntpResponse::parse(b"288 XFEATURE COMPRESS GZIP\r\n"),
             NntpResponse::MultilineData(_)
