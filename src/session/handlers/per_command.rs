@@ -44,7 +44,6 @@ enum SingleCommandResult {
 
 /// Parameters for executing a command decision
 struct CommandExecutionParams<'a, 'b> {
-    command: &'a str,
     request: &'a RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
@@ -56,7 +55,6 @@ struct CommandExecutionParams<'a, 'b> {
 
 /// Parameters for processing a single command (full flow including QUIT handling)
 struct ProcessCommandParams<'a, 'b> {
-    command: &'a str,
     request: &'a RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
@@ -75,7 +73,6 @@ impl ClientSession {
         params: CommandExecutionParams<'_, '_>,
     ) -> Result<CommandResult> {
         let CommandExecutionParams {
-            command,
             request,
             skip_auth_check,
             router,
@@ -92,7 +89,6 @@ impl ClientSession {
             self.mode_state.routing_mode(),
         );
 
-        let trimmed = command.trim();
         match decision {
             CommandRoutingDecision::InterceptAuth => {
                 debug!("Client {} decision: InterceptAuth", self.client_addr);
@@ -133,8 +129,10 @@ impl ClientSession {
 
             CommandRoutingDecision::Forward => {
                 debug!(
-                    "Client {} decision: Forward ({})",
-                    self.client_addr, trimmed
+                    "Client {} decision: Forward kind={:?}, verb={:?}",
+                    self.client_addr,
+                    request.kind(),
+                    request.verb()
                 );
                 let mut c2b_mutable = client_to_backend_bytes;
                 self.route_and_execute_request(
@@ -163,12 +161,16 @@ impl ClientSession {
 
             CommandRoutingDecision::SwitchToStateful => {
                 debug!(
-                    "Client {} decision: SwitchToStateful ({})",
-                    self.client_addr, trimmed
+                    "Client {} decision: SwitchToStateful kind={:?}, verb={:?}",
+                    self.client_addr,
+                    request.kind(),
+                    request.verb()
                 );
                 info!(
-                    "Client {} switching to stateful mode (command: {})",
-                    self.client_addr, trimmed
+                    "Client {} switching to stateful mode (kind={:?}, verb={:?})",
+                    self.client_addr,
+                    request.kind(),
+                    request.verb()
                 );
                 Ok(CommandResult::SwitchToStateful)
             }
@@ -218,7 +220,6 @@ impl ClientSession {
         params: ProcessCommandParams<'_, '_>,
     ) -> Result<SingleCommandResult> {
         let ProcessCommandParams {
-            command,
             request,
             skip_auth_check,
             router,
@@ -239,7 +240,6 @@ impl ClientSession {
         // Execute command decision
         match self
             .execute_command_decision(CommandExecutionParams {
-                command,
                 request,
                 skip_auth_check,
                 router,
@@ -395,21 +395,20 @@ impl ClientSession {
                 if !batch_handled {
                     // Sequential processing for mixed, single-command, or failed-batch commands
                     for i in 0..batch_size {
-                        let command = batch.command(i);
                         let request = batch.context(i);
                         debug!(
-                            "Client {} received {} bytes: {:?}",
+                            "Client {} received {} request bytes: kind={:?}, verb={:?}",
                             self.client_addr,
-                            command.len(),
-                            command.trim()
+                            request.wire_len(),
+                            request.kind(),
+                            request.verb()
                         );
 
-                        client_to_backend_bytes = client_to_backend_bytes.add(command.len());
+                        client_to_backend_bytes = client_to_backend_bytes.add(request.wire_len());
                         skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
                         match self
                             .process_single_command(ProcessCommandParams {
-                                command,
                                 request,
                                 skip_auth_check,
                                 router,
@@ -476,7 +475,6 @@ impl ClientSession {
 
                 match self
                     .process_single_command(ProcessCommandParams {
-                        command: trailing_cmd,
                         request: trailing_context.expect("valid trailing command has context"),
                         skip_auth_check,
                         router,

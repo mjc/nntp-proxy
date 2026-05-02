@@ -201,7 +201,6 @@ impl ClientSession {
 
         let backend_id = bcc.backend_id;
         let request = batch.context(idx);
-        let command = batch.command(idx);
         let msg_id = request.message_id_value();
         let leftover = &mut bcc.leftover;
         let chunk_data = &mut bcc.chunk_data;
@@ -308,7 +307,7 @@ impl ClientSession {
 
             self.send_430_to_client(client_write, state.backend_to_client_bytes)
                 .await?;
-            *state.client_to_backend_bytes = state.client_to_backend_bytes.add(command.len());
+            *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request.wire_len());
 
             if let Some(mid) = msg_id.as_ref() {
                 self.cache
@@ -326,7 +325,8 @@ impl ClientSession {
             warn!(
                 client = %self.client_addr,
                 backend = ?backend_id,
-                command = %command.trim(),
+                request_kind = ?request.kind(),
+                request_verb = ?request.verb(),
                 response_index = idx + 1,
                 total_commands = batch.len(),
                 chunk_len = chunk.len(),
@@ -340,7 +340,7 @@ impl ClientSession {
         }
 
         // --- Success: stream response to client ---
-        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(command.len());
+        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request.wire_len());
 
         let bytes_written = if is_multiline {
             let ctx = streaming::StreamContext {

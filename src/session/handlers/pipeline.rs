@@ -44,13 +44,6 @@ impl RequestBatch {
         self.offsets.is_empty() && self.trailing_range.is_none()
     }
 
-    /// Get a command by index from the pipelineable commands
-    pub fn command(&self, i: usize) -> &str {
-        let start = if i == 0 { 0 } else { self.offsets[i - 1] };
-        let end = self.offsets[i];
-        &self.buffer[start..end]
-    }
-
     /// Get a typed context by index from the pipelineable commands.
     pub fn context(&self, i: usize) -> &RequestContext {
         &self.contexts[i]
