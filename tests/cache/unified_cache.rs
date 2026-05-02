@@ -658,7 +658,7 @@ fn hybrid_response_bytes(
 
 #[test]
 fn test_hybrid_entry_has_availability_info_empty() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Fresh entry has no availability info
     assert!(!entry.has_availability_info());
@@ -666,7 +666,7 @@ fn test_hybrid_entry_has_availability_info_empty() {
 
 #[test]
 fn test_hybrid_entry_has_availability_info_after_missing() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     entry.record_backend_missing(BackendId::from_index(0));
 
@@ -675,7 +675,7 @@ fn test_hybrid_entry_has_availability_info_after_missing() {
 
 #[test]
 fn test_hybrid_entry_has_availability_info_after_has() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     entry.record_backend_has(BackendId::from_index(0));
 
@@ -684,7 +684,7 @@ fn test_hybrid_entry_has_availability_info_after_has() {
 
 #[test]
 fn test_hybrid_entry_is_availability_stale_fresh() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Entry just created should not be stale with reasonable TTL
     assert!(!entry.is_availability_stale(3600)); // 1 hour TTL
@@ -693,7 +693,7 @@ fn test_hybrid_entry_is_availability_stale_fresh() {
 
 #[test]
 fn test_hybrid_entry_is_availability_stale_zero_ttl() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // With zero TTL, everything is immediately stale (edge case)
     // Note: implementation uses `> ttl` so zero TTL means 0 seconds old is not stale
@@ -702,7 +702,7 @@ fn test_hybrid_entry_is_availability_stale_zero_ttl() {
 
 #[test]
 fn test_hybrid_entry_clear_stale_availability_not_stale() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Record some availability info
     entry.record_backend_missing(BackendId::from_index(0));
@@ -722,7 +722,7 @@ fn test_hybrid_entry_clear_stale_availability_not_stale() {
 
 #[test]
 fn test_hybrid_entry_should_try_after_record_missing() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Initially should try all backends
     assert!(entry.should_try_backend(BackendId::from_index(0)));
@@ -740,7 +740,7 @@ fn test_hybrid_entry_should_try_after_record_missing() {
 
 #[test]
 fn test_hybrid_entry_should_try_after_record_has() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Mark backend 0 as missing first
     entry.record_backend_missing(BackendId::from_index(0));
@@ -755,7 +755,7 @@ fn test_hybrid_entry_should_try_after_record_has() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_none() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // With no missing backends marked, not exhausted
     assert!(!entry.all_backends_exhausted(BackendCount::new(3)));
@@ -763,7 +763,7 @@ fn test_hybrid_entry_all_backends_exhausted_none() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_partial() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Mark 2 of 3 backends as missing
     entry.record_backend_missing(BackendId::from_index(0));
@@ -775,7 +775,7 @@ fn test_hybrid_entry_all_backends_exhausted_partial() {
 
 #[test]
 fn test_hybrid_entry_all_backends_exhausted_all() {
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Mark all 3 backends as missing
     entry.record_backend_missing(BackendId::from_index(0));
@@ -788,7 +788,7 @@ fn test_hybrid_entry_all_backends_exhausted_all() {
 
 #[test]
 fn test_hybrid_entry_430_stub_creation() {
-    let entry = HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_430_stub_buffer()).unwrap();
 
     // 430 responses should be cached
     assert_eq!(entry.status_code().as_u16(), 430);
@@ -800,7 +800,7 @@ fn test_hybrid_entry_430_stub_creation() {
 #[test]
 fn test_hybrid_entry_complete_article_detection() {
     let article_buf = make_valid_article_buffer();
-    let entry = HybridArticleEntry::from_wire_response(article_buf).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(article_buf).unwrap();
 
     // 220 with proper terminator is a complete article
     assert!(entry.is_complete_article());
@@ -810,7 +810,7 @@ fn test_hybrid_entry_complete_article_detection() {
 #[test]
 fn test_hybrid_entry_response_for_command_article() {
     let buffer = make_valid_article_buffer();
-    let entry = HybridArticleEntry::from_wire_response(buffer.clone()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(buffer.clone()).unwrap();
 
     let response = hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>");
     assert!(response.is_some());
@@ -819,7 +819,7 @@ fn test_hybrid_entry_response_for_command_article() {
 
 #[test]
 fn test_hybrid_entry_response_for_command_stat_synthesized() {
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     let response = hybrid_response_bytes(&entry, b"STAT", "<test@example.com>");
     assert!(response.is_some());
@@ -830,7 +830,7 @@ fn test_hybrid_entry_response_for_command_stat_synthesized() {
 
 #[test]
 fn test_hybrid_entry_response_for_command_430_returns_none() {
-    let entry = HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_430_stub_buffer()).unwrap();
 
     // 430 stubs should not serve ARTICLE requests
     assert!(hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>").is_none());
@@ -843,7 +843,7 @@ fn test_hybrid_entry_response_for_command_430_returns_none() {
 fn test_hybrid_entry_invalid_status_code_rejected() {
     // 200 is not a valid article response code
     let buffer = b"200 server ready\r\n".to_vec();
-    let entry = HybridArticleEntry::from_wire_response(buffer);
+    let entry = HybridArticleEntry::from_backend_response(buffer);
 
     // Should reject invalid status codes
     assert!(entry.is_none());
@@ -853,11 +853,11 @@ fn test_hybrid_entry_invalid_status_code_rejected() {
 fn test_hybrid_entry_valid_status_codes() {
     // Valid codes: 220 (ARTICLE), 221 (HEAD), 222 (BODY), 223 (STAT), 430 (not found)
     let valid_220 =
-        HybridArticleEntry::from_wire_response(b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n");
-    let valid_221 = HybridArticleEntry::from_wire_response(b"221 0 <id>\r\nH: V\r\n.\r\n");
-    let valid_222 = HybridArticleEntry::from_wire_response(b"222 0 <id>\r\nBody\r\n.\r\n");
-    let valid_223 = HybridArticleEntry::from_wire_response(b"223 0 <id>\r\n");
-    let valid_430 = HybridArticleEntry::from_wire_response(b"430 No article\r\n");
+        HybridArticleEntry::from_backend_response(b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n");
+    let valid_221 = HybridArticleEntry::from_backend_response(b"221 0 <id>\r\nH: V\r\n.\r\n");
+    let valid_222 = HybridArticleEntry::from_backend_response(b"222 0 <id>\r\nBody\r\n.\r\n");
+    let valid_223 = HybridArticleEntry::from_backend_response(b"223 0 <id>\r\n");
+    let valid_430 = HybridArticleEntry::from_backend_response(b"430 No article\r\n");
 
     assert!(valid_220.is_some());
     assert!(valid_221.is_some());
@@ -876,7 +876,7 @@ fn test_hybrid_entry_serialization_roundtrip() {
     use std::io::Cursor;
 
     let buffer = make_valid_article_buffer();
-    let mut entry = HybridArticleEntry::from_wire_response(buffer).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(buffer).unwrap();
 
     // Add some availability info
     entry.record_backend_missing(BackendId::from_index(0));
@@ -903,7 +903,7 @@ fn test_hybrid_entry_serialization_preserves_availability() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let mut entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // Mark several backends
     entry.record_backend_missing(BackendId::from_index(0));
@@ -929,7 +929,7 @@ fn test_hybrid_entry_serialization_preserves_availability() {
 fn test_hybrid_entry_serialization_estimated_size() {
     use foyer::Code;
 
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     let mut encoded = Vec::new();
     entry.encode(&mut encoded).unwrap();
@@ -941,7 +941,7 @@ fn test_hybrid_entry_serialization_430_stub() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let mut entry = HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap();
+    let mut entry = HybridArticleEntry::from_backend_response(make_430_stub_buffer()).unwrap();
     entry.record_backend_missing(BackendId::from_index(0));
 
     // Serialize and deserialize
@@ -958,7 +958,7 @@ fn test_hybrid_entry_serialization_empty_availability() {
     use foyer::Code;
     use std::io::Cursor;
 
-    let entry = HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap();
+    let entry = HybridArticleEntry::from_backend_response(make_valid_article_buffer()).unwrap();
 
     // No availability recorded
     assert!(!entry.has_availability_info());
