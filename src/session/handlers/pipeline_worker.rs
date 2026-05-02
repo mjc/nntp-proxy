@@ -306,7 +306,11 @@ mod tests {
 
     fn expect_success_status(response: PipelineResponse) -> u16 {
         match response {
-            Ok(completed) => completed.status_code.as_u16(),
+            Ok(completed) => completed
+                .context
+                .response_status()
+                .expect("completed queued request records response status")
+                .as_u16(),
             other @ Err(_) => panic!("Expected Success, got {other:?}"),
         }
     }
@@ -730,10 +734,22 @@ mod tests {
         let first = rx1.await.unwrap().unwrap();
         let second = rx2.await.unwrap().unwrap();
 
-        assert_eq!(first.status_code.as_u16(), 223);
+        assert_eq!(
+            first
+                .context
+                .response_status()
+                .map(|status| status.as_u16()),
+            Some(223)
+        );
         assert_eq!(first.context.message_id(), Some("<a@b>"));
         assert_eq!(first.context.backend_id(), Some(backend_id));
-        assert_eq!(second.status_code.as_u16(), 430);
+        assert_eq!(
+            second
+                .context
+                .response_status()
+                .map(|status| status.as_u16()),
+            Some(430)
+        );
         assert_eq!(second.context.message_id(), Some("<c@d>"));
         assert_eq!(second.context.backend_id(), Some(backend_id));
     }
@@ -939,7 +955,10 @@ mod tests {
                 for (idx, result) in results.into_iter().enumerate() {
                     match result {
                         Ok(completed) => {
-                            prop_assert_eq!(completed.status_code.as_u16(), codes[idx]);
+                            prop_assert_eq!(
+                                completed.context.response_status().map(|status| status.as_u16()),
+                                Some(codes[idx])
+                            );
                             prop_assert_eq!(completed.data.to_vec(), responses[idx].clone());
                         }
                         other => prop_assert!(false, "expected success response, got {other:?}"),

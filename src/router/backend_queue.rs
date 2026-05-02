@@ -23,8 +23,6 @@ pub struct CompletedPipelineRequest {
     pub context: RequestContext,
     /// Complete response data (status line + multiline body if applicable).
     pub data: crate::pool::ChunkedResponse,
-    /// Parsed status code from the response.
-    pub status_code: crate::protocol::StatusCode,
 }
 
 /// Response sent back to a client session from the pipeline worker.
@@ -89,11 +87,9 @@ impl QueuedContext {
         let mut context = self.context;
         context.set_backend_id(backend_id);
         context.set_response_status(status_code);
-        let _ = self.client_return.send(Ok(CompletedPipelineRequest {
-            context,
-            data,
-            status_code,
-        }));
+        let _ = self
+            .client_return
+            .send(Ok(CompletedPipelineRequest { context, data }));
     }
 
     /// Complete this queued context with a queue/worker failure.
@@ -405,9 +401,8 @@ mod tests {
         assert_eq!(completed.context.backend_id(), Some(backend_id));
         assert_eq!(
             completed.context.response_status(),
-            Some(completed.status_code)
+            Some(crate::protocol::StatusCode::new(223))
         );
-        assert_eq!(completed.status_code.as_u16(), 223);
         assert!(completed.data.is_empty());
     }
 

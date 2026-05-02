@@ -551,7 +551,12 @@ impl ClientSession {
 
                         // Await response from the pipeline worker
                         match rx.await {
-                            Ok(Ok(completed)) if completed.status_code.as_u16() != 430 => {
+                            Ok(Ok(completed))
+                                if completed
+                                    .context
+                                    .response_status()
+                                    .is_some_and(|status| status.as_u16() != 430) =>
+                            {
                                 // Success - article found, return immediately
                                 completed
                                     .data
