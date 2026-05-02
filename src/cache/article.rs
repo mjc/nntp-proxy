@@ -979,7 +979,7 @@ impl ArticleCache {
                     entry.record_backend_missing(backend_id);
                     entry
                 } else {
-                    // First 430 for this article - create cache entry with minimal stub
+                    // First 430 for this article - create typed missing entry.
                     let mut entry = ArticleEntry::from_wire_response(b"430\r\n".to_vec());
                     entry.record_backend_missing(backend_id);
                     entry

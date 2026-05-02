@@ -417,7 +417,7 @@ impl HybridArticleCache {
     pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
 
-        // Get existing entry or create a minimal stub
+        // Get existing entry or create a typed missing entry.
         let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
             let mut updated = existing.value().clone();
             updated.record_backend_missing(backend_id);
