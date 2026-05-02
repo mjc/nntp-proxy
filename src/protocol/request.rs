@@ -263,6 +263,66 @@ pub struct RequestContext {
     response_payload: Option<crate::pool::ChunkedResponse>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLine<'a> {
+    kind: RequestKind,
+    verb: &'a [u8],
+    args: &'a [u8],
+    message_id: Option<(usize, usize)>,
+}
+
+impl<'a> RequestLine<'a> {
+    #[must_use]
+    pub fn parse(line: &'a [u8]) -> Self {
+        let bytes = trim_line_end(line);
+        let split = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+        let verb = &bytes[..split];
+        let args = if split < bytes.len() {
+            &bytes[split + 1..]
+        } else {
+            &[]
+        };
+
+        Self {
+            kind: classify_verb(verb),
+            verb,
+            args,
+            message_id: find_message_id(args),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RequestKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn verb(&self) -> &'a [u8] {
+        self.verb
+    }
+
+    #[must_use]
+    pub const fn args(&self) -> &'a [u8] {
+        self.args
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> Option<&str> {
+        let (start, end) = self.message_id?;
+        std::str::from_utf8(&self.args[start..end]).ok()
+    }
+
+    #[must_use]
+    pub fn request_wire_len(&self) -> RequestWireLen {
+        (self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2).into()
+    }
+
+    #[must_use]
+    pub fn route_class(&self) -> RequestRouteClass {
+        route_class(self.kind, self.message_id.is_some())
+    }
+}
+
 impl Clone for RequestContext {
     fn clone(&self) -> Self {
         debug_assert!(
@@ -658,40 +718,7 @@ impl RequestContext {
 
     #[must_use]
     pub fn route_class(&self) -> RequestRouteClass {
-        match self.kind {
-            RequestKind::Capabilities | RequestKind::Quit | RequestKind::AuthInfo => {
-                RequestRouteClass::Local
-            }
-            RequestKind::Post
-            | RequestKind::Ihave
-            | RequestKind::Check
-            | RequestKind::TakeThis
-            | RequestKind::StartTls => RequestRouteClass::Reject,
-            RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
-                if self.message_id.is_some() =>
-            {
-                RequestRouteClass::ArticleByMessageId
-            }
-            RequestKind::Article
-            | RequestKind::Body
-            | RequestKind::Head
-            | RequestKind::Stat
-            | RequestKind::Group
-            | RequestKind::ListGroup
-            | RequestKind::Last
-            | RequestKind::Next
-            | RequestKind::Over
-            | RequestKind::Xover
-            | RequestKind::Hdr
-            | RequestKind::Xhdr
-            | RequestKind::Unknown => RequestRouteClass::Stateful,
-            RequestKind::List
-            | RequestKind::Date
-            | RequestKind::Help
-            | RequestKind::Mode
-            | RequestKind::NewGroups
-            | RequestKind::NewNews => RequestRouteClass::Stateless,
-        }
+        route_class(self.kind, self.message_id.is_some())
     }
 
     #[must_use]
@@ -758,6 +785,43 @@ fn trim_line_end(mut line: &[u8]) -> &[u8] {
         line = &line[..line.len() - 1];
     }
     line
+}
+
+fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteClass {
+    match kind {
+        RequestKind::Capabilities | RequestKind::Quit | RequestKind::AuthInfo => {
+            RequestRouteClass::Local
+        }
+        RequestKind::Post
+        | RequestKind::Ihave
+        | RequestKind::Check
+        | RequestKind::TakeThis
+        | RequestKind::StartTls => RequestRouteClass::Reject,
+        RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
+            if has_message_id =>
+        {
+            RequestRouteClass::ArticleByMessageId
+        }
+        RequestKind::Article
+        | RequestKind::Body
+        | RequestKind::Head
+        | RequestKind::Stat
+        | RequestKind::Group
+        | RequestKind::ListGroup
+        | RequestKind::Last
+        | RequestKind::Next
+        | RequestKind::Over
+        | RequestKind::Xover
+        | RequestKind::Hdr
+        | RequestKind::Xhdr
+        | RequestKind::Unknown => RequestRouteClass::Stateful,
+        RequestKind::List
+        | RequestKind::Date
+        | RequestKind::Help
+        | RequestKind::Mode
+        | RequestKind::NewGroups
+        | RequestKind::NewNews => RequestRouteClass::Stateless,
+    }
 }
 
 fn classify_verb(verb: &[u8]) -> RequestKind {
@@ -863,6 +927,19 @@ mod tests {
         assert_eq!(ctx.response_wire_len(), None);
         assert!(ctx.is_pipelineable());
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[test]
+    fn borrowed_request_line_parses_without_owning_bytes() {
+        let bytes = b"ARTICLE <a@b>\r\n";
+        let parsed = RequestLine::parse(bytes);
+
+        assert_eq!(parsed.kind(), RequestKind::Article);
+        assert_eq!(parsed.verb(), b"ARTICLE");
+        assert_eq!(parsed.args(), b"<a@b>");
+        assert_eq!(parsed.message_id(), Some("<a@b>"));
+        assert_eq!(parsed.request_wire_len(), RequestWireLen::new(15));
+        assert_eq!(parsed.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
     #[tokio::test]
