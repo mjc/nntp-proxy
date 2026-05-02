@@ -279,13 +279,13 @@ fn stash_leftover(
 fn validate_response_prefix(
     response: &[u8],
     source: &'static str,
-) -> Result<(crate::protocol::StatusCode, bool), StreamingError> {
+) -> Result<crate::protocol::StatusCode, StreamingError> {
     let validated = crate::session::backend::validate_backend_response(
         response,
         response.len(),
         crate::protocol::MIN_RESPONSE_LENGTH,
     );
-    let status_code = validated.response.status_code().ok_or_else(|| {
+    validated.status_code.ok_or_else(|| {
         warn!(
             bytes_read = response.len(),
             first_bytes_hex = %crate::session::backend::format_hex_preview(response, 256),
@@ -294,8 +294,7 @@ fn validate_response_prefix(
             "Invalid status code in response"
         );
         StreamingError::Io(anyhow::anyhow!("Invalid status code in response"))
-    })?;
-    Ok((status_code, validated.response.is_multiline()))
+    })
 }
 
 async fn fill_multiline_response(
@@ -392,7 +391,7 @@ pub(crate) async fn read_full_response_for_request(
 
     let initial_len = io_buffer.initialized();
     let response = &io_buffer[..initial_len];
-    let (status_code, _) = validate_response_prefix(response, source)?;
+    let status_code = validate_response_prefix(response, source)?;
 
     if request.response_shape(status_code) == crate::protocol::ResponseShape::SingleLine {
         result_buf.extend_from_slice(pool, response);
@@ -423,7 +422,7 @@ pub(crate) async fn buffer_multiline_response(
 
     let mut io_buffer = ctx.buffer_pool.acquire().await;
     let mut captured = crate::pool::ChunkedResponse::default();
-    let _status_code = validate_response_prefix(first_chunk, "prefetched")?;
+    validate_response_prefix(first_chunk, "prefetched")?;
 
     let mut tail = TailBuffer::default();
     match tail.detect_terminator(first_chunk) {
