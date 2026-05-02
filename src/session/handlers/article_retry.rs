@@ -293,13 +293,30 @@ impl ClientSession {
             chunk.len(),
             crate::protocol::MIN_RESPONSE_LENGTH,
         );
-        let response_code = validated.response;
-        let is_multiline = response_code.status_code().is_some_and(|status| {
-            matches!(request.response_shape(status), ResponseShape::Multiline)
-        });
+        let Some(status_code) = validated.status_code else {
+            warn!(
+                client = %self.client_addr,
+                backend = ?backend_id,
+                request_kind = ?request.kind(),
+                request_verb = ?request.verb(),
+                response_index = idx + 1,
+                total_commands = batch.len(),
+                chunk_len = chunk.len(),
+                first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
+                first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
+                source = if from_leftover { "leftover" } else { "fresh_read" },
+                "Backend returned Invalid response during batch, aborting batch"
+            );
+
+            return Ok(BatchStep::BackendDead);
+        };
+        let is_multiline = matches!(
+            request.response_shape(status_code),
+            ResponseShape::Multiline
+        );
 
         // --- Handle 430 (article not found on this backend) ---
-        if response_code.is_430() {
+        if status_code.as_u16() == 430 {
             // Single-line 430: split at line boundary, saving the next response's prefix.
             if !is_multiline {
                 super::split_single_line_response(chunk_data, leftover);
@@ -318,25 +335,6 @@ impl ClientSession {
             self.metrics.record_error_4xx(backend_id);
             self.metrics.user_command(self.username());
             return Ok(BatchStep::Continue);
-        }
-
-        // --- Handle Invalid response ---
-        if response_code == crate::protocol::NntpResponse::Invalid {
-            warn!(
-                client = %self.client_addr,
-                backend = ?backend_id,
-                request_kind = ?request.kind(),
-                request_verb = ?request.verb(),
-                response_index = idx + 1,
-                total_commands = batch.len(),
-                chunk_len = chunk.len(),
-                first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
-                first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
-                source = if from_leftover { "leftover" } else { "fresh_read" },
-                "Backend returned Invalid response during batch, aborting batch"
-            );
-
-            return Ok(BatchStep::BackendDead);
         }
 
         // --- Success: stream response to client ---
@@ -412,15 +410,13 @@ impl ClientSession {
         // Record metrics
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
-        if let Some(status_code) = response_code.status_code() {
-            match determine_metrics_action(status_code.as_u16(), is_multiline) {
-                MetricsAction::Article => {
-                    self.metrics.record_article(backend_id, bytes_written);
-                }
-                MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
-                MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
-                MetricsAction::None => {}
+        match determine_metrics_action(status_code.as_u16(), is_multiline) {
+            MetricsAction::Article => {
+                self.metrics.record_article(backend_id, bytes_written);
             }
+            MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+            MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+            MetricsAction::None => {}
         }
 
         Ok(BatchStep::Continue)
