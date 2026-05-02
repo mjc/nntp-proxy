@@ -2,7 +2,7 @@
 
 use crate::auth::AuthHandler;
 use crate::command::AuthAction;
-use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
+use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata};
 use crate::types::BackendToClientBytes;
 
 use anyhow::Result;
@@ -104,8 +104,8 @@ where
 }
 
 fn local_response_metadata(response: &[u8]) -> RequestResponseMetadata {
-    let status = StatusCode::parse(response).expect("local NNTP response starts with status code");
-    RequestResponseMetadata::new(status, response.len().into())
+    RequestResponseMetadata::from_wire_response(response)
+        .expect("local NNTP response starts with status code")
 }
 
 fn auth_response_metadata(

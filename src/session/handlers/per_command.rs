@@ -8,7 +8,7 @@
 //! - [`command_execution`]: Single-backend command execution and response streaming
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
-use crate::protocol::{RequestContext, RequestResponseMetadata, StatusCode};
+use crate::protocol::{RequestContext, RequestResponseMetadata};
 use crate::session::common;
 use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
 use crate::session::{ClientSession, connection};
@@ -65,8 +65,9 @@ struct ProcessCommandParams<'a, 'b> {
 }
 
 fn record_local_wire_response(request: &mut RequestContext, response: &[u8]) {
-    let status = StatusCode::parse(response).expect("local NNTP response starts with status code");
-    request.record_local_response(RequestResponseMetadata::new(status, response.len().into()));
+    let response = RequestResponseMetadata::from_wire_response(response)
+        .expect("local NNTP response starts with status code");
+    request.record_local_response(response);
 }
 
 impl ClientSession {
