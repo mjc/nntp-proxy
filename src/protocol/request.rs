@@ -60,6 +60,27 @@ pub enum RequestCacheStatus {
     Miss,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ResponseWireLen(usize);
+
+impl ResponseWireLen {
+    #[must_use]
+    pub const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for ResponseWireLen {
+    fn from(value: usize) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     kind: RequestKind,
@@ -69,7 +90,7 @@ pub struct RequestContext {
     cache_status: Option<RequestCacheStatus>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
-    response_wire_len: Option<usize>,
+    response_wire_len: Option<ResponseWireLen>,
 }
 
 impl RequestContext {
@@ -149,7 +170,7 @@ impl RequestContext {
 
     #[inline]
     #[must_use]
-    pub const fn response_wire_len(&self) -> Option<usize> {
+    pub const fn response_wire_len(&self) -> Option<ResponseWireLen> {
         self.response_wire_len
     }
 
@@ -158,7 +179,7 @@ impl RequestContext {
         &mut self,
         backend_id: BackendId,
         status: StatusCode,
-        wire_len: usize,
+        wire_len: ResponseWireLen,
     ) {
         self.backend_id = Some(backend_id);
         self.response_status = Some(status);
@@ -170,7 +191,7 @@ impl RequestContext {
         &mut self,
         backend_id: BackendId,
         status: StatusCode,
-        wire_len: usize,
+        wire_len: ResponseWireLen,
     ) {
         self.cache_status = Some(RequestCacheStatus::Hit);
         self.backend_id = Some(backend_id);
@@ -402,11 +423,11 @@ mod tests {
         let backend_id = BackendId::from_index(2);
         let status = StatusCode::new(223);
 
-        ctx.record_backend_response(backend_id, status, 19);
+        ctx.record_backend_response(backend_id, status, ResponseWireLen::new(19));
 
         assert_eq!(ctx.backend_id(), Some(backend_id));
         assert_eq!(ctx.response_status(), Some(status));
-        assert_eq!(ctx.response_wire_len(), Some(19));
+        assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(19)));
         assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
     }
 
@@ -426,12 +447,12 @@ mod tests {
         let backend_id = BackendId::from_index(1);
         let status = StatusCode::new(221);
 
-        ctx.record_cache_response(backend_id, status, 24);
+        ctx.record_cache_response(backend_id, status, ResponseWireLen::new(24));
 
         assert_eq!(ctx.cache_status(), Some(RequestCacheStatus::Hit));
         assert_eq!(ctx.backend_id(), Some(backend_id));
         assert_eq!(ctx.response_status(), Some(status));
-        assert_eq!(ctx.response_wire_len(), Some(24));
+        assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(24)));
         assert_eq!(wire(&ctx), b"HEAD <a@b>\r\n");
     }
 

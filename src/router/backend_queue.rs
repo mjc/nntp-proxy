@@ -121,7 +121,7 @@ impl QueuedContext {
         backend_id: BackendId,
     ) {
         let mut context = self.context;
-        context.record_backend_response(backend_id, status_code, data.len());
+        context.record_backend_response(backend_id, status_code, data.len().into());
         let response = CompletedResponse::new(data);
         let _ = self
             .client_return
@@ -439,7 +439,10 @@ mod tests {
             completed.context.response_status(),
             Some(crate::protocol::StatusCode::new(223))
         );
-        assert_eq!(completed.context.response_wire_len(), Some(0));
+        assert_eq!(
+            completed.context.response_wire_len().map(|len| len.get()),
+            Some(0)
+        );
         assert!(completed.response.is_empty());
     }
 

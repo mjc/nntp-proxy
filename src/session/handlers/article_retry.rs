@@ -496,7 +496,7 @@ impl ClientSession {
                     .await
                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
                     {
-                        write.wire_len
+                        write.wire_len.get()
                     } else {
                         client_write
                             .write_all(crate::protocol::NO_SUCH_ARTICLE)
@@ -572,7 +572,7 @@ impl ClientSession {
                                     .response_wire_len()
                                     .expect("completed queued request records response size");
                                 *backend_to_client_bytes =
-                                    backend_to_client_bytes.add(response_wire_len);
+                                    backend_to_client_bytes.add(response_wire_len.get());
                                 *client_to_backend_bytes =
                                     client_to_backend_bytes.add(completed.context.wire_len());
                                 self.metrics.record_pipeline_complete();

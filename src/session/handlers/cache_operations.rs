@@ -5,7 +5,7 @@
 
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
-use crate::protocol::{RequestCacheStatus, RequestContext, StatusCode};
+use crate::protocol::{RequestCacheStatus, RequestContext, ResponseWireLen, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
@@ -126,7 +126,7 @@ impl ClientSession {
             request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));
         };
-        *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len);
+        *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len.get());
 
         let backend_id = router.route(self.client_id)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
@@ -194,7 +194,7 @@ impl ClientSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CachedResponseWrite {
     pub status: StatusCode,
-    pub wire_len: usize,
+    pub wire_len: ResponseWireLen,
 }
 
 fn cached_response_status_for_verb(verb: &[u8]) -> Option<StatusCode> {
@@ -247,7 +247,7 @@ where
         .expect("cached article response has typed status");
     Ok(Some(CachedResponseWrite {
         status,
-        wire_len: bytes_written,
+        wire_len: bytes_written.into(),
     }))
 }
 
@@ -402,7 +402,10 @@ mod tests {
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::Hit));
         assert_eq!(request.backend_id(), Some(backend_id));
         assert_eq!(request.response_status(), Some(StatusCode::new(220)));
-        assert_eq!(request.response_wire_len(), Some(expected.len()));
+        assert_eq!(
+            request.response_wire_len(),
+            Some(ResponseWireLen::new(expected.len()))
+        );
         assert_eq!(metrics, BackendToClientBytes::zero().add(expected.len()));
     }
 
