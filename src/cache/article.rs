@@ -96,6 +96,16 @@ pub enum CachedPayload {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CachedPayloadKind {
+    Missing,
+    AvailabilityOnly,
+    Article,
+    Head,
+    Body,
+    Stat,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CachedArticleResponse<'a> {
     status_line: StackStatusLine,
@@ -290,6 +300,18 @@ impl CachedPayload {
         };
         CachedPayloadLen::new(len)
     }
+
+    #[must_use]
+    pub const fn kind(&self) -> CachedPayloadKind {
+        match self {
+            Self::Missing => CachedPayloadKind::Missing,
+            Self::AvailabilityOnly => CachedPayloadKind::AvailabilityOnly,
+            Self::Article { .. } => CachedPayloadKind::Article,
+            Self::Head { .. } => CachedPayloadKind::Head,
+            Self::Body { .. } => CachedPayloadKind::Body,
+            Self::Stat { .. } => CachedPayloadKind::Stat,
+        }
+    }
 }
 
 /// Cache entry for an article.
@@ -401,6 +423,12 @@ impl ArticleEntry {
     #[must_use]
     pub const fn payload(&self) -> &CachedPayload {
         &self.payload
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn payload_kind(&self) -> CachedPayloadKind {
+        self.payload.kind()
     }
 
     /// Get status code from the response buffer

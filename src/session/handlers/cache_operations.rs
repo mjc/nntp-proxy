@@ -210,18 +210,20 @@ fn cache_entry_metadata(
         cache_availability_metadata(availability),
         RequestCacheTier::new(cached.tier().get()),
         RequestCacheTimestampMillis::new(cached.inserted_at().get()),
-        cache_payload_kind(cached.payload()),
+        cache_payload_kind(cached.payload_kind()),
     ))
 }
 
-fn cache_payload_kind(payload: &crate::cache::CachedPayload) -> RequestCachePayloadKind {
+fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCachePayloadKind {
     match payload {
-        crate::cache::CachedPayload::Missing => RequestCachePayloadKind::Missing,
-        crate::cache::CachedPayload::AvailabilityOnly => RequestCachePayloadKind::AvailabilityOnly,
-        crate::cache::CachedPayload::Article { .. } => RequestCachePayloadKind::Article,
-        crate::cache::CachedPayload::Head { .. } => RequestCachePayloadKind::Head,
-        crate::cache::CachedPayload::Body { .. } => RequestCachePayloadKind::Body,
-        crate::cache::CachedPayload::Stat { .. } => RequestCachePayloadKind::Stat,
+        crate::cache::CachedPayloadKind::Missing => RequestCachePayloadKind::Missing,
+        crate::cache::CachedPayloadKind::AvailabilityOnly => {
+            RequestCachePayloadKind::AvailabilityOnly
+        }
+        crate::cache::CachedPayloadKind::Article => RequestCachePayloadKind::Article,
+        crate::cache::CachedPayloadKind::Head => RequestCachePayloadKind::Head,
+        crate::cache::CachedPayloadKind::Body => RequestCachePayloadKind::Body,
+        crate::cache::CachedPayloadKind::Stat => RequestCachePayloadKind::Stat,
     }
 }
 
