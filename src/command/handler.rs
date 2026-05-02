@@ -124,13 +124,10 @@ impl CommandHandler {
     pub fn classify_request(request: &RequestContext) -> CommandAction<'_> {
         match request.kind() {
             RequestKind::AuthInfo => {
-                let args = request.args_str().unwrap_or("").trim();
-                if let Some(username) = strip_authinfo_arg(args, "USER") {
-                    CommandAction::InterceptAuth(AuthAction::RequestPassword(username.trim()))
-                } else if let Some(password) = strip_authinfo_arg(args, "PASS") {
-                    CommandAction::InterceptAuth(AuthAction::ValidateAndRespond {
-                        password: password.trim(),
-                    })
+                if let Some(username) = strip_authinfo_arg(request.args(), b"USER") {
+                    CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
+                } else if let Some(password) = strip_authinfo_arg(request.args(), b"PASS") {
+                    CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
                 } else {
                     CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
                 }
@@ -150,11 +147,30 @@ impl CommandHandler {
     }
 }
 
-fn strip_authinfo_arg<'a>(args: &'a str, subcommand: &str) -> Option<&'a str> {
-    let (head, tail) = args
-        .split_once(char::is_whitespace)
-        .map_or((args, ""), |(head, tail)| (head, tail));
-    head.eq_ignore_ascii_case(subcommand).then_some(tail)
+fn strip_authinfo_arg<'a>(args: &'a [u8], subcommand: &[u8]) -> Option<&'a str> {
+    let args = trim_ascii(args);
+    let split = args
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(args.len());
+    let head = &args[..split];
+    let tail = trim_ascii(args.get(split..).unwrap_or_default());
+
+    head.eq_ignore_ascii_case(subcommand)
+        .then(|| std::str::from_utf8(tail).ok())
+        .flatten()
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
 }
 
 #[cfg(test)]

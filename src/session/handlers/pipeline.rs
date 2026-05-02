@@ -238,7 +238,6 @@ mod tests {
             .expect("non-pipelineable command trails the ARTICLE batch");
         assert_eq!(trailing.kind(), RequestKind::Unknown);
         assert_eq!(trailing.args(), b"\xff");
-        assert_eq!(trailing.args_str(), None);
         assert_eq!(trailing.route_class(), RequestRouteClass::Stateful);
     }
 }

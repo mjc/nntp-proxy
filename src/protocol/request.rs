@@ -578,11 +578,6 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn args_str(&self) -> Option<&str> {
-        std::str::from_utf8(&self.args).ok()
-    }
-
-    #[must_use]
     pub fn message_id(&self) -> Option<&str> {
         let (start, end) = self.message_id?;
         std::str::from_utf8(&self.args[start..end]).ok()
@@ -818,7 +813,6 @@ mod tests {
         assert_eq!(ctx.kind(), RequestKind::Unknown);
         assert_eq!(ctx.verb(), b"XFOO");
         assert_eq!(ctx.args(), b"\xff");
-        assert_eq!(ctx.args_str(), None);
         assert_eq!(ctx.route_class(), RequestRouteClass::Stateful);
         assert_eq!(wire(&ctx), b"XFOO \xff\r\n");
     }
