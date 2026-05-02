@@ -193,7 +193,10 @@ impl ClientSession {
                     unreachable!("Reject decision must come from Reject action")
                 };
                 client_write.write_all(response.as_bytes()).await?;
-                record_local_wire_response(request, response.as_bytes());
+                request.record_local_response(RequestResponseMetadata::new(
+                    response.status(),
+                    response.len().into(),
+                ));
                 *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                 Ok(CommandResult::Continue {
                     auth_succeeded: false,

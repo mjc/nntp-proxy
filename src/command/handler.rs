@@ -17,7 +17,7 @@
 //!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
 //!   Used when a feature (e.g. stateful commands in per-command mode) is not supported
 
-use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
+use crate::protocol::{RequestContext, RequestKind, RequestRouteClass, StatusCode, codes};
 
 /// Action to take in response to a command
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,12 +26,75 @@ pub enum CommandAction<'a> {
     /// Intercept and send authentication response to client
     InterceptAuth(AuthAction<'a>),
     /// Reject the command with an error message (NNTP response format with CRLF)
-    Reject(&'static str),
+    Reject(RejectResponse),
     /// Forward the command to backend (stateless)
     ForwardStateless,
     /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list
     InterceptCapabilities,
 }
+
+/// Static local reject response with typed status metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectResponse {
+    status: u16,
+    wire: &'static str,
+}
+
+impl RejectResponse {
+    #[must_use]
+    pub const fn new(status: u16, wire: &'static str) -> Self {
+        Self { status, wire }
+    }
+
+    #[must_use]
+    pub fn status(self) -> StatusCode {
+        StatusCode::new(self.status)
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.wire
+    }
+
+    #[must_use]
+    pub const fn as_bytes(self) -> &'static [u8] {
+        self.wire.as_bytes()
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.wire.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.wire.is_empty()
+    }
+}
+
+impl std::ops::Deref for RejectResponse {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.wire
+    }
+}
+
+impl std::fmt::Display for RejectResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.wire.fmt(f)
+    }
+}
+
+const POST_REJECT: RejectResponse = RejectResponse::new(440, "440 Posting not permitted\r\n");
+const TRANSIT_REJECT: RejectResponse = RejectResponse::new(
+    codes::FEATURE_NOT_SUPPORTED,
+    "503 Feature not supported in per-command routing mode\r\n",
+);
+const STATEFUL_REJECT: RejectResponse = RejectResponse::new(
+    codes::FEATURE_NOT_SUPPORTED,
+    "503 Feature not supported in stateless proxy mode\r\n",
+);
 
 /// Specific authentication action
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,20 +129,14 @@ impl CommandHandler {
                 }
             }
             RequestKind::Capabilities => CommandAction::InterceptCapabilities,
-            RequestKind::Post => CommandAction::Reject("440 Posting not permitted\r\n"),
-            RequestKind::Ihave => {
-                CommandAction::Reject("503 Feature not supported in per-command routing mode\r\n")
-            }
+            RequestKind::Post => CommandAction::Reject(POST_REJECT),
+            RequestKind::Ihave => CommandAction::Reject(TRANSIT_REJECT),
             _ => match request.route_class() {
                 RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
                     CommandAction::ForwardStateless
                 }
-                RequestRouteClass::Stateful => {
-                    CommandAction::Reject("503 Feature not supported in stateless proxy mode\r\n")
-                }
-                RequestRouteClass::Reject => CommandAction::Reject(
-                    "503 Feature not supported in per-command routing mode\r\n",
-                ),
+                RequestRouteClass::Stateful => CommandAction::Reject(STATEFUL_REJECT),
+                RequestRouteClass::Reject => CommandAction::Reject(TRANSIT_REJECT),
                 RequestRouteClass::Local => CommandAction::ForwardStateless,
             },
         }
@@ -409,12 +466,9 @@ mod tests {
         let unknown_commands = ["INVALIDCOMMAND", "XYZABC", "RANDOM DATA", "12345"];
 
         assert!(
-            unknown_commands.iter().all(|cmd| {
-                matches!(
-                    classify(cmd),
-                    CommandAction::Reject("503 Feature not supported in stateless proxy mode\r\n")
-                )
-            }),
+            unknown_commands
+                .iter()
+                .all(|cmd| { matches!(classify(cmd), CommandAction::Reject(STATEFUL_REJECT)) }),
             "All unknown commands should be rejected from stateless routing"
         );
     }
@@ -584,6 +638,19 @@ mod tests {
             response.starts_with("503 "),
             "IHAVE should return 503, got: {response}"
         );
+    }
+
+    #[test]
+    fn reject_actions_expose_typed_status_codes() {
+        let CommandAction::Reject(response) = classify("GROUP alt.test") else {
+            panic!("Expected Reject");
+        };
+        assert_eq!(response.status().as_u16(), 503);
+
+        let CommandAction::Reject(response) = classify("POST") else {
+            panic!("Expected Reject");
+        };
+        assert_eq!(response.status().as_u16(), 440);
     }
 
     #[test]
