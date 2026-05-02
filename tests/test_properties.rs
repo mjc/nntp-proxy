@@ -12,7 +12,7 @@
 
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, effective_ttl};
-use nntp_proxy::protocol::{RequestContext, RequestRouteClass, StatusCode};
+use nntp_proxy::protocol::{NntpResponse, RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::types::MessageId;
 use proptest::prelude::*;
 
@@ -446,8 +446,6 @@ proptest! {
 // 7. NntpResponse::parse - Consistency properties
 // =============================================================================
 
-use nntp_proxy::protocol::NntpResponse;
-
 proptest! {
     #[test]
     fn prop_nntp_response_parse_never_panics(data in prop::collection::vec(any::<u8>(), 0..100)) {
@@ -488,20 +486,18 @@ proptest! {
     }
 
     #[test]
-    fn prop_nntp_response_multiline_consistency(code in 100u16..=599u16) {
+    fn prop_nntp_response_multiline_is_response_categorization(code in 100u16..=599u16) {
         let formatted = format!("{code:03} text\r\n");
         let response = NntpResponse::parse(formatted.as_bytes());
 
-        if let Some(sc) = StatusCode::parse(formatted.as_bytes()) {
-            // NntpResponse.is_multiline() should agree with StatusCode.is_multiline()
-            // EXCEPT for special codes that NntpResponse categorizes differently
-            // (200, 201 as Greeting; 205 as Disconnect; 281 as AuthSuccess; 381/480 as AuthRequired)
-            let special = matches!(code, 200 | 201 | 205 | 281 | 381 | 480);
-            if !special {
-                prop_assert_eq!(response.is_multiline(), sc.is_multiline(),
-                    "Multiline consistency for code {}: response={}, statuscode={}",
-                    code, response.is_multiline(), sc.is_multiline());
-            }
+        if StatusCode::parse(formatted.as_bytes()).is_some() {
+            let expected = matches!(
+                code,
+                100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231 | 282 | 288
+            );
+            prop_assert_eq!(response.is_multiline(), expected,
+                "Multiline categorization mismatch for code {}: response={}",
+                code, response.is_multiline());
         }
     }
 
@@ -765,12 +761,9 @@ proptest! {
         let data = response.as_bytes();
         let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
-        prop_assert_ne!(
-            validated.response,
-            nntp_proxy::protocol::NntpResponse::Invalid,
-            "Valid NNTP response '{}' should not be classified as Invalid", response
-        );
-        let status = validated.response.status_code().unwrap();
+        let status = validated
+            .status_code
+            .expect("valid NNTP response should parse status code");
         prop_assert_eq!(status.as_u16(), code,
             "Parsed status code should match generated code");
     }
@@ -805,8 +798,14 @@ proptest! {
         let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
         // Should be multiline for 220/221/222
-        prop_assert!(validated.response.is_multiline(),
-            "Code {code} should be detected as multiline");
+        prop_assert_eq!(
+            validated.status_code.map(|status| status.as_u16()),
+            Some(code),
+            "Code {} should parse as backend status",
+            code
+        );
+        prop_assert!(NntpResponse::parse(data).is_multiline(),
+            "Code {} should be categorized as multiline", code);
 
         // Terminator detection should find the real terminator, not a false positive
         use nntp_proxy::session::streaming::tail_buffer::TailBuffer;

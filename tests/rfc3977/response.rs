@@ -166,21 +166,20 @@ fn test_response_383_sasl_continue() {
 fn test_response_100_help_text() {
     let code = StatusCode::new(100);
     assert!(code.is_informational());
-    assert!(code.is_multiline());
+    assert!(NntpResponse::parse(b"100 Help\r\n").is_multiline());
 }
 
 #[test]
 fn test_response_101_capability_list() {
     let code = StatusCode::new(101);
     assert!(code.is_informational());
-    assert!(code.is_multiline());
+    assert!(NntpResponse::parse(b"101 Capability list\r\n").is_multiline());
 }
 
 #[test]
 fn test_response_111_server_date() {
     let code = StatusCode::new(111);
     assert!(code.is_informational());
-    assert!(!code.is_multiline());
     assert!(!NntpResponse::parse(b"111 20260501173336\r\n").is_multiline());
 }
 
@@ -414,26 +413,26 @@ fn test_response_status_code_extraction() {
     assert_eq!(NntpResponse::Invalid.status_code(), None);
 }
 
-// Multiline status code detection on StatusCode itself
+// Multiline classification remains response categorization, not a StatusCode property.
 
 #[test]
-fn test_status_code_multiline_detection() {
+fn test_response_multiline_detection() {
     // HELP and CAPABILITIES are multiline, but DATE is single-line.
-    assert!(StatusCode::new(100).is_multiline());
-    assert!(StatusCode::new(101).is_multiline());
-    assert!(!StatusCode::new(111).is_multiline());
-    assert!(!StatusCode::new(199).is_multiline());
+    assert!(NntpResponse::parse(b"100 Help\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"101 Capability list\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"199 Other informational\r\n").is_multiline());
 
     // Specific 2xx multiline codes
-    assert!(StatusCode::new(220).is_multiline());
-    assert!(StatusCode::new(221).is_multiline());
-    assert!(StatusCode::new(222).is_multiline());
+    assert!(NntpResponse::parse(b"220 Article\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"221 Headers\r\n").is_multiline());
+    assert!(NntpResponse::parse(b"222 Body\r\n").is_multiline());
 
     // Non-multiline
-    assert!(!StatusCode::new(200).is_multiline());
-    assert!(!StatusCode::new(211).is_multiline());
-    assert!(!StatusCode::new(400).is_multiline());
-    assert!(!StatusCode::new(500).is_multiline());
+    assert!(!NntpResponse::parse(b"200 Posting allowed\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"211 Group selected\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"400 Temporary failure\r\n").is_multiline());
+    assert!(!NntpResponse::parse(b"500 Syntax error\r\n").is_multiline());
 }
 
 // Response with multiline content
