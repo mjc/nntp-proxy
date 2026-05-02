@@ -159,6 +159,8 @@ pub struct BackendResponse {
     pub bytes_read: usize,
     /// Parsed NNTP response
     pub response: NntpResponse,
+    /// Parsed status code, if present
+    pub status_code: Option<StatusCode>,
     /// Whether this is a multiline response
     pub is_multiline: bool,
     /// Any validation warnings
@@ -169,8 +171,8 @@ impl BackendResponse {
     /// Get status code if valid
     #[inline]
     #[must_use]
-    pub fn status_code(&self) -> Option<crate::protocol::StatusCode> {
-        self.response.status_code()
+    pub const fn status_code(&self) -> Option<StatusCode> {
+        self.status_code
     }
 
     /// Log validation warnings with context
@@ -281,8 +283,7 @@ where
 
     let validated = validate_backend_response(&buffer[..total], total, min_len);
     let is_multiline = validated
-        .response
-        .status_code()
+        .status_code
         .is_some_and(|status| matches!(request.response_shape(status), ResponseShape::Multiline));
 
     let elapsed = start.elapsed();
@@ -291,6 +292,7 @@ where
         BackendResponse {
             bytes_read: total,
             response: validated.response,
+            status_code: validated.status_code,
             is_multiline,
             warnings: validated.warnings,
         },
@@ -433,6 +435,7 @@ mod tests {
         let response = BackendResponse {
             bytes_read: 20,
             response: NntpResponse::parse(b"430 No such article\r\n"),
+            status_code: Some(StatusCode::new(430)),
             is_multiline: false,
             warnings: SmallVec::new(),
         };
@@ -442,6 +445,7 @@ mod tests {
         let response = BackendResponse {
             bytes_read: 30,
             response: NntpResponse::parse(b"220 0 <msg@example.com>\r\n"),
+            status_code: Some(StatusCode::new(220)),
             is_multiline: true,
             warnings: SmallVec::new(),
         };
@@ -453,6 +457,7 @@ mod tests {
         let response = BackendResponse {
             bytes_read: 10,
             response: NntpResponse::parse(b"211 Group\r\n"),
+            status_code: Some(StatusCode::new(211)),
             is_multiline: false,
             warnings: SmallVec::new(),
         };
