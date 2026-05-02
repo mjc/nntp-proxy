@@ -87,7 +87,7 @@ impl ClientSession {
         BR: tokio::io::AsyncRead + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
-        let mut line = String::with_capacity(COMMAND);
+        let mut line = Vec::with_capacity(COMMAND);
 
         loop {
             line.clear();
@@ -100,7 +100,7 @@ impl ClientSession {
 
             tokio::select! {
                 // Client → Backend
-                result = client_reader.read_line(&mut line) => {
+                result = client_reader.read_until(b'\n', &mut line) => {
                     match result {
                         Ok(0) => break, // Client disconnected
                         Ok(_) => {
@@ -111,7 +111,7 @@ impl ClientSession {
                                 state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
                                 continue;
                             }
-                            let request = RequestContext::from_request_bytes(line.as_bytes());
+                            let request = RequestContext::from_request_bytes(&line);
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
@@ -130,7 +130,7 @@ impl ClientSession {
                                     );
                                 } else {
                                     // Hot path: forward directly
-                                    backend_write.write_all(line.as_bytes()).await?;
+                                    backend_write.write_all(&line).await?;
                                     state.add_client_to_backend(line.len());
                                 }
                             } else {
@@ -360,6 +360,54 @@ mod tests {
             b"AUTHINFO USER test\r\n".len() as u64,
             "AUTHINFO should be forwarded when auth is disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stateful_loop_forwards_non_utf8_command_bytes() {
+        let session = test_session();
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false);
+        let command = b"XFOO \xff\r\n";
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+
+        let backend = tokio::spawn(async move {
+            let mut backend_end = backend_end;
+            let mut buf = [0u8; 64];
+            let n = tokio::io::AsyncReadExt::read(&mut backend_end, &mut buf)
+                .await
+                .unwrap();
+            let _ = captured_tx.send(buf[..n].to_vec());
+        });
+
+        client_end.write_all(command).await.unwrap();
+        drop(client_end);
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.run_stateful_proxy_loop(
+                client_reader,
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                state,
+                backend_id,
+            ),
+        )
+        .await
+        .expect("test timed out")
+        .unwrap();
+
+        backend.await.unwrap();
+
+        assert_eq!(captured_rx.await.unwrap(), command);
+        assert_eq!(result.client_to_backend.as_u64(), command.len() as u64);
     }
 
     #[tokio::test]
