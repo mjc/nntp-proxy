@@ -112,7 +112,7 @@ mod cache_buffer_status {
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn vec_status_code(bencher: Bencher) {
-        let buffer = CacheBuffer::Vec(b"220 42 <bench@example.com>\r\nBody\r\n.\r\n".to_vec());
+        let buffer = CacheBuffer::from(b"220 42 <bench@example.com>\r\nBody\r\n.\r\n".to_vec());
         bencher.bench(|| black_box(black_box(&buffer).status_code()));
     }
 

@@ -356,7 +356,7 @@ impl ArticleEntry {
         tier: ttl::CacheTier,
     ) -> Self {
         match buffer {
-            super::CacheBuffer::Vec(buffer) => Self::from_wire_response_with_tier(buffer, tier),
+            super::CacheBuffer::Boxed(buffer) => Self::from_wire_response_with_tier(buffer, tier),
             super::CacheBuffer::Pooled(buffer) => {
                 Self::from_wire_response_with_tier(buffer.as_ref(), tier)
             }

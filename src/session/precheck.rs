@@ -190,7 +190,7 @@ async fn execute_backend_query(
             } else if deps.cache_articles {
                 let mut response = Vec::with_capacity(cmd_response.bytes_read);
                 response.extend_from_slice(&buffer[..cmd_response.bytes_read]);
-                PrecheckHit::Payload(crate::cache::CacheBuffer::Vec(response))
+                PrecheckHit::Payload(crate::cache::CacheBuffer::from(response))
             } else {
                 PrecheckHit::Availability(status_code)
             };
@@ -450,7 +450,7 @@ mod tests {
             found,
             Some((
                 BackendId::from_index(1),
-                PrecheckHit::Payload(crate::cache::CacheBuffer::Vec(b"first".to_vec()))
+                PrecheckHit::Payload(crate::cache::CacheBuffer::from(b"first".to_vec()))
             ))
         );
         assert!(avail.is_missing(BackendId::from_index(0)));

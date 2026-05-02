@@ -38,7 +38,7 @@ use smallvec::SmallVec;
 /// flattening into a fresh `Vec<u8>` before spawning cache work.
 #[derive(Debug)]
 pub enum CacheBuffer {
-    Vec(Vec<u8>),
+    Boxed(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
     Chunked(crate::pool::ChunkedResponse),
     Small(SmallVec<[u8; 128]>),
@@ -48,7 +48,7 @@ impl CacheBuffer {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Vec(buf) => buf.len(),
+            Self::Boxed(buf) => buf.len(),
             Self::Pooled(buf) => buf.len(),
             Self::Chunked(buf) => buf.len(),
             Self::Small(buf) => buf.len(),
@@ -63,7 +63,7 @@ impl CacheBuffer {
     #[must_use]
     pub fn status_code(&self) -> Option<StatusCode> {
         match self {
-            Self::Vec(buf) => StatusCode::parse(buf),
+            Self::Boxed(buf) => StatusCode::parse(buf),
             Self::Pooled(buf) => StatusCode::parse(buf.as_ref()),
             Self::Chunked(buf) => {
                 let mut prefix = SmallVec::<[u8; 128]>::new();
@@ -79,7 +79,7 @@ impl PartialEq for CacheBuffer {
     fn eq(&self, other: &Self) -> bool {
         fn chunks<'a>(buf: &'a CacheBuffer) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             match buf {
-                CacheBuffer::Vec(v) => Box::new(std::iter::once(v.as_slice())),
+                CacheBuffer::Boxed(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheBuffer::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheBuffer::Chunked(v) => Box::new(v.iter_chunks()),
                 CacheBuffer::Small(v) => Box::new(std::iter::once(v.as_slice())),
@@ -100,7 +100,7 @@ impl Eq for CacheBuffer {}
 
 impl From<Vec<u8>> for CacheBuffer {
     fn from(value: Vec<u8>) -> Self {
-        Self::Vec(value)
+        Self::Boxed(value.into_boxed_slice())
     }
 }
 
@@ -126,7 +126,7 @@ impl From<&[u8]> for CacheBuffer {
     fn from(value: &[u8]) -> Self {
         let small = SmallVec::<[u8; 128]>::from_slice(value);
         if small.spilled() {
-            Self::Vec(value.to_vec())
+            Self::Boxed(value.into())
         } else {
             Self::Small(small)
         }
@@ -153,7 +153,7 @@ mod tests {
         let small = SmallVec::<[u8; 128]>::from_slice(bytes);
 
         assert_eq!(
-            CacheBuffer::Vec(bytes.to_vec()),
+            CacheBuffer::Boxed(bytes.to_vec().into_boxed_slice()),
             CacheBuffer::Pooled(pooled)
         );
         assert_eq!(CacheBuffer::Chunked(chunked), CacheBuffer::Small(small));
@@ -175,7 +175,7 @@ mod tests {
         let small = SmallVec::<[u8; 128]>::from_slice(bytes);
 
         assert_eq!(
-            CacheBuffer::Vec(bytes.to_vec()).status_code(),
+            CacheBuffer::Boxed(bytes.to_vec().into_boxed_slice()).status_code(),
             Some(StatusCode::new(220))
         );
         assert_eq!(
@@ -198,6 +198,14 @@ mod tests {
 
         assert!(matches!(buffer, CacheBuffer::Small(_)));
         assert_eq!(buffer.status_code(), Some(StatusCode::new(223)));
+    }
+
+    #[test]
+    fn cache_buffer_from_vec_stores_tight_owned_slice() {
+        let buffer = CacheBuffer::from(Vec::from(&b"220 1 <tight@example>\r\n.\r\n"[..]));
+
+        assert!(matches!(buffer, CacheBuffer::Boxed(_)));
+        assert_eq!(buffer.status_code(), Some(StatusCode::new(220)));
     }
 
     #[tokio::test]
