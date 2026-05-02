@@ -64,7 +64,6 @@ struct ProcessCommandParams<'a, 'b> {
     auth_username: &'a mut Option<String>,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
-    last_command: &'a mut String,
 }
 
 impl ClientSession {
@@ -228,7 +227,6 @@ impl ClientSession {
             auth_username,
             client_to_backend_bytes,
             backend_to_client_bytes,
-            last_command,
         } = params;
 
         // Handle QUIT locally
@@ -239,14 +237,10 @@ impl ClientSession {
             return Ok(SingleCommandResult::Quit);
         }
 
-        // Update last_command buffer (used for switch-to-stateful)
-        last_command.clear();
-        last_command.push_str(command);
-
         // Execute command decision
         match self
             .execute_command_decision(CommandExecutionParams {
-                command: last_command,
+                command,
                 request,
                 skip_auth_check,
                 router,
@@ -298,9 +292,6 @@ impl ClientSession {
         // PERFORMANCE: Cache authenticated state to avoid atomic loads after auth succeeds
         // If auth is disabled, skip checks from the start
         let mut skip_auth_check = !self.auth_handler.is_enabled();
-
-        // Track last command for switch-to-stateful (needs to be outside loop for borrow checker)
-        let mut last_command = String::new();
 
         // Accumulator buffers for zero-alloc batching (hoisted to session scope, reused across batches)
         let mut batch_buf = String::with_capacity(512 * 4); // ~2KB for typical 4-command batch
@@ -427,7 +418,6 @@ impl ClientSession {
                                 auth_username: &mut auth_username,
                                 client_to_backend_bytes,
                                 backend_to_client_bytes: &mut backend_to_client_bytes,
-                                last_command: &mut last_command,
                             })
                             .await?
                         {
@@ -442,7 +432,7 @@ impl ClientSession {
                                     .switch_to_stateful_mode(
                                         client_reader,
                                         client_write,
-                                        &last_command,
+                                        request,
                                         client_to_backend_bytes.into(),
                                         backend_to_client_bytes.into(),
                                     )
@@ -495,7 +485,6 @@ impl ClientSession {
                         auth_username: &mut auth_username,
                         client_to_backend_bytes,
                         backend_to_client_bytes: &mut backend_to_client_bytes,
-                        last_command: &mut last_command,
                     })
                     .await?
                 {
@@ -512,7 +501,7 @@ impl ClientSession {
                             .switch_to_stateful_mode(
                                 client_reader,
                                 client_write,
-                                &last_command,
+                                trailing_context.expect("valid trailing command has context"),
                                 client_to_backend_bytes.into(),
                                 backend_to_client_bytes.into(),
                             )
