@@ -468,7 +468,7 @@ impl ClientSession {
     fn maybe_cache_upsert_buffer(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        data: crate::cache::CacheBuffer,
+        data: crate::cache::CacheIngestBytes,
         backend_id: BackendId,
     ) {
         if let Some(msg_id_ref) = msg_id {

@@ -216,13 +216,13 @@ fn test_is_expired_future_timestamp() {
 
 #[test]
 fn test_article_entry_tier_default() {
-    let entry = ArticleEntry::from_wire_response(b"220 0 <test@example.com>\r\n.\r\n");
+    let entry = ArticleEntry::from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
     assert_eq!(entry.tier().get(), 0);
 }
 
 #[test]
 fn test_article_entry_with_tier() {
-    let entry = ArticleEntry::from_wire_response_with_tier(
+    let entry = ArticleEntry::from_response_bytes_with_tier(
         b"220 0 <test@example.com>\r\n.\r\n",
         CacheTier::new(3),
     );
@@ -231,7 +231,7 @@ fn test_article_entry_with_tier() {
 
 #[test]
 fn test_article_entry_set_tier() {
-    let mut entry = ArticleEntry::from_wire_response(b"220 0 <test@example.com>\r\n.\r\n");
+    let mut entry = ArticleEntry::from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
     assert_eq!(entry.tier().get(), 0);
 
     entry.set_tier(CacheTier::new(5));
@@ -241,9 +241,9 @@ fn test_article_entry_set_tier() {
 #[test]
 fn test_article_entry_is_expired_uses_tier() {
     let entry_tier_0 =
-        ArticleEntry::from_wire_response_with_tier(b"220 test\r\n.\r\n", CacheTier::new(0));
+        ArticleEntry::from_response_bytes_with_tier(b"220 test\r\n.\r\n", CacheTier::new(0));
     let entry_tier_1 =
-        ArticleEntry::from_wire_response_with_tier(b"220 test\r\n.\r\n", CacheTier::new(1));
+        ArticleEntry::from_response_bytes_with_tier(b"220 test\r\n.\r\n", CacheTier::new(1));
 
     // With a very short TTL, tier 0 might expire but tier 1 has 2x
     // Just verify the method exists and uses tier

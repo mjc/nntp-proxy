@@ -7,7 +7,7 @@
 //! Run with: cargo bench --bench cache_ingest_semantic
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleCache, ArticleEntry, CacheBuffer};
+use nntp_proxy::cache::{ArticleCache, ArticleEntry, CacheIngestBytes};
 use nntp_proxy::pool::{BufferPool, ChunkedResponse};
 use nntp_proxy::types::BufferSize;
 use nntp_proxy::types::{BackendId, MessageId};
@@ -56,7 +56,7 @@ mod semantic_ingest {
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
                     .bench(|| {
-                        black_box(ArticleEntry::from_wire_response(black_box(
+                        black_box(ArticleEntry::from_response_bytes(black_box(
                             bytes.as_slice(),
                         )))
                     });
@@ -75,7 +75,7 @@ mod semantic_ingest {
 
 mod cache_upsert {
     use super::{
-        ArticleCache, BackendId, Bencher, CacheBuffer, Duration, MessageId, article_response,
+        ArticleCache, BackendId, Bencher, CacheIngestBytes, Duration, MessageId, article_response,
         black_box, chunked_response,
     };
 
@@ -96,7 +96,7 @@ mod cache_upsert {
                     cache
                         .upsert(
                             msg_id,
-                            CacheBuffer::Chunked(response),
+                            CacheIngestBytes::Chunked(response),
                             BackendId::from_index(0),
                             0.into(),
                         )
@@ -107,18 +107,20 @@ mod cache_upsert {
 }
 
 mod cache_buffer_status {
-    use super::{CacheBuffer, SmallVec, black_box, chunked_response};
+    use super::{CacheIngestBytes, SmallVec, black_box, chunked_response};
     use divan::Bencher;
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn vec_status_code(bencher: Bencher) {
-        let buffer = CacheBuffer::from(b"220 42 <bench@example.com>\r\nBody\r\n.\r\n".to_vec());
+        let buffer =
+            CacheIngestBytes::from(b"220 42 <bench@example.com>\r\nBody\r\n.\r\n".to_vec());
         bencher.bench(|| black_box(black_box(&buffer).status_code()));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn small_status_code(bencher: Bencher) {
-        let buffer = CacheBuffer::Small(SmallVec::from_slice(b"223 42 <bench@example.com>\r\n"));
+        let buffer =
+            CacheIngestBytes::Small(SmallVec::from_slice(b"223 42 <bench@example.com>\r\n"));
         bencher.bench(|| black_box(black_box(&buffer).status_code()));
     }
 
@@ -126,7 +128,7 @@ mod cache_buffer_status {
     fn chunked_status_code_split(bencher: Bencher) {
         let response =
             chunked_response(&[b"2", b"20", b" 42 <bench@example.com>\r\nBody\r\n.\r\n"]);
-        let buffer = CacheBuffer::Chunked(response);
+        let buffer = CacheIngestBytes::Chunked(response);
         bencher.bench(|| black_box(black_box(&buffer).status_code()));
     }
 }

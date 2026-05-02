@@ -197,7 +197,7 @@ fn test_response_parts_for_command_body_from_article_allocates_nothing() {
 
 #[test]
 fn test_response_parts_exposes_typed_status() {
-    let entry = ArticleEntry::from_wire_response(
+    let entry = ArticleEntry::from_response_bytes(
         b"220 42 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
     );
 
@@ -253,7 +253,7 @@ fn test_response_for_command_stat_from_head() {
 
 #[test]
 fn test_response_for_command_430_returns_none_for_stat() {
-    let entry = ArticleEntry::from_wire_response(b"430 No Such Article\r\n");
+    let entry = ArticleEntry::from_response_bytes(b"430 No Such Article\r\n");
 
     assert_no_article_response(&entry, b"STAT");
 }
@@ -299,7 +299,7 @@ fn test_response_for_command_head_cannot_serve_body() {
 fn test_response_for_command_validates_buffer() {
     // Create an invalid buffer (missing .\r\n terminator)
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_response_bytes(buffer);
 
     // Should return None because buffer fails validation
     assert_no_article_response(&entry, b"ARTICLE");
@@ -308,7 +308,7 @@ fn test_response_for_command_validates_buffer() {
 #[test]
 fn test_response_for_command_empty_message_id() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_response_bytes(buffer);
 
     // STAT with minimal message ID <x> should still work
     let msg_id = MessageId::from_borrowed("<x>").unwrap();
@@ -412,7 +412,7 @@ fn test_availability_from_bits_roundtrip() {
 #[test]
 fn test_article_entry_set_availability() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::from_wire_response(buffer);
+    let mut entry = ArticleEntry::from_response_bytes(buffer);
 
     // Initially no availability info
     assert!(!entry.has_availability_info());
@@ -434,7 +434,7 @@ fn test_article_entry_set_availability() {
 #[test]
 fn test_article_entry_set_availability_overwrites() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::from_wire_response(buffer);
+    let mut entry = ArticleEntry::from_response_bytes(buffer);
 
     // Set initial availability
     let mut avail1 = ArticleAvailability::new();
@@ -543,7 +543,7 @@ fn test_cache_config_without_disk() {
 fn test_response_validation_rejects_short_buffer() {
     // Buffer too short (< 9 bytes)
     let buffer = b"220 ok".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_response_bytes(buffer);
 
     // Should fail validation and return None
     assert_no_article_response(&entry, b"ARTICLE");
@@ -553,7 +553,7 @@ fn test_response_validation_rejects_short_buffer() {
 fn test_response_validation_rejects_missing_terminator() {
     // Buffer missing .\r\n terminator
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_response_bytes(buffer);
 
     assert_no_article_response(&entry, b"ARTICLE");
 }
@@ -563,7 +563,7 @@ fn test_response_validation_rejects_non_digit_start() {
     // Buffer not starting with digits - but this won't even parse as valid status code
     // So we test with a valid-looking but corrupted buffer
     let buffer = b"ABC 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer);
+    let entry = ArticleEntry::from_response_bytes(buffer);
 
     assert_no_article_response(&entry, b"ARTICLE");
 }
@@ -573,7 +573,7 @@ fn test_response_validation_accepts_valid_buffer() {
     // Valid buffer passes validation
     let buffer =
         b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content here\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_wire_response(buffer.clone());
+    let entry = ArticleEntry::from_response_bytes(buffer.clone());
 
     assert_article_response(&entry, b"ARTICLE", &buffer);
 }
@@ -593,11 +593,11 @@ fn make_430_stub_buffer() -> Vec<u8> {
 }
 
 fn hybrid_article() -> HybridArticleEntry {
-    HybridArticleEntry::from_wire_response(make_valid_article_buffer()).unwrap()
+    HybridArticleEntry::from_response_bytes(make_valid_article_buffer()).unwrap()
 }
 
 fn hybrid_missing() -> HybridArticleEntry {
-    HybridArticleEntry::from_wire_response(make_430_stub_buffer()).unwrap()
+    HybridArticleEntry::from_response_bytes(make_430_stub_buffer()).unwrap()
 }
 
 fn record_missing(entry: &mut HybridArticleEntry, backends: &[usize]) {
@@ -774,7 +774,7 @@ fn test_hybrid_entry_response_for_command_430_returns_none() {
 fn test_hybrid_entry_invalid_status_code_rejected() {
     // 200 is not a valid article response code
     let buffer = b"200 server ready\r\n".to_vec();
-    let entry = HybridArticleEntry::from_wire_response(buffer);
+    let entry = HybridArticleEntry::from_response_bytes(buffer);
 
     // Should reject invalid status codes
     assert!(entry.is_none());
@@ -784,11 +784,11 @@ fn test_hybrid_entry_invalid_status_code_rejected() {
 fn test_hybrid_entry_valid_status_codes() {
     // Valid codes: 220 (ARTICLE), 221 (HEAD), 222 (BODY), 223 (STAT), 430 (not found)
     let valid_220 =
-        HybridArticleEntry::from_wire_response(b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n");
-    let valid_221 = HybridArticleEntry::from_wire_response(b"221 0 <id>\r\nH: V\r\n.\r\n");
-    let valid_222 = HybridArticleEntry::from_wire_response(b"222 0 <id>\r\nBody\r\n.\r\n");
-    let valid_223 = HybridArticleEntry::from_wire_response(b"223 0 <id>\r\n");
-    let valid_430 = HybridArticleEntry::from_wire_response(b"430 No article\r\n");
+        HybridArticleEntry::from_response_bytes(b"220 0 <id>\r\nH: V\r\n\r\nBody\r\n.\r\n");
+    let valid_221 = HybridArticleEntry::from_response_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n");
+    let valid_222 = HybridArticleEntry::from_response_bytes(b"222 0 <id>\r\nBody\r\n.\r\n");
+    let valid_223 = HybridArticleEntry::from_response_bytes(b"223 0 <id>\r\n");
+    let valid_430 = HybridArticleEntry::from_response_bytes(b"430 No article\r\n");
 
     assert!(valid_220.is_some());
     assert!(valid_221.is_some());

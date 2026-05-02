@@ -37,14 +37,14 @@ use smallvec::SmallVec;
 /// Hot-path code should hand off one of these owned forms directly instead of
 /// flattening into a fresh `Vec<u8>` before spawning cache work.
 #[derive(Debug)]
-pub enum CacheBuffer {
+pub enum CacheIngestBytes {
     Boxed(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
     Chunked(crate::pool::ChunkedResponse),
     Small(SmallVec<[u8; 128]>),
 }
 
-impl CacheBuffer {
+impl CacheIngestBytes {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -75,14 +75,14 @@ impl CacheBuffer {
     }
 }
 
-impl PartialEq for CacheBuffer {
+impl PartialEq for CacheIngestBytes {
     fn eq(&self, other: &Self) -> bool {
-        fn chunks<'a>(buf: &'a CacheBuffer) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        fn chunks<'a>(buf: &'a CacheIngestBytes) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             match buf {
-                CacheBuffer::Boxed(v) => Box::new(std::iter::once(v.as_ref())),
-                CacheBuffer::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
-                CacheBuffer::Chunked(v) => Box::new(v.iter_chunks()),
-                CacheBuffer::Small(v) => Box::new(std::iter::once(v.as_slice())),
+                CacheIngestBytes::Boxed(v) => Box::new(std::iter::once(v.as_ref())),
+                CacheIngestBytes::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
+                CacheIngestBytes::Chunked(v) => Box::new(v.iter_chunks()),
+                CacheIngestBytes::Small(v) => Box::new(std::iter::once(v.as_slice())),
             }
         }
 
@@ -96,33 +96,33 @@ impl PartialEq for CacheBuffer {
     }
 }
 
-impl Eq for CacheBuffer {}
+impl Eq for CacheIngestBytes {}
 
-impl From<Vec<u8>> for CacheBuffer {
+impl From<Vec<u8>> for CacheIngestBytes {
     fn from(value: Vec<u8>) -> Self {
         Self::Boxed(value.into_boxed_slice())
     }
 }
 
-impl From<crate::pool::PooledBuffer> for CacheBuffer {
+impl From<crate::pool::PooledBuffer> for CacheIngestBytes {
     fn from(value: crate::pool::PooledBuffer) -> Self {
         Self::Pooled(value)
     }
 }
 
-impl From<crate::pool::ChunkedResponse> for CacheBuffer {
+impl From<crate::pool::ChunkedResponse> for CacheIngestBytes {
     fn from(value: crate::pool::ChunkedResponse) -> Self {
         Self::Chunked(value)
     }
 }
 
-impl From<SmallVec<[u8; 128]>> for CacheBuffer {
+impl From<SmallVec<[u8; 128]>> for CacheIngestBytes {
     fn from(value: SmallVec<[u8; 128]>) -> Self {
         Self::Small(value)
     }
 }
 
-impl From<&[u8]> for CacheBuffer {
+impl From<&[u8]> for CacheIngestBytes {
     fn from(value: &[u8]) -> Self {
         let small = SmallVec::<[u8; 128]>::from_slice(value);
         if small.spilled() {
@@ -153,10 +153,13 @@ mod tests {
         let small = SmallVec::<[u8; 128]>::from_slice(bytes);
 
         assert_eq!(
-            CacheBuffer::Boxed(bytes.to_vec().into_boxed_slice()),
-            CacheBuffer::Pooled(pooled)
+            CacheIngestBytes::Boxed(bytes.to_vec().into_boxed_slice()),
+            CacheIngestBytes::Pooled(pooled)
         );
-        assert_eq!(CacheBuffer::Chunked(chunked), CacheBuffer::Small(small));
+        assert_eq!(
+            CacheIngestBytes::Chunked(chunked),
+            CacheIngestBytes::Small(small)
+        );
     }
 
     #[tokio::test]
@@ -175,36 +178,36 @@ mod tests {
         let small = SmallVec::<[u8; 128]>::from_slice(bytes);
 
         assert_eq!(
-            CacheBuffer::Boxed(bytes.to_vec().into_boxed_slice()).status_code(),
+            CacheIngestBytes::Boxed(bytes.to_vec().into_boxed_slice()).status_code(),
             Some(StatusCode::new(220))
         );
         assert_eq!(
-            CacheBuffer::Pooled(pooled).status_code(),
+            CacheIngestBytes::Pooled(pooled).status_code(),
             Some(StatusCode::new(220))
         );
         assert_eq!(
-            CacheBuffer::Chunked(chunked).status_code(),
+            CacheIngestBytes::Chunked(chunked).status_code(),
             Some(StatusCode::new(220))
         );
         assert_eq!(
-            CacheBuffer::Small(small).status_code(),
+            CacheIngestBytes::Small(small).status_code(),
             Some(StatusCode::new(220))
         );
     }
 
     #[test]
     fn cache_buffer_from_short_slice_uses_inline_storage() {
-        let buffer = CacheBuffer::from(b"223\r\n".as_slice());
+        let buffer = CacheIngestBytes::from(b"223\r\n".as_slice());
 
-        assert!(matches!(buffer, CacheBuffer::Small(_)));
+        assert!(matches!(buffer, CacheIngestBytes::Small(_)));
         assert_eq!(buffer.status_code(), Some(StatusCode::new(223)));
     }
 
     #[test]
     fn cache_buffer_from_vec_stores_tight_owned_slice() {
-        let buffer = CacheBuffer::from(Vec::from(&b"220 1 <tight@example>\r\n.\r\n"[..]));
+        let buffer = CacheIngestBytes::from(Vec::from(&b"220 1 <tight@example>\r\n.\r\n"[..]));
 
-        assert!(matches!(buffer, CacheBuffer::Boxed(_)));
+        assert!(matches!(buffer, CacheIngestBytes::Boxed(_)));
         assert_eq!(buffer.status_code(), Some(StatusCode::new(220)));
     }
 
@@ -346,7 +349,7 @@ impl UnifiedCache {
         backend_id: BackendId,
         tier: ttl::CacheTier,
     ) where
-        B: Into<CacheBuffer>,
+        B: Into<CacheIngestBytes>,
     {
         let buffer = buffer.into();
         match self {

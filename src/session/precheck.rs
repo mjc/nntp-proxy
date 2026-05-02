@@ -15,7 +15,7 @@ use crate::types::{BackendId, MessageId};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrecheckHit {
-    Payload(crate::cache::CacheBuffer),
+    Payload(crate::cache::CacheIngestBytes),
     Availability(StatusCode),
 }
 
@@ -183,14 +183,14 @@ async fn execute_backend_query(
                     }
                 }
                 if let Some(response) = response {
-                    PrecheckHit::Payload(crate::cache::CacheBuffer::Chunked(response))
+                    PrecheckHit::Payload(crate::cache::CacheIngestBytes::Chunked(response))
                 } else {
                     PrecheckHit::Availability(status_code)
                 }
             } else if deps.cache_articles {
                 let mut response = Vec::with_capacity(cmd_response.bytes_read);
                 response.extend_from_slice(&buffer[..cmd_response.bytes_read]);
-                PrecheckHit::Payload(crate::cache::CacheBuffer::from(response))
+                PrecheckHit::Payload(crate::cache::CacheIngestBytes::from(response))
             } else {
                 PrecheckHit::Availability(status_code)
             };
@@ -450,7 +450,7 @@ mod tests {
             found,
             Some((
                 BackendId::from_index(1),
-                PrecheckHit::Payload(crate::cache::CacheBuffer::from(b"first".to_vec()))
+                PrecheckHit::Payload(crate::cache::CacheIngestBytes::from(b"first".to_vec()))
             ))
         );
         assert!(avail.is_missing(BackendId::from_index(0)));

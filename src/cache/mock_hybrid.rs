@@ -6,7 +6,7 @@
 // Methods are async to match the HybridArticleCache trait interface; no internal awaits needed.
 #![allow(clippy::unused_async)]
 
-use super::{ArticleAvailability, CacheBuffer, HybridArticleEntry, HybridCacheStats};
+use super::{ArticleAvailability, CacheIngestBytes, HybridArticleEntry, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,14 +47,14 @@ impl MockHybridCache {
 
     pub async fn upsert<B>(&self, message_id: MessageId<'_>, buffer: B, backend_id: BackendId)
     where
-        B: Into<CacheBuffer>,
+        B: Into<CacheIngestBytes>,
     {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
         let buffer = buffer.into();
 
         let Some(mut entry) =
-            HybridArticleEntry::from_cache_buffer_with_tier(buffer, super::ttl::CacheTier::new(0))
+            HybridArticleEntry::from_ingest_bytes_with_tier(buffer, super::ttl::CacheTier::new(0))
         else {
             return;
         };
@@ -85,7 +85,7 @@ impl MockHybridCache {
             updated
         } else {
             let mut entry =
-                HybridArticleEntry::from_wire_response(b"430\r\n").expect("430 is valid");
+                HybridArticleEntry::from_response_bytes(b"430\r\n").expect("430 is valid");
             entry.record_backend_missing(backend_id);
             entry
         };
@@ -124,7 +124,7 @@ impl MockHybridCache {
                     None
                 } else {
                     let mut entry =
-                        HybridArticleEntry::from_wire_response(b"430\r\n").expect("430 is valid");
+                        HybridArticleEntry::from_response_bytes(b"430\r\n").expect("430 is valid");
                     for i in 0..8 {
                         let backend_id = BackendId::from_index(i);
                         if availability.should_try(backend_id) {

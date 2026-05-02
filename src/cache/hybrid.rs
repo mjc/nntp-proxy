@@ -360,13 +360,13 @@ impl HybridArticleCache {
         backend_id: BackendId,
         tier: super::ttl::CacheTier,
     ) where
-        B: Into<super::CacheBuffer>,
+        B: Into<super::CacheIngestBytes>,
     {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
         let mut entry = if self.config.cache_articles {
             let buffer_len = buffer.len();
-            let Some(entry) = HybridArticleEntry::from_cache_buffer_with_tier(buffer, tier) else {
+            let Some(entry) = HybridArticleEntry::from_ingest_bytes_with_tier(buffer, tier) else {
                 warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
                 return;
             };
@@ -427,7 +427,7 @@ impl HybridArticleCache {
         } else {
             // Create stub entry for availability tracking
             // SAFETY: "430\r\n" is a valid NNTP response
-            let mut entry = HybridArticleEntry::from_wire_response(b"430\r\n")
+            let mut entry = HybridArticleEntry::from_response_bytes(b"430\r\n")
                 .expect("430 is a valid status code");
             entry.record_backend_missing(backend_id);
             entry
@@ -505,7 +505,7 @@ impl HybridArticleCache {
                 } else {
                     // All checked backends returned 430 - create stub to track this
                     // SAFETY: "430\r\n" is a valid NNTP response
-                    let mut entry = HybridArticleEntry::from_wire_response(b"430\r\n")
+                    let mut entry = HybridArticleEntry::from_response_bytes(b"430\r\n")
                         .expect("430 is a valid status code");
                     entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);

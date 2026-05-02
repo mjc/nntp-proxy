@@ -154,7 +154,7 @@ impl ClientSession {
     pub(super) fn spawn_cache_upsert_buffer(
         &self,
         msg_id: &crate::types::MessageId<'_>,
-        buffer: crate::cache::CacheBuffer,
+        buffer: crate::cache::CacheIngestBytes,
         backend_id: crate::types::BackendId,
         tier: CacheTier,
     ) {
