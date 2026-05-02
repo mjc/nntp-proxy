@@ -87,6 +87,7 @@ impl QueuedContext {
         let mut context = self.context;
         context.set_backend_id(backend_id);
         context.set_response_status(status_code);
+        context.set_response_wire_len(data.len());
         let _ = self
             .client_return
             .send(Ok(CompletedPipelineRequest { context, data }));
@@ -403,6 +404,7 @@ mod tests {
             completed.context.response_status(),
             Some(crate::protocol::StatusCode::new(223))
         );
+        assert_eq!(completed.context.response_wire_len(), Some(0));
         assert!(completed.data.is_empty());
     }
 

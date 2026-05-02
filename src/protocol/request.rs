@@ -61,6 +61,7 @@ pub struct RequestContext {
     message_id: Option<(usize, usize)>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
+    response_wire_len: Option<usize>,
 }
 
 impl RequestContext {
@@ -85,6 +86,7 @@ impl RequestContext {
             message_id,
             backend_id: None,
             response_status: None,
+            response_wire_len: None,
         }
     }
 
@@ -102,6 +104,7 @@ impl RequestContext {
             message_id,
             backend_id: None,
             response_status: None,
+            response_wire_len: None,
         }
     }
 
@@ -131,6 +134,17 @@ impl RequestContext {
     #[inline]
     pub const fn set_response_status(&mut self, status: StatusCode) {
         self.response_status = Some(status);
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn response_wire_len(&self) -> Option<usize> {
+        self.response_wire_len
+    }
+
+    #[inline]
+    pub const fn set_response_wire_len(&mut self, len: usize) {
+        self.response_wire_len = Some(len);
     }
 
     #[inline]
@@ -345,6 +359,7 @@ mod tests {
         assert_eq!(ctx.message_id(), Some("<a@b>"));
         assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), None);
+        assert_eq!(ctx.response_wire_len(), None);
         assert!(ctx.is_pipelineable());
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }
@@ -368,6 +383,16 @@ mod tests {
         ctx.set_response_status(status);
 
         assert_eq!(ctx.response_status(), Some(status));
+        assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_response_wire_len_when_known() {
+        let mut ctx = RequestContext::from_request_line("STAT <a@b>\r\n");
+
+        ctx.set_response_wire_len(19);
+
+        assert_eq!(ctx.response_wire_len(), Some(19));
         assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
     }
 
