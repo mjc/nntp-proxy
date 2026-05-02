@@ -58,6 +58,8 @@ use super::availability::ArticleAvailability;
 use super::hybrid_codec::HybridArticleEntry;
 use super::ttl;
 
+const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
+
 /// Check available disk space at the given path using df command
 fn check_available_space(path: &Path) -> Option<u64> {
     // Try to use statfs on Linux/Unix
@@ -231,7 +233,7 @@ impl HybridArticleCache {
             .map_err(|e| anyhow::anyhow!("Failed to create foyer runtime: {e}"))?;
 
         let mut builder = HybridCacheBuilder::new()
-            .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
+            .with_name(HYBRID_CACHE_NAME)
             .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(memory_capacity_usize)
             .with_shards(config.shards)
@@ -617,6 +619,11 @@ mod tests {
     //! Cache-level integration tests for `HybridArticleCache`
     //!
     use super::*;
+
+    #[test]
+    fn hybrid_cache_name_cold_invalidates_old_disk_formats() {
+        assert_eq!(HYBRID_CACHE_NAME, "nntp-article-cache-v3");
+    }
 
     #[tokio::test]
     async fn test_hybrid_cache_basic() {
