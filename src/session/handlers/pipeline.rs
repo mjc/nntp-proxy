@@ -137,7 +137,7 @@ impl ClientSession {
         while batch_contexts.len() < MAX_PIPELINE_DEPTH {
             // Only proceed if buffer has a complete line (contains \n).
             // Checking just is_empty() is insufficient: if the buffer has a partial
-            // command without \n, read_line() would block on the socket waiting for
+            // command without \n, read_until() would block on the socket waiting for
             // more data, defeating the non-blocking batch intent.
             if memchr::memchr(b'\n', reader.buffer()).is_none() {
                 break;
