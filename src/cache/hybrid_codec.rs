@@ -540,21 +540,6 @@ impl HybridArticleEntry {
         )
     }
 
-    /// Check if buffer contains a valid NNTP multiline response
-    #[inline]
-    #[must_use]
-    pub fn is_valid_response(&self) -> bool {
-        matches!(
-            self.payload,
-            CachedPayload::Article { .. }
-                | CachedPayload::Head { .. }
-                | CachedPayload::Body { .. }
-                | CachedPayload::Stat { .. }
-                | CachedPayload::Missing
-                | CachedPayload::AvailabilityOnly
-        )
-    }
-
     /// Get backend availability as `ArticleAvailability` struct
     #[inline]
     #[must_use]

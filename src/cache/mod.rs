@@ -15,7 +15,6 @@
 
 mod article;
 mod availability;
-pub(super) mod entry_helpers;
 mod hybrid;
 mod hybrid_codec;
 pub mod ttl;

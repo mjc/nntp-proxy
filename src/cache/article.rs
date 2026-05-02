@@ -509,26 +509,6 @@ impl ArticleEntry {
         )
     }
 
-    /// Check if buffer contains a valid NNTP multiline response
-    ///
-    /// A valid response must:
-    /// 1. Start with 3 ASCII digits (status code)
-    /// 2. Have CRLF somewhere (line terminator)
-    /// 3. End with `\r\n.\r\n` for multiline responses (220/221/222)
-    #[inline]
-    #[must_use]
-    pub fn is_valid_response(&self) -> bool {
-        matches!(
-            self.payload,
-            CachedPayload::Article { .. }
-                | CachedPayload::Head { .. }
-                | CachedPayload::Body { .. }
-                | CachedPayload::Stat { .. }
-                | CachedPayload::Missing
-                | CachedPayload::AvailabilityOnly
-        )
-    }
-
     /// Initialize availability tracker from this cached entry
     ///
     /// Creates a fresh `ArticleAvailability` with backends marked missing based on
