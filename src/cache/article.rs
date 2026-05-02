@@ -14,25 +14,46 @@ use std::time::Duration;
 use super::availability::ArticleAvailability;
 use super::ttl;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CachedArticleNumber(u64);
+
+impl CachedArticleNumber {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for CachedArticleNumber {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CachedPayload {
     Missing,
     AvailabilityOnly,
     Article {
-        article_number: Option<u64>,
+        article_number: Option<CachedArticleNumber>,
         headers: Vec<u8>,
         body: Vec<u8>,
     },
     Head {
-        article_number: Option<u64>,
+        article_number: Option<CachedArticleNumber>,
         headers: Vec<u8>,
     },
     Body {
-        article_number: Option<u64>,
+        article_number: Option<CachedArticleNumber>,
         body: Vec<u8>,
     },
     Stat {
-        article_number: Option<u64>,
+        article_number: Option<CachedArticleNumber>,
     },
 }
 
@@ -507,7 +528,7 @@ pub(crate) fn response_parts_for_payload_bytes<'a>(
         | CachedPayload::Stat { article_number } => *article_number,
         CachedPayload::Missing | CachedPayload::AvailabilityOnly => None,
     };
-    let number = article_number.unwrap_or(0);
+    let number = article_number.map_or(0, CachedArticleNumber::get);
 
     if cmd_verb.eq_ignore_ascii_case(b"STAT")
         && matches!(
@@ -611,10 +632,14 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
     }
 }
 
-fn parse_article_number(status_line: &[u8]) -> Option<u64> {
+fn parse_article_number(status_line: &[u8]) -> Option<CachedArticleNumber> {
     let rest = status_line.get(4..)?;
     let end = memchr::memchr(b' ', rest).unwrap_or(rest.len());
-    std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
+    std::str::from_utf8(&rest[..end])
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(CachedArticleNumber::new)
 }
 
 /// Article cache using LRU eviction with TTL

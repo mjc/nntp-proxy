@@ -15,7 +15,7 @@ use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
 
-use super::article::{CachedPayload, parse_payload};
+use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
@@ -278,19 +278,26 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
     }
 }
 
-fn write_article_number(writer: &mut impl Write, article_number: Option<u64>) -> foyer::Result<()> {
+fn write_article_number(
+    writer: &mut impl Write,
+    article_number: Option<CachedArticleNumber>,
+) -> foyer::Result<()> {
     writer
-        .write_all(&article_number.unwrap_or(NO_ARTICLE_NUMBER).to_le_bytes())
+        .write_all(
+            &article_number
+                .map_or(NO_ARTICLE_NUMBER, CachedArticleNumber::get)
+                .to_le_bytes(),
+        )
         .map_err(foyer::Error::io_error)
 }
 
-fn read_article_number(reader: &mut impl Read) -> foyer::Result<Option<u64>> {
+fn read_article_number(reader: &mut impl Read) -> foyer::Result<Option<CachedArticleNumber>> {
     let mut bytes = [0u8; 8];
     reader
         .read_exact(&mut bytes)
         .map_err(foyer::Error::io_error)?;
     let raw = u64::from_le_bytes(bytes);
-    Ok((raw != NO_ARTICLE_NUMBER).then_some(raw))
+    Ok((raw != NO_ARTICLE_NUMBER).then(|| CachedArticleNumber::new(raw)))
 }
 
 fn write_vec(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
