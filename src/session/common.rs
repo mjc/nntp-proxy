@@ -2,7 +2,7 @@
 
 use crate::auth::AuthHandler;
 use crate::command::AuthAction;
-use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata};
+use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode, codes};
 use crate::types::BackendToClientBytes;
 
 use anyhow::Result;
@@ -70,7 +70,7 @@ where
         let bytes = BackendToClientBytes::new(AUTH_ALREADY_AUTHENTICATED.len() as u64);
         return Ok(AuthResult::NotAuthenticated {
             bytes,
-            response: local_response_metadata(AUTH_ALREADY_AUTHENTICATED),
+            response: local_response_metadata(codes::ACCESS_DENIED, AUTH_ALREADY_AUTHENTICATED),
         });
     }
 
@@ -103,9 +103,8 @@ where
     })
 }
 
-fn local_response_metadata(response: &[u8]) -> RequestResponseMetadata {
-    RequestResponseMetadata::from_wire_response(response)
-        .expect("local NNTP response starts with status code")
+fn local_response_metadata(status: u16, response: &[u8]) -> RequestResponseMetadata {
+    RequestResponseMetadata::new(StatusCode::new(status), response.len().into())
 }
 
 fn auth_response_metadata(
@@ -114,19 +113,23 @@ fn auth_response_metadata(
     auth_success: bool,
 ) -> RequestResponseMetadata {
     match auth_action {
-        AuthAction::RequestPassword(_) => local_response_metadata(crate::protocol::AUTH_REQUIRED),
-        AuthAction::ValidateAndRespond { .. } if !had_username => {
-            local_response_metadata(crate::protocol::AUTH_OUT_OF_SEQUENCE)
+        AuthAction::RequestPassword(_) => {
+            local_response_metadata(codes::PASSWORD_REQUIRED, crate::protocol::AUTH_REQUIRED)
         }
+        AuthAction::ValidateAndRespond { .. } if !had_username => local_response_metadata(
+            codes::AUTH_OUT_OF_SEQUENCE,
+            crate::protocol::AUTH_OUT_OF_SEQUENCE,
+        ),
         AuthAction::ValidateAndRespond { .. } if auth_success => {
-            local_response_metadata(crate::protocol::AUTH_ACCEPTED)
+            local_response_metadata(codes::AUTH_ACCEPTED, crate::protocol::AUTH_ACCEPTED)
         }
         AuthAction::ValidateAndRespond { .. } => {
-            local_response_metadata(crate::protocol::AUTH_FAILED)
+            local_response_metadata(codes::AUTH_REJECTED, crate::protocol::AUTH_FAILED)
         }
-        AuthAction::UnknownSubcommand => {
-            local_response_metadata(crate::protocol::AUTH_UNKNOWN_SUBCOMMAND)
-        }
+        AuthAction::UnknownSubcommand => local_response_metadata(
+            codes::COMMAND_SYNTAX_ERROR,
+            crate::protocol::AUTH_UNKNOWN_SUBCOMMAND,
+        ),
     }
 }
 
