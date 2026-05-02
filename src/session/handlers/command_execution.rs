@@ -57,7 +57,6 @@ struct ResponseStreamParams<'a> {
     request: &'a RequestContext,
     msg_id: Option<&'a crate::types::MessageId<'a>>,
     status_code: StatusCode,
-    is_multiline: bool,
     first_chunk: &'a [u8],
 }
 
@@ -183,7 +182,6 @@ impl ClientSession {
                     request,
                     msg_id,
                     status_code,
-                    is_multiline,
                     first_chunk: &state.buffer[..cmd_response.bytes_read],
                 },
             )
@@ -327,6 +325,10 @@ impl ClientSession {
         params: ResponseStreamParams<'_>,
     ) -> Result<u64, StreamingError> {
         let code = params.status_code.as_u16();
+        let is_multiline = matches!(
+            params.request.response_shape(params.status_code),
+            crate::protocol::ResponseShape::Multiline
+        );
 
         let cache_action = determine_cache_action_for_request(
             params.request,
@@ -338,13 +340,13 @@ impl ClientSession {
         debug!(
             "stream_response_to_client: code={}, is_multiline={}, cache_articles={}, has_msg_id={}, action={:?}",
             code,
-            params.is_multiline,
+            is_multiline,
             self.cache_articles,
             params.msg_id.is_some(),
             cache_action
         );
 
-        match (params.is_multiline, cache_action) {
+        match (is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
                 let captured =
                     streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
