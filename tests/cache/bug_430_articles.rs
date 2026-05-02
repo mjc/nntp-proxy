@@ -18,6 +18,8 @@ use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
+use super::article_response_bytes;
+
 /// Test that `sync_availability` does NOT create a 430 stub when a backend has the article
 #[tokio::test]
 async fn test_sync_availability_does_not_create_430_stub_when_backend_has_article() -> Result<()> {
@@ -126,7 +128,7 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
         status.as_u16()
     );
 
-    let rendered = cached.response_for_command("ARTICLE", &msg_id).unwrap();
+    let rendered = article_response_bytes(&cached, b"ARTICLE", &msg_id).unwrap();
     assert!(rendered.starts_with(b"220"));
 
     Ok(())
@@ -544,8 +546,7 @@ async fn test_precheck_stub_then_article_request() -> Result<()> {
     assert!(cached.is_complete_article());
     assert_eq!(cached.status_code().map(|s| s.as_u16()), Some(220));
     assert!(
-        cached
-            .response_for_command("ARTICLE", &msg_id)
+        article_response_bytes(&cached, b"ARTICLE", &msg_id)
             .unwrap()
             .ends_with(b".\r\n")
     );

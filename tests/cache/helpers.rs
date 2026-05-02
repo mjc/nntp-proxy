@@ -12,6 +12,8 @@ use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::article_response_bytes;
+
 /// Test cache hit serves cached content
 #[tokio::test]
 async fn test_cache_hit() -> Result<()> {
@@ -29,10 +31,7 @@ async fn test_cache_hit() -> Result<()> {
     let retrieved = cache.get(&msgid).await;
     assert!(retrieved.is_some());
     assert_eq!(
-        retrieved
-            .unwrap()
-            .response_for_command("ARTICLE", &msgid)
-            .unwrap(),
+        article_response_bytes(&retrieved.unwrap(), b"ARTICLE", &msgid).unwrap(),
         buffer
     );
 
