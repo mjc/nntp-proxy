@@ -563,8 +563,12 @@ impl ClientSession {
                                     .write_all_to(client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                                let response_wire_len = completed
+                                    .context
+                                    .response_wire_len()
+                                    .expect("completed queued request records response size");
                                 *backend_to_client_bytes =
-                                    backend_to_client_bytes.add(completed.data.len());
+                                    backend_to_client_bytes.add(response_wire_len);
                                 *client_to_backend_bytes =
                                     client_to_backend_bytes.add(completed.context.wire_len());
                                 self.metrics.record_pipeline_complete();
