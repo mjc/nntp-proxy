@@ -11,8 +11,14 @@ use nntp_proxy::cache::{ArticleCache, ArticleEntry};
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
+use super::article_response_bytes;
+
 // NOTE: Cache policy tests are in src/session/routing/cache_policy.rs unit tests
 // as the routing module is private
+
+fn can_serve(entry: &ArticleEntry, verb: &[u8], message_id: &MessageId<'_>) -> bool {
+    article_response_bytes(entry, verb, message_id).is_some()
+}
 
 #[tokio::test]
 async fn test_upsert_prevents_stub_overwrite() -> Result<()> {
@@ -115,19 +121,19 @@ fn test_matches_command_type_article_response() {
     // ARTICLE response can serve ARTICLE, BODY, HEAD, or STAT requests
     let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
-        entry.response_for_command("ARTICLE", msg_id_ref).is_some(),
+        can_serve(&entry, b"ARTICLE", msg_id_ref),
         "ARTICLE (220) should match ARTICLE command"
     );
     assert!(
-        entry.response_for_command("BODY", msg_id_ref).is_some(),
+        can_serve(&entry, b"BODY", msg_id_ref),
         "ARTICLE (220) should match BODY command"
     );
     assert!(
-        entry.response_for_command("HEAD", msg_id_ref).is_some(),
+        can_serve(&entry, b"HEAD", msg_id_ref),
         "ARTICLE (220) should match HEAD command"
     );
     assert!(
-        entry.response_for_command("STAT", msg_id_ref).is_some(),
+        can_serve(&entry, b"STAT", msg_id_ref),
         "ARTICLE (220) should match STAT command"
     );
 }
@@ -142,19 +148,19 @@ fn test_matches_command_type_body_response() {
     // BODY response can serve BODY and STAT requests
     let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
-        entry.response_for_command("BODY", msg_id_ref).is_some(),
+        can_serve(&entry, b"BODY", msg_id_ref),
         "BODY (222) should match BODY command"
     );
     assert!(
-        entry.response_for_command("ARTICLE", msg_id_ref).is_none(),
+        !can_serve(&entry, b"ARTICLE", msg_id_ref),
         "BODY (222) should NOT match ARTICLE command"
     );
     assert!(
-        entry.response_for_command("HEAD", msg_id_ref).is_none(),
+        !can_serve(&entry, b"HEAD", msg_id_ref),
         "BODY (222) should NOT match HEAD command"
     );
     assert!(
-        entry.response_for_command("STAT", msg_id_ref).is_some(),
+        can_serve(&entry, b"STAT", msg_id_ref),
         "BODY (222) should match STAT command (article exists)"
     );
 }
@@ -169,19 +175,19 @@ fn test_matches_command_type_head_response() {
     // HEAD response can serve HEAD and STAT requests
     let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
-        entry.response_for_command("HEAD", msg_id_ref).is_some(),
+        can_serve(&entry, b"HEAD", msg_id_ref),
         "HEAD (221) should match HEAD command"
     );
     assert!(
-        entry.response_for_command("ARTICLE", msg_id_ref).is_none(),
+        !can_serve(&entry, b"ARTICLE", msg_id_ref),
         "HEAD (221) should NOT match ARTICLE command"
     );
     assert!(
-        entry.response_for_command("BODY", msg_id_ref).is_none(),
+        !can_serve(&entry, b"BODY", msg_id_ref),
         "HEAD (221) should NOT match BODY command"
     );
     assert!(
-        entry.response_for_command("STAT", msg_id_ref).is_some(),
+        can_serve(&entry, b"STAT", msg_id_ref),
         "HEAD (221) should match STAT command (article exists)"
     );
 }
@@ -194,7 +200,7 @@ fn test_response_for_command_verbs_uppercase() {
 
     // Only uppercase verbs are expected (caller is responsible for uppercasing)
     let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
-    assert!(entry.response_for_command("BODY", msg_id_ref).is_some());
+    assert!(can_serve(&entry, b"BODY", msg_id_ref));
 }
 
 #[test]
@@ -269,33 +275,25 @@ fn test_body_article_command_type_mismatch() {
     // BODY response should NOT match ARTICLE request (no headers)
     let msg_id_ref = &MessageId::from_borrowed(msg_id).unwrap();
     assert!(
-        body_response
-            .response_for_command("ARTICLE", msg_id_ref)
-            .is_none(),
+        !can_serve(&body_response, b"ARTICLE", msg_id_ref),
         "ARTICLE command should not match BODY (222) response"
     );
 
     // But BODY response should match BODY request
     assert!(
-        body_response
-            .response_for_command("BODY", msg_id_ref)
-            .is_some(),
+        can_serve(&body_response, b"BODY", msg_id_ref),
         "BODY command should match BODY (222) response"
     );
 
     // And should not match HEAD request (no body)
     assert!(
-        body_response
-            .response_for_command("HEAD", msg_id_ref)
-            .is_none(),
+        !can_serve(&body_response, b"HEAD", msg_id_ref),
         "HEAD command should not match BODY (222) response"
     );
 
     // STAT should work - we know the article exists
     assert!(
-        body_response
-            .response_for_command("STAT", msg_id_ref)
-            .is_some(),
+        can_serve(&body_response, b"STAT", msg_id_ref),
         "STAT should match BODY (222) response (article exists)"
     );
 
@@ -304,27 +302,19 @@ fn test_body_article_command_type_mismatch() {
         b"220 0 <test@example.com>\r\nHeaders\r\n\r\nBody\r\n.\r\n".to_vec(),
     );
     assert!(
-        article_response
-            .response_for_command("ARTICLE", msg_id_ref)
-            .is_some(),
+        can_serve(&article_response, b"ARTICLE", msg_id_ref),
         "ARTICLE command should match ARTICLE (220) response"
     );
     assert!(
-        article_response
-            .response_for_command("BODY", msg_id_ref)
-            .is_some(),
+        can_serve(&article_response, b"BODY", msg_id_ref),
         "BODY command should match ARTICLE (220) response"
     );
     assert!(
-        article_response
-            .response_for_command("HEAD", msg_id_ref)
-            .is_some(),
+        can_serve(&article_response, b"HEAD", msg_id_ref),
         "HEAD command should match ARTICLE (220) response"
     );
     assert!(
-        article_response
-            .response_for_command("STAT", msg_id_ref)
-            .is_some(),
+        can_serve(&article_response, b"STAT", msg_id_ref),
         "STAT should match ARTICLE (220) response"
     );
 }
