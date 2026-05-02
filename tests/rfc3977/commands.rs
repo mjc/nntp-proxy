@@ -10,7 +10,7 @@
 
 use futures::executor::block_on;
 use nntp_proxy::protocol;
-use nntp_proxy::protocol::{RequestKind, RequestLine, RequestRouteClass};
+use nntp_proxy::protocol::{RequestContext, RequestKind, RequestLine, RequestRouteClass};
 use nntp_proxy::types::MessageId;
 
 fn msgid(value: &str) -> MessageId<'_> {
@@ -23,109 +23,118 @@ fn wire(context: &protocol::RequestContext) -> Vec<u8> {
     out
 }
 
+fn assert_wire(context: &RequestContext, expected: &[u8]) {
+    assert_eq!(wire(context), expected);
+}
+
+fn standard_requests() -> Vec<RequestContext> {
+    let id = msgid("<msgid@example>");
+    vec![
+        protocol::authinfo_user("user"),
+        protocol::authinfo_pass("pass"),
+        protocol::article_request(&id),
+        protocol::body_request(&id),
+        protocol::head_request(&id),
+        protocol::stat_request(&id),
+        protocol::date_request(),
+    ]
+}
+
+fn assert_class(line: &str, kind: RequestKind, route_class: RequestRouteClass) {
+    let request = RequestLine::parse(line.as_bytes());
+    assert_eq!(request.kind(), kind, "{line}");
+    assert_eq!(request.route_class(), route_class, "{line}");
+}
+
 // === Command Termination (RFC 3977 §3.1) ===
 
 #[test]
 fn test_all_commands_end_with_crlf() {
     // RFC 3977 §3.1: "Commands in NNTP MUST use the canonical CRLF"
-    let test_commands = vec![
-        wire(&protocol::authinfo_user("user")),
-        wire(&protocol::authinfo_pass("pass")),
-        wire(&protocol::article_request(&msgid("<msgid@example>"))),
-        wire(&protocol::body_request(&msgid("<msgid@example>"))),
-        wire(&protocol::head_request(&msgid("<msgid@example>"))),
-        wire(&protocol::stat_request(&msgid("<msgid@example>"))),
-    ];
+    standard_requests()
+        .into_iter()
+        .map(|request| wire(&request))
+        .for_each(|cmd| {
+            assert!(
+                cmd.ends_with(b"\r\n"),
+                "Command does not end with CRLF: {cmd:?}"
+            );
+        });
 
-    for cmd in &test_commands {
-        assert!(
-            cmd.ends_with(b"\r\n"),
-            "Command does not end with CRLF: {cmd:?}"
-        );
-    }
-
-    // Constants too
     assert!(protocol::QUIT.ends_with(b"\r\n"));
-    assert!(wire(&protocol::date_request()).ends_with(b"\r\n"));
 }
 
 #[test]
 fn test_commands_only_one_crlf() {
     // Commands should have exactly one CRLF - prevents command injection
-    let commands = vec![
-        wire(&protocol::authinfo_user("testuser")),
-        wire(&protocol::authinfo_pass("testpass")),
-        wire(&protocol::article_request(&msgid("<test@example>"))),
-        wire(&protocol::body_request(&msgid("<test@example>"))),
-        wire(&protocol::head_request(&msgid("<test@example>"))),
-        wire(&protocol::stat_request(&msgid("<test@example>"))),
-    ];
-
-    for cmd in &commands {
-        assert_eq!(
-            cmd.windows(2).filter(|window| *window == b"\r\n").count(),
-            1,
-            "Command has multiple CRLFs (injection risk): {cmd:?}"
-        );
-    }
+    standard_requests()
+        .into_iter()
+        .map(|request| wire(&request))
+        .for_each(|cmd| {
+            assert_eq!(
+                cmd.windows(2).filter(|window| *window == b"\r\n").count(),
+                1,
+                "Command has multiple CRLFs (injection risk): {cmd:?}"
+            );
+        });
 }
 
 // === AUTHINFO Commands (RFC 4643) ===
 
 #[test]
-fn test_authinfo_user_format() {
-    let cmd = protocol::authinfo_user("testuser");
-    assert_eq!(wire(&cmd), b"AUTHINFO USER testuser\r\n");
-}
-
-#[test]
-fn test_authinfo_user_with_spaces() {
-    let cmd = protocol::authinfo_user("user name");
-    assert_eq!(wire(&cmd), b"AUTHINFO USER user name\r\n");
-}
-
-#[test]
-fn test_authinfo_pass_with_special_chars() {
-    let cmd = protocol::authinfo_pass("p@ss!w0rd#$%");
-    assert_eq!(wire(&cmd), b"AUTHINFO PASS p@ss!w0rd#$%\r\n");
+fn test_authinfo_command_format() {
+    [
+        (
+            protocol::authinfo_user("testuser"),
+            b"AUTHINFO USER testuser\r\n".as_slice(),
+        ),
+        (
+            protocol::authinfo_user("user name"),
+            b"AUTHINFO USER user name\r\n".as_slice(),
+        ),
+        (
+            protocol::authinfo_pass("p@ss!w0rd#$%"),
+            b"AUTHINFO PASS p@ss!w0rd#$%\r\n".as_slice(),
+        ),
+    ]
+    .into_iter()
+    .for_each(|(request, expected)| assert_wire(&request, expected));
 }
 
 // === ARTICLE/HEAD/BODY/STAT Commands (RFC 3977 §6.2) ===
 
 #[test]
-fn test_article_command_with_message_id() {
-    let cmd = protocol::article_request(&msgid("<unique-id@news.example.com>"));
-    assert_eq!(wire(&cmd), b"ARTICLE <unique-id@news.example.com>\r\n");
-}
+fn test_article_body_head_stat_commands_with_message_id() {
+    let message_id = msgid("<test@example.com>");
 
-#[test]
-fn test_body_command_with_message_id() {
-    let cmd = protocol::body_request(&msgid("<test@example.com>"));
-    assert_eq!(wire(&cmd), b"BODY <test@example.com>\r\n");
-}
-
-#[test]
-fn test_head_command_with_message_id() {
-    let cmd = protocol::head_request(&msgid("<test@example.com>"));
-    assert_eq!(wire(&cmd), b"HEAD <test@example.com>\r\n");
-}
-
-#[test]
-fn test_stat_command_with_message_id() {
-    let cmd = protocol::stat_request(&msgid("<test@example.com>"));
-    assert_eq!(wire(&cmd), b"STAT <test@example.com>\r\n");
+    [
+        (
+            protocol::article_request(&message_id),
+            b"ARTICLE <test@example.com>\r\n".as_slice(),
+        ),
+        (
+            protocol::body_request(&message_id),
+            b"BODY <test@example.com>\r\n".as_slice(),
+        ),
+        (
+            protocol::head_request(&message_id),
+            b"HEAD <test@example.com>\r\n".as_slice(),
+        ),
+        (
+            protocol::stat_request(&message_id),
+            b"STAT <test@example.com>\r\n".as_slice(),
+        ),
+    ]
+    .into_iter()
+    .for_each(|(request, expected)| assert_wire(&request, expected));
 }
 
 // === Command Constants ===
 
 #[test]
-fn test_quit_constant() {
+fn test_command_constants() {
     assert_eq!(protocol::QUIT, b"QUIT\r\n");
-}
-
-#[test]
-fn test_date_constant() {
-    assert_eq!(wire(&protocol::date_request()), b"DATE\r\n");
+    assert_wire(&protocol::date_request(), b"DATE\r\n");
 }
 
 // === Keywords Are Uppercase ===
@@ -133,14 +142,23 @@ fn test_date_constant() {
 #[test]
 fn test_keywords_are_uppercase() {
     // RFC 3977 §3.1: Keywords are case-insensitive, convention is UPPERCASE
-    assert!(wire(&protocol::authinfo_user("u")).starts_with(b"AUTHINFO USER "));
-    assert!(wire(&protocol::authinfo_pass("p")).starts_with(b"AUTHINFO PASS "));
-    assert!(wire(&protocol::article_request(&msgid("<m>"))).starts_with(b"ARTICLE "));
-    assert!(wire(&protocol::body_request(&msgid("<m>"))).starts_with(b"BODY "));
-    assert!(wire(&protocol::head_request(&msgid("<m>"))).starts_with(b"HEAD "));
-    assert!(wire(&protocol::stat_request(&msgid("<m>"))).starts_with(b"STAT "));
+    let message_id = msgid("<m>");
+    [
+        (protocol::authinfo_user("u"), b"AUTHINFO USER ".as_slice()),
+        (protocol::authinfo_pass("p"), b"AUTHINFO PASS ".as_slice()),
+        (
+            protocol::article_request(&message_id),
+            b"ARTICLE ".as_slice(),
+        ),
+        (protocol::body_request(&message_id), b"BODY ".as_slice()),
+        (protocol::head_request(&message_id), b"HEAD ".as_slice()),
+        (protocol::stat_request(&message_id), b"STAT ".as_slice()),
+        (protocol::date_request(), b"DATE".as_slice()),
+    ]
+    .into_iter()
+    .for_each(|(request, prefix)| assert!(wire(&request).starts_with(prefix)));
+
     assert!(protocol::QUIT.starts_with(b"QUIT"));
-    assert!(wire(&protocol::date_request()).starts_with(b"DATE"));
 }
 
 // === Command Length (RFC 3977 §3.1) ===
@@ -148,27 +166,23 @@ fn test_keywords_are_uppercase() {
 #[test]
 fn test_standard_commands_under_512_octets() {
     // RFC 3977 §3.1: "command line MUST NOT exceed 512 octets"
-    let commands = vec![
-        String::from_utf8(wire(&protocol::authinfo_user("typical_username"))).unwrap(),
-        String::from_utf8(wire(&protocol::authinfo_pass("typical_password"))).unwrap(),
-        String::from_utf8(wire(&protocol::article_request(&msgid(
-            "<typical-msgid@example.com>",
-        ))))
-        .unwrap(),
-        String::from_utf8(wire(&protocol::body_request(&msgid(
-            "<typical-msgid@example.com>",
-        ))))
-        .unwrap(),
-    ];
-
-    for cmd in &commands {
+    let message_id = msgid("<typical-msgid@example.com>");
+    [
+        protocol::authinfo_user("typical_username"),
+        protocol::authinfo_pass("typical_password"),
+        protocol::article_request(&message_id),
+        protocol::body_request(&message_id),
+    ]
+    .into_iter()
+    .map(|request| String::from_utf8(wire(&request)).unwrap())
+    .for_each(|cmd| {
         assert!(
             cmd.len() <= 512,
             "Command exceeds 512 octets ({} bytes): {:?}",
             cmd.len(),
             cmd
         );
-    }
+    });
 }
 
 #[test]
@@ -184,56 +198,59 @@ fn test_long_message_id_command_length() {
 // === Request Classification ===
 
 #[test]
-fn test_classify_article_by_message_id() {
-    for line in [
-        "ARTICLE <test@example.com>",
-        "BODY <test@example.com>",
-        "HEAD <test@example.com>",
-        "STAT <test@example.com>",
-    ] {
-        assert_eq!(
-            RequestLine::parse(line.as_bytes()).route_class(),
-            RequestRouteClass::ArticleByMessageId
-        );
-    }
-}
-
-#[test]
-fn test_classify_article_by_number_is_stateful() {
-    for line in ["ARTICLE 12345", "BODY 12345"] {
-        assert_eq!(
-            RequestLine::parse(line.as_bytes()).route_class(),
-            RequestRouteClass::Stateful
-        );
-    }
-}
-
-#[test]
-fn test_classify_case_insensitive() {
-    // RFC 3977 §3.1: Keywords are case-insensitive
-    for line in [
-        "article <test@example.com>",
-        "Article <test@example.com>",
-        "ARTICLE <test@example.com>",
-    ] {
-        let request = RequestLine::parse(line.as_bytes());
-        assert_eq!(request.kind(), RequestKind::Article);
-        assert_eq!(request.route_class(), RequestRouteClass::ArticleByMessageId);
-    }
-}
-
-#[test]
-fn test_classify_auth_commands() {
-    for line in ["AUTHINFO USER testuser", "AUTHINFO PASS testpass"] {
-        let request = RequestLine::parse(line.as_bytes());
-        assert_eq!(request.kind(), RequestKind::AuthInfo);
-        assert_eq!(request.route_class(), RequestRouteClass::Local);
-    }
-}
-
-#[test]
-fn test_classify_stateless_commands() {
-    let cases = [
+fn test_classify_commands() {
+    [
+        (
+            "ARTICLE <test@example.com>",
+            RequestKind::Article,
+            RequestRouteClass::ArticleByMessageId,
+        ),
+        (
+            "BODY <test@example.com>",
+            RequestKind::Body,
+            RequestRouteClass::ArticleByMessageId,
+        ),
+        (
+            "HEAD <test@example.com>",
+            RequestKind::Head,
+            RequestRouteClass::ArticleByMessageId,
+        ),
+        (
+            "STAT <test@example.com>",
+            RequestKind::Stat,
+            RequestRouteClass::ArticleByMessageId,
+        ),
+        (
+            "ARTICLE 12345",
+            RequestKind::Article,
+            RequestRouteClass::Stateful,
+        ),
+        ("BODY 12345", RequestKind::Body, RequestRouteClass::Stateful),
+        (
+            "article <test@example.com>",
+            RequestKind::Article,
+            RequestRouteClass::ArticleByMessageId,
+        ),
+        (
+            "Article <test@example.com>",
+            RequestKind::Article,
+            RequestRouteClass::ArticleByMessageId,
+        ),
+        (
+            "ARTICLE <test@example.com>",
+            RequestKind::Article,
+            RequestRouteClass::ArticleByMessageId,
+        ),
+        (
+            "AUTHINFO USER testuser",
+            RequestKind::AuthInfo,
+            RequestRouteClass::Local,
+        ),
+        (
+            "AUTHINFO PASS testpass",
+            RequestKind::AuthInfo,
+            RequestRouteClass::Local,
+        ),
         ("QUIT", RequestKind::Quit, RequestRouteClass::Local),
         ("DATE", RequestKind::Date, RequestRouteClass::Stateless),
         ("LIST", RequestKind::List, RequestRouteClass::Stateless),
@@ -243,66 +260,35 @@ fn test_classify_stateless_commands() {
             RequestKind::Capabilities,
             RequestRouteClass::Local,
         ),
-    ];
-    for (line, kind, route_class) in cases {
-        let request = RequestLine::parse(line.as_bytes());
-        assert_eq!(request.kind(), kind);
-        assert_eq!(request.route_class(), route_class);
-    }
-}
-
-#[test]
-fn test_classify_stateful_commands() {
-    for line in ["GROUP alt.test", "NEXT", "LAST", "XOVER 1-100"] {
-        assert_eq!(
-            RequestLine::parse(line.as_bytes()).route_class(),
-            RequestRouteClass::Stateful
-        );
-    }
-}
-
-#[test]
-fn test_classify_non_routable_commands() {
-    // POST — RFC 3977 §6.3.1: posting not permitted → dedicated Post variant
-    for line in ["POST", "IHAVE <msgid@example>"] {
-        assert_eq!(
-            RequestLine::parse(line.as_bytes()).route_class(),
-            RequestRouteClass::Reject
-        );
-    }
-}
-
-#[test]
-fn test_classify_empty_command() {
-    // Empty input shouldn't panic
-    let _ = RequestLine::parse(b"");
-}
-
-#[test]
-fn test_classify_whitespace_only() {
-    let _ = RequestLine::parse(b"   ");
-}
-
-#[test]
-fn test_classify_unknown_command() {
-    // Unknown commands fall through to a default classification
-    let request = RequestLine::parse(b"XYZZY");
-    assert_eq!(request.kind(), RequestKind::Unknown);
-    assert_eq!(request.route_class(), RequestRouteClass::Stateful);
-}
-
-#[test]
-fn test_classify_case_insensitive_auth() {
-    for line in ["authinfo user test", "Authinfo Pass test"] {
-        let request = RequestLine::parse(line.as_bytes());
-        assert_eq!(request.kind(), RequestKind::AuthInfo);
-        assert_eq!(request.route_class(), RequestRouteClass::Local);
-    }
-}
-
-#[test]
-fn test_classify_case_insensitive_stateless() {
-    let cases = [
+        (
+            "GROUP alt.test",
+            RequestKind::Group,
+            RequestRouteClass::Stateful,
+        ),
+        ("NEXT", RequestKind::Next, RequestRouteClass::Stateful),
+        ("LAST", RequestKind::Last, RequestRouteClass::Stateful),
+        (
+            "XOVER 1-100",
+            RequestKind::Xover,
+            RequestRouteClass::Stateful,
+        ),
+        ("POST", RequestKind::Post, RequestRouteClass::Reject),
+        (
+            "IHAVE <msgid@example>",
+            RequestKind::Ihave,
+            RequestRouteClass::Reject,
+        ),
+        ("XYZZY", RequestKind::Unknown, RequestRouteClass::Stateful),
+        (
+            "authinfo user test",
+            RequestKind::AuthInfo,
+            RequestRouteClass::Local,
+        ),
+        (
+            "Authinfo Pass test",
+            RequestKind::AuthInfo,
+            RequestRouteClass::Local,
+        ),
         ("quit", RequestKind::Quit, RequestRouteClass::Local),
         ("list", RequestKind::List, RequestRouteClass::Stateless),
         ("help", RequestKind::Help, RequestRouteClass::Stateless),
@@ -317,32 +303,23 @@ fn test_classify_case_insensitive_stateless() {
             RequestKind::NewNews,
             RequestRouteClass::Stateless,
         ),
-    ];
-    // NEWGROUPS/NEWNEWS are read-only queries (RFC 3977 §7.3-7.4)
-    for (line, kind, route_class) in cases {
-        let request = RequestLine::parse(line.as_bytes());
-        assert_eq!(request.kind(), kind);
-        assert_eq!(request.route_class(), route_class);
-    }
-}
+        (
+            "group alt.test",
+            RequestKind::Group,
+            RequestRouteClass::Stateful,
+        ),
+        ("next", RequestKind::Next, RequestRouteClass::Stateful),
+        ("last", RequestKind::Last, RequestRouteClass::Stateful),
+        ("post", RequestKind::Post, RequestRouteClass::Reject),
+        (
+            "ihave <msgid@example>",
+            RequestKind::Ihave,
+            RequestRouteClass::Reject,
+        ),
+    ]
+    .into_iter()
+    .for_each(|(line, kind, route_class)| assert_class(line, kind, route_class));
 
-#[test]
-fn test_classify_case_insensitive_stateful() {
-    for line in ["group alt.test", "next", "last"] {
-        assert_eq!(
-            RequestLine::parse(line.as_bytes()).route_class(),
-            RequestRouteClass::Stateful
-        );
-    }
-}
-
-#[test]
-fn test_classify_case_insensitive_non_routable() {
-    // POST — RFC 3977 §6.3.1: dedicated Post variant, case-insensitive
-    for line in ["post", "ihave <msgid@example>"] {
-        assert_eq!(
-            RequestLine::parse(line.as_bytes()).route_class(),
-            RequestRouteClass::Reject
-        );
-    }
+    let _ = RequestLine::parse(b"");
+    let _ = RequestLine::parse(b"   ");
 }
