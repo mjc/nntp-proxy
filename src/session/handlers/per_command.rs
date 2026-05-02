@@ -8,7 +8,7 @@
 //! - [`command_execution`]: Single-backend command execution and response streaming
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
-use crate::protocol::RequestContext;
+use crate::protocol::{RequestContext, RequestResponseMetadata, StatusCode};
 use crate::session::common;
 use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
 use crate::session::{ClientSession, connection};
@@ -62,6 +62,11 @@ struct ProcessCommandParams<'a, 'b> {
     auth_username: &'a mut Option<String>,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
+}
+
+fn record_local_wire_response(request: &mut RequestContext, response: &[u8]) {
+    let status = StatusCode::parse(response).expect("local NNTP response starts with status code");
+    request.record_local_response(RequestResponseMetadata::new(status, response.len().into()));
 }
 
 impl ClientSession {
@@ -152,6 +157,7 @@ impl ClientSession {
                 debug!("Client {} decision: RequireAuth", self.client_addr);
                 use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
                 client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
+                record_local_wire_response(request, AUTH_REQUIRED_FOR_COMMAND);
                 *backend_to_client_bytes =
                     backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
                 Ok(CommandResult::Continue {
@@ -182,6 +188,7 @@ impl ClientSession {
                     unreachable!("Reject decision must come from Reject action")
                 };
                 client_write.write_all(response.as_bytes()).await?;
+                record_local_wire_response(request, response.as_bytes());
                 *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
                 Ok(CommandResult::Continue {
                     auth_succeeded: false,
@@ -204,6 +211,7 @@ impl ClientSession {
                     crate::protocol::CAPABILITIES_WITH_AUTHINFO
                 };
                 client_write.write_all(capabilities).await?;
+                record_local_wire_response(request, capabilities);
                 *backend_to_client_bytes = backend_to_client_bytes.add(capabilities.len());
                 Ok(CommandResult::Continue {
                     auth_succeeded: false,
@@ -233,6 +241,7 @@ impl ClientSession {
         if let common::QuitStatus::Quit(bytes) =
             common::handle_quit_command(request, client_write).await?
         {
+            record_local_wire_response(request, crate::protocol::CONNECTION_CLOSING);
             *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
             return Ok(SingleCommandResult::Quit);
         }
@@ -519,6 +528,24 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use crate::protocol::{RequestContext, ResponseWireLen, StatusCode};
+
+    #[test]
+    fn local_wire_response_records_status_and_wire_len() {
+        let mut request = RequestContext::from_request_line("QUIT\r\n");
+
+        super::record_local_wire_response(&mut request, crate::protocol::CONNECTION_CLOSING);
+
+        assert_eq!(request.backend_id(), None);
+        assert_eq!(request.response_status(), Some(StatusCode::new(205)));
+        assert_eq!(
+            request.response_wire_len(),
+            Some(ResponseWireLen::new(
+                crate::protocol::CONNECTION_CLOSING.len()
+            ))
+        );
+    }
+
     #[test]
     fn test_client_disconnect_is_detected() {
         use std::io::ErrorKind;
