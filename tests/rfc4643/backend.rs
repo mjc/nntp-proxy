@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 fn command_wire(request: &RequestContext) -> Vec<u8> {
-    let mut out = Vec::with_capacity(request.wire_len());
+    let mut out = Vec::with_capacity(request.request_wire_len().get());
     out.extend_from_slice(request.verb());
     if !request.args().is_empty() {
         out.push(b' ');

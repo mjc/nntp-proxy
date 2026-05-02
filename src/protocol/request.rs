@@ -705,13 +705,8 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn wire_len(&self) -> usize {
-        self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2
-    }
-
-    #[must_use]
     pub fn request_wire_len(&self) -> RequestWireLen {
-        self.wire_len().into()
+        (self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2).into()
     }
 
     /// Write the typed request as NNTP wire bytes without building a command buffer.
@@ -844,7 +839,7 @@ mod tests {
     use super::*;
 
     fn wire(context: &RequestContext) -> Vec<u8> {
-        let mut out = Vec::with_capacity(context.wire_len());
+        let mut out = Vec::with_capacity(context.request_wire_len().get());
         out.extend_from_slice(context.verb());
         if !context.args().is_empty() {
             out.push(b' ');

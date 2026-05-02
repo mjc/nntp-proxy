@@ -69,7 +69,7 @@ mod tests {
     }
 
     fn wire(context: &RequestContext) -> Vec<u8> {
-        let mut out = Vec::with_capacity(context.wire_len());
+        let mut out = Vec::with_capacity(context.request_wire_len().get());
         out.extend_from_slice(context.verb());
         if !context.args().is_empty() {
             out.push(b' ');

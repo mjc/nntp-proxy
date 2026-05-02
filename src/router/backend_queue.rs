@@ -368,7 +368,7 @@ mod tests {
         let context = RequestContext::from_request_bytes(b"STAT <test@example.com>\r\n");
         assert_eq!(context.verb(), b"STAT");
         assert_eq!(context.args(), b"<test@example.com>");
-        assert_eq!(context.wire_len(), 25);
+        assert_eq!(context.request_wire_len().get(), 25);
     }
 
     #[test]

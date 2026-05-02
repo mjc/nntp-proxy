@@ -17,7 +17,7 @@ fn msgid(value: &str) -> MessageId<'_> {
 }
 
 fn wire(context: &protocol::RequestContext) -> Vec<u8> {
-    let mut out = Vec::with_capacity(context.wire_len());
+    let mut out = Vec::with_capacity(context.request_wire_len().get());
     out.extend_from_slice(context.verb());
     if !context.args().is_empty() {
         out.push(b' ');
@@ -181,7 +181,7 @@ fn test_long_message_id_command_length() {
     let long_id = format!("<{}@example.com>", "x".repeat(450));
     let cmd = protocol::article_request(&msgid(&long_id));
     // We produce the command; server will reject if too long
-    assert!(cmd.wire_len() > 0);
+    assert!(cmd.request_wire_len().get() > 0);
     assert!(wire(&cmd).ends_with(b"\r\n"));
 }
 
