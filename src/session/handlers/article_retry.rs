@@ -489,7 +489,7 @@ impl ClientSession {
                 precheck::precheck(&deps, request, msg_id_ref).await
             {
                 if let Some(write) =
-                    write_cached_article_response(client_write, &entry, request.verb(), msg_id_ref)
+                    write_cached_article_response(client_write, &entry, request, msg_id_ref)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
                 {

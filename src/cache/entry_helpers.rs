@@ -57,6 +57,7 @@ pub(super) fn is_complete_article(buffer: &[u8], status_code: u16) -> bool {
 /// Simpler version of `response_for_command` for boolean checks. Commands are
 /// ASCII and case-insensitive per RFC 3977, so keep this byte-native.
 #[inline]
+#[cfg(test)]
 pub(super) fn matches_command_type_verb(status_code: u16, cmd_verb: &[u8]) -> bool {
     match status_code {
         220 => {

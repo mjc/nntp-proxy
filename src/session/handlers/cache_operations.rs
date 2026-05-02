@@ -99,9 +99,7 @@ impl ClientSession {
         // Check if this is a complete article we can serve
         // Stubs from STAT/HEAD precheck or availability tracking should not be served
         // Exception: STAT can be answered from any cache entry (we just need to know it exists)
-        let cmd_verb = request.verb();
-
-        if !cmd_verb.eq_ignore_ascii_case(b"STAT") && !cached.is_complete_article() {
+        if !request.is_stat() && !cached.is_complete_article() {
             debug!(
                 "Client {} cache entry for {} is a stub (payload_len={}), fetching full article",
                 self.client_addr,
@@ -113,22 +111,17 @@ impl ClientSession {
         }
 
         // Serve from cache, avoiding buffer copies for the common path.
-        // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
-        if !cached.matches_command_type_verb(cmd_verb) {
+        // STAT is synthesized (tiny response), everything else writes directly from typed payload sections.
+        let Some(write) = write_cached_article_response(client_write, &cached, request, msg_id_ref)
+            .await?
+        else {
             let status_code = cached.status_code().as_u16();
             debug!(
-                "Client {} cached response (code={}) can't serve command {:?}",
+                "Client {} cached response (code={}) can't serve request kind {:?}",
                 self.client_addr,
                 status_code,
-                String::from_utf8_lossy(cmd_verb)
+                request.kind()
             );
-            request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit);
-        }
-
-        let Some(write) =
-            write_cached_article_response(client_write, &cached, cmd_verb, msg_id_ref).await?
-        else {
             request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit);
         };
@@ -268,13 +261,14 @@ impl CachedResponseWrite {
 pub(super) async fn write_cached_article_response<W>(
     client_write: &mut W,
     cached: &crate::cache::ArticleEntry,
-    cmd_verb: &[u8],
+    request: &RequestContext,
     msg_id: &MessageId<'_>,
 ) -> std::io::Result<Option<CachedResponseWrite>>
 where
     W: AsyncWrite + Unpin,
 {
-    let Some(response) = cached.response_parts_for_command_bytes(cmd_verb, msg_id.as_str()) else {
+    let Some(response) = cached.response_parts_for_request_kind(request.kind(), msg_id.as_str())
+    else {
         return Ok(None);
     };
     let wire_len = response.wire_len();
