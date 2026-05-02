@@ -3,7 +3,7 @@
 //! Pure functions for determining caching behavior based on response codes
 //! and command types.
 
-use crate::protocol::{RequestContext, RequestRouteClass};
+use crate::protocol::{RequestContext, RequestRouteClass, ResponseShape, StatusCode};
 
 /// Determine what caching action to take for a response
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,22 +27,22 @@ pub enum CacheAction {
 /// - 222 = BODY (body only - cache this for yEnc content)
 /// - 223 = STAT (status only)
 #[inline]
-pub const fn should_capture_for_cache(
-    response_code: u16,
-    is_multiline: bool,
+pub fn should_capture_for_cache(
+    response_code: StatusCode,
+    response_shape: ResponseShape,
     cache_articles: bool,
     has_message_id: bool,
 ) -> bool {
     cache_articles
-        && is_multiline
+        && matches!(response_shape, ResponseShape::Multiline)
         && has_message_id
-        && (response_code == 220 || response_code == 222)
+        && matches!(response_code.as_u16(), 220 | 222)
 }
 
 /// Check if a response should be tracked for availability (HEAD/BODY/ARTICLE/STAT success)
 #[inline]
-pub const fn should_track_availability(response_code: u16, has_message_id: bool) -> bool {
-    has_message_id && matches!(response_code, 220..=223)
+pub fn should_track_availability(response_code: StatusCode, has_message_id: bool) -> bool {
+    has_message_id && matches!(response_code.as_u16(), 220..=223)
 }
 
 /// Determine caching action for a response
@@ -59,24 +59,17 @@ pub const fn should_track_availability(response_code: u16, has_message_id: bool)
 fn determine_cache_action(
     command: &str,
     response_code: u16,
-    is_multiline: bool,
     cache_articles: bool,
     has_message_id: bool,
 ) -> CacheAction {
     let request = RequestContext::from_request_line(command);
-    determine_cache_action_for_request(
-        &request,
-        response_code,
-        is_multiline,
-        cache_articles,
-        has_message_id,
-    )
+    let response_code = StatusCode::new(response_code);
+    determine_cache_action_for_request(&request, response_code, cache_articles, has_message_id)
 }
 
 pub fn determine_cache_action_for_request(
     request: &RequestContext,
-    response_code: u16,
-    is_multiline: bool,
+    response_code: StatusCode,
     cache_articles: bool,
     has_message_id: bool,
 ) -> CacheAction {
@@ -90,11 +83,20 @@ pub fn determine_cache_action_for_request(
         return CacheAction::None;
     }
 
-    if should_capture_for_cache(response_code, is_multiline, cache_articles, has_message_id) {
+    let response_shape = request.response_shape(response_code);
+
+    if should_capture_for_cache(
+        response_code,
+        response_shape,
+        cache_articles,
+        has_message_id,
+    ) {
         CacheAction::CaptureArticle
-    } else if is_multiline && should_track_availability(response_code, has_message_id) {
+    } else if matches!(response_shape, ResponseShape::Multiline)
+        && should_track_availability(response_code, has_message_id)
+    {
         CacheAction::TrackAvailability
-    } else if response_code == 223 {
+    } else if response_code.as_u16() == 223 {
         CacheAction::TrackStat
     } else {
         CacheAction::None
@@ -110,58 +112,113 @@ mod tests {
     #[test]
     fn test_should_capture_for_cache_article_response() {
         // 220 (ARTICLE) and 222 (BODY) with all conditions met should capture
-        assert!(should_capture_for_cache(220, true, true, true));
-        assert!(should_capture_for_cache(222, true, true, true));
+        assert!(should_capture_for_cache(
+            StatusCode::new(220),
+            ResponseShape::Multiline,
+            true,
+            true
+        ));
+        assert!(should_capture_for_cache(
+            StatusCode::new(222),
+            ResponseShape::Multiline,
+            true,
+            true
+        ));
 
         // 221 (HEAD) should NOT capture (headers only)
-        assert!(!should_capture_for_cache(221, true, true, true));
+        assert!(!should_capture_for_cache(
+            StatusCode::new(221),
+            ResponseShape::Multiline,
+            true,
+            true
+        ));
     }
 
     #[test]
     fn test_should_capture_for_cache_requires_all_conditions() {
         // Not multiline
-        assert!(!should_capture_for_cache(220, false, true, true));
+        assert!(!should_capture_for_cache(
+            StatusCode::new(220),
+            ResponseShape::SingleLine,
+            true,
+            true
+        ));
 
         // Cache disabled
-        assert!(!should_capture_for_cache(220, true, false, true));
+        assert!(!should_capture_for_cache(
+            StatusCode::new(220),
+            ResponseShape::Multiline,
+            false,
+            true
+        ));
 
         // No message-ID
-        assert!(!should_capture_for_cache(220, true, true, false));
+        assert!(!should_capture_for_cache(
+            StatusCode::new(220),
+            ResponseShape::Multiline,
+            true,
+            false
+        ));
 
         // Wrong response code
-        assert!(!should_capture_for_cache(430, true, true, true));
+        assert!(!should_capture_for_cache(
+            StatusCode::new(430),
+            ResponseShape::Multiline,
+            true,
+            true
+        ));
     }
 
     #[test]
     fn test_should_capture_for_cache_220_and_222() {
         // 220 (ARTICLE) and 222 (BODY) responses should be captured
-        assert!(should_capture_for_cache(220, true, true, true));
-        assert!(should_capture_for_cache(222, true, true, true)); // BODY
-        assert!(!should_capture_for_cache(221, true, true, true)); // HEAD
-        assert!(!should_capture_for_cache(223, true, true, true)); // STAT
+        assert!(should_capture_for_cache(
+            StatusCode::new(220),
+            ResponseShape::Multiline,
+            true,
+            true
+        ));
+        assert!(should_capture_for_cache(
+            StatusCode::new(222),
+            ResponseShape::Multiline,
+            true,
+            true
+        )); // BODY
+        assert!(!should_capture_for_cache(
+            StatusCode::new(221),
+            ResponseShape::Multiline,
+            true,
+            true
+        )); // HEAD
+        assert!(!should_capture_for_cache(
+            StatusCode::new(223),
+            ResponseShape::Multiline,
+            true,
+            true
+        )); // STAT
     }
 
     // Tests for should_track_availability
 
     #[test]
     fn test_should_track_availability_success_responses() {
-        assert!(should_track_availability(220, true)); // ARTICLE
-        assert!(should_track_availability(221, true)); // HEAD
-        assert!(should_track_availability(222, true)); // BODY
-        assert!(should_track_availability(223, true)); // STAT
+        assert!(should_track_availability(StatusCode::new(220), true)); // ARTICLE
+        assert!(should_track_availability(StatusCode::new(221), true)); // HEAD
+        assert!(should_track_availability(StatusCode::new(222), true)); // BODY
+        assert!(should_track_availability(StatusCode::new(223), true)); // STAT
     }
 
     #[test]
     fn test_should_track_availability_requires_message_id() {
-        assert!(!should_track_availability(220, false));
-        assert!(!should_track_availability(223, false));
+        assert!(!should_track_availability(StatusCode::new(220), false));
+        assert!(!should_track_availability(StatusCode::new(223), false));
     }
 
     #[test]
     fn test_should_track_availability_error_responses() {
-        assert!(!should_track_availability(430, true)); // Article not found
-        assert!(!should_track_availability(500, true)); // Server error
-        assert!(!should_track_availability(200, true)); // Greeting
+        assert!(!should_track_availability(StatusCode::new(430), true)); // Article not found
+        assert!(!should_track_availability(StatusCode::new(500), true)); // Server error
+        assert!(!should_track_availability(StatusCode::new(200), true)); // Greeting
     }
 
     // Tests for determine_cache_action
@@ -170,7 +227,7 @@ mod tests {
     fn test_determine_cache_action_capture_article() {
         // Full article capture for 220 response when cache enabled
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 220, true, true, true),
+            determine_cache_action("ARTICLE <test@example.com>", 220, true, true),
             CacheAction::CaptureArticle
         );
     }
@@ -179,17 +236,17 @@ mod tests {
     fn test_determine_cache_action_track_availability() {
         // HEAD (221) only tracks availability (headers only)
         assert_eq!(
-            determine_cache_action("HEAD <test@example.com>", 221, true, true, true),
+            determine_cache_action("HEAD <test@example.com>", 221, true, true),
             CacheAction::TrackAvailability
         );
         // BODY (222) now captures full article when cache_articles=true
         assert_eq!(
-            determine_cache_action("BODY <test@example.com>", 222, true, true, true),
+            determine_cache_action("BODY <test@example.com>", 222, true, true),
             CacheAction::CaptureArticle
         );
         // BODY (222) with cache_articles=false only tracks availability
         assert_eq!(
-            determine_cache_action("BODY <test@example.com>", 222, true, false, true),
+            determine_cache_action("BODY <test@example.com>", 222, false, true),
             CacheAction::TrackAvailability
         );
     }
@@ -198,7 +255,7 @@ mod tests {
     fn test_determine_cache_action_track_stat() {
         // Track STAT (223) - not multiline
         assert_eq!(
-            determine_cache_action("STAT <test@example.com>", 223, false, false, true),
+            determine_cache_action("STAT <test@example.com>", 223, false, true),
             CacheAction::TrackStat
         );
     }
@@ -207,11 +264,11 @@ mod tests {
     fn test_determine_cache_action_error_responses() {
         // No caching for error responses
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 430, true, true, true),
+            determine_cache_action("ARTICLE <test@example.com>", 430, true, true),
             CacheAction::None
         );
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 500, true, true, true),
+            determine_cache_action("ARTICLE <test@example.com>", 500, true, true),
             CacheAction::None
         );
     }
@@ -220,7 +277,7 @@ mod tests {
     fn test_determine_cache_action_cache_disabled() {
         // When cache_articles is false, don't capture full article but still track availability
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 220, true, false, true),
+            determine_cache_action("ARTICLE <test@example.com>", 220, false, true),
             CacheAction::TrackAvailability
         );
     }

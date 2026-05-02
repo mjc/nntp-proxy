@@ -338,8 +338,7 @@ impl ClientSession {
 
         let cache_action = determine_cache_action_for_request(
             params.request,
-            code,
-            params.is_multiline,
+            params.status_code,
             self.cache_articles,
             params.msg_id.is_some(),
         );
