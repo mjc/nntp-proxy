@@ -112,6 +112,7 @@ pub struct RequestContext {
     message_id: Option<(usize, usize)>,
     cache_status: Option<RequestCacheStatus>,
     cache_availability: Option<RequestCacheAvailability>,
+    cache_entry_status: Option<StatusCode>,
     backend_id: Option<BackendId>,
     response_status: Option<StatusCode>,
     response_wire_len: Option<ResponseWireLen>,
@@ -139,6 +140,7 @@ impl RequestContext {
             message_id,
             cache_status: None,
             cache_availability: None,
+            cache_entry_status: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -159,6 +161,7 @@ impl RequestContext {
             message_id,
             cache_status: None,
             cache_availability: None,
+            cache_entry_status: None,
             backend_id: None,
             response_status: None,
             response_wire_len: None,
@@ -190,6 +193,12 @@ impl RequestContext {
     }
 
     #[inline]
+    #[must_use]
+    pub const fn cache_entry_status(&self) -> Option<StatusCode> {
+        self.cache_entry_status
+    }
+
+    #[inline]
     pub const fn record_cache_status(&mut self, status: RequestCacheStatus) {
         self.cache_status = Some(status);
     }
@@ -197,6 +206,11 @@ impl RequestContext {
     #[inline]
     pub const fn record_cache_availability(&mut self, availability: RequestCacheAvailability) {
         self.cache_availability = Some(availability);
+    }
+
+    #[inline]
+    pub const fn record_cache_entry_status(&mut self, status: StatusCode) {
+        self.cache_entry_status = Some(status);
     }
 
     #[inline]
@@ -231,6 +245,7 @@ impl RequestContext {
         wire_len: ResponseWireLen,
     ) {
         self.cache_status = Some(RequestCacheStatus::Hit);
+        self.cache_entry_status = Some(status);
         self.backend_id = Some(backend_id);
         self.response_status = Some(status);
         self.response_wire_len = Some(wire_len);
@@ -448,6 +463,7 @@ mod tests {
         assert_eq!(ctx.message_id(), Some("<a@b>"));
         assert_eq!(ctx.cache_status(), None);
         assert_eq!(ctx.cache_availability(), None);
+        assert_eq!(ctx.cache_entry_status(), None);
         assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(ctx.response_wire_len(), None);
@@ -489,6 +505,18 @@ mod tests {
         assert_eq!(ctx.cache_availability(), Some(availability));
         assert_eq!(availability.checked_bits(), 0b0000_0011);
         assert_eq!(availability.missing_bits(), 0b0000_0001);
+        assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_cache_entry_status_when_known() {
+        let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
+        let status = StatusCode::new(430);
+
+        ctx.record_cache_entry_status(status);
+
+        assert_eq!(ctx.cache_entry_status(), Some(status));
+        assert_eq!(ctx.response_status(), None);
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }
 

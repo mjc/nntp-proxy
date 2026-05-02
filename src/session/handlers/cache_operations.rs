@@ -62,6 +62,9 @@ impl ClientSession {
         // Extract availability before any early returns so we can pass it back
         let availability = cached.to_availability(router.backend_count());
         request.record_cache_availability(cache_availability_metadata(&availability));
+        if let Some(status) = cached.status_code() {
+            request.record_cache_entry_status(status);
+        }
 
         if !cached.has_availability_info() {
             debug!(
@@ -460,6 +463,7 @@ mod tests {
 
         assert!(matches!(result, CacheLookupResult::PartialHit));
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::PartialHit));
+        assert_eq!(request.cache_entry_status(), Some(StatusCode::new(430)));
         assert_eq!(
             request
                 .cache_availability()
