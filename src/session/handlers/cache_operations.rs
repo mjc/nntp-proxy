@@ -5,7 +5,7 @@
 
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
-use crate::protocol::{RequestCacheStatus, RequestContext, RequestKind, StatusCode};
+use crate::protocol::{RequestCacheStatus, RequestContext, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
@@ -120,19 +120,18 @@ impl ClientSession {
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
-        let Some(bytes_written) =
+        let Some(write) =
             write_cached_article_response(client_write, &cached, cmd_verb, msg_id_ref).await?
         else {
             request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));
         };
-        *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
+        *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len);
 
         let backend_id = router.route(self.client_id)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
-        let status = cached_response_status(request).expect("cache hit has typed response status");
-        request.record_cache_response(backend_id, status, bytes_written);
+        request.record_cache_response(backend_id, write.status, write.wire_len);
         Ok(CacheLookupResult::Hit)
     }
 
@@ -192,13 +191,23 @@ impl ClientSession {
     }
 }
 
-fn cached_response_status(request: &RequestContext) -> Option<StatusCode> {
-    let code = match request.kind() {
-        RequestKind::Article => 220,
-        RequestKind::Head => 221,
-        RequestKind::Body => 222,
-        RequestKind::Stat => 223,
-        _ => return None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CachedResponseWrite {
+    pub status: StatusCode,
+    pub wire_len: usize,
+}
+
+fn cached_response_status_for_verb(verb: &[u8]) -> Option<StatusCode> {
+    let code = if verb.eq_ignore_ascii_case(b"ARTICLE") {
+        220
+    } else if verb.eq_ignore_ascii_case(b"HEAD") {
+        221
+    } else if verb.eq_ignore_ascii_case(b"BODY") {
+        222
+    } else if verb.eq_ignore_ascii_case(b"STAT") {
+        223
+    } else {
+        return None;
     };
     Some(StatusCode::new(code))
 }
@@ -208,7 +217,7 @@ pub(super) async fn write_cached_article_response<W>(
     cached: &crate::cache::ArticleEntry,
     cmd_verb: &[u8],
     msg_id: &MessageId<'_>,
-) -> std::io::Result<Option<usize>>
+) -> std::io::Result<Option<CachedResponseWrite>>
 where
     W: AsyncWrite + Unpin,
 {
@@ -234,7 +243,12 @@ where
             client_write.write_all(b"\r\n.\r\n").await?;
         }
     }
-    Ok(Some(bytes_written))
+    let status = cached_response_status_for_verb(cmd_verb)
+        .expect("cached article response has typed status");
+    Ok(Some(CachedResponseWrite {
+        status,
+        wire_len: bytes_written,
+    }))
 }
 
 #[cfg(test)]
@@ -402,10 +416,8 @@ mod tests {
         ];
 
         for (line, status) in cases {
-            let request = RequestContext::from_request_line(line);
-
             assert_eq!(
-                cached_response_status(&request),
+                cached_response_status_for_verb(RequestContext::from_request_line(line).verb()),
                 Some(StatusCode::new(status))
             );
         }

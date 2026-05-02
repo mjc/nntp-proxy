@@ -487,7 +487,7 @@ impl ClientSession {
                 let bytes_written = if let Some(entry) =
                     precheck::precheck(&deps, request, msg_id_ref, is_head).await
                 {
-                    if let Some(bytes_written) = write_cached_article_response(
+                    if let Some(write) = write_cached_article_response(
                         client_write,
                         &entry,
                         request.verb(),
@@ -496,7 +496,7 @@ impl ClientSession {
                     .await
                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
                     {
-                        bytes_written
+                        write.wire_len
                     } else {
                         client_write
                             .write_all(crate::protocol::NO_SUCH_ARTICLE)
