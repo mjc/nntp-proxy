@@ -44,6 +44,11 @@ impl RequestBatch {
         &self.contexts[i]
     }
 
+    /// Get a mutable typed context by index from the pipelineable commands.
+    pub fn context_mut(&mut self, i: usize) -> &mut RequestContext {
+        &mut self.contexts[i]
+    }
+
     /// Get the trailing non-pipelineable command if present
     pub fn trailing(&self) -> Option<&str> {
         self.trailing_context.as_ref().map(|_| self.buffer.as_str())
@@ -52,6 +57,11 @@ impl RequestBatch {
     /// Get the trailing typed context if present.
     pub fn trailing_context(&self) -> Option<&RequestContext> {
         self.trailing_context.as_ref()
+    }
+
+    /// Get the trailing typed context mutably if present.
+    pub fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
+        self.trailing_context.as_mut()
     }
 
     /// Number of pipelineable commands

@@ -5,7 +5,7 @@
 
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
-use crate::protocol::RequestContext;
+use crate::protocol::{RequestCacheStatus, RequestContext};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
@@ -37,12 +37,13 @@ impl ClientSession {
     pub(super) async fn try_serve_from_cache(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        request: &RequestContext,
+        request: &mut RequestContext,
         router: &Arc<BackendSelector>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CacheLookupResult> {
         let Some(msg_id_ref) = msg_id else {
+            request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
 
@@ -53,6 +54,7 @@ impl ClientSession {
 
         let Some(cached) = self.cache.get(msg_id_ref).await else {
             debug!("Cache MISS for message-ID: {}", msg_id_ref);
+            request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
 
@@ -64,6 +66,7 @@ impl ClientSession {
                 "Cache entry exists for {} but no availability info (missing=0) - running precheck",
                 msg_id_ref
             );
+            request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
@@ -83,6 +86,7 @@ impl ClientSession {
                     msg_id_ref.to_owned(),
                 );
             }
+            request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
@@ -98,6 +102,7 @@ impl ClientSession {
                 msg_id_ref,
                 cached.payload_len()
             );
+            request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
@@ -111,12 +116,14 @@ impl ClientSession {
                 status_code,
                 String::from_utf8_lossy(cmd_verb)
             );
+            request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
         let Some(bytes_written) =
             write_cached_article_response(client_write, &cached, cmd_verb, msg_id_ref).await?
         else {
+            request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit(availability));
         };
         *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
@@ -124,6 +131,7 @@ impl ClientSession {
         let backend_id = router.route(self.client_id)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
+        request.record_cache_status(RequestCacheStatus::Hit);
         Ok(CacheLookupResult::Hit(backend_id))
     }
 
@@ -215,4 +223,95 @@ where
         }
     }
     Ok(Some(bytes_written))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthHandler;
+    use crate::cache::UnifiedCache;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::BufferPool;
+    use crate::types::{BufferSize, ClientAddress};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn test_session() -> ClientSession {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
+        ClientSession::builder(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(1024).expect("valid buffer size"), 1),
+            Arc::new(AuthHandler::new(None, None).expect("auth disabled")),
+            MetricsCollector::new(1),
+        )
+        .with_cache(Arc::new(UnifiedCache::memory(
+            1024,
+            Duration::from_secs(60),
+            true,
+        )))
+        .build()
+    }
+
+    async fn tcp_write_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener address");
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, server) = tokio::join!(connect, accept);
+        (
+            client.expect("connect client"),
+            server.expect("accept client").0,
+        )
+    }
+
+    #[tokio::test]
+    async fn cache_miss_is_recorded_on_request_context() {
+        let session = test_session();
+        let router = Arc::new(BackendSelector::new());
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, _server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = RequestContext::from_request_line("ARTICLE <missing@example>\r\n");
+        let msg_id = request
+            .message_id_value()
+            .map(|msg_id| msg_id.to_owned())
+            .expect("message id");
+
+        let result = session
+            .try_serve_from_cache(
+                Some(&msg_id),
+                &mut request,
+                &router,
+                &mut write,
+                &mut metrics,
+            )
+            .await
+            .expect("lookup succeeds");
+
+        assert!(matches!(result, CacheLookupResult::Miss));
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::Miss));
+        assert_eq!(metrics, BackendToClientBytes::zero());
+    }
+
+    #[tokio::test]
+    async fn request_without_message_id_records_cache_miss() {
+        let session = test_session();
+        let router = Arc::new(BackendSelector::new());
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, _server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = RequestContext::from_request_line("DATE\r\n");
+
+        let result = session
+            .try_serve_from_cache(None, &mut request, &router, &mut write, &mut metrics)
+            .await
+            .expect("lookup succeeds");
+
+        assert!(matches!(result, CacheLookupResult::Miss));
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::Miss));
+        assert_eq!(metrics, BackendToClientBytes::zero());
+    }
 }

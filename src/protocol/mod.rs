@@ -18,7 +18,9 @@ mod responses;
 pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
-pub use request::{RequestContext, RequestKind, RequestRouteClass, ResponseShape};
+pub use request::{
+    RequestCacheStatus, RequestContext, RequestKind, RequestRouteClass, ResponseShape,
+};
 pub use response::{NntpResponse, StatusCode};
 
 // Re-export command construction helpers

@@ -433,7 +433,7 @@ impl ClientSession {
     pub(super) async fn route_and_execute_request(
         &self,
         router: Arc<BackendSelector>,
-        request: &RequestContext,
+        request: &mut RequestContext,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
@@ -445,7 +445,7 @@ impl ClientSession {
             request.verb()
         );
         // Extract message-ID early for cache/availability tracking
-        let msg_id = request.message_id_value();
+        let msg_id = request.message_id_value().map(|msg_id| msg_id.to_owned());
 
         debug!(
             "Client {} msg_id={:?}, cache_articles={}",

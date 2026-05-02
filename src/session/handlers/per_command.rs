@@ -44,7 +44,7 @@ enum SingleCommandResult {
 
 /// Parameters for executing a command decision
 struct CommandExecutionParams<'a, 'b> {
-    request: &'a RequestContext,
+    request: &'a mut RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
     client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
@@ -55,7 +55,7 @@ struct CommandExecutionParams<'a, 'b> {
 
 /// Parameters for processing a single command (full flow including QUIT handling)
 struct ProcessCommandParams<'a, 'b> {
-    request: &'a RequestContext,
+    request: &'a mut RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
     client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
@@ -297,7 +297,7 @@ impl ClientSession {
 
         // Process commands in batches (single commands fall through with zero overhead)
         'command_batch_loop: loop {
-            let batch = match self
+            let mut batch = match self
                 .read_command_batch(&mut client_reader, &mut command_buf, &mut batch_buf)
                 .await
             {
@@ -389,7 +389,7 @@ impl ClientSession {
                 if !batch_handled {
                     // Sequential processing for mixed, single-command, or failed-batch commands
                     for i in 0..batch_size {
-                        let request = batch.context(i);
+                        let request = batch.context_mut(i);
                         debug!(
                             "Client {} received {} request bytes: kind={:?}, verb={:?}",
                             self.client_addr,
@@ -441,14 +441,13 @@ impl ClientSession {
             }
 
             // --- Handle trailing non-pipelineable command (auth, QUIT, stateful, etc.) ---
-            if let Some(trailing_cmd) = batch.trailing() {
-                let trailing_context = batch.trailing_context();
+            if batch.trailing_context().is_some() {
+                let trailing_cmd_len = batch.trailing().expect("trailing command exists").len();
                 // Reject oversized commands per RFC 3977 (512-byte limit)
                 if batch.is_trailing_oversized() {
                     warn!(
                         "Client {} sent oversized command ({} bytes), rejecting",
-                        self.client_addr,
-                        trailing_cmd.len()
+                        self.client_addr, trailing_cmd_len
                     );
                     client_write
                         .write_all(crate::protocol::COMMAND_TOO_LONG)
@@ -460,16 +459,19 @@ impl ClientSession {
                 debug!(
                     "Client {} trailing non-pipelineable {:?}: {:?}",
                     self.client_addr,
-                    trailing_context.map(|ctx| ctx.kind()),
-                    trailing_cmd.trim()
+                    batch.trailing_context().map(|ctx| ctx.kind()),
+                    batch.trailing().expect("trailing command exists").trim()
                 );
 
-                client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd.len());
+                client_to_backend_bytes = client_to_backend_bytes.add(trailing_cmd_len);
                 skip_auth_check = self.is_authenticated_cached(skip_auth_check);
 
+                let trailing_context = batch
+                    .trailing_context_mut()
+                    .expect("valid trailing command has context");
                 match self
                     .process_single_command(ProcessCommandParams {
-                        request: trailing_context.expect("valid trailing command has context"),
+                        request: trailing_context,
                         skip_auth_check,
                         router,
                         client_write: &mut client_write,
@@ -492,7 +494,7 @@ impl ClientSession {
                             .switch_to_stateful_mode(
                                 client_reader,
                                 client_write,
-                                trailing_context.expect("valid trailing command has context"),
+                                trailing_context,
                                 client_to_backend_bytes.into(),
                                 backend_to_client_bytes.into(),
                             )
