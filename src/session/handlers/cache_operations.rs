@@ -15,7 +15,7 @@ use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 use tracing::debug;
 
 /// Result of a cache lookup attempt in `try_serve_from_cache`.
@@ -278,24 +278,7 @@ where
         return Ok(None);
     };
     let bytes_written = response.len();
-    client_write.write_all(response.status_line()).await?;
-    match response.payload_slices() {
-        crate::cache::CachedArticlePayloadSlices::None => {}
-        crate::cache::CachedArticlePayloadSlices::Article { headers, body } => {
-            client_write.write_all(headers).await?;
-            client_write.write_all(b"\r\n\r\n").await?;
-            client_write.write_all(body).await?;
-            client_write.write_all(b"\r\n.\r\n").await?;
-        }
-        crate::cache::CachedArticlePayloadSlices::Head { headers } => {
-            client_write.write_all(headers).await?;
-            client_write.write_all(b"\r\n.\r\n").await?;
-        }
-        crate::cache::CachedArticlePayloadSlices::Body { body } => {
-            client_write.write_all(body).await?;
-            client_write.write_all(b"\r\n.\r\n").await?;
-        }
-    }
+    response.write_to(client_write).await?;
     Ok(Some(CachedResponseWrite {
         status: response.status(),
         wire_len: bytes_written.into(),
