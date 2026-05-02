@@ -28,6 +28,41 @@ const PAYLOAD_BODY: u8 = 4;
 const PAYLOAD_STAT: u8 = 5;
 const NO_ARTICLE_NUMBER: u64 = u64::MAX;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CachedSectionLen(u32);
+
+impl CachedSectionLen {
+    const MAX: usize = 100 * 1024 * 1024;
+
+    fn try_from_usize(value: usize) -> foyer::Result<Self> {
+        let len = u32::try_from(value).map_err(|_| {
+            foyer::Error::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Cached article section too large: {value} bytes"),
+            ))
+        })?;
+        Ok(Self(len))
+    }
+
+    fn from_wire(value: u32) -> foyer::Result<Self> {
+        if value as usize > Self::MAX {
+            return Err(foyer::Error::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Cached article section too large: {value} bytes"),
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    const fn get(self) -> u32 {
+        self.0
+    }
+
+    const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// Valid NNTP status codes for cached articles
 ///
 /// Using an enum instead of raw `u16` makes invalid states unrepresentable.
@@ -301,14 +336,9 @@ fn read_article_number(reader: &mut impl Read) -> foyer::Result<Option<CachedArt
 }
 
 fn write_vec(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
-    let len = u32::try_from(data.len()).map_err(|_| {
-        foyer::Error::io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Cached article section too large: {} bytes", data.len()),
-        ))
-    })?;
+    let len = CachedSectionLen::try_from_usize(data.len())?;
     writer
-        .write_all(&len.to_le_bytes())
+        .write_all(&len.get().to_le_bytes())
         .map_err(foyer::Error::io_error)?;
     writer.write_all(data).map_err(foyer::Error::io_error)
 }
@@ -318,14 +348,7 @@ fn read_vec(reader: &mut impl Read) -> foyer::Result<Vec<u8>> {
     reader
         .read_exact(&mut len_bytes)
         .map_err(foyer::Error::io_error)?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    const MAX_SECTION_SIZE: usize = 100 * 1024 * 1024;
-    if len > MAX_SECTION_SIZE {
-        return Err(foyer::Error::io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Cached article section too large: {len} bytes"),
-        )));
-    }
+    let len = CachedSectionLen::from_wire(u32::from_le_bytes(len_bytes))?.as_usize();
     let mut data = Vec::with_capacity(len);
     reader
         .take(len as u64)
@@ -715,6 +738,17 @@ mod tests {
     fn test_cacheable_status_code_repr_u16_size() {
         use std::mem::size_of;
         assert_eq!(size_of::<CacheableStatusCode>(), size_of::<u16>());
+    }
+
+    #[test]
+    fn test_cached_section_len_rejects_oversized_sections() {
+        assert_eq!(
+            CachedSectionLen::try_from_usize(u32::MAX as usize)
+                .unwrap()
+                .get(),
+            u32::MAX
+        );
+        assert!(CachedSectionLen::try_from_usize(u32::MAX as usize + 1).is_err());
     }
 
     // =========================================================================
