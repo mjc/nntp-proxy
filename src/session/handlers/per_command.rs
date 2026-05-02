@@ -231,7 +231,7 @@ impl ClientSession {
 
         // Handle QUIT locally
         if let common::QuitStatus::Quit(bytes) =
-            common::handle_quit_command(command, client_write).await?
+            common::handle_quit_command(request, client_write).await?
         {
             *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
             return Ok(SingleCommandResult::Quit);

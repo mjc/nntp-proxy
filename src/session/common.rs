@@ -2,6 +2,7 @@
 
 use crate::auth::AuthHandler;
 use crate::command::AuthAction;
+use crate::protocol::{RequestContext, RequestKind};
 use crate::types::BackendToClientBytes;
 
 use anyhow::Result;
@@ -68,11 +69,14 @@ where
 }
 
 /// Check if command is QUIT and send closing response
-pub async fn handle_quit_command<W>(command: &str, client_write: &mut W) -> Result<QuitStatus>
+pub async fn handle_quit_command<W>(
+    request: &RequestContext,
+    client_write: &mut W,
+) -> Result<QuitStatus>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if command.trim().eq_ignore_ascii_case("QUIT") {
+    if request.kind() == RequestKind::Quit {
         use crate::protocol::CONNECTION_CLOSING;
 
         client_write
@@ -143,6 +147,33 @@ mod tests {
 
         assert_eq!(quit1, quit2);
         assert_ne!(quit1, cont);
+    }
+
+    #[tokio::test]
+    async fn handle_quit_command_uses_typed_request_kind() {
+        let request = RequestContext::from_request_line("quit\r\n");
+        let mut written = Vec::new();
+
+        let status = handle_quit_command(&request, &mut written).await.unwrap();
+
+        assert_eq!(
+            status,
+            QuitStatus::Quit(BackendToClientBytes::new(
+                crate::protocol::CONNECTION_CLOSING.len() as u64
+            ))
+        );
+        assert_eq!(written, crate::protocol::CONNECTION_CLOSING);
+    }
+
+    #[tokio::test]
+    async fn handle_quit_command_ignores_non_quit_request_contexts() {
+        let request = RequestContext::from_request_line("HELP\r\n");
+        let mut written = Vec::new();
+
+        let status = handle_quit_command(&request, &mut written).await.unwrap();
+
+        assert_eq!(status, QuitStatus::Continue);
+        assert!(written.is_empty());
     }
 
     // =========================================================================
