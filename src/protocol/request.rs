@@ -327,6 +327,67 @@ mod tests {
     }
 
     #[test]
+    fn all_rfc_command_verbs_classify_to_request_kinds() {
+        let cases = [
+            ("ARTICLE <a@b>\r\n", RequestKind::Article),
+            ("BODY <a@b>\r\n", RequestKind::Body),
+            ("HEAD <a@b>\r\n", RequestKind::Head),
+            ("STAT <a@b>\r\n", RequestKind::Stat),
+            ("GROUP alt.test\r\n", RequestKind::Group),
+            ("LISTGROUP alt.test\r\n", RequestKind::ListGroup),
+            ("LAST\r\n", RequestKind::Last),
+            ("NEXT\r\n", RequestKind::Next),
+            ("LIST\r\n", RequestKind::List),
+            ("DATE\r\n", RequestKind::Date),
+            ("HELP\r\n", RequestKind::Help),
+            ("CAPABILITIES\r\n", RequestKind::Capabilities),
+            ("MODE READER\r\n", RequestKind::Mode),
+            ("QUIT\r\n", RequestKind::Quit),
+            ("OVER 1-10\r\n", RequestKind::Over),
+            ("XOVER 1-10\r\n", RequestKind::Xover),
+            ("HDR Subject 1-10\r\n", RequestKind::Hdr),
+            ("XHDR Subject 1-10\r\n", RequestKind::Xhdr),
+            ("NEWGROUPS 20260101 000000 GMT\r\n", RequestKind::NewGroups),
+            ("NEWNEWS * 20260101 000000 GMT\r\n", RequestKind::NewNews),
+            ("POST\r\n", RequestKind::Post),
+            ("IHAVE <a@b>\r\n", RequestKind::Ihave),
+            ("AUTHINFO USER test\r\n", RequestKind::AuthInfo),
+        ];
+
+        for (line, expected) in cases {
+            assert_eq!(
+                RequestContext::from_request_line(line).kind(),
+                expected,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_route_classes_match_typed_command_behavior() {
+        let cases = [
+            ("ARTICLE <a@b>\r\n", RequestRouteClass::ArticleByMessageId),
+            ("BODY 123\r\n", RequestRouteClass::Stateful),
+            ("GROUP alt.test\r\n", RequestRouteClass::Stateful),
+            ("LIST\r\n", RequestRouteClass::Stateless),
+            ("MODE READER\r\n", RequestRouteClass::Stateless),
+            ("QUIT\r\n", RequestRouteClass::Local),
+            ("AUTHINFO PASS secret\r\n", RequestRouteClass::Local),
+            ("POST\r\n", RequestRouteClass::Reject),
+            ("IHAVE <a@b>\r\n", RequestRouteClass::Reject),
+            ("XFOO arg\r\n", RequestRouteClass::Stateful),
+        ];
+
+        for (line, expected) in cases {
+            assert_eq!(
+                RequestContext::from_request_line(line).route_class(),
+                expected,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn request_aware_response_shape() {
         let group = RequestContext::from_request_line("GROUP alt.test\r\n");
         let listgroup = RequestContext::from_request_line("LISTGROUP alt.test\r\n");
