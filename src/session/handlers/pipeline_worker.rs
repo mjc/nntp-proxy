@@ -199,7 +199,7 @@ async fn execute_pipeline_batch(
                     backend = ?backend_id,
                     response_index = i + 1,
                     batch_size = batch_len,
-                    command_verb = %String::from_utf8_lossy(req.context.verb()),
+                    command_verb = ?req.context.verb(),
                     error = %e,
                     leftover_bytes = conn.leftover_len(),
                     "Pipeline worker read failed"

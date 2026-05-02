@@ -118,7 +118,7 @@ impl ClientSession {
             tracing::warn!(
                 client = %self.client_addr,
                 backend = ?backend_id,
-                command_verb = %String::from_utf8_lossy(request.verb()),
+                command_verb = ?request.verb(),
                 bytes_read = cmd_response.bytes_read,
                 first_bytes_hex = %crate::session::backend::format_hex_preview(
                     &state.buffer[..bytes_to_read], 256
@@ -133,13 +133,13 @@ impl ClientSession {
 
             // Try to salvage connection with DATE health check
             // Spawn in background so client can retry immediately
-            let cmd_for_log = String::from_utf8_lossy(request.verb()).into_owned();
+            let request_kind = request.kind();
             let provider_for_salvage = provider.clone();
             let conn_for_salvage = conn.release(); // hand off; salvage decides pool fate
             tokio::spawn(async move {
                 tracing::debug!(
                     backend = ?backend_id,
-                    command_verb = %cmd_for_log,
+                    request_kind = ?request_kind,
                     "Attempting to salvage connection after Invalid response"
                 );
                 crate::pool::salvage_with_health_check(conn_for_salvage, provider_for_salvage)
@@ -166,7 +166,7 @@ impl ClientSession {
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
-            command_verb = %String::from_utf8_lossy(request.verb()),
+            command_verb = ?request.verb(),
             first_chunk_bytes = cmd_response.bytes_read,
             status_code = status_code.as_u16(),
             response_is_multiline,
@@ -202,7 +202,7 @@ impl ClientSession {
                     warn!(
                         client = %self.client_addr,
                         backend = backend_id.as_index(),
-                        command_verb = %String::from_utf8_lossy(request.verb()),
+                        command_verb = ?request.verb(),
                         error = %e,
                         "Streaming error, removing connection from pool"
                     );
@@ -216,7 +216,7 @@ impl ClientSession {
                         warn!(
                             client = %self.client_addr,
                             backend = backend_id.as_index(),
-                            command_verb = %String::from_utf8_lossy(request.verb()),
+                            command_verb = ?request.verb(),
                             leftover_bytes = conn.leftover_len(),
                             "Buffered direct-path response ended with trailing backend bytes; retiring connection"
                         );
@@ -250,7 +250,7 @@ impl ClientSession {
             warn!(
                 client = %self.client_addr,
                 backend = backend_id.as_index(),
-                command_verb = %String::from_utf8_lossy(request.verb()),
+                command_verb = ?request.verb(),
                 leftover_bytes = conn.leftover_len(),
                 "Direct per-command response left trailing backend bytes; retiring connection"
             );
