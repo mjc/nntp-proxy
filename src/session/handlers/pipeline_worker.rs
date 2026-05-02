@@ -735,8 +735,15 @@ mod tests {
         .await;
         assert!(success);
 
-        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
-        assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
+        let first = rx1.await.unwrap().unwrap();
+        let second = rx2.await.unwrap().unwrap();
+
+        assert_eq!(first.status_code.as_u16(), 223);
+        assert_eq!(first.context.message_id(), Some("<a@b>"));
+        assert_eq!(first.backend_id, backend_id);
+        assert_eq!(second.status_code.as_u16(), 430);
+        assert_eq!(second.context.message_id(), Some("<c@d>"));
+        assert_eq!(second.backend_id, backend_id);
     }
 
     #[tokio::test]
