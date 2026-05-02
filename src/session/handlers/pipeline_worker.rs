@@ -959,7 +959,7 @@ mod tests {
                                 completed.context.response_status().map(|status| status.as_u16()),
                                 Some(codes[idx])
                             );
-                            prop_assert_eq!(completed.data.to_vec(), responses[idx].clone());
+                            prop_assert_eq!(completed.response.to_vec(), responses[idx].clone());
                         }
                         other => prop_assert!(false, "expected success response, got {other:?}"),
                     }

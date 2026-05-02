@@ -559,7 +559,7 @@ impl ClientSession {
                             {
                                 // Success - article found, return immediately
                                 completed
-                                    .data
+                                    .response
                                     .write_all_to(client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
