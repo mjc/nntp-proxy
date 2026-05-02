@@ -21,11 +21,8 @@ fn parse_typed_contexts(buffer: &[u8]) -> usize {
 
     while let Some(relative_lf) = buffer[start..].iter().position(|byte| *byte == b'\n') {
         let end = start + relative_lf + 1;
-        if end >= 2
-            && buffer[end - 2] == b'\r'
-            && let Ok(line) = std::str::from_utf8(&buffer[start..end])
-        {
-            black_box(RequestContext::from_request_bytes(line.as_bytes()));
+        if end >= 2 && buffer[end - 2] == b'\r' {
+            black_box(RequestContext::from_request_bytes(&buffer[start..end]));
             count += 1;
         }
         start = end;
