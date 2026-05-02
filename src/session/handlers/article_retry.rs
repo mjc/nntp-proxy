@@ -464,7 +464,11 @@ impl ClientSession {
             )
             .await?
         {
-            CacheLookupResult::Hit(backend_id) => return Ok(backend_id),
+            CacheLookupResult::Hit => {
+                return Ok(request
+                    .backend_id()
+                    .expect("cache hit records selected backend id"));
+            }
             CacheLookupResult::PartialHit(availability) => Some(availability),
             CacheLookupResult::Miss => None,
         };

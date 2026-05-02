@@ -21,7 +21,7 @@ use tracing::debug;
 /// and a complete miss (no entry in cache at all).
 pub(super) enum CacheLookupResult {
     /// Response was served directly from cache.
-    Hit(BackendId),
+    Hit,
     /// Entry existed but wasn't servable. Carries the availability info
     /// so callers can skip a redundant `cache.get()`.
     PartialHit(ArticleAvailability),
@@ -133,7 +133,7 @@ impl ClientSession {
         guard.complete();
         let status = cached_response_status(request).expect("cache hit has typed response status");
         request.record_cache_response(backend_id, status, bytes_written);
-        Ok(CacheLookupResult::Hit(backend_id))
+        Ok(CacheLookupResult::Hit)
     }
 
     /// Spawn async cache upsert task
