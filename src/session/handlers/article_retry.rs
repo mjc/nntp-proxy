@@ -564,19 +564,26 @@ impl ClientSession {
                                     client_to_backend_bytes.add(completed.context.wire_len());
                                 self.metrics.record_pipeline_complete();
                                 guard.complete();
-                                return Ok(completed.backend_id);
+                                return Ok(completed
+                                    .context
+                                    .backend_id()
+                                    .expect("completed queued request records backend id"));
                             }
                             Ok(Ok(completed)) => {
+                                let completed_backend_id = completed
+                                    .context
+                                    .backend_id()
+                                    .expect("completed queued request records backend id");
                                 // 430 (article not found) - fall through to retry loop
                                 debug!(
                                     "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
-                                    self.client_addr, completed.backend_id
+                                    self.client_addr, completed_backend_id
                                 );
                                 // O2: Record this backend as missing in local availability (no cache round-trip)
                                 let avail = availability.get_or_insert_default();
-                                avail.record_missing(completed.backend_id);
+                                avail.record_missing(completed_backend_id);
                                 self.metrics.record_pipeline_complete();
-                                self.metrics.record_error_4xx(completed.backend_id);
+                                self.metrics.record_error_4xx(completed_backend_id);
                                 // Fall through - guard drops, decrementing pending_count
                             }
                             Ok(Err(e)) => {

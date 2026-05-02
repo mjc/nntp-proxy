@@ -732,10 +732,10 @@ mod tests {
 
         assert_eq!(first.status_code.as_u16(), 223);
         assert_eq!(first.context.message_id(), Some("<a@b>"));
-        assert_eq!(first.backend_id, backend_id);
+        assert_eq!(first.context.backend_id(), Some(backend_id));
         assert_eq!(second.status_code.as_u16(), 430);
         assert_eq!(second.context.message_id(), Some("<c@d>"));
-        assert_eq!(second.backend_id, backend_id);
+        assert_eq!(second.context.backend_id(), Some(backend_id));
     }
 
     #[tokio::test]
