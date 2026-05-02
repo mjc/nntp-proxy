@@ -403,6 +403,23 @@ impl ArticleEntry {
         }
     }
 
+    #[must_use]
+    pub(crate) fn from_cache_buffer_with_tier(
+        buffer: super::CacheBuffer,
+        tier: ttl::CacheTier,
+    ) -> Self {
+        match buffer {
+            super::CacheBuffer::Vec(buffer) => Self::from_wire_response_with_tier(buffer, tier),
+            super::CacheBuffer::Pooled(buffer) => {
+                Self::from_wire_response_with_tier(buffer.as_ref(), tier)
+            }
+            super::CacheBuffer::Chunked(buffer) => {
+                Self::from_wire_response_with_tier(buffer.to_vec(), tier)
+            }
+            super::CacheBuffer::Small(buffer) => Self::from_wire_response_with_tier(buffer, tier),
+        }
+    }
+
     /// Check if this entry has expired based on tier-aware TTL
     ///
     /// See [`super::ttl`] for the TTL formula.
@@ -901,7 +918,7 @@ impl ArticleCache {
         let cache_articles = self.cache_articles;
 
         let new_entry_template = if cache_articles {
-            ArticleEntry::from_wire_response_with_tier(buffer.into_vec(), tier)
+            ArticleEntry::from_cache_buffer_with_tier(buffer, tier)
         } else {
             let Some(status_code) = buffer.status_code() else {
                 return;
@@ -1175,6 +1192,20 @@ mod tests {
     fn article_entry_ingests_borrowed_wire_response_bytes() {
         let entry = ArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
+        );
+
+        assert_eq!(entry.status_code(), StatusCode::new(220));
+        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+    }
+
+    #[test]
+    fn article_entry_ingests_cache_buffer_without_required_vec() {
+        let entry = ArticleEntry::from_cache_buffer_with_tier(
+            smallvec::SmallVec::<[u8; 128]>::from_slice(
+                b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+            )
+            .into(),
+            ttl::CacheTier::new(0),
         );
 
         assert_eq!(entry.status_code(), StatusCode::new(220));

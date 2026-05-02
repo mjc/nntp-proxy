@@ -363,8 +363,7 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let mut entry = if self.config.cache_articles {
             let buffer_len = buffer.len();
-            let buffer = buffer.into_vec();
-            let Some(entry) = HybridArticleEntry::from_wire_response_with_tier(buffer, tier) else {
+            let Some(entry) = HybridArticleEntry::from_cache_buffer_with_tier(buffer, tier) else {
                 warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
                 return;
             };

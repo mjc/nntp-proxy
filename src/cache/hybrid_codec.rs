@@ -381,6 +381,23 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
+    pub(crate) fn from_cache_buffer_with_tier(
+        buffer: super::CacheBuffer,
+        tier: ttl::CacheTier,
+    ) -> Option<Self> {
+        match buffer {
+            super::CacheBuffer::Vec(buffer) => Self::from_wire_response_with_tier(buffer, tier),
+            super::CacheBuffer::Pooled(buffer) => {
+                Self::from_wire_response_with_tier(buffer.as_ref(), tier)
+            }
+            super::CacheBuffer::Chunked(buffer) => {
+                Self::from_wire_response_with_tier(buffer.to_vec(), tier)
+            }
+            super::CacheBuffer::Small(buffer) => Self::from_wire_response_with_tier(buffer, tier),
+        }
+    }
+
+    #[must_use]
     pub fn availability_only(status_code: CacheableStatusCode, tier: ttl::CacheTier) -> Self {
         Self {
             status_code,
@@ -702,6 +719,21 @@ mod tests {
     fn hybrid_entry_ingests_borrowed_wire_response_bytes() {
         let entry = HybridArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
+        )
+        .expect("valid status code");
+
+        assert_eq!(entry.status_code().as_u16(), 220);
+        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+    }
+
+    #[test]
+    fn hybrid_entry_ingests_cache_buffer_without_required_vec() {
+        let entry = HybridArticleEntry::from_cache_buffer_with_tier(
+            smallvec::SmallVec::<[u8; 128]>::from_slice(
+                b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+            )
+            .into(),
+            ttl::CacheTier::new(0),
         )
         .expect("valid status code");
 
