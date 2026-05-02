@@ -157,8 +157,6 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 pub struct BackendResponse {
     /// Number of bytes read into buffer
     pub bytes_read: usize,
-    /// Parsed NNTP response
-    pub response: NntpResponse,
     /// Parsed status code, if present
     pub status_code: Option<StatusCode>,
     /// Whether this is a multiline response
@@ -291,7 +289,6 @@ where
     Ok((
         BackendResponse {
             bytes_read: total,
-            response: validated.response,
             status_code: validated.status_code,
             is_multiline,
             warnings: validated.warnings,
@@ -374,11 +371,8 @@ mod tests {
         let result = send_request(&mut stream, &request, &mut buffer).await;
         assert!(result.is_ok(), "send_request should handle partial reads");
         let resp = result.unwrap();
-        assert!(
-            matches!(resp.response, NntpResponse::Greeting(_)),
-            "Expected 200 greeting, got {:?}",
-            resp.response
-        );
+        assert_eq!(resp.status_code(), Some(StatusCode::new(200)));
+        assert!(!resp.is_multiline);
     }
 
     #[tokio::test]
@@ -399,7 +393,8 @@ mod tests {
         );
         let resp = result.unwrap();
         assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
-        assert!(matches!(resp.response, NntpResponse::SingleLine(_)));
+        assert_eq!(resp.status_code(), Some(StatusCode::new(111)));
+        assert!(!resp.is_multiline);
         assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
     }
 
@@ -420,11 +415,8 @@ mod tests {
             "send_request should handle single-byte reads"
         );
         let resp = result.unwrap();
-        assert!(
-            matches!(resp.response, NntpResponse::SingleLine(_)),
-            "Expected 211 single-line, got {:?}",
-            resp.response
-        );
+        assert_eq!(resp.status_code(), Some(StatusCode::new(211)));
+        assert!(!resp.is_multiline);
     }
 
     // ─── Command response tests ─────────────────────────────────────────────
@@ -434,29 +426,26 @@ mod tests {
         // Create a 430 response
         let response = BackendResponse {
             bytes_read: 20,
-            response: NntpResponse::parse(b"430 No such article\r\n"),
             status_code: Some(StatusCode::new(430)),
             is_multiline: false,
             warnings: SmallVec::new(),
         };
-        assert!(response.response.is_430());
+        assert_eq!(response.status_code(), Some(StatusCode::new(430)));
 
         // Create a 220 response
         let response = BackendResponse {
             bytes_read: 30,
-            response: NntpResponse::parse(b"220 0 <msg@example.com>\r\n"),
             status_code: Some(StatusCode::new(220)),
             is_multiline: true,
             warnings: SmallVec::new(),
         };
-        assert!(!response.response.is_430());
+        assert_ne!(response.status_code(), Some(StatusCode::new(430)));
     }
 
     #[test]
     fn test_command_response_status_code() {
         let response = BackendResponse {
             bytes_read: 10,
-            response: NntpResponse::parse(b"211 Group\r\n"),
             status_code: Some(StatusCode::new(211)),
             is_multiline: false,
             warnings: SmallVec::new(),

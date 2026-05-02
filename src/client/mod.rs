@@ -247,7 +247,6 @@ impl NntpClient {
     #[inline]
     fn validate_response(response: &crate::session::backend::BackendResponse) -> Result<()> {
         response
-            .response
             .status_code()
             .ok_or_else(|| anyhow::anyhow!("Invalid response from server"))
             .and_then(|code| match code.as_u16() {

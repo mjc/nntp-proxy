@@ -173,7 +173,7 @@ impl ClientSession {
             backend = backend_id.as_index(),
             command_verb = %String::from_utf8_lossy(request.verb()),
             first_chunk_bytes = cmd_response.bytes_read,
-            response = ?cmd_response.response,
+            status_code = status_code.as_u16(),
             is_multiline = cmd_response.is_multiline,
             "Streaming backend response to client"
         );
