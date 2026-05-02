@@ -63,8 +63,8 @@ impl std::fmt::Display for PipelineError {
 pub struct QueuedContext {
     /// Typed request context. Owns verb/args, not redundant full wire bytes.
     pub context: RequestContext,
-    /// Channel to send the response back to the waiting client session
-    pub response_tx: oneshot::Sender<PipelineResponse>,
+    /// Return path to the client session that queued this request.
+    pub client_return: oneshot::Sender<PipelineResponse>,
 }
 
 impl QueuedContext {
@@ -79,7 +79,7 @@ impl QueuedContext {
         status_code: crate::protocol::StatusCode,
         backend_id: BackendId,
     ) {
-        let _ = self.response_tx.send(Ok(CompletedPipelineRequest {
+        let _ = self.client_return.send(Ok(CompletedPipelineRequest {
             context: self.context,
             data,
             status_code,
@@ -89,7 +89,7 @@ impl QueuedContext {
 
     /// Complete this queued context with a queue/worker failure.
     pub fn complete_error(self, error: PipelineError) {
-        let _ = self.response_tx.send(Err(error));
+        let _ = self.client_return.send(Err(error));
     }
 }
 
@@ -260,7 +260,7 @@ mod tests {
         queue
             .try_enqueue(QueuedContext {
                 context: RequestContext::from_request_line("ARTICLE <test@example.com>\r\n"),
-                response_tx: tx,
+                client_return: tx,
             })
             .unwrap();
         assert_eq!(queue.len(), 1);
@@ -276,14 +276,14 @@ mod tests {
                     context: RequestContext::from_request_line(&format!(
                         "ARTICLE <test{i}@example.com>\r\n"
                     )),
-                    response_tx: tx,
+                    client_return: tx,
                 })
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
         let result = queue.try_enqueue(QueuedContext {
             context: RequestContext::from_request_line("ARTICLE <overflow@example.com>\r\n"),
-            response_tx: tx,
+            client_return: tx,
         });
         assert!(result.is_err());
         assert!(matches!(
@@ -303,7 +303,7 @@ mod tests {
             queue
                 .try_enqueue(QueuedContext {
                     context: RequestContext::from_request_line(&format!("CMD {i}\r\n")),
-                    response_tx: tx,
+                    client_return: tx,
                 })
                 .unwrap();
         }
@@ -333,7 +333,7 @@ mod tests {
         queue
             .try_enqueue(QueuedContext {
                 context: RequestContext::from_request_line("HELLO\r\n"),
-                response_tx: tx,
+                client_return: tx,
             })
             .unwrap();
 
@@ -381,7 +381,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let queued = QueuedContext {
             context: RequestContext::from_request_line("STAT <test@example.com>\r\n"),
-            response_tx: tx,
+            client_return: tx,
         };
         let backend_id = BackendId::from_index(1);
 
@@ -403,7 +403,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let queued = QueuedContext {
             context: RequestContext::from_request_line("STAT <test@example.com>\r\n"),
-            response_tx: tx,
+            client_return: tx,
         };
 
         queued.complete_error(PipelineError::ReadFailed);

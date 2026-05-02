@@ -298,7 +298,7 @@ mod tests {
         (
             QueuedContext {
                 context: crate::protocol::RequestContext::from_request_line(command),
-                response_tx: tx,
+                client_return: tx,
             },
             rx,
         )
