@@ -21,7 +21,8 @@ pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 pub use request::{
     RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
-    RequestContext, RequestKind, RequestRouteClass, ResponseShape, ResponseWireLen,
+    RequestContext, RequestKind, RequestResponseMetadata, RequestRouteClass, ResponseShape,
+    ResponseWireLen,
 };
 pub use response::{NntpResponse, StatusCode};
 

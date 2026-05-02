@@ -81,6 +81,29 @@ impl From<usize> for ResponseWireLen {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestResponseMetadata {
+    status: StatusCode,
+    wire_len: ResponseWireLen,
+}
+
+impl RequestResponseMetadata {
+    #[must_use]
+    pub const fn new(status: StatusCode, wire_len: ResponseWireLen) -> Self {
+        Self { status, wire_len }
+    }
+
+    #[must_use]
+    pub const fn status(self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn wire_len(self) -> ResponseWireLen {
+        self.wire_len
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct RequestCacheAvailability {
     checked: u8,
@@ -191,8 +214,7 @@ pub struct RequestContext {
     cache_payload_kind: Option<RequestCachePayloadKind>,
     cache_article_number: Option<RequestCacheArticleNumber>,
     backend_id: Option<BackendId>,
-    response_status: Option<StatusCode>,
-    response_wire_len: Option<ResponseWireLen>,
+    response: Option<RequestResponseMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,8 +306,7 @@ impl RequestContext {
             cache_payload_kind: None,
             cache_article_number: None,
             backend_id: None,
-            response_status: None,
-            response_wire_len: None,
+            response: None,
         }
     }
 
@@ -309,8 +330,7 @@ impl RequestContext {
             cache_payload_kind: None,
             cache_article_number: None,
             backend_id: None,
-            response_status: None,
-            response_wire_len: None,
+            response: None,
         }
     }
 
@@ -396,13 +416,25 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn response_status(&self) -> Option<StatusCode> {
-        self.response_status
+        match self.response {
+            Some(response) => Some(response.status),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     pub const fn response_wire_len(&self) -> Option<ResponseWireLen> {
-        self.response_wire_len
+        match self.response {
+            Some(response) => Some(response.wire_len),
+            None => None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn response_metadata(&self) -> Option<RequestResponseMetadata> {
+        self.response
     }
 
     #[inline]
@@ -413,8 +445,7 @@ impl RequestContext {
         wire_len: ResponseWireLen,
     ) {
         self.backend_id = Some(backend_id);
-        self.response_status = Some(status);
-        self.response_wire_len = Some(wire_len);
+        self.response = Some(RequestResponseMetadata::new(status, wire_len));
     }
 
     #[inline]
@@ -427,8 +458,7 @@ impl RequestContext {
         self.cache_status = Some(RequestCacheStatus::Hit);
         self.cache_entry_status = Some(status);
         self.backend_id = Some(backend_id);
-        self.response_status = Some(status);
-        self.response_wire_len = Some(wire_len);
+        self.response = Some(RequestResponseMetadata::new(status, wire_len));
     }
 
     #[inline]
@@ -664,6 +694,13 @@ mod tests {
         ctx.record_backend_response(backend_id, status, ResponseWireLen::new(19));
 
         assert_eq!(ctx.backend_id(), Some(backend_id));
+        assert_eq!(
+            ctx.response_metadata(),
+            Some(RequestResponseMetadata::new(
+                status,
+                ResponseWireLen::new(19)
+            ))
+        );
         assert_eq!(ctx.response_status(), Some(status));
         assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(19)));
         assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
