@@ -89,6 +89,13 @@ impl QueuedContext {
             .send(Ok(CompletedPipelineRequest { context }));
     }
 
+    /// Complete this queued context after a response reader has filled it.
+    pub fn complete_context(self) {
+        let _ = self.client_return.send(Ok(CompletedPipelineRequest {
+            context: self.context,
+        }));
+    }
+
     /// Complete this queued context with a queue/worker failure.
     pub fn complete_error(self, error: PipelineError) {
         let _ = self.client_return.send(Err(error));
@@ -405,6 +412,28 @@ mod tests {
         );
         assert_eq!(completed.context.response_payload_len(), Some(0));
         assert_eq!(completed.context.response_payload_is_empty(), Some(true));
+    }
+
+    #[test]
+    fn test_queued_context_returns_precompleted_context() {
+        let (tx, rx) = oneshot::channel();
+        let backend_id = BackendId::from_index(1);
+        let mut context = RequestContext::from_request_line("STAT <test@example.com>\r\n");
+        context.complete_backend_response(
+            backend_id,
+            crate::protocol::StatusCode::new(223),
+            crate::pool::ChunkedResponse::default(),
+        );
+        let queued = QueuedContext::new(context, tx);
+
+        queued.complete_context();
+
+        let completed = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(completed.context.backend_id(), Some(backend_id));
+        assert_eq!(
+            completed.context.response_status(),
+            Some(crate::protocol::StatusCode::new(223))
+        );
     }
 
     #[test]

@@ -409,6 +409,23 @@ pub(crate) async fn read_full_response_for_request(
     Ok(status_code)
 }
 
+/// Read a complete NNTP response and attach it to the matching request context.
+pub(crate) async fn read_response_into_context(
+    request: &mut crate::protocol::RequestContext,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    result_buf: &mut crate::pool::ChunkedResponse,
+    pool: &crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<(), StreamingError> {
+    let status_code =
+        read_full_response_for_request(request, io_buffer, conn, result_buf, pool, backend_id)
+            .await?;
+    let response = std::mem::take(result_buf);
+    request.complete_backend_response(backend_id, status_code, response);
+    Ok(())
+}
+
 /// Read and validate a full response after the first chunk has already been prefetched.
 ///
 /// Used by the direct per-command path, which performs the initial command send/read
@@ -911,6 +928,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(captured.to_vec(), response);
+    }
+
+    #[tokio::test]
+    async fn test_read_response_into_context_completes_request() {
+        let response = b"223 0 <test@example>\r\n";
+        let pool = test_helpers::make_pool();
+        let mut io_buffer = pool.acquire().await;
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let mut conn = test_helpers::mock_backend_conn(vec![response.to_vec()]).await;
+        let backend_id = crate::types::BackendId::from_index(1);
+        let mut request =
+            crate::protocol::RequestContext::from_request_line("STAT <test@example>\r\n");
+
+        read_response_into_context(
+            &mut request,
+            &mut io_buffer,
+            &mut conn,
+            &mut captured,
+            &pool,
+            backend_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            request.response_status(),
+            Some(crate::protocol::StatusCode::new(223))
+        );
+        assert_eq!(request.backend_id(), Some(backend_id));
+        assert_eq!(request.response_payload_to_vec().unwrap(), response);
     }
 
     #[tokio::test]

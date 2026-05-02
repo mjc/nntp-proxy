@@ -166,10 +166,10 @@ async fn execute_pipeline_batch(
     // result_buf is passed in as a parameter (hoisted to worker loop)
 
     let mut batch_iter = batch.drain(..).enumerate();
-    while let Some((i, req)) = batch_iter.next() {
+    while let Some((i, mut req)) = batch_iter.next() {
         // Read the response for this command
-        match crate::session::streaming::read_full_response_for_request(
-            &req.context,
+        match crate::session::streaming::read_response_into_context(
+            &mut req.context,
             &mut buffer,
             conn,
             result_buf,
@@ -179,15 +179,14 @@ async fn execute_pipeline_batch(
         .await
         .map_err(crate::session::streaming::StreamingError::into_anyhow)
         {
-            Ok(status_code) => {
-                let data = std::mem::take(result_buf);
+            Ok(()) => {
                 metrics.record_command(backend_id);
-                let data_len = data.len();
+                let data_len = req.context.response_payload_len().unwrap_or_default();
                 metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
                 metrics
                     .record_client_to_backend_bytes_for(backend_id, req.context.wire_len() as u64);
 
-                req.complete_success(data, status_code, backend_id);
+                req.complete_context();
             }
             Err(e) => {
                 warn!(
