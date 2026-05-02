@@ -7,10 +7,10 @@ use crate::cache::ArticleAvailability;
 use crate::protocol::RequestContext;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::{ClientSession, precheck};
-use crate::types::{BackendId, BackendToClientBytes};
+use crate::types::{BackendId, BackendToClientBytes, MessageId};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 /// Result of a cache lookup attempt in `try_serve_from_cache`.
@@ -113,29 +113,11 @@ impl ClientSession {
             return Ok(CacheLookupResult::PartialHit(availability));
         }
 
-        let Some(response) = cached.response_parts_for_command_bytes(cmd_verb, msg_id_ref.as_str())
+        let Some(bytes_written) =
+            write_cached_article_response(client_write, &cached, cmd_verb, msg_id_ref).await?
         else {
             return Ok(CacheLookupResult::PartialHit(availability));
         };
-        let bytes_written = response.len();
-        client_write.write_all(response.status_line()).await?;
-        match response.payload_slices() {
-            crate::cache::CachedArticlePayloadSlices::None => {}
-            crate::cache::CachedArticlePayloadSlices::Article { headers, body } => {
-                client_write.write_all(headers).await?;
-                client_write.write_all(b"\r\n\r\n").await?;
-                client_write.write_all(body).await?;
-                client_write.write_all(b"\r\n.\r\n").await?;
-            }
-            crate::cache::CachedArticlePayloadSlices::Head { headers } => {
-                client_write.write_all(headers).await?;
-                client_write.write_all(b"\r\n.\r\n").await?;
-            }
-            crate::cache::CachedArticlePayloadSlices::Body { body } => {
-                client_write.write_all(body).await?;
-                client_write.write_all(b"\r\n.\r\n").await?;
-            }
-        }
         *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
 
         let backend_id = router.route(self.client_id)?;
@@ -197,4 +179,38 @@ impl ClientSession {
             cache_articles: self.cache_articles,
         }
     }
+}
+
+pub(super) async fn write_cached_article_response<W>(
+    client_write: &mut W,
+    cached: &crate::cache::ArticleEntry,
+    cmd_verb: &[u8],
+    msg_id: &MessageId<'_>,
+) -> std::io::Result<Option<usize>>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(response) = cached.response_parts_for_command_bytes(cmd_verb, msg_id.as_str()) else {
+        return Ok(None);
+    };
+    let bytes_written = response.len();
+    client_write.write_all(response.status_line()).await?;
+    match response.payload_slices() {
+        crate::cache::CachedArticlePayloadSlices::None => {}
+        crate::cache::CachedArticlePayloadSlices::Article { headers, body } => {
+            client_write.write_all(headers).await?;
+            client_write.write_all(b"\r\n\r\n").await?;
+            client_write.write_all(body).await?;
+            client_write.write_all(b"\r\n.\r\n").await?;
+        }
+        crate::cache::CachedArticlePayloadSlices::Head { headers } => {
+            client_write.write_all(headers).await?;
+            client_write.write_all(b"\r\n.\r\n").await?;
+        }
+        crate::cache::CachedArticlePayloadSlices::Body { body } => {
+            client_write.write_all(body).await?;
+            client_write.write_all(b"\r\n.\r\n").await?;
+        }
+    }
+    Ok(Some(bytes_written))
 }

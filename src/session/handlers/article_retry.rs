@@ -7,7 +7,9 @@ use crate::router::backend_queue::{PipelineResponse, QueuedContext};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::SessionError;
-use crate::session::handlers::cache_operations::CacheLookupResult;
+use crate::session::handlers::cache_operations::{
+    CacheLookupResult, write_cached_article_response,
+};
 use crate::session::handlers::command_execution::{ArticleAttemptState, BackendAttemptResult};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -481,14 +483,23 @@ impl ClientSession {
                 let bytes_written = if let Some(entry) =
                     precheck::precheck(&deps, request, msg_id_ref, is_head).await
                 {
-                    let buf = entry
-                        .response_for_command_bytes(request.verb(), msg_id_ref)
-                        .unwrap_or_else(|| crate::protocol::NO_SUCH_ARTICLE.to_vec());
-                    client_write
-                        .write_all(&buf)
-                        .await
-                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                    buf.len()
+                    if let Some(bytes_written) = write_cached_article_response(
+                        client_write,
+                        &entry,
+                        request.verb(),
+                        msg_id_ref,
+                    )
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
+                    {
+                        bytes_written
+                    } else {
+                        client_write
+                            .write_all(crate::protocol::NO_SUCH_ARTICLE)
+                            .await
+                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                        crate::protocol::NO_SUCH_ARTICLE.len()
+                    }
                 } else {
                     client_write
                         .write_all(crate::protocol::NO_SUCH_ARTICLE)
