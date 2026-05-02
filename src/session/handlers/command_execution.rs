@@ -32,6 +32,16 @@ pub(super) enum BackendAttemptResult {
     BackendUnavailable,
 }
 
+impl BackendAttemptResult {
+    #[must_use]
+    const fn success(backend_id: BackendId, response: RequestResponseMetadata) -> Self {
+        Self::Success {
+            backend_id,
+            response,
+        }
+    }
+}
+
 /// Mutable state for an article backend attempt loop
 ///
 /// Groups the mutable parameters that track retry state across
@@ -244,15 +254,15 @@ impl ClientSession {
             let _ = conn.release(); // streaming completed; connection healthy, return to pool
         }
 
-        Ok(BackendAttemptResult::Success {
+        Ok(BackendAttemptResult::success(
             backend_id,
-            response: RequestResponseMetadata::new(
+            RequestResponseMetadata::new(
                 cmd_response
                     .status_code()
                     .expect("valid streamed response has status code"),
                 (bytes_written as usize).into(),
             ),
-        })
+        ))
     }
 
     /// Execute a single backend attempt - get connection and execute command
@@ -511,10 +521,7 @@ mod tests {
     fn backend_attempt_success_carries_typed_response_metadata() {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
-        let result = BackendAttemptResult::Success {
-            backend_id,
-            response,
-        };
+        let result = BackendAttemptResult::success(backend_id, response);
 
         match result {
             BackendAttemptResult::Success {
