@@ -34,6 +34,8 @@ pub enum RequestKind {
     NewNews,
     Post,
     Ihave,
+    Check,
+    TakeThis,
     AuthInfo,
     StartTls,
     Unknown,
@@ -591,9 +593,11 @@ impl RequestContext {
             RequestKind::Capabilities | RequestKind::Quit | RequestKind::AuthInfo => {
                 RequestRouteClass::Local
             }
-            RequestKind::Post | RequestKind::Ihave | RequestKind::StartTls => {
-                RequestRouteClass::Reject
-            }
+            RequestKind::Post
+            | RequestKind::Ihave
+            | RequestKind::Check
+            | RequestKind::TakeThis
+            | RequestKind::StartTls => RequestRouteClass::Reject,
             RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
                 if self.message_id.is_some() =>
             {
@@ -715,6 +719,10 @@ fn classify_verb(verb: &[u8]) -> RequestKind {
         RequestKind::Post
     } else if is!(b"IHAVE") {
         RequestKind::Ihave
+    } else if is!(b"CHECK") {
+        RequestKind::Check
+    } else if is!(b"TAKETHIS") {
+        RequestKind::TakeThis
     } else if is!(b"AUTHINFO") {
         RequestKind::AuthInfo
     } else if is!(b"STARTTLS") {
@@ -904,6 +912,8 @@ mod tests {
             ("NEWNEWS * 20260101 000000 GMT\r\n", RequestKind::NewNews),
             ("POST\r\n", RequestKind::Post),
             ("IHAVE <a@b>\r\n", RequestKind::Ihave),
+            ("CHECK <a@b>\r\n", RequestKind::Check),
+            ("TAKETHIS <a@b>\r\n", RequestKind::TakeThis),
             ("AUTHINFO USER test\r\n", RequestKind::AuthInfo),
             ("STARTTLS\r\n", RequestKind::StartTls),
         ];
@@ -929,6 +939,8 @@ mod tests {
             ("AUTHINFO PASS secret\r\n", RequestRouteClass::Local),
             ("POST\r\n", RequestRouteClass::Reject),
             ("IHAVE <a@b>\r\n", RequestRouteClass::Reject),
+            ("CHECK <a@b>\r\n", RequestRouteClass::Reject),
+            ("TAKETHIS <a@b>\r\n", RequestRouteClass::Reject),
             ("STARTTLS\r\n", RequestRouteClass::Reject),
             ("XFOO arg\r\n", RequestRouteClass::Stateful),
         ];
