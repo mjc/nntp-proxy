@@ -957,7 +957,7 @@ mod tests {
             Some(crate::protocol::StatusCode::new(223))
         );
         assert_eq!(request.backend_id(), Some(backend_id));
-        assert_eq!(request.response_payload_to_vec().unwrap(), response);
+        assert_eq!(request.response_payload_eq(response), Some(true));
     }
 
     #[tokio::test]

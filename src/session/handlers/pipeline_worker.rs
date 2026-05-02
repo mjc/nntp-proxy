@@ -976,8 +976,8 @@ mod tests {
                                 Some(codes[idx])
                             );
                             prop_assert_eq!(
-                                completed.context.response_payload_to_vec(),
-                                Some(responses[idx].clone())
+                                completed.context.response_payload_eq(&responses[idx]),
+                                Some(true)
                             );
                         }
                         other => prop_assert!(false, "expected success response, got {other:?}"),

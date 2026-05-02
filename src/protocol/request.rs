@@ -490,10 +490,21 @@ impl RequestContext {
 
     #[inline]
     #[must_use]
-    pub fn response_payload_to_vec(&self) -> Option<Vec<u8>> {
-        self.response_payload
-            .as_ref()
-            .map(crate::pool::ChunkedResponse::to_vec)
+    pub fn response_payload_eq(&self, expected: &[u8]) -> Option<bool> {
+        let response = self.response_payload.as_ref()?;
+        if response.len() != expected.len() {
+            return Some(false);
+        }
+
+        let mut offset = 0;
+        Some(response.iter_chunks().all(|chunk| {
+            let end = offset + chunk.len();
+            let matches = expected
+                .get(offset..end)
+                .is_some_and(|expected_chunk| expected_chunk == chunk);
+            offset = end;
+            matches
+        }))
     }
 
     #[inline]
@@ -811,6 +822,25 @@ mod tests {
         assert_eq!(ctx.response_status(), Some(status));
         assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(19)));
         assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_compares_chunked_response_payload_without_flattening() {
+        let mut ctx = RequestContext::from_request_bytes(b"STAT <a@b>\r\n");
+        let backend_id = BackendId::from_index(2);
+        let pool = crate::pool::BufferPool::for_tests();
+        let mut response = crate::pool::ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"223 0 ");
+        response.extend_from_slice(&pool, b"<a@b>\r\n");
+
+        ctx.complete_backend_response(backend_id, StatusCode::new(223), response);
+
+        assert_eq!(ctx.response_payload_eq(b"223 0 <a@b>\r\n"), Some(true));
+        assert_eq!(ctx.response_payload_eq(b"223 0 <other>\r\n"), Some(false));
+        assert_eq!(
+            ctx.response_payload_eq(b"223 0 <a@b>\r\nextra"),
+            Some(false)
+        );
     }
 
     #[test]
