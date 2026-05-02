@@ -1,447 +1,213 @@
 //! RFC 3977 Section 3.2 - Response Code Classification Tests
 //!
-//! These tests verify correct classification of NNTP response codes:
-//! - 1xx: Informational
-//! - 2xx: Success
-//! - 3xx: Continuation (send more input)
-//! - 4xx: Temporary error
-//! - 5xx: Permanent error
-//!
-//! Adapted from nntp-rs RFC 3977 response.rs and parsing.rs tests.
+//! These tests verify correct classification of NNTP response codes.
 
 use nntp_proxy::protocol::{NntpResponse, StatusCode};
+
+fn status(code: u16) -> StatusCode {
+    StatusCode::new(code)
+}
+
+fn line(code: u16) -> String {
+    format!("{code} Test\r\n")
+}
+
+fn parsed(code: u16) -> NntpResponse {
+    NntpResponse::parse(line(code).as_bytes())
+}
+
+fn assert_status_flags(
+    code: u16,
+    success: bool,
+    error: bool,
+    informational: bool,
+    continuation: bool,
+) {
+    let status = status(code);
+    assert_eq!(status.is_success(), success, "success {code}");
+    assert_eq!(status.is_error(), error, "error {code}");
+    assert_eq!(
+        status.is_informational(),
+        informational,
+        "informational {code}"
+    );
+    assert_eq!(
+        status.is_continuation(),
+        continuation,
+        "continuation {code}"
+    );
+}
+
+fn assert_multiline(code: u16, multiline: bool) {
+    assert_eq!(
+        parsed(code).status_implies_multiline(),
+        multiline,
+        "multiline {code}"
+    );
+}
 
 // StatusCode classification
 
 #[test]
-fn test_response_is_success_2xx() {
-    let code = StatusCode::new(200);
-    assert!(code.is_success());
-    assert!(!code.is_error());
-    assert!(!code.is_informational());
-    assert!(!code.is_continuation());
+fn test_status_code_categories_and_boundaries() {
+    [
+        (100, false, false, true, false),
+        (199, false, false, true, false),
+        (200, true, false, false, false),
+        (299, true, false, false, false),
+        (300, true, false, false, true),
+        (335, true, false, false, true),
+        (381, true, false, false, true),
+        (399, true, false, false, true),
+        (400, false, true, false, false),
+        (430, false, true, false, false),
+        (499, false, true, false, false),
+        (500, false, true, false, false),
+    ]
+    .into_iter()
+    .for_each(|(code, success, error, informational, continuation)| {
+        assert_status_flags(code, success, error, informational, continuation);
+    });
 }
 
 #[test]
-fn test_response_is_success_3xx() {
-    // Per RFC 3977 §3.2.1: 3xx is "success so far"
-    let code = StatusCode::new(381);
-    assert!(code.is_success());
-    assert!(code.is_continuation());
-    assert!(!code.is_error());
-}
-
-#[test]
-fn test_response_is_continuation() {
-    let code = StatusCode::new(335);
-    assert!(code.is_continuation());
-    assert!(code.is_success()); // 3xx counts as success
-}
-
-#[test]
-fn test_response_is_error_4xx() {
-    let code = StatusCode::new(430);
-    assert!(code.is_error());
-    assert!(!code.is_success());
-    assert!(!code.is_continuation());
-}
-
-#[test]
-fn test_response_is_error_5xx() {
-    let code = StatusCode::new(500);
-    assert!(code.is_error());
-    assert!(!code.is_success());
-}
-
-#[test]
-fn test_response_1xx_informational() {
-    let code = StatusCode::new(100);
-    assert!(code.is_informational());
-    assert!(!code.is_success());
-    assert!(!code.is_error());
-    assert!(!code.is_continuation());
-}
-
-// Boundary code tests - verify exact transitions between categories
-
-#[test]
-fn test_boundary_between_informational_and_success() {
-    let code_199 = StatusCode::new(199);
-    assert!(code_199.is_informational());
-    assert!(!code_199.is_success());
-
-    let code_200 = StatusCode::new(200);
-    assert!(!code_200.is_informational());
-    assert!(code_200.is_success());
-}
-
-#[test]
-fn test_boundary_between_success_and_continuation() {
-    let code_299 = StatusCode::new(299);
-    assert!(code_299.is_success());
-    assert!(!code_299.is_continuation());
-
-    let code_300 = StatusCode::new(300);
-    assert!(code_300.is_success()); // 3xx is also success
-    assert!(code_300.is_continuation());
-}
-
-#[test]
-fn test_boundary_between_continuation_and_error() {
-    let code_399 = StatusCode::new(399);
-    assert!(code_399.is_continuation());
-    assert!(code_399.is_success());
-    assert!(!code_399.is_error());
-
-    let code_400 = StatusCode::new(400);
-    assert!(!code_400.is_continuation());
-    assert!(!code_400.is_success());
-    assert!(code_400.is_error());
-}
-
-#[test]
-fn test_boundary_between_4xx_and_5xx() {
-    let code_499 = StatusCode::new(499);
-    assert!(code_499.is_error());
-
-    let code_500 = StatusCode::new(500);
-    assert!(code_500.is_error());
-}
-
-// All 2xx success codes
-
-#[test]
-fn test_all_2xx_success_codes() {
-    let codes = [
+fn test_known_success_and_continuation_codes() {
+    [
         200, 201, 205, 211, 215, 220, 221, 222, 223, 224, 225, 230, 231, 281, 282,
-    ];
-    for code in codes {
-        let sc = StatusCode::new(code);
-        assert!(sc.is_success(), "Code {code} should be success");
-        assert!(!sc.is_error(), "Code {code} should not be error");
-    }
-}
+    ]
+    .into_iter()
+    .for_each(|code| {
+        let status = status(code);
+        assert!(status.is_success(), "Code {code} should be success");
+        assert!(!status.is_error(), "Code {code} should not be error");
+    });
 
-// All 3xx continuation codes
-
-#[test]
-fn test_all_3xx_continuation_codes() {
-    let codes = [335, 340, 381, 383];
-    for code in codes {
-        let sc = StatusCode::new(code);
-        assert!(sc.is_continuation(), "Code {code} should be continuation");
-        assert!(sc.is_success(), "Code {code} should also be success");
-    }
-}
-
-// Specific 3xx codes
-
-#[test]
-fn test_response_335_ihave_send_article() {
-    let code = StatusCode::new(335);
-    assert!(code.is_continuation());
-}
-
-#[test]
-fn test_response_340_post_send_article() {
-    let code = StatusCode::new(340);
-    assert!(code.is_continuation());
-}
-
-#[test]
-fn test_response_381_password_required() {
-    let code = StatusCode::new(381);
-    assert!(code.is_continuation());
-}
-
-#[test]
-fn test_response_383_sasl_continue() {
-    let code = StatusCode::new(383);
-    assert!(code.is_continuation());
-}
-
-// 1xx informational codes
-
-#[test]
-fn test_response_100_help_text() {
-    let code = StatusCode::new(100);
-    assert!(code.is_informational());
-    assert!(NntpResponse::parse(b"100 Help\r\n").status_implies_multiline());
-}
-
-#[test]
-fn test_response_101_capability_list() {
-    let code = StatusCode::new(101);
-    assert!(code.is_informational());
-    assert!(NntpResponse::parse(b"101 Capability list\r\n").status_implies_multiline());
-}
-
-#[test]
-fn test_response_111_server_date() {
-    let code = StatusCode::new(111);
-    assert!(code.is_informational());
-    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").status_implies_multiline());
+    [335, 340, 381, 383].into_iter().for_each(|code| {
+        let status = status(code);
+        assert!(
+            status.is_continuation(),
+            "Code {code} should be continuation"
+        );
+        assert!(status.is_success(), "Code {code} should also be success");
+    });
 }
 
 // StatusCode::parse() tests
 
 #[test]
-fn test_parse_three_digit_code_with_message() {
-    let parsed = StatusCode::parse(b"200 Service ready\r\n");
-    assert_eq!(parsed, Some(StatusCode::new(200)));
-}
+fn test_status_code_parse_valid_inputs() {
+    [
+        (b"200 Service ready\r\n".as_slice(), 200),
+        (b"200".as_slice(), 200),
+        (b"200 ".as_slice(), 200),
+        (b"000".as_slice(), 0),
+        (b"999".as_slice(), 999),
+        (b"211 42 1 100 alt.test".as_slice(), 211),
+        (b"200 Welcome! <server@example>\r\n".as_slice(), 200),
+        (b"200  multiple  spaces  \r\n".as_slice(), 200),
+        ("200 Привет мир\r\n".as_bytes(), 200),
+    ]
+    .into_iter()
+    .for_each(|(input, code)| assert_eq!(StatusCode::parse(input), Some(status(code))));
 
-#[test]
-fn test_parse_three_digit_code_only() {
-    let parsed = StatusCode::parse(b"200");
-    assert_eq!(parsed, Some(StatusCode::new(200)));
-}
-
-#[test]
-fn test_parse_with_empty_message_after_space() {
-    let parsed = StatusCode::parse(b"200 ");
-    assert_eq!(parsed, Some(StatusCode::new(200)));
-}
-
-#[test]
-fn test_parse_empty_string_is_invalid() {
-    assert_eq!(StatusCode::parse(b""), None);
-}
-
-#[test]
-fn test_parse_two_digit_code_is_invalid() {
-    assert_eq!(StatusCode::parse(b"20"), None);
-}
-
-#[test]
-fn test_parse_one_digit_code_is_invalid() {
-    assert_eq!(StatusCode::parse(b"2"), None);
-}
-
-#[test]
-fn test_parse_non_digit_in_code_is_invalid() {
-    assert_eq!(StatusCode::parse(b"2X0 Error\r\n"), None);
-    assert_eq!(StatusCode::parse(b"ABC Invalid\r\n"), None);
-}
-
-#[test]
-fn test_parse_space_prefix_is_invalid() {
-    // Space at position 0 is not a digit
-    assert_eq!(StatusCode::parse(b" 200 Error\r\n"), None);
-}
-
-#[test]
-fn test_parse_code_000() {
-    // 000 is technically parseable (3 digits)
-    let parsed = StatusCode::parse(b"000");
-    assert_eq!(parsed, Some(StatusCode::new(0)));
-}
-
-#[test]
-fn test_parse_code_999() {
-    let parsed = StatusCode::parse(b"999");
-    assert_eq!(parsed, Some(StatusCode::new(999)));
-}
-
-#[test]
-fn test_parse_preserves_message_content() {
-    // Parsing extracts the code; message content doesn't affect code
-    let parsed = StatusCode::parse(b"211 42 1 100 alt.test");
-    assert_eq!(parsed, Some(StatusCode::new(211)));
-}
-
-#[test]
-fn test_parse_message_with_special_chars() {
-    let parsed = StatusCode::parse(b"200 Welcome! <server@example>\r\n");
-    assert_eq!(parsed, Some(StatusCode::new(200)));
-}
-
-#[test]
-fn test_parse_long_message() {
     let long_msg = format!("200 {}\r\n", "x".repeat(1000));
-    let parsed = StatusCode::parse(long_msg.as_bytes());
-    assert_eq!(parsed, Some(StatusCode::new(200)));
+    assert_eq!(StatusCode::parse(long_msg.as_bytes()), Some(status(200)));
 }
 
 #[test]
-fn test_parse_unicode_message() {
-    let parsed = StatusCode::parse("200 Привет мир\r\n".as_bytes());
-    assert_eq!(parsed, Some(StatusCode::new(200)));
-}
-
-#[test]
-fn test_parse_multiple_spaces_in_message() {
-    let parsed = StatusCode::parse(b"200  multiple  spaces  \r\n");
-    assert_eq!(parsed, Some(StatusCode::new(200)));
+fn test_status_code_parse_invalid_inputs() {
+    [
+        b"".as_slice(),
+        b"20".as_slice(),
+        b"2".as_slice(),
+        b"2X0 Error\r\n".as_slice(),
+        b"ABC Invalid\r\n".as_slice(),
+        b" 200 Error\r\n".as_slice(),
+    ]
+    .into_iter()
+    .for_each(|input| assert_eq!(StatusCode::parse(input), None));
 }
 
 // NntpResponse categorization
 
 #[test]
-fn test_response_greeting_200() {
-    assert!(matches!(
-        NntpResponse::parse(b"200 OK\r\n"),
-        NntpResponse::Greeting(_)
-    ));
-}
-
-#[test]
-fn test_response_greeting_201() {
-    assert!(matches!(
-        NntpResponse::parse(b"201 No posting\r\n"),
-        NntpResponse::Greeting(_)
-    ));
-}
-
-#[test]
-fn test_response_disconnect_205() {
+fn test_nntp_response_special_categories() {
+    assert!(matches!(parsed(200), NntpResponse::Greeting(_)));
+    assert!(matches!(parsed(201), NntpResponse::Greeting(_)));
     assert_eq!(
         NntpResponse::parse(b"205 Bye\r\n"),
         NntpResponse::Disconnect
     );
-}
-
-#[test]
-fn test_response_auth_success_281() {
     assert_eq!(
         NntpResponse::parse(b"281 OK\r\n"),
         NntpResponse::AuthSuccess
     );
-}
-
-#[test]
-fn test_response_auth_required_381() {
-    assert!(matches!(
-        NntpResponse::parse(b"381 Password required\r\n"),
-        NntpResponse::AuthRequired(_)
-    ));
-}
-
-#[test]
-fn test_response_auth_required_480() {
-    assert!(matches!(
-        NntpResponse::parse(b"480 Auth required\r\n"),
-        NntpResponse::AuthRequired(_)
-    ));
-}
-
-#[test]
-fn test_response_multiline_1xx() {
-    assert!(NntpResponse::parse(b"100 Help\r\n").status_implies_multiline());
-    assert!(NntpResponse::parse(b"101 Capabilities\r\n").status_implies_multiline());
-}
-
-#[test]
-fn test_response_multiline_specific_2xx() {
-    let multiline_codes = [215, 220, 221, 222, 224, 225, 230, 231, 282];
-    for code in multiline_codes {
-        let data = format!("{code} Test\r\n");
-        assert!(
-            NntpResponse::parse(data.as_bytes()).status_implies_multiline(),
-            "Code {code} should be multiline"
-        );
-    }
-}
-
-#[test]
-fn test_response_non_multiline_2xx() {
-    // 200, 201, 205, 211 are NOT multiline
-    let non_multiline = [200, 201, 205, 211, 281];
-    for code in non_multiline {
-        let data = format!("{code} Test\r\n");
-        assert!(
-            !NntpResponse::parse(data.as_bytes()).status_implies_multiline(),
-            "Code {code} should not be multiline"
-        );
-    }
-}
-
-#[test]
-fn test_response_single_line_4xx() {
-    assert!(matches!(
-        NntpResponse::parse(b"400 Error\r\n"),
-        NntpResponse::SingleLine(_)
-    ));
-    assert!(matches!(
-        NntpResponse::parse(b"430 No such article\r\n"),
-        NntpResponse::SingleLine(_)
-    ));
-}
-
-#[test]
-fn test_response_single_line_5xx() {
-    assert!(matches!(
-        NntpResponse::parse(b"500 Not recognized\r\n"),
-        NntpResponse::SingleLine(_)
-    ));
-}
-
-#[test]
-fn test_response_invalid_empty() {
+    assert!(matches!(parsed(381), NntpResponse::AuthRequired(_)));
+    assert!(matches!(parsed(480), NntpResponse::AuthRequired(_)));
+    assert!(matches!(parsed(400), NntpResponse::SingleLine(_)));
+    assert!(matches!(parsed(430), NntpResponse::SingleLine(_)));
+    assert!(matches!(parsed(500), NntpResponse::SingleLine(_)));
     assert_eq!(NntpResponse::parse(b""), NntpResponse::Invalid);
-}
-
-#[test]
-fn test_response_invalid_non_digit() {
     assert_eq!(NntpResponse::parse(b"XXX\r\n"), NntpResponse::Invalid);
 }
 
 #[test]
-fn test_response_is_success_method() {
-    assert!(NntpResponse::parse(b"200 OK\r\n").is_success());
-    assert!(NntpResponse::parse(b"281 Auth\r\n").is_success());
-    assert!(NntpResponse::parse(b"381 Password required\r\n").is_success());
-    assert!(!NntpResponse::parse(b"400 Error\r\n").is_success());
-    assert!(!NntpResponse::parse(b"500 Error\r\n").is_success());
+fn test_response_success_method() {
+    [200, 281, 381]
+        .into_iter()
+        .for_each(|code| assert!(parsed(code).is_success(), "success {code}"));
+    [400, 500]
+        .into_iter()
+        .for_each(|code| assert!(!parsed(code).is_success(), "not success {code}"));
     assert!(!NntpResponse::Invalid.is_success());
 }
 
 #[test]
 fn test_response_status_code_extraction() {
-    assert_eq!(
-        NntpResponse::parse(b"200 OK\r\n").status_code(),
-        Some(StatusCode::new(200))
-    );
-    assert_eq!(
-        NntpResponse::Disconnect.status_code(),
-        Some(StatusCode::new(205))
-    );
-    assert_eq!(
-        NntpResponse::AuthSuccess.status_code(),
-        Some(StatusCode::new(281))
-    );
-    assert_eq!(NntpResponse::Invalid.status_code(), None);
+    [
+        (NntpResponse::parse(b"200 OK\r\n"), Some(status(200))),
+        (NntpResponse::Disconnect, Some(status(205))),
+        (NntpResponse::AuthSuccess, Some(status(281))),
+        (NntpResponse::Invalid, None),
+    ]
+    .into_iter()
+    .for_each(|(response, expected)| assert_eq!(response.status_code(), expected));
 }
 
 // Multiline classification remains response categorization, not a StatusCode property.
 
 #[test]
 fn test_response_multiline_detection() {
-    // HELP and CAPABILITIES are multiline, but DATE is single-line.
-    assert!(NntpResponse::parse(b"100 Help\r\n").status_implies_multiline());
-    assert!(NntpResponse::parse(b"101 Capability list\r\n").status_implies_multiline());
-    assert!(!NntpResponse::parse(b"111 20260501173336\r\n").status_implies_multiline());
-    assert!(!NntpResponse::parse(b"199 Other informational\r\n").status_implies_multiline());
-
-    // Specific 2xx multiline codes
-    assert!(NntpResponse::parse(b"220 Article\r\n").status_implies_multiline());
-    assert!(NntpResponse::parse(b"221 Headers\r\n").status_implies_multiline());
-    assert!(NntpResponse::parse(b"222 Body\r\n").status_implies_multiline());
-
-    // Non-multiline
-    assert!(!NntpResponse::parse(b"200 Posting allowed\r\n").status_implies_multiline());
-    assert!(!NntpResponse::parse(b"211 Group selected\r\n").status_implies_multiline());
-    assert!(!NntpResponse::parse(b"400 Temporary failure\r\n").status_implies_multiline());
-    assert!(!NntpResponse::parse(b"500 Syntax error\r\n").status_implies_multiline());
+    [
+        (100, true),
+        (101, true),
+        (111, false),
+        (199, false),
+        (200, false),
+        (201, false),
+        (205, false),
+        (211, false),
+        (215, true),
+        (220, true),
+        (221, true),
+        (222, true),
+        (224, true),
+        (225, true),
+        (230, true),
+        (231, true),
+        (281, false),
+        (282, true),
+        (400, false),
+        (500, false),
+    ]
+    .into_iter()
+    .for_each(|(code, multiline)| assert_multiline(code, multiline));
 }
-
-// Response with multiline content
 
 #[test]
 fn test_response_with_multiline_data_parses_code() {
-    // Even with additional data, the first 3 bytes determine the code
     let data = b"220 12345 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
     let response = NntpResponse::parse(data);
     assert!(matches!(response, NntpResponse::MultilineData(_)));
-    assert_eq!(response.status_code(), Some(StatusCode::new(220)));
+    assert_eq!(response.status_code(), Some(status(220)));
 }
