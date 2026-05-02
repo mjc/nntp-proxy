@@ -137,10 +137,7 @@ impl ClientSession {
         let backend_id = router.route(self.client_id)?;
         let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
-        request.record_cache_response(
-            backend_id,
-            RequestResponseMetadata::new(write.status, write.wire_len),
-        );
+        request.record_cache_response(backend_id, write.metadata());
         Ok(CacheLookupResult::Hit)
     }
 
@@ -241,6 +238,13 @@ fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCacheP
 pub(super) struct CachedResponseWrite {
     pub status: StatusCode,
     pub wire_len: ResponseWireLen,
+}
+
+impl CachedResponseWrite {
+    #[must_use]
+    pub const fn metadata(self) -> RequestResponseMetadata {
+        RequestResponseMetadata::new(self.status, self.wire_len)
+    }
 }
 
 fn cached_response_status_for_verb(verb: &[u8]) -> Option<StatusCode> {
