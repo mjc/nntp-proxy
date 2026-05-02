@@ -12,20 +12,19 @@
 
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::effective_ttl;
-use nntp_proxy::command::NntpCommand;
-use nntp_proxy::protocol::StatusCode;
+use nntp_proxy::protocol::{RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::types::MessageId;
 use proptest::prelude::*;
 
 // =============================================================================
-// 1. NntpCommand::parse - Classifier robustness and consistency
+// 1. RequestContext - Classifier robustness and consistency
 // =============================================================================
 
 proptest! {
     #[test]
-    fn prop_parse_never_panics(s in ".*") {
-        // Parse any string without panicking
-        let _ = NntpCommand::parse(&s);
+    fn prop_request_context_never_panics(s in ".*") {
+        // Parse any already-read request line without panicking
+        let _ = RequestContext::from_request_line(&s);
     }
 
     #[test]
@@ -36,33 +35,23 @@ proptest! {
         let upper = format!("{cmd} {arg}");
         let lower = format!("{} {}", cmd.to_lowercase(), arg);
 
-        let upper_result = NntpCommand::parse(&upper);
-        let lower_result = NntpCommand::parse(&lower);
+        let upper_result = RequestContext::from_request_line(&upper);
+        let lower_result = RequestContext::from_request_line(&lower);
 
         // Same classification regardless of case
-        prop_assert_eq!(
-            std::mem::discriminant(&upper_result),
-            std::mem::discriminant(&lower_result),
-            "UPPER vs lower case differ: {} vs {}",
-            upper,
-            lower
-        );
+        prop_assert_eq!(upper_result.kind(), lower_result.kind(), "UPPER vs lower kind differs: {} vs {}", upper, lower);
+        prop_assert_eq!(upper_result.route_class(), lower_result.route_class(), "UPPER vs lower route differs: {} vs {}", upper, lower);
     }
 
     #[test]
-    fn prop_trimming_idempotent(s in ".*") {
-        let with_spaces = format!("  {s}  ");
-        let result1 = NntpCommand::parse(&with_spaces);
-        let result2 = NntpCommand::parse(&s);
+    fn prop_trailing_line_ending_idempotent(s in "[A-Za-z0-9]+( [A-Za-z0-9@.<>_-]+)?") {
+        let with_crlf = format!("{s}\r\n");
+        let result1 = RequestContext::from_request_line(&with_crlf);
+        let result2 = RequestContext::from_request_line(&s);
 
-        // Trimming is idempotent
-        prop_assert_eq!(
-            std::mem::discriminant(&result1),
-            std::mem::discriminant(&result2),
-            "Trimming changed classification: '{}' vs '{}'",
-            with_spaces,
-            s
-        );
+        // Request line endings do not affect classification.
+        prop_assert_eq!(result1.kind(), result2.kind(), "Line ending changed kind: '{}' vs '{}'", with_crlf, s);
+        prop_assert_eq!(result1.route_class(), result2.route_class(), "Line ending changed route: '{}' vs '{}'", with_crlf, s);
     }
 
     #[test]
@@ -72,28 +61,18 @@ proptest! {
     ) {
         // With angle brackets, should be ArticleByMessageId
         let with_brackets = format!("{cmd} <{arg}>");
-        match NntpCommand::parse(&with_brackets) {
-            NntpCommand::ArticleByMessageId => {
-                // Expected
-            }
-            other => {
-                prop_assert!(false, "Should be ArticleByMessageId with brackets: {}, got {:?}", with_brackets, other);
-            }
-        }
+        let request = RequestContext::from_request_line(&with_brackets);
+        prop_assert_eq!(request.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
     #[test]
-    fn prop_parse_deterministic(s in ".*") {
+    fn prop_request_context_deterministic(s in ".*") {
         // Same input always produces same classification
-        let result1 = NntpCommand::parse(&s);
-        let result2 = NntpCommand::parse(&s);
+        let result1 = RequestContext::from_request_line(&s);
+        let result2 = RequestContext::from_request_line(&s);
 
-        prop_assert_eq!(
-            std::mem::discriminant(&result1),
-            std::mem::discriminant(&result2),
-            "Parse not deterministic for: {}",
-            s
-        );
+        prop_assert_eq!(result1.kind(), result2.kind(), "Kind not deterministic for: {}", s);
+        prop_assert_eq!(result1.route_class(), result2.route_class(), "Route not deterministic for: {}", s);
     }
 }
 
