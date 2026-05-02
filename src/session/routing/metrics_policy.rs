@@ -2,6 +2,8 @@
 //!
 //! Pure functions for determining what metrics to record based on response codes.
 
+use crate::protocol::{RequestContext, ResponseShape, StatusCode};
+
 /// Determine what action to take for metrics recording based on response code
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsAction {
@@ -26,12 +28,20 @@ pub enum MetricsAction {
 /// # Excluded Error Codes
 /// - 423 (no such article number in group) - expected for article numbers
 /// - 430 (no such article) - expected, handled by retry logic
-pub fn determine_metrics_action(response_code: u16, is_multiline: bool) -> MetricsAction {
+pub fn determine_metrics_action_for_request(
+    request: &RequestContext,
+    status_code: StatusCode,
+) -> MetricsAction {
+    let response_code = status_code.as_u16();
+    let response_shape = request.response_shape(status_code);
+
     if (400..500).contains(&response_code) && response_code != 423 && response_code != 430 {
         MetricsAction::Error4xx
     } else if response_code >= 500 {
         MetricsAction::Error5xx
-    } else if is_multiline && matches!(response_code, 220..=222) {
+    } else if matches!(response_shape, ResponseShape::Multiline)
+        && matches!(response_code, 220..=222)
+    {
         MetricsAction::Article
     } else {
         MetricsAction::None
@@ -42,19 +52,24 @@ pub fn determine_metrics_action(response_code: u16, is_multiline: bool) -> Metri
 mod tests {
     use super::*;
 
+    fn determine_metrics_action(command: &str, response_code: u16) -> MetricsAction {
+        let request = RequestContext::from_request_line(command);
+        determine_metrics_action_for_request(&request, StatusCode::new(response_code))
+    }
+
     #[test]
     fn test_determine_metrics_action_4xx_errors() {
         // 4xx errors (excluding 423, 430) should record error_4xx
         assert_eq!(
-            determine_metrics_action(400, false),
+            determine_metrics_action("ARTICLE <test@example.com>", 400),
             MetricsAction::Error4xx
         );
         assert_eq!(
-            determine_metrics_action(401, false),
+            determine_metrics_action("ARTICLE <test@example.com>", 401),
             MetricsAction::Error4xx
         );
         assert_eq!(
-            determine_metrics_action(480, false),
+            determine_metrics_action("ARTICLE <test@example.com>", 480),
             MetricsAction::Error4xx
         );
     }
@@ -62,22 +77,28 @@ mod tests {
     #[test]
     fn test_determine_metrics_action_4xx_exclusions() {
         // 423 (no such article number) and 430 (no such article) are not errors
-        assert_eq!(determine_metrics_action(423, false), MetricsAction::None);
-        assert_eq!(determine_metrics_action(430, false), MetricsAction::None);
+        assert_eq!(
+            determine_metrics_action("ARTICLE <test@example.com>", 423),
+            MetricsAction::None
+        );
+        assert_eq!(
+            determine_metrics_action("ARTICLE <test@example.com>", 430),
+            MetricsAction::None
+        );
     }
 
     #[test]
     fn test_determine_metrics_action_5xx_errors() {
         assert_eq!(
-            determine_metrics_action(500, false),
+            determine_metrics_action("ARTICLE <test@example.com>", 500),
             MetricsAction::Error5xx
         );
         assert_eq!(
-            determine_metrics_action(502, false),
+            determine_metrics_action("ARTICLE <test@example.com>", 502),
             MetricsAction::Error5xx
         );
         assert_eq!(
-            determine_metrics_action(503, false),
+            determine_metrics_action("ARTICLE <test@example.com>", 503),
             MetricsAction::Error5xx
         );
     }
@@ -85,35 +106,65 @@ mod tests {
     #[test]
     fn test_determine_metrics_action_article_success() {
         // Multiline 220-222 should record article
-        assert_eq!(determine_metrics_action(220, true), MetricsAction::Article);
-        assert_eq!(determine_metrics_action(221, true), MetricsAction::Article);
-        assert_eq!(determine_metrics_action(222, true), MetricsAction::Article);
+        assert_eq!(
+            determine_metrics_action("ARTICLE <test@example.com>", 220),
+            MetricsAction::Article
+        );
+        assert_eq!(
+            determine_metrics_action("HEAD <test@example.com>", 221),
+            MetricsAction::Article
+        );
+        assert_eq!(
+            determine_metrics_action("BODY <test@example.com>", 222),
+            MetricsAction::Article
+        );
     }
 
     #[test]
-    fn test_determine_metrics_action_article_not_multiline() {
-        // Non-multiline shouldn't record article
-        assert_eq!(determine_metrics_action(220, false), MetricsAction::None);
+    fn test_determine_metrics_action_article_status_not_for_other_request() {
+        // The status code alone does not decide response shape.
+        assert_eq!(
+            determine_metrics_action("GROUP alt.test", 220),
+            MetricsAction::None
+        );
     }
 
     #[test]
     fn test_determine_metrics_action_stat_not_article() {
-        // STAT (223) is not an article even if multiline flag is true
-        assert_eq!(determine_metrics_action(223, true), MetricsAction::None);
+        assert_eq!(
+            determine_metrics_action("STAT <test@example.com>", 223),
+            MetricsAction::None
+        );
     }
 
     #[test]
     fn test_determine_metrics_action_success_codes() {
         // 2xx success codes (other than 220-222) should not record article
-        assert_eq!(determine_metrics_action(200, false), MetricsAction::None);
-        assert_eq!(determine_metrics_action(211, false), MetricsAction::None);
-        assert_eq!(determine_metrics_action(215, true), MetricsAction::None);
+        assert_eq!(
+            determine_metrics_action("MODE READER", 200),
+            MetricsAction::None
+        );
+        assert_eq!(
+            determine_metrics_action("GROUP alt.test", 211),
+            MetricsAction::None
+        );
+        assert_eq!(determine_metrics_action("LIST", 215), MetricsAction::None);
+        assert_eq!(
+            determine_metrics_action("LISTGROUP alt.test", 211),
+            MetricsAction::None
+        );
     }
 
     #[test]
     fn test_determine_metrics_action_3xx_codes() {
         // 3xx codes should not record anything special
-        assert_eq!(determine_metrics_action(335, false), MetricsAction::None);
-        assert_eq!(determine_metrics_action(381, false), MetricsAction::None);
+        assert_eq!(
+            determine_metrics_action("IHAVE <test@example.com>", 335),
+            MetricsAction::None
+        );
+        assert_eq!(
+            determine_metrics_action("AUTHINFO USER user", 381),
+            MetricsAction::None
+        );
     }
 }

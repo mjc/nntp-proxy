@@ -8,7 +8,8 @@ use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
 use crate::session::retry::retry_once;
 use crate::session::routing::{
-    CacheAction, MetricsAction, determine_cache_action_for_request, determine_metrics_action,
+    CacheAction, MetricsAction, determine_cache_action_for_request,
+    determine_metrics_action_for_request,
 };
 use crate::session::streaming::StreamingError;
 use crate::session::{ClientSession, backend, streaming};
@@ -244,8 +245,8 @@ impl ClientSession {
         );
         self.record_response_metrics(
             backend_id,
+            request,
             status_code,
-            cmd_response.is_multiline,
             request.wire_len() as u64,
             bytes_written,
         );
@@ -476,14 +477,14 @@ impl ClientSession {
     fn record_response_metrics(
         &self,
         backend_id: crate::types::BackendId,
+        request: &RequestContext,
         status_code: StatusCode,
-        is_multiline: bool,
         cmd_bytes: u64,
         resp_bytes: u64,
     ) {
         use crate::types::MetricsBytes;
 
-        match determine_metrics_action(status_code.as_u16(), is_multiline) {
+        match determine_metrics_action_for_request(request, status_code) {
             MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
             MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
             MetricsAction::Article => self.metrics.record_article(backend_id, resp_bytes),

@@ -196,7 +196,7 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         state: &mut BatchPipelineState<'_>,
     ) -> Result<BatchStep> {
-        use crate::session::routing::{MetricsAction, determine_metrics_action};
+        use crate::session::routing::{MetricsAction, determine_metrics_action_for_request};
         use crate::session::{backend, streaming};
 
         let backend_id = bcc.backend_id;
@@ -410,7 +410,7 @@ impl ClientSession {
         // Record metrics
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
-        match determine_metrics_action(status_code.as_u16(), is_multiline) {
+        match determine_metrics_action_for_request(request, status_code) {
             MetricsAction::Article => {
                 self.metrics.record_article(backend_id, bytes_written);
             }
