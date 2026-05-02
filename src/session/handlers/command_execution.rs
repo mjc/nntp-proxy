@@ -159,7 +159,7 @@ impl ClientSession {
         }
 
         // Success - stream response
-        let is_multiline = matches!(
+        let response_is_multiline = matches!(
             request.response_shape(status_code),
             crate::protocol::ResponseShape::Multiline
         );
@@ -169,7 +169,7 @@ impl ClientSession {
             command_verb = %String::from_utf8_lossy(request.verb()),
             first_chunk_bytes = cmd_response.bytes_read,
             status_code = status_code.as_u16(),
-            is_multiline,
+            response_is_multiline,
             "Streaming backend response to client"
         );
         let mut conn = conn;
@@ -330,7 +330,7 @@ impl ClientSession {
         params: ResponseStreamParams<'_>,
     ) -> Result<u64, StreamingError> {
         let code = params.status_code.as_u16();
-        let is_multiline = matches!(
+        let response_is_multiline = matches!(
             params.request.response_shape(params.status_code),
             crate::protocol::ResponseShape::Multiline
         );
@@ -343,15 +343,15 @@ impl ClientSession {
         );
 
         debug!(
-            "stream_response_to_client: code={}, is_multiline={}, cache_articles={}, has_msg_id={}, action={:?}",
+            "stream_response_to_client: code={}, response_is_multiline={}, cache_articles={}, has_msg_id={}, action={:?}",
             code,
-            is_multiline,
+            response_is_multiline,
             self.cache_articles,
             params.msg_id.is_some(),
             cache_action
         );
 
-        match (is_multiline, cache_action) {
+        match (response_is_multiline, cache_action) {
             (true, CacheAction::CaptureArticle) => {
                 let captured =
                     streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
