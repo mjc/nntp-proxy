@@ -299,11 +299,6 @@ impl RequestCacheEntryMetadata {
 
 impl RequestContext {
     #[must_use]
-    pub fn from_request_line(line: &str) -> Self {
-        Self::from_request_bytes(line.as_bytes())
-    }
-
-    #[must_use]
     pub fn from_request_bytes(line: &[u8]) -> Self {
         let bytes = trim_line_end(line);
         let split = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
@@ -765,7 +760,7 @@ mod tests {
 
     #[test]
     fn typed_request_context_parses_message_id() {
-        let ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
+        let ctx = RequestContext::from_request_bytes(b"ARTICLE <a@b>\r\n");
         assert_eq!(ctx.kind(), RequestKind::Article);
         assert_eq!(ctx.message_id(), Some("<a@b>"));
         assert_eq!(ctx.cache_status(), None);
@@ -796,7 +791,7 @@ mod tests {
 
     #[test]
     fn request_context_records_backend_response_when_known() {
-        let mut ctx = RequestContext::from_request_line("STAT <a@b>\r\n");
+        let mut ctx = RequestContext::from_request_bytes(b"STAT <a@b>\r\n");
         let backend_id = BackendId::from_index(2);
         let status = StatusCode::new(223);
 
@@ -820,7 +815,7 @@ mod tests {
 
     #[test]
     fn request_context_records_cache_status_when_known() {
-        let mut ctx = RequestContext::from_request_line("BODY <a@b>\r\n");
+        let mut ctx = RequestContext::from_request_bytes(b"BODY <a@b>\r\n");
 
         ctx.record_cache_status(RequestCacheStatus::PartialHit);
 
@@ -830,7 +825,7 @@ mod tests {
 
     #[test]
     fn request_context_records_cache_entry_metadata_together() {
-        let mut ctx = RequestContext::from_request_line("ARTICLE <a@b>\r\n");
+        let mut ctx = RequestContext::from_request_bytes(b"ARTICLE <a@b>\r\n");
         let status = StatusCode::new(430);
         let availability = RequestCacheAvailability::from_bits(0b0000_0010, 0b0000_0010);
         let tier = RequestCacheTier::new(2);
@@ -870,7 +865,7 @@ mod tests {
 
     #[test]
     fn request_context_records_cache_response_when_served() {
-        let mut ctx = RequestContext::from_request_line("HEAD <a@b>\r\n");
+        let mut ctx = RequestContext::from_request_bytes(b"HEAD <a@b>\r\n");
         let backend_id = BackendId::from_index(1);
         let status = StatusCode::new(221);
 
@@ -888,7 +883,7 @@ mod tests {
 
     #[test]
     fn request_context_records_local_response_without_backend() {
-        let mut ctx = RequestContext::from_request_line("QUIT\r\n");
+        let mut ctx = RequestContext::from_request_bytes(b"QUIT\r\n");
         let status = StatusCode::new(205);
 
         ctx.record_local_response(RequestResponseMetadata::new(
@@ -904,7 +899,7 @@ mod tests {
 
     #[test]
     fn unknown_extensions_are_stateful() {
-        let ctx = RequestContext::from_request_line("XFOO arg\r\n");
+        let ctx = RequestContext::from_request_bytes(b"XFOO arg\r\n");
         assert_eq!(ctx.kind(), RequestKind::Unknown);
         assert_eq!(ctx.route_class(), RequestRouteClass::Stateful);
     }
@@ -942,7 +937,7 @@ mod tests {
 
         for (line, expected) in cases {
             assert_eq!(
-                RequestContext::from_request_line(line).kind(),
+                RequestContext::from_request_bytes(line.as_bytes()).kind(),
                 expected,
                 "{line}"
             );
@@ -969,7 +964,7 @@ mod tests {
 
         for (line, expected) in cases {
             assert_eq!(
-                RequestContext::from_request_line(line).route_class(),
+                RequestContext::from_request_bytes(line.as_bytes()).route_class(),
                 expected,
                 "{line}"
             );
@@ -978,8 +973,8 @@ mod tests {
 
     #[test]
     fn request_aware_response_shape() {
-        let group = RequestContext::from_request_line("GROUP alt.test\r\n");
-        let listgroup = RequestContext::from_request_line("LISTGROUP alt.test\r\n");
+        let group = RequestContext::from_request_bytes(b"GROUP alt.test\r\n");
+        let listgroup = RequestContext::from_request_bytes(b"LISTGROUP alt.test\r\n");
         assert_eq!(
             group.response_shape(StatusCode::new(211)),
             ResponseShape::SingleLine
@@ -989,7 +984,7 @@ mod tests {
             ResponseShape::Multiline
         );
         assert_eq!(
-            RequestContext::from_request_line("ARTICLE <x@y>\r\n")
+            RequestContext::from_request_bytes(b"ARTICLE <x@y>\r\n")
                 .response_shape(StatusCode::new(430)),
             ResponseShape::SingleLine
         );

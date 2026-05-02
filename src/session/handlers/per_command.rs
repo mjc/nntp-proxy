@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn local_response_records_typed_status_and_wire_len() {
-        let mut request = RequestContext::from_request_line("QUIT\r\n");
+        let mut request = RequestContext::from_request_bytes(b"QUIT\r\n");
 
         super::record_local_response(
             &mut request,

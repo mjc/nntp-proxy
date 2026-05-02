@@ -538,7 +538,7 @@ mod tests {
             cache_articles: true,
         };
 
-        let request = RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
+        let request = RequestContext::from_request_bytes(b"ARTICLE <test@example.com>\r\n");
         let result = query_backend(&deps, backend_id, &request).await;
         assert_eq!(result, QueryResult::Error(backend_id));
     }

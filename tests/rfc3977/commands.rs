@@ -196,7 +196,7 @@ fn test_classify_article_by_message_id() {
         "STAT <test@example.com>",
     ] {
         assert_eq!(
-            RequestContext::from_request_line(line).route_class(),
+            RequestContext::from_request_bytes(line.as_bytes()).route_class(),
             RequestRouteClass::ArticleByMessageId
         );
     }
@@ -206,7 +206,7 @@ fn test_classify_article_by_message_id() {
 fn test_classify_article_by_number_is_stateful() {
     for line in ["ARTICLE 12345", "BODY 12345"] {
         assert_eq!(
-            RequestContext::from_request_line(line).route_class(),
+            RequestContext::from_request_bytes(line.as_bytes()).route_class(),
             RequestRouteClass::Stateful
         );
     }
@@ -220,7 +220,7 @@ fn test_classify_case_insensitive() {
         "Article <test@example.com>",
         "ARTICLE <test@example.com>",
     ] {
-        let request = RequestContext::from_request_line(line);
+        let request = RequestContext::from_request_bytes(line.as_bytes());
         assert_eq!(request.kind(), RequestKind::Article);
         assert_eq!(request.route_class(), RequestRouteClass::ArticleByMessageId);
     }
@@ -229,7 +229,7 @@ fn test_classify_case_insensitive() {
 #[test]
 fn test_classify_auth_commands() {
     for line in ["AUTHINFO USER testuser", "AUTHINFO PASS testpass"] {
-        let request = RequestContext::from_request_line(line);
+        let request = RequestContext::from_request_bytes(line.as_bytes());
         assert_eq!(request.kind(), RequestKind::AuthInfo);
         assert_eq!(request.route_class(), RequestRouteClass::Local);
     }
@@ -249,7 +249,7 @@ fn test_classify_stateless_commands() {
         ),
     ];
     for (line, kind, route_class) in cases {
-        let request = RequestContext::from_request_line(line);
+        let request = RequestContext::from_request_bytes(line.as_bytes());
         assert_eq!(request.kind(), kind);
         assert_eq!(request.route_class(), route_class);
     }
@@ -259,7 +259,7 @@ fn test_classify_stateless_commands() {
 fn test_classify_stateful_commands() {
     for line in ["GROUP alt.test", "NEXT", "LAST", "XOVER 1-100"] {
         assert_eq!(
-            RequestContext::from_request_line(line).route_class(),
+            RequestContext::from_request_bytes(line.as_bytes()).route_class(),
             RequestRouteClass::Stateful
         );
     }
@@ -270,7 +270,7 @@ fn test_classify_non_routable_commands() {
     // POST — RFC 3977 §6.3.1: posting not permitted → dedicated Post variant
     for line in ["POST", "IHAVE <msgid@example>"] {
         assert_eq!(
-            RequestContext::from_request_line(line).route_class(),
+            RequestContext::from_request_bytes(line.as_bytes()).route_class(),
             RequestRouteClass::Reject
         );
     }
@@ -279,18 +279,18 @@ fn test_classify_non_routable_commands() {
 #[test]
 fn test_classify_empty_command() {
     // Empty input shouldn't panic
-    let _ = RequestContext::from_request_line("");
+    let _ = RequestContext::from_request_bytes(b"");
 }
 
 #[test]
 fn test_classify_whitespace_only() {
-    let _ = RequestContext::from_request_line("   ");
+    let _ = RequestContext::from_request_bytes(b"   ");
 }
 
 #[test]
 fn test_classify_unknown_command() {
     // Unknown commands fall through to a default classification
-    let request = RequestContext::from_request_line("XYZZY");
+    let request = RequestContext::from_request_bytes(b"XYZZY");
     assert_eq!(request.kind(), RequestKind::Unknown);
     assert_eq!(request.route_class(), RequestRouteClass::Stateful);
 }
@@ -298,7 +298,7 @@ fn test_classify_unknown_command() {
 #[test]
 fn test_classify_case_insensitive_auth() {
     for line in ["authinfo user test", "Authinfo Pass test"] {
-        let request = RequestContext::from_request_line(line);
+        let request = RequestContext::from_request_bytes(line.as_bytes());
         assert_eq!(request.kind(), RequestKind::AuthInfo);
         assert_eq!(request.route_class(), RequestRouteClass::Local);
     }
@@ -324,7 +324,7 @@ fn test_classify_case_insensitive_stateless() {
     ];
     // NEWGROUPS/NEWNEWS are read-only queries (RFC 3977 §7.3-7.4)
     for (line, kind, route_class) in cases {
-        let request = RequestContext::from_request_line(line);
+        let request = RequestContext::from_request_bytes(line.as_bytes());
         assert_eq!(request.kind(), kind);
         assert_eq!(request.route_class(), route_class);
     }
@@ -334,7 +334,7 @@ fn test_classify_case_insensitive_stateless() {
 fn test_classify_case_insensitive_stateful() {
     for line in ["group alt.test", "next", "last"] {
         assert_eq!(
-            RequestContext::from_request_line(line).route_class(),
+            RequestContext::from_request_bytes(line.as_bytes()).route_class(),
             RequestRouteClass::Stateful
         );
     }
@@ -345,7 +345,7 @@ fn test_classify_case_insensitive_non_routable() {
     // POST — RFC 3977 §6.3.1: dedicated Post variant, case-insensitive
     for line in ["post", "ihave <msgid@example>"] {
         assert_eq!(
-            RequestContext::from_request_line(line).route_class(),
+            RequestContext::from_request_bytes(line.as_bytes()).route_class(),
             RequestRouteClass::Reject
         );
     }

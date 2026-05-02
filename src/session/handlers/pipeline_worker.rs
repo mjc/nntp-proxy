@@ -252,7 +252,8 @@ async fn read_full_response(
     result_buf: &mut crate::pool::ChunkedResponse,
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
-    let request = crate::protocol::RequestContext::from_request_line("ARTICLE <test@example>\r\n");
+    let request =
+        crate::protocol::RequestContext::from_request_bytes(b"ARTICLE <test@example>\r\n");
     crate::session::streaming::read_full_response_for_request(
         &request,
         buffer,
@@ -296,7 +297,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
             QueuedContext::new(
-                crate::protocol::RequestContext::from_request_line(command),
+                crate::protocol::RequestContext::from_request_bytes(command.as_bytes()),
                 tx,
             ),
             rx,

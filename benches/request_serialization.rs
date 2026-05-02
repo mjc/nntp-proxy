@@ -89,7 +89,7 @@ mod single_request {
         ($name:ident, $line:literal) => {
             #[divan::bench(sample_count = 1000, sample_size = 1000)]
             fn $name(bencher: Bencher) {
-                let request = RequestContext::from_request_line($line);
+                let request = RequestContext::from_request_bytes($line.as_bytes());
                 bencher.bench(|| {
                     let mut sink = FixedSink::default();
                     black_box(write_request_slices(
@@ -123,13 +123,13 @@ mod allocating_baselines {
 
                 #[divan::bench(sample_count = 1000, sample_size = 1000)]
                 fn vec_builder(bencher: Bencher) {
-                    let request = RequestContext::from_request_line($line);
+                    let request = RequestContext::from_request_bytes($line.as_bytes());
                     bencher.bench(|| black_box(build_request_vec(black_box(&request))));
                 }
 
                 #[divan::bench(sample_count = 1000, sample_size = 1000)]
                 fn string_builder(bencher: Bencher) {
-                    let request = RequestContext::from_request_line($line);
+                    let request = RequestContext::from_request_bytes($line.as_bytes());
                     bencher.bench(|| black_box(build_request_string(black_box(&request))));
                 }
             }
@@ -164,7 +164,7 @@ mod mixed_batch {
     fn realistic_request_stream(bencher: Bencher) {
         let requests = COMMANDS
             .iter()
-            .map(|line| RequestContext::from_request_line(line))
+            .map(|line| RequestContext::from_request_bytes(line.as_bytes()))
             .collect::<Vec<_>>();
 
         bencher
@@ -182,7 +182,7 @@ mod mixed_batch {
     fn realistic_request_stream_vec_baseline(bencher: Bencher) {
         let requests = COMMANDS
             .iter()
-            .map(|line| RequestContext::from_request_line(line))
+            .map(|line| RequestContext::from_request_bytes(line.as_bytes()))
             .collect::<Vec<_>>();
 
         bencher
@@ -216,7 +216,7 @@ mod response_shape {
             .iter()
             .map(|(line, status)| {
                 (
-                    RequestContext::from_request_line(line),
+                    RequestContext::from_request_bytes(line.as_bytes()),
                     StatusCode::new(*status),
                 )
             })

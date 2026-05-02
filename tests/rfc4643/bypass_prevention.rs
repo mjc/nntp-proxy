@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn classify(command: &str) -> CommandAction<'static> {
-    let request = Box::leak(Box::new(RequestContext::from_request_line(command)));
+    let request = Box::leak(Box::new(RequestContext::from_request_bytes(
+        command.as_bytes(),
+    )));
     CommandHandler::classify_request(request)
 }
 

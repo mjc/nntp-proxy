@@ -254,7 +254,7 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         queue
             .try_enqueue(QueuedContext::new(
-                RequestContext::from_request_line("ARTICLE <test@example.com>\r\n"),
+                RequestContext::from_request_bytes(b"ARTICLE <test@example.com>\r\n"),
                 tx,
             ))
             .unwrap();
@@ -266,18 +266,17 @@ mod tests {
         let queue = BackendQueue::new(2);
         for i in 0..2 {
             let (tx, _rx) = oneshot::channel();
+            let request = format!("ARTICLE <test{i}@example.com>\r\n");
             queue
                 .try_enqueue(QueuedContext::new(
-                    RequestContext::from_request_line(&format!(
-                        "ARTICLE <test{i}@example.com>\r\n"
-                    )),
+                    RequestContext::from_request_bytes(request.as_bytes()),
                     tx,
                 ))
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
         let result = queue.try_enqueue(QueuedContext::new(
-            RequestContext::from_request_line("ARTICLE <overflow@example.com>\r\n"),
+            RequestContext::from_request_bytes(b"ARTICLE <overflow@example.com>\r\n"),
             tx,
         ));
         assert!(result.is_err());
@@ -295,9 +294,10 @@ mod tests {
         let queue = Arc::new(BackendQueue::new(100));
         for i in 0..5 {
             let (tx, _rx) = oneshot::channel();
+            let request = format!("CMD {i}\r\n");
             queue
                 .try_enqueue(QueuedContext::new(
-                    RequestContext::from_request_line(&format!("CMD {i}\r\n")),
+                    RequestContext::from_request_bytes(request.as_bytes()),
                     tx,
                 ))
                 .unwrap();
@@ -327,7 +327,7 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         queue
             .try_enqueue(QueuedContext::new(
-                RequestContext::from_request_line("HELLO\r\n"),
+                RequestContext::from_request_bytes(b"HELLO\r\n"),
                 tx,
             ))
             .unwrap();
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_queued_context_owns_typed_context() {
-        let context = RequestContext::from_request_line("STAT <test@example.com>\r\n");
+        let context = RequestContext::from_request_bytes(b"STAT <test@example.com>\r\n");
         assert_eq!(context.verb(), b"STAT");
         assert_eq!(context.args(), b"<test@example.com>");
         assert_eq!(context.wire_len(), 25);
@@ -375,7 +375,7 @@ mod tests {
     fn test_queued_context_returns_completed_matching_context() {
         let (tx, rx) = oneshot::channel();
         let backend_id = BackendId::from_index(1);
-        let mut context = RequestContext::from_request_line("STAT <test@example.com>\r\n");
+        let mut context = RequestContext::from_request_bytes(b"STAT <test@example.com>\r\n");
         context.complete_backend_response(
             backend_id,
             crate::protocol::StatusCode::new(223),
@@ -403,7 +403,7 @@ mod tests {
     fn test_queued_context_error_completes_without_response_data() {
         let (tx, rx) = oneshot::channel();
         let queued = QueuedContext::new(
-            RequestContext::from_request_line("STAT <test@example.com>\r\n"),
+            RequestContext::from_request_bytes(b"STAT <test@example.com>\r\n"),
             tx,
         );
 

@@ -25,7 +25,7 @@ fn parse_typed_contexts(buffer: &[u8]) -> usize {
             && buffer[end - 2] == b'\r'
             && let Ok(line) = std::str::from_utf8(&buffer[start..end])
         {
-            black_box(RequestContext::from_request_line(line));
+            black_box(RequestContext::from_request_bytes(line.as_bytes()));
             count += 1;
         }
         start = end;

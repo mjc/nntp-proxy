@@ -516,7 +516,7 @@ mod tests {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
         let mut request =
-            crate::protocol::RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
+            crate::protocol::RequestContext::from_request_bytes(b"ARTICLE <test@example.com>\r\n");
         let result = BackendAttemptResult::success(&mut request, backend_id, response);
 
         match result {
@@ -534,7 +534,7 @@ mod tests {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
         let mut request =
-            crate::protocol::RequestContext::from_request_line("ARTICLE <test@example.com>\r\n");
+            crate::protocol::RequestContext::from_request_bytes(b"ARTICLE <test@example.com>\r\n");
 
         let result = BackendAttemptResult::success(&mut request, backend_id, response);
 

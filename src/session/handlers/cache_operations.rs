@@ -369,7 +369,7 @@ mod tests {
         let mut metrics = BackendToClientBytes::zero();
         let (mut client, _server) = tcp_write_pair().await;
         let (_read, mut write) = client.split();
-        let mut request = RequestContext::from_request_line("ARTICLE <missing@example>\r\n");
+        let mut request = RequestContext::from_request_bytes(b"ARTICLE <missing@example>\r\n");
         let msg_id = request
             .message_id_value()
             .map(|msg_id| msg_id.to_owned())
@@ -398,7 +398,7 @@ mod tests {
         let mut metrics = BackendToClientBytes::zero();
         let (mut client, _server) = tcp_write_pair().await;
         let (_read, mut write) = client.split();
-        let mut request = RequestContext::from_request_line("DATE\r\n");
+        let mut request = RequestContext::from_request_bytes(b"DATE\r\n");
 
         let result = session
             .try_serve_from_cache(None, &mut request, &router, &mut write, &mut metrics)
@@ -446,7 +446,7 @@ mod tests {
         let mut metrics = BackendToClientBytes::zero();
         let (mut client, mut server) = tcp_write_pair().await;
         let (_read, mut write) = client.split();
-        let mut request = RequestContext::from_request_line("ARTICLE <hit@example>\r\n");
+        let mut request = RequestContext::from_request_bytes(b"ARTICLE <hit@example>\r\n");
 
         let result = session
             .try_serve_from_cache(
@@ -517,7 +517,7 @@ mod tests {
         let mut metrics = BackendToClientBytes::zero();
         let (mut client, _server) = tcp_write_pair().await;
         let (_read, mut write) = client.split();
-        let mut request = RequestContext::from_request_line("ARTICLE <partial@example>\r\n");
+        let mut request = RequestContext::from_request_bytes(b"ARTICLE <partial@example>\r\n");
 
         let result = session
             .try_serve_from_cache(
@@ -566,7 +566,9 @@ mod tests {
 
         for (line, status) in cases {
             assert_eq!(
-                cached_response_status_for_verb(RequestContext::from_request_line(line).verb()),
+                cached_response_status_for_verb(
+                    RequestContext::from_request_bytes(line.as_bytes()).verb()
+                ),
                 Some(StatusCode::new(status))
             );
         }

@@ -939,7 +939,7 @@ mod tests {
         let mut conn = test_helpers::mock_backend_conn(vec![response.to_vec()]).await;
         let backend_id = crate::types::BackendId::from_index(1);
         let mut request =
-            crate::protocol::RequestContext::from_request_line("STAT <test@example>\r\n");
+            crate::protocol::RequestContext::from_request_bytes(b"STAT <test@example>\r\n");
 
         read_response_into_context(
             &mut request,
